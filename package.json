@@ -1,0 +1,37 @@
+{
+  "name": "ain",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Ain — the AI services platform that runs a business end to end.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "gen": "node scripts/gen-registry.mjs",
+    "dev": "npm run gen && concurrently -k -n api,web -c blue,magenta \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "tsx watch src/server/main.ts",
+    "dev:web": "vite",
+    "api": "npm run gen && tsx src/server/main.ts",
+    "build": "npm run gen && vite build",
+    "start": "npm run build && NODE_ENV=production tsx src/server/main.ts",
+    "typecheck": "npm run gen && tsc --noEmit",
+    "test": "npm run gen && tsx --test --test-reporter=spec \"tests/**/*.test.ts\"",
+    "test:e2e": "playwright test",
+    "seed": "npm run gen && tsx scripts/seed.ts",
+    "check": "npm run typecheck && npm run test"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.1",
+    "@types/node": "^22.10.5",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7"
+  }
+}

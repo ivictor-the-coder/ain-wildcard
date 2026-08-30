@@ -1,0 +1,242 @@
+/* ============================================================================
+   Ain design tokens.
+   One palette, two themes. Every colour is defined once at :root in the light
+   theme and re-declared for dark; components only ever reference tokens.
+   ========================================================================== */
+
+:root {
+  /* ---- neutral ramp (slate, very slightly cool) ---- */
+  --gray-0:  #ffffff;
+  --gray-25: #fcfcfd;
+  --gray-50: #f8f9fb;
+  --gray-75: #f3f5f8;
+  --gray-100:#eceff4;
+  --gray-150:#e3e7ee;
+  --gray-200:#d8dee7;
+  --gray-300:#bcc5d3;
+  --gray-400:#98a3b5;
+  --gray-500:#76829a;
+  --gray-600:#5b667d;
+  --gray-700:#454f64;
+  --gray-800:#333c4d;
+  --gray-900:#232a37;
+  --gray-950:#151a23;
+  --gray-1000:#0c0f15;
+
+  /* ---- brand: indigo ---- */
+  --brand-50: #f1f0fe;
+  --brand-100:#e3e1fd;
+  --brand-200:#c8c4fb;
+  --brand-300:#a49df6;
+  --brand-400:#8478ef;
+  --brand-500:#6a5ce8;
+  --brand-600:#5b4be1;
+  --brand-700:#4a3bc4;
+  --brand-800:#3c3199;
+  --brand-900:#2c2470;
+
+  /* ---- semantic hues ---- */
+  --green-50:#e9f8f0; --green-100:#cdefdd; --green-300:#6fd3a2; --green-500:#17a862; --green-600:#0f8b4f; --green-700:#0b6f40;
+  --amber-50:#fff5e6; --amber-100:#ffe8c2; --amber-300:#ffc768; --amber-500:#e08c00; --amber-600:#bd7300; --amber-700:#985c00;
+  --red-50:  #fdeeee; --red-100:  #fbd8d8; --red-300:  #f39a9a; --red-500:  #dc3a3a; --red-600:  #bd2b2b; --red-700:  #9a2020;
+  --blue-50: #eaf3ff; --blue-100: #d1e5ff; --blue-300: #7fb4f7; --blue-500: #2a7ae4; --blue-600: #1c62bd; --blue-700: #164e97;
+  --teal-50: #e6f7f7; --teal-100: #c4ecec; --teal-300: #5cc9c9; --teal-500: #12a0a0; --teal-600: #0c8383;
+  --pink-50: #fdeef6; --pink-100: #fbd6ea; --pink-300: #f294c4; --pink-500: #d63f8f; --pink-600: #b52d75;
+  --violet-500:#8b5cf6; --violet-600:#7442e0;
+
+  /* ---- surfaces ---- */
+  --bg-app: var(--gray-50);
+  --bg-surface: var(--gray-0);
+  --bg-surface-raised: var(--gray-0);
+  --bg-sunken: var(--gray-75);
+  --bg-subtle: var(--gray-50);
+  --bg-hover: var(--gray-75);
+  --bg-active: var(--gray-100);
+  --bg-selected: var(--brand-50);
+  --bg-inverse: var(--gray-900);
+  --bg-overlay: rgba(17, 21, 28, 0.44);
+  --bg-nav: var(--gray-0);
+
+  /* ---- text ---- */
+  --text-primary: var(--gray-900);
+  --text-secondary: var(--gray-600);
+  --text-tertiary: var(--gray-500);
+  --text-placeholder: var(--gray-400);
+  --text-inverse: var(--gray-0);
+  --text-brand: var(--brand-700);
+  --text-success: var(--green-700);
+  --text-warning: var(--amber-700);
+  --text-danger: var(--red-600);
+  --text-info: var(--blue-600);
+  --text-link: var(--brand-700);
+
+  /* ---- borders ---- */
+  --border-subtle: var(--gray-100);
+  --border-default: var(--gray-200);
+  --border-strong: var(--gray-300);
+  --border-brand: var(--brand-600);
+  --border-danger: var(--red-500);
+  --border-focus: var(--brand-500);
+
+  /* ---- interactive ---- */
+  --accent: var(--brand-600);
+  --accent-hover: var(--brand-700);
+  --accent-active: var(--brand-800);
+  --accent-subtle: var(--brand-50);
+  --accent-subtle-hover: var(--brand-100);
+  --accent-contrast: #ffffff;
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--brand-500) 28%, transparent);
+
+  /* ---- data-viz categorical ramp (colour-blind aware ordering) ---- */
+  --viz-1: #5b4be1; --viz-2: #12a0a0; --viz-3: #e08c00; --viz-4: #d63f8f;
+  --viz-5: #2a7ae4; --viz-6: #17a862; --viz-7: #8b5cf6; --viz-8: #dc3a3a;
+  --viz-grid: var(--gray-100);
+  --viz-axis: var(--gray-400);
+
+  /* ---- typography ---- */
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --font-display: var(--font-sans);
+
+  --text-2xs: 10.5px;
+  --text-xs: 11.5px;
+  --text-sm: 12.5px;
+  --text-md: 13.5px;
+  --text-base: 14px;
+  --text-lg: 16px;
+  --text-xl: 18px;
+  --text-2xl: 21px;
+  --text-3xl: 26px;
+  --text-4xl: 32px;
+  --text-5xl: 40px;
+
+  --leading-tight: 1.22;
+  --leading-snug: 1.35;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.62;
+
+  --weight-normal: 420;
+  --weight-medium: 520;
+  --weight-semibold: 600;
+  --weight-bold: 680;
+
+  --tracking-tight: -0.014em;
+  --tracking-snug: -0.008em;
+  --tracking-normal: 0;
+  --tracking-wide: 0.04em;
+
+  /* ---- spacing (4px base) ---- */
+  --space-0: 0px;  --space-1: 2px;  --space-2: 4px;  --space-3: 6px;
+  --space-4: 8px;  --space-5: 12px; --space-6: 16px; --space-7: 20px;
+  --space-8: 24px; --space-9: 32px; --space-10: 40px; --space-11: 48px;
+  --space-12: 64px; --space-13: 80px; --space-14: 96px;
+
+  /* ---- radii ---- */
+  --radius-xs: 3px; --radius-sm: 5px; --radius-md: 7px; --radius-lg: 10px;
+  --radius-xl: 14px; --radius-2xl: 20px; --radius-full: 999px;
+
+  /* ---- elevation ---- */
+  --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-sm: 0 1px 3px rgba(16, 24, 40, 0.08), 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-md: 0 4px 8px -2px rgba(16, 24, 40, 0.09), 0 2px 4px -2px rgba(16, 24, 40, 0.05);
+  --shadow-lg: 0 12px 20px -4px rgba(16, 24, 40, 0.10), 0 4px 8px -4px rgba(16, 24, 40, 0.05);
+  --shadow-xl: 0 24px 44px -12px rgba(16, 24, 40, 0.20), 0 8px 16px -8px rgba(16, 24, 40, 0.08);
+  --shadow-popover: 0 8px 24px -6px rgba(16, 24, 40, 0.16), 0 2px 6px -2px rgba(16, 24, 40, 0.08);
+  --shadow-inset: inset 0 1px 2px rgba(16, 24, 40, 0.06);
+
+  /* ---- motion ---- */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.34, 1.42, 0.64, 1);
+  --dur-instant: 80ms;
+  --dur-fast: 130ms;
+  --dur-normal: 200ms;
+  --dur-slow: 320ms;
+
+  /* ---- layout ---- */
+  --nav-width: 232px;
+  --nav-width-collapsed: 56px;
+  --topbar-height: 52px;
+  --page-max: 1440px;
+  --z-base: 0; --z-sticky: 100; --z-dropdown: 400; --z-drawer: 500;
+  --z-modal: 600; --z-popover: 700; --z-toast: 800; --z-tooltip: 900; --z-command: 1000;
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg-app: var(--gray-1000);
+  --bg-surface: #14181f;
+  --bg-surface-raised: #1a1f28;
+  --bg-sunken: #0f131a;
+  --bg-subtle: #171c24;
+  --bg-hover: #1f2530;
+  --bg-active: #262d3a;
+  --bg-selected: color-mix(in srgb, var(--brand-500) 18%, #14181f);
+  --bg-inverse: var(--gray-100);
+  --bg-overlay: rgba(4, 6, 10, 0.68);
+  --bg-nav: #12161d;
+
+  --text-primary: #e8ecf3;
+  --text-secondary: #a3adbf;
+  --text-tertiary: #7d8799;
+  --text-placeholder: #5f6a7d;
+  --text-inverse: var(--gray-950);
+  --text-brand: #a49df6;
+  --text-success: #5fd39c;
+  --text-warning: #f0b64d;
+  --text-danger: #f28585;
+  --text-info: #7fb4f7;
+  --text-link: #a49df6;
+
+  --border-subtle: #212833;
+  --border-default: #2c3542;
+  --border-strong: #3d4757;
+  --border-brand: var(--brand-400);
+  --border-danger: var(--red-300);
+  --border-focus: var(--brand-400);
+
+  --accent: var(--brand-500);
+  --accent-hover: var(--brand-400);
+  --accent-active: var(--brand-300);
+  --accent-subtle: color-mix(in srgb, var(--brand-500) 16%, transparent);
+  --accent-subtle-hover: color-mix(in srgb, var(--brand-500) 26%, transparent);
+  --accent-contrast: #ffffff;
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--brand-400) 34%, transparent);
+
+  --green-50: color-mix(in srgb, var(--green-500) 16%, transparent);
+  --amber-50: color-mix(in srgb, var(--amber-500) 18%, transparent);
+  --red-50:   color-mix(in srgb, var(--red-500) 16%, transparent);
+  --blue-50:  color-mix(in srgb, var(--blue-500) 16%, transparent);
+  --teal-50:  color-mix(in srgb, var(--teal-500) 16%, transparent);
+  --pink-50:  color-mix(in srgb, var(--pink-500) 16%, transparent);
+  --brand-50: color-mix(in srgb, var(--brand-500) 16%, transparent);
+  --brand-100:color-mix(in srgb, var(--brand-500) 26%, transparent);
+
+  --viz-1: #8478ef; --viz-2: #34c4c4; --viz-3: #f0b64d; --viz-4: #f07ab5;
+  --viz-5: #6aa8f5; --viz-6: #4dcb8f; --viz-7: #b18bff; --viz-8: #f28585;
+  --viz-grid: #242c37;
+  --viz-axis: #5f6a7d;
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.45), 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 10px -2px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 14px 26px -6px rgba(0, 0, 0, 0.6);
+  --shadow-xl: 0 26px 50px -12px rgba(0, 0, 0, 0.7);
+  --shadow-popover: 0 10px 30px -8px rgba(0, 0, 0, 0.7);
+  --shadow-inset: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+/* Density: `compact` tightens tables and forms for power users. */
+[data-density='compact'] {
+  --row-height: 34px;
+  --control-height: 28px;
+  --control-height-sm: 24px;
+  --control-height-lg: 34px;
+}
+:root {
+  --row-height: 42px;
+  --control-height: 32px;
+  --control-height-sm: 26px;
+  --control-height-lg: 38px;
+}

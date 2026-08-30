@@ -1,0 +1,18 @@
+.shell { display: grid; grid-template-columns: var(--nav-width) 1fr; height: 100vh; overflow: hidden; background: var(--bg-app); }
+.shell__nav { display: flex; flex-direction: column; background: var(--bg-nav); border-right: 1px solid var(--border-subtle); min-height: 0; }
+.shell__brand { display: flex; align-items: center; gap: var(--space-4); height: var(--topbar-height); padding: 0 var(--space-6); color: var(--text-primary); font-weight: var(--weight-semibold); border-bottom: 1px solid var(--border-subtle); }
+.shell__brand:hover { text-decoration: none; }
+.shell__mark { color: var(--accent); font-size: 16px; }
+.shell__brandname { font-size: var(--text-md); letter-spacing: var(--tracking-tight); }
+.shell__navscroll { flex: 1; overflow-y: auto; padding: var(--space-5) var(--space-4) var(--space-8); display: flex; flex-direction: column; gap: var(--space-6); }
+.shell__group { display: flex; flex-direction: column; gap: 1px; }
+.shell__grouplabel { font-size: var(--text-2xs); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-wide); text-transform: uppercase; color: var(--text-tertiary); padding: var(--space-2) var(--space-4) var(--space-3); }
+.shell__link { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-3) var(--space-4); border-radius: var(--radius-md); color: var(--text-secondary); font-size: var(--text-md); font-weight: var(--weight-medium); transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out); }
+.shell__link:hover { background: var(--bg-hover); color: var(--text-primary); text-decoration: none; }
+.shell__link.is-active { background: var(--bg-selected); color: var(--text-brand); }
+.shell__icon { display: inline-flex; width: 16px; justify-content: center; opacity: 0.9; }
+.shell__badge { margin-left: auto; font-size: var(--text-2xs); }
+.shell__main { overflow: auto; min-width: 0; }
+.shell-boot { display: grid; place-items: center; height: 100vh; background: var(--bg-app); }
+.shell-boot__spinner { width: 22px; height: 22px; border: 2px solid var(--border-default); border-top-color: var(--accent); border-radius: 50%; animation: ain-spin 700ms linear infinite; }
+.shell-empty { display: flex; flex-direction: column; gap: var(--space-4); align-items: center; justify-content: center; height: 100vh; color: var(--text-secondary); }

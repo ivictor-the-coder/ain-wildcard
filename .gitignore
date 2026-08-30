@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/
+*.log
+.playwright/
+test-results/
+playwright-report/
+src/server/generated/registry.ts
+src/client/generated/registry.tsx
+.artifacts/

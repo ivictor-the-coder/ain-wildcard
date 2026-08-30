@@ -1,0 +1,12 @@
+import { createApp } from '../src/server/app';
+const app = await createApp({ db: 'memory' });
+const r1 = await app.handle({ method: 'GET', path: '/v1/health' });
+console.log('health', r1.status, JSON.stringify(r1.body).slice(0, 240));
+const r2 = await app.handle({ method: 'POST', path: '/v1/auth/demo' });
+console.log('demo', r2.status, JSON.stringify(r2.body).slice(0, 200));
+const cookie = String(r2.headers['set-cookie']).split(';')[0];
+const r3 = await app.handle({ method: 'GET', path: '/v1/me', headers: { cookie } });
+console.log('me', r3.status, JSON.stringify(r3.body).slice(0, 400));
+const r4 = await app.handle({ method: 'GET', path: '/openapi.json' });
+console.log('openapi', r4.status, Object.keys((r4.body as any).paths).length, 'paths');
+app.close();
