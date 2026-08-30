@@ -1,11 +1,11 @@
 {
-  "updated": "2026-08-30T19:48:24.231995",
-  "headline": "Wave 1 is in flight. Four builders are working disjoint directories; each one is followed by a fresh critic that runs the software, screenshots it, and compares it blind against HubSpot or Stripe. A piece loops until the critic picks ours.",
+  "updated": "2026-08-30T23:43:37.249918",
+  "headline": "Wave 1 shipped 40,000 lines and every critic still chose HubSpot or Stripe. That is the system working: they found popovers that never flip, a CRM timeline keyed off a millisecond clock, pricing prose that contradicts the billing engine, and an AI tool allowlist that was not enforced. All four are back in with the gaps named.",
   "stats": {
-    "modules": 1,
-    "api routes": 22,
-    "pieces": 31,
-    "critic rounds": 0
+    "server modules": 4,
+    "api routes": 28,
+    "tests passing": 317,
+    "lines of code": "40,181"
   },
   "waves": [
     {
@@ -72,37 +72,58 @@
         {
           "id": "design-system",
           "title": "Design system",
-          "status": "building",
-          "rounds": 0,
-          "note": "The component kit: buttons, fields, tables, menus, overlays, charts \u2014 in both themes"
+          "status": "rework",
+          "rounds": 2,
+          "note": "The component kit: buttons, fields, tables, menus, overlays, charts \u2014 in both themes",
+          "history": [
+            "reference",
+            "reference"
+          ],
+          "verdict": "Filter popovers never flip upward \u2014 measured a 120px stub with 690px of unused space above the anchor. And one hand-edited date in a shared link white-screens the whole page."
         },
         {
           "id": "crm-core",
           "title": "Smart CRM data model",
-          "status": "building",
-          "rounds": 0,
-          "note": "Objects, custom properties, associations, records, timeline \u2014 the substrate"
+          "status": "rework",
+          "rounds": 3,
+          "note": "Objects, custom properties, associations, records, timeline \u2014 the substrate",
+          "history": [
+            "reference",
+            "reference",
+            "reference"
+          ],
+          "verdict": "Record history is keyed off a millisecond clock, so two saves in the same millisecond merge and a stage move gets titled \"Deal name changed\". Paging that history silently loses 8 of 23 rows."
         },
         {
           "id": "ai-engine",
           "title": "AI engine & tool runtime",
-          "status": "building",
-          "rounds": 0,
-          "note": "Grounded reasoning over real workspace data, tool calling, cost and trace capture"
+          "status": "rework",
+          "rounds": 2,
+          "note": "Grounded reasoning over real workspace data, tool calling, cost and trace capture",
+          "history": [
+            "reference",
+            "reference"
+          ],
+          "verdict": "\"Compare Q1 and Q2\" answers with Q1 vs Q4 and reports -1.7% for a quarter that fell 77%. The tool allowlist is not enforced, and add_note writes the raw prompt into a customer record with no approval gate."
         },
         {
           "id": "catalog",
           "title": "Product catalog & pricing",
-          "status": "building",
-          "rounds": 0,
-          "note": "Flat, per-seat, tiered, volume, package, usage and hybrid prices in every currency"
+          "status": "rework",
+          "rounds": 2,
+          "note": "Flat, per-seat, tiered, volume, package, usage and hybrid prices in every currency",
+          "history": [
+            "reference",
+            "reference"
+          ],
+          "verdict": "Every boolean query param compares a string to an already-coerced boolean, so ?active=true returns the archived price. Worse: the pricing summary says \"falling to\" on a ladder where the engine bills a jump."
         },
         {
           "id": "app-shell",
           "title": "App shell & navigation",
-          "status": "queued",
+          "status": "building",
           "rounds": 0,
-          "note": "Sidebar, topbar, command palette, global search, toasts \u2014 starts when the design system passes"
+          "note": "Navigation, command palette, global search, the shortcut model, a real sign-in, and the time machine one click from the top bar"
         }
       ]
     },
