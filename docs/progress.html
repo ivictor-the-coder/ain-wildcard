@@ -1,488 +1,649 @@
-<!doctype html>
-<html lang="en" data-theme="dark">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ain — build progress</title>
+<title>Ain Build Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Source+Sans+3:wght@400;600&display=swap">
 <style>
-:root{--bg:#0c0f15;--panel:#14181f;--panel2:#1a1f28;--line:#242c37;--line2:#333d4c;--ink:#e8ecf3;--ink2:#a3adbf;--ink3:#7d8799;--brand:#8478ef;--green:#4dcb8f;--amber:#f0b64d;--blue:#6aa8f5;--pink:#f07ab5}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
-.wrap{max-width:1000px;margin:0 auto;padding:48px 24px 96px}
-header.top{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:8px}
-.mark{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,#6a5ce8,#12a0a0);display:grid;place-items:center;font-weight:700;color:#fff;flex:none}
-h1{font-size:24px;margin:0;letter-spacing:-.02em}
-.sub{color:var(--ink2);font-size:13px;margin-top:3px}
-.stamp{margin-left:auto;color:var(--ink3);font-size:12px;text-align:right}
-.headline{margin:22px 0 26px;padding:16px 18px;background:var(--panel);border:1px solid var(--line);border-radius:12px;font-size:15px;color:var(--ink)}
-.bar{height:8px;border-radius:99px;background:var(--panel2);overflow:hidden;margin:18px 0 8px;border:1px solid var(--line)}
-.bar i{display:block;height:100%;background:linear-gradient(90deg,#6a5ce8,#34c4c4);width:18%;transition:width .5s}
-.barmeta{display:flex;justify-content:space-between;color:var(--ink2);font-size:12.5px;margin-bottom:30px}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:34px}
-.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-.stat b{display:block;font-size:22px;letter-spacing:-.02em}
-.stat span{color:var(--ink3);font-size:12px;text-transform:uppercase;letter-spacing:.05em}
-.wave{margin-bottom:28px;background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
-.wave__head{display:flex;align-items:center;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line)}
-.wave__head h2{font-size:15px;margin:0;letter-spacing:-.01em}
-.wave__note{margin:0;padding:12px 18px 0;color:var(--ink2);font-size:13px}
-.pieces{list-style:none;margin:0;padding:10px 6px 12px}
-.piece{display:flex;gap:12px;padding:10px 12px;border-radius:9px}
-.piece+.piece{margin-top:1px}
-.piece:hover{background:var(--panel2)}
-.dot{width:8px;height:8px;border-radius:50%;margin-top:7px;flex:none;background:var(--line2)}
-.piece.done .dot{background:var(--green)}
-.piece.building .dot{background:var(--brand);box-shadow:0 0 0 4px rgba(132,120,239,.16);animation:p 1.6s ease-in-out infinite}
-.piece.critique .dot{background:var(--blue);box-shadow:0 0 0 4px rgba(106,168,245,.14);animation:p 1.6s ease-in-out infinite}
-.piece.rework .dot{background:var(--amber)}
-@keyframes p{50%{opacity:.4}}
-.piece__body{min-width:0;flex:1}
-.piece__head{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
-.piece__title{font-weight:520}
-.piece__note{margin:2px 0 0;color:var(--ink2);font-size:12.5px}
-.verdict{margin:5px 0 0;color:var(--ink2);font-size:12.5px;padding:7px 10px;background:var(--bg);border:1px solid var(--line);border-left:2px solid var(--pink);border-radius:6px}
-.tag{font-size:11px;padding:2px 7px;border-radius:99px;border:1px solid var(--line2);color:var(--ink2)}
-.tag.done{color:var(--green);border-color:rgba(77,203,143,.4);background:rgba(77,203,143,.1)}
-.tag.building{color:var(--brand);border-color:rgba(132,120,239,.45);background:rgba(132,120,239,.12)}
-.tag.critique{color:var(--blue);border-color:rgba(106,168,245,.4);background:rgba(106,168,245,.1)}
-.tag.rework{color:var(--amber);border-color:rgba(240,182,77,.4);background:rgba(240,182,77,.1)}
-.rounds{font-size:11.5px;color:var(--ink3)}
-footer{color:var(--ink3);font-size:12px;margin-top:34px;text-align:center}
+/* Light is the base palette; both dark paths redefine only tokens. */
+:root {
+  --ground:#f2f4f7; --panel:#ffffff; --panel-2:#f7f8fa; --sunk:#e9ecf1;
+  --line:#dfe4ec; --line-2:#c6cedb;
+  --ink:#141b2a; --ink-2:#4d576b; --ink-3:#78829a;
+  --ours:#3d4fc4;          /* our side of the duel */
+  --ours-soft:#e7e9fb;
+  --theirs:#b8532f;        /* the reference product's side */
+  --theirs-soft:#fbeae3;
+  --good:#1f7a52; --good-soft:#e2f2ea;
+  --warn:#9a6510; --warn-soft:#faefdc;
+  --shadow:0 1px 2px rgba(20,27,42,.06), 0 8px 20px -14px rgba(20,27,42,.28);
+  --font-display:"Archivo","Helvetica Neue",Arial,sans-serif;
+  --font-body:"Source Sans 3",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --font-mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:#0d1220; --panel:#141a2a; --panel-2:#182031; --sunk:#0a0f1a;
+    --line:#242e44; --line-2:#36425c;
+    --ink:#e7ebf4; --ink-2:#a2adc2; --ink-3:#7684a0;
+    --ours:#8a95f0; --ours-soft:rgba(138,149,240,.16);
+    --theirs:#e08b64; --theirs-soft:rgba(224,139,100,.16);
+    --good:#57c294; --good-soft:rgba(87,194,148,.15);
+    --warn:#d9a94f; --warn-soft:rgba(217,169,79,.15);
+    --shadow:0 1px 2px rgba(0,0,0,.5), 0 10px 28px -18px rgba(0,0,0,.8);
+  }
+}
+:root[data-theme="dark"] {
+  --ground:#0d1220; --panel:#141a2a; --panel-2:#182031; --sunk:#0a0f1a;
+  --line:#242e44; --line-2:#36425c;
+  --ink:#e7ebf4; --ink-2:#a2adc2; --ink-3:#7684a0;
+  --ours:#8a95f0; --ours-soft:rgba(138,149,240,.16);
+  --theirs:#e08b64; --theirs-soft:rgba(224,139,100,.16);
+  --good:#57c294; --good-soft:rgba(87,194,148,.15);
+  --warn:#d9a94f; --warn-soft:rgba(217,169,79,.15);
+  --shadow:0 1px 2px rgba(0,0,0,.5), 0 10px 28px -18px rgba(0,0,0,.8);
+}
+
+* { box-sizing:border-box; }
+body {
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:var(--font-body); font-size:15px; line-height:1.55;
+  -webkit-font-smoothing:antialiased; font-variant-numeric:tabular-nums;
+}
+h1,h2,h3 { font-family:var(--font-display); margin:0; text-wrap:balance; }
+
+.board { max-width:1180px; margin:0 auto; padding:40px 24px 80px; display:grid; grid-template-columns:264px 1fr; gap:40px; align-items:start; }
+@media (max-width:900px){ .board{ grid-template-columns:1fr; gap:28px; padding:28px 18px 60px; } .rail{ position:static !important; } }
+
+/* ---------------------------------------------------------------- rail */
+.rail { position:sticky; top:28px; display:flex; flex-direction:column; gap:22px; }
+.brand { display:flex; align-items:center; gap:11px; }
+.brand__mark { width:34px; height:34px; border-radius:9px; background:var(--ours); color:#fff; display:grid; place-items:center; font-family:var(--font-display); font-weight:700; font-size:17px; flex:none; }
+.brand__name { font-family:var(--font-display); font-weight:700; font-size:20px; letter-spacing:-.015em; line-height:1.1; }
+.brand__sub { font-size:12.5px; color:var(--ink-3); letter-spacing:.01em; }
+
+.live { display:flex; align-items:center; gap:7px; font-family:var(--font-mono); font-size:11.5px; color:var(--ink-2); }
+.live__dot { width:7px; height:7px; border-radius:50%; background:var(--ours); box-shadow:0 0 0 3px var(--ours-soft); animation:breathe 2.4s ease-in-out infinite; }
+@keyframes breathe { 50% { opacity:.35; } }
+@media (prefers-reduced-motion: reduce){ .live__dot{ animation:none; } }
+
+.counts { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); border:1px solid var(--line); border-radius:11px; overflow:hidden; }
+.count { background:var(--panel); padding:12px 13px; }
+.count b { display:block; font-family:var(--font-display); font-size:24px; font-weight:600; letter-spacing:-.02em; line-height:1.15; }
+.count span { font-size:11px; color:var(--ink-3); text-transform:uppercase; letter-spacing:.07em; }
+.count.wide { grid-column:1 / -1; }
+.count.cleared b { color:var(--good); }
+.count.flight b { color:var(--ours); }
+
+.legend { border:1px solid var(--line); border-radius:11px; background:var(--panel); padding:14px; }
+.legend h4 { font-family:var(--font-display); font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.08em; color:var(--ink-3); margin:0 0 9px; }
+.legend ul { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:7px; }
+.legend li { display:flex; align-items:center; gap:9px; font-size:12.5px; color:var(--ink-2); }
+.rule { font-size:12.5px; color:var(--ink-2); line-height:1.5; border-left:2px solid var(--ours); padding-left:11px; }
+.rule b { color:var(--ink); font-weight:600; }
+
+/* ---------------------------------------------------------------- main */
+.headline { font-family:var(--font-display); font-size:19px; font-weight:500; line-height:1.42; letter-spacing:-.01em; margin:0 0 22px; max-width:62ch; }
+.headline em { font-style:normal; color:var(--ours); }
+
+.strip { margin-bottom:8px; }
+.strip__bar { display:flex; gap:2px; height:26px; }
+.seg { flex:1 1 0; min-width:3px; border-radius:2px; background:var(--sunk); border:1px solid var(--line); }
+.seg.done { background:var(--good); border-color:var(--good); }
+.seg.building { background:var(--ours); border-color:var(--ours); }
+.seg.critique { background:var(--ours-soft); border-color:var(--ours); }
+.seg.rework { background:var(--warn); border-color:var(--warn); }
+.strip__meta { display:flex; justify-content:space-between; font-family:var(--font-mono); font-size:11.5px; color:var(--ink-3); margin-top:7px; }
+
+.wave { margin-top:34px; }
+.wave__head { display:flex; align-items:baseline; gap:12px; }
+.wave__rule { width:10px; height:10px; border-radius:2px; background:var(--line-2); flex:none; align-self:center; }
+.wave.active .wave__rule { background:var(--ours); }
+.wave.done .wave__rule { background:var(--good); }
+.wave__title { font-size:15px; font-weight:600; letter-spacing:-.005em; }
+.wave__count { margin-left:auto; font-family:var(--font-mono); font-size:12.5px; color:var(--ink-2); }
+.wave__of { color:var(--ink-3); }
+.wave__note { margin:6px 0 0 22px; font-size:13.5px; color:var(--ink-2); max-width:70ch; }
+
+.rows { list-style:none; margin:12px 0 0; padding:0; border:1px solid var(--line); border-radius:12px; background:var(--panel); box-shadow:var(--shadow); overflow:hidden; }
+.row { display:flex; gap:12px; padding:13px 16px; }
+.row + .row { border-top:1px solid var(--line); }
+.row__dot { width:8px; height:8px; border-radius:50%; margin-top:8px; flex:none; background:var(--line-2); }
+.row.done .row__dot { background:var(--good); }
+.row.building .row__dot { background:var(--ours); box-shadow:0 0 0 4px var(--ours-soft); }
+.row.critique .row__dot { background:var(--ours); box-shadow:0 0 0 4px var(--ours-soft); }
+.row.rework .row__dot { background:var(--warn); box-shadow:0 0 0 4px var(--warn-soft); }
+.row__main { min-width:0; flex:1; }
+.row__head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.row__title { font-size:14.5px; font-weight:600; letter-spacing:-.005em; }
+.row__note { margin:3px 0 0; font-size:13px; color:var(--ink-2); max-width:78ch; }
+.row__verdict { margin:9px 0 0; padding:9px 12px; background:var(--panel-2); border:1px solid var(--line); border-left:2px solid var(--theirs); border-radius:0 7px 7px 0; font-size:13px; color:var(--ink-2); max-width:78ch; }
+.row__verdictlabel { display:block; font-family:var(--font-display); font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.09em; color:var(--theirs); margin-bottom:2px; }
+
+.chip { font-family:var(--font-mono); font-size:10.5px; padding:2px 7px; border-radius:5px; border:1px solid var(--line-2); color:var(--ink-3); background:var(--panel-2); white-space:nowrap; }
+.chip.done { color:var(--good); border-color:var(--good); background:var(--good-soft); }
+.chip.building, .chip.critique { color:var(--ours); border-color:var(--ours); background:var(--ours-soft); }
+.chip.rework { color:var(--warn); border-color:var(--warn); background:var(--warn-soft); }
+
+.pips { display:inline-flex; gap:3px; align-items:center; }
+.pip { width:7px; height:7px; border-radius:2px; display:block; }
+.pip.reference { background:var(--theirs); }
+.pip.ain { background:var(--ours); }
+.pip.tie { background:var(--line-2); }
+
+footer { margin-top:44px; padding-top:18px; border-top:1px solid var(--line); font-size:12.5px; color:var(--ink-3); max-width:74ch; }
+footer code { font-family:var(--font-mono); font-size:11.5px; color:var(--ink-2); }
 </style>
-</head>
-<body><div class="wrap">
-<header class="top">
-  <div class="mark">◈</div>
-  <div><h1>Ain</h1><div class="sub">The AI services platform that runs a business end to end</div></div>
-  <div class="stamp">Updated<br>2026-08-30 19:48 UTC</div>
-</header>
-<div class="headline">Wave 1 is in flight. Four builders are working disjoint directories; each one is followed by a fresh critic that runs the software, screenshots it, and compares it blind against HubSpot or Stripe. A piece loops until the critic picks ours.</div>
-<div class="bar"><i></i></div>
-<div class="barmeta"><span>7 of 38 pieces passed their critic</span><span>18%</span></div>
-<div class="stats">
-  <div class="stat"><b>1</b><span>modules</span></div><div class="stat"><b>22</b><span>api routes</span></div><div class="stat"><b>31</b><span>pieces</span></div><div class="stat"><b>0</b><span>critic rounds</span></div>
+
+<div class="board">
+  <aside class="rail">
+    <div class="brand">
+      <div class="brand__mark">A</div>
+      <div>
+        <div class="brand__name">Ain</div>
+        <div class="brand__sub">Build board</div>
+      </div>
+    </div>
+    <div class="live"><span class="live__dot"></span>updated 2026-08-30 19:48 UTC</div>
+
+    <div class="counts">
+      <div class="count cleared"><b>7</b><span>cleared</span></div>
+      <div class="count flight"><b>4</b><span>in flight</span></div>
+      <div class="count"><b>27</b><span>queued</span></div>
+      <div class="count"><b>0</b><span>critic rounds</span></div>
+      <div class="count wide"><b>1</b><span>modules</span></div><div class="count wide"><b>22</b><span>api routes</span></div><div class="count wide"><b>31</b><span>pieces</span></div><div class="count wide"><b>0</b><span>critic rounds</span></div>
+    </div>
+
+    <div class="legend">
+      <h4>Round pips</h4>
+      <ul>
+        <li><span class="pips"><i class="pip reference"></i></span> critic chose HubSpot / Stripe</li>
+        <li><span class="pips"><i class="pip ain"></i></span> critic chose Ain</li>
+      </ul>
+    </div>
+
+    <p class="rule">A piece clears only when a critic with <b>fresh context</b> ran the real software, compared it blind against the reference product, and picked ours with <b>zero blocking issues</b>. Builders never grade their own work.</p>
+  </aside>
+
+  <main>
+    <h1 class="headline">Wave 1 is in flight. Four builders are working disjoint directories; each one is followed by a fresh critic that runs the software, screenshots it, and compares it blind against HubSpot or Stripe. A piece loops until the critic picks ours.</h1>
+
+    <div class="strip">
+      <div class="strip__bar" role="img" aria-label="7 of 38 pieces cleared"><i class="seg done" title="Data layer &amp; migrations — Cleared"></i><i class="seg done" title="Exact money arithmetic — Cleared"></i><i class="seg done" title="Billing-grade time — Cleared"></i><i class="seg done" title="API kernel — Cleared"></i><i class="seg done" title="Event log &amp; jobs — Cleared"></i><i class="seg done" title="Workspace core — Cleared"></i><i class="seg done" title="Design tokens — Cleared"></i><i class="seg building" title="Design system — Building"></i><i class="seg building" title="Smart CRM data model — Building"></i><i class="seg building" title="AI engine &amp; tool runtime — Building"></i><i class="seg building" title="Product catalog &amp; pricing — Building"></i><i class="seg queued" title="App shell &amp; navigation — Queued"></i><i class="seg queued" title="Subscription lifecycle — Queued"></i><i class="seg queued" title="Mid-cycle changes &amp; proration — Queued"></i><i class="seg queued" title="Usage metering — Queued"></i><i class="seg queued" title="Usage credits &amp; grants — Queued"></i><i class="seg queued" title="Invoicing &amp; credit notes — Queued"></i><i class="seg queued" title="Payments &amp; smart dunning — Queued"></i><i class="seg queued" title="Tax — Queued"></i><i class="seg queued" title="Entitlements &amp; feature gating — Queued"></i><i class="seg queued" title="Revenue reporting — Queued"></i><i class="seg queued" title="Contact, company &amp; record pages — Queued"></i><i class="seg queued" title="Deals &amp; pipelines — Queued"></i><i class="seg queued" title="Lists &amp; segmentation — Queued"></i><i class="seg queued" title="Shared inbox &amp; conversations — Queued"></i><i class="seg queued" title="Support desk — Queued"></i><i class="seg queued" title="Campaigns, email &amp; forms — Queued"></i><i class="seg queued" title="Sequences — Queued"></i><i class="seg queued" title="Reports &amp; dashboards — Queued"></i><i class="seg queued" title="Workflow automation — Queued"></i><i class="seg queued" title="Autonomous agents — Queued"></i><i class="seg queued" title="Copilot — Queued"></i><i class="seg queued" title="Scoring &amp; insights — Queued"></i><i class="seg queued" title="Customer billing portal — Queued"></i><i class="seg queued" title="Pricing, quotes &amp; checkout — Queued"></i><i class="seg queued" title="API, webhooks &amp; SDK — Queued"></i><i class="seg queued" title="Settings &amp; administration — Queued"></i><i class="seg queued" title="Home, search &amp; onboarding — Queued"></i></div>
+      <div class="strip__meta"><span>7 of 38 pieces cleared</span><span>0 reworks demanded</span></div>
+    </div>
+
+    <section class="wave done">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 0 · Foundation</h2>
+        <span class="wave__count">7<span class="wave__of">/7</span></span>
+      </header>
+      <p class="wave__note">Kernel, contracts and the demo workspace. Built directly, not delegated.</p>
+      <ul class="rows"><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Data layer &amp; migrations</h3>
+          <span class="chip done">Cleared</span>
+          
+        </div>
+        <p class="row__note">node:sqlite, namespaced migrations, savepoint transactions</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Exact money arithmetic</h3>
+          <span class="chip done">Cleared</span>
+          
+        </div>
+        <p class="row__note">integer minor units, BigInt rationals, largest-remainder allocation</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Billing-grade time</h3>
+          <span class="chip done">Cleared</span>
+          
+        </div>
+        <p class="row__note">anchor-day period maths, virtual clock, replayable job queue</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">API kernel</h3>
+          <span class="chip done">Cleared</span>
+          
+        </div>
+        <p class="row__note">router, validation, idempotency, rate limits, generated OpenAPI</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Event log &amp; jobs</h3>
+          <span class="chip done">Cleared</span>
+          
+        </div>
+        <p class="row__note">one event stream feeding webhooks, automation, timeline and audit</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Workspace core</h3>
+          <span class="chip done">Cleared</span>
+          
+        </div>
+        <p class="row__note">orgs, people, auth, API keys, audit trail, time machine</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Design tokens</h3>
+          <span class="chip done">Cleared</span>
+          
+        </div>
+        <p class="row__note">full light and dark palettes, type scale, elevation, motion</p>
+        
+      </div>
+    </li></ul>
+    </section><section class="wave active">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 1 · The spine</h2>
+        <span class="wave__count">0<span class="wave__of">/5</span></span>
+      </header>
+      <p class="wave__note">Everything downstream depends on these. The app shell follows immediately after the design system lands.</p>
+      <ul class="rows"><li class="row building">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Design system</h3>
+          <span class="chip building">Building</span>
+          
+        </div>
+        <p class="row__note">The component kit: buttons, fields, tables, menus, overlays, charts — in both themes</p>
+        
+      </div>
+    </li><li class="row building">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Smart CRM data model</h3>
+          <span class="chip building">Building</span>
+          
+        </div>
+        <p class="row__note">Objects, custom properties, associations, records, timeline — the substrate</p>
+        
+      </div>
+    </li><li class="row building">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">AI engine &amp; tool runtime</h3>
+          <span class="chip building">Building</span>
+          
+        </div>
+        <p class="row__note">Grounded reasoning over real workspace data, tool calling, cost and trace capture</p>
+        
+      </div>
+    </li><li class="row building">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Product catalog &amp; pricing</h3>
+          <span class="chip building">Building</span>
+          
+        </div>
+        <p class="row__note">Flat, per-seat, tiered, volume, package, usage and hybrid prices in every currency</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">App shell &amp; navigation</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Sidebar, topbar, command palette, global search, toasts — starts when the design system passes</p>
+        
+      </div>
+    </li></ul>
+    </section><section class="wave queued">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 2 · Revenue</h2>
+        <span class="wave__count">0<span class="wave__of">/9</span></span>
+      </header>
+      <p class="wave__note">Stripe Billing parity, piece by piece. Each one is judged against the real thing.</p>
+      <ul class="rows"><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Subscription lifecycle</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Trials, activation, pause, resume, cancel, schedules and phases</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Mid-cycle changes &amp; proration</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Upgrades, downgrades, quantity changes, credit proration, invoice-now vs next cycle</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Usage metering</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Meters, event ingestion, idempotency, aggregation formulas, backdating</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Usage credits &amp; grants</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Prepaid balances, burn-down order, expiry, rollover, top-ups, overage</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Invoicing &amp; credit notes</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Draft to paid, line items, discounts, credit notes, a printable invoice</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Payments &amp; smart dunning</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Payment methods, failures, retry strategy, recovery, grace periods</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Tax</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Inclusive and exclusive rates, tax IDs, reverse charge, per-line tax breakdown</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Entitlements &amp; feature gating</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Features, limits, real-time checks the product can call</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Revenue reporting</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">MRR movement, churn, cohorts, deferred revenue, collections</p>
+        
+      </div>
+    </li></ul>
+    </section><section class="wave queued">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 3 · Customer platform</h2>
+        <span class="wave__count">0<span class="wave__of">/8</span></span>
+      </header>
+      <p class="wave__note">HubSpot parity for the people who actually work the business every day.</p>
+      <ul class="rows"><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Contact, company &amp; record pages</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Timeline, properties, associations, inline editing, activity</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Deals &amp; pipelines</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Kanban, stages, weighted forecast, deal rooms</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Lists &amp; segmentation</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">A filter builder that handles real conditions, active and static lists</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Shared inbox &amp; conversations</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Threads, email, chat, assignment, snoozes, SLA timers</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Support desk</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Tickets, queues, escalation, satisfaction</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Campaigns, email &amp; forms</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Campaign builder, email composer, forms, landing pages, attribution</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Sequences</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Multi-step cadences with enrollment rules and reply detection</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Reports &amp; dashboards</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">A real report builder over every object, saved dashboards, charts</p>
+        
+      </div>
+    </li></ul>
+    </section><section class="wave queued">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 4 · Autonomy</h2>
+        <span class="wave__count">0<span class="wave__of">/4</span></span>
+      </header>
+      <p class="wave__note">The part that actually runs the business without a human in the loop.</p>
+      <ul class="rows"><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Workflow automation</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Triggers, branches, delays, goals, enrollment, a visual builder that edits real workflows</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Autonomous agents</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Prospecting, support, success, finance and ops agents with runs, traces and approvals</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Copilot</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Ask anything about the business; grounded answers with citations and actions</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Scoring &amp; insights</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Lead score, health score, churn risk, next best action, forecast</p>
+        
+      </div>
+    </li></ul>
+    </section><section class="wave queued">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 5 · Surfaces</h2>
+        <span class="wave__count">0<span class="wave__of">/5</span></span>
+      </header>
+      <p class="wave__note">Where customers and developers meet the platform.</p>
+      <ul class="rows"><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Customer billing portal</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Self-serve plan changes, payment methods, invoice history, cancel flow</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Pricing, quotes &amp; checkout</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Plan picker, quotes, a checkout that actually completes</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">API, webhooks &amp; SDK</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Signed webhook delivery with retries, an API reference, a typed SDK</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Settings &amp; administration</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">Roles, teams, data quality, import/export, audit</p>
+        
+      </div>
+    </li><li class="row queued">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Home, search &amp; onboarding</h3>
+          <span class="chip queued">Queued</span>
+          
+        </div>
+        <p class="row__note">The first screen, global search, notifications, a setup guide that knows what is done</p>
+        
+      </div>
+    </li></ul>
+    </section>
+
+    <footer>
+      Regenerated from <code>docs/progress.json</code> by <code>scripts/progress.mjs</code> on every wave.
+      Each piece is owned by one builder working a disjoint set of directories, then handed to a critic
+      that runs <code>scripts/verify.ts</code>, exercises the API, screenshots the UI in both themes, and
+      writes a verdict. Losing sends the builder back with the single biggest gap named.
+    </footer>
+  </main>
 </div>
-<section class="wave done">
-    <header class="wave__head">
-      <h2>Wave 0 · Foundation</h2>
-      <span class="tag done">Complete</span>
-    </header>
-    <p class="wave__note">Kernel, contracts and the demo workspace. Built directly, not delegated.</p>
-    <ul class="pieces"><li class="piece done">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Data layer &amp; migrations</span>
-          <span class="tag done">Passed</span>
-          
-        </div>
-        <p class="piece__note">node:sqlite, namespaced migrations, savepoint transactions</p>
-        
-      </div>
-    </li><li class="piece done">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Exact money arithmetic</span>
-          <span class="tag done">Passed</span>
-          
-        </div>
-        <p class="piece__note">integer minor units, BigInt rationals, largest-remainder allocation</p>
-        
-      </div>
-    </li><li class="piece done">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Billing-grade time</span>
-          <span class="tag done">Passed</span>
-          
-        </div>
-        <p class="piece__note">anchor-day period maths, virtual clock, replayable job queue</p>
-        
-      </div>
-    </li><li class="piece done">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">API kernel</span>
-          <span class="tag done">Passed</span>
-          
-        </div>
-        <p class="piece__note">router, validation, idempotency, rate limits, generated OpenAPI</p>
-        
-      </div>
-    </li><li class="piece done">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Event log &amp; jobs</span>
-          <span class="tag done">Passed</span>
-          
-        </div>
-        <p class="piece__note">one event stream feeding webhooks, automation, timeline and audit</p>
-        
-      </div>
-    </li><li class="piece done">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Workspace core</span>
-          <span class="tag done">Passed</span>
-          
-        </div>
-        <p class="piece__note">orgs, people, auth, API keys, audit trail, time machine</p>
-        
-      </div>
-    </li><li class="piece done">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Design tokens</span>
-          <span class="tag done">Passed</span>
-          
-        </div>
-        <p class="piece__note">full light and dark palettes, type scale, elevation, motion</p>
-        
-      </div>
-    </li></ul>
-  </section><section class="wave active">
-    <header class="wave__head">
-      <h2>Wave 1 · The spine</h2>
-      <span class="tag building">In flight</span>
-    </header>
-    <p class="wave__note">Everything downstream depends on these. The app shell follows immediately after the design system lands.</p>
-    <ul class="pieces"><li class="piece building">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Design system</span>
-          <span class="tag building">Building</span>
-          
-        </div>
-        <p class="piece__note">The component kit: buttons, fields, tables, menus, overlays, charts — in both themes</p>
-        
-      </div>
-    </li><li class="piece building">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Smart CRM data model</span>
-          <span class="tag building">Building</span>
-          
-        </div>
-        <p class="piece__note">Objects, custom properties, associations, records, timeline — the substrate</p>
-        
-      </div>
-    </li><li class="piece building">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">AI engine &amp; tool runtime</span>
-          <span class="tag building">Building</span>
-          
-        </div>
-        <p class="piece__note">Grounded reasoning over real workspace data, tool calling, cost and trace capture</p>
-        
-      </div>
-    </li><li class="piece building">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Product catalog &amp; pricing</span>
-          <span class="tag building">Building</span>
-          
-        </div>
-        <p class="piece__note">Flat, per-seat, tiered, volume, package, usage and hybrid prices in every currency</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">App shell &amp; navigation</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Sidebar, topbar, command palette, global search, toasts — starts when the design system passes</p>
-        
-      </div>
-    </li></ul>
-  </section><section class="wave queued">
-    <header class="wave__head">
-      <h2>Wave 2 · Revenue</h2>
-      <span class="tag queued">Queued</span>
-    </header>
-    <p class="wave__note">Stripe Billing parity, piece by piece. Each one is judged against the real thing.</p>
-    <ul class="pieces"><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Subscription lifecycle</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Trials, activation, pause, resume, cancel, schedules and phases</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Mid-cycle changes &amp; proration</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Upgrades, downgrades, quantity changes, credit proration, invoice-now vs next cycle</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Usage metering</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Meters, event ingestion, idempotency, aggregation formulas, backdating</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Usage credits &amp; grants</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Prepaid balances, burn-down order, expiry, rollover, top-ups, overage</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Invoicing &amp; credit notes</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Draft to paid, line items, discounts, credit notes, a printable invoice</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Payments &amp; smart dunning</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Payment methods, failures, retry strategy, recovery, grace periods</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Tax</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Inclusive and exclusive rates, tax IDs, reverse charge, per-line tax breakdown</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Entitlements &amp; feature gating</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Features, limits, real-time checks the product can call</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Revenue reporting</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">MRR movement, churn, cohorts, deferred revenue, collections</p>
-        
-      </div>
-    </li></ul>
-  </section><section class="wave queued">
-    <header class="wave__head">
-      <h2>Wave 3 · Customer platform</h2>
-      <span class="tag queued">Queued</span>
-    </header>
-    <p class="wave__note">HubSpot parity for the people who actually work the business every day.</p>
-    <ul class="pieces"><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Contact, company &amp; record pages</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Timeline, properties, associations, inline editing, activity</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Deals &amp; pipelines</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Kanban, stages, weighted forecast, deal rooms</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Lists &amp; segmentation</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">A filter builder that handles real conditions, active and static lists</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Shared inbox &amp; conversations</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Threads, email, chat, assignment, snoozes, SLA timers</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Support desk</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Tickets, queues, escalation, satisfaction</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Campaigns, email &amp; forms</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Campaign builder, email composer, forms, landing pages, attribution</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Sequences</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Multi-step cadences with enrollment rules and reply detection</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Reports &amp; dashboards</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">A real report builder over every object, saved dashboards, charts</p>
-        
-      </div>
-    </li></ul>
-  </section><section class="wave queued">
-    <header class="wave__head">
-      <h2>Wave 4 · Autonomy</h2>
-      <span class="tag queued">Queued</span>
-    </header>
-    <p class="wave__note">The part that actually runs the business without a human in the loop.</p>
-    <ul class="pieces"><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Workflow automation</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Triggers, branches, delays, goals, enrollment, a visual builder that edits real workflows</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Autonomous agents</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Prospecting, support, success, finance and ops agents with runs, traces and approvals</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Copilot</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Ask anything about the business; grounded answers with citations and actions</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Scoring &amp; insights</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Lead score, health score, churn risk, next best action, forecast</p>
-        
-      </div>
-    </li></ul>
-  </section><section class="wave queued">
-    <header class="wave__head">
-      <h2>Wave 5 · Surfaces</h2>
-      <span class="tag queued">Queued</span>
-    </header>
-    <p class="wave__note">Where customers and developers meet the platform.</p>
-    <ul class="pieces"><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Customer billing portal</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Self-serve plan changes, payment methods, invoice history, cancel flow</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Pricing, quotes &amp; checkout</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Plan picker, quotes, a checkout that actually completes</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">API, webhooks &amp; SDK</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Signed webhook delivery with retries, an API reference, a typed SDK</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Settings &amp; administration</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">Roles, teams, data quality, import/export, audit</p>
-        
-      </div>
-    </li><li class="piece queued">
-      <span class="dot" aria-hidden="true"></span>
-      <div class="piece__body">
-        <div class="piece__head"><span class="piece__title">Home, search &amp; onboarding</span>
-          <span class="tag queued">Queued</span>
-          
-        </div>
-        <p class="piece__note">The first screen, global search, notifications, a setup guide that knows what is done</p>
-        
-      </div>
-    </li></ul>
-  </section>
-<footer>A piece is only "Passed" when a fresh critic ran the real thing, compared it blind against HubSpot and Stripe, and picked ours.</footer>
-</div></body></html>
