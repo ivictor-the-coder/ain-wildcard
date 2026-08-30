@@ -1,7 +1,7 @@
 /* Styles for the living style guide at /design. Only the documentation chrome
    lives here — every component on the page uses its own stylesheet. */
 
-.sg { display: grid; grid-template-columns: 244px minmax(0, 1fr); min-height: 100vh; background: var(--bg-app); }
+.sg { position: relative; display: grid; grid-template-columns: 244px minmax(0, 1fr); min-height: 100vh; background: var(--bg-app); }
 .sg__side {
   position: sticky; top: 0; height: 100vh; overflow-y: auto;
   border-inline-end: 1px solid var(--border-subtle); background: var(--bg-nav);
@@ -87,7 +87,9 @@
 .sg__shadowbox { width: 118px; height: 74px; border-radius: var(--radius-lg); background: var(--bg-surface); display: grid; place-items: center; font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--text-tertiary); }
 
 /* icons */
-.sg__icons { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: var(--space-2); }
+.sg__icons { display: grid; grid-template-columns: repeat(var(--sg-icon-cols, 8), minmax(0, 1fr)); gap: var(--space-2); }
+@media (max-width: 1200px) { .sg__icons { --sg-icon-cols: 6; } }
+@media (max-width: 900px) { .sg__icons { --sg-icon-cols: 4; } }
 .sg__icon {
   display: flex; flex-direction: column; align-items: center; gap: var(--space-3);
   padding: var(--space-5) var(--space-3); border-radius: var(--radius-md); color: var(--text-secondary);

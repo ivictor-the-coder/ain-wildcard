@@ -13,9 +13,13 @@ import {
   stackedMax, trendSlope, waterfallLayout,
 } from '../src/client/design/chart-core';
 import {
-  compareValues, filterRows, matchesFilter, rangeBetween, searchRows, selectionState, sortRows,
-  sumColumn, toggleId, toggleSort, uniqueValues,
+  activeFilterCount, compareValues, dateExtent, decodeFilters, decodeTableState, describeFilter,
+  encodeFilters, encodeTableState, extendSelection, filterRows, fold, isFilterEmpty, matchesFilter,
+  rangeBetween, searchRows, selectionState, sortRows, splitSelection, sumColumn, toggleId,
+  toggleSort, uniqueValues, valueCounts, type FilterMap,
 } from '../src/client/design/table-core';
+import { contrastGrade, contrastRatio, parseColor, relativeLuminance } from '../src/client/design/color';
+import { readFileSync } from 'node:fs';
 import { computePosition } from '../src/client/design/position';
 import {
   addDays, addMonths, monthMatrix, nextRange, RANGE_PRESETS, startOfMonthUtc, weekdayLabels,

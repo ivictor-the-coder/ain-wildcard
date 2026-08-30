@@ -25,6 +25,42 @@ if (methodArg && pathArg) {
   process.exit(res.status < 400 ? 0 : 1);
 }
 
+/* Credential-shaped literals get the whole branch rejected by GitHub push
+   protection, so catch them here rather than at push time. */
+const SECRET_PATTERNS: [string, RegExp][] = [
+  ['Stripe-style secret key', /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{20,}/],
+  ['Stripe publishable key', /\bpk_live_[A-Za-z0-9]{20,}/],
+  ['AWS access key id', /\bAKIA[0-9A-Z]{16}\b/],
+  ['GitHub token', /\bgh[pousr]_[A-Za-z0-9]{36,}/],
+  ['Anthropic key', /\bsk-ant-[A-Za-z0-9_-]{20,}/],
+  ['OpenAI key', /\bsk-proj-[A-Za-z0-9_-]{20,}/],
+  ['Slack token', /\bxox[abposr]-[A-Za-z0-9-]{10,}/],
+  ['Private key block', /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/],
+];
+const scanned: string[] = [];
+{
+  const { readdirSync, readFileSync, statSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir)) {
+      if (entry === 'node_modules' || entry === '.git' || entry === 'dist' || entry === '.artifacts' || entry === 'data') continue;
+      const full = join(dir, entry);
+      if (statSync(full).isDirectory()) { walk(full); continue; }
+      if (!/\.(ts|tsx|js|jsx|mjs|css|json|md|html)$/.test(entry)) continue;
+      const text = readFileSync(full, 'utf8');
+      for (const [label, re] of SECRET_PATTERNS) {
+        const hit = text.match(re);
+        if (hit) scanned.push(`${full}: ${label} — "${hit[0].slice(0, 24)}…"`);
+      }
+    }
+  };
+  for (const dir of ['src', 'scripts', 'tests', 'e2e', 'docs']) { try { walk(dir); } catch { /* absent */ } }
+}
+if (scanned.length) {
+  console.log(`\ncredential-shaped literals (these get the branch rejected on push): ${scanned.length}`);
+  for (const s of scanned) console.log('  \u2717 ' + s);
+}
+
 const health = await call('GET', '/v1/health');
 const map = await call('GET', '/v1/system/map');
 const routes = app.ctx.router.routes;
@@ -48,4 +84,4 @@ console.log(`time machine: +90d ran ${travelled.ran} jobs, ${travelled.failed} f
 void map;
 
 app.close();
-process.exit(failures.length || travelled.failed ? 1 : 0);
+process.exit(failures.length || travelled.failed || scanned.length ? 1 : 0);

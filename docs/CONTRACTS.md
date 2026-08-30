@@ -132,6 +132,20 @@ npm run build && (npm run api &) && sleep 3
 npx playwright screenshot --viewport-size=1512,950 http://127.0.0.1:8787/your/route out.png
 ```
 
+## 5a. Never write a credential-shaped literal
+
+GitHub push protection rejects the whole branch if any file contains a string
+matching a real provider's key format. When you need to *show* a key — in the
+style guide, the API reference, an example payload, a masked field — use a
+prefix that belongs to us and reads as inert:
+
+    ain_demo_key_not_a_real_credential      good
+    sk_live_<24 more base62 characters>    blocks the push for everyone
+
+Our own keys are minted at runtime as `sk_test_…`/`sk_live_…` from
+`randomBytes`, which is fine — it is *literals in source* that get flagged.
+Run `npx tsx scripts/verify.ts` before you finish; it fails on this.
+
 ## 6. House style
 
 - TypeScript strict. No `any` in exported signatures. No `as unknown as`.
