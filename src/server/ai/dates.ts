@@ -175,10 +175,13 @@ const RULES: Rule[] = [
     },
   },
   {
-    re: new RegExp(`\\b(?:in|during|for|since)?\\s*(${MONTHS.join('|')})\\s*((?:19|20)\\d{2})?\\b`, 'i'),
+    re: new RegExp(`\\b((?:in|during|for|since|of)\\s+)?(${MONTHS.join('|')})\\s*((?:19|20)\\d{2})?\\b`, 'i'),
     build(m, now) {
-      const month = MONTHS.indexOf(m[1].toLowerCase());
-      const explicitYear = m[2] ? Number(m[2]) : null;
+      // "we may close it" is not the month of May. A bare month name only reads
+      // as a period when a preposition or a year makes it one.
+      if (m[2].toLowerCase() === 'may' && !m[1] && !m[3]) return null;
+      const month = MONTHS.indexOf(m[2].toLowerCase());
+      const explicitYear = m[3] ? Number(m[3]) : null;
       const nowYear = new Date(now).getUTCFullYear();
       let year = explicitYear ?? nowYear;
       let start = Date.UTC(year, month, 1);
@@ -216,19 +219,110 @@ const RULES: Rule[] = [
 ];
 
 /**
+ * Every period the question names, in the order they were written.
+ *
+ * "Compare Q1 2026 and Q2 2026 bookings" names two periods and must be answered
+ * about those two, so this collects all of them rather than stopping at the
+ * first. Overlapping matches are resolved leftmost-longest — "in March 2025"
+ * is one period, not a month and a year.
+ */
+export function resolveWindows(text: string, now: number, limit = 3): TimeWindow[] {
+  const found: { at: number; to: number; rule: number; window: TimeWindow }[] = [];
+  RULES.forEach((rule, index) => {
+    const flags = rule.re.flags.includes('g') ? rule.re.flags : `${rule.re.flags}g`;
+    for (const match of text.matchAll(new RegExp(rule.re.source, flags))) {
+      if (match.index === undefined) continue;
+      const built = rule.build(match, now);
+      if (!built || built.end <= built.start) continue;
+      found.push({ at: match.index, to: match.index + match[0].length, rule: index, window: built });
+    }
+  });
+  found.sort((a, b) => a.at - b.at || (b.to - b.at) - (a.to - a.at) || a.rule - b.rule);
+
+  const out: TimeWindow[] = [];
+  const seen = new Set<string>();
+  let consumed = -1;
+  for (const candidate of found) {
+    if (candidate.at < consumed) continue;
+    consumed = candidate.to;
+    const key = `${candidate.window.start}:${candidate.window.end}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(candidate.window);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/**
  * Find the period a question is about. Returns `null` when the question carries
  * no time expression — callers then decide their own default rather than
  * inventing one, so an answer never silently reports the wrong period.
  */
 export function resolveWindow(text: string, now: number): TimeWindow | null {
-  for (const rule of RULES) {
-    const match = text.match(rule.re);
-    if (!match) continue;
-    const built = rule.build(match, now);
-    if (built && built.end > built.start) return built;
-  }
-  return null;
+  return resolveWindows(text, now, 1)[0] ?? null;
 }
+
+/**
+ * Period-shaped phrases, including ones this engine cannot turn into a range.
+ * The gap between what this finds and what `resolveWindows` parses is exactly
+ * the set of periods the answer must refuse rather than quietly substitute.
+ */
+const PERIOD_MENTIONS: RegExp[] = [
+  /\bq[1-9]\b(?:\s*(?:of\s+)?(?:fy)?\s*(?:'?\d{2,4}))?/gi,
+  /\bh[12]\b\s*(?:of\s+)?(?:fy)?\s*(?:'?\d{2,4})?/gi,
+  /\b(?:first|second|third|fourth)\s+(?:quarter|half)(?:\s+of\s+(?:19|20)\d{2})?/gi,
+  /\bfy\s*'?\d{2,4}\b/gi,
+  /\b(?:last|past|previous|prior|trailing|this|current|next|coming)\s+(?:\d{1,3}\s*)?(?:day|week|fortnight|month|quarter|half|year|semester)s?\b/gi,
+  new RegExp(`\\b(?:${MONTHS.join('|')})\\s*(?:(?:19|20)\\d{2})?\\b`, 'gi'),
+  /\b(?:19|20)\d{2}\b/g,
+  /\b(?:yesterday|today|tomorrow|ytd|mtd|qtd|wtd|year\s+to\s+date|month\s+to\s+date)\b/gi,
+  /\b(?:19|20)\d{2}-\d{2}-\d{2}\b/g,
+  /\bweek\s+\d{1,2}\b/gi,
+];
+
+export interface PeriodMention { text: string; at: number }
+
+export function periodMentions(text: string): PeriodMention[] {
+  const spans: PeriodMention[] = [];
+  const raw: { at: number; to: number; text: string }[] = [];
+  for (const re of PERIOD_MENTIONS) {
+    for (const match of text.matchAll(re)) {
+      if (match.index === undefined) continue;
+      const value = match[0].trim();
+      // A bare "may" is the modal verb far more often than the month.
+      if (/^may$/i.test(value)) continue;
+      if (value) raw.push({ at: match.index, to: match.index + match[0].length, text: value });
+    }
+  }
+  raw.sort((a, b) => a.at - b.at || (b.to - b.at) - (a.to - a.at));
+  let consumed = -1;
+  for (const span of raw) {
+    if (span.at < consumed) continue;
+    consumed = span.to;
+    spans.push({ text: span.text, at: span.at });
+  }
+  return spans;
+}
+
+/** The same window one or more years earlier — "the same period last year". */
+export function shiftWindowYears(w: TimeWindow, years: number): TimeWindow {
+  const start = addInterval(w.start, interval('year', years), 1);
+  const end = addInterval(w.end, interval('year', years), 1);
+  const year = new Date(start).getUTCFullYear();
+  const label = w.grain === 'quarter'
+    ? quarterLabel(start)
+    : w.grain === 'month'
+      ? `${monthLabel(start)} ${year}`
+      : w.grain === 'year'
+        ? String(year)
+        : `${formatDate(start, { timeZone: 'UTC' })} – ${formatDate(end - 1, { timeZone: 'UTC' })}`;
+  return { start, end, label, grain: w.grain, matched: `${w.matched} (${Math.abs(years)}y earlier)`, partial: false };
+}
+
+/** Does the question ask for a like-for-like comparison against last year? */
+export const asksYearOverYear = (text: string): boolean =>
+  /\b(same\s+(?:period|quarter|month|time|week)\s+(?:in\s+|of\s+)?last\s+year|year[\s-]over[\s-]year|yoy|versus\s+last\s+year|vs\.?\s+last\s+year|against\s+last\s+year)\b/i.test(text);
 
 /** The window a metric should use when the question says nothing about time. */
 export function defaultWindow(now: number, grain: 'quarter' | 'month' | 'year' = 'quarter'): TimeWindow {
@@ -242,6 +336,86 @@ export function defaultWindow(now: number, grain: 'quarter' | 'month' | 'year' =
   }
   const start = startOfQuarter(now);
   return makeWindow(start, addQuarters(start, 1), `${quarterLabel(start)} to date`, 'quarter', '', now);
+}
+
+const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+
+/** Work starts at 09:00 in the workspace's calendar day. */
+const AT_NINE = (ts: number): number => startOfDay(ts) + 9 * 60 * 60 * 1000;
+
+export interface DueDate {
+  at: number;
+  matched: string;
+  label: string;
+  /** Whole calendar days from now — what "in 5 days" has to mean. */
+  days: number;
+}
+
+/**
+ * "next Tuesday", "in 5 days", "tomorrow", "on 2026-09-14" — the phrases people
+ * actually use when they ask for a task. Returns `null` rather than a default,
+ * because a task with a made-up due date is worse than one the caller is asked
+ * to date themselves.
+ */
+export function resolveDueDate(text: string, now: number): DueDate | null {
+  const due = (at: number, matched: string): DueDate => ({
+    at,
+    matched,
+    label: formatDate(at, { timeZone: 'UTC' }),
+    days: Math.max(1, Math.round((startOfDay(at) - startOfDay(now)) / DAY)),
+  });
+
+  const iso = text.match(/\b(?:on|by|before|due)?\s*((?:19|20)\d{2}-\d{2}-\d{2})\b/i);
+  if (iso) {
+    const at = Date.parse(`${iso[1]}T09:00:00Z`);
+    if (Number.isFinite(at)) return due(at, iso[0].trim());
+  }
+
+  const relative = text.match(/\bin\s+(\d{1,3})\s*(day|days|week|weeks|month|months)\b/i);
+  if (relative) {
+    const count = Number(relative[1]);
+    const unit = relative[2].toLowerCase().replace(/s$/, '');
+    const at = unit === 'month'
+      ? AT_NINE(addInterval(now, interval('month', count), 1))
+      : AT_NINE(startOfDay(now) + count * (unit === 'week' ? 7 : 1) * DAY);
+    return due(at, relative[0]);
+  }
+
+  const tomorrow = text.match(/\btomorrow\b/i);
+  if (tomorrow) {
+    return due(AT_NINE(now + DAY), tomorrow[0]);
+  }
+
+  const weekday = text.match(new RegExp(`\\b(next|this|on|coming)?\\s*(${WEEKDAYS.join('|')})\\b`, 'i'));
+  if (weekday) {
+    const wanted = WEEKDAYS.indexOf(weekday[2].toLowerCase());
+    const today = startOfDay(now);
+    let ahead = (wanted - new Date(today).getUTCDay() + 7) % 7;
+    if (ahead === 0) ahead = 7;
+    // "next Tuesday" means the Tuesday of the following week, not the one in
+    // three days' time; "this Tuesday" and a bare weekday mean the next one.
+    if (/next/i.test(weekday[1] ?? '') && startOfWeek(today + ahead * DAY) === startOfWeek(today)) ahead += 7;
+    return due(AT_NINE(today + ahead * DAY), weekday[0].trim());
+  }
+
+  const nextWeek = text.match(/\bnext\s+(week|month)\b/i);
+  if (nextWeek) {
+    return due(/week/i.test(nextWeek[1])
+      ? AT_NINE(startOfWeek(now) + 7 * DAY)
+      : AT_NINE(addInterval(startOfMonth(now), interval('month', 1), 1)), nextWeek[0]);
+  }
+
+  const endOfWeek = text.match(/\b(?:by\s+)?(?:the\s+)?end\s+of\s+(?:the\s+)?(week|month|quarter)\b/i);
+  if (endOfWeek) {
+    const unit = endOfWeek[1].toLowerCase();
+    return due(unit === 'week'
+      ? AT_NINE(startOfWeek(now) + 4 * DAY)
+      : unit === 'month'
+        ? AT_NINE(addInterval(startOfMonth(now), interval('month', 1), 1) - DAY)
+        : AT_NINE(addQuarters(startOfQuarter(now), 1) - DAY), endOfWeek[0]);
+  }
+
+  return null;
 }
 
 /** Bucket key for grouping a timestamp inside a window, matching the grain. */

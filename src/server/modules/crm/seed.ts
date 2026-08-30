@@ -492,12 +492,17 @@ export function seedCrm(ctx: Ctx, crm: Crm, orgId: string): void {
     const target = closed ? path.length : path.indexOf(deal.stage);
     const span = Math.max(2 * DAY, Math.floor((now - deal.created) * 0.75 / Math.max(1, target)));
     const seedRow = COMPANIES.find((c) => c.slug === deal.companySlug)!;
+    let enteredCurrentStage = deal.created;
     for (let step = 1; step <= target; step++) {
       const to = step === path.length ? deal.stage : path[step];
-      crm.recordHistory(orgId, 'deal', deal.id, 'deal_stage', path[step - 1], to,
-        deal.created + step * span + between(1, 8) * HOUR,
+      const at = deal.created + step * span + between(1, 8) * HOUR;
+      crm.recordHistory(orgId, 'deal', deal.id, 'deal_stage', path[step - 1], to, at,
         { actorId: TEAM[seedRow.owner], actorType: 'user', source: 'user' });
+      enteredCurrentStage = at;
     }
+    // The stamp has to agree with the trail, or "days in stage" says every
+    // deal arrived the day it was created and the funnel report is fiction.
+    crm.setSystemProperties(orgId, deal.id, { stage_entered_at: enteredCurrentStage });
     if (deal.stage === 'negotiation' || deal.stage === 'proposal') {
       const original = Math.round(deal.amount * 1.18);
       crm.recordHistory(orgId, 'deal', deal.id, 'amount', original, deal.amount,

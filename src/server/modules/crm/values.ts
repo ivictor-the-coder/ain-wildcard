@@ -150,6 +150,19 @@ const MAX_LENGTH: Partial<Record<PropertyDef['type'], number>> = {
 const MAX_MULTI_ITEMS = 100;
 const MAX_JSON_BYTES = 64 * 1024;
 
+/**
+ * Ceilings on stored numbers. A hundred billion in a two-decimal currency is
+ * three orders of magnitude above the largest deal anyone has ever booked, and
+ * it leaves room for ~900 records at the cap before a sum leaves the exact
+ * integer range — so a rollup can never go non-finite, and never has to.
+ */
+export const MAX_MINOR_UNITS = 10_000_000_000_000;
+export const MAX_NUMBER = Number.MAX_SAFE_INTEGER;
+
+/** `1e+308` in an error message is clearer than 308 digits of it. */
+const describeNumber = (n: number): string =>
+  (Math.abs(n) >= 1e15 ? n.toExponential(3) : n.toLocaleString('en-US'));
+
 const PHONE_RE = /^[+]?[0-9 ()\-.]{6,32}$/;
 const EMAIL_RE = /^[^\s@,;<>()[\]\\]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$/;
 
@@ -177,6 +190,16 @@ export function coerceValue(prop: PropertyDef, raw: unknown, ctx: CoerceContext)
       if (!Number.isFinite(n)) reject(`${prop.label} must be a number.`);
       if (prop.type === 'currency' && !Number.isInteger(n)) {
         reject(`${prop.label} is money and must be an integer number of minor units (cents), not ${n}.`);
+      }
+      // An unbounded amount is not a generous API, it is a loaded gun: one
+      // fat-fingered 1e308 makes every sum that touches it non-finite, and
+      // `JSON.stringify(Infinity)` is `null` — so a single bad record used to
+      // blank the weighted forecast of the entire workspace.
+      const ceiling = prop.type === 'currency' ? MAX_MINOR_UNITS : MAX_NUMBER;
+      if (Math.abs(n) > ceiling) {
+        reject(prop.type === 'currency'
+          ? `${prop.label} is capped at ${ceiling.toLocaleString('en-US')} minor units (${(ceiling / 100).toLocaleString('en-US')} in a two-decimal currency); ${describeNumber(n)} was sent. Amounts are in cents — check whether this is already converted.`
+          : `${prop.label} is capped at ${ceiling.toLocaleString('en-US')}; ${describeNumber(n)} was sent.`);
       }
       if (v.min !== undefined && n < v.min) reject(`${prop.label} must be at least ${v.min}.`);
       if (v.max !== undefined && n > v.max) reject(`${prop.label} must be at most ${v.max}.`);

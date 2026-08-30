@@ -14,8 +14,9 @@ import type { TaskIntent } from './intent';
 import type { ResolvedEntity } from './resolve';
 import type { GroupBy, MetricDetection, MetricSubject, StageSets } from './metrics';
 import type { TimeWindow } from './dates';
+import { resolveDueDate } from './dates';
 import type { WorkspaceProfile } from './grounding';
-import { contentWords, normalise, stem, trigramSimilarity } from './text';
+import { capitalise, contentWords, normalise, stem, trigramSimilarity, truncate } from './text';
 
 export type BuiltinTool =
   | 'workspace_search' | 'account_profile' | 'business_metric'
@@ -33,6 +34,14 @@ export interface PlannedStep {
   relevance: number;
 }
 
+/** The two periods a comparison is actually about, both named in the answer. */
+export interface WindowPair {
+  a: TimeWindow;
+  b: TimeWindow;
+  /** How the second window was chosen — for the trace and the answer. */
+  source: 'both_named' | 'year_over_year' | 'preceding_period';
+}
+
 export interface PlanInput {
   question: string;
   /** Which deal stages count as open, won and lost in this workspace. */
@@ -41,6 +50,10 @@ export interface PlanInput {
   namedSomething: boolean;
   intent: TaskIntent;
   window: TimeWindow;
+  /** Every period the question named, in the order it named them. */
+  windows: TimeWindow[];
+  /** Set for a comparison: exactly the two periods that will be measured. */
+  comparison: WindowPair | null;
   entities: ResolvedEntity[];
   subject: MetricSubject | null;
   metric: MetricDetection | null;
@@ -49,6 +62,14 @@ export interface PlanInput {
   tools: AiToolDef[];
   workspace: WorkspaceProfile;
   maxSteps: number;
+  /** Tool names this run is scoped to; `null` means the whole catalogue. */
+  allowedTools: Set<string> | null;
+  /** Who is asking — the default assignee for anything scheduled. */
+  actorId: string | null;
+  /** Picklist values for deal_stage, so "move it to Negotiation" writes a real stage. */
+  dealStages: { value: string; label: string }[];
+  /** Whether this run may change data at all. */
+  allowWrites: boolean;
 }
 
 const OPEN_TICKET_STATUSES = ['new', 'waiting_on_us', 'waiting_on_customer', 'escalated'];
@@ -108,6 +129,235 @@ export function inferConditions(question: string, objectType: string, stages: St
 const builtin = (tool: BuiltinTool, args: Record<string, unknown>, why: string, relevance = 1): PlannedStep =>
   ({ tool, args, why, builtin: tool, relevance });
 
+/* ------------------------------- write plans ------------------------------ */
+
+/**
+ * Turning an instruction into a write.
+ *
+ * The rule that matters: the *instruction wrapper never reaches the record*.
+ * "Add a note to Rheinwerk saying the pilot is delayed" writes "The pilot is
+ * delayed" — not the sentence the user typed at the copilot. Everything below
+ * exists to strip the wrapper and keep only the content, and to refuse when the
+ * content is not there rather than pasting the prompt into a customer's
+ * timeline.
+ */
+export interface WriteAction {
+  tool: string;
+  args: Record<string, unknown>;
+  why: string;
+  /** What the confirmation card shows, in plain English. */
+  preview: string[];
+}
+
+export interface WriteBlocked {
+  /** The write the phrasing asked for, which could not be prepared. */
+  wanted: string;
+  reason: string;
+}
+
+const TRAILING_TIME =
+  /\s*(?:,\s*)?\b(?:next|this|by|on|before|due|in)\s+(?:the\s+)?(?:\d{1,3}\s+)?(?:day|days|week|weeks|month|months|monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|morning|afternoon|eod|eow)\b.*$/i;
+
+const CLOSERS = /\s*(?:please|thanks|thank you|asap|for me)\s*$/i;
+
+/** Strip the command wrapper and the scheduling tail from an instruction. */
+function contentOf(instruction: string, lead: RegExp): string | null {
+  const match = instruction.match(lead);
+  if (!match) return null;
+  const rest = instruction.slice((match.index ?? 0) + match[0].length);
+  const cleaned = rest.replace(TRAILING_TIME, '').replace(CLOSERS, '').replace(/[\s.]+$/, '').trim();
+  return cleaned.length >= 3 ? cleaned : null;
+}
+
+/** The note body: quoted text wins, then the clause after "saying"/"that". */
+export function noteBodyFrom(instruction: string): string | null {
+  const quoted = instruction.match(/["“”']([^"“”']{6,2000})["“”']/);
+  if (quoted) return quoted[1].trim();
+  for (const lead of [
+    /\b(?:saying|stating|that\s+says|which\s+says|to\s+say)\s+(?:that\s+)?/i,
+    /\bnote\s*:\s*/i,
+    /\bnote\s+that\s+/i,
+    /\brecord(?:ing)?\s+that\s+/i,
+    /\blog(?:ging)?\s+that\s+/i,
+  ]) {
+    const body = contentOf(instruction, lead);
+    if (body) return capitalise(body).replace(/([^.!?])$/, '$1.');
+  }
+  return null;
+}
+
+/** A short, human subject line derived from the body — never the raw prompt. */
+export function subjectFrom(body: string, max = 64): string {
+  const first = body.split(/(?<=[.!?])\s+/)[0] ?? body;
+  const trimmed = first.replace(/^(?:the|a|an)\s+/i, '').replace(/[.!?]+$/, '');
+  if (trimmed.length <= max) return capitalise(trimmed);
+  const cut = trimmed.slice(0, max);
+  return capitalise(cut.slice(0, cut.lastIndexOf(' ') > 20 ? cut.lastIndexOf(' ') : max).trim());
+}
+
+/** "Create a task to call the plant manager next Tuesday" → "Call the plant manager". */
+export function taskSubjectFrom(instruction: string): string | null {
+  for (const lead of [
+    /\b(?:task|to-?do|reminder|follow[-\s]?up)\s+(?:to|for|about|that|:)\s*/i,
+    /\b(?:remind\s+me\s+to)\s*/i,
+    /\b(?:create|add|log|make|set\s+up|open)\s+(?:a|an|the)\s+\w+\s+to\s+/i,
+  ]) {
+    const body = contentOf(instruction, lead);
+    if (body) return capitalise(body);
+  }
+  return null;
+}
+
+/** "Move the Rheinwerk deal to Negotiation" → the stage's machine value. */
+export function stageFrom(instruction: string, options: { value: string; label: string }[]): { value: string; label: string } | null {
+  const text = normalise(instruction);
+  const target = text.match(/\b(?:to|into|at|as)\s+([a-z0-9 ]{3,40})$/)?.[1] ?? text;
+  let best: { value: string; label: string } | null = null;
+  for (const option of options) {
+    const label = normalise(option.label);
+    const value = normalise(option.value);
+    if (!label && !value) continue;
+    if (new RegExp(`\\b${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(target)
+      || new RegExp(`\\b${value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(target)) {
+      // Prefer the longest label so "closed won" beats "won".
+      if (!best || label.length > normalise(best.label).length) best = option;
+    }
+  }
+  return best;
+}
+
+const WRITE_SHAPES: { wanted: string; re: RegExp }[] = [
+  { wanted: 'add_note', re: /\b(?:add|write|log|leave|put|record)\s+(?:a|an|the)?\s*note\b|\bnote\s+(?:that|on|against)\b|\blog\s+(?:that|a\s+call|an\s+update)\b/i },
+  { wanted: 'create_record', re: /\b(?:create|add|open|make|set\s+up|raise|file)\s+(?:a|an|the)?\s*(task|to-?do|reminder|ticket|deal|contact|company|case)\b/i },
+  { wanted: 'update_record', re: /\b(?:move|update|change|set|advance|push|mark|reassign|assign|edit)\b/i },
+  { wanted: 'schedule_followup', re: /\b(?:schedule|book|diarise|set\s+up)\s+(?:a\s+)?(?:follow[-\s]?up|check[-\s]?in|call\s+back)\b|\bfollow\s+up\s+(?:with|on|in)\b|\bremind\s+me\b/i },
+];
+
+/**
+ * Choose the one write this instruction asks for and fill it from resolved
+ * records. Returns the action, or what was wanted and why it could not be
+ * prepared — never a read tool dressed up as a write.
+ */
+export function planWrite(input: PlanInput): WriteAction | WriteBlocked | null {
+  const question = input.question;
+  const wanted = WRITE_SHAPES.find((shape) => shape.re.test(question))?.wanted ?? null;
+  if (!wanted) return null;
+
+  const target = input.entities.find((e) => ['company', 'contact', 'deal', 'ticket', 'customer'].includes(e.entity.type));
+  const person = input.entities.find((e) => e.entity.type === 'user');
+  const assignee = person?.entity.id
+    ?? (target?.entity.ownerId && target.entity.ownerId.startsWith('usr_') ? target.entity.ownerId : null)
+    ?? (input.actorId && input.actorId.startsWith('usr_') ? input.actorId : null);
+  const available = (name: string) =>
+    input.tools.some((tool) => tool.name === name) && (!input.allowedTools || input.allowedTools.has(name));
+
+  const noRecord = (verb: string): WriteBlocked => ({
+    wanted,
+    reason: `${verb} needs a record to write to, and nothing in the request resolved to one.`,
+  });
+  const noTool = (): WriteBlocked => ({
+    wanted,
+    reason: input.allowWrites
+      ? `no "${wanted}" tool is registered in this workspace, or this run was scoped away from it.`
+      : `this run is read-only. Send \`allow_writes: true\` and I will prepare it for your approval.`,
+  });
+
+  if (wanted === 'add_note') {
+    if (!available('add_note')) return noTool();
+    if (!target) return noRecord('Writing a note');
+    const body = noteBodyFrom(question);
+    if (!body) {
+      return {
+        wanted,
+        reason: 'the note has no content — say what the note should read, e.g. add a note to an account saying "the pilot slipped to October".',
+      };
+    }
+    const subject = subjectFrom(body);
+    return {
+      tool: 'add_note',
+      args: { record_ids: [target.entity.id], subject, body },
+      why: `Write the note onto ${target.entity.label}; the instruction wrapper is stripped so the timeline reads as a note, not as a prompt.`,
+      preview: [`On ${target.entity.label}`, `Subject: ${subject}`, body],
+    };
+  }
+
+  if (wanted === 'create_record') {
+    const kind = question.match(/\b(?:create|add|open|make|set\s+up|raise|file)\s+(?:a|an|the)?\s*(task|to-?do|reminder|ticket|deal|contact|company|case)\b/i)?.[1]?.toLowerCase() ?? 'task';
+    const objectType = /task|to-?do|reminder/.test(kind) ? 'task' : kind === 'case' ? 'ticket' : kind;
+    if (objectType !== 'task') {
+      return { wanted, reason: `creating a ${objectType} needs its required properties spelled out; ask me to draft it and I will show you the fields first.` };
+    }
+    if (!available('create_record')) return noTool();
+    const subject = taskSubjectFrom(question) ?? (target ? `Follow up with ${target.entity.label}` : null);
+    if (!subject) return { wanted, reason: 'the task has no subject — say what the task is, e.g. "create a task to call the plant manager".' };
+    const due = resolveDueDate(question, input.workspace.now);
+    const properties: Record<string, unknown> = {
+      subject: truncate(subject, 120),
+      occurred_at: input.workspace.now,
+      status: 'not_started',
+      task_type: /\bcall\b/i.test(subject) ? 'call' : /\bemail\b/i.test(subject) ? 'email' : 'follow_up',
+      priority: /\b(urgent|asap|critical)\b/i.test(question) ? 'high' : 'medium',
+      ...(due ? { due_at: due.at } : {}),
+      ...(assignee ? { owner_id: assignee } : {}),
+    };
+    return {
+      tool: 'create_record',
+      args: { object_type: 'task', properties, ...(target ? { associate_to: [target.entity.id] } : {}) },
+      why: `Create the task the request describes${target ? ` on ${target.entity.label}` : ''}${due ? `, due ${due.label}` : ''}.`,
+      preview: [
+        `Task: ${truncate(subject, 120)}`,
+        target ? `On ${target.entity.label}` : 'Not linked to a record',
+        due ? `Due ${due.label}` : 'No due date given',
+      ],
+    };
+  }
+
+  if (wanted === 'update_record') {
+    if (!available('update_record')) return noTool();
+    const deal = input.entities.find((e) => e.entity.type === 'deal');
+    const stage = stageFrom(question, input.dealStages);
+    if (!stage || !/\b(stage|move|advance|push|to\s+negotiation|to\s+proposal|closed)\b/i.test(question)) {
+      return { wanted, reason: 'I could not tell which property to set — name the property and the value, e.g. "move <deal> to Negotiation".' };
+    }
+    if (!deal) return noRecord('Changing a deal stage');
+    return {
+      tool: 'update_record',
+      args: { object_type: 'deal', id: deal.entity.id, properties: { deal_stage: stage.value } },
+      why: `Set ${deal.entity.label} to the ${stage.label} stage; probability and forecast category restamp from the pipeline.`,
+      preview: [`${deal.entity.label}`, `deal_stage → ${stage.label} (${stage.value})`],
+    };
+  }
+
+  if (!available('schedule_followup')) return noTool();
+  if (!target) return noRecord('Scheduling a follow-up');
+  const due = resolveDueDate(question, input.workspace.now);
+  const inDays = due?.days ?? null;
+  if (!inDays) {
+    return { wanted, reason: 'no due date was given — say when, e.g. "in 5 days", "next Tuesday" or "on 2026-09-14".' };
+  }
+  const purpose = taskSubjectFrom(question)
+    ?? contentOf(question, /\b(?:follow\s+up|follow[-\s]?up|check\s+in)\s+(?:with\s+[^,]+?)?\s*(?:about|on|to|re)\s+/i)
+    ?? `Follow up with ${target.entity.label}`;
+  return {
+    tool: 'schedule_followup',
+    args: {
+      record_id: target.entity.id,
+      in_days: inDays,
+      note: truncate(purpose, 200),
+      ...(assignee ? { assignee_id: assignee } : {}),
+    },
+    why: `Schedule the follow-up on ${target.entity.label} for ${due!.label}${assignee ? `, assigned to its owner` : ''}.`,
+    preview: [
+      `On ${target.entity.label}`,
+      `Due ${due!.label} (${inDays} ${inDays === 1 ? 'day' : 'days'} from now)`,
+      truncate(purpose, 200),
+    ],
+  };
+}
+
+export const isWriteBlocked = (value: WriteAction | WriteBlocked | null): value is WriteBlocked =>
+  !!value && 'reason' in value;
+
 /** The canonical sequence for the classified task. */
 function canonicalPlan(input: PlanInput): PlannedStep[] {
   const steps: PlannedStep[] = [];
@@ -116,15 +366,15 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
     .filter((e) => ['company', 'contact', 'customer'].includes(e.entity.type))
     .slice(0, 3);
 
-  const metricStep = (subjectId: string | undefined, label: string) =>
+  const metricStep = (subjectId: string | undefined, label: string, over: TimeWindow = window, compare = true) =>
     builtin('business_metric', {
       metric: metric?.metric.id ?? 'closed_won',
-      start: window.start,
-      end: window.end,
-      window_label: window.label,
+      start: over.start,
+      end: over.end,
+      window_label: over.label,
       ...(subjectId ? { subject_id: subjectId } : {}),
       group_by: groupBy,
-      compare: true,
+      compare,
     }, label);
 
   switch (intent) {
@@ -153,6 +403,12 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
         for (const candidate of comparisonSubjects.slice(0, 2)) {
           steps.push(metricStep(candidate.entity.id, `Compute ${metric?.metric.label ?? 'bookings'} for ${candidate.entity.label}.`));
         }
+      } else if (input.comparison) {
+        // Two periods were named, so two periods are measured. The delta the
+        // answer quotes is between exactly the windows the question asked for.
+        const { a, b } = input.comparison;
+        steps.push(metricStep(subject?.id, `Measure ${metric?.metric.label ?? 'bookings'} over ${a.label} — the first period in the question.`, a, false));
+        steps.push(metricStep(subject?.id, `Measure ${metric?.metric.label ?? 'bookings'} over ${b.label} — the second period, computed separately so the delta is between the two named periods.`, b, false));
       } else {
         steps.push(metricStep(subject?.id, `Compute ${metric?.metric.label ?? 'bookings'} for ${window.label} and the period before it.`));
       }
@@ -202,20 +458,30 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
       }
       if (subject) {
         steps.push(builtin('account_profile', { id: subject.id }, `"${subject.label}" resolved to a record; load its full profile.`));
-      } else if (input.namedSomething) {
+      } else if (input.namedSomething && !input.types.length) {
+        // With an object type in the question, a typed list beats a fuzzy
+        // workspace search — "which deals are slipping" is about deals, not
+        // about a note whose title happens to contain the word "slipping".
         steps.push(builtin('workspace_search', { query: input.question, limit: 8 }, 'The question names something that did not resolve to one record — search the workspace first.'));
       }
       if (!subject && input.types.length) {
         const objectType = input.types[0] === 'activity' ? 'meeting' : input.types[0];
         const conditions = inferConditions(input.question, objectType, input.stages);
+        // "which deals are slipping this quarter" is about the deals due to
+        // close in that quarter, not about every open deal on the book.
+        const dated = objectType === 'deal' && input.windows.length > 0;
         steps.push(builtin('record_search', {
           object_type: objectType,
           ...(conditions.length ? { conditions } : {}),
           ...(objectType === 'deal' ? { order_by: 'amount' } : {}),
+          ...(dated ? { date_property: 'close_date', start: window.start, end: window.end } : {}),
           limit: 10,
-        }, conditions.length
-          ? `The question asks for ${objectType} records qualified by ${conditions.map((c) => c.property).join(' and ')}.`
-          : `The question names ${objectType} records; list the most recent ones.`, 0.7));
+        }, [
+          conditions.length
+            ? `The question asks for ${objectType} records qualified by ${conditions.map((c) => c.property).join(' and ')}.`
+            : `The question names ${objectType} records; list the most recent ones.`,
+          dated ? `Scoped to deals closing in ${window.label}, the period the question named.` : '',
+        ].filter(Boolean).join(' '), 0.7));
       }
       break;
     }
@@ -274,9 +540,17 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
       }
       break;
 
-    case 'act':
-      if (subject) steps.push(builtin('account_profile', { id: subject.id }, `Confirm the current state of ${subject.label} before changing anything.`));
+    case 'act': {
+      const write = planWrite(input);
+      if (write && !isWriteBlocked(write)) {
+        steps.push({ tool: write.tool, args: write.args, why: write.why, builtin: null, relevance: 1 });
+      } else if (subject) {
+        // Nothing writable was resolved. Load the record so the answer can say
+        // what it knows — and say plainly that it changed nothing.
+        steps.push(builtin('account_profile', { id: subject.id }, `No write could be prepared, so this reads ${subject.label} rather than pretending to change it.`));
+      }
       break;
+    }
   }
 
   // "How are we doing?" names nothing at all. Answer it with the state of the
@@ -327,8 +601,9 @@ export function scoreTool(tool: AiToolDef, input: Pick<PlanInput, 'question' | '
   for (const type of input.types) {
     for (const hint of TYPE_HINTS[type] ?? []) if (haystack.includes(hint)) { score += 0.12; break; }
   }
-  if (!tool.readOnly) score += input.intent === 'act' ? 0.25 : -0.6;
-  if (tool.requiresApproval && input.intent !== 'act') score -= 0.2;
+  // A write is never chosen because it *sounds* relevant. Writes come only from
+  // `planWrite`, which has to extract real arguments before it will propose one.
+  if (!tool.readOnly) return 0;
   return Math.max(0, Math.min(1, score));
 }
 
@@ -340,6 +615,8 @@ interface FillContext {
   metric: MetricDetection | null;
   groupBy: GroupBy;
   types: string[];
+  /** Read tools may fall back to the raw question; writes may never. */
+  readOnly: boolean;
 }
 
 const ID_FIELD = /(^|_)(id|ids|record_id|customer_id|company_id|account_id|contact_id|deal_id|subject_id|entity_id)$/;
@@ -380,8 +657,10 @@ function fillField(name: string, node: SchemaNode, context: FillContext): unknow
     const match = context.question.match(/\b(\d{1,6})\b/);
     return match ? Number(match[1]) : undefined;
   }
-  if (node.type === 'string' && !node.optional) {
-    // A required free-text field with no better source gets the question itself.
+  if (node.type === 'string' && !node.optional && context.readOnly) {
+    // A required free-text field on a *read* gets the question itself; on a
+    // write it stays empty, because pasting a prompt into a customer's record
+    // is how an account history becomes unreadable.
     return context.question;
   }
   return undefined;
@@ -395,6 +674,7 @@ export interface FilledArguments {
 /** Fill a tool's arguments from the resolved context; report what is missing. */
 export function fillArguments(tool: AiToolDef, context: FillContext): FilledArguments {
   const schema = tool.input.describe();
+  context = { ...context, readOnly: tool.readOnly };
   const args: Record<string, unknown> = {};
   const missing: string[] = [];
   if (schema.type !== 'object' || !schema.fields) return { args, missing };
@@ -414,7 +694,12 @@ export function fillArguments(tool: AiToolDef, context: FillContext): FilledArgu
  * registered tool that scores well enough and whose arguments can be filled.
  */
 export function planSteps(input: PlanInput): PlannedStep[] {
-  const steps = canonicalPlan(input);
+  // A caller that scopes a run to two tools gets exactly those two. The
+  // allowlist is applied to the canonical plan as well as to the generic
+  // matcher, because the built-in capabilities are registered tools like any
+  // other and an integrator scoping an agent means the whole run.
+  const allowed = (name: string) => !input.allowedTools || input.allowedTools.has(name);
+  const steps = canonicalPlan(input).filter((step) => allowed(step.tool));
   const planned = new Set(steps.map((s) => s.tool));
   const context: FillContext = {
     question: input.question,
@@ -424,14 +709,24 @@ export function planSteps(input: PlanInput): PlannedStep[] {
     metric: input.metric,
     groupBy: input.groupBy,
     types: input.types,
+    readOnly: true,
   };
 
   const offIntent = (name: string) =>
     (name === 'compose_message' && input.intent !== 'draft') ||
     (name === 'schedule_followup' && input.intent !== 'act');
 
+  // Two tools that read the same rows are one tool. A registered search that
+  // duplicates a capability already in the plan buys nothing and costs a step.
+  const OVERLAPS: Record<string, string[]> = {
+    search_records: ['record_search', 'workspace_search', 'record_aggregate'],
+    get_record: ['account_profile', 'record_timeline'],
+  };
+  const duplicates = (name: string) => (OVERLAPS[name] ?? []).some((covered) => planned.has(covered));
+
   const candidates = input.tools
-    .filter((tool) => !planned.has(tool.name) && !BUILTIN_TOOLS.includes(tool.name as BuiltinTool) && !offIntent(tool.name))
+    .filter((tool) => tool.readOnly && allowed(tool.name) && !planned.has(tool.name)
+      && !BUILTIN_TOOLS.includes(tool.name as BuiltinTool) && !offIntent(tool.name) && !duplicates(tool.name))
     .map((tool) => ({ tool, relevance: scoreTool(tool, input) }))
     .filter((c) => c.relevance >= 0.42)
     .sort((a, b) => b.relevance - a.relevance)

@@ -147,6 +147,8 @@
 .sg__copy:hover { background: var(--bg-hover); color: var(--text-primary); }
 .sg__copy:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 .sg__code {
+  /* Code is always read left-to-right, even when the document is mirrored. */
+  direction: ltr; unicode-bidi: isolate;
   margin: 0; padding: var(--space-5); overflow-x: auto;
   font-family: var(--font-mono); font-size: var(--text-sm); line-height: var(--leading-relaxed);
   color: var(--text-primary); tab-size: 2;
@@ -187,6 +189,7 @@
 .sg__apitable td:last-child { color: var(--text-secondary); line-height: var(--leading-snug); min-width: 260px; }
 .sg__apitable tbody tr:last-child th, .sg__apitable tbody tr:last-child td { border-bottom: none; }
 .sg__mono {
+  direction: ltr; unicode-bidi: isolate;
   font-family: var(--font-mono); font-size: var(--text-xs); color: var(--text-primary);
   background: var(--bg-code); border: 1px solid var(--border-subtle); border-radius: var(--radius-xs);
   padding: 1px var(--space-2); white-space: nowrap;

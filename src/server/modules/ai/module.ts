@@ -98,6 +98,20 @@ function describeAnalysis(completion: AinCompletion) {
       partial: analysis.window.partial,
       from_question: analysis.windowFromQuestion,
     },
+    windows: analysis.windows.map((w) => ({
+      label: w.label, start: w.start, end: w.end, grain: w.grain, partial: w.partial, matched: w.matched.trim(),
+    })),
+    comparison: analysis.comparison
+      ? {
+          source: analysis.comparison.source,
+          a: { label: analysis.comparison.a.label, start: analysis.comparison.a.start, end: analysis.comparison.a.end },
+          b: { label: analysis.comparison.b.label, start: analysis.comparison.b.start, end: analysis.comparison.b.end },
+        }
+      : null,
+    refusal: analysis.refusal,
+    write_blocked: analysis.writeBlocked,
+    scoped_tools: analysis.scopedTools,
+    budget_exhausted: analysis.budgetExhausted,
     entities: analysis.entities,
     subject: analysis.subject,
     metric: analysis.metric,
@@ -109,6 +123,22 @@ function describeAnalysis(completion: AinCompletion) {
     steps: analysis.steps,
     passes: analysis.passes,
   };
+}
+
+/**
+ * Models this platform can actually run. A request for one it does not have is
+ * a 400, not a silent substitution — a caller comparing two models' answers has
+ * to be able to trust that it ran the one it asked for.
+ */
+export const KNOWN_MODELS = ['ain-engine-1', 'claude-sonnet-4-5', 'claude-opus-4-1', 'claude-haiku-4-5'];
+
+function assertKnownModel(model: string): void {
+  if (KNOWN_MODELS.includes(model)) return;
+  throw badRequest(
+    'unknown_model',
+    `"${model}" is not a model this workspace can run. Available: ${KNOWN_MODELS.join(', ')}. Omit \`model\` to use whichever provider is configured.`,
+    'model',
+  );
 }
 
 const toMessages = (ctx: Ctx, orgId: string, history: AiMessage[], question: string): AiMessage[] => [
@@ -187,15 +217,38 @@ export default defineModule({
       ...(opts.maxSteps ? { budget: { steps: opts.maxSteps } } : {}),
     });
 
+    /**
+     * Resolve a caller's tool allowlist. An unknown name is a 400 rather than a
+     * silent drop, and an empty list means "no tools" — the restriction an
+     * integrator uses to scope an agent has to mean something.
+     */
     const toolsFor = (opts: AskOptions) => {
       if (!opts.toolNames) return undefined;
-      return opts.toolNames.map((name) => runtime.tool(name)).filter((tool): tool is NonNullable<typeof tool> => !!tool);
+      const resolved = [];
+      const unknown = [];
+      for (const name of opts.toolNames) {
+        const tool = runtime.tool(name);
+        if (tool) resolved.push(tool);
+        else unknown.push(name);
+      }
+      if (unknown.length) {
+        throw badRequest(
+          'unknown_tool',
+          `No tool named ${unknown.map((n) => `"${n}"`).join(', ')}. Available: ${runtime.tools().map((t) => t.name).join(', ')}.`,
+          'tools',
+        );
+      }
+      return resolved;
     };
 
     const service: AiService = {
       async complete(orgId, request, opts = {}) {
         const tools = toolsFor(opts);
-        return runtime.complete({ ...request, ...(tools ? { tools } : {}) }, callContext(orgId, opts));
+        if (request.model) assertKnownModel(request.model);
+        return runtime.complete({ ...request, ...(tools ? { tools } : {}) }, {
+          ...callContext(orgId, opts),
+          restrictTools: tools ? tools.map((tool) => tool.name) : null,
+        });
       },
 
       async ask(orgId, question, opts = {}) {
@@ -409,10 +462,12 @@ export default defineModule({
       return {
         object: 'ai_completion',
         run_id: completion.runId,
-        provider: runtime.active().id,
+        provider: completion.degraded ? completion.degraded.answeredBy : runtime.active().id,
         model: completion.model,
         content: completion.content,
-        finish_reason: completion.finishReason,
+        // A run whose plan died on the budget stopped; it did not finish.
+        finish_reason: completion.analysis?.budgetExhausted ? 'budget_exhausted' : completion.finishReason,
+        degraded: completion.degraded ?? null,
         tool_calls: completion.toolCalls,
         citations: completion.citations ?? [],
         reasoning: completion.reasoning ?? [],
@@ -647,6 +702,31 @@ export default defineModule({
         return publicApproval(store.approval(req.auth.orgId, approval.id)!);
       }
 
+      // Arguments are re-validated here, not just when the plan was made: an
+      // approval can sit in the queue while the schema, the record or the
+      // assignee it names changes underneath it.
+      const definition = runtime.tool(approval.tool);
+      const args = JSON.parse(approval.args) as Record<string, unknown>;
+      if (!definition) {
+        store.decideApproval(req.auth.orgId, approval.id, 'declined', req.auth.userId ?? null,
+          `Blocked: no tool named "${approval.tool}" is registered any more.`);
+        throw badRequest('tool_unavailable', `"${approval.tool}" is no longer registered, so this approval cannot be executed.`, 'id');
+      }
+      try {
+        definition.input.parse(args);
+      } catch (e) {
+        const message = (e as Error).message;
+        store.decideApproval(req.auth.orgId, approval.id, 'declined', req.auth.userId ?? null, `Blocked: ${message}`);
+        c.emit(req.auth.orgId, 'ai.approval.declined', {
+          id: approval.id, tool: approval.tool, run_id: approval.run_id, reason: 'invalid_arguments',
+        }, { objectId: approval.id, objectType: 'ai_approval', actorId: req.auth.userId, actorType: 'user' });
+        throw badRequest(
+          'approval_arguments_invalid',
+          `This approval cannot run: ${message} It has been declined rather than executed with bad arguments.`,
+          'args',
+        );
+      }
+
       const call: AiCallContext = {
         ctx: c,
         orgId: req.auth.orgId,
@@ -659,7 +739,7 @@ export default defineModule({
         approvals: [approval.tool],
         startedNs: process.hrtime.bigint(),
       };
-      const execution = await runtime.execute(approval.tool, JSON.parse(approval.args), call);
+      const execution = await runtime.execute(approval.tool, args, call, definition);
       store.decideApproval(
         req.auth.orgId, approval.id, 'approved', req.auth.userId ?? null,
         execution.ok ? execution.span.summary : `Failed: ${execution.error?.message}`,

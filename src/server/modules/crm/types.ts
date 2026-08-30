@@ -150,7 +150,11 @@ export interface PipelineBinding {
     minutes_to_close?: string;
     /** Rep-set expected close date, snapped to reality the day it closes. */
     expected_close_date?: string;
+    /** When the record entered the stage it is in now — stage velocity. */
+    stage_entered_at?: string;
   };
+  /** True when the binding was provisioned onto a user-defined object type. */
+  custom?: boolean;
 }
 
 export interface CrmRecord {
@@ -205,9 +209,47 @@ export interface HistoryEntry {
   from_value: PropertyValue;
   to_value: PropertyValue;
   changed_at: number;
+  /**
+   * Monotonic write order. `changed_at` alone cannot order an audit trail:
+   * a save is one clock tick, and several land inside it. `(changed_at, seq)`
+   * is a total order, and it is what history cursors page on.
+   */
+  seq: number;
+  /** The save this row belongs to. Rows sharing it changed together. */
+  write_id: string;
   actor_id: string | null;
   actor_type: ActorType;
   source: ChangeSource;
+}
+
+/** One page of property history, ordered newest first on (changed_at, seq). */
+export interface HistoryPage {
+  entries: HistoryEntry[];
+  has_more: boolean;
+  next_cursor: string | null;
+}
+
+/** One continuous spell a record spent in one stage, read off its history. */
+export interface StageSpell {
+  object: 'stage_spell';
+  pipeline: string;
+  pipeline_label: string;
+  stage: string;
+  stage_label: string;
+  probability: number | null;
+  is_closed: boolean;
+  is_won: boolean;
+  entered_at: number;
+  exited_at: number | null;
+  /** Milliseconds in the stage; for the current stage, up to `ctx.now()`. */
+  duration_ms: number;
+  days_in_stage: number;
+  is_current: boolean;
+  /** Who moved the record *into* this stage — the compliance answer. */
+  moved_by: string | null;
+  source: ChangeSource | null;
+  /** The stage it went to next; null while the record is still here. */
+  moved_to: string | null;
 }
 
 /* ------------------------------- filtering ------------------------------- */
@@ -341,4 +383,10 @@ export interface WriteOptions {
   id?: string;
   createdAt?: number;
   ownerId?: string | null;
+  /**
+   * Groups every history row this call writes into one save. Set it to fold
+   * several store calls (a merge, a batch item) into a single timeline entry;
+   * leave it unset and each call gets its own.
+   */
+  writeId?: string;
 }

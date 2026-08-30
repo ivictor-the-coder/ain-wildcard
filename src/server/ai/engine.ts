@@ -13,11 +13,19 @@ import type { AiCompletion, AiCompletionRequest, AiProvider, AiToolCall, AiToolD
 import type { Ctx } from '../kernel/context';
 import type { AiCallContext, AinAiRuntime, PendingApproval, AiTraceSpan } from './runtime';
 import { classifyIntent, describeIntent, type IntentResult, type TaskIntent } from './intent';
-import { defaultWindow, describeWindow, resolveWindow, type TimeWindow } from './dates';
+import {
+  asksYearOverYear, defaultWindow, describeWindow, periodMentions, previousWindow,
+  resolveWindows, shiftWindowYears, type TimeWindow,
+} from './dates';
 import { entityIndex, workspaceProfile, type WorkspaceProfile } from './grounding';
 import { extractMentions, mentionedTypes, resolveEntities, type ResolvedEntity } from './resolve';
-import { detectGrouping, detectMetric, stageSets, type GroupBy, type MetricDetection, type MetricSubject } from './metrics';
-import { planSteps, replan, type PlannedStep } from './plan';
+import {
+  detectGrouping, detectMetric, metricById, metricIds, stageSets,
+  type GroupBy, type MetricDetection, type MetricSubject,
+} from './metrics';
+import { comprehend, isUsableEntity, refusalFor, workspaceVocabulary, type Refusal } from './clarify';
+import { planSteps, planWrite, replan, isWriteBlocked, type PlannedStep, type WindowPair, type WriteBlocked } from './plan';
+import { propertyMap } from './query';
 import {
   accountProfile, businessMetric, recordAggregate, recordSearch, recordTimeline, workspaceSearch,
   type AccountProfileResult, type TimelineItem,
@@ -26,7 +34,7 @@ import { composeDraft, detectDraftKind, detectTone, type DraftKind, type DraftRe
 import { extractStructured } from './extract';
 import { synthesise, type StepResult } from './synth';
 import { accountUsage, estimateTokens, messageTokens, toolTokens } from './usage';
-import { truncate } from './text';
+import { EMAIL_PATTERN, ID_PATTERN, QUOTED_PATTERN, truncate } from './text';
 
 export const ENGINE_MODEL = 'ain-engine-1';
 
@@ -34,6 +42,17 @@ export interface EngineAnalysis {
   question: string;
   intent: IntentResult;
   window: TimeWindow;
+  /** Every period the question named — a comparison must measure two. */
+  windows: TimeWindow[];
+  comparison: WindowPair | null;
+  /** Why the engine declined to answer, when it did. */
+  refusal: { code: string; why: string } | null;
+  /** Set when an `act` request could not be turned into a write. */
+  writeBlocked: WriteBlocked | null;
+  /** Tool names the caller scoped this run to, `null` for the full catalogue. */
+  scopedTools: string[] | null;
+  /** True when the plan died on the run's step or time budget. */
+  budgetExhausted: boolean;
   windowFromQuestion: boolean;
   entities: { id: string; label: string; type: string; score: number; rule: string; mention: string }[];
   subject: MetricSubject | null;
@@ -72,6 +91,8 @@ async function executeStep(
 ): Promise<StepResult> {
   const runtime = call.runtime;
   const definition = tools.get(step.tool) ?? call.runtime?.tool(step.tool);
+  // Whether this step changes the workspace decides what the answer may claim.
+  const write = definition ? !definition.readOnly : false;
   // If nothing registered this capability, run our own implementation instead
   // of asking the runtime for a tool that does not exist.
   if (runtime && !definition && step.builtin) {
@@ -79,15 +100,15 @@ async function executeStep(
     try {
       const result = callBuiltin(step.builtin, step.args, call.ctx, call.orgId);
       runtime.note(call, 'tool', `${step.builtin} (built-in)`, summarise(result), Number((process.hrtime.bigint() - started) / 1_000_000n));
-      return { tool: step.tool, ok: true, why: step.why, args: step.args, result };
+      return { tool: step.tool, ok: true, why: step.why, args: step.args, result, write };
     } catch (e) {
-      return { tool: step.tool, ok: false, why: step.why, args: step.args, error: { code: 'tool_failed', message: (e as Error).message } };
+      return { tool: step.tool, ok: false, why: step.why, args: step.args, write, error: { code: 'tool_failed', message: (e as Error).message } };
     }
   }
   if (runtime) {
     const execution = await runtime.execute(step.tool, step.args, call, definition);
     if (execution.ok) {
-      return { tool: step.tool, ok: true, why: step.why, args: step.args, result: execution.result };
+      return { tool: step.tool, ok: true, why: step.why, args: step.args, result: execution.result, write };
     }
     // A capability the workspace never registered still works: it is our own
     // code, and the trace records it as a built-in rather than a tool call.
@@ -96,13 +117,13 @@ async function executeStep(
       try {
         const result = callBuiltin(step.builtin, step.args, call.ctx, call.orgId);
         runtime.note(call, 'tool', `${step.builtin} (built-in)`, summarise(result), Number((process.hrtime.bigint() - started) / 1_000_000n));
-        return { tool: step.tool, ok: true, why: step.why, args: step.args, result };
+        return { tool: step.tool, ok: true, why: step.why, args: step.args, result, write };
       } catch (e) {
-        return { tool: step.tool, ok: false, why: step.why, args: step.args, error: { code: 'tool_failed', message: (e as Error).message } };
+        return { tool: step.tool, ok: false, why: step.why, args: step.args, write, error: { code: 'tool_failed', message: (e as Error).message } };
       }
     }
     return {
-      tool: step.tool, ok: false, why: step.why, args: step.args,
+      tool: step.tool, ok: false, why: step.why, args: step.args, write,
       error: { code: execution.error?.code ?? 'tool_failed', message: execution.error?.message ?? 'Tool failed.' },
     };
   }
@@ -110,9 +131,9 @@ async function executeStep(
     const result = step.builtin
       ? callBuiltin(step.builtin, step.args, call.ctx, call.orgId)
       : await definition?.run(definition.input.parse(step.args), call.ctx, { orgId: call.orgId, actorId: call.actorId ?? undefined });
-    return { tool: step.tool, ok: true, why: step.why, args: step.args, result };
+    return { tool: step.tool, ok: true, why: step.why, args: step.args, result, write };
   } catch (e) {
-    return { tool: step.tool, ok: false, why: step.why, args: step.args, error: { code: 'tool_failed', message: (e as Error).message } };
+    return { tool: step.tool, ok: false, why: step.why, args: step.args, write, error: { code: 'tool_failed', message: (e as Error).message } };
   }
 }
 
@@ -131,9 +152,45 @@ const summarise = (value: unknown): string => {
 const lastUserMessage = (req: AiCompletionRequest): string =>
   [...req.messages].reverse().find((m) => m.role === 'user')?.content ?? '';
 
+/**
+ * A 20,000-character prompt is a pasted document with a question on top of it,
+ * not twenty thousand characters of question. Resolution and classification see
+ * the opening of the message plus anything explicitly quoted or given as an id
+ * or an email further down — which keeps a long paste from spending the whole
+ * run's time budget on trigram scoring.
+ */
+const FOCUS_CHARS = 800;
+
+export function focusText(text: string): string {
+  const value = String(text ?? '');
+  if (value.length <= FOCUS_CHARS) return value;
+  const head = value.slice(0, FOCUS_CHARS);
+  const tail = value.slice(FOCUS_CHARS);
+  const explicit: string[] = [];
+  for (const match of tail.matchAll(QUOTED_PATTERN)) explicit.push(match[1]);
+  for (const match of tail.matchAll(ID_PATTERN)) explicit.push(match[0]);
+  for (const match of tail.matchAll(EMAIL_PATTERN)) explicit.push(match[0]);
+  return [head, ...[...new Set(explicit)].slice(0, 40)].join('\n');
+}
+
 /** Earlier turns still name the account, so the whole thread feeds resolution. */
 const conversationContext = (req: AiCompletionRequest): string =>
-  req.messages.filter((m) => m.role === 'user').slice(-3).map((m) => m.content).join('\n');
+  req.messages.filter((m) => m.role === 'user').slice(-3).map((m) => focusText(m.content)).join('\n');
+
+/** The two periods a comparison will measure, and how they were chosen. */
+export function comparisonWindows(question: string, windows: TimeWindow[], now: number): WindowPair | null {
+  const named = windows.filter((w) => w.end > w.start);
+  // "the same period last year" is one period and an instruction, not two
+  // periods: the second window is the first one shifted, so a quarter is
+  // compared with that quarter, never with a whole year.
+  if (asksYearOverYear(question)) {
+    const base = named.find((w) => !/\blast\s+year\b|\byear\s+ago\b/i.test(w.matched)) ?? defaultWindow(now);
+    return { a: base, b: shiftWindowYears(base, -1), source: 'year_over_year' };
+  }
+  if (named.length >= 2) return { a: named[0], b: named[1], source: 'both_named' };
+  const base = named[0] ?? defaultWindow(now);
+  return { a: base, b: previousWindow(base), source: 'preceding_period' };
+}
 
 export function builtinEngine(): AiProvider {
   return {
@@ -147,9 +204,13 @@ export function builtinEngine(): AiProvider {
       const runtime = call.runtime as AinAiRuntime | undefined;
       const ctx = call.ctx;
       const orgId = call.orgId;
-      const question = lastUserMessage(req);
+      const rawQuestion = lastUserMessage(req);
+      const question = focusText(rawQuestion);
       const reasoning: string[] = [];
       const workspace = workspaceProfile(ctx, orgId);
+      if (question.length < rawQuestion.length) {
+        reasoning.push(`Prompt is ${rawQuestion.length.toLocaleString('en-US')} characters; resolution reads the leading ${FOCUS_CHARS} plus every quoted name, id and email after it.`);
+      }
 
       reasoning.push(
         `Workspace ${workspace.name}: currency ${workspace.currency.toUpperCase()}, timezone ${workspace.timezone}, clock ${new Date(workspace.now).toISOString()}.`,
@@ -160,12 +221,21 @@ export function builtinEngine(): AiProvider {
       reasoning.push(describeIntent(intent));
       runtime?.note(call, 'plan', 'classify_intent', describeIntent(intent));
 
-      /* 2. what period */
-      const explicit = resolveWindow(question, workspace.now);
+      /* 2. what period — every one the question names, in the order it names them */
+      const windows = resolveWindows(question, workspace.now, 3);
+      const mentions = periodMentions(question);
+      const explicit = windows[0] ?? null;
       const window = explicit ?? defaultWindow(workspace.now);
+      const comparison = intent.intent === 'compare' ? comparisonWindows(question, windows, workspace.now) : null;
       reasoning.push(explicit
-        ? `Period "${explicit.matched.trim()}" → ${window.label} (${describeWindow(window, workspace.locale)}).`
+        ? `Period${windows.length > 1 ? 's' : ''} ${windows.map((w) => `"${w.matched.trim()}" → ${w.label} (${describeWindow(w, workspace.locale)})`).join('; ')}.`
         : `No period in the question; defaulting to ${window.label}.`);
+      if (mentions.length > windows.length) {
+        reasoning.push(`Period expressions found: ${mentions.map((m) => `"${m.text}"`).join(', ')}; ${windows.length} of ${mentions.length} resolved to a date range.`);
+      }
+      if (comparison) {
+        reasoning.push(`Comparison windows: ${comparison.a.label} against ${comparison.b.label} (${comparison.source.replace(/_/g, ' ')}).`);
+      }
 
       /* 3. which records */
       const types = mentionedTypes(question);
@@ -187,24 +257,55 @@ export function builtinEngine(): AiProvider {
       if (metric) reasoning.push(`Metric: ${metric.metric.label} (matched "${metric.matched}", score ${metric.score})${metric.alternatives.length ? `, over ${metric.alternatives.map((a) => a.id).join(', ')}` : ''}.`);
       if (groupBy !== 'none') reasoning.push(`Grouping requested: by ${groupBy}.`);
 
-      /* 5. plan */
+      /* 5. can this be answered at all, or must it be refused */
+      const index = entityIndex(ctx, orgId);
+      const comprehension = comprehend(question, workspaceVocabulary(index));
+      const countableTypes = types.filter((t) => t !== 'activity' && t !== 'customer');
+      const refusal: Refusal | null = refusalFor({
+        question, workspace, intent, comprehension, metric, entities, types, windows, mentions,
+        metrics: metricIds().map((id) => metricById(id)?.label ?? id),
+        countableTypes,
+      });
+      if (refusal) {
+        reasoning.push(`Refused (${refusal.code}): ${refusal.why}`);
+        runtime?.note(call, 'plan', 'refuse_to_answer', `${refusal.code}: ${refusal.why}`);
+      } else if (comprehension.unknown.length) {
+        reasoning.push(`Unrecognised terms carried through: ${comprehension.unknown.slice(0, 5).map((w) => `"${w}"`).join(', ')} — answered anyway because ${metric ? `the metric "${metric.metric.label}"` : entities.filter(isUsableEntity).length ? 'a record' : 'an object type'} resolved.`);
+      }
+
+      /* 6. plan */
       const budget = runtime?.budget(call) ?? { steps: 6, timeMs: 10_000, callsPerMinute: 600 };
       const available = req.tools ?? [];
+      const scopedTools = call.restrictTools ?? null;
       const toolIndex = new Map(available.map((tool) => [tool.name, tool]));
       const planInput = {
-        question, intent: intent.intent, window, entities, subject, metric, groupBy, types,
+        question, intent: intent.intent, window, windows, comparison, entities, subject, metric, groupBy, types,
         stages: stageSets(ctx, orgId),
         namedSomething: extractMentions(question).some((mention) => mention.kind !== 'ngram'),
         tools: available, workspace, maxSteps: Math.max(1, budget.steps - 1),
+        allowedTools: scopedTools ? new Set(scopedTools) : null,
+        actorId: call.actorId ?? null,
+        dealStages: [...propertyMap(ctx, orgId, 'deal').get('deal_stage')?.options ?? []],
+        allowWrites: !!call.allowWrites,
       };
-      const plan = planSteps(planInput);
+      const attempted = intent.intent === 'act' ? planWrite(planInput) : null;
+      const writeBlocked = isWriteBlocked(attempted) ? attempted : null;
+      if (writeBlocked) {
+        reasoning.push(`No write prepared: the request looks like ${writeBlocked.wanted}, but ${writeBlocked.reason}`);
+      }
+      const plan = refusal ? [] : planSteps(planInput);
+      if (scopedTools) {
+        reasoning.push(`Run scoped to ${scopedTools.length ? scopedTools.map((t) => `"${t}"`).join(', ') : 'no tools'}; the plan is filtered against that list, not just the tools offered to the model.`);
+      }
       reasoning.push(plan.length
         ? `Plan (${plan.length} ${plan.length === 1 ? 'step' : 'steps'}, budget ${budget.steps}): ${plan.map((s) => s.tool).join(' → ')}.`
-        : 'No tool was needed to answer this.');
+        : refusal
+          ? 'No tool ran: the question was refused before anything was measured.'
+          : 'No tool was needed to answer this.');
       for (const step of plan) reasoning.push(`  ${step.tool}: ${step.why}`);
       runtime?.note(call, 'plan', 'plan_tools', plan.map((s) => `${s.tool}(${Object.keys(s.args).join(',')})`).join(' → ') || 'no tools required');
 
-      /* 6. execute, then one replanning pass with whatever budget is left */
+      /* 7. execute, then one replanning pass with whatever budget is left */
       const steps: StepResult[] = [];
       const executed: { tool: string; result: unknown }[] = [];
       const traced: EngineAnalysis['steps'] = [];
@@ -226,7 +327,7 @@ export function builtinEngine(): AiProvider {
       }
 
       const remaining = Math.max(0, budget.steps - (call.steps ?? steps.length));
-      const second = replan(planInput, executed, Math.min(remaining, 2));
+      const second = refusal ? [] : replan(planInput, executed, Math.min(remaining, 2));
       if (second.length) {
         passes += 1;
         reasoning.push(`Second pass: ${second.map((s) => `${s.tool} — ${s.why}`).join(' ')}`);
@@ -245,9 +346,9 @@ export function builtinEngine(): AiProvider {
         }
       }
 
-      /* 7. draft, extract or answer */
+      /* 8. draft, extract or answer */
       const tone = detectTone(question);
-      const draftKind = intent.intent === 'draft' ? detectDraftKind(question) : null;
+      const draftKind = !refusal && intent.intent === 'draft' ? detectDraftKind(question) : null;
       let draft: DraftResult | null = null;
       if (draftKind) {
         const profile = steps.map((s) => s.result).find((r) => !!r && typeof r === 'object' && 'totals' in (r as object)) as AccountProfileResult | undefined;
@@ -266,12 +367,28 @@ export function builtinEngine(): AiProvider {
         reasoning.push(`Drafted a ${draftKind.replace(/_/g, ' ')} in a ${tone} tone from ${draft.personalisation.length} verified ${draft.personalisation.length === 1 ? 'fact' : 'facts'}.`);
       }
 
-      const synthesis = synthesise({
-        question, intent, workspace, window, subject, entities, steps, metric, draft,
-        pendingApprovals: (call.pendingApprovals ?? []) as PendingApproval[],
-      });
+      const synthesis = refusal
+        ? { content: refusal.content, citations: [] }
+        : synthesise({
+            question, intent, workspace, window, subject, entities, steps, metric, draft,
+            pendingApprovals: (call.pendingApprovals ?? []) as PendingApproval[],
+            writeBlocked,
+            scopedTools,
+          });
 
-      let content = synthesis.content;
+      // A plan that died entirely on the run's budget did not answer the
+      // question, and must not report itself as a finished answer.
+      const budgetExhausted = plan.length > 0
+        && steps.length > 0
+        && steps.every((step) => !step.ok)
+        && steps.some((step) => step.error?.code === 'time_budget_exhausted' || step.error?.code === 'step_budget_exhausted');
+
+      let content = budgetExhausted
+        ? [
+            `I ran out of this run's ${budget.timeMs.toLocaleString('en-US')}ms / ${budget.steps}-step budget before ${plan.length === 1 ? 'the planned step' : 'any planned step'} returned, so I have no answer for you rather than a partial one.`,
+            `Planned: ${plan.map((s) => s.tool).join(' → ')}. Ask again with a shorter prompt, or raise \`max_steps\`.`,
+          ].join(' ')
+        : synthesis.content;
       if (req.responseSchema) {
         const metricResult = executed.map((e) => e.result).find((r) => !!r && typeof r === 'object' && 'formatted' in (r as object)) as { value?: number; formatted?: string } | undefined;
         const extraction = extractStructured(req.responseSchema, {
@@ -306,6 +423,12 @@ export function builtinEngine(): AiProvider {
         question,
         intent,
         window,
+        windows,
+        comparison,
+        refusal: refusal ? { code: refusal.code, why: refusal.why } : null,
+        writeBlocked,
+        scopedTools,
+        budgetExhausted,
         windowFromQuestion: !!explicit,
         entities: entities.map((e) => ({ id: e.entity.id, label: e.entity.label, type: e.entity.type, score: e.score, rule: e.rule, mention: e.mention })),
         subject,
@@ -322,7 +445,7 @@ export function builtinEngine(): AiProvider {
       const completion: AiCompletion & { analysis: EngineAnalysis; spans: AiTraceSpan[] } = {
         content,
         toolCalls,
-        finishReason: (call.pendingApprovals?.length ?? 0) > 0 ? 'tool_calls' : 'stop',
+        finishReason: budgetExhausted ? 'length' : (call.pendingApprovals?.length ?? 0) > 0 ? 'tool_calls' : 'stop',
         usage,
         model: ENGINE_MODEL,
         reasoning,

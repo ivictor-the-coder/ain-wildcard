@@ -33,6 +33,10 @@ export function buildTimeline(ctx: Ctx, crm: Crm, orgId: string, record: CrmReco
   const wanted = new Set<TimelineItem['kind']>(options.kinds?.length ? options.kinds : ['activity', 'property_change', 'event', 'association']);
   const activityTypes = crm.activityTypes(orgId);
   const items: TimelineItem[] = [];
+  // Two saves can share a millisecond, so the timeline needs a tiebreak that
+  // is not the clock. Property changes carry the write sequence; everything
+  // else falls back to its id, which is stable across requests either way.
+  const order = new Map<string, number>();
 
   // An account rolls up the activity logged against the records that point at
   // it; a deal or a contact shows only what is attached directly. The rule is
@@ -106,25 +110,36 @@ export function buildTimeline(ctx: Ctx, crm: Crm, orgId: string, record: CrmReco
     // One save is one line. Moving a deal to Closed won changes six properties
     // — the stage a person chose, and the five Ain restamped from it — and a
     // timeline that lists all six as separate events is unreadable.
+    //
+    // The fold is on the write, never on the clock. Grouping by
+    // `${record}|${changed_at}|${actor}` merged genuinely separate saves
+    // whenever two landed in the same millisecond, which is most of the time
+    // on a fast machine: a create and a stage change became one row titled
+    // after whichever property happened to sort first.
     const grouped = new Map<string, HistoryEntry[]>();
-    for (const entry of crm.history(orgId, record.id, { limit: limit * 3, before: before === Number.MAX_SAFE_INTEGER ? undefined : before })) {
-      const key = `${entry.record_id}|${entry.changed_at}|${entry.actor_id ?? ''}`;
-      const bucket = grouped.get(key);
-      if (bucket) bucket.push(entry); else grouped.set(key, [entry]);
+    for (const entry of crm.history(orgId, record.id, { limit: limit * 4, before: before === Number.MAX_SAFE_INTEGER ? undefined : before })) {
+      const bucket = grouped.get(entry.write_id);
+      if (bucket) bucket.push(entry); else grouped.set(entry.write_id, [entry]);
     }
+    const creationWrite = crm.creationWriteId(orgId, record.id);
+    const stageProperty = crm.pipelines.binding(orgId, record.object_type)?.stage_property ?? null;
     for (const group of grouped.values()) {
       // The values a record was born with are already the "Record created"
       // event; repeating them as fourteen changes is noise, not history.
       const bornWith = group.every((e) => e.from_value === null || e.from_value === '');
-      if (bornWith && group[0].record_id === record.id && group[0].changed_at <= record.created + 1000) continue;
+      if (bornWith && group[0].write_id === creationWrite && group[0].record_id === record.id) continue;
 
       // The person changed the stage; Ain changed the five fields that follow
-      // from it. Lead with what a person did, and with the property the record
-      // is actually organised around.
+      // from it. Lead with what a person did, on the property the record is
+      // organised around, preferring a real before→after over a blank filled in.
       const positionOf = (entry: HistoryEntry): number =>
         crm.propertyOrNull(orgId, entry.object_type, entry.property)?.position ?? 900;
+      const rank = (entry: HistoryEntry): number =>
+        (entry.property === stageProperty ? 0 : 1_000_000)
+        + (entry.from_value === null || entry.from_value === '' ? 100_000 : 0)
+        + positionOf(entry);
       const chosen = group.filter((e) => e.source !== 'system');
-      const lead = (chosen.length ? chosen : group).slice().sort((a, b) => positionOf(a) - positionOf(b))[0];
+      const lead = (chosen.length ? chosen : group).slice().sort((a, b) => rank(a) - rank(b) || a.seq - b.seq)[0];
       const rest = group.filter((e) => e !== lead);
       const render = (entry: HistoryEntry): string => {
         const prop = crm.propertyOrNull(orgId, entry.object_type, entry.property);
@@ -133,12 +148,13 @@ export function buildTimeline(ctx: Ctx, crm: Crm, orgId: string, record: CrmReco
       const shown = rest.slice(0, 4);
       const body = [render(lead), ...shown.map((e) => `${e.property_label} ${render(e)}`)].join(' · ')
         + (rest.length > shown.length ? ` · and ${rest.length - shown.length} more` : '');
+      order.set(lead.id, lead.seq);
       items.push({
         object: 'timeline_item',
         id: lead.id,
         kind: 'property_change',
         at: lead.changed_at,
-        title: `${lead.property_label} changed`,
+        title: titleOf(lead),
         body,
         icon: 'history',
         actor_id: lead.actor_id,
@@ -147,6 +163,7 @@ export function buildTimeline(ctx: Ctx, crm: Crm, orgId: string, record: CrmReco
         via: lead.record_id === record.id ? null : { id: lead.record_id, object_type: lead.object_type, display_name: 'merged duplicate' },
         data: {
           property: lead.property, from: lead.from_value, to: lead.to_value, source: lead.source,
+          write_id: lead.write_id, seq: lead.seq,
           ...(rest.length ? {
             also: rest.map((e) => ({ property: e.property, label: e.property_label, from: e.from_value, to: e.to_value, source: e.source })),
           } : {}),
@@ -197,7 +214,19 @@ export function buildTimeline(ctx: Ctx, crm: Crm, orgId: string, record: CrmReco
     }
   }
 
-  return items.sort((a, b) => b.at - a.at || a.id.localeCompare(b.id)).slice(0, limit);
+  return items
+    .sort((a, b) => b.at - a.at || (order.get(b.id) ?? 0) - (order.get(a.id) ?? 0) || a.id.localeCompare(b.id))
+    .slice(0, limit);
+}
+
+/**
+ * A few history rows are record-level facts rather than property edits, and
+ * "Duplicate merged in changed" is not a sentence anybody wrote on purpose.
+ */
+function titleOf(lead: HistoryEntry): string {
+  if (lead.property === 'merged_from') return 'Duplicate merged in';
+  if (lead.property === 'archived') return lead.to_value === 'true' ? 'Record archived' : 'Record restored';
+  return `${lead.property_label} changed`;
 }
 
 function display(prop: PropertyDef | null, value: PropertyValue): string | null {

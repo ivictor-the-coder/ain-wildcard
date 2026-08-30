@@ -15,9 +15,9 @@
  *     `transform_quantity` bills in packages; the copy converts every rate and
  *     every tier boundary back into the units the customer counts in.
  */
-import { exponentOf, type Rational } from '../../../shared/money';
+import { exponentOf, ratRound, type Rational } from '../../../shared/money';
 import {
-  computeLineAmount, decimalToRat, pluralUnit, ratToDecimal, resolveForCurrency, tierCap, tierFlat, tierUnit,
+  decimalToRat, exactAmount, pluralUnit, ratToDecimal, resolveForCurrency, tierCap, tierFlat, tierUnit,
 } from './engine';
 import type { Price, PriceTier, Product, TransformQuantity } from './types';
 
@@ -119,14 +119,13 @@ function tierBands(tiers: PriceTier[], transform: TransformQuantity | null | und
     const cap = tierCap(tier);
     const upper = Number.isFinite(cap) ? cap * divide + slack : null;
     bands.push({ lower: previousUpper + 1, upper });
-    if (upper === null) break;
-    previousUpper = upper;
+    if (upper !== null) previousUpper = upper;
   }
   return bands;
 }
 
 function bandLabel(band: TierBand, unitNoun: string, locale: string, only: boolean): string {
-  if (only) return `every ${unitNoun}`;
+  if (only) return 'any quantity';
   if (band.upper === null) return `${qty(band.lower, locale)} and above`;
   if (band.lower === 1) return `first ${qty(band.upper, locale)} ${pluralUnit(unitNoun, band.upper)}`;
   return `${qty(band.lower, locale)}–${qty(band.upper, locale)}`;
@@ -172,11 +171,18 @@ export interface PriceDisplay {
 
 interface Charge { display: string; amount: number }
 
-/** What the engine really bills for `quantity` — the anchor for all "from" copy. */
+/**
+ * What the engine really bills for `quantity` — the anchor for all "from" copy.
+ * This is the same exact sum `computeLineAmount` rounds, so a headline can
+ * never drift from the invoice line it is describing.
+ */
 function chargeAt(price: Price, quantity: number, currency: string, locale: string, unitLabel: string): Charge | null {
   try {
-    const line = computeLineAmount(price, quantity, currency, { unitLabel });
-    return { display: formatMinorDecimal(line.amount_decimal, currency, locale), amount: line.amount };
+    const exact = exactAmount(price, quantity, currency, { unitLabel });
+    return {
+      display: formatMinorDecimal(ratToDecimal(exact), currency, locale),
+      amount: Number(ratRound(exact, 'half_up')),
+    };
   } catch {
     return null;
   }
@@ -195,8 +201,10 @@ export function describePrice(price: Price, currency: string, locale = 'en-US', 
     ? `${qty(transform.divide_by, locale)} ${pluralUnit(unitNoun, transform.divide_by)}`
     : unitNoun;
   const perRate = `per ${rateNoun}`;
+  const noChargeNoun = transform ? `charge per ${rateNoun}` : `per-${unitNoun} charge`;
   const intervalSuffix = !metered && interval ? ` ${interval}` : '';
   const cadenceSuffix = metered ? ` — ${cadencePhrase(price).toLowerCase()}` : '';
+  const zeroMoney = formatMinorDecimal('0', resolved.currency, locale);
 
   if (price.model === 'custom') {
     const preset = resolved.customUnitAmount?.preset;
@@ -231,14 +239,16 @@ export function describePrice(price: Price, currency: string, locale = 'en-US', 
     const paidUnit = (i: number) => !!units[i] && units[i]!.n !== 0n;
     const paidFlat = (i: number) => !!flats[i] && flats[i]!.n !== 0n;
 
-    const lines = tiers.map((tier, i) => {
+    const lines = tiers.map((_, i) => {
+      const unit = units[i];
+      const flat = flats[i];
       const label = bandLabel(bands[i], unitNoun, locale, only);
-      if (paidFlat(i) && units[i] && units[i]!.n === 0n) {
-        return `${label}: ${money(flats[i]!)} base, no ${perRate.slice(4)} charge`;
+      if (flat && flat.n !== 0n && unit && unit.n === 0n) {
+        return `${label}: ${money(flat)} base, no ${noChargeNoun}`;
       }
       const parts: string[] = [];
-      if (paidFlat(i)) parts.push(`${money(flats[i]!)} base`);
-      if (units[i]) parts.push(units[i]!.n === 0n ? 'included' : `${money(units[i]!)} ${perRate}`);
+      if (flat && flat.n !== 0n) parts.push(`${money(flat)} base`);
+      if (unit) parts.push(unit.n === 0n ? 'included' : `${money(unit)} ${perRate}`);
       return `${label}: ${parts.length ? parts.join(' + ') : 'no charge'}`;
     });
 
@@ -253,7 +263,7 @@ export function describePrice(price: Price, currency: string, locale = 'en-US', 
 
     /* Nothing is charged at any quantity: the one case "included" is honest. */
     if (!anyPaidUnit && !anyPaidFlat) {
-      const zero = floor?.display ?? money(units.find(Boolean) ?? decimalToRat('0'));
+      const zero = floor?.display ?? zeroMoney;
       return {
         amount: zero,
         amount_detail: null,
@@ -261,7 +271,7 @@ export function describePrice(price: Price, currency: string, locale = 'en-US', 
         cadence: cadencePhrase(price),
         unit: perRate,
         interval,
-        summary: `Included — no ${perRate.slice(4)} charge`,
+        summary: `Included — no ${noChargeNoun}`,
         tiers: lines,
         from: floor?.display ?? zero,
         from_amount: floor?.amount ?? 0,
@@ -278,16 +288,16 @@ export function describePrice(price: Price, currency: string, locale = 'en-US', 
       const totals = bands.map((band) => chargeAt(price, band.lower, resolved.currency, locale, unitNoun));
       const first = totals[0];
       const last = totals[totals.length - 1];
-      const head = first?.display ?? money(flats[0] ?? decimalToRat('0'));
+      const head = first?.display ?? zeroMoney;
       const firstUpper = bands[0].upper;
       const lastLower = bands[bands.length - 1].lower;
       let summary = `${head}${intervalSuffix}`;
       if (bands.length > 1 && firstUpper !== null && last) {
         const direction = first && last.amount < first.amount ? 'falling' : 'rising';
-        const ceiling = `${last.display}${intervalSuffix} above ${qty(lastLower - 1, locale)} ${pluralUnit(unitNoun, 2)}`;
+        const opening = `${head}${intervalSuffix} up to ${qty(firstUpper, locale)} ${pluralUnit(unitNoun, firstUpper)}`;
         summary = bands.length === 2
-          ? `${head}${intervalSuffix} up to ${qty(firstUpper, locale)} ${pluralUnit(unitNoun, firstUpper)}, then ${ceiling}`
-          : `${head}${intervalSuffix} up to ${qty(firstUpper, locale)} ${pluralUnit(unitNoun, firstUpper)}, ${direction} through ${bands.length} tiers to ${ceiling}`;
+          ? `${opening}, then ${last.display}${intervalSuffix}`
+          : `${opening}, ${direction} through ${bands.length} tiers to ${last.display}${intervalSuffix} above ${qty(lastLower - 1, locale)} ${pluralUnit(unitNoun, 2)}`;
       }
       return {
         amount: head,
@@ -309,17 +319,31 @@ export function describePrice(price: Price, currency: string, locale = 'en-US', 
     const entryIndex = tiers.findIndex((_, i) => paidUnit(i));
     const entryRate = money(units[entryIndex]!);
     const base = paidFlat(0) ? money(flats[0]!) : null;
-    const allowance = entryIndex > 0 && units[0] && units[0]!.n === 0n && bands[0].upper !== null
-      ? bands[0].upper
-      : null;
+    /*
+     * Everything under the first paid tier is an allowance, whether it is
+     * priced at zero or carries no per-unit rate at all — either way the
+     * customer is not charged per unit until this many units have gone by.
+     */
+    const allowance = entryIndex > 0 && bands[entryIndex].lower > 1 ? bands[entryIndex].lower - 1 : null;
+    const volumePriced = price.tiers_mode === 'volume';
+    const inUnits = (n: number) => `${qty(n, locale)} ${pluralUnit(unitNoun, n)}`;
+    const entryFlat = entryIndex > 0 && paidFlat(entryIndex) ? money(flats[entryIndex]!) : null;
+    // Volume tiering re-prices every unit at the tier it lands in, so "then
+    // $1.00 per event" would understate it: every event costs $1.00, not just
+    // the ones past the allowance.
+    const thenRate = `${entryFlat ? `${entryFlat} base + ` : ''}${entryRate}${volumePriced ? ` for every ${rateNoun}` : ` ${perRate}`}`;
 
     const clauses: string[] = [];
     if (base && allowance !== null) {
-      clauses.push(`${base}${intervalSuffix} including the first ${qty(allowance, locale)} ${pluralUnit(unitNoun, allowance)}, then ${entryRate} ${perRate}`);
+      clauses.push(volumePriced
+        ? `${base}${intervalSuffix} up to ${inUnits(allowance)}, then ${thenRate}`
+        : `${base}${intervalSuffix} including the first ${inUnits(allowance)}, then ${thenRate}`);
     } else if (base) {
       clauses.push(`${base}${intervalSuffix} + ${entryRate} ${perRate}`);
     } else if (allowance !== null) {
-      clauses.push(`First ${qty(allowance, locale)} ${pluralUnit(unitNoun, allowance)} included, then ${entryRate} ${perRate}`);
+      clauses.push(volumePriced
+        ? `Free up to ${inUnits(allowance)}, then ${thenRate}`
+        : `First ${inUnits(allowance)} included, then ${thenRate}`);
     } else {
       clauses.push(`${entryRate} ${perRate}${intervalSuffix}`);
     }
@@ -329,15 +353,24 @@ export function describePrice(price: Price, currency: string, locale = 'en-US', 
         ? `${money(flats[cheapestUnitIndex]!)} base + ${cheapestUnit} ${perRate}`
         : cheapestUnit!;
       const from = bands[cheapestUnitIndex].lower - 1;
-      clauses.push(price.tiers_mode === 'volume'
-        ? `falling to ${target} for every ${unitNoun} once you pass ${qty(from, locale)}`
+      clauses.push(volumePriced
+        ? `falling to ${target} for every ${rateNoun} once you pass ${qty(from, locale)}`
         : `falling to ${target} for ${pluralUnit(unitNoun, 2)} beyond ${qty(from, locale)}`);
     }
 
-    const headline = base ? `${base} base + ${entryRate} ${perRate}` : `${entryRate} ${perRate}`;
+    /*
+     * Volume tiering charges one tier for the whole quantity, so a base that
+     * only covers the allowance is not paid alongside the rate that follows it:
+     * the headline says what it buys instead of adding the two together.
+     */
+    const buys = volumePriced && base !== null && allowance !== null ? `up to ${inUnits(allowance)}` : null;
+    const detail = buys ?? (base ? `+ ${entryRate} ${perRate}` : null);
+    const headline = base
+      ? `${base} ${buys ?? `base + ${entryRate} ${perRate}`}`
+      : `${entryRate} ${perRate}`;
     return {
       amount: base ?? entryRate,
-      amount_detail: base ? `+ ${entryRate} ${perRate}` : null,
+      amount_detail: detail,
       headline,
       cadence: cadencePhrase(price),
       unit: base ? null : perRate,

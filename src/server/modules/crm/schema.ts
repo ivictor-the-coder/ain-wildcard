@@ -236,4 +236,31 @@ UPDATE crm_record_values SET
 DROP TABLE _crm_domain_fix;
 `,
   },
+  /**
+   * A millisecond clock cannot order an audit trail. Two saves inside the same
+   * millisecond are indistinguishable by `changed_at`, which made three things
+   * wrong at once: the timeline merged unrelated saves into one entry, paging
+   * by timestamp silently skipped every row that shared a millisecond with the
+   * page boundary, and "who moved this deal to Closed won" had no stable answer.
+   *
+   * `seq` is a monotonic counter assigned at insert, so (changed_at, seq) is a
+   * total order and a cursor keyed on it can never lose or repeat a row.
+   * `write_id` names the save a row belongs to, so a create and a later stage
+   * change can never fold together however close in time they land.
+   */
+  {
+    id: 'crm.0003_history_sequence',
+    sql: `
+ALTER TABLE crm_property_history ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE crm_property_history ADD COLUMN write_id TEXT;
+
+UPDATE crm_property_history SET seq = rowid WHERE seq = 0;
+UPDATE crm_property_history
+   SET write_id = 'aud_pre_seq_' || record_id || '_' || changed_at || '_' || COALESCE(actor_id, 'none')
+ WHERE write_id IS NULL;
+
+CREATE INDEX idx_crm_history_seq ON crm_property_history(org_id, record_id, changed_at DESC, seq DESC);
+CREATE INDEX idx_crm_history_write ON crm_property_history(org_id, write_id);
+`,
+  },
 ];

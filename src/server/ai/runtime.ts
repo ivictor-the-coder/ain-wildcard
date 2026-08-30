@@ -111,6 +111,12 @@ export interface AiCallContext {
   feature?: string;
   /** Tool names the operator has already approved for this run. */
   approvals?: string[];
+  /**
+   * Tool names this run is scoped to. `null`/absent means the whole catalogue;
+   * an empty array means no tools at all. The engine plans against this list,
+   * so scoping an agent actually scopes what it can do.
+   */
+  restrictTools?: string[] | null;
   /** Write tools are refused unless this is set. */
   allowWrites?: boolean;
   budget?: Partial<AiBudget>;
@@ -126,7 +132,7 @@ export interface AiCallContext {
 }
 
 export interface ToolFailure {
-  code: 'tool_not_found' | 'invalid_arguments' | 'write_not_permitted' | 'approval_required'
+  code: 'tool_not_found' | 'tool_not_permitted' | 'invalid_arguments' | 'write_not_permitted' | 'approval_required'
     | 'rate_limited' | 'step_budget_exhausted' | 'time_budget_exhausted' | 'tool_failed';
   message: string;
   param?: string;
@@ -148,6 +154,8 @@ export interface AinCompletion extends AiCompletion {
   spans: AiTraceSpan[];
   pendingApprovals: PendingApproval[];
   analysis?: EngineAnalysis;
+  /** Set when the preferred provider failed and another one answered. */
+  degraded?: { provider: string; answeredBy: string; code: string; message: string } | null;
 }
 
 export interface AinAiRuntime extends AiRuntime {
@@ -332,6 +340,17 @@ export function createAiRuntime(config: Config): AinAiRuntime {
           recoverable: true,
         });
       }
+      // A caller that scoped this run to a set of tools gets that set enforced
+      // here as well as in the planner, so no provider can widen it.
+      if (call.restrictTools && !call.restrictTools.includes(name)) {
+        return fail({
+          code: 'tool_not_permitted',
+          message: call.restrictTools.length
+            ? `This run is scoped to ${call.restrictTools.map((t) => `"${t}"`).join(', ')}; "${name}" is not in that list.`
+            : `This run was scoped to no tools, so "${name}" may not run.`,
+          recoverable: false,
+        });
+      }
       call.steps = (call.steps ?? 0) + 1;
       if (call.steps > budget.steps) {
         return fail({ code: 'step_budget_exhausted', message: `This run already used its ${budget.steps}-step budget.`, recoverable: false });
@@ -363,11 +382,16 @@ export function createAiRuntime(config: Config): AinAiRuntime {
           recoverable: false,
         });
       }
-      if (tool.requiresApproval && !(call.approvals ?? []).includes(name)) {
+      // Every write is confirmed by a person before it lands. A tool that forgot
+      // to set `requiresApproval` does not get a free pass: changing a
+      // customer's record is the thing being gated, not the flag.
+      if ((!tool.readOnly || tool.requiresApproval) && !(call.approvals ?? []).includes(name)) {
         const pending: PendingApproval = {
           tool: name,
           args: redactArgs(parsed as Record<string, unknown>),
-          reason: `${name} writes to the workspace and needs a person to approve it.`,
+          reason: tool.readOnly
+            ? `${name} is marked as needing a person to approve it before it runs.`
+            : `${name} changes workspace data, so a person approves it before it runs.`,
           readOnly: tool.readOnly,
         };
         (call.pendingApprovals ||= []).push(pending);
@@ -411,7 +435,12 @@ export function createAiRuntime(config: Config): AinAiRuntime {
       call.startedNs ||= process.hrtime.bigint();
       call.steps ||= 0;
 
-      const provider = runtime.active();
+      const preferred = runtime.active();
+      // The copilot does not go offline because a key was mistyped: providers
+      // are tried in order and the local engine is always the last one, so a
+      // 401 downgrades the answer instead of taking the surface down.
+      const chain = [preferred, ...providers.filter((p) => p !== preferred && p.available())];
+      const provider = preferred;
       const model = req.model || (provider.id === 'anthropic' ? ANTHROPIC_DEFAULT_MODEL : 'ain-engine-1');
       const question = [...req.messages].reverse().find((m) => m.role === 'user')?.content ?? '';
       const request: AiCompletionRequest = {
@@ -437,7 +466,43 @@ export function createAiRuntime(config: Config): AinAiRuntime {
       catch (e) { call.ctx.log.warn('ai.run_sink_failed', { error: (e as Error).message }); }
 
       try {
-        const completion = await provider.complete(request, call);
+        let degraded: AinCompletion['degraded'] = null;
+        let completion: AiCompletion | null = null;
+        for (let i = 0; i < chain.length; i++) {
+          const candidate = chain[i];
+          try {
+            completion = await candidate.complete(request, call);
+            break;
+          } catch (e) {
+            const failure = isApiError(e) ? e : null;
+            const message = (e as Error).message;
+            const span = makeSpan(call, 'provider', candidate.id, null);
+            span.ok = false;
+            span.errorCode = failure?.code ?? 'ai_provider_error';
+            span.errorMessage = message;
+            span.summary = `${candidate.label} failed: ${message}`;
+            record(call, span);
+            const next = chain[i + 1];
+            if (!next) throw e;
+            call.ctx.log.warn('ai.provider_failed', { provider: candidate.id, fallback: next.id, error: message });
+            degraded = {
+              provider: candidate.id,
+              answeredBy: next.id,
+              code: failure?.code ?? 'ai_provider_error',
+              message,
+            };
+          }
+        }
+        if (!completion) throw new Error('No AI provider produced a completion.');
+        if (degraded) {
+          completion = {
+            ...completion,
+            reasoning: [
+              `${degraded.provider} failed (${degraded.code}): ${degraded.message}. Answered by ${degraded.answeredBy} instead — this answer is degraded, not the configured provider's.`,
+              ...(completion.reasoning ?? []),
+            ],
+          };
+        }
         const analysis = (completion as AinCompletion).analysis;
         const finish: AiRunFinish = {
           runId: call.runId,
@@ -465,6 +530,7 @@ export function createAiRuntime(config: Config): AinAiRuntime {
           spans: call.spans,
           pendingApprovals: call.pendingApprovals,
           analysis,
+          degraded,
         };
       } catch (e) {
         const message = (e as Error).message;

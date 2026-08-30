@@ -27,6 +27,8 @@ export interface StepResult {
   args: Record<string, unknown>;
   result?: unknown;
   error?: { code: string; message: string };
+  /** True when this step changed the workspace, not just read it. */
+  write?: boolean;
 }
 
 export interface Citation { id: string; label: string; type: string }
@@ -42,6 +44,10 @@ export interface SynthesisInput {
   metric: MetricDetection | null;
   draft: DraftResult | null;
   pendingApprovals: PendingApproval[];
+  /** Set when the request asked for a write that could not be prepared. */
+  writeBlocked?: { wanted: string; reason: string } | null;
+  /** Tool names this run was scoped to, when the caller restricted it. */
+  scopedTools?: string[] | null;
 }
 
 export interface SynthesisOutput {
@@ -60,7 +66,8 @@ const isMetric = (value: unknown): boolean => !!value && typeof value === 'objec
 const isProfile = (value: unknown): boolean => !!value && typeof value === 'object' && 'totals' in (value as object) && 'contacts' in (value as object);
 const isTimeline = (value: unknown): boolean => !!value && typeof value === 'object' && 'items' in (value as object);
 const isSearch = (value: unknown): boolean => !!value && typeof value === 'object' && 'matches' in (value as object);
-const isRecordList = (value: unknown): boolean => !!value && typeof value === 'object' && 'records' in (value as object);
+const isRecordList = (value: unknown): boolean =>
+  !!value && typeof value === 'object' && 'records' in (value as object) && 'object_type' in (value as object);
 const isAggregate = (value: unknown): boolean => !!value && typeof value === 'object' && 'measure' in (value as object) && 'groups' in (value as object);
 
 export class Facts {
@@ -74,6 +81,79 @@ export class Facts {
 }
 
 const bullet = (line: string) => `• ${line}`;
+
+/** How each metric reads with two periods either side of it. */
+const COMPARE_VERB: Record<string, string> = {
+  spend: 'spent', revenue: 'collected', invoiced: 'invoiced', closed_won: 'booked',
+  closed_lost: 'lost', outstanding: 'carried', pipeline: 'carried', weighted_pipeline: 'carried',
+  avg_deal_size: 'averaged', sales_cycle: 'averaged', win_rate: 'closed', mrr: 'held',
+  new_customers: 'added', customers: 'had', deal_count: 'had', open_tickets: 'had',
+  tickets_created: 'logged', resolution_time: 'averaged', csat: 'averaged',
+};
+
+const verb = (metric: MetricToolResult): string => COMPARE_VERB[metric.metric] ?? 'recorded';
+
+/**
+ * Two runs of the same metric over different periods — the shape a real period
+ * comparison takes. Two runs over different *accounts* is a different answer,
+ * so this returns null for that and the account branch handles it.
+ */
+function periodPair(metrics: MetricToolResult[]): [MetricToolResult, MetricToolResult] | null {
+  if (metrics.length < 2) return null;
+  const [a, b] = metrics;
+  if (a.metric !== b.metric) return null;
+  if ((a.subject?.id ?? null) !== (b.subject?.id ?? null)) return null;
+  if (a.window.start === b.window.start && a.window.end === b.window.end) return null;
+  return [a, b];
+}
+
+/** A write, described the way the person approving it needs to read it. */
+export function describeWrite(
+  tool: string,
+  args: Record<string, unknown>,
+  nameOf: (id: string) => string | null = () => null,
+): string[] {
+  const named = (id: string) => {
+    const label = nameOf(id);
+    return label ? `${label} (${id})` : id;
+  };
+  const value = (key: string) => (args[key] === undefined || args[key] === null ? '' : String(args[key]));
+  if (tool === 'add_note') {
+    const ids = Array.isArray(args.record_ids) ? (args.record_ids as unknown[]).map(String) : [];
+    return [
+      `Note on ${ids.map(named).join(', ') || 'no record'}`,
+      value('subject') ? `Subject: ${value('subject')}` : '',
+      value('body'),
+    ].filter(Boolean);
+  }
+  if (tool === 'create_record') {
+    const properties = (args.properties ?? {}) as Record<string, unknown>;
+    const associate = Array.isArray(args.associate_to) ? (args.associate_to as unknown[]).map(String) : [];
+    return [
+      `New ${humanise(value('object_type')).toLowerCase()}`,
+      ...Object.entries(properties)
+        .filter(([, v]) => v !== undefined && v !== null && v !== '')
+        .map(([k, v]) => `${humanise(k)}: ${/(_at|_date)$/.test(k) && typeof v === 'number' ? formatDate(v, { timeZone: 'UTC' }) : truncate(String(v), 160)}`),
+      associate.length ? `Linked to ${associate.map(named).join(', ')}` : '',
+    ].filter(Boolean);
+  }
+  if (tool === 'update_record') {
+    const properties = (args.properties ?? {}) as Record<string, unknown>;
+    return [
+      `${humanise(value('object_type'))} ${named(value('id'))}`,
+      ...Object.entries(properties).map(([k, v]) => `${humanise(k)} → ${truncate(String(v), 120)}`),
+    ];
+  }
+  if (tool === 'schedule_followup') {
+    return [
+      `Follow-up on ${named(value('record_id'))}`,
+      `Due in ${value('in_days')} ${value('in_days') === '1' ? 'day' : 'days'}`,
+      value('assignee_id') ? `Assigned to ${named(value('assignee_id'))}` : 'Assigned to you',
+      value('note'),
+    ].filter(Boolean);
+  }
+  return Object.entries(args).map(([k, v]) => `${humanise(k)}: ${truncate(String(v), 120)}`);
+}
 
 /* ------------------------------- composers -------------------------------- */
 
@@ -204,10 +284,20 @@ function recordLines(list: RecordSearchResult, facts: Facts, workspace: Workspac
   });
 }
 
-function citationsFrom(input: SynthesisInput): Citation[] {
+/**
+ * Citations are provenance, not a list of everything the resolver considered.
+ * A record only earns one if the answer actually names it, or if it is one of
+ * the rows a stated number was computed from. That is why a trigram near-miss
+ * on another account never shows up under an answer about a different one.
+ */
+function citationsFrom(input: SynthesisInput, content: string): Citation[] {
   const out = new Map<string, Citation>();
-  const add = (id: string | null | undefined, label: string, type: string) => {
-    if (!id || out.has(id)) return;
+  /** Rows a stated number was computed from — cited whether or not they are named. */
+  const grounded = new Set<string>();
+  const add = (id: string | null | undefined, label: string, type: string, isGrounded = false) => {
+    if (!id) return;
+    if (isGrounded) grounded.add(id);
+    if (out.has(id)) return;
     out.set(id, { id, label, type });
   };
   for (const step of input.steps) {
@@ -215,15 +305,15 @@ function citationsFrom(input: SynthesisInput): Citation[] {
     const value = step.result;
     if (isProfile(value)) {
       const profile = value as AccountProfileResult;
-      add(profile.id, profile.name, profile.object_type);
+      add(profile.id, profile.name, profile.object_type, true);
       for (const deal of profile.open_deals.slice(0, 4)) add(deal.id, deal.name, 'deal');
       for (const contact of profile.contacts.slice(0, 3)) add(contact.id, contact.name, 'contact');
       for (const ticket of profile.open_tickets.slice(0, 3)) add(ticket.id, ticket.subject, 'ticket');
     } else if (isMetric(value)) {
       const metric = value as MetricToolResult;
-      if (metric.subject) add(metric.subject.id, metric.subject.label, metric.subject.type);
-      for (const row of metric.evidence.slice(0, 6)) add(row.id, row.label, row.type);
-      for (const account of metric.top_accounts.slice(0, 3)) add(account.id, account.label, 'company');
+      if (metric.subject) add(metric.subject.id, metric.subject.label, metric.subject.type, true);
+      for (const row of metric.evidence.slice(0, 6)) add(row.id, row.label, row.type, true);
+      for (const account of metric.top_accounts.slice(0, 3)) add(account.id, account.label, 'company', true);
     } else if (isSearch(value)) {
       for (const match of (value as WorkspaceSearchResult).matches.slice(0, 5)) add(match.id, match.label, match.type);
     } else if (isRecordList(value)) {
@@ -232,11 +322,26 @@ function citationsFrom(input: SynthesisInput): Citation[] {
     } else if (isTimeline(value)) {
       for (const item of (value as { items: TimelineItem[] }).items.slice(0, 4)) add(item.id, item.title, item.kind);
     } else if (isAggregate(value)) {
-      for (const id of (value as RecordAggregateResult).sample_ids.slice(0, 4)) add(id, 'matched record', 'record');
+      for (const id of (value as RecordAggregateResult).sample_ids.slice(0, 4)) add(id, 'matched record', 'record', true);
     }
   }
-  for (const entity of input.entities.slice(0, 3)) add(entity.entity.id, entity.entity.label, entity.entity.type);
-  return [...out.values()].slice(0, 12);
+  if (input.subject) {
+    const resolved = input.entities.find((e) => e.entity.id === input.subject!.id);
+    if (resolved) add(resolved.entity.id, resolved.entity.label, resolved.entity.type, true);
+  }
+  // A write is about the record it touches, whether or not the answer names it.
+  for (const step of input.steps) {
+    if (!step.write) continue;
+    const targets = [step.args.record_id, step.args.id, ...(Array.isArray(step.args.record_ids) ? step.args.record_ids : [])];
+    for (const target of targets) {
+      if (typeof target !== 'string') continue;
+      const entity = input.entities.find((e) => e.entity.id === target);
+      add(target, entity?.entity.label ?? target, entity?.entity.type ?? 'record', true);
+    }
+  }
+  return [...out.values()]
+    .filter((citation) => grounded.has(citation.id) || content.includes(citation.label) || content.includes(citation.id))
+    .slice(0, 12);
 }
 
 interface Gathered {
@@ -299,6 +404,10 @@ function emptyAnswer(input: SynthesisInput, facts: Facts): string {
 
 export function synthesise(input: SynthesisInput): SynthesisOutput {
   const facts = new Facts(input.workspace);
+  const nameOf = (id: string): string | null =>
+    input.entities.find((e) => e.entity.id === id)?.entity.label
+    ?? input.workspace.people.find((p) => p.id === id)?.name
+    ?? null;
   const metrics = resultsOf<MetricToolResult>(input.steps, 'business_metric', isMetric);
   const profiles = input.steps.filter((s) => ok(s) && isProfile(s.result)).map((s) => s.result as AccountProfileResult);
   const timelines = input.steps.filter((s) => ok(s) && isTimeline(s.result)).map((s) => s.result as { record: string; items: TimelineItem[] });
@@ -316,11 +425,37 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
       blocks.push(`Written from: ${draft.personalisation.join('; ')}.`);
     }
     if (draft.recipient?.email) blocks.push(`Ready to send to ${draft.recipient.name} <${draft.recipient.email}>.`);
-    return { content: blocks.join('\n\n'), citations: citationsFrom(input) };
+    const drafted = blocks.join('\n\n');
+    return { content: drafted, citations: citationsFrom(input, drafted) };
   }
 
   switch (input.intent.intent) {
     case 'compare': {
+      const periods = periodPair(metrics);
+      if (periods) {
+        const [a, b] = periods;
+        const delta = b.value - a.value;
+        const percent = a.value === 0 ? null : (delta / Math.abs(a.value)) * 100;
+        const who = a.subject ? a.subject.label : input.workspace.name;
+        const deltaText = a.unit === 'money'
+          ? facts.money(Math.abs(delta))
+          : Math.abs(Number(delta.toFixed(a.unit === 'percent' ? 1 : 0))).toLocaleString(input.workspace.locale);
+        const direction = delta > 0 ? 'up' : delta < 0 ? 'down' : 'level';
+        blocks.push(delta === 0
+          ? `${who} ${verb(a)} the same ${a.label.toLowerCase()} in both periods: ${a.formatted} in ${a.window.label} and in ${b.window.label}.`
+          : `${who} ${verb(a)} ${a.formatted} in ${a.window.label} and ${b.formatted} in ${b.window.label} — ${direction} ${deltaText}${percent === null ? '' : ` (${formatSignedPercent(percent)})`}.`);
+        for (const metric of [a, b]) {
+          blocks.push(bullet(`${metric.window.label}: ${metric.formatted}${metric.count ? ` from ${metric.source}` : ' — nothing recorded'}${metric.window.partial ? ' (period still running)' : ''}`));
+        }
+        const partial = [a, b].filter((m) => m.window.partial && !m.snapshot);
+        if (partial.length === 1) {
+          blocks.push(`${partial[0].window.label} is still running, so it is a period-to-date figure and the two periods are not yet like for like.`);
+        }
+        for (const metric of [a, b]) {
+          if (metric.groups.length) blocks.push(`${metric.window.label} breakdown: ${metric.groups.slice(0, 6).map((g) => `${g.label} ${g.formatted}`).join(' · ')}.`);
+        }
+        break;
+      }
       if (metrics.length >= 2) {
         const [a, b] = metrics;
         const leader = a.value >= b.value ? a : b;
@@ -498,16 +633,26 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
     }
 
     case 'act': {
+      const written = input.steps.filter((s) => s.ok && s.write);
       if (input.pendingApprovals.length) {
+        // Breeze shows a confirmation card before it writes; so does this, with
+        // the extracted content rather than the sentence the user typed.
         const pending = input.pendingApprovals[0];
-        blocks.push(`I prepared ${pending.tool} and stopped: it writes to the workspace, so it needs your approval before it runs.`);
-        blocks.push(`Arguments: ${Object.entries(pending.args).map(([k, v]) => `${k}=${truncate(String(v), 60)}`).join(', ')}.`);
-        blocks.push('Approve it from the run detail and I will finish the job.');
+        blocks.push(`I prepared ${pending.tool} and stopped there — it changes the workspace, so it needs your approval first. Nothing has been written.`);
+        blocks.push(describeWrite(pending.tool, pending.args, nameOf).join('\n'));
+        blocks.push(input.pendingApprovals.length > 1
+          ? `Approve or edit ${countOf(input.pendingApprovals.length, 'pending write')} from the approvals queue and I will finish the job.`
+          : 'Approve it from the approvals queue and I will write it; decline and nothing happens.');
+      } else if (written.length) {
+        blocks.push(`Done — ${listPhrase(written.map((s) => describeWrite(s.tool, s.args, nameOf)[0] ?? s.tool)).toLowerCase()}.`);
+        for (const step of written) blocks.push(describeWrite(step.tool, step.args, nameOf).join('\n'));
       } else {
-        const written = input.steps.filter((s) => s.ok && !s.tool.startsWith('record_') && !s.tool.startsWith('business_'));
-        blocks.push(written.length
-          ? `Done: ${written.map((s) => s.tool).join(', ')}.`
-          : 'I did not change anything — the request did not resolve to a write tool I am allowed to run.');
+        const failed = input.steps.filter((s) => !s.ok && s.write);
+        blocks.push(failed.length
+          ? `I changed nothing: ${failed.map((s) => `${s.tool} failed (${s.error?.code}) — ${s.error?.message}`).join('; ')}`
+          : input.writeBlocked
+            ? `I changed nothing. That reads as a request to ${humanise(input.writeBlocked.wanted).toLowerCase()}, but ${input.writeBlocked.reason}`
+            : 'I changed nothing — the request did not resolve to a write I can prepare. Name the record and what should change, e.g. "move the Rheinwerk OEE deal to Negotiation" or "add a note to Rheinwerk saying the pilot slipped to October".');
         if (profiles.length) blocks.push(...profileParagraph(profiles[0], facts, input.workspace));
       }
       break;
@@ -518,11 +663,17 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
   }
 
   if (!blocks.length) blocks.push(...overview(input, facts, { metrics, profiles, lists, aggregates, searches }));
+  if (!blocks.length && input.scopedTools) {
+    blocks.push(input.scopedTools.length
+      ? `This run was scoped to ${listPhrase(input.scopedTools.map((t) => `\`${t}\``))}, and none of those can answer that. Nothing else ran — the allowlist is enforced on the plan, not just on what I was offered.`
+      : 'This run was scoped to no tools at all, so I read nothing. Send a `tools` list with at least one capability, or omit it for the full read-only catalogue.');
+  }
   if (!blocks.length) blocks.push(emptyAnswer(input, facts));
 
   if (input.pendingApprovals.length && input.intent.intent !== 'act') {
-    blocks.push(`${countOf(input.pendingApprovals.length, 'step')} needs approval before it can run: ${input.pendingApprovals.map((p) => p.tool).join(', ')}.`);
+    blocks.push(`${countOf(input.pendingApprovals.length, 'step')} needs approval before it can run: ${input.pendingApprovals.map((p) => p.tool).join(', ')}. Nothing was written.`);
   }
 
-  return { content: blocks.filter(Boolean).join('\n\n'), citations: citationsFrom(input) };
+  const content = blocks.filter(Boolean).join('\n\n');
+  return { content, citations: citationsFrom(input, content) };
 }

@@ -1,6 +1,5 @@
 import type { Ctx } from '../../kernel/context';
 import { badRequest, conflict } from '../../../shared/errors';
-import { newId } from '../../../shared/ids';
 import type { Crm } from './store';
 import type { CrmRecord, PropertyValue, WriteOptions } from './types';
 import { canonicalDigits, canonicalDomain, isEmptyValue } from './values';
@@ -217,12 +216,13 @@ export function mergeRecords(
     if (activityTypes.includes(edge.from_type) || activityTypes.includes(edge.to_type)) activitiesMoved++;
   }
 
-  ctx.db.insert('crm_property_history', {
-    id: newId('audit'), org_id: orgId, record_id: winner.id, object_type: objectType,
-    property: 'merged_from', from_value: null, to_value: `${loser.display_name} (${loser.id})`,
-    changed_at: now, actor_id: opts.actorId ?? null, actor_type: opts.actorType ?? 'user',
-    source: 'merge', request_id: opts.requestId ?? null,
-  });
+  // Through the store, so the merge lands in the same totally-ordered audit
+  // trail as everything else and pages with the same cursor.
+  crm.recordHistory(
+    orgId, objectType, winner.id, 'merged_from',
+    null, `${loser.display_name} (${loser.id})`, now,
+    { ...opts, source: 'merge' },
+  );
 
   ctx.emit(orgId, `${objectType}.merged`, {
     winner_id: winner.id, merged_id: loser.id, display_name: winner.display_name,

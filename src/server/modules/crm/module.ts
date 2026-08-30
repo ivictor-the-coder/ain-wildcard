@@ -4,18 +4,19 @@ import { created, list, noContent, type Req } from '../../kernel/http';
 import { ApiError, badRequest, isApiError, notFound } from '../../../shared/errors';
 import v from '../../../shared/validate';
 import { CRM_MIGRATIONS } from './schema';
-import { Crm } from './store';
+import { Crm, type HistoryQuery } from './store';
 import { buildTimeline, type TimelineOptions } from './timeline';
 import { findSimilar, mergeRecords, type MergeResult, type SimilarMatch } from './dedupe';
 import { installBuiltins, seedCrm } from './seed';
 import { EXPRESSION_FUNCTIONS } from './expr';
 import { BUILTIN_PROPERTY_NAMES, suggestProperty } from './filter';
 import { FILTER_OPERATORS } from './types';
-import type { PipelineInput, PipelinePatch, StageUsage } from './pipelines';
+import { CUSTOM_PIPELINE_PROPERTIES, safeMinorUnits, type PipelineInput, type PipelinePatch, type StageUsage } from './pipelines';
+import { pipelineVelocity, stageHistory } from './velocity';
 import type {
   AssociationSummary, AssociationTypeDef, ChangeSource, CrmRecord, FilterNode, HistoryEntry,
-  ObjectTypeDef, PipelineDef, PipelineStageDef, PropertyDef, PropertyValue, SearchQuery, SearchResult,
-  TimelineItem, ViewDef, WriteOptions,
+  HistoryPage, ObjectTypeDef, PipelineDef, PipelineStageDef, PropertyDef, PropertyValue, SearchQuery,
+  SearchResult, StageSpell, TimelineItem, ViewDef, WriteOptions,
 } from './types';
 
 /* -------------------------------- service --------------------------------- */
@@ -67,7 +68,11 @@ export interface CrmService {
 
   logActivity(orgId: string, input: LogActivityInput, opts?: WriteOptions): CrmRecord;
   timeline(orgId: string, objectType: string, id: string, opts?: TimelineOptions): TimelineItem[];
-  history(orgId: string, recordId: string, opts?: { limit?: number; property?: string; before?: number }): HistoryEntry[];
+  history(orgId: string, recordId: string, opts?: HistoryQuery): HistoryEntry[];
+  /** The same trail, paged on a cursor that cannot skip a row. */
+  historyPage(orgId: string, recordId: string, opts?: HistoryQuery): HistoryPage;
+  /** Every stage a record has been through, replayed from its history. */
+  stageHistory(orgId: string, objectType: string, id: string): StageSpell[];
 
   merge(orgId: string, objectType: string, winnerId: string, loserId: string, opts?: WriteOptions): MergeResult;
   similar(orgId: string, objectType: string, id: string, limit?: number): SimilarMatch[];
@@ -110,6 +115,18 @@ const writeOptions = (req: Req, source?: ChangeSource): WriteOptions => ({
   source: source ?? (req.auth.kind === 'api_key' ? 'api' : 'user'),
   requestId: req.requestId,
 });
+
+/**
+ * An instant a caller can actually type. `v.timestamp()` accepts a JSON number
+ * or an ISO string, but a query string is always text — so the endpoint that
+ * emits `changed_at: 1788130545105` rejected that exact value when it came
+ * back as `?before=1788130545105`. Numeric strings coerce here.
+ */
+const instant = () => v.transform(
+  v.union(v.int(), v.timestamp()),
+  (value: number) => value,
+  { type: 'integer', format: 'unix-ms', fields: undefined, description: 'Unix milliseconds or an ISO-8601 timestamp.' },
+);
 
 const splitList = (value: unknown): string[] =>
   typeof value === 'string' && value.trim() ? value.split(',').map((s) => s.trim()).filter(Boolean) : [];
@@ -233,6 +250,8 @@ export default defineModule({
 
       timeline: (orgId, objectType, id, opts) => buildTimeline(ctx, crm, orgId, crm.require(orgId, objectType, id), opts),
       history: (orgId, recordId, opts) => crm.history(orgId, recordId, opts),
+      historyPage: (orgId, recordId, opts) => crm.historyPage(orgId, recordId, opts),
+      stageHistory: (orgId, objectType, id) => stageHistory(ctx, crm, orgId, crm.require(orgId, objectType, id)),
 
       merge: (orgId, objectType, winnerId, loserId, opts) =>
         ctx.atomic(() => mergeRecords(ctx, crm, orgId, objectType, winnerId, loserId, opts)),
@@ -296,7 +315,7 @@ export default defineModule({
         object: 'object_type', ...type,
         properties: crm.properties(req.auth.orgId, type.name),
         views: crm.views(req.auth.orgId, type.name),
-        ...(crm.pipelines.binding(type.name) ? { pipelines: crm.pipelines.list(req.auth.orgId, type.name) } : {}),
+        ...(crm.pipelines.binding(req.auth.orgId, type.name) ? { pipelines: crm.pipelines.list(req.auth.orgId, type.name) } : {}),
         associations: crm.associationTypes(req.auth.orgId).filter((a) => a.from_object === type.name || a.to_object === type.name || a.from_object === '*'),
         record_count: ctx.db.count(`SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = ? AND archived = 0 AND merged_into IS NULL`, req.auth.orgId, type.name),
       };
@@ -397,7 +416,7 @@ export default defineModule({
      * from the value index at request time.
      */
     const summarise = (orgId: string, objectType: string, pipeline: PipelineDef, usage: Map<string, StageUsage>) => {
-      const binding = crm.pipelines.requireBinding(objectType);
+      const binding = crm.pipelines.requireBinding(orgId, objectType);
       const money = !!binding.amount_property;
       let records = 0;
       let openAmount = 0;
@@ -422,7 +441,11 @@ export default defineModule({
         pipeline_property: binding.pipeline_property,
         stage_property: binding.stage_property,
         record_count: records,
-        ...(money ? { open_amount: openAmount, weighted_amount: weighted, won_amount: wonAmount } : {}),
+        ...(money ? {
+          open_amount: safeMinorUnits(openAmount),
+          weighted_amount: safeMinorUnits(weighted),
+          won_amount: safeMinorUnits(wonAmount),
+        } : {}),
         stages,
         created: pipeline.created, updated: pipeline.updated,
       };
@@ -436,7 +459,7 @@ export default defineModule({
 
     router.get('/v1/pipelines', (req: Req) => {
       const orgId = req.auth.orgId;
-      const data = crm.pipelines.boundTypes()
+      const data = crm.pipelines.boundTypes(orgId)
         .filter((type) => crm.objectTypeOrNull(orgId, type))
         .flatMap((type) => pipelinesOf(orgId, type, false));
       return list(data, { totalCount: data.length, url: '/v1/pipelines' });
@@ -449,7 +472,7 @@ export default defineModule({
       const orgId = req.auth.orgId;
       const objectType = req.params.objectType;
       crm.objectType(orgId, objectType);
-      crm.pipelines.requireBinding(objectType);
+      crm.pipelines.requireBinding(orgId, objectType);
       const data = pipelinesOf(orgId, objectType, String(req.query.include_archived) === 'true');
       return list(data, { totalCount: data.length, url: `/v1/pipelines/${objectType}` });
     }, {
@@ -458,15 +481,43 @@ export default defineModule({
       query: v.object({ include_archived: v.optional(v.boolean()) }, { strict: true }),
     });
 
+    /**
+     * A user-defined object earns a pipeline by asking for one. HubSpot makes
+     * you add the properties yourself and then wire them up; here the first
+     * pipeline on an "Installation" object provisions `pipeline`, `stage`,
+     * `stage_entered_at` and the close stamps, and the object behaves exactly
+     * like a deal from that moment on.
+     */
+    const enablePipelines = (orgId: string, objectType: string): string[] => {
+      if (crm.pipelines.binding(orgId, objectType)) return [];
+      const objectDef = crm.objectType(orgId, objectType);
+      if (objectDef.system) crm.pipelines.requireBinding(orgId, objectType);
+      const addedProperties: string[] = [];
+      for (const prop of CUSTOM_PIPELINE_PROPERTIES) {
+        if (crm.propertyOrNull(orgId, objectType, prop.name)) continue;
+        crm.defineProperty(orgId, objectType, { ...prop, system: true });
+        addedProperties.push(prop.name);
+      }
+      crm.reloadSchema();
+      return addedProperties;
+    };
+
     router.post('/v1/pipelines/:objectType', (req: Req) => {
       const orgId = req.auth.orgId;
       const objectType = req.params.objectType;
       crm.objectType(orgId, objectType);
-      const pipeline = ctx.atomic(() => crm.pipelines.create(orgId, objectType, req.body as PipelineInput));
-      return created(summarise(orgId, objectType, pipeline, crm.pipelines.usage(orgId, objectType)));
+      let provisioned: string[] = [];
+      const pipeline = ctx.atomic(() => {
+        provisioned = enablePipelines(orgId, objectType);
+        return crm.pipelines.create(orgId, objectType, req.body as PipelineInput);
+      });
+      return created({
+        ...summarise(orgId, objectType, pipeline, crm.pipelines.usage(orgId, objectType)),
+        ...(provisioned.length ? { properties_provisioned: provisioned } : {}),
+      });
     }, {
       summary: 'Create a pipeline with its ordered stages', tags: ['crm'], roles: ['admin'],
-      description: 'Stages are ordered as given. At least one must set `is_closed`, or nothing ever leaves the pipeline. Creating a pipeline regenerates the options of the pipeline and stage properties, so lists and forms pick it up immediately.',
+      description: 'Stages are ordered as given. At least one must set `is_closed`, or nothing ever leaves the pipeline. Creating a pipeline regenerates the options of the pipeline and stage properties, so lists and forms pick it up immediately. Pointing this at a custom object type puts that object on pipelines for the first time: `properties_provisioned` names the stage, entered-stage and close properties created for it, and stage moves start restamping them like they do on a deal.',
       body: v.object({
         name: v.string({ min: 2, max: 60, pattern: /^[a-z][a-z0-9_]*$/ }),
         label: v.string({ min: 1, max: 80 }),
@@ -484,6 +535,12 @@ export default defineModule({
       return summarise(orgId, objectType, pipeline, crm.pipelines.usage(orgId, objectType));
     }, { summary: 'Retrieve one pipeline by name or id', tags: ['crm'] });
 
+    router.get('/v1/pipelines/:objectType/:id/velocity', (req: Req) =>
+      pipelineVelocity(ctx, crm, req.auth.orgId, req.params.objectType, req.params.id), {
+      summary: 'Stage velocity: time in stage, advance rate and what has stopped moving', tags: ['crm'],
+      description: 'The funnel, replayed from the property history rather than cached in three columns per stage. Each stage reports how many records have ever entered it, the median and mean days they stayed, how long the ones sitting there now have been waiting, and how many are stalled — where stalled means longer than twice this stage’s own median, floored at three days, and `stalled_after_days` says what that worked out to. Everything a record left months ago still counts, which is what a cached per-stage column can never do.',
+    });
+
     /**
      * Editing a stage is editing every record sitting in it. Raising the
      * probability of "Proposal sent" from 60 to 70 has to move the forecast of
@@ -493,7 +550,7 @@ export default defineModule({
     const restampStage = (req: Req, objectType: string, pipeline: string, stages: string[]): number => {
       if (!stages.length) return 0;
       const orgId = req.auth.orgId;
-      const binding = crm.pipelines.requireBinding(objectType);
+      const binding = crm.pipelines.requireBinding(orgId, objectType);
       const rows = ctx.db.all<{ id: string }>(
         `SELECT r.id FROM crm_records r
            JOIN crm_record_values pv ON pv.record_id = r.id AND pv.property = ?
@@ -559,11 +616,11 @@ export default defineModule({
         category: t.category, primary_property: t.primary_property, secondary_property: t.secondary_property,
       })),
       association_types: crm.associationTypes(req.auth.orgId),
-      pipelines: crm.pipelines.boundTypes()
+      pipelines: crm.pipelines.boundTypes(req.auth.orgId)
         .filter((type) => crm.objectTypeOrNull(req.auth.orgId, type))
         .flatMap((type) => crm.pipelines.list(req.auth.orgId, type).map((p) => ({
           object_type: type, name: p.name, label: p.label, is_default: p.is_default,
-          stage_property: crm.pipelines.requireBinding(type).stage_property,
+          stage_property: crm.pipelines.requireBinding(req.auth.orgId, type).stage_property,
           stages: p.stages.map((stage) => ({
             name: stage.name, label: stage.label, probability: stage.probability,
             is_closed: stage.is_closed, is_won: stage.is_won,
@@ -593,6 +650,7 @@ export default defineModule({
             deals: used.records, amount: used.amount, weighted_amount: used.weighted_amount,
           };
         }));
+      const open = board.filter((r) => !r.is_closed);
       const lifecycle = ctx.db.all<{ stage: string; n: number }>(
         `SELECT v.value_text AS stage, COUNT(*) AS n FROM crm_record_values v
           JOIN crm_records r ON r.id = v.record_id
@@ -610,9 +668,9 @@ export default defineModule({
         records: byType,
         pipeline: board,
         open_pipeline: {
-          deals: board.filter((r) => !r.is_closed).reduce((n, r) => n + r.deals, 0),
-          amount: board.filter((r) => !r.is_closed).reduce((n, r) => n + r.amount, 0),
-          weighted_amount: board.filter((r) => !r.is_closed).reduce((n, r) => n + r.weighted_amount, 0),
+          deals: open.reduce((n, r) => n + r.deals, 0),
+          amount: safeMinorUnits(open.reduce((n, r) => n + r.amount, 0)),
+          weighted_amount: safeMinorUnits(open.reduce((n, r) => n + r.weighted_amount, 0)),
         },
         lifecycle: lifecycle.map((r) => ({ stage: r.stage, companies: r.n })),
         activity_last_30_days: activityRows.map((r) => ({ type: r.object_type, count: r.n })),
@@ -936,7 +994,7 @@ export default defineModule({
       const limit = q.limit ? Number(q.limit) : 50;
       const items = buildTimeline(ctx, crm, orgId, record, {
         limit,
-        before: q.before ? Number(q.before) : undefined,
+        before: q.before ? instant().parse(q.before, 'before') : undefined,
         rollUp: q.roll_up === undefined ? undefined : String(q.roll_up) === 'true',
         kinds: splitList(q.kinds) as TimelineOptions['kinds'],
       });
@@ -950,7 +1008,7 @@ export default defineModule({
       description: 'A company timeline rolls up the activity logged against its contacts, deals and tickets. Pass `roll_up=false` for only what is attached directly.',
       query: v.object({
         limit: v.optional(v.int({ min: 1, max: 200 })),
-        before: v.optional(v.timestamp()),
+        before: v.optional(instant()),
         roll_up: v.optional(v.boolean()),
         kinds: v.optional(v.string({ max: 120 })),
       }, { strict: true }),
@@ -960,19 +1018,57 @@ export default defineModule({
       const orgId = req.auth.orgId;
       crm.require(orgId, req.params.type, req.params.id);
       const q = req.query as Record<string, string | undefined>;
-      const entries = crm.history(orgId, req.params.id, {
-        limit: q.limit ? Number(q.limit) : 100,
+      const limit = q.limit ? Number(q.limit) : 100;
+      const page = crm.historyPage(orgId, req.params.id, {
+        limit,
         property: q.property,
-        before: q.before ? Number(q.before) : undefined,
+        before: q.before ? instant().parse(q.before, 'before') : undefined,
+        since: q.since ? instant().parse(q.since, 'since') : undefined,
+        after: q.after,
+        order: q.order === 'asc' ? 'asc' : 'desc',
       });
-      return list(entries, { hasMore: entries.length === (q.limit ? Number(q.limit) : 100) });
+      return {
+        ...list(page.entries, { hasMore: page.has_more, nextCursor: page.next_cursor }),
+        next_page: page.next_cursor
+          ? `/v1/records/${req.params.type}/${req.params.id}/history?after=${encodeURIComponent(page.next_cursor)}`
+            + `&limit=${limit}${q.property ? `&property=${encodeURIComponent(q.property)}` : ''}`
+          : null,
+      };
     }, {
       summary: 'Every recorded change to a record, with who changed it and how', tags: ['crm'],
+      description: 'Newest first, totally ordered on `(changed_at, seq)` — a monotonic write sequence, because a millisecond clock cannot order an audit trail and paging on one silently drops every row that shares a tick with a page boundary. Page by passing the previous page’s `next_cursor` back as `after`; `has_more` is measured by reading one row past the page, not inferred from its length. `before`/`since` are time filters and accept unix milliseconds or ISO-8601. Rows carry `write_id`, so every property one save touched can be pulled out together.',
       query: v.object({
         limit: v.optional(v.int({ min: 1, max: 500 })),
         property: v.optional(v.string({ max: 60 })),
-        before: v.optional(v.timestamp()),
+        before: v.optional(instant()),
+        since: v.optional(instant()),
+        after: v.optional(v.string({ max: 200 })),
+        order: v.optional(v.enum(['asc', 'desc'] as const)),
       }, { strict: true }),
+    });
+
+    /**
+     * "Who moved this deal to Closed won, and how long had it been sitting in
+     * Negotiation?" — read off the audit trail rather than stored, so it is
+     * right for records that pre-date the stamp and for every stage a record
+     * has ever been through, not just the one it is in now.
+     */
+    router.get('/v1/records/:type/:id/stage-history', (req: Req) => {
+      const orgId = req.auth.orgId;
+      const record = crm.require(orgId, req.params.type, req.params.id);
+      const spells = stageHistory(ctx, crm, orgId, record);
+      const current = spells.find((s) => s.is_current) ?? null;
+      return {
+        ...list(spells, { totalCount: spells.length }),
+        record_id: record.id,
+        stage_property: crm.pipelines.requireBinding(orgId, record.object_type).stage_property,
+        current_stage: current ? current.stage : null,
+        days_in_current_stage: current ? current.days_in_stage : null,
+        total_days: spells.length ? Math.round((ctx.now() - spells[0].entered_at) / 86_400_000) : 0,
+      };
+    }, {
+      summary: 'Every stage this record has been in, when it arrived, and how long it stayed', tags: ['crm'],
+      description: 'Reconstructed from the property history, so it covers stages the record left months ago and names the person who moved it. `duration_ms` on the current stage counts up to now.',
     });
 
     router.get('/v1/records/:type/:id/associations', (req: Req) => {

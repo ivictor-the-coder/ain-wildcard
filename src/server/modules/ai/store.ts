@@ -8,6 +8,7 @@
  */
 import type { Ctx } from '../../kernel/context';
 import { parseJson } from '../../kernel/db';
+import { describeWrite } from '../../ai/synth';
 import { newId } from '../../../shared/ids';
 import { dayKey } from '../../../shared/time';
 import type { AiRunFinish, AiRunStart, AiTraceSpan, PendingApproval } from '../../ai/runtime';
@@ -129,6 +130,8 @@ export const publicApproval = (row: ApprovalRow) => ({
   thread_id: row.thread_id,
   tool: row.tool,
   args: parseJson<Record<string, unknown>>(row.args, {}),
+  /** The write in plain English, so a person can approve it without reading JSON. */
+  preview: describeWrite(row.tool, parseJson<Record<string, unknown>>(row.args, {})),
   reason: row.reason,
   status: row.status,
   outcome: row.outcome,

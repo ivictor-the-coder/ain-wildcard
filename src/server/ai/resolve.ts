@@ -11,7 +11,7 @@
  * subsets, trigram similarity and finally bounded edit distance.
  */
 import {
-  DOMAIN_PATTERN, EMAIL_PATTERN, ID_PATTERN, QUOTED_PATTERN, STOPWORDS,
+  COMMON_WORDS, DOMAIN_PATTERN, EMAIL_PATTERN, ID_PATTERN, QUOTED_PATTERN, STOPWORDS,
   acronymOf, coreName, dice, editSimilarity, normalise, ngramSpans, properNounSpans, trigrams,
 } from './text';
 import { keysOf, type EntityIndex, type EntityRef } from './grounding';
@@ -40,7 +40,11 @@ export interface ResolvedEntity {
   explain: string;
 }
 
-/** Words that describe the *shape* of a question, never the subject of one. */
+/**
+ * Words that describe the *shape* of a question, never the subject of one.
+ * `COMMON_WORDS` carries the long tail; these are the ones a CRM question leans
+ * on hardest, kept here so this file reads on its own.
+ */
 const VOCABULARY = new Set([
   'revenue', 'spend', 'spent', 'spending', 'invoice', 'invoices', 'invoiced', 'bill', 'billed', 'billing',
   'deal', 'deals', 'pipeline', 'quota', 'forecast', 'quarter', 'quarters', 'month', 'months', 'year',
@@ -79,14 +83,16 @@ export function extractMentions(text: string): Mention[] {
     const cleaned = span.replace(/\b(?:Q[1-4]|YTD|MTD|QTD)\b/g, '').trim();
     const tokens = normalise(cleaned).split(' ').filter(Boolean);
     if (!tokens.length) continue;
-    if (tokens.every((t) => VOCABULARY.has(t) || STOPWORDS.has(t))) continue;
+    if (tokens.every((t) => VOCABULARY.has(t) || STOPWORDS.has(t) || COMMON_WORDS.has(t))) continue;
     add(cleaned, 'proper', 0.96, text.indexOf(span));
   }
 
   for (const span of ngramSpans(text, 4)) {
     const tokens = span.split(' ');
-    if (tokens.every((t) => VOCABULARY.has(t) || STOPWORDS.has(t) || t.length < 3)) continue;
-    if (tokens.length === 1 && (span.length < 4 || VOCABULARY.has(span))) continue;
+    // "line 4", "the rate this quarter", "note that" — a span made only of the
+    // words questions are built from is never the name of a record.
+    if (tokens.every((t) => VOCABULARY.has(t) || STOPWORDS.has(t) || COMMON_WORDS.has(t) || t.length < 3)) continue;
+    if (tokens.length === 1 && (span.length < 4 || VOCABULARY.has(span) || COMMON_WORDS.has(span))) continue;
     // Longer n-grams are better evidence; a bare word is the weakest mention.
     const weight = 0.6 + Math.min(tokens.length, 4) * 0.06;
     add(span, 'ngram', weight, text.toLowerCase().indexOf(span));

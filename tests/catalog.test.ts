@@ -5,8 +5,8 @@ import type { Auth } from '../src/server/kernel/http';
 import {
   aggregateUsage, applyTransform, computeLineAmount, previewCurve, ratToDecimal, decimalToRat,
 } from '../src/server/modules/catalog/engine';
-import { formatMinor, formatMinorDecimal } from '../src/server/modules/catalog/format';
-import type { CurrencyOption, Price, PriceTier } from '../src/server/modules/catalog/types';
+import { describePrice, formatMinor, formatMinorDecimal } from '../src/server/modules/catalog/format';
+import type { CurrencyOption, Price, PriceTier, Product } from '../src/server/modules/catalog/types';
 
 const ORG = 'org_demo';
 const DANA: Auth = { kind: 'session', orgId: ORG, userId: 'usr_seed01', role: 'owner', scopes: ['*'], livemode: true };
@@ -59,6 +59,29 @@ const priceOf = (over: Partial<Price>): Price => ({
   tax_behavior: 'unspecified',
   proration_behavior: 'create_prorations',
   metadata: {},
+  created: 0,
+  updated: 0,
+  livemode: true,
+  ...over,
+});
+
+const productOf = (unit_label: string, over: Partial<Product> = {}): Product => ({
+  object: 'product',
+  id: 'prod_fixture',
+  name: 'Fixture',
+  description: null,
+  statement_descriptor: null,
+  unit_label,
+  active: true,
+  images: [],
+  features: [],
+  metadata: {},
+  tax_code: null,
+  default_price: null,
+  category: 'component',
+  tagline: null,
+  url: null,
+  position: 0,
   created: 0,
   updated: 0,
   livemode: true,
@@ -912,5 +935,293 @@ describe('what the copilot can do with the catalog', () => {
     const result = await tool!.run({ price: 'telemetry_events_monthly', from: 0, to: 30_000_000 }, app.ctx, { orgId: ORG }) as any;
     assert.deepEqual(result.boundaries, [500_000, 5_000_000, 25_000_000]);
     assert.ok(result.points.length >= 12);
+  });
+});
+
+/* ------------------------ the copy on the pricing page -------------------- */
+
+/*
+ * `display` is the only part of a price a customer ever reads, and it is
+ * generated, not typed by a marketer — so every string here is checked against
+ * what computeLineAmount actually bills for the same price. A headline that
+ * disagrees with the invoice is the one defect a price book cannot ship.
+ */
+describe('the pricing copy says what the engine bills', () => {
+  const events = productOf('event');
+  const seats = productOf('seat');
+  /** "$10.50" → 1050 minor units. Every currency used here has two decimals. */
+  const minorOf = (formatted: string) => Math.round(Number(formatted.replace(/[^0-9.]/g, '')) * 100);
+
+  const platformVolume = priceOf({
+    id: 'price_platform_volume', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'volume',
+    tiers: [{ up_to: 10, flat_amount: 5000 }, { up_to: 'inf', flat_amount: 20000 }],
+  });
+  const platformGraduated = priceOf({
+    id: 'price_platform_graduated', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'graduated',
+    tiers: [{ up_to: 10, flat_amount: 5000 }, { up_to: 'inf', flat_amount: 20000 }],
+  });
+  const baseAndRate = priceOf({
+    id: 'price_base_and_rate', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'graduated',
+    tiers: [{ up_to: 10, flat_amount: 1000, unit_amount: 50 }, { up_to: 'inf', flat_amount: 500, unit_amount: 25 }],
+  });
+  const packagedTiers = priceOf({
+    id: 'price_packaged_tiers', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'graduated',
+    transform_quantity: { divide_by: 100, round: 'up' },
+    tiers: [{ up_to: 5, unit_amount: 1000 }, { up_to: 'inf', unit_amount: 500 }],
+  });
+
+  test('a volume ladder of base charges is priced, never advertised as free', () => {
+    // The engine bills this price $50 at five events and $200 at eleven.
+    assert.equal(computeLineAmount(platformVolume, 5, 'usd').amount, 5000);
+    assert.equal(computeLineAmount(platformVolume, 11, 'usd').amount, 20000);
+
+    const display = describePrice(platformVolume, 'usd', 'en-US', events);
+    assert.doesNotMatch(display.summary, /Included/);
+    assert.equal(display.summary, '$50.00 per month up to 10 events, then $200.00 per month');
+    assert.equal(display.amount, '$50.00');
+    assert.equal(display.headline, '$50.00');
+    assert.equal(display.from, '$50.00');
+    assert.equal(display.from_amount, 5000);
+    assert.equal(display.unit, null, 'a base charge is not a per-event rate');
+    assert.deepEqual(display.tiers, ['first 10 events: $50.00 base', '11 and above: $200.00 base']);
+  });
+
+  test('a graduated ladder of base charges quotes what each band really costs', () => {
+    // Graduated enters both tiers, so above ten events the charge is $50 + $200.
+    assert.equal(computeLineAmount(platformGraduated, 11, 'usd').amount, 25000);
+
+    const display = describePrice(platformGraduated, 'usd', 'en-US', events);
+    assert.equal(display.summary, '$50.00 per month up to 10 events, then $250.00 per month');
+    assert.equal(display.from_amount, computeLineAmount(platformGraduated, 1, 'usd').amount);
+  });
+
+  test('an entry-tier base charge is folded into the headline and into "from"', () => {
+    const display = describePrice(baseAndRate, 'usd', 'en-US', events);
+    assert.equal(display.amount, '$10.00');
+    assert.equal(display.amount_detail, '+ $0.50 per event');
+    assert.equal(display.headline, '$10.00 base + $0.50 per event');
+    // The old copy said "from $0.25" for a price whose smallest line is $10.50.
+    assert.equal(display.from, '$10.50');
+    assert.equal(display.from_amount, 1050);
+    assert.equal(display.from_amount, computeLineAmount(baseAndRate, 1, 'usd').amount);
+    assert.equal(computeLineAmount(baseAndRate, 10, 'usd').amount, 1500);
+    assert.equal(display.summary,
+      '$10.00 per month + $0.50 per event, falling to $5.00 base + $0.25 per event for events beyond 10');
+    assert.deepEqual(display.tiers, [
+      'first 10 events: $10.00 base + $0.50 per event',
+      '11 and above: $5.00 base + $0.25 per event',
+    ]);
+  });
+
+  test('"from" is never cheaper than the cheapest line the engine will bill', () => {
+    const shapes: [string, Price, Product][] = [
+      ['volume base ladder', platformVolume, events],
+      ['graduated base ladder', platformGraduated, events],
+      ['base plus rate', baseAndRate, events],
+      ['packaged tiers', packagedTiers, events],
+      ['graduated ladder', graduated, seats],
+      ['volume ladder', volume, seats],
+      ['flat fee', priceOf({ model: 'flat', unit_amount: 49900 }), seats],
+      ['per seat', priceOf({ model: 'per_unit', unit_amount: 2900 }), seats],
+      ['package', priceOf({ model: 'package', unit_amount: 900, transform_quantity: { divide_by: 10, round: 'up' } }), productOf('GB')],
+      ['sub-cent metered', priceOf({ model: 'usage', unit_amount_decimal: '0.04' }), events],
+    ];
+    for (const [name, price, product] of shapes) {
+      const display = describePrice(price, 'usd', 'en-US', product);
+      const one = computeLineAmount(price, 1, 'usd', { unitLabel: product.unit_label });
+      assert.equal(display.from_amount, one.amount, `${name}: from_amount`);
+      assert.ok(minorOf(display.from!) >= one.amount, `${name}: "${display.from}" undersells ${one.amount}`);
+    }
+  });
+
+  test('a packaged tiered price quotes its rate and its boundaries per package', () => {
+    // 750 events → 8 packages of 100: 5 at $10.00 then 3 at $5.00.
+    const line = computeLineAmount(packagedTiers, 750, 'usd', { unitLabel: 'event' });
+    assert.equal(line.billable_quantity, 8);
+    assert.equal(line.amount, 6500);
+
+    const display = describePrice(packagedTiers, 'usd', 'en-US', events);
+    assert.equal(display.unit, 'per 100 events');
+    assert.equal(display.headline, '$10.00 per 100 events');
+    assert.equal(display.summary, '$10.00 per 100 events per month, falling to $5.00 for events beyond 500');
+    assert.doesNotMatch(display.summary, /\$10\.00 per event\b/);
+    // Tier 1 ends at package 5 — that is event 500, not event 5.
+    assert.deepEqual(display.tiers, [
+      'first 500 events: $10.00 per 100 events',
+      '501 and above: $5.00 per 100 events',
+    ]);
+    assert.equal(computeLineAmount(packagedTiers, 500, 'usd').amount, 5000);
+    assert.equal(computeLineAmount(packagedTiers, 501, 'usd').amount, 5500);
+  });
+
+  test('rounding part packages down moves the boundary to the last unit that still fits', () => {
+    const roundedDown = priceOf({
+      id: 'price_packaged_down', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'graduated',
+      transform_quantity: { divide_by: 100, round: 'down' },
+      tiers: [{ up_to: 5, unit_amount: 1000 }, { up_to: 'inf', unit_amount: 500 }],
+    });
+    // 599 events is still five whole packages; the sixth starts at 600.
+    assert.equal(computeLineAmount(roundedDown, 599, 'usd').amount, 5000);
+    assert.equal(computeLineAmount(roundedDown, 600, 'usd').amount, 5500);
+    const display = describePrice(roundedDown, 'usd', 'en-US', events);
+    assert.deepEqual(display.tiers, [
+      'first 599 events: $10.00 per 100 events',
+      '600 and above: $5.00 per 100 events',
+    ]);
+  });
+
+  test('only a price that charges nothing is called "included"', () => {
+    const free = priceOf({
+      id: 'price_free', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'graduated',
+      tiers: [{ up_to: 'inf', unit_amount: 0 }],
+    });
+    const display = describePrice(free, 'usd', 'en-US', events);
+    assert.equal(display.summary, 'Included — no per-event charge');
+    for (const q of [1, 10, 10_000]) assert.equal(computeLineAmount(free, q, 'usd').amount, 0);
+    assert.equal(display.from_amount, 0);
+  });
+
+  test('an included allowance is named before the rate that follows it', () => {
+    const allowance = priceOf({
+      id: 'price_allowance', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'graduated',
+      recurring: { interval: 'month', interval_count: 1, usage_type: 'metered', aggregate_usage: 'sum', trial_period_days: null, meter: 'events' },
+      tiers: [{ up_to: 10_000, flat_amount: 9900, unit_amount: 0 }, { up_to: 'inf', unit_amount: 1 }],
+    });
+    const display = describePrice(allowance, 'usd', 'en-US', events);
+    assert.equal(display.summary, '$99.00 including the first 10,000 events, then $0.01 per event — billed monthly');
+    assert.equal(display.amount, '$99.00');
+    assert.equal(display.from_amount, 9900);
+    assert.equal(computeLineAmount(allowance, 10_000, 'usd').amount, 9900);
+    assert.equal(computeLineAmount(allowance, 10_100, 'usd').amount, 10_000);
+    assert.equal(display.tiers![0], 'first 10,000 events: $99.00 base, no per-event charge');
+  });
+
+  test('the seeded metered price names its allowance, its rate and where it steps down', () => {
+    const price = app.ctx.svc.catalog.requirePrice(ORG, 'price_nw_telemetry_events');
+    const product = app.ctx.svc.catalog.product(ORG, price.product);
+    const display = app.ctx.svc.catalog.describe(price, 'usd', 'en-US', product);
+    assert.equal(display.summary,
+      'First 500,000 events included, then $0.0004 per event, falling to $0.00019 for events beyond 25,000,000 — billed monthly');
+    assert.equal(display.cheapest_unit, '$0.00019');
+    assert.deepEqual(display.tiers, [
+      'first 500,000 events: included',
+      '500,001–5,000,000: $0.0004 per event',
+      '5,000,001–25,000,000: $0.00028 per event',
+      '25,000,001 and above: $0.00019 per event',
+    ]);
+  });
+
+  test('every price in the workspace agrees with the engine, in every currency it sells in', () => {
+    const svc = app.ctx.svc.catalog;
+    const prices = svc.prices(ORG, { limit: 200 });
+    assert.ok(prices.length >= 14, 'expected the seeded price book');
+    let checked = 0;
+    for (const price of prices) {
+      const product = svc.product(ORG, price.product);
+      for (const currency of svc.currencies(price)) {
+        const display = svc.describe(price, currency, 'en-US', product);
+        if (price.model === 'custom') {
+          assert.ok(display.summary.length > 0, `${price.id}: custom prices still need copy`);
+          continue;
+        }
+        let one;
+        try { one = svc.compute(price, 1, currency, { unitLabel: product?.unit_label ?? null }); }
+        catch { continue; } // not priceable in that currency — resolveForCurrency already says so
+        checked++;
+        assert.equal(display.from_amount, one.amount, `${price.id} (${currency}): from_amount vs engine`);
+        assert.ok(minorOf(display.from!) >= one.amount, `${price.id} (${currency}): "${display.from}" undersells`);
+        if (/Included —/.test(display.summary)) {
+          for (const q of [1, 10, 1_000, 1_000_000]) {
+            assert.equal(svc.compute(price, q, currency).amount, 0,
+              `${price.id} (${currency}) claims to be included but bills at ${q}`);
+          }
+        }
+        if (display.tiers) {
+          const tiers = currency === price.currency ? price.tiers : price.currency_options[currency]?.tiers;
+          assert.equal(display.tiers.length, tiers?.length ?? 0, `${price.id} (${currency}): a line per tier`);
+        }
+      }
+    }
+    assert.ok(checked >= 30, `expected to check every currency of every price, checked ${checked}`);
+  });
+});
+
+/* ------------------- the pricing page and the invoice agree --------------- */
+
+describe('what GET /v1/catalog serves a pricing page', () => {
+  test('a tiered platform fee reaches the pricing page priced, and matches its own preview', async () => {
+    const product = await expectOk('POST', '/v1/products', {
+      name: 'Fleet gateway fee', unit_label: 'event', category: 'component',
+    });
+    const price = await expectOk('POST', '/v1/prices', {
+      product: product.id, currency: 'usd', model: 'tiered', tiers_mode: 'volume',
+      recurring: { interval: 'month', interval_count: 1 },
+      tiers: [{ up_to: 10, flat_amount: 5000 }, { up_to: 'inf', flat_amount: 20000 }],
+    });
+    assert.equal(price.display.summary, '$50.00 per month up to 10 events, then $200.00 per month');
+
+    const small = await expectOk('POST', `/v1/prices/${price.id}/preview`, { quantity: 5 });
+    const large = await expectOk('POST', `/v1/prices/${price.id}/preview`, { quantity: 11 });
+    assert.equal(small.amount_display, '$50.00');
+    assert.equal(large.amount_display, '$200.00');
+
+    const catalog = await expectOk('GET', '/v1/catalog');
+    const entry = catalog.components.find((c: any) => c.product.id === product.id);
+    assert.ok(entry, 'the new component should appear in the catalog');
+    const listed = entry.prices[0].display;
+    assert.equal(listed.summary, price.display.summary);
+    assert.doesNotMatch(listed.summary, /Included/);
+    assert.equal(listed.from, '$50.00');
+    assert.ok(listed.summary.includes(small.amount_display) && listed.summary.includes(large.amount_display),
+      'the pricing page quotes the two numbers the preview returns');
+  });
+});
+
+/* ---------------------------- currency hygiene ---------------------------- */
+
+describe('a currency has to be a currency', () => {
+  test('a made-up code is refused on the price itself', async () => {
+    const error = await expectError('POST', '/v1/prices', {
+      product: 'prod_nw_events', currency: 'zzz', unit_amount: 500, recurring: { interval: 'month' },
+    }, 400, 'parameter_invalid');
+    assert.match(error.message, /Invalid currency: zzz/);
+    assert.equal(error.param, 'currency');
+  });
+
+  test('and inside currency_options, where it would end up on a pricing page', async () => {
+    const error = await expectError('POST', '/v1/prices', {
+      product: 'prod_nw_events', currency: 'usd', unit_amount: 500, recurring: { interval: 'month' },
+      currency_options: { zzz: { unit_amount: 400 } },
+    }, 400, 'parameter_invalid');
+    assert.match(error.message, /Invalid currency: zzz/);
+    assert.equal(error.param, 'currency_options.zzz');
+  });
+
+  test('and when a whole price book is asked for in one', async () => {
+    const error = await expectError('GET', '/v1/catalog?currency=zzz', undefined, 400, 'parameter_invalid');
+    assert.match(error.message, /Invalid currency: zzz/);
+  });
+
+  test('a real but unusual ISO-4217 code is accepted', async () => {
+    const price = await expectOk('POST', '/v1/prices', {
+      product: 'prod_nw_predictive', currency: 'usd', model: 'per_unit', unit_amount: 1200,
+      recurring: { interval: 'month' }, currency_options: { sek: { unit_amount: 13_000 } },
+    });
+    const preview = await expectOk('POST', `/v1/prices/${price.id}/preview`, { quantity: 3, currency: 'sek' });
+    assert.equal(preview.amount, 39_000);
+    assert.match(preview.amount_display, /^SEK\s390\.00$/); // en-US sets a non-breaking space after the code
+  });
+
+  test('the currency picker lists what the price book actually sells in', async () => {
+    const page = await expectOk('GET', '/v1/catalog/currencies');
+    const byCode = new Map<string, any>(page.data.map((c: any) => [c.code, c]));
+    assert.ok(byCode.has('usd') && byCode.has('eur') && byCode.has('gbp'));
+    assert.equal(byCode.get('usd').name, 'US dollar');
+    assert.equal(byCode.get('usd').symbol, '$');
+    assert.equal(byCode.get('gbp').name, 'British pound');
+    assert.equal(byCode.get('gbp').symbol, '£');
+    assert.ok(byCode.get('usd').prices >= 14, 'every price is quoted in the home currency');
+    assert.equal(page.data.filter((c: any) => c.default).length, 1);
+    for (const entry of page.data) assert.ok(entry.prices >= 1, `${entry.code} is listed but priced on nothing`);
   });
 });

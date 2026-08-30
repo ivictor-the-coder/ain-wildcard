@@ -464,3 +464,319 @@ describe('icons', () => {
     assert.equal(iconByName('invoice'), Icons.invoice);
   });
 });
+
+/* ------------------- filter stack: folding, dates, sharing ---------------- */
+
+interface Invoice {
+  id: string; number: string; owner: string; status: string; issuedAt: number; amount: number;
+}
+const DAY_MS = 86_400_000;
+const JUL_1 = Date.UTC(2026, 6, 1);
+const invoices: Invoice[] = [
+  { id: 'i1', number: 'INV-02481', owner: 'Nina Kovač', status: 'open', issuedAt: JUL_1, amount: 120_00 },
+  { id: 'i2', number: 'INV-02482', owner: 'Nina Kovač', status: 'past_due', issuedAt: JUL_1 + 10 * DAY_MS, amount: 340_00 },
+  { id: 'i3', number: 'INV-02483', owner: 'Sofia Lindqvist', status: 'paid', issuedAt: JUL_1 + 40 * DAY_MS, amount: 90_00 },
+  { id: 'i4', number: 'INV-02484', owner: 'Tom Bergeron', status: 'open', issuedAt: JUL_1 - 30 * DAY_MS, amount: 15_00 },
+];
+const invoiceAccess = (row: Invoice, columnId: string) =>
+  (row as unknown as Record<string, string | number>)[columnId];
+
+describe('diacritic folding', () => {
+  it('folds accents and case so a US keyboard finds Nina Kovač', () => {
+    assert.equal(fold('Nina Kovač'), 'nina kovac');
+    assert.equal(fold('ÀÉÎÕÜ'), 'aeiou');
+    const accented = searchRows(invoices, 'Kovač', ['owner'], invoiceAccess);
+    for (const typed of ['Kovac', 'kovac', 'KOVAC', '  kovac  ']) {
+      assert.equal(
+        searchRows(invoices, typed, ['owner'], invoiceAccess).length,
+        accented.length,
+        `"${typed}" should find as many rows as "Kovač"`,
+      );
+    }
+    assert.equal(accented.length, 2);
+  });
+
+  it('folds inside the text filter too, so search and filter agree', () => {
+    assert.equal(matchesFilter('Nina Kovač', { kind: 'text', value: 'kovac' }), true);
+    assert.equal(matchesFilter('Nina Kovač', { kind: 'text', value: 'kovac', op: 'not_contains' }), false);
+    assert.equal(matchesFilter('Sofia Lindqvist', { kind: 'text', value: 'sofia', op: 'starts_with' }), true);
+    assert.equal(matchesFilter('Sofia Lindqvist', { kind: 'text', value: 'sofia lindqvist', op: 'is' }), true);
+  });
+});
+
+describe('typed filter kinds', () => {
+  it('filters a date column by is / after / before / between', () => {
+    const on = filterRows(invoices, { issuedAt: { kind: 'date', op: 'is', from: JUL_1, to: JUL_1 } }, invoiceAccess);
+    assert.deepEqual(on.map((r) => r.id), ['i1']);
+
+    const after = filterRows(invoices, { issuedAt: { kind: 'date', op: 'after', from: JUL_1 + DAY_MS } }, invoiceAccess);
+    assert.deepEqual(after.map((r) => r.id), ['i2', 'i3']);
+
+    const before = filterRows(invoices, { issuedAt: { kind: 'date', op: 'before', to: JUL_1 - DAY_MS } }, invoiceAccess);
+    assert.deepEqual(before.map((r) => r.id), ['i4']);
+
+    const between = filterRows(
+      invoices,
+      { issuedAt: { kind: 'date', op: 'between', from: JUL_1, to: JUL_1 + 10 * DAY_MS } },
+      invoiceAccess,
+    );
+    assert.deepEqual(between.map((r) => r.id), ['i1', 'i2']);
+  });
+
+  it('treats the end of a between range as inclusive of the whole day', () => {
+    const noon = JUL_1 + 10 * DAY_MS + 13 * 3_600_000;
+    assert.equal(matchesFilter(noon, { kind: 'date', from: JUL_1, to: JUL_1 + 10 * DAY_MS }), true);
+  });
+
+  it('holds two statuses at once, and can invert the set', () => {
+    const anyOf = filterRows(invoices, { status: { kind: 'set', values: ['open', 'past_due'] } }, invoiceAccess);
+    assert.deepEqual(anyOf.map((r) => r.id), ['i1', 'i2', 'i4']);
+    const noneOf = filterRows(invoices, { status: { kind: 'set', values: ['open'], op: 'none_of' } }, invoiceAccess);
+    assert.deepEqual(noneOf.map((r) => r.id), ['i2', 'i3']);
+  });
+
+  it('knows which filters are empty and how many are active', () => {
+    assert.equal(isFilterEmpty(undefined), true);
+    assert.equal(isFilterEmpty({ kind: 'text', value: '   ' }), true);
+    assert.equal(isFilterEmpty({ kind: 'set', values: [] }), true);
+    assert.equal(isFilterEmpty({ kind: 'number' }), true);
+    assert.equal(isFilterEmpty({ kind: 'date' }), true);
+    assert.equal(isFilterEmpty({ kind: 'date', from: JUL_1 }), false);
+    assert.equal(activeFilterCount({
+      status: { kind: 'set', values: ['open'] },
+      owner: { kind: 'text', value: '' },
+      issuedAt: { kind: 'date', from: JUL_1 },
+    }), 2);
+  });
+
+  it('describes a chip the way an operator reads it, humanising enum values', () => {
+    const iso = (ts: number) => new Date(ts).toISOString().slice(0, 10);
+    assert.equal(
+      describeFilter({ kind: 'set', values: ['open', 'past_due'] }, { optionLabel: humanize }),
+      'is Open, Past due',
+    );
+    assert.equal(
+      describeFilter({ kind: 'set', values: ['a', 'b', 'c', 'd'] }),
+      'is a, b +2',
+    );
+    assert.equal(describeFilter({ kind: 'date', op: 'after', from: JUL_1 + DAY_MS }, { formatDate: iso }), 'is after 2026-07-01');
+    assert.equal(describeFilter({ kind: 'date', op: 'before', to: JUL_1 - DAY_MS }, { formatDate: iso }), 'is before 2026-07-01');
+    assert.equal(describeFilter({ kind: 'date', from: JUL_1, to: JUL_1 }, { formatDate: iso }), 'is 2026-07-01');
+    assert.equal(describeFilter({ kind: 'number', min: 10, max: 20 }), 'is 10 – 20');
+    assert.equal(describeFilter({ kind: 'number', min: 10 }), 'is at least 10');
+    assert.equal(describeFilter({ kind: 'text', value: 'halden', op: 'not_contains' }), 'does not contain “halden”');
+  });
+
+  it('counts distinct values and finds a date column’s span', () => {
+    assert.deepEqual(valueCounts(invoices, 'status', invoiceAccess), [
+      { value: 'open', count: 2 }, { value: 'paid', count: 1 }, { value: 'past_due', count: 1 },
+    ]);
+    assert.deepEqual(dateExtent(invoices, 'issuedAt', invoiceAccess), { min: JUL_1 - 30 * DAY_MS, max: JUL_1 + 40 * DAY_MS });
+    assert.equal(dateExtent([], 'issuedAt', invoiceAccess), null);
+  });
+});
+
+describe('shareable table state', () => {
+  const stack: FilterMap = {
+    status: { kind: 'set', values: ['open', 'past_due'], op: 'any_of' },
+    issuedAt: { kind: 'date', op: 'between', from: JUL_1, to: JUL_1 + 10 * DAY_MS },
+    amount: { kind: 'number', op: 'gte', min: 5000 },
+    company: { kind: 'text', value: 'Halden; Metal~works', op: 'contains' },
+  };
+
+  it('round-trips a filter stack through a URL-safe string', () => {
+    const encoded = encodeFilters(stack);
+    assert.ok(encoded.includes('status~set~any_of~open,past_due'), encoded);
+    assert.deepEqual(decodeFilters(encoded), stack);
+  });
+
+  it('survives separators inside a value', () => {
+    const decoded = decodeFilters(encodeFilters({ company: { kind: 'text', value: 'a;b~c,d\\e', op: 'is' } }));
+    assert.deepEqual(decoded, { company: { kind: 'text', value: 'a;b~c,d\\e', op: 'is' } });
+  });
+
+  it('round-trips the whole view — query, sort and filters', () => {
+    const state = { query: 'kovac', sort: { columnId: 'issuedAt', direction: 'desc' as const }, filters: stack };
+    const params = encodeTableState(state);
+    assert.equal(params.q, 'kovac');
+    assert.equal(params.sort, 'issuedAt:desc');
+    assert.deepEqual(decodeTableState(params), state);
+  });
+
+  it('leaves the parameters out entirely when there is nothing to share', () => {
+    const params = encodeTableState({ query: '  ', sort: null, filters: { status: { kind: 'set', values: [] } } });
+    assert.deepEqual(params, { q: undefined, sort: undefined, filter: undefined });
+    assert.deepEqual(decodeTableState({}), { query: '', sort: null, filters: {} });
+  });
+
+  it('ignores junk in a hand-edited URL instead of throwing', () => {
+    assert.deepEqual(decodeFilters('~~~;status~set~;;bogus'), {});
+    assert.deepEqual(decodeFilters('amount~number~gte~notanumber,'), {});
+  });
+});
+
+describe('selection safety', () => {
+  const visible = ['i1', 'i2'];
+
+  it('splits a selection into what the filter shows and what it hides', () => {
+    const split = splitSelection(['i1', 'i2', 'i3', 'i4'], visible);
+    assert.deepEqual(split.visible, ['i1', 'i2']);
+    assert.deepEqual(split.hidden, ['i3', 'i4']);
+  });
+
+  it('reports nothing hidden when the filter shows every selected row', () => {
+    assert.deepEqual(splitSelection(['i1'], visible), { visible: ['i1'], hidden: [] });
+    assert.deepEqual(splitSelection([], visible), { visible: [], hidden: [] });
+  });
+
+  it('extends a selection from an anchor, in either direction', () => {
+    const ids = ['a', 'b', 'c', 'd', 'e'];
+    assert.deepEqual(extendSelection([], ids, 'b', 'd'), ['b', 'c', 'd']);
+    assert.deepEqual(extendSelection([], ids, 'd', 'b'), ['b', 'c', 'd']);
+    assert.deepEqual(extendSelection(['a'], ids, 'c', 'c'), ['a', 'c']);
+    // No anchor yet — Shift+Arrow behaves like a plain select on the first press.
+    assert.deepEqual(extendSelection(['a'], ids, null, 'c'), ['a', 'c']);
+    assert.deepEqual(extendSelection(['a'], ids, null, 'a'), ['a']);
+  });
+});
+
+/* --------------------------------- colour -------------------------------- */
+
+describe('contrast', () => {
+  it('parses the colour forms a browser hands back', () => {
+    assert.deepEqual(parseColor('#fff'), { r: 255, g: 255, b: 255 });
+    assert.deepEqual(parseColor('#232a37'), { r: 35, g: 42, b: 55 });
+    assert.deepEqual(parseColor('rgb(35, 42, 55)'), { r: 35, g: 42, b: 55 });
+    assert.deepEqual(parseColor('rgba(35 42 55 / 0.5)'), { r: 35, g: 42, b: 55 });
+    assert.equal(parseColor('color-mix(in srgb, red, blue)'), null);
+  });
+
+  it('computes WCAG ratios and grades', () => {
+    assert.equal(relativeLuminance({ r: 255, g: 255, b: 255 }), 1);
+    assert.equal(contrastRatio('#000000', '#ffffff'), 21);
+    assert.equal(contrastRatio('#ffffff', '#ffffff'), 1);
+    assert.equal(contrastGrade(21), 'AAA');
+    assert.equal(contrastGrade(4.6), 'AA');
+    assert.equal(contrastGrade(3.2), 'AA Large');
+    assert.equal(contrastGrade(2), 'Fail');
+    assert.equal(contrastRatio('nonsense', '#fff'), null);
+  });
+});
+
+/* ------------------------------ design tokens ----------------------------- */
+
+/**
+ * The style guide promises every text token clears 4.5:1 on every resting
+ * surface in both themes. This is that promise, asserted against the stylesheet
+ * itself so it cannot quietly drift.
+ */
+describe('token contrast', () => {
+  const CSS = readFileSync(new URL('../src/client/design/tokens.css', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+
+  const declarationsIn = (selector: string): Record<string, string> => {
+    const out: Record<string, string> = {};
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const blocks = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`, 'g');
+    let match: RegExpExecArray | null;
+    while ((match = blocks.exec(CSS)) !== null) {
+      for (const declaration of match[1].split(';')) {
+        const colon = declaration.indexOf(':');
+        if (colon < 0) continue;
+        const name = declaration.slice(0, colon).trim();
+        if (name.startsWith('--')) out[name] = declaration.slice(colon + 1).trim();
+      }
+    }
+    return out;
+  };
+
+  const light = declarationsIn(':root');
+  const dark: Record<string, string> = { ...light, ...declarationsIn("[data-theme='dark']") };
+
+  const resolve = (vars: Record<string, string>, value: string, depth = 0): string | null => {
+    if (depth > 12) return null;
+    const trimmed = value.trim();
+    const reference = /^var\((--[\w-]+)\)$/.exec(trimmed);
+    if (reference) {
+      const next = vars[reference[1]];
+      return next === undefined ? null : resolve(vars, next, depth + 1);
+    }
+    return /^#[0-9a-f]{6}$/i.test(trimmed) ? trimmed.toLowerCase() : null;
+  };
+
+  /** Backgrounds text is allowed to rest on, in both themes. */
+  const SURFACES = ['--bg-surface', '--bg-app', '--bg-subtle', '--bg-sunken', '--bg-surface-raised', '--bg-nav'];
+  /** Type-scale tokens share the `--text-` prefix but are not colours. */
+  const SCALE = /^--text-(2xs|xs|sm|md|base|lg|xl|2xl|3xl|4xl|5xl)$/;
+  /** Pairs with `--bg-inverse`, so it is measured against that instead. */
+  const INVERSE = new Set(['--text-inverse', '--text-tooltip', '--text-inverse-warning']);
+
+  for (const [themeName, vars] of [['light', light], ['dark', dark]] as const) {
+    it(`keeps every ${themeName} text token above 4.5:1 on every resting surface`, () => {
+      const surfaces = SURFACES.map((token) => {
+        const colour = resolve(vars, `var(${token})`);
+        assert.ok(colour, `${token} does not resolve to a hex colour in the ${themeName} theme`);
+        return { token, colour: colour as string };
+      });
+
+      const textTokens = Object.keys(vars).filter((k) => k.startsWith('--text-') && !SCALE.test(k) && !INVERSE.has(k));
+      assert.ok(textTokens.length >= 12, `only found ${textTokens.length} text colour tokens`);
+
+      for (const token of textTokens) {
+        const colour = resolve(vars, vars[token]);
+        assert.ok(colour, `${token} does not resolve to a hex colour in the ${themeName} theme`);
+        for (const surface of surfaces) {
+          const ratio = contrastRatio(colour as string, surface.colour);
+          assert.ok(ratio !== null, `could not measure ${token} on ${surface.token}`);
+          assert.ok(
+            (ratio as number) >= 4.5,
+            `${themeName} ${token} (${colour as string}) is ${(ratio as number).toFixed(2)}:1 on ${surface.token} — needs 4.5:1`,
+          );
+        }
+      }
+    });
+  }
+
+  it('keeps the inverse pair (bulk bar, tooltips) legible in both themes', () => {
+    for (const [themeName, vars] of [['light', light], ['dark', dark]] as const) {
+      const inverseBg = resolve(vars, 'var(--bg-inverse)');
+      const tooltipBg = resolve(vars, 'var(--bg-tooltip)');
+      assert.ok(inverseBg && tooltipBg, `inverse surfaces do not resolve in ${themeName}`);
+      for (const [token, background] of [
+        ['--text-inverse', inverseBg as string],
+        ['--text-inverse-warning', inverseBg as string],
+        ['--text-tooltip', tooltipBg as string],
+      ] as const) {
+        const colour = resolve(vars, vars[token]);
+        assert.ok(colour, `${token} does not resolve in ${themeName}`);
+        const ratio = contrastRatio(colour as string, background) as number;
+        assert.ok(ratio >= 4.5, `${themeName} ${token} is ${ratio.toFixed(2)}:1 on its inverse surface`);
+      }
+    }
+  });
+
+  it('keeps the accent readable under its own contrast colour', () => {
+    for (const [themeName, vars] of [['light', light], ['dark', dark]] as const) {
+      const accent = resolve(vars, 'var(--accent)');
+      const onAccent = resolve(vars, vars['--accent-contrast']);
+      assert.ok(accent && onAccent, `accent pair does not resolve in ${themeName}`);
+      const ratio = contrastRatio(onAccent as string, accent as string) as number;
+      assert.ok(ratio >= 4.5, `${themeName} --accent-contrast on --accent is ${ratio.toFixed(2)}:1`);
+    }
+  });
+
+  it('mirrors for RTL: no physical inline properties left in the stylesheets', () => {
+    const files = [
+      'base.css', 'tokens.css', 'layout.css', 'controls.css', 'fields.css', 'data.css', 'table.css',
+      'overlays.css', 'feedback.css', 'nav.css', 'charts.css', 'toast.css', 'styleguide.css',
+    ];
+    const physical = /(?:^|[\s;{])(margin-left|margin-right|padding-left|padding-right|border-left|border-right|border-top-left-radius|border-top-right-radius|border-bottom-left-radius|border-bottom-right-radius)\s*:|text-align\s*:\s*(?:left|right)|(?:^|[\s;{])(?:left|right)\s*:/;
+    for (const file of files) {
+      const source = readFileSync(new URL(`../src/client/design/${file}`, import.meta.url), 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '');
+      for (const line of source.split('\n')) {
+        assert.ok(!physical.test(line), `${file} uses a physical inline property, which cannot mirror for RTL:\n  ${line.trim()}`);
+      }
+    }
+  });
+});

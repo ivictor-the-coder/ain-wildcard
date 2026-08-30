@@ -194,13 +194,19 @@ export function describeFilter(filter: ColumnFilter, o: FilterLabelOptions = {})
     return `${filter.op === 'none_of' ? 'is none of' : 'is'} ${shown}`;
   }
   if (filter.kind === 'date') {
+    const op = filter.op ?? (filter.from !== undefined && filter.to !== undefined ? 'between'
+      : filter.from !== undefined ? 'after' : 'before');
+    // `after`/`before` store the first (or last) day that qualifies, so the
+    // label reads back the day the operator actually picked.
+    if (op === 'after' && filter.from !== undefined && filter.to === undefined) return `is after ${date(filter.from - DAY)}`;
+    if (op === 'before' && filter.to !== undefined && filter.from === undefined) return `is before ${date(filter.to + DAY)}`;
     if (filter.from !== undefined && filter.to !== undefined) {
       return startOfDay(filter.from) === startOfDay(filter.to)
         ? `is ${date(filter.from)}`
         : `is ${date(filter.from)} – ${date(filter.to)}`;
     }
-    if (filter.from !== undefined) return `is after ${date(filter.from - DAY)}`;
-    if (filter.to !== undefined) return `is before ${date(filter.to + DAY)}`;
+    if (filter.from !== undefined) return `is on or after ${date(filter.from)}`;
+    if (filter.to !== undefined) return `is on or before ${date(filter.to)}`;
     return 'is any date';
   }
   if (filter.min !== undefined && filter.max !== undefined) {
@@ -222,18 +228,26 @@ export interface TableState {
 export const EMPTY_TABLE_STATE: TableState = { query: '', sort: null, filters: {} };
 
 const esc = (s: string): string => s.replace(/([\\,;~])/g, '\\$1');
+
+/**
+ * Splits on unescaped separators while leaving the escape sequences intact, so
+ * the same string can be split again at the next level down. Only the leaf
+ * calls `unesc`.
+ */
 const splitEscaped = (s: string, sep: string): string[] => {
   const out: string[] = [];
   let current = '';
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
-    if (ch === '\\' && i + 1 < s.length) { current += s[++i]; continue; }
+    if (ch === '\\' && i + 1 < s.length) { current += ch + s[++i]; continue; }
     if (ch === sep) { out.push(current); current = ''; continue; }
     current += ch;
   }
   out.push(current);
   return out;
 };
+
+const unesc = (s: string): string => s.replace(/\\(.)/g, '$1');
 
 const numOrUndef = (raw: string): number | undefined => {
   if (raw === '') return undefined;
@@ -264,21 +278,24 @@ export function decodeFilters(raw: string): FilterMap {
   if (!raw) return out;
   for (const part of splitEscaped(raw, ';')) {
     if (!part) continue;
-    const [columnId, kind, op, payload = ''] = splitEscaped(part, '~');
+    const [rawId, kind, op, payload = ''] = splitEscaped(part, '~');
+    const columnId = unesc(rawId ?? '');
     if (!columnId || !kind) continue;
+    const operator = op ? { op } : {};
     if (kind === 'text') {
-      const value = payload;
-      if (value.trim()) out[columnId] = { kind: 'text', value, ...(op ? { op: op as TextOperator } : {}) };
+      const value = unesc(payload);
+      if (value.trim()) out[columnId] = { kind: 'text', value, ...operator } as ColumnFilter;
     } else if (kind === 'set') {
-      const values = splitEscaped(payload, ',').filter(Boolean);
-      if (values.length) out[columnId] = { kind: 'set', values, ...(op ? { op: op as SetOperator } : {}) };
-    } else if (kind === 'number') {
-      const [min, max] = splitEscaped(payload, ',');
-      const filter: ColumnFilter = { kind: 'number', min: numOrUndef(min ?? ''), max: numOrUndef(max ?? ''), ...(op ? { op: op as NumberOperator } : {}) };
-      if (!isFilterEmpty(filter)) out[columnId] = filter;
-    } else if (kind === 'date') {
-      const [from, to] = splitEscaped(payload, ',');
-      const filter: ColumnFilter = { kind: 'date', from: numOrUndef(from ?? ''), to: numOrUndef(to ?? ''), ...(op ? { op: op as DateOperator } : {}) };
+      const values = splitEscaped(payload, ',').filter(Boolean).map(unesc);
+      if (values.length) out[columnId] = { kind: 'set', values, ...operator } as ColumnFilter;
+    } else if (kind === 'number' || kind === 'date') {
+      const [rawFrom, rawTo] = splitEscaped(payload, ',');
+      const from = numOrUndef(rawFrom ?? '');
+      const to = numOrUndef(rawTo ?? '');
+      const bounds = kind === 'number'
+        ? { ...(from !== undefined ? { min: from } : {}), ...(to !== undefined ? { max: to } : {}) }
+        : { ...(from !== undefined ? { from } : {}), ...(to !== undefined ? { to } : {}) };
+      const filter = { kind, ...bounds, ...operator } as ColumnFilter;
       if (!isFilterEmpty(filter)) out[columnId] = filter;
     }
   }

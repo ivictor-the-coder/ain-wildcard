@@ -11,6 +11,7 @@ import { parseJson } from '../../kernel/db';
 import { badRequest, conflict, notFound } from '../../../shared/errors';
 import { cursorOf, newId, parseCursor } from '../../../shared/ids';
 import { rat, ratMul, ratRound, ratSub } from '../../../shared/money';
+import { assertCurrency } from './currencies';
 import { decimalToRat, resolveForCurrency, validateTiers } from './engine';
 import { anchorUnitDecimal, describePrice, type PriceDisplay } from './format';
 import {
@@ -163,7 +164,6 @@ export function hydratePrice(row: any): Price {
 
 /* ------------------------------- normalising ------------------------------ */
 
-const CURRENCY_RE = /^[a-z]{3}$/;
 const LOOKUP_RE = /^[a-z0-9][a-z0-9_.-]{1,79}$/;
 
 function checkAmount(value: number | null | undefined, param: string): number | null {
@@ -254,10 +254,7 @@ function normalizeCurrencyOptions(
 ): Record<string, CurrencyOption> {
   const out: Record<string, CurrencyOption> = {};
   for (const [raw, option] of Object.entries(options ?? {})) {
-    const code = raw.toLowerCase();
-    if (!CURRENCY_RE.test(code)) {
-      throw badRequest('parameter_invalid', `"${raw}" is not a 3-letter ISO-4217 currency code.`, `currency_options.${raw}`);
-    }
+    const code = assertCurrency(raw, `currency_options.${raw}`);
     if (code === base) {
       throw badRequest('parameter_invalid', `${code.toUpperCase()} is the price's own currency — set unit_amount or tiers directly instead.`, `currency_options.${raw}`);
     }
@@ -303,10 +300,7 @@ export interface NormalizedPrice {
 
 /** Turn a create/replace payload into a coherent, computable price. */
 export function normalizePrice(input: PriceInput): NormalizedPrice {
-  const currency = String(input.currency || '').toLowerCase();
-  if (!CURRENCY_RE.test(currency)) {
-    throw badRequest('parameter_invalid', `"${input.currency}" is not a 3-letter ISO-4217 currency code.`, 'currency');
-  }
+  const currency = assertCurrency(input.currency, 'currency');
   const model = inferModel(input);
   const type: PriceType = input.type ?? (input.recurring ? 'recurring' : 'one_time');
   if (type === 'recurring' && !input.recurring) {

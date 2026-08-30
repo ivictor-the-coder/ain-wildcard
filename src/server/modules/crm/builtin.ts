@@ -198,6 +198,7 @@ const OBJECT_SEEDS: ObjectTypeSeed[] = [
       { name: 'close_notes', label: 'Close notes', type: 'text', group: 'Outcome', position: 17 },
       { name: 'closed_at', label: 'Closed on', type: 'datetime', group: 'Outcome', position: 18, read_only: true, description: 'Stamped the moment the deal reaches a closed stage, and cleared again if it reopens.' },
       { name: 'days_to_close', label: 'Days to close', type: 'number', group: 'Outcome', position: 19, read_only: true, description: 'Calendar days from creation to the close stamp.' },
+      { name: 'stage_entered_at', label: 'Entered stage', type: 'datetime', group: 'Deal information', position: 20, read_only: true, description: 'When this deal arrived in the stage it is in now. Filter on it to find deals that have stopped moving; the stage-history and velocity reports read the rest from the audit trail.' },
     ],
   },
   {
@@ -226,6 +227,7 @@ const OBJECT_SEEDS: ObjectTypeSeed[] = [
       { name: 'resolved_at', label: 'Resolved', type: 'datetime', group: 'Service level', position: 12, read_only: true, description: 'Stamped when the ticket reaches a closed status, and cleared if it is reopened.' },
       { name: 'resolution_minutes', label: 'Time to resolution (min)', type: 'number', group: 'Service level', position: 13, read_only: true },
       { name: 'satisfaction_score', label: 'CSAT', type: 'number', group: 'Service level', position: 14, validation: { min: 1, max: 5 } },
+      { name: 'stage_entered_at', label: 'Entered status', type: 'datetime', group: 'Service level', position: 15, read_only: true, description: 'When this ticket arrived at the status it is in now — what “waiting on us for three days” is measured from.' },
     ],
   },
 ];
@@ -338,6 +340,7 @@ export const PIPELINE_BINDINGS: PipelineBinding[] = [
       closed_at: 'closed_at',
       days_to_close: 'days_to_close',
       expected_close_date: 'close_date',
+      stage_entered_at: 'stage_entered_at',
     },
   },
   {
@@ -348,6 +351,7 @@ export const PIPELINE_BINDINGS: PipelineBinding[] = [
     derived: {
       closed_at: 'resolved_at',
       minutes_to_close: 'resolution_minutes',
+      stage_entered_at: 'stage_entered_at',
     },
   },
 ];

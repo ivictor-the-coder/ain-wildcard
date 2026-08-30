@@ -165,10 +165,12 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
       requiresApproval: true,
       tags: ['ai', 'crm'],
       input: v.object({
-        record_id: v.string({ min: 3, max: 80 }),
+        record_id: v.string({ min: 3, max: 80, description: 'The record the follow-up is about.' }),
         in_days: v.int({ min: 1, max: 365, description: 'How many days from now the follow-up is due.' }),
-        note: v.string({ min: 3, max: 1000, description: 'What the follow-up is for.' }),
-        assignee_id: v.optional(v.string({ max: 80 })),
+        note: v.string({ min: 3, max: 1000, description: 'What the follow-up is for, in words a colleague would understand.' }),
+        // A user id, not "whichever id was handy": a company id in an assignee
+        // field is the kind of thing an approval card must never be able to show.
+        assignee_id: v.optional(v.id('usr')),
       }),
       run: (args: { record_id: string; in_days: number; note: string; assignee_id?: string }, _c, meta) => {
         const runAt = ctx.now() + args.in_days * DAY;

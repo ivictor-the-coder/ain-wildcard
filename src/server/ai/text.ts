@@ -58,6 +58,66 @@ export const COMPANY_NOISE = new Set([
   'international', 'global', 'worldwide', 'the', 'and', 'of',
 ]);
 
+/**
+ * The words a business question is built from — question shapes, CRM nouns,
+ * finance verbs, time words. Two jobs: a term outside this set and outside the
+ * workspace's own vocabulary is one the engine has no grounding for, and a
+ * mention made only of these words is a description of a question, never the
+ * name of a record.
+ */
+export const COMMON_WORDS = new Set([
+  // question shapes and framing
+  'how', 'what', 'which', 'who', 'whose', 'whom', 'where', 'when', 'why', 'whether', 'much', 'many',
+  'show', 'tell', 'give', 'list', 'find', 'look', 'lookup', 'pull', 'fetch', 'bring', 'open', 'see',
+  'compare', 'comparison', 'versus', 'vs', 'against', 'between', 'difference', 'gap', 'delta', 'split',
+  'summarise', 'summarize', 'summary', 'recap', 'brief', 'briefing', 'overview', 'digest', 'catch',
+  'explain', 'explanation', 'reason', 'reasons', 'cause', 'caused', 'driver', 'drivers', 'because',
+  'draft', 'write', 'compose', 'rewrite', 'reword', 'send', 'reply', 'respond', 'message', 'email',
+  'create', 'add', 'log', 'record', 'update', 'change', 'edit', 'move', 'assign', 'reassign', 'set',
+  'close', 'closed', 'closing', 'reopen', 'archive', 'delete', 'remove', 'merge', 'apply', 'schedule',
+  'plan', 'planning', 'playbook', 'strategy', 'approach', 'recommend', 'recommendation', 'suggest',
+  'advice', 'advise', 'next', 'step', 'steps', 'action', 'actions', 'priority', 'prioritise',
+  'prioritize', 'focus', 'start', 'stop', 'help', 'need', 'needs', 'want', 'should', 'could', 'would',
+  // the business
+  'revenue', 'revenues', 'bookings', 'booked', 'book', 'billing', 'billed', 'bill', 'invoice',
+  'invoices', 'invoiced', 'payment', 'payments', 'paid', 'pay', 'spend', 'spent', 'spending', 'cost',
+  'costs', 'price', 'pricing', 'prices', 'discount', 'refund', 'credit', 'credits', 'balance', 'due',
+  'overdue', 'outstanding', 'unpaid', 'collections', 'dunning', 'churn', 'churned', 'retention',
+  'renewal', 'renewals', 'renew', 'expansion', 'upsell', 'cross', 'sell', 'mrr', 'arr', 'acv', 'tcv',
+  'quota', 'attainment', 'forecast', 'forecasted', 'pipeline', 'coverage', 'weighted', 'commit',
+  'deal', 'deals', 'opportunity', 'opportunities', 'stage', 'stages', 'won', 'win', 'wins', 'lost',
+  'loss', 'losses', 'rate', 'rates', 'conversion', 'velocity', 'cycle', 'size', 'average', 'median',
+  'total', 'sum', 'count', 'number', 'numbers', 'top', 'bottom', 'biggest', 'largest', 'smallest',
+  'highest', 'lowest', 'best', 'worst', 'growth', 'growing', 'decline', 'declined', 'drop', 'dropped',
+  'fell', 'fall', 'rise', 'rose', 'up', 'down', 'flat', 'trend', 'trending', 'share', 'percent',
+  'percentage', 'ratio', 'value', 'amount', 'target', 'goal', 'performance', 'health', 'state',
+  'business', 'company', 'companies', 'account', 'accounts', 'customer', 'customers', 'client',
+  'clients', 'prospect', 'prospects', 'lead', 'leads', 'partner', 'partners', 'logo', 'logos',
+  'contact', 'contacts', 'person', 'people', 'champion', 'champions', 'buyer', 'buyers', 'sponsor',
+  'committee', 'stakeholder', 'stakeholders', 'owner', 'owners', 'rep', 'reps', 'team', 'teams',
+  'ticket', 'tickets', 'case', 'cases', 'issue', 'issues', 'escalation', 'escalated', 'escalations',
+  'support', 'backlog', 'sla', 'breach', 'priority', 'urgent', 'severity', 'resolution', 'resolved',
+  'unresolved', 'response', 'csat', 'satisfaction', 'complaint', 'bug', 'error', 'failing', 'failed',
+  'failure', 'broken', 'outage', 'incident', 'down', 'degraded', 'timeout', 'stuck', 'blocked',
+  'working', 'work', 'problem', 'wrong', 'risk', 'risks', 'slipping', 'slipped', 'stalled', 'stale',
+  'quiet', 'active', 'inactive', 'engaged', 'engagement', 'activity', 'activities', 'touch',
+  'touchpoint', 'meeting', 'meetings', 'call', 'calls', 'note', 'notes', 'task', 'tasks', 'todo',
+  'follow', 'followup', 'reminder', 'remind', 'chase', 'outreach', 'sequence', 'campaign', 'demo',
+  'pilot', 'poc', 'trial', 'onboarding', 'implementation', 'rollout', 'launch', 'delivery',
+  'subscription', 'subscriptions', 'plan', 'plans', 'seat', 'seats', 'licence', 'license', 'usage',
+  'product', 'products', 'sku', 'catalogue', 'catalog', 'contract', 'agreement', 'quote', 'proposal',
+  'order', 'term', 'terms', 'industry', 'segment', 'vertical', 'region', 'territory', 'market',
+  'quarter', 'quarters', 'quarterly', 'month', 'months', 'monthly', 'week', 'weeks', 'weekly', 'year',
+  'years', 'yearly', 'annual', 'day', 'days', 'daily', 'today', 'yesterday', 'tomorrow', 'date',
+  'dates', 'deadline', 'period', 'periods', 'time', 'times', 'now', 'recent', 'recently', 'ago',
+  'last', 'past', 'previous', 'prior', 'current', 'ytd', 'mtd', 'qtd', 'ago', 'since', 'until',
+  'new', 'old', 'first', 'second', 'third', 'fourth', 'half', 'still', 'yet', 'ever', 'never',
+  'good', 'bad', 'well', 'better', 'worse', 'big', 'small', 'high', 'low', 'more', 'less', 'fewer',
+  'doing', 'going', 'looking', 'tracking', 'happened', 'happening', 'know', 'think', 'stand',
+  'stands', 'standing', 'left', 'right', 'ready', 'done', 'else', 'anything', 'something', 'nothing',
+  'everything', 'someone', 'anyone', 'everyone', 'thing', 'things', 'way', 'ways', 'part', 'parts',
+]);
+
 export const contentWords = (input: string): string[] => words(input).filter((w) => !STOPWORDS.has(w));
 
 /** Character trigrams with boundary padding, the workhorse of fuzzy matching. */

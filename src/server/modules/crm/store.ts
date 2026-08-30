@@ -5,13 +5,36 @@ import { badRequest, conflict, notFound } from '../../../shared/errors';
 import { newId, randomId } from '../../../shared/ids';
 import { compileFilter, compileSort, isBuiltinProperty, type CompileEnv, type PropertyIndex } from './filter';
 import { analyzeExpression, evaluateExpression, ExpressionError } from './expr';
-import { NORMALISERS, canonicalLookupValue, coerceValue, historyText, indexValue, isEmptyValue, valuesEqual } from './values';
+import {
+  MAX_MINOR_UNITS, MAX_NUMBER, NORMALISERS, canonicalLookupValue, coerceValue, historyText,
+  indexValue, isEmptyValue, valuesEqual,
+} from './values';
 import { Pipelines } from './pipelines';
 import { deriveStage, stageOwnedExplanation } from './derive';
 import type {
-  AssociationSummary, AssociationTypeDef, ChangeSource, CrmRecord, FilterNode, HistoryEntry,
-  ObjectTypeDef, PropertyDef, PropertyValue, SearchQuery, SearchResult, ViewDef, WriteOptions,
+  ActorType, AssociationSummary, AssociationTypeDef, ChangeSource, CrmRecord, FilterNode, HistoryEntry,
+  HistoryPage, ObjectTypeDef, PropertyDef, PropertyValue, SearchQuery, SearchResult, ViewDef, WriteOptions,
 } from './types';
+
+/** How the audit trail is read: filtered, ordered, and paged on a real cursor. */
+export interface HistoryQuery {
+  limit?: number;
+  property?: string;
+  /** Only changes strictly before this instant (unix ms). */
+  before?: number;
+  /** Only changes at or after this instant (unix ms). */
+  since?: number;
+  /** Opaque cursor from a previous page's `next_cursor`. */
+  after?: string;
+  order?: 'asc' | 'desc';
+}
+
+interface HistoryRow {
+  id: string; org_id: string; record_id: string; object_type: string; property: string;
+  from_value: string | null; to_value: string | null; changed_at: number; seq: number;
+  write_id: string; actor_id: string | null; actor_type: ActorType; source: ChangeSource;
+  request_id: string | null;
+}
 
 interface RecordRow {
   id: string; org_id: string; object_type: string; properties: string; display_name: string;
@@ -51,9 +74,24 @@ export class Crm {
   private objectCache = new Map<string, ObjectTypeDef>();
   /** Pipelines live beside the schema: a stage change is a schema-driven write. */
   readonly pipelines: Pipelines;
+  /** Lazily seeded from the table so restarts continue the sequence. */
+  private historySeq: number | null = null;
 
   constructor(private readonly ctx: Ctx) {
     this.pipelines = new Pipelines(ctx, () => this.invalidateSchema());
+  }
+
+  /**
+   * The audit trail's ordering key. A millisecond clock cannot order writes —
+   * six of them land in the same tick every time a stage moves — so every
+   * history row gets a number that only ever goes up, and cursors page on it.
+   */
+  private nextHistorySeq(): number {
+    if (this.historySeq === null) {
+      this.historySeq = this.ctx.db.count(`SELECT COALESCE(MAX(seq), 0) FROM crm_property_history`);
+    }
+    this.historySeq += 1;
+    return this.historySeq;
   }
 
   /** Drop the schema cache after a bulk install writes rows directly. */
@@ -353,7 +391,7 @@ export class Crm {
         else if (prop.required) throw badRequest('property_required', `${prop.label} is required to create a ${objectDef.label.toLowerCase()}.`, `properties.${prop.name}`);
         continue;
       }
-      if (prop.read_only && !MAINTAINED_SOURCES.has(opts.source ?? 'api')) throw this.readOnlyError(objectType, prop);
+      if (prop.read_only && !MAINTAINED_SOURCES.has(opts.source ?? 'api')) throw this.readOnlyError(orgId, objectType, prop);
       const coerced = coerceValue(prop, raw, { now, path: 'properties' });
       if (!isEmptyValue(coerced)) values[prop.name] = coerced;
       else if (prop.required) throw badRequest('property_required', `${prop.label} is required to create a ${objectDef.label.toLowerCase()}.`, `properties.${prop.name}`);
@@ -380,9 +418,12 @@ export class Crm {
     this.writeValues(orgId, objectType, id, index, values, Object.keys(values));
 
     if (opts.history !== false) {
+      // One save, one write id. Everything a record is born with belongs to
+      // the same entry on the timeline, and nothing later can join it.
+      const writeId = opts.writeId ?? newId('audit');
       for (const [name, value] of Object.entries(values)) {
         if (isEmptyValue(value)) continue;
-        this.writeHistory(orgId, objectType, id, index.get(name), name, null, value, createdAt, opts);
+        this.writeHistory(orgId, objectType, id, index.get(name), name, null, value, createdAt, { ...opts, writeId });
       }
     }
 
@@ -411,7 +452,7 @@ export class Crm {
       const prop = index.get(name);
       if (!prop) continue;
       if (prop.calculated) throw badRequest('property_read_only', `${prop.label} is calculated from other properties and cannot be set directly.`, `properties.${name}`);
-      if (prop.read_only && !MAINTAINED_SOURCES.has(opts.source ?? 'user')) throw this.readOnlyError(objectType, prop);
+      if (prop.read_only && !MAINTAINED_SOURCES.has(opts.source ?? 'user')) throw this.readOnlyError(orgId, objectType, prop);
       const coerced = coerceValue(prop, raw, { now, path: 'properties' });
       if (valuesEqual(existing.properties[name] ?? null, coerced)) continue;
       previous[name] = existing.properties[name] ?? null;
@@ -422,7 +463,8 @@ export class Crm {
 
     const derived = deriveStage(this.pipelines, {
       orgId, objectType, values, has: (name) => index.has(name),
-      incoming: new Set(Object.keys(incoming)), createdAt: existing.created, now,
+      incoming: new Set(Object.keys(incoming)), previous: existing.properties,
+      createdAt: existing.created, now,
     });
     this.applyCalculated(index, values, now);
     // A rep moved the stage; Ain moved the probability. The history says so.
@@ -460,12 +502,16 @@ export class Crm {
     this.writeValues(orgId, objectType, id, index, values, touched);
 
     if (opts.history !== false) {
+      // The stage a person moved and the five fields Ain restamped from it are
+      // one save. They share a write id, so the timeline folds them into one
+      // entry — and a different save in the same millisecond never joins them.
+      const writeId = opts.writeId ?? newId('audit');
       for (const name of touched) {
         const source: ChangeSource = maintained.has(name) && !(name in incoming) ? 'system' : (opts.source ?? 'user');
-        this.writeHistory(orgId, objectType, id, index.get(name), name, previous[name] ?? null, values[name] ?? null, now, { ...opts, source });
+        this.writeHistory(orgId, objectType, id, index.get(name), name, previous[name] ?? null, values[name] ?? null, now, { ...opts, source, writeId });
       }
       if (ownerChanged) {
-        this.writeHistory(orgId, objectType, id, undefined, 'owner_id', existing.owner_id, ownerId ?? null, now, opts);
+        this.writeHistory(orgId, objectType, id, undefined, 'owner_id', existing.owner_id, ownerId ?? null, now, { ...opts, writeId });
       }
     }
 
@@ -554,8 +600,17 @@ export class Crm {
       if (!prop.calculated) continue;
       try {
         const result = evaluateExpression(prop.calculated, { properties: values, now });
-        if (result === null || result === '' || (typeof result === 'number' && !Number.isFinite(result))) delete values[prop.name];
-        else values[prop.name] = prop.type === 'currency' || prop.type === 'number' ? Math.round(Number(result)) : result;
+        if (result === null || result === '' || (typeof result === 'number' && !Number.isFinite(result))) {
+          delete values[prop.name];
+        } else if (prop.type === 'currency' || prop.type === 'number') {
+          // A formula can multiply its way out of range even when every input
+          // is legal. Clamping keeps the value serialisable, so one record can
+          // never turn a workspace-wide sum into `null`.
+          const ceiling = prop.type === 'currency' ? MAX_MINOR_UNITS : MAX_NUMBER;
+          values[prop.name] = Math.max(-ceiling, Math.min(ceiling, Math.round(Number(result))));
+        } else {
+          values[prop.name] = result;
+        }
       } catch (e) {
         if (e instanceof ExpressionError) throw badRequest('expression_failed', `The formula for ${prop.label} could not be evaluated: ${e.message}`, `properties.${prop.name}`);
         throw e;
@@ -582,8 +637,8 @@ export class Crm {
     }
   }
 
-  private readOnlyError(objectType: string, prop: PropertyDef) {
-    const why = stageOwnedExplanation(this.pipelines, objectType, prop.name);
+  private readOnlyError(orgId: string, objectType: string, prop: PropertyDef) {
+    const why = stageOwnedExplanation(this.pipelines, orgId, objectType, prop.name);
     return badRequest(
       'property_read_only',
       `${prop.label} is maintained by Ain and cannot be written directly.${why ? ` ${why}` : ''}`,
@@ -620,6 +675,7 @@ export class Crm {
     this.ctx.db.insert('crm_property_history', {
       id: newId('audit'), org_id: orgId, record_id: recordId, object_type: objectType, property,
       from_value: historyText(prop, from), to_value: historyText(prop, to), changed_at: at,
+      seq: this.nextHistorySeq(), write_id: opts.writeId ?? newId('audit'),
       actor_id: opts.actorId ?? null, actor_type: opts.actorType ?? 'user',
       source: opts.source ?? 'user', request_id: opts.requestId ?? null,
     });
@@ -633,27 +689,80 @@ export class Crm {
     this.writeHistory(orgId, objectType, recordId, this.propertyOrNull(orgId, objectType, property) ?? undefined, property, from, to, at, opts);
   }
 
-  history(orgId: string, recordId: string, opts: { limit?: number; property?: string; before?: number } = {}): HistoryEntry[] {
+  /**
+   * The audit trail, newest first, totally ordered on `(changed_at, seq)`.
+   * `before` is a time filter a human can type; `after` is the opaque cursor
+   * this endpoint emits, and paging on it can neither skip nor repeat a row
+   * however many share a millisecond.
+   */
+  history(orgId: string, recordId: string, opts: HistoryQuery = {}): HistoryEntry[] {
     const merged = this.ctx.db.all<{ id: string }>(`SELECT id FROM crm_records WHERE org_id = ? AND merged_into = ?`, orgId, recordId).map((r) => r.id);
     const ids = [recordId, ...merged];
     const clauses = [`org_id = ?`, `record_id IN (${ids.map(() => '?').join(',')})`];
     const params: unknown[] = [orgId, ...ids];
     if (opts.property) { clauses.push('property = ?'); params.push(opts.property); }
     if (opts.before) { clauses.push('changed_at < ?'); params.push(opts.before); }
-    const rows = this.ctx.db.all<any>(
-      `SELECT * FROM crm_property_history WHERE ${clauses.join(' AND ')} ORDER BY changed_at DESC, rowid DESC LIMIT ?`,
-      ...(params as never[]), Math.min(opts.limit ?? 100, 500),
+    if (opts.since) { clauses.push('changed_at >= ?'); params.push(opts.since); }
+    const after = decodeHistoryCursor(opts.after);
+    if (after) {
+      clauses.push('(changed_at < ? OR (changed_at = ? AND seq < ?))');
+      params.push(after.changed_at, after.changed_at, after.seq);
+    }
+    const rows = this.ctx.db.all<HistoryRow>(
+      `SELECT * FROM crm_property_history WHERE ${clauses.join(' AND ')}
+        ORDER BY changed_at ${opts.order === 'asc' ? 'ASC' : 'DESC'}, seq ${opts.order === 'asc' ? 'ASC' : 'DESC'} LIMIT ?`,
+      ...(params as never[]), Math.min(Math.max(opts.limit ?? 100, 1), 500),
     );
-    return rows.map((row) => {
-      const prop = this.propertyOrNull(orgId, row.object_type, row.property);
-      return {
-        object: 'property_history' as const,
-        id: row.id, record_id: row.record_id, object_type: row.object_type, property: row.property,
-        property_label: prop?.label ?? labelForBuiltin(row.property),
-        from_value: row.from_value, to_value: row.to_value, changed_at: row.changed_at,
-        actor_id: row.actor_id, actor_type: row.actor_type, source: row.source,
-      };
-    });
+    return rows.map((row) => this.hydrateHistory(orgId, row));
+  }
+
+  /** One page plus the cursor that fetches the next, with an honest `has_more`. */
+  historyPage(orgId: string, recordId: string, opts: HistoryQuery = {}): HistoryPage {
+    const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+    // Peek one row past the page: `has_more` should be a fact, not a guess
+    // from whether the page came back exactly full.
+    const rows = this.history(orgId, recordId, { ...opts, limit: limit + 1 });
+    const has_more = rows.length > limit;
+    const entries = has_more ? rows.slice(0, limit) : rows;
+    const last = entries[entries.length - 1];
+    return {
+      entries,
+      has_more,
+      next_cursor: has_more && last ? encodeHistoryCursor(last.changed_at, last.seq) : null,
+    };
+  }
+
+  /**
+   * The write that brought a record into existence. Its rows are already told
+   * by the "Record created" event, so the timeline does not repeat them as
+   * fourteen separate "empty → value" changes.
+   */
+  creationWriteId(orgId: string, recordId: string): string | null {
+    const row = this.ctx.db.get<{ write_id: string }>(
+      `SELECT write_id FROM crm_property_history WHERE org_id = ? AND record_id = ?
+        ORDER BY changed_at ASC, seq ASC LIMIT 1`,
+      orgId, recordId,
+    );
+    return row?.write_id ?? null;
+  }
+
+  /** Every row written by one save, oldest first. */
+  historyOfWrite(orgId: string, writeId: string): HistoryEntry[] {
+    return this.ctx.db
+      .all<HistoryRow>(`SELECT * FROM crm_property_history WHERE org_id = ? AND write_id = ? ORDER BY seq ASC`, orgId, writeId)
+      .map((row) => this.hydrateHistory(orgId, row));
+  }
+
+  private hydrateHistory(orgId: string, row: HistoryRow): HistoryEntry {
+    const prop = this.propertyOrNull(orgId, row.object_type, row.property);
+    return {
+      object: 'property_history',
+      id: row.id, record_id: row.record_id, object_type: row.object_type, property: row.property,
+      property_label: prop?.label ?? labelForBuiltin(row.property),
+      from_value: row.from_value, to_value: row.to_value, changed_at: row.changed_at,
+      seq: row.seq, write_id: row.write_id,
+      actor_id: row.actor_id, actor_type: row.actor_type, source: row.source,
+    };
   }
 
   /* -------------------------------- search ------------------------------- */
@@ -1069,8 +1178,15 @@ function buildSearchBlob(objectDef: ObjectTypeDef, values: Record<string, Proper
   return parts.join(' • ').toLowerCase().slice(0, 2000);
 }
 
+/** Record-level fields that get history rows without being properties. */
+const BUILTIN_HISTORY_LABELS: Record<string, string> = {
+  owner_id: 'Owner',
+  archived: 'Archived',
+  merged_from: 'Duplicate merged in',
+};
+
 function labelForBuiltin(name: string): string {
-  return name === 'owner_id' ? 'Owner' : name === 'archived' ? 'Archived' : name;
+  return BUILTIN_HISTORY_LABELS[name] ?? name;
 }
 
 const SIGNATURE_KEYS = ['filter', 'query', 'sort', 'include_archived', 'associated_to'] as const;
@@ -1079,6 +1195,30 @@ function signatureOf(objectType: string, query: SearchQuery): string {
   const shape: Record<string, unknown> = { objectType };
   for (const key of SIGNATURE_KEYS) shape[key] = (query as Record<string, unknown>)[key] ?? null;
   return createHash('sha1').update(JSON.stringify(shape)).digest('base64url').slice(0, 12);
+}
+
+/**
+ * A history cursor is the exact position of the last row returned, not a
+ * timestamp: `(changed_at, seq)` is a total order, so resuming from it lands on
+ * the very next row even when a dozen changes share one millisecond.
+ */
+function encodeHistoryCursor(changedAt: number, seq: number): string {
+  return Buffer.from(`h1.${changedAt}.${seq}`).toString('base64url');
+}
+
+function decodeHistoryCursor(cursor: string | undefined): { changed_at: number; seq: number } | null {
+  if (!cursor) return null;
+  let decoded = '';
+  try { decoded = Buffer.from(cursor, 'base64url').toString('utf8'); } catch { decoded = ''; }
+  const [tag, changedAt, seq] = decoded.split('.');
+  if (tag !== 'h1' || !Number.isInteger(Number(changedAt)) || !Number.isInteger(Number(seq))) {
+    throw badRequest(
+      'cursor_invalid',
+      'That is not a history cursor. Pass the `next_cursor` from the previous page verbatim as `after`, or start again without it.',
+      'after',
+    );
+  }
+  return { changed_at: Number(changedAt), seq: Number(seq) };
 }
 
 function encodeCursor(offset: number, signature: string): string {

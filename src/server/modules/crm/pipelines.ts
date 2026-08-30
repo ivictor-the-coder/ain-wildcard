@@ -65,33 +65,120 @@ interface StageRow {
 
 const NAME_RE = /^[a-z][a-z0-9_]{1,60}$/;
 
+/**
+ * A money total that can always be serialised. `JSON.stringify(Infinity)` is
+ * `null`, so one non-finite sum used to blank the weighted forecast of every
+ * stage and of the whole workspace. Property validation now caps a single
+ * amount far below this, so a clamp here can only be reached by data written
+ * before that cap existed — and a clamped number is still an answer.
+ */
+export function safeMinorUnits(value: number): number {
+  if (Number.isNaN(value)) return 0;
+  if (!Number.isFinite(value)) return value > 0 ? Number.MAX_SAFE_INTEGER : -Number.MAX_SAFE_INTEGER;
+  return Math.max(-Number.MAX_SAFE_INTEGER, Math.min(Number.MAX_SAFE_INTEGER, Math.round(value)));
+}
+
+/** The properties a user-defined object needs before it can run a pipeline. */
+export const CUSTOM_PIPELINE_PROPERTIES = [
+  {
+    name: 'pipeline', label: 'Pipeline', type: 'enum' as const, group: 'Process', position: 2,
+    validation: { allow_other: true },
+    description: 'Which process this record runs through. The pipeline decides which stages are legal.',
+  },
+  {
+    name: 'stage', label: 'Stage', type: 'enum' as const, group: 'Process', position: 3,
+    validation: { allow_other: true },
+    description: 'Validated against the stages of this record’s own pipeline.',
+  },
+  {
+    name: 'stage_entered_at', label: 'Entered stage', type: 'datetime' as const, group: 'Process', position: 4,
+    read_only: true, description: 'Stamped every time the record moves, so “how long has this been sitting here” is answerable.',
+  },
+  {
+    name: 'closed_at', label: 'Closed on', type: 'datetime' as const, group: 'Process', position: 5,
+    read_only: true, description: 'Stamped when the record reaches a stage marked closed, and cleared if it moves back.',
+  },
+  {
+    name: 'days_to_close', label: 'Days to close', type: 'number' as const, group: 'Process', position: 6,
+    read_only: true, description: 'Calendar days from creation to the close stamp.',
+  },
+];
+
 export class Pipelines {
   private cache = new Map<string, PipelineDef[]>();
+  private bindingCache = new Map<string, PipelineBinding | null>();
 
   constructor(private readonly ctx: Ctx, private readonly onSchemaChange: () => void) {}
 
-  invalidate(): void { this.cache.clear(); }
+  invalidate(): void { this.cache.clear(); this.bindingCache.clear(); }
 
   /* ------------------------------- bindings ------------------------------ */
 
-  binding(objectType: string): PipelineBinding | null {
-    return PIPELINE_BINDINGS.find((b) => b.object_type === objectType) ?? null;
+  /**
+   * Deals and tickets are wired to pipelines at build time. Anything else earns
+   * a binding by having the properties a pipeline needs — which is why a
+   * user-defined "Installation" object can run a rollout process, rather than
+   * pipelines being a privilege of the two objects we happened to ship.
+   */
+  binding(orgId: string, objectType: string): PipelineBinding | null {
+    const builtin = PIPELINE_BINDINGS.find((b) => b.object_type === objectType);
+    if (builtin) return builtin;
+    const key = `${orgId}:${objectType}`;
+    if (this.bindingCache.has(key)) return this.bindingCache.get(key) ?? null;
+    const found = this.deriveCustomBinding(orgId, objectType);
+    this.bindingCache.set(key, found);
+    return found;
   }
 
-  requireBinding(objectType: string): PipelineBinding {
-    const found = this.binding(objectType);
+  requireBinding(orgId: string, objectType: string): PipelineBinding {
+    const found = this.binding(orgId, objectType);
     if (!found) {
-      const supported = PIPELINE_BINDINGS.map((b) => b.object_type).join(', ');
+      const supported = this.boundTypes(orgId).join(', ');
+      const system = this.ctx.db.get<{ system: number }>(
+        `SELECT system FROM crm_object_types WHERE org_id = ? AND name = ?`, orgId, objectType);
       throw badRequest(
         'pipelines_unsupported',
-        `${objectType} records do not move through a pipeline. Pipelines exist for: ${supported}.`,
+        system?.system
+          ? `${objectType} records do not move through a pipeline. Pipelines exist for: ${supported}.`
+          : `${objectType} is not on a pipeline yet. Pipelines exist for: ${supported}. POST /v1/pipelines/${objectType} to put it on one — the stage, entered-stage and close properties are created with it.`,
         'object_type',
       );
     }
     return found;
   }
 
-  boundTypes(): string[] { return PIPELINE_BINDINGS.map((b) => b.object_type); }
+  /** Every object type in this workspace that moves through a pipeline. */
+  boundTypes(orgId: string): string[] {
+    const custom = this.ctx.db
+      .all<{ name: string }>(`SELECT name FROM crm_object_types WHERE org_id = ? AND system = 0 ORDER BY position, label`, orgId)
+      .map((row) => row.name)
+      .filter((name) => this.binding(orgId, name));
+    return [...PIPELINE_BINDINGS.map((b) => b.object_type), ...custom];
+  }
+
+  private deriveCustomBinding(orgId: string, objectType: string): PipelineBinding | null {
+    const rows = this.ctx.db.all<{ name: string; type: string }>(
+      `SELECT name, type FROM crm_properties WHERE org_id = ? AND object_type = ?`, orgId, objectType);
+    if (!rows.length) return null;
+    const types = new Map(rows.map((row) => [row.name, row.type]));
+    const has = (name: string, type: string): string | undefined => (types.get(name) === type ? name : undefined);
+    if (!has('pipeline', 'enum') || !has('stage', 'enum')) return null;
+    return {
+      object_type: objectType,
+      noun: 'pipeline',
+      pipeline_property: 'pipeline',
+      stage_property: 'stage',
+      amount_property: has('amount', 'currency'),
+      derived: {
+        probability: has('probability', 'number'),
+        forecast_category: has('forecast_category', 'enum'),
+        closed_at: has('closed_at', 'datetime'),
+        days_to_close: has('days_to_close', 'number'),
+        stage_entered_at: has('stage_entered_at', 'datetime'),
+      },
+      custom: true,
+    };
+  }
 
   /* --------------------------------- reads ------------------------------- */
 
@@ -162,7 +249,7 @@ export class Pipelines {
    * the numbers a board header shows, computed rather than cached.
    */
   usage(orgId: string, objectType: string): Map<string, StageUsage> {
-    const binding = this.requireBinding(objectType);
+    const binding = this.requireBinding(orgId, objectType);
     const amount = binding.amount_property;
     const rows = this.ctx.db.all<{ pipeline: string | null; stage: string | null; n: number; total: number }>(
       `SELECT pv.value_text AS pipeline, sv.value_text AS stage, COUNT(*) AS n,
@@ -180,11 +267,11 @@ export class Pipelines {
     for (const row of rows) {
       if (!row.pipeline || !row.stage) continue;
       const stage = this.stage(orgId, objectType, row.pipeline, row.stage);
-      const total = Math.round(row.total);
+      const total = safeMinorUnits(row.total);
       out.set(`${row.pipeline}:${row.stage}`, {
         records: row.n,
         amount: total,
-        weighted_amount: Math.round((total * (stage?.probability ?? 0)) / 100),
+        weighted_amount: safeMinorUnits((total * (stage?.probability ?? 0)) / 100),
       });
     }
     return out;
@@ -193,7 +280,7 @@ export class Pipelines {
   /* -------------------------------- writes ------------------------------- */
 
   create(orgId: string, objectType: string, input: PipelineInput, opts: { system?: boolean; emit?: boolean } = {}): PipelineDef {
-    this.requireBinding(objectType);
+    this.requireBinding(orgId, objectType);
     if (!NAME_RE.test(input.name)) {
       throw badRequest('pipeline_name_invalid', 'A pipeline name must be lowercase letters, digits and underscores, e.g. "field_service".', 'name');
     }
@@ -323,12 +410,13 @@ export class Pipelines {
   private writeStages(orgId: string, objectType: string, pipeline: string, stages: StageInput[], now: number): void {
     stages.forEach((stage, index) => {
       const closed = stage.is_won ? true : stage.is_closed === true;
+      const probability = stage.is_won ? 100 : closed ? 0 : Math.round(stage.probability ?? 0);
       this.ctx.db.insert('crm_pipeline_stages', {
         id: newId('stage'), org_id: orgId, object_type: objectType, pipeline, name: stage.name,
         label: stage.label, description: stage.description ?? null,
-        probability: stage.is_won ? 100 : closed ? 0 : Math.round(stage.probability ?? 0),
+        probability,
         is_closed: closed ? 1 : 0, is_won: stage.is_won ? 1 : 0,
-        forecast_category: stage.forecast_category ?? (closed ? 'closed' : null),
+        forecast_category: stage.forecast_category ?? defaultForecastCategory(closed, probability),
         color: stage.color ?? (stage.is_won ? 'green' : closed ? 'red' : 'gray'),
         position: (index + 1) * 10, created: now, updated: now,
       });
@@ -354,7 +442,7 @@ export class Pipelines {
   }
 
   private recordsInPipeline(orgId: string, objectType: string, pipeline: string): number {
-    const binding = this.requireBinding(objectType);
+    const binding = this.requireBinding(orgId, objectType);
     return this.ctx.db.count(
       `SELECT COUNT(*) FROM crm_record_values v JOIN crm_records r ON r.id = v.record_id
         WHERE v.org_id = ? AND v.object_type = ? AND v.property = ? AND v.value_text = ? AND r.archived = 0 AND r.merged_into IS NULL`,
@@ -362,7 +450,7 @@ export class Pipelines {
   }
 
   private recordsInStage(orgId: string, objectType: string, pipeline: string, stage: string): number {
-    const binding = this.requireBinding(objectType);
+    const binding = this.requireBinding(orgId, objectType);
     return this.ctx.db.count(
       `SELECT COUNT(*) FROM crm_records r
          JOIN crm_record_values pv ON pv.record_id = r.id AND pv.property = ?
@@ -385,7 +473,7 @@ export class Pipelines {
    * from drifting apart.
    */
   syncProperties(orgId: string, objectType: string): void {
-    const binding = this.binding(objectType);
+    const binding = this.binding(orgId, objectType);
     if (!binding) return;
     const pipelines = this.list(orgId, objectType);
     if (!pipelines.length) return;
@@ -427,6 +515,19 @@ export class Pipelines {
     write(binding.pipeline_property, pipelineOptions, fallback.name);
     write(binding.stage_property, stageOptions, fallback.stages[0]?.name ?? null);
   }
+}
+
+/**
+ * A stage you build yourself still has to land in a forecast bucket. Leaving it
+ * null drops the whole pipeline out of forecast-category rollups silently,
+ * which is worse than an opinionated default: the band the probability already
+ * implies is the honest answer, and it stays overridable.
+ */
+function defaultForecastCategory(closed: boolean, probability: number): string {
+  if (closed) return 'closed';
+  if (probability >= 75) return 'commit';
+  if (probability >= 40) return 'best_case';
+  return 'pipeline';
 }
 
 function hydrate(row: PipelineRow, stages: StageRow[]): PipelineDef {

@@ -3,7 +3,8 @@ import type { Ctx } from '../../kernel/context';
 import { created, list, noContent, type Req } from '../../kernel/http';
 import { badRequest, notFound } from '../../../shared/errors';
 import { rat, ratAdd, ratRound } from '../../../shared/money';
-import v from '../../../shared/validate';
+import v, { type SchemaNode, type Validator } from '../../../shared/validate';
+import { assertCurrency, CURRENCY_CODES, currencyName } from './currencies';
 import { CATALOG_MIGRATIONS } from './schema';
 import {
   Catalog, type CatalogView, type PriceInput, type PriceListFilter, type ProductInput, type ProductListFilter,
@@ -81,6 +82,19 @@ const writeMeta = (req: Req) => ({
 
 /* ------------------------------- validators ------------------------------- */
 
+/**
+ * `[a-z]{3}` is a shape, not a currency: it accepts "zzz", and a price's
+ * currency can never be edited once the price has billed. Every currency that
+ * enters the catalog is checked against the ISO-4217 register instead.
+ */
+const currencyCode = (): Validator<string> => ({
+  parse: (value: unknown, path = '') => assertCurrency(v.currency().parse(value, path), path || 'currency'),
+  describe: (): SchemaNode => ({
+    type: 'string', format: 'currency', pattern: '^[a-z]{3}$',
+    description: 'Lowercase ISO-4217 currency code, e.g. usd.',
+  }),
+});
+
 const tierBody = v.object({
   up_to: v.union(v.int({ min: 1 }), v.literal('inf')),
   unit_amount: v.optional(v.int({ min: 0 })),
@@ -114,7 +128,7 @@ const currencyOptionBody = v.object({
 });
 
 const PRICE_FIELDS = {
-  currency: v.currency(),
+  currency: currencyCode(),
   nickname: v.optional(v.string({ max: 160 })),
   lookup_key: v.optional(v.string({ max: 80 })),
   active: v.optional(v.boolean()),
@@ -138,7 +152,7 @@ const priceDataBody = v.object(PRICE_FIELDS);
 
 const priceUpdateBody = v.object({
   product: v.optional(v.id('prod')),
-  currency: v.optional(v.currency()),
+  currency: v.optional(currencyCode()),
   transfer_lookup_key: v.optional(v.boolean()),
   ...Object.fromEntries(Object.entries(PRICE_FIELDS).filter(([k]) => k !== 'currency')),
 });
@@ -181,7 +195,7 @@ const usageRecordBody = v.object({
 
 const previewBody = v.object({
   quantity: v.optional(v.int({ min: 0 })),
-  currency: v.optional(v.currency()),
+  currency: v.optional(currencyCode()),
   custom_unit_amount: v.optional(v.int({ min: 0 })),
   usage_records: v.optional(v.array(usageRecordBody, { max: 500 })),
   proration: v.optional(v.object({ numerator: v.int({ min: 0 }), denominator: v.int({ min: 1 }) })),
@@ -382,7 +396,7 @@ export default defineModule({
         active: v.optional(v.boolean()),
         type: v.optional(v.enum(PRICE_TYPES)),
         model: v.optional(v.enum(PRICE_MODELS)),
-        currency: v.optional(v.currency()),
+        currency: v.optional(currencyCode()),
         lookup_key: v.optional(v.string({ max: 80 })),
         limit: v.optional(v.int({ min: 1, max: 200 })),
         cursor: v.optional(v.string({ max: 200 })),
@@ -515,7 +529,7 @@ export default defineModule({
         to: v.optional(v.int({ min: 1 })),
         points: v.optional(v.int({ min: 2, max: 250 })),
         quantities: v.optional(v.string({ max: 600 })),
-        currency: v.optional(v.currency()),
+        currency: v.optional(currencyCode()),
         custom_unit_amount: v.optional(v.int({ min: 0 })),
       }),
     });
@@ -533,9 +547,39 @@ export default defineModule({
       summary: 'The whole price book, shaped for a pricing page', tags: ['catalog'],
       description: 'Plans with their base and per-seat prices, shared metered components, add-ons, services, credit packs, a feature comparison matrix and the annual saving, all computed from the stored prices.',
       query: v.object({
-        currency: v.optional(v.currency()),
+        currency: v.optional(currencyCode()),
         include_inactive: v.optional(v.boolean()),
       }),
+    });
+
+    router.get('/v1/catalog/currencies', (req: Req, c: Ctx) => {
+      const orgId = req.auth.orgId;
+      const store = catalogStore(c);
+      const home = currencyOf(c, orgId);
+      const counts = new Map<string, number>();
+      let cursor: string | null = null;
+      do {
+        const page = store.listPrices(orgId, { limit: 200, cursor });
+        for (const price of page.data) {
+          for (const code of currenciesOf(price)) counts.set(code, (counts.get(code) ?? 0) + 1);
+        }
+        cursor = page.nextCursor;
+      } while (cursor);
+      const offered = [...counts.keys()].sort();
+      return list(
+        offered.map((code) => ({
+          object: 'catalog_currency',
+          code,
+          name: currencyName(code),
+          symbol: formatMinor(0, code, localeOf(c, orgId)).replace(/[\d.,\s]/g, ''),
+          prices: counts.get(code) ?? 0,
+          default: code === home,
+        })),
+        { totalCount: offered.length },
+      );
+    }, {
+      summary: 'Currencies this price book already sells in', tags: ['catalog'],
+      description: `The currency picker's source of truth: every code that appears on a price or one of its currency_options, with the number of prices quoted in it. New codes must be valid ISO-4217 — ${CURRENCY_CODES.length} are accepted.`,
     });
 
     router.post('/v1/catalog/estimate', (req: Req, c: Ctx) => {
@@ -594,7 +638,7 @@ export default defineModule({
       summary: 'Price a whole basket — the pricing page calculator', tags: ['catalog'], roles: ['readonly'],
       description: 'Accepts price ids or lookup keys, prices every line in one currency, and rolls the result up per interval plus a monthly-equivalent figure.',
       body: v.object({
-        currency: v.optional(v.currency()),
+        currency: v.optional(currencyCode()),
         lines: v.array(v.object({
           price: v.string({ min: 3, max: 120 }),
           quantity: v.optional(v.int({ min: 0 })),
@@ -616,7 +660,7 @@ export default defineModule({
         tags: ['catalog', 'billing'],
         input: v.object({
           category: v.optional(v.enum(PRODUCT_CATEGORIES)),
-          currency: v.optional(v.currency()),
+          currency: v.optional(currencyCode()),
         }),
         run(args: { category?: string; currency?: string }, c: Ctx, meta) {
           const s = catalogStore(c);
@@ -647,7 +691,7 @@ export default defineModule({
         input: v.object({
           price: v.string({ min: 3, max: 120 }),
           quantity: v.int({ min: 0 }),
-          currency: v.optional(v.currency()),
+          currency: v.optional(currencyCode()),
           custom_unit_amount: v.optional(v.int({ min: 0 })),
         }),
         run(args: { price: string; quantity: number; currency?: string; custom_unit_amount?: number }, c: Ctx, meta) {
@@ -680,7 +724,7 @@ export default defineModule({
           price: v.string({ min: 3, max: 120 }),
           from: v.optional(v.int({ min: 0 })),
           to: v.optional(v.int({ min: 1 })),
-          currency: v.optional(v.currency()),
+          currency: v.optional(currencyCode()),
         }),
         run(args: { price: string; from?: number; to?: number; currency?: string }, c: Ctx, meta) {
           const s = catalogStore(c);

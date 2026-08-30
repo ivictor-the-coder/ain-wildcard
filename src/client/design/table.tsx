@@ -158,6 +158,12 @@ export function DataTable<T>({
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [openFilterId, setOpenFilterId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
+  /**
+   * A chip the operator has added but not yet filled in. It deliberately lives
+   * outside `filters` — an empty filter matches everything, so committing one
+   * would put a no-op in the shared URL.
+   */
+  const [draft, setDraft] = useState<{ columnId: string; filter: ColumnFilter } | null>(null);
   const [internalDensity, setInternalDensity] = useState<Density | null>(null);
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(
     () => new Set(columns.filter((c) => c.defaultHidden).map((c) => c.id)),
@@ -208,7 +214,11 @@ export function DataTable<T>({
   const selectState = selectionState(selection, visibleIds);
   const filterCount = activeFilterCount(filters);
   const filtersActive = filterCount > 0 || !!query;
-  const chipIds = useMemo(() => Object.keys(filters).filter((id) => filters[id]), [filters]);
+  const chipFilters = useMemo<[string, ColumnFilter][]>(() => {
+    const entries = Object.entries(filters).filter(([, f]) => f) as [string, ColumnFilter][];
+    if (draft && !entries.some(([id]) => id === draft.columnId)) entries.push([draft.columnId, draft.filter]);
+    return entries;
+  }, [filters, draft]);
 
   const split = useMemo(() => splitSelection(selection, visibleIds), [selection, visibleIds]);
   const actionableIds = includeHidden ? selection : split.visible;
@@ -249,16 +259,34 @@ export function DataTable<T>({
   };
 
   const addFilter = (columnId: string, kind: FilterKind) => {
-    setFilter(columnId, emptyFilterFor(kind));
+    if (isFilterEmpty(filters[columnId])) setDraft({ columnId, filter: emptyFilterFor(kind) });
     setFiltersOpen(true);
     setAddOpen(false);
     setOpenFilterId(columnId);
   };
 
+  /** An edit that empties a chip parks it as a draft rather than dropping it
+   *  under the operator's cursor. */
+  const changeFilter = (columnId: string, next: ColumnFilter) => {
+    if (isFilterEmpty(next)) {
+      setDraft({ columnId, filter: next });
+      if (filters[columnId]) setFilter(columnId, undefined);
+    } else {
+      setDraft(null);
+      setFilter(columnId, next);
+    }
+  };
+
+  const removeFilter = (columnId: string) => {
+    setOpenFilterId(null);
+    if (draft?.columnId === columnId) setDraft(null);
+    if (filters[columnId]) setFilter(columnId, undefined);
+  };
+
   /** Closing an editor that was never filled in removes its chip again. */
   const closeEditor = (columnId: string) => {
     setOpenFilterId(null);
-    if (isFilterEmpty(filters[columnId])) setFilter(columnId, undefined);
+    if (draft?.columnId === columnId) setDraft(null);
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTableSectionElement>) => {
@@ -293,7 +321,7 @@ export function DataTable<T>({
   const windowRows = virtual.virtualised ? processed.slice(virtual.startIndex, virtual.endIndex) : processed;
   const columnCount = visibleColumns.length + (selectable ? 1 : 0) + (rowActions ? 1 : 0);
   const hasTotals = stickyFooter && visibleColumns.some((c) => c.total);
-  const showFilterBar = showFilters && filterableColumns.length > 0 && (filtersOpen || chipIds.length > 0);
+  const showFilterBar = showFilters && filterableColumns.length > 0 && (filtersOpen || chipFilters.length > 0);
 
   const addSections: MenuSection[] = useMemo(() => [{
     id: 'properties',
@@ -411,7 +439,7 @@ export function DataTable<T>({
 
       {showFilterBar && (
         <div className="ain-table__bar ain-table__bar--filters" role="group" aria-label="Active filters">
-          {chipIds.map((columnId) => {
+          {chipFilters.map(([columnId, filter]) => {
             const column = columns.find((c) => c.id === columnId);
             if (!column) return null;
             return (
@@ -420,12 +448,12 @@ export function DataTable<T>({
                 column={column}
                 rows={rows}
                 accessor={accessor}
-                filter={filters[columnId] as ColumnFilter}
+                filter={filter}
                 open={openFilterId === columnId}
                 onOpen={() => setOpenFilterId(columnId)}
                 onClose={() => closeEditor(columnId)}
-                onChange={(next) => setFilter(columnId, next)}
-                onRemove={() => { setOpenFilterId(null); setFilter(columnId, undefined); }}
+                onChange={(next) => changeFilter(columnId, next)}
+                onRemove={() => removeFilter(columnId)}
               />
             );
           })}
@@ -452,7 +480,7 @@ export function DataTable<T>({
           {filterCount > 0 && (
             <>
               <span className="u-spacer" />
-              <Button size="sm" variant="ghost" iconLeft={<FilterXIcon size={13} />} onClick={() => setFilters({})}>
+              <Button size="sm" variant="ghost" iconLeft={<FilterXIcon size={13} />} onClick={() => { setDraft(null); setOpenFilterId(null); setFilters({}); }}>
                 Clear filters
               </Button>
             </>
@@ -472,11 +500,13 @@ export function DataTable<T>({
           </span>
           {split.hidden.length > 0 && (
             <>
-              <span className="ain-table__bulknote">
-                {includeHidden
-                  ? `Actions apply to all ${formatNumber(selection.length)}, including rows this filter hides.`
-                  : `Actions apply to the ${formatNumber(split.visible.length)} in view.`}
-              </span>
+              {(includeHidden || split.visible.length > 0) && (
+                <span className="ain-table__bulknote">
+                  {includeHidden
+                    ? `Actions apply to all ${formatNumber(selection.length)}, including rows this filter hides.`
+                    : `Actions apply to the ${formatNumber(split.visible.length)} in view.`}
+                </span>
+              )}
               <Button size="sm" variant="ghost" onClick={() => { setSelection(split.visible); setIncludeHidden(false); }}>
                 Drop hidden
               </Button>
@@ -848,10 +878,10 @@ function SetEditor<T>({
       <div className="ain-filtered__list" role="group" aria-label={`${columnLabel(column)} values`}>
         {shown.length === 0 && <p className="ain-filtered__none">No value matches “{search.trim()}”.</p>}
         {shown.map((option) => (
-          <label className="ain-filtered__opt" key={option.value}>
+          <div className="ain-filtered__opt" key={option.value}>
             <Checkbox checked={selectedSet.has(option.value)} onChange={() => toggle(option.value)} label={optionLabel(option.value)} />
             <span className="ain-filtered__count">{formatNumber(option.count)}</span>
-          </label>
+          </div>
         ))}
       </div>
       <EditorFooter

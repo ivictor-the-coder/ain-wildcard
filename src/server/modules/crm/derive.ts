@@ -24,6 +24,8 @@ export interface DeriveInput {
   has: (property: string) => boolean;
   /** Property names the caller explicitly set in this request. */
   incoming: Set<string>;
+  /** The record's properties before this write; absent when creating. */
+  previous?: Record<string, PropertyValue>;
   createdAt: number;
   now: number;
 }
@@ -44,7 +46,7 @@ const stageList = (stages: PipelineStageDef[]): string =>
  * different pipeline, and restamp everything the stage owns.
  */
 export function deriveStage(pipelines: Pipelines, input: DeriveInput): DeriveResult {
-  const binding = pipelines.binding(input.objectType);
+  const binding = pipelines.binding(input.orgId, input.objectType);
   if (!binding) return { stage: null, changed: [] };
   const { orgId, objectType, values, has } = input;
   if (!has(binding.pipeline_property) || !has(binding.stage_property)) return { stage: null, changed: [] };
@@ -113,6 +115,19 @@ export function deriveStage(pipelines: Pipelines, input: DeriveInput): DeriveRes
   /* ------------------------- what the stage owns ------------------------- */
 
   const derived = binding.derived;
+
+  // "Which deals are stuck" is the question a pipeline exists to answer, and
+  // it needs one fact nobody types: when this record arrived where it is. The
+  // stamp only moves when the stage does, so a rename or an amount edit never
+  // resets the clock a forecast review is reading.
+  if (derived.stage_entered_at) {
+    // A record written before this stamp existed keeps an empty one rather
+    // than a fabricated "arrived just now" — the stage history knows the truth
+    // and the velocity report reads it from there.
+    if (!input.previous) set(derived.stage_entered_at, input.createdAt);
+    else if (text(input.previous[binding.stage_property]) !== stage.name) set(derived.stage_entered_at, input.now);
+  }
+
   if (derived.probability) set(derived.probability, stage.probability);
   if (derived.forecast_category && stage.forecast_category) set(derived.forecast_category, stage.forecast_category);
   if (derived.status) set(derived.status, stage.is_closed ? (stage.is_won ? 'won' : 'lost') : 'open');
@@ -147,11 +162,12 @@ export function deriveStage(pipelines: Pipelines, input: DeriveInput): DeriveRes
  * owns it, and where to change it instead.
  */
 export function stageOwnedExplanation(
-  pipelines: Pipelines, objectType: string, property: string,
+  pipelines: Pipelines, orgId: string, objectType: string, property: string,
 ): string | null {
-  const binding = pipelines.binding(objectType);
+  const binding = pipelines.binding(orgId, objectType);
   if (!binding) return null;
   const owned: Record<string, string> = {};
+  if (binding.derived.stage_entered_at) owned[binding.derived.stage_entered_at] = 'the moment it last moved stage';
   if (binding.derived.probability) owned[binding.derived.probability] = 'the probability of the stage it sits in';
   if (binding.derived.forecast_category) owned[binding.derived.forecast_category] = 'the forecast category of its stage';
   if (binding.derived.status) owned[binding.derived.status] = 'whether its stage is closed, and whether that close is a win';
