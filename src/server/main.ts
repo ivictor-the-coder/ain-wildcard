@@ -13,7 +13,9 @@ const MIME: Record<string, string> = {
 };
 
 const app = await createApp();
-const clientDir = join(process.cwd(), 'dist/client');
+const clientDir = process.env.AIN_CLIENT_DIR
+  ? (process.env.AIN_CLIENT_DIR.startsWith('/') ? process.env.AIN_CLIENT_DIR : join(process.cwd(), process.env.AIN_CLIENT_DIR))
+  : join(process.cwd(), 'dist/client');
 const hasClient = existsSync(join(clientDir, 'index.html'));
 
 const server = createServer(async (req, res) => {

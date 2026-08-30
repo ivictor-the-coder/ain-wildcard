@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ain — build progress</title>
+<style>
+:root{--bg:#0c0f15;--panel:#14181f;--panel2:#1a1f28;--line:#242c37;--line2:#333d4c;--ink:#e8ecf3;--ink2:#a3adbf;--ink3:#7d8799;--brand:#8478ef;--green:#4dcb8f;--amber:#f0b64d;--blue:#6aa8f5;--pink:#f07ab5}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
+.wrap{max-width:1000px;margin:0 auto;padding:48px 24px 96px}
+header.top{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:8px}
+.mark{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,#6a5ce8,#12a0a0);display:grid;place-items:center;font-weight:700;color:#fff;flex:none}
+h1{font-size:24px;margin:0;letter-spacing:-.02em}
+.sub{color:var(--ink2);font-size:13px;margin-top:3px}
+.stamp{margin-left:auto;color:var(--ink3);font-size:12px;text-align:right}
+.headline{margin:22px 0 26px;padding:16px 18px;background:var(--panel);border:1px solid var(--line);border-radius:12px;font-size:15px;color:var(--ink)}
+.bar{height:8px;border-radius:99px;background:var(--panel2);overflow:hidden;margin:18px 0 8px;border:1px solid var(--line)}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,#6a5ce8,#34c4c4);width:18%;transition:width .5s}
+.barmeta{display:flex;justify-content:space-between;color:var(--ink2);font-size:12.5px;margin-bottom:30px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:34px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.stat b{display:block;font-size:22px;letter-spacing:-.02em}
+.stat span{color:var(--ink3);font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+.wave{margin-bottom:28px;background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.wave__head{display:flex;align-items:center;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line)}
+.wave__head h2{font-size:15px;margin:0;letter-spacing:-.01em}
+.wave__note{margin:0;padding:12px 18px 0;color:var(--ink2);font-size:13px}
+.pieces{list-style:none;margin:0;padding:10px 6px 12px}
+.piece{display:flex;gap:12px;padding:10px 12px;border-radius:9px}
+.piece+.piece{margin-top:1px}
+.piece:hover{background:var(--panel2)}
+.dot{width:8px;height:8px;border-radius:50%;margin-top:7px;flex:none;background:var(--line2)}
+.piece.done .dot{background:var(--green)}
+.piece.building .dot{background:var(--brand);box-shadow:0 0 0 4px rgba(132,120,239,.16);animation:p 1.6s ease-in-out infinite}
+.piece.critique .dot{background:var(--blue);box-shadow:0 0 0 4px rgba(106,168,245,.14);animation:p 1.6s ease-in-out infinite}
+.piece.rework .dot{background:var(--amber)}
+@keyframes p{50%{opacity:.4}}
+.piece__body{min-width:0;flex:1}
+.piece__head{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.piece__title{font-weight:520}
+.piece__note{margin:2px 0 0;color:var(--ink2);font-size:12.5px}
+.verdict{margin:5px 0 0;color:var(--ink2);font-size:12.5px;padding:7px 10px;background:var(--bg);border:1px solid var(--line);border-left:2px solid var(--pink);border-radius:6px}
+.tag{font-size:11px;padding:2px 7px;border-radius:99px;border:1px solid var(--line2);color:var(--ink2)}
+.tag.done{color:var(--green);border-color:rgba(77,203,143,.4);background:rgba(77,203,143,.1)}
+.tag.building{color:var(--brand);border-color:rgba(132,120,239,.45);background:rgba(132,120,239,.12)}
+.tag.critique{color:var(--blue);border-color:rgba(106,168,245,.4);background:rgba(106,168,245,.1)}
+.tag.rework{color:var(--amber);border-color:rgba(240,182,77,.4);background:rgba(240,182,77,.1)}
+.rounds{font-size:11.5px;color:var(--ink3)}
+footer{color:var(--ink3);font-size:12px;margin-top:34px;text-align:center}
+</style>
+</head>
+<body><div class="wrap">
+<header class="top">
+  <div class="mark">◈</div>
+  <div><h1>Ain</h1><div class="sub">The AI services platform that runs a business end to end</div></div>
+  <div class="stamp">Updated<br>2026-08-30 19:45 UTC</div>
+</header>
+<div class="headline">Foundation is live and verified. Wave 1 builders are going out now — every piece gets a fresh critic that runs the real thing before it can pass.</div>
+<div class="bar"><i></i></div>
+<div class="barmeta"><span>7 of 38 pieces passed their critic</span><span>18%</span></div>
+<div class="stats">
+  <div class="stat"><b>1</b><span>modules</span></div><div class="stat"><b>22</b><span>api routes</span></div><div class="stat"><b>31</b><span>pieces</span></div><div class="stat"><b>0</b><span>critic rounds</span></div>
+</div>
+<section class="wave done">
+    <header class="wave__head">
+      <h2>Wave 0 · Foundation</h2>
+      <span class="tag done">Complete</span>
+    </header>
+    <p class="wave__note">Kernel, contracts and the demo workspace. Built directly, not delegated.</p>
+    <ul class="pieces"><li class="piece done">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Data layer &amp; migrations</span>
+          <span class="tag done">Passed</span>
+          
+        </div>
+        <p class="piece__note">node:sqlite, namespaced migrations, savepoint transactions</p>
+        
+      </div>
+    </li><li class="piece done">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Exact money arithmetic</span>
+          <span class="tag done">Passed</span>
+          
+        </div>
+        <p class="piece__note">integer minor units, BigInt rationals, largest-remainder allocation</p>
+        
+      </div>
+    </li><li class="piece done">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Billing-grade time</span>
+          <span class="tag done">Passed</span>
+          
+        </div>
+        <p class="piece__note">anchor-day period maths, virtual clock, replayable job queue</p>
+        
+      </div>
+    </li><li class="piece done">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">API kernel</span>
+          <span class="tag done">Passed</span>
+          
+        </div>
+        <p class="piece__note">router, validation, idempotency, rate limits, generated OpenAPI</p>
+        
+      </div>
+    </li><li class="piece done">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Event log &amp; jobs</span>
+          <span class="tag done">Passed</span>
+          
+        </div>
+        <p class="piece__note">one event stream feeding webhooks, automation, timeline and audit</p>
+        
+      </div>
+    </li><li class="piece done">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Workspace core</span>
+          <span class="tag done">Passed</span>
+          
+        </div>
+        <p class="piece__note">orgs, people, auth, API keys, audit trail, time machine</p>
+        
+      </div>
+    </li><li class="piece done">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Design tokens</span>
+          <span class="tag done">Passed</span>
+          
+        </div>
+        <p class="piece__note">full light and dark palettes, type scale, elevation, motion</p>
+        
+      </div>
+    </li></ul>
+  </section><section class="wave queued">
+    <header class="wave__head">
+      <h2>Wave 1 · The spine</h2>
+      <span class="tag queued">Queued</span>
+    </header>
+    <p class="wave__note">Everything downstream depends on these five. They go first and get the harshest critics.</p>
+    <ul class="pieces"><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Design system</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">The component kit: buttons, fields, tables, menus, overlays, charts — in both themes</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">App shell &amp; navigation</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Sidebar, topbar, command palette, global search, toasts, keyboard model</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Smart CRM data model</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Objects, custom properties, associations, records, timeline — the substrate</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">AI engine &amp; tool runtime</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Grounded reasoning over real workspace data, tool calling, cost and trace capture</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Product catalog &amp; pricing</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Flat, per-seat, tiered, volume, package, usage and hybrid prices in every currency</p>
+        
+      </div>
+    </li></ul>
+  </section><section class="wave queued">
+    <header class="wave__head">
+      <h2>Wave 2 · Revenue</h2>
+      <span class="tag queued">Queued</span>
+    </header>
+    <p class="wave__note">Stripe Billing parity, piece by piece. Each one is judged against the real thing.</p>
+    <ul class="pieces"><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Subscription lifecycle</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Trials, activation, pause, resume, cancel, schedules and phases</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Mid-cycle changes &amp; proration</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Upgrades, downgrades, quantity changes, credit proration, invoice-now vs next cycle</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Usage metering</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Meters, event ingestion, idempotency, aggregation formulas, backdating</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Usage credits &amp; grants</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Prepaid balances, burn-down order, expiry, rollover, top-ups, overage</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Invoicing &amp; credit notes</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Draft to paid, line items, discounts, credit notes, a printable invoice</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Payments &amp; smart dunning</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Payment methods, failures, retry strategy, recovery, grace periods</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Tax</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Inclusive and exclusive rates, tax IDs, reverse charge, per-line tax breakdown</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Entitlements &amp; feature gating</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Features, limits, real-time checks the product can call</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Revenue reporting</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">MRR movement, churn, cohorts, deferred revenue, collections</p>
+        
+      </div>
+    </li></ul>
+  </section><section class="wave queued">
+    <header class="wave__head">
+      <h2>Wave 3 · Customer platform</h2>
+      <span class="tag queued">Queued</span>
+    </header>
+    <p class="wave__note">HubSpot parity for the people who actually work the business every day.</p>
+    <ul class="pieces"><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Contact, company &amp; record pages</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Timeline, properties, associations, inline editing, activity</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Deals &amp; pipelines</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Kanban, stages, weighted forecast, deal rooms</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Lists &amp; segmentation</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">A filter builder that handles real conditions, active and static lists</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Shared inbox &amp; conversations</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Threads, email, chat, assignment, snoozes, SLA timers</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Support desk</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Tickets, queues, escalation, satisfaction</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Campaigns, email &amp; forms</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Campaign builder, email composer, forms, landing pages, attribution</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Sequences</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Multi-step cadences with enrollment rules and reply detection</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Reports &amp; dashboards</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">A real report builder over every object, saved dashboards, charts</p>
+        
+      </div>
+    </li></ul>
+  </section><section class="wave queued">
+    <header class="wave__head">
+      <h2>Wave 4 · Autonomy</h2>
+      <span class="tag queued">Queued</span>
+    </header>
+    <p class="wave__note">The part that actually runs the business without a human in the loop.</p>
+    <ul class="pieces"><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Workflow automation</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Triggers, branches, delays, goals, enrollment, a visual builder that edits real workflows</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Autonomous agents</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Prospecting, support, success, finance and ops agents with runs, traces and approvals</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Copilot</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Ask anything about the business; grounded answers with citations and actions</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Scoring &amp; insights</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Lead score, health score, churn risk, next best action, forecast</p>
+        
+      </div>
+    </li></ul>
+  </section><section class="wave queued">
+    <header class="wave__head">
+      <h2>Wave 5 · Surfaces</h2>
+      <span class="tag queued">Queued</span>
+    </header>
+    <p class="wave__note">Where customers and developers meet the platform.</p>
+    <ul class="pieces"><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Customer billing portal</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Self-serve plan changes, payment methods, invoice history, cancel flow</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Pricing, quotes &amp; checkout</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Plan picker, quotes, a checkout that actually completes</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">API, webhooks &amp; SDK</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Signed webhook delivery with retries, an API reference, a typed SDK</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Settings &amp; administration</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">Roles, teams, data quality, import/export, audit</p>
+        
+      </div>
+    </li><li class="piece queued">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="piece__body">
+        <div class="piece__head"><span class="piece__title">Home, search &amp; onboarding</span>
+          <span class="tag queued">Queued</span>
+          
+        </div>
+        <p class="piece__note">The first screen, global search, notifications, a setup guide that knows what is done</p>
+        
+      </div>
+    </li></ul>
+  </section>
+<footer>A piece is only "Passed" when a fresh critic ran the real thing, compared it blind against HubSpot and Stripe, and picked ours.</footer>
+</div></body></html>

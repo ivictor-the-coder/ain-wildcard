@@ -1,0 +1,320 @@
+{
+  "updated": "2026-08-30T19:45:01.550252",
+  "headline": "Foundation is live and verified. Wave 1 builders are going out now \u2014 every piece gets a fresh critic that runs the real thing before it can pass.",
+  "stats": {
+    "modules": 1,
+    "api routes": 22,
+    "pieces": 31,
+    "critic rounds": 0
+  },
+  "waves": [
+    {
+      "name": "Wave 0 \u00b7 Foundation",
+      "status": "done",
+      "note": "Kernel, contracts and the demo workspace. Built directly, not delegated.",
+      "pieces": [
+        {
+          "id": "kernel-data",
+          "title": "Data layer & migrations",
+          "status": "done",
+          "rounds": 0,
+          "note": "node:sqlite, namespaced migrations, savepoint transactions"
+        },
+        {
+          "id": "kernel-money",
+          "title": "Exact money arithmetic",
+          "status": "done",
+          "rounds": 0,
+          "note": "integer minor units, BigInt rationals, largest-remainder allocation"
+        },
+        {
+          "id": "kernel-time",
+          "title": "Billing-grade time",
+          "status": "done",
+          "rounds": 0,
+          "note": "anchor-day period maths, virtual clock, replayable job queue"
+        },
+        {
+          "id": "kernel-http",
+          "title": "API kernel",
+          "status": "done",
+          "rounds": 0,
+          "note": "router, validation, idempotency, rate limits, generated OpenAPI"
+        },
+        {
+          "id": "kernel-events",
+          "title": "Event log & jobs",
+          "status": "done",
+          "rounds": 0,
+          "note": "one event stream feeding webhooks, automation, timeline and audit"
+        },
+        {
+          "id": "core",
+          "title": "Workspace core",
+          "status": "done",
+          "rounds": 0,
+          "note": "orgs, people, auth, API keys, audit trail, time machine"
+        },
+        {
+          "id": "tokens",
+          "title": "Design tokens",
+          "status": "done",
+          "rounds": 0,
+          "note": "full light and dark palettes, type scale, elevation, motion"
+        }
+      ]
+    },
+    {
+      "name": "Wave 1 \u00b7 The spine",
+      "status": "queued",
+      "note": "Everything downstream depends on these five. They go first and get the harshest critics.",
+      "pieces": [
+        {
+          "id": "design-system",
+          "title": "Design system",
+          "status": "queued",
+          "rounds": 0,
+          "note": "The component kit: buttons, fields, tables, menus, overlays, charts \u2014 in both themes"
+        },
+        {
+          "id": "app-shell",
+          "title": "App shell & navigation",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Sidebar, topbar, command palette, global search, toasts, keyboard model"
+        },
+        {
+          "id": "crm-core",
+          "title": "Smart CRM data model",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Objects, custom properties, associations, records, timeline \u2014 the substrate"
+        },
+        {
+          "id": "ai-engine",
+          "title": "AI engine & tool runtime",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Grounded reasoning over real workspace data, tool calling, cost and trace capture"
+        },
+        {
+          "id": "catalog",
+          "title": "Product catalog & pricing",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Flat, per-seat, tiered, volume, package, usage and hybrid prices in every currency"
+        }
+      ]
+    },
+    {
+      "name": "Wave 2 \u00b7 Revenue",
+      "status": "queued",
+      "note": "Stripe Billing parity, piece by piece. Each one is judged against the real thing.",
+      "pieces": [
+        {
+          "id": "subscriptions",
+          "title": "Subscription lifecycle",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Trials, activation, pause, resume, cancel, schedules and phases"
+        },
+        {
+          "id": "proration",
+          "title": "Mid-cycle changes & proration",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Upgrades, downgrades, quantity changes, credit proration, invoice-now vs next cycle"
+        },
+        {
+          "id": "metering",
+          "title": "Usage metering",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Meters, event ingestion, idempotency, aggregation formulas, backdating"
+        },
+        {
+          "id": "credits",
+          "title": "Usage credits & grants",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Prepaid balances, burn-down order, expiry, rollover, top-ups, overage"
+        },
+        {
+          "id": "invoicing",
+          "title": "Invoicing & credit notes",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Draft to paid, line items, discounts, credit notes, a printable invoice"
+        },
+        {
+          "id": "payments",
+          "title": "Payments & smart dunning",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Payment methods, failures, retry strategy, recovery, grace periods"
+        },
+        {
+          "id": "tax",
+          "title": "Tax",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Inclusive and exclusive rates, tax IDs, reverse charge, per-line tax breakdown"
+        },
+        {
+          "id": "entitlements",
+          "title": "Entitlements & feature gating",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Features, limits, real-time checks the product can call"
+        },
+        {
+          "id": "revenue",
+          "title": "Revenue reporting",
+          "status": "queued",
+          "rounds": 0,
+          "note": "MRR movement, churn, cohorts, deferred revenue, collections"
+        }
+      ]
+    },
+    {
+      "name": "Wave 3 \u00b7 Customer platform",
+      "status": "queued",
+      "note": "HubSpot parity for the people who actually work the business every day.",
+      "pieces": [
+        {
+          "id": "records",
+          "title": "Contact, company & record pages",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Timeline, properties, associations, inline editing, activity"
+        },
+        {
+          "id": "deals",
+          "title": "Deals & pipelines",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Kanban, stages, weighted forecast, deal rooms"
+        },
+        {
+          "id": "lists",
+          "title": "Lists & segmentation",
+          "status": "queued",
+          "rounds": 0,
+          "note": "A filter builder that handles real conditions, active and static lists"
+        },
+        {
+          "id": "inbox",
+          "title": "Shared inbox & conversations",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Threads, email, chat, assignment, snoozes, SLA timers"
+        },
+        {
+          "id": "tickets",
+          "title": "Support desk",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Tickets, queues, escalation, satisfaction"
+        },
+        {
+          "id": "marketing",
+          "title": "Campaigns, email & forms",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Campaign builder, email composer, forms, landing pages, attribution"
+        },
+        {
+          "id": "sequences",
+          "title": "Sequences",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Multi-step cadences with enrollment rules and reply detection"
+        },
+        {
+          "id": "reporting",
+          "title": "Reports & dashboards",
+          "status": "queued",
+          "rounds": 0,
+          "note": "A real report builder over every object, saved dashboards, charts"
+        }
+      ]
+    },
+    {
+      "name": "Wave 4 \u00b7 Autonomy",
+      "status": "queued",
+      "note": "The part that actually runs the business without a human in the loop.",
+      "pieces": [
+        {
+          "id": "workflows",
+          "title": "Workflow automation",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Triggers, branches, delays, goals, enrollment, a visual builder that edits real workflows"
+        },
+        {
+          "id": "agents",
+          "title": "Autonomous agents",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Prospecting, support, success, finance and ops agents with runs, traces and approvals"
+        },
+        {
+          "id": "copilot",
+          "title": "Copilot",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Ask anything about the business; grounded answers with citations and actions"
+        },
+        {
+          "id": "insights",
+          "title": "Scoring & insights",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Lead score, health score, churn risk, next best action, forecast"
+        }
+      ]
+    },
+    {
+      "name": "Wave 5 \u00b7 Surfaces",
+      "status": "queued",
+      "note": "Where customers and developers meet the platform.",
+      "pieces": [
+        {
+          "id": "portal",
+          "title": "Customer billing portal",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Self-serve plan changes, payment methods, invoice history, cancel flow"
+        },
+        {
+          "id": "checkout",
+          "title": "Pricing, quotes & checkout",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Plan picker, quotes, a checkout that actually completes"
+        },
+        {
+          "id": "developers",
+          "title": "API, webhooks & SDK",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Signed webhook delivery with retries, an API reference, a typed SDK"
+        },
+        {
+          "id": "admin",
+          "title": "Settings & administration",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Roles, teams, data quality, import/export, audit"
+        },
+        {
+          "id": "home",
+          "title": "Home, search & onboarding",
+          "status": "queued",
+          "rounds": 0,
+          "note": "The first screen, global search, notifications, a setup guide that knows what is done"
+        }
+      ]
+    }
+  ]
+}
