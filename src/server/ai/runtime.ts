@@ -1,56 +1,496 @@
-import type { AiCompletion, AiCompletionRequest, AiProvider, AiRuntime, AiToolDef } from '../kernel/ai';
-import type { Config } from '../kernel/context';
-import { randomId } from '../../shared/ids';
+import type {
+  AiCompletion, AiCompletionRequest, AiProvider, AiRuntime, AiToolCall, AiToolDef, AiUsage,
+} from '../kernel/ai';
+import type { Config, Ctx } from '../kernel/context';
+import { isApiError } from '../../shared/errors';
+import { newId, randomId } from '../../shared/ids';
+import { builtinEngine, type EngineAnalysis } from './engine';
+import { anthropicProvider } from './anthropic';
 
 /**
- * Model gateway. Providers are tried in priority order; the built-in
- * deterministic engine is always available so the platform is fully functional
- * with no network and no keys, and every AI surface stays demoable and testable.
+ * The model gateway and the tool runtime.
+ *
+ * Providers are tried in priority order and the built-in deterministic engine
+ * is always available, so the platform is fully intelligent with no network and
+ * no keys. Every tool call — whoever asks for it, whichever provider decided to
+ * make it — goes through `execute()`, which validates arguments, enforces the
+ * read-only and approval gates, spends the run's step and time budget, applies
+ * a per-org rate limit and records a trace span. That is the only path, so the
+ * observability UI can never show a partial picture of what an agent did.
  */
-export function createAiRuntime(config: Config): AiRuntime {
-  const tools = new Map<string, AiToolDef>();
-  const providers: AiProvider[] = [];
 
-  const runtime: AiRuntime = {
+export interface AiBudget {
+  /** Maximum tool executions in one run. */
+  steps: number;
+  /** Wall-clock ceiling for the whole run, in milliseconds. */
+  timeMs: number;
+  /** Per-org tool executions per minute. */
+  callsPerMinute: number;
+}
+
+export const DEFAULT_BUDGET: AiBudget = {
+  steps: Number(process.env.AIN_AI_MAX_STEPS || 8),
+  timeMs: Number(process.env.AIN_AI_TIME_BUDGET_MS || 10_000),
+  callsPerMinute: Number(process.env.AIN_AI_TOOL_RATE || 600),
+};
+
+export type SpanKind = 'tool' | 'plan' | 'resolve' | 'synthesis' | 'provider';
+
+export interface AiTraceSpan {
+  id: string;
+  runId: string;
+  orgId: string;
+  seq: number;
+  kind: SpanKind;
+  name: string;
+  args: Record<string, unknown> | null;
+  /** Short, redacted description of what came back. */
+  summary: string;
+  ok: boolean;
+  errorCode: string | null;
+  errorMessage: string | null;
+  startedAt: number;
+  durationMs: number;
+}
+
+export interface AiRunStart {
+  runId: string;
+  orgId: string;
+  threadId: string | null;
+  feature: string;
+  provider: string;
+  model: string;
+  actorId: string | null;
+  actorType: string;
+  question: string;
+  startedAt: number;
+}
+
+export interface AiRunFinish {
+  runId: string;
+  orgId: string;
+  model: string;
+  status: 'succeeded' | 'failed' | 'needs_approval';
+  answer: string;
+  usage: AiUsage;
+  reasoning: string[];
+  citations: { id: string; label: string; type: string }[];
+  spans: AiTraceSpan[];
+  steps: number;
+  durationMs: number;
+  finishedAt: number;
+  error: string | null;
+  pendingApprovals: PendingApproval[];
+  intent: string | null;
+  confidence: number | null;
+}
+
+export interface PendingApproval {
+  tool: string;
+  args: Record<string, unknown>;
+  reason: string;
+  readOnly: boolean;
+}
+
+/** Where runs, spans and approval requests are persisted. Supplied by the `ai` module. */
+export interface AiTraceSink {
+  runStarted(run: AiRunStart): void;
+  span(span: AiTraceSpan): void;
+  runFinished(finish: AiRunFinish): void;
+  approvalRequested(request: PendingApproval & { runId: string; orgId: string; actorId: string | null }): void;
+}
+
+export interface AiCallContext {
+  ctx: Ctx;
+  orgId: string;
+  actorId?: string | null;
+  actorType?: 'user' | 'api_key' | 'system' | 'agent' | 'workflow';
+  threadId?: string | null;
+  runId?: string;
+  /** What used the model — copilot, agent, workflow, scoring, seed. */
+  feature?: string;
+  /** Tool names the operator has already approved for this run. */
+  approvals?: string[];
+  /** Write tools are refused unless this is set. */
+  allowWrites?: boolean;
+  budget?: Partial<AiBudget>;
+  /** Filled in by the runtime before the provider is called. */
+  runtime?: AinAiRuntime;
+  spans?: AiTraceSpan[];
+  pendingApprovals?: PendingApproval[];
+  /** Monotonic clock reading taken when the run started. */
+  startedNs?: bigint;
+  steps?: number;
+  /** Receive assistant text as it is produced, when the provider streams. */
+  onDelta?: (text: string) => void;
+}
+
+export interface ToolFailure {
+  code: 'tool_not_found' | 'invalid_arguments' | 'write_not_permitted' | 'approval_required'
+    | 'rate_limited' | 'step_budget_exhausted' | 'time_budget_exhausted' | 'tool_failed';
+  message: string;
+  param?: string;
+  /** True when the engine can usefully try something else. */
+  recoverable: boolean;
+}
+
+export interface ToolExecution {
+  ok: boolean;
+  tool: string;
+  args: Record<string, unknown>;
+  result?: unknown;
+  error?: ToolFailure;
+  span: AiTraceSpan;
+}
+
+export interface AinCompletion extends AiCompletion {
+  runId: string;
+  spans: AiTraceSpan[];
+  pendingApprovals: PendingApproval[];
+  analysis?: EngineAnalysis;
+}
+
+export interface AinAiRuntime extends AiRuntime {
+  complete(req: AiCompletionRequest, ctx: unknown): Promise<AinCompletion>;
+  execute(name: string, args: Record<string, unknown>, call: AiCallContext, definition?: AiToolDef): Promise<ToolExecution>;
+  /** Record a non-tool step (planning, resolution, synthesis) on the trace. */
+  note(call: AiCallContext, kind: SpanKind, name: string, summary: string, durationMs?: number): AiTraceSpan;
+  setTraceSink(sink: AiTraceSink | null): void;
+  budget(call: AiCallContext): AiBudget;
+  config: Config;
+}
+
+/** Narrow the kernel-typed runtime to this implementation's richer surface. */
+export const aiRuntime = (ctx: Ctx): AinAiRuntime => ctx.ai as AinAiRuntime;
+
+/* ------------------------------- redaction ------------------------------- */
+
+const SECRET_KEY = /(password|secret|token|api[_-]?key|authorization|credential)/i;
+
+export function redactArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args ?? {})) {
+    if (SECRET_KEY.test(key)) { out[key] = '[redacted]'; continue; }
+    if (typeof value === 'string' && value.length > 400) { out[key] = `${value.slice(0, 400)}…`; continue; }
+    out[key] = value;
+  }
+  return out;
+}
+
+/** A one-line, human-readable description of a tool result for the trace. */
+export function summariseResult(value: unknown): string {
+  if (value === null || value === undefined) return 'no result';
+  if (typeof value === 'string') return value.length > 200 ? `${value.slice(0, 200)}…` : value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return `${value.length} ${value.length === 1 ? 'item' : 'items'}`;
+  const record = value as Record<string, unknown>;
+  const parts: string[] = [];
+  for (const [key, val] of Object.entries(record)) {
+    if (parts.length >= 5) break;
+    if (SECRET_KEY.test(key)) { parts.push(`${key}=[redacted]`); continue; }
+    if (val === null || val === undefined) continue;
+    if (Array.isArray(val)) { parts.push(`${key}=${val.length}`); continue; }
+    if (typeof val === 'object') continue;
+    const text = String(val);
+    parts.push(`${key}=${text.length > 60 ? `${text.slice(0, 60)}…` : text}`);
+  }
+  return parts.length ? parts.join(' ') : `${Object.keys(record).length} fields`;
+}
+
+/* ------------------------------ call context ----------------------------- */
+
+const isCtx = (value: unknown): value is Ctx =>
+  !!value && typeof value === 'object' && 'db' in (value as Record<string, unknown>) && 'now' in (value as Record<string, unknown>);
+
+/**
+ * Callers hand us whatever context they have: a bare `Ctx`, the per-request
+ * `RequestCtx` (which knows the org and the user), or an explicit call context.
+ * All three are accepted so no module has to learn a new calling convention.
+ */
+export function resolveCallContext(input: unknown, config: Config): AiCallContext {
+  if (input && typeof input === 'object' && 'ctx' in (input as Record<string, unknown>)) {
+    const call = input as AiCallContext;
+    return { ...call, orgId: call.orgId || call.ctx.config.defaultOrgId };
+  }
+  if (isCtx(input)) {
+    const auth = (input as { auth?: { orgId?: string; userId?: string; kind?: string } }).auth;
+    return {
+      ctx: input,
+      orgId: auth?.orgId || input.config.defaultOrgId,
+      actorId: auth?.userId ?? null,
+      actorType: auth?.kind === 'session' ? 'user' : 'system',
+      feature: 'api',
+    };
+  }
+  throw new Error(`AI runtime: complete() needs a Ctx or an AiCallContext, received ${typeof input}. Pass the request context.`);
+}
+
+const elapsedMs = (from: bigint): number => Number((process.hrtime.bigint() - from) / 1_000_000n);
+
+/* -------------------------------- runtime -------------------------------- */
+
+export function createAiRuntime(config: Config): AinAiRuntime {
+  const tools = new Map<string, AiToolDef>();
+  const providers: AiProvider[] = [anthropicProvider(config), builtinEngine()];
+  let sink: AiTraceSink | null = null;
+  const buckets = new Map<string, { tokens: number; last: number }>();
+
+  const budgetFor = (call: AiCallContext): AiBudget => ({ ...DEFAULT_BUDGET, ...(call.budget ?? {}) });
+
+  function rateLimit(orgId: string, now: number, limit: number): boolean {
+    const bucket = buckets.get(orgId) ?? { tokens: limit, last: now };
+    bucket.tokens = Math.min(limit, bucket.tokens + ((now - bucket.last) / 60_000) * limit);
+    bucket.last = now;
+    if (bucket.tokens < 1) { buckets.set(orgId, bucket); return false; }
+    bucket.tokens -= 1;
+    buckets.set(orgId, bucket);
+    return true;
+  }
+
+  function record(call: AiCallContext, span: AiTraceSpan): AiTraceSpan {
+    (call.spans ||= []).push(span);
+    try { sink?.span(span); }
+    catch (e) { call.ctx.log.warn('ai.span_sink_failed', { error: (e as Error).message }); }
+    return span;
+  }
+
+  function makeSpan(call: AiCallContext, kind: SpanKind, name: string, args: Record<string, unknown> | null): AiTraceSpan {
+    return {
+      id: randomId('trc', 14),
+      runId: call.runId ?? 'run_unbound',
+      orgId: call.orgId,
+      seq: (call.spans?.length ?? 0) + 1,
+      kind,
+      name,
+      args: args ? redactArgs(args) : null,
+      summary: '',
+      ok: true,
+      errorCode: null,
+      errorMessage: null,
+      startedAt: call.ctx.now(),
+      durationMs: 0,
+    };
+  }
+
+  const runtime: AinAiRuntime = {
     providers,
+    config,
+
     active() {
       const preferred = config.aiProvider && config.aiProvider !== 'auto'
         ? providers.find((p) => p.id === config.aiProvider && p.available())
         : undefined;
-      return preferred || providers.find((p) => p.available()) || fallbackProvider;
+      return preferred || providers.find((p) => p.available()) || providers[providers.length - 1];
     },
-    async complete(req, ctx) { return runtime.active().complete(req, ctx); },
+
+    budget: budgetFor,
+    setTraceSink(next) { sink = next; },
+
     registerTool(tool) {
       if (tools.has(tool.name)) throw new Error(`Duplicate AI tool: ${tool.name}`);
       tools.set(tool.name, tool);
     },
+
     tools(filter) {
       let out = [...tools.values()];
       if (filter?.tags?.length) out = out.filter((t) => t.tags?.some((tag) => filter.tags!.includes(tag)));
       if (filter?.readOnly !== undefined) out = out.filter((t) => t.readOnly === filter.readOnly);
       return out.sort((a, b) => a.name.localeCompare(b.name));
     },
+
     tool(name) { return tools.get(name); },
+
+    note(call, kind, name, summary, durationMs = 0) {
+      const span = makeSpan(call, kind, name, null);
+      span.summary = summary;
+      span.durationMs = durationMs;
+      return record(call, span);
+    },
+
+    async execute(name, args, call, definition) {
+      const started = process.hrtime.bigint();
+      // A caller may hand the engine a tool that lives outside the registry
+      // (an agent's private tool); it goes through the same gates either way.
+      const tool = definition ?? tools.get(name);
+      const span = makeSpan(call, 'tool', name, args);
+      const budget = budgetFor(call);
+
+      const fail = (error: ToolFailure): ToolExecution => {
+        span.ok = false;
+        span.errorCode = error.code;
+        span.errorMessage = error.message;
+        span.summary = `${error.code}: ${error.message}`;
+        span.durationMs = elapsedMs(started);
+        record(call, span);
+        return { ok: false, tool: name, args, error, span };
+      };
+
+      if (!tool) {
+        return fail({
+          code: 'tool_not_found',
+          message: `No tool named "${name}" is registered. Available: ${[...tools.keys()].slice(0, 12).join(', ')}.`,
+          recoverable: true,
+        });
+      }
+      call.steps = (call.steps ?? 0) + 1;
+      if (call.steps > budget.steps) {
+        return fail({ code: 'step_budget_exhausted', message: `This run already used its ${budget.steps}-step budget.`, recoverable: false });
+      }
+      if (call.startedNs && elapsedMs(call.startedNs) > budget.timeMs) {
+        return fail({ code: 'time_budget_exhausted', message: `This run exceeded its ${budget.timeMs}ms budget.`, recoverable: false });
+      }
+      if (!rateLimit(call.orgId, call.ctx.now(), budget.callsPerMinute)) {
+        return fail({ code: 'rate_limited', message: `This workspace is over its limit of ${budget.callsPerMinute} tool calls per minute.`, recoverable: false });
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = tool.input.parse(args ?? {});
+      } catch (e) {
+        const apiError = isApiError(e) ? e : null;
+        return fail({
+          code: 'invalid_arguments',
+          message: apiError?.message ?? (e as Error).message,
+          param: apiError?.param,
+          recoverable: true,
+        });
+      }
+
+      if (!tool.readOnly && !call.allowWrites) {
+        return fail({
+          code: 'write_not_permitted',
+          message: `"${name}" changes data and this run is read-only.`,
+          recoverable: false,
+        });
+      }
+      if (tool.requiresApproval && !(call.approvals ?? []).includes(name)) {
+        const pending: PendingApproval = {
+          tool: name,
+          args: redactArgs(parsed as Record<string, unknown>),
+          reason: `${name} writes to the workspace and needs a person to approve it.`,
+          readOnly: tool.readOnly,
+        };
+        (call.pendingApprovals ||= []).push(pending);
+        try { sink?.approvalRequested({ ...pending, runId: call.runId ?? 'run_unbound', orgId: call.orgId, actorId: call.actorId ?? null }); }
+        catch (e) { call.ctx.log.warn('ai.approval_sink_failed', { error: (e as Error).message }); }
+        return fail({
+          code: 'approval_required',
+          message: `"${name}" is waiting for approval before it can run.`,
+          recoverable: false,
+        });
+      }
+
+      try {
+        const output = await tool.run(parsed, call.ctx, {
+          orgId: call.orgId,
+          actorId: call.actorId ?? undefined,
+          runId: call.runId,
+          threadId: call.threadId ?? undefined,
+        });
+        span.summary = summariseResult(output);
+        span.durationMs = elapsedMs(started);
+        record(call, span);
+        return { ok: true, tool: name, args, result: output, span };
+      } catch (e) {
+        const apiError = isApiError(e) ? e : null;
+        return fail({
+          code: 'tool_failed',
+          message: apiError?.message ?? (e as Error).message,
+          param: apiError?.param,
+          recoverable: true,
+        });
+      }
+    },
+
+    async complete(req, input) {
+      const call = resolveCallContext(input, config);
+      call.runtime = runtime;
+      call.runId ||= newId('agentrun');
+      call.spans ||= [];
+      call.pendingApprovals ||= [];
+      call.startedNs ||= process.hrtime.bigint();
+      call.steps ||= 0;
+
+      const provider = runtime.active();
+      const model = req.model || (provider.id === 'anthropic' ? ANTHROPIC_DEFAULT_MODEL : 'ain-engine-1');
+      const question = [...req.messages].reverse().find((m) => m.role === 'user')?.content ?? '';
+      const request: AiCompletionRequest = {
+        ...req,
+        // With no explicit tool list the engine sees the live catalogue, minus
+        // the write tools unless the caller asked for an agent that can act.
+        tools: req.tools ?? runtime.tools(call.allowWrites ? undefined : { readOnly: true }),
+      };
+
+      const start: AiRunStart = {
+        runId: call.runId,
+        orgId: call.orgId,
+        threadId: call.threadId ?? null,
+        feature: call.feature ?? 'api',
+        provider: provider.id,
+        model,
+        actorId: call.actorId ?? null,
+        actorType: call.actorType ?? 'system',
+        question,
+        startedAt: call.ctx.now(),
+      };
+      try { sink?.runStarted(start); }
+      catch (e) { call.ctx.log.warn('ai.run_sink_failed', { error: (e as Error).message }); }
+
+      try {
+        const completion = await provider.complete(request, call);
+        const analysis = (completion as AinCompletion).analysis;
+        const finish: AiRunFinish = {
+          runId: call.runId,
+          orgId: call.orgId,
+          model: completion.model,
+          status: call.pendingApprovals.length ? 'needs_approval' : 'succeeded',
+          answer: completion.content,
+          usage: completion.usage,
+          reasoning: completion.reasoning ?? [],
+          citations: completion.citations ?? [],
+          spans: call.spans,
+          steps: call.steps ?? 0,
+          durationMs: elapsedMs(call.startedNs),
+          finishedAt: call.ctx.now(),
+          error: null,
+          pendingApprovals: call.pendingApprovals,
+          intent: analysis?.intent.intent ?? null,
+          confidence: analysis?.intent.confidence ?? null,
+        };
+        try { sink?.runFinished(finish); }
+        catch (e) { call.ctx.log.warn('ai.run_sink_failed', { error: (e as Error).message }); }
+        return {
+          ...completion,
+          runId: call.runId,
+          spans: call.spans,
+          pendingApprovals: call.pendingApprovals,
+          analysis,
+        };
+      } catch (e) {
+        const message = (e as Error).message;
+        try {
+          sink?.runFinished({
+            runId: call.runId, orgId: call.orgId, model, status: 'failed', answer: '',
+            usage: { inputTokens: 0, outputTokens: 0, costCents: 0, credits: 0 },
+            reasoning: [], citations: [], spans: call.spans, steps: call.steps ?? 0,
+            durationMs: elapsedMs(call.startedNs), finishedAt: call.ctx.now(), error: message,
+            pendingApprovals: call.pendingApprovals, intent: null, confidence: null,
+          });
+        } catch (sinkError) { call.ctx.log.warn('ai.run_sink_failed', { error: (sinkError as Error).message }); }
+        throw e;
+      }
+    },
   };
+
   return runtime;
 }
 
-/** Last-resort provider so `complete()` never throws for lack of a model. */
-const fallbackProvider: AiProvider = {
-  id: 'fallback',
-  label: 'Built-in',
-  available: () => true,
-  async complete(req: AiCompletionRequest): Promise<AiCompletion> {
-    const last = [...req.messages].reverse().find((m) => m.role === 'user');
-    return {
-      content: last ? `I can help with that. (${last.content.slice(0, 120)})` : 'How can I help?',
-      toolCalls: [],
-      finishReason: 'stop',
-      usage: { inputTokens: 0, outputTokens: 0, costCents: 0, credits: 0 },
-      model: 'ain-fallback',
-      reasoning: ['No reasoning engine registered; returned a passthrough response.'],
-    };
-  },
-};
+export const ANTHROPIC_DEFAULT_MODEL = 'claude-sonnet-4-5';
 
-export const newToolCallId = () => randomId('call', 12);
+export const newToolCallId = (): string => randomId('call', 12);
+
+export const toolCall = (name: string, args: Record<string, unknown>): AiToolCall => ({
+  id: newToolCallId(),
+  name,
+  arguments: args,
+});

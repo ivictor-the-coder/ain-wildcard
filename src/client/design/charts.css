@@ -1,0 +1,91 @@
+.ain-chart { position: relative; display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+.ain-chart__plot { position: relative; width: 100%; min-width: 0; }
+.ain-chart__svg { display: block; width: 100%; overflow: visible; }
+
+.ain-chart__grid line { stroke: var(--viz-grid); stroke-width: 1; shape-rendering: crispEdges; }
+.ain-chart__grid line.is-zero { stroke: var(--border-strong); }
+.ain-chart__axis text { fill: var(--viz-axis); font-size: var(--text-2xs); font-family: var(--font-sans); font-variant-numeric: tabular-nums; }
+.ain-chart__axis line { stroke: var(--viz-grid); }
+.ain-chart__axislabel { fill: var(--text-tertiary); font-size: var(--text-2xs); font-family: var(--font-sans); letter-spacing: var(--tracking-wide); text-transform: uppercase; }
+
+.ain-chart__line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.ain-chart__line--dashed { stroke-dasharray: 5 4; }
+.ain-chart__area { stroke: none; }
+.ain-chart__dot { stroke: var(--bg-surface); stroke-width: 2; }
+.ain-chart__bar { transition: opacity var(--dur-fast) var(--ease-out); }
+.ain-chart__bar.is-dim { opacity: 0.35; }
+.ain-chart__hoverline { stroke: var(--border-strong); stroke-width: 1; stroke-dasharray: 3 3; }
+.ain-chart__hoverband { fill: var(--bg-hover); opacity: 0.6; }
+
+/* Mount animation: draw lines, grow bars, fade areas. */
+@keyframes ain-draw { from { stroke-dashoffset: 1 } to { stroke-dashoffset: 0 } }
+@keyframes ain-grow { from { transform: scaleY(0) } to { transform: scaleY(1) } }
+@keyframes ain-growx { from { transform: scaleX(0) } to { transform: scaleX(1) } }
+.ain-anim-draw { stroke-dasharray: 1; stroke-dashoffset: 1; animation: ain-draw 760ms var(--ease-out) forwards; }
+.ain-anim-grow { transform-box: fill-box; transform-origin: bottom; animation: ain-grow 460ms var(--ease-out) backwards; }
+.ain-anim-growx { transform-box: fill-box; transform-origin: left; animation: ain-growx 520ms var(--ease-out) backwards; }
+.ain-anim-fade { animation: ain-fade-in 620ms var(--ease-out) backwards; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ain-anim-draw { stroke-dasharray: none; stroke-dashoffset: 0; animation: none; }
+  .ain-anim-grow, .ain-anim-growx, .ain-anim-fade { animation: none; }
+}
+
+/* -------------------------------- legend --------------------------------- */
+.ain-legend { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3) var(--space-6); }
+.ain-legend__item { display: inline-flex; align-items: center; gap: var(--space-3); font-size: var(--text-sm); color: var(--text-secondary); border-radius: var(--radius-sm); padding: var(--space-1) var(--space-2); }
+.ain-legend__item.is-clickable { cursor: pointer; }
+.ain-legend__item.is-clickable:hover { background: var(--bg-hover); color: var(--text-primary); }
+.ain-legend__item.is-off { opacity: 0.42; }
+.ain-legend__item:focus-visible { box-shadow: var(--focus-ring); outline: none; }
+.ain-legend__swatch { width: 9px; height: 9px; border-radius: 2px; flex: 0 0 auto; }
+.ain-legend__value { color: var(--text-primary); font-weight: var(--weight-medium); font-variant-numeric: tabular-nums; }
+
+/* -------------------------------- tooltip -------------------------------- */
+.ain-charttip {
+  position: absolute; z-index: var(--z-tooltip); pointer-events: none;
+  min-width: 148px; padding: var(--space-4) var(--space-5);
+  background: var(--bg-surface-raised); border: 1px solid var(--border-default);
+  border-radius: var(--radius-md); box-shadow: var(--shadow-popover);
+  transform: translate(-50%, calc(-100% - 10px)); animation: ain-fade-in var(--dur-fast) var(--ease-out);
+}
+.ain-charttip__title { font-size: var(--text-xs); font-weight: var(--weight-semibold); color: var(--text-primary); margin-bottom: var(--space-3); letter-spacing: var(--tracking-snug); }
+.ain-charttip__row { display: flex; align-items: center; gap: var(--space-4); font-size: var(--text-sm); line-height: 1.7; }
+.ain-charttip__swatch { width: 8px; height: 8px; border-radius: 2px; flex: 0 0 auto; }
+.ain-charttip__name { color: var(--text-secondary); flex: 1 1 auto; white-space: nowrap; }
+.ain-charttip__val { color: var(--text-primary); font-weight: var(--weight-medium); font-variant-numeric: tabular-nums; }
+.ain-charttip__total { margin-top: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--border-subtle); }
+
+/* ------------------------------- sparkline -------------------------------- */
+.ain-spark { display: block; overflow: visible; }
+.ain-spark__line { fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.ain-spark__area { stroke: none; opacity: 0.16; }
+.ain-spark__last { stroke: var(--bg-surface); stroke-width: 1.5; }
+
+/* --------------------------------- donut ---------------------------------- */
+.ain-donut { position: relative; display: flex; align-items: center; gap: var(--space-7); flex-wrap: wrap; }
+.ain-donut__center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; pointer-events: none; }
+.ain-donut__value { font-size: var(--text-xl); font-weight: var(--weight-bold); letter-spacing: var(--tracking-tight); color: var(--text-primary); }
+.ain-donut__label { font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: var(--tracking-wide); color: var(--text-tertiary); }
+.ain-donut__slice { transition: opacity var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out); transform-origin: center; }
+.ain-donut__slice.is-dim { opacity: 0.3; }
+
+/* --------------------------------- funnel --------------------------------- */
+.ain-funnel { display: flex; flex-direction: column; gap: var(--space-2); }
+.ain-funnel__row { display: grid; grid-template-columns: minmax(96px, 22%) 1fr auto; align-items: center; gap: var(--space-5); padding: var(--space-2) 0; }
+.ain-funnel__label { font-size: var(--text-sm); color: var(--text-secondary); }
+.ain-funnel__track { position: relative; height: 26px; background: var(--bg-sunken); border-radius: var(--radius-sm); overflow: hidden; }
+.ain-funnel__fill { position: absolute; inset: 0 auto 0 0; border-radius: var(--radius-sm); animation: ain-growx 620ms var(--ease-out) backwards; transform-origin: left; }
+.ain-funnel__figures { display: flex; align-items: baseline; gap: var(--space-4); font-size: var(--text-sm); }
+.ain-funnel__count { font-weight: var(--weight-semibold); color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.ain-funnel__rate { color: var(--text-tertiary); font-variant-numeric: tabular-nums; min-width: 44px; text-align: end; }
+.ain-funnel__drop { display: flex; justify-content: flex-end; font-size: var(--text-2xs); color: var(--text-tertiary); padding-inline-end: 2px; }
+
+/* -------------------------------- heatmap --------------------------------- */
+.ain-heat { display: flex; flex-direction: column; gap: var(--space-3); }
+.ain-heat__grid { display: grid; gap: 3px; }
+.ain-heat__cell { border-radius: 2px; aspect-ratio: 1; min-height: 12px; transition: outline-color var(--dur-fast) var(--ease-out); outline: 1px solid transparent; }
+.ain-heat__cell:hover, .ain-heat__cell:focus-visible { outline-color: var(--border-strong); outline-offset: 1px; }
+.ain-heat__rowlabel, .ain-heat__collabel { font-size: var(--text-2xs); color: var(--text-tertiary); }
+.ain-heat__scale { display: flex; align-items: center; gap: var(--space-3); font-size: var(--text-2xs); color: var(--text-tertiary); }
+.ain-heat__swatch { width: 12px; height: 12px; border-radius: 2px; }
