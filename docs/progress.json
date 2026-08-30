@@ -1,6 +1,6 @@
 {
-  "updated": "2026-08-30T19:45:01.550252",
-  "headline": "Foundation is live and verified. Wave 1 builders are going out now \u2014 every piece gets a fresh critic that runs the real thing before it can pass.",
+  "updated": "2026-08-30T19:48:24.231995",
+  "headline": "Wave 1 is in flight. Four builders are working disjoint directories; each one is followed by a fresh critic that runs the software, screenshots it, and compares it blind against HubSpot or Stripe. A piece loops until the critic picks ours.",
   "stats": {
     "modules": 1,
     "api routes": 22,
@@ -66,43 +66,43 @@
     },
     {
       "name": "Wave 1 \u00b7 The spine",
-      "status": "queued",
-      "note": "Everything downstream depends on these five. They go first and get the harshest critics.",
+      "status": "active",
+      "note": "Everything downstream depends on these. The app shell follows immediately after the design system lands.",
       "pieces": [
         {
           "id": "design-system",
           "title": "Design system",
-          "status": "queued",
+          "status": "building",
           "rounds": 0,
           "note": "The component kit: buttons, fields, tables, menus, overlays, charts \u2014 in both themes"
         },
         {
-          "id": "app-shell",
-          "title": "App shell & navigation",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Sidebar, topbar, command palette, global search, toasts, keyboard model"
-        },
-        {
           "id": "crm-core",
           "title": "Smart CRM data model",
-          "status": "queued",
+          "status": "building",
           "rounds": 0,
           "note": "Objects, custom properties, associations, records, timeline \u2014 the substrate"
         },
         {
           "id": "ai-engine",
           "title": "AI engine & tool runtime",
-          "status": "queued",
+          "status": "building",
           "rounds": 0,
           "note": "Grounded reasoning over real workspace data, tool calling, cost and trace capture"
         },
         {
           "id": "catalog",
           "title": "Product catalog & pricing",
-          "status": "queued",
+          "status": "building",
           "rounds": 0,
           "note": "Flat, per-seat, tiered, volume, package, usage and hybrid prices in every currency"
+        },
+        {
+          "id": "app-shell",
+          "title": "App shell & navigation",
+          "status": "queued",
+          "rounds": 0,
+          "note": "Sidebar, topbar, command palette, global search, toasts \u2014 starts when the design system passes"
         }
       ]
     },
