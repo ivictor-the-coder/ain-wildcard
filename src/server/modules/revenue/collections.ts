@@ -84,7 +84,7 @@ export interface AgeingRow {
 
 export interface Ageing {
   as_of: number;
-  currency: string;
+  currency: string | null;
   total: number;
   invoices: number;
   buckets: AgeingRow[];
@@ -93,7 +93,7 @@ export interface Ageing {
   oldest_due: number | null;
 }
 
-export function ageBook(invoices: InvoiceRow[], at: number, currency: string): Ageing {
+export function ageBook(invoices: InvoiceRow[], at: number, currency: string | null): Ageing {
   const buckets = new Map<AgeingBucket, { invoices: number; amount: number; oldest: number | null }>();
   for (const bucket of AGEING_BUCKETS) buckets.set(bucket, { invoices: 0, amount: 0, oldest: null });
   let total = 0, count = 0, oldest: number | null = null;
@@ -139,6 +139,8 @@ export function ageBook(invoices: InvoiceRow[], at: number, currency: string): A
 /* -------------------------------- dunning --------------------------------- */
 
 export interface RecoveryReport {
+  /** The currency these figures are in, or null when the whole book is in scope. */
+  currency: string | null;
   /** Open campaigns: what is still being chased, right now. */
   at_risk: number;
   at_risk_campaigns: number;
@@ -155,35 +157,49 @@ export interface RecoveryReport {
   top_failure_codes: { code: string; campaigns: number; amount: number }[];
 }
 
-export function recoveryReport(ctx: Ctx, orgId: string, from: number, to: number): RecoveryReport {
+/**
+ * Dunning, optionally narrowed to one currency.
+ *
+ * `payments_dunning` carries the currency of the bill it is chasing, so a
+ * per-currency recovery rate is a real rate rather than a ratio of two sums
+ * that were never in the same unit.
+ */
+export function recoveryReport(
+  ctx: Ctx, orgId: string, from: number, to: number, currency?: string | null,
+): RecoveryReport {
+  const clause = currency ? ' AND currency = ?' : '';
+  const scoped = <T>(sql: string, ...params: unknown[]): T[] =>
+    ctx.db.all<T>(sql, ...((currency ? [...params, currency] : params) as never[]));
+
   const open = ctx.db.get<{ campaigns: number; amount: number }>(
     `SELECT COUNT(*) AS campaigns, COALESCE(SUM(amount_at_risk - recovered_amount), 0) AS amount
-       FROM payments_dunning WHERE org_id = ? AND status = 'recovering'`,
-    orgId,
+       FROM payments_dunning WHERE org_id = ? AND status = 'recovering'${clause}`,
+    ...((currency ? [orgId, currency] : [orgId]) as never[]),
   ) ?? { campaigns: 0, amount: 0 };
 
-  const byStatus = ctx.db.all<{ status: string; campaigns: number; at_risk: number; recovered: number }>(
+  const byStatus = scoped<{ status: string; campaigns: number; at_risk: number; recovered: number }>(
     `SELECT status, COUNT(*) AS campaigns,
             COALESCE(SUM(amount_at_risk), 0) AS at_risk,
             COALESCE(SUM(recovered_amount), 0) AS recovered
        FROM payments_dunning
-      WHERE org_id = ? AND started_at >= ? AND started_at < ?
+      WHERE org_id = ? AND started_at >= ? AND started_at < ?${clause}
       GROUP BY status ORDER BY status`,
     orgId, from, to,
   );
 
-  const attempts = ctx.db.all<{ outcome: string; attempts: number }>(
-    `SELECT outcome, COUNT(*) AS attempts FROM payments_dunning_attempts
-      WHERE org_id = ? AND attempted_at >= ? AND attempted_at < ?
-      GROUP BY outcome ORDER BY outcome`,
+  const attempts = scoped<{ outcome: string; attempts: number }>(
+    `SELECT a.outcome AS outcome, COUNT(*) AS attempts FROM payments_dunning_attempts a
+       JOIN payments_dunning d ON d.id = a.dunning_id AND d.org_id = a.org_id
+      WHERE a.org_id = ? AND a.attempted_at >= ? AND a.attempted_at < ?${clause ? ' AND d.currency = ?' : ''}
+      GROUP BY a.outcome ORDER BY a.outcome`,
     orgId, from, to,
   );
 
-  const codes = ctx.db.all<{ code: string; campaigns: number; amount: number }>(
+  const codes = scoped<{ code: string; campaigns: number; amount: number }>(
     `SELECT last_failure_code AS code, COUNT(*) AS campaigns,
             COALESCE(SUM(amount_at_risk - recovered_amount), 0) AS amount
        FROM payments_dunning
-      WHERE org_id = ? AND last_failure_code IS NOT NULL AND started_at >= ? AND started_at < ?
+      WHERE org_id = ? AND last_failure_code IS NOT NULL AND started_at >= ? AND started_at < ?${clause}
       GROUP BY last_failure_code ORDER BY amount DESC, campaigns DESC LIMIT 8`,
     orgId, from, to,
   );
@@ -194,6 +210,7 @@ export function recoveryReport(ctx: Ctx, orgId: string, from: number, to: number
   const made = attempts.filter((row) => row.outcome !== 'skipped').reduce((sum, row) => sum + Number(row.attempts), 0);
 
   return {
+    currency: currency ?? null,
     at_risk: Number(open.amount),
     at_risk_campaigns: Number(open.campaigns),
     campaigns_started: byStatus.reduce((sum, row) => sum + Number(row.campaigns), 0),
@@ -221,7 +238,7 @@ export interface CollectionsRow {
   month: string;
   period: { start: number; end: number };
   complete: boolean;
-  currency: string;
+  currency: string | null;
   /** Billings raised in the month: what the bills finalised in it asked for. */
   billed: number;
   /** Cash that landed in the month, whichever month the bill was raised in. */
@@ -258,7 +275,7 @@ export interface CollectionsReport {
     dso: Decimal2;
     dso_basis: string;
     days_in_range: number;
-    currency: string;
+    currency: string | null;
   };
 }
 
@@ -268,7 +285,7 @@ export interface CollectionsInput {
   cells: MonthCell[];
   from: number;
   to: number;
-  currency: string;
+  currency: string | null;
   recovery: RecoveryReport;
 }
 

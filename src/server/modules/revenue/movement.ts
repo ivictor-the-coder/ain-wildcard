@@ -93,6 +93,8 @@ export interface Mover {
   customer: string;
   name: string;
   kind: MovementKind;
+  /** The currency this movement is in. Null only on a mixed-book row, which is why one is never published. */
+  currency: string | null;
   /** Signed: what this account added to, or took off, the month. */
   amount: number;
   from: number;
@@ -106,7 +108,7 @@ export interface MovementRow {
   opening_at: number;
   closing_at: number;
   complete: boolean;
-  currency: string;
+  currency: string | null;
   opening: number;
   new_business: number;
   expansion: number;
@@ -130,6 +132,7 @@ interface CustomerDelta {
 
 function classify(
   matrix: RevenueMatrix, index: number, cell: MonthCell, names: Map<string, string>, topMovers: number,
+  currency: string | null,
 ): Omit<MovementRow, 'month' | 'period' | 'opening_at' | 'closing_at' | 'complete' | 'currency'> {
   let opening = 0, newBusiness = 0, expansion = 0, reactivation = 0, contraction = 0, churn = 0;
   const counts: MovementCounts = {
@@ -139,7 +142,7 @@ function classify(
   const movers: Mover[] = [];
   const moved = (customer: string, kind: MovementKind, amount: number, delta: CustomerDelta) => {
     movers.push({
-      customer, kind, amount, name: names.get(customer) ?? customer,
+      customer, kind, amount, currency, name: names.get(customer) ?? customer,
       from: delta.opening, to: delta.closing,
     });
   };
@@ -227,7 +230,7 @@ export interface MovementSeries {
 export function movementSeries(
   matrix: RevenueMatrix,
   cells: MonthCell[],
-  currency: string,
+  currency: string | null,
   opts: { names?: Map<string, string>; topMovers?: number } = {},
 ): MovementSeries {
   const names = opts.names ?? new Map<string, string>();
@@ -239,7 +242,7 @@ export function movementSeries(
     closing_at: cell.at,
     complete: cell.complete,
     currency,
-    ...classify(matrix, index, cell, names, topMovers),
+    ...classify(matrix, index, cell, names, topMovers, currency),
   }));
 
   const totals = {
@@ -279,7 +282,7 @@ export interface ChurnRow {
   month: string;
   period: { start: number; end: number };
   complete: boolean;
-  currency: string;
+  currency: string | null;
   opening_mrr: number;
   closing_mrr: number;
   churned_mrr: number;
@@ -387,11 +390,16 @@ export interface CohortRow {
   cohort: string;
   accounts: number;
   initial_mrr: number;
-  currency: string;
+  /**
+   * A cohort is keyed by month **and** currency: a March cohort billing in
+   * euros and one billing in dollars are two cohorts, because their retention
+   * curves are two different numbers and adding them makes neither.
+   */
+  currency: string | null;
   cells: CohortCell[];
 }
 
-export function cohortMatrix(matrix: RevenueMatrix, cells: MonthCell[], currency: string): {
+export function cohortMatrix(matrix: RevenueMatrix, cells: MonthCell[], currency: string | null): {
   rows: CohortRow[];
   totals: {
     cohorts: number;

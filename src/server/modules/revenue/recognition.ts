@@ -94,7 +94,17 @@ export interface RecognitionRow {
   month: string;
   period: { start: number; end: number };
   complete: boolean;
-  currency: string;
+  currency: string | null;
+  /**
+   * The instant this row was read at: the close of the month, or `as_of` when
+   * `as_of` falls inside it or before it. A month after `as_of` is read at
+   * `as_of` and therefore recognises nothing — which is what makes the last
+   * cumulative figure in the series equal `totals.recognised` instead of
+   * running past it.
+   */
+  read_at: number;
+  /** False for a month the report never reached because `as_of` is before it. */
+  in_scope: boolean;
   invoiced: number;
   recognised: number;
   /** Cumulative invoiced at the close of this month. */
@@ -111,6 +121,15 @@ export interface RecognitionRow {
   unbilled_balance: number;
 }
 
+export interface RecognitionCheck {
+  name: string;
+  description: string;
+  expected: number;
+  actual: number;
+  difference: number;
+  ok: boolean;
+}
+
 export interface RecognitionReport {
   rows: RecognitionRow[];
   totals: {
@@ -119,7 +138,7 @@ export interface RecognitionReport {
     recognised: number;
     deferred_balance: number;
     unbilled_balance: number;
-    currency: string;
+    currency: string | null;
   };
   reconciliation: {
     invoiced: number;
@@ -128,6 +147,17 @@ export interface RecognitionReport {
     difference: number;
     balanced: boolean;
     note: string | null;
+    /**
+     * What was actually checked. `invoiced = recognised + deferred` alone is an
+     * identity — `deferred` is defined as the difference, so it can never fail
+     * and a report that offers it as proof is offering nothing. These are the
+     * checks that can fail: the daily schedule is re-summed against the line it
+     * came from, and the cumulative figure is re-derived by a second algorithm
+     * (a monotone cursor over the days) and compared with the first (a filter
+     * over the same days). A schedule that does not sum, or days that are not
+     * in order, break them.
+     */
+    checks: RecognitionCheck[];
   };
 }
 
@@ -136,7 +166,9 @@ export interface RecognitionReport {
  * daily schedule. Nothing is recomputed per month, so a year of invoices costs
  * one pass over the days plus one pass over the months.
  */
-export function recognise(lines: RecognitionLine[], cells: MonthCell[], asOf: number, currency: string): RecognitionReport {
+export function recognise(
+  lines: RecognitionLine[], cells: MonthCell[], asOf: number, currency: string | null,
+): RecognitionReport {
   const size = cells.length;
   const invoicedInMonth = new Array<number>(size).fill(0);
   const recognisedInMonth = new Array<number>(size).fill(0);
@@ -144,19 +176,25 @@ export function recognise(lines: RecognitionLine[], cells: MonthCell[], asOf: nu
   const invoicedToDate = new Array<number>(size).fill(0);
   const deferredEnd = new Array<number>(size).fill(0);
   const unbilledEnd = new Array<number>(size).fill(0);
+  // Every month is read at its own close, or at `as_of` when `as_of` is
+  // earlier. Without the clamp the series kept recognising past the date the
+  // totals were computed at, and a request with ?as_of= in the past published a
+  // cumulative figure larger than its own total in the same document.
+  const readAt = cells.map((cell) => Math.min(cell.at, asOf));
 
   let totalInvoiced = 0, totalRecognised = 0, totalDeferred = 0, totalUnbilled = 0;
+  let sweptRecognised = 0, scheduledAmount = 0, lineAmount = 0;
 
   for (const line of lines) {
     const days = scheduleFor(line.amount, line.currency, line.period.start, line.period.end, asOf);
     let cursor = 0, cumulative = 0;
 
     if (size) {
-      const opening = cells[0].opens_at;
+      const opening = Math.min(cells[0].opens_at, asOf);
       while (cursor < days.length && days[cursor].end <= opening) { cumulative += days[cursor].amount; cursor += 1; }
       let previous = cumulative;
       for (let i = 0; i < size; i++) {
-        const at = cells[i].at;
+        const at = readAt[i];
         while (cursor < days.length && days[cursor].end <= at) { cumulative += days[cursor].amount; cursor += 1; }
         recognisedInMonth[i] += cumulative - previous;
         recognisedToDate[i] += cumulative;
@@ -166,12 +204,20 @@ export function recognise(lines: RecognitionLine[], cells: MonthCell[], asOf: nu
         const gap = billed - cumulative;
         deferredEnd[i] += gap;
         if (gap < 0) unbilledEnd[i] += -gap;
-        if (line.invoiced_at >= cells[i].start && line.invoiced_at < cells[i].end) invoicedInMonth[i] += line.amount;
+        if (line.invoiced_at >= cells[i].start && line.invoiced_at < cells[i].end && line.invoiced_at <= asOf) {
+          invoicedInMonth[i] += line.amount;
+        }
       }
     }
+    // The same cursor, carried on to as_of, is the second opinion the
+    // reconciliation compares against the filter below.
+    while (cursor < days.length && days[cursor].end <= asOf) { cumulative += days[cursor].amount; cursor += 1; }
+    sweptRecognised += cumulative;
+    scheduledAmount += days.reduce((sum, day) => sum + day.amount, 0);
+    lineAmount += line.amount;
 
-    // Line-level figures are read straight off the schedule, independent of the
-    // month sweep above — which is what makes the reconciliation a real check.
+    // Line-level figures are read straight off the schedule by filtering it,
+    // which is a different traversal from the cursor above.
     const earned = days.reduce((sum, day) => sum + (day.recognised ? day.amount : 0), 0);
     const billedNow = line.invoiced_at <= asOf ? line.amount : 0;
     line.days = days.length;
@@ -184,6 +230,43 @@ export function recognise(lines: RecognitionLine[], cells: MonthCell[], asOf: nu
     totalUnbilled += line.unbilled;
   }
 
+  const checks: RecognitionCheck[] = [
+    {
+      name: 'schedule_sums_to_line',
+      description:
+        'Every daily schedule re-summed against the invoice line it was split from. allocate() guarantees it; this ' +
+        'checks it, because a schedule whose days do not add up to the invoice is worse than no schedule at all.',
+      expected: lineAmount,
+      actual: scheduledAmount,
+      difference: scheduledAmount - lineAmount,
+      ok: scheduledAmount === lineAmount,
+    },
+    {
+      name: 'cursor_matches_filter',
+      description:
+        'Recognised-to-date computed twice over the same days by two different traversals: a monotone cursor that ' +
+        'walks them in order (the one the monthly series uses) and a filter over the whole schedule (the one the line ' +
+        'totals use). They differ if the days are not in order or the sweep drops one.',
+      expected: totalRecognised,
+      actual: sweptRecognised,
+      difference: sweptRecognised - totalRecognised,
+      ok: sweptRecognised === totalRecognised,
+    },
+  ];
+  if (size && readAt[size - 1] === asOf) {
+    checks.push({
+      name: 'series_ends_at_totals',
+      description:
+        'The last cumulative figure in the monthly series against the total computed from the lines. The series is ' +
+        'read at as_of once as_of is inside the range, so the two are the same figure reached two ways.',
+      expected: totalRecognised,
+      actual: recognisedToDate[size - 1],
+      difference: recognisedToDate[size - 1] - totalRecognised,
+      ok: recognisedToDate[size - 1] === totalRecognised,
+    });
+  }
+
+  const failed = checks.filter((check) => !check.ok);
   const difference = totalInvoiced - totalRecognised - totalDeferred;
 
   return {
@@ -192,6 +275,8 @@ export function recognise(lines: RecognitionLine[], cells: MonthCell[], asOf: nu
       period: { start: cell.start, end: cell.end },
       complete: cell.complete,
       currency,
+      read_at: readAt[i],
+      in_scope: cell.start <= asOf,
       invoiced: invoicedInMonth[i],
       recognised: recognisedInMonth[i],
       invoiced_to_date: invoicedToDate[i],
@@ -212,10 +297,13 @@ export function recognise(lines: RecognitionLine[], cells: MonthCell[], asOf: nu
       recognised: totalRecognised,
       deferred: totalDeferred,
       difference,
-      balanced: difference === 0,
-      note: difference === 0
+      balanced: difference === 0 && failed.length === 0,
+      note: difference === 0 && failed.length === 0
         ? null
-        : `Invoiced ${totalInvoiced} does not equal recognised ${totalRecognised} plus deferred ${totalDeferred}.`,
+        : failed.length
+          ? failed.map((check) => `${check.name}: expected ${check.expected}, got ${check.actual}.`).join(' ')
+          : `Invoiced ${totalInvoiced} does not equal recognised ${totalRecognised} plus deferred ${totalDeferred}.`,
+      checks,
     },
   };
 }

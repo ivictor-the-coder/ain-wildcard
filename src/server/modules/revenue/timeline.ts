@@ -58,6 +58,33 @@ export function toMonthly(amount: number, currency: string, unit: IntervalUnit, 
 /** ARR is twelve months of MRR. Integer minor units, no rounding to do. */
 export const annualise = (mrr: number): number => mrr * 12;
 
+/**
+ * The part of a subscription's monthly value that is gross of tax.
+ *
+ * MRR is what the contract says, and on a `tax_behavior: inclusive` price what
+ * the contract says includes the tax that will be remitted — so that part of
+ * MRR is larger than the revenue the same money will be recognised at. Two
+ * accounts on identical 49,900 prices, one inclusive, contribute the same
+ * 49,900 to MRR and 41,583 and 49,900 to recognised revenue, and a report that
+ * puts both figures on one screen owes the reader the reason.
+ *
+ * This is that reason, and it is only the base: the *rate* depends on where the
+ * account is registered and is resolved when the invoice is raised, never
+ * against a contract. Item by item, in the same order and with the same single
+ * rounding `subscriptionMrr()` uses, so the part can never exceed the whole.
+ */
+export function taxInclusiveMrr(sub: Subscription, book: Pricebook): number {
+  let total = 0;
+  for (const item of sub.items) {
+    const price = book.find(item.price);
+    if (!price || isMetered(price) || !isRecurring(price)) continue;
+    if (price.tax_behavior !== 'inclusive') continue;
+    const line = book.compute(price, item.quantity, sub.currency, { customUnitAmount: item.custom_unit_amount });
+    total += toMonthly(line.amount, sub.currency, sub.interval, sub.interval_count);
+  }
+  return total;
+}
+
 /* ---------------------------- contract changes ---------------------------- */
 
 export interface ContractChange {
@@ -196,8 +223,18 @@ export interface SubscriptionTimeline {
   live_to: number;
   /** Why it stopped, when it has. */
   ended_because: 'canceled' | 'collection_paused' | 'never_started' | null;
+  /**
+   * Every stretch of paused collection this subscription has had, dated from
+   * the event log. The segments below have the closed ones cut out of them.
+   */
+  pauses: PauseWindow[];
   /** Billing's own figure for today, in monthly minor units. */
   current_mrr: number;
+  /**
+   * How much of `current_mrr` sits on tax-inclusive prices, and is therefore
+   * gross of a tax that revenue recognition will book net.
+   */
+  tax_inclusive_mrr: number;
   /**
    * What the contract is worth a month regardless of status — the figure a
    * trialing or paused subscription would contribute if it were recognised.
@@ -207,24 +244,97 @@ export interface SubscriptionTimeline {
   changes: ContractChange[];
 }
 
+/* -------------------------------- pauses ---------------------------------- */
+
+/** One stretch of paused collection. `to` is `OPEN_ENDED` while it is still on. */
+export interface PauseWindow {
+  from: number;
+  to: number;
+  /** True when the instant came from `updated` because no event row was found. */
+  inferred: boolean;
+}
+
+/**
+ * When collection was paused, read from the event log rather than from the row.
+ *
+ * `pause_collection` records no instant, so this module used to date a pause at
+ * `subscription.updated` — the last time anything wrote the row. That made
+ * history mutable: a `keep_as_draft` renewal two months later rewrote `updated`,
+ * and two closed months of MRR appeared retroactively where there had been
+ * none. The event log does record the instant, exactly once, and never moves it:
+ * `subscription.paused` is emitted inside the same transaction that sets the
+ * status, and `subscription.resumed` when collection comes back.
+ *
+ * A row with no event — one seeded straight into the table, or paused before
+ * this log existed — still falls back to `updated`, and says so with
+ * `inferred: true` so the caller can tell a read date from a guessed one.
+ */
+export function readCollectionPauses(ctx: Ctx, orgId: string): Map<string, PauseWindow[]> {
+  const rows = ctx.db.all<{ object_id: string; type: string; created: number }>(
+    `SELECT object_id, type, created FROM events
+      WHERE org_id = ? AND object_type = 'subscription'
+        AND type IN ('subscription.paused', 'subscription.resumed')
+      ORDER BY object_id, created, rowid`,
+    orgId,
+  );
+
+  const windows = new Map<string, PauseWindow[]>();
+  for (const row of rows) {
+    if (!row.object_id) continue;
+    const list = windows.get(row.object_id) ?? [];
+    if (!windows.has(row.object_id)) windows.set(row.object_id, list);
+    const open = list.length && list[list.length - 1].to === OPEN_ENDED ? list[list.length - 1] : null;
+    if (row.type === 'subscription.paused') {
+      // A second pause with no resume between them is the same pause: keep the
+      // first instant, which is the one collection actually stopped at.
+      if (!open) list.push({ from: Number(row.created), to: OPEN_ENDED, inferred: false });
+    } else if (open) {
+      open.to = Math.max(open.from, Number(row.created));
+    }
+  }
+  return windows;
+}
+
+/** Remove every closed pause window from a set of segments. */
+function carve(segments: MrrSegment[], windows: PauseWindow[]): MrrSegment[] {
+  let out = segments;
+  for (const window of windows) {
+    if (window.to === OPEN_ENDED || window.to <= window.from) continue;
+    const next: MrrSegment[] = [];
+    for (const segment of out) {
+      if (window.to <= segment.from || window.from >= segment.to) { next.push(segment); continue; }
+      if (segment.from < window.from) next.push({ from: segment.from, to: window.from, mrr: segment.mrr });
+      if (window.to < segment.to) next.push({ from: window.to, to: segment.to, mrr: segment.mrr });
+    }
+    out = next;
+  }
+  return out;
+}
+
 /**
  * When a subscription stopped being recurring revenue, and why.
  *
- * `ended_at` is durable and exact. A collection pause is neither — billing
- * records no instant for it — so the pause is dated at `updated`, the last time
- * the row was written, which is the instant `pauseSubscription()` set it. That
- * is stated in every `basis` block rather than buried here, because it is the
- * one date in this module that is inferred rather than read.
+ * `ended_at` is durable and exact. A collection pause has no column of its own,
+ * so it is dated from the `subscription.paused` event — durable, written once,
+ * and never rewritten by a later renewal — falling back to `updated` only for a
+ * row the log has nothing for. Which of the two was used is reported per
+ * subscription in `pause.inferred` rather than left to be assumed.
  */
-function endOf(sub: Subscription): { at: number; because: SubscriptionTimeline['ended_because'] } {
+function endOf(sub: Subscription, windows: PauseWindow[]): {
+  at: number; because: SubscriptionTimeline['ended_because']; pause: PauseWindow | null;
+} {
   if (sub.status === 'incomplete' || sub.status === 'incomplete_expired') {
-    return { at: -1, because: 'never_started' };
+    return { at: -1, because: 'never_started', pause: null };
   }
   if (isTerminal(sub.status)) {
-    return { at: sub.ended_at ?? sub.canceled_at ?? sub.updated, because: 'canceled' };
+    return { at: sub.ended_at ?? sub.canceled_at ?? sub.updated, because: 'canceled', pause: null };
   }
-  if (sub.status === 'paused') return { at: sub.updated, because: 'collection_paused' };
-  return { at: OPEN_ENDED, because: null };
+  if (sub.status === 'paused') {
+    const open = windows.find((window) => window.to === OPEN_ENDED)
+      ?? { from: sub.updated, to: OPEN_ENDED, inferred: true };
+    return { at: open.from, because: 'collection_paused', pause: open };
+  }
+  return { at: OPEN_ENDED, because: null, pause: null };
 }
 
 /** The first instant a subscription bills: free trial time is not revenue. */
@@ -234,17 +344,17 @@ function startOf(sub: Subscription): number {
 }
 
 export function buildTimeline(
-  sub: Subscription, book: Pricebook, changes: ContractChange[],
+  sub: Subscription, book: Pricebook, changes: ContractChange[], pauses: PauseWindow[] = [],
 ): SubscriptionTimeline {
   const contracted = subscriptionMrr(sub, book);
   const liveFrom = startOf(sub);
-  const end = endOf(sub);
+  const end = endOf(sub, pauses);
   const liveTo = Math.max(liveFrom, end.at);
   const applicable = changes
     .filter((change) => change.at > liveFrom && change.at < liveTo && change.delta !== 0)
     .sort((a, b) => a.at - b.at);
 
-  const segments: MrrSegment[] = [];
+  let segments: MrrSegment[] = [];
   if (end.because !== 'never_started' && liveTo > liveFrom) {
     // Walk backwards: today's contract minus every change made since.
     const values: number[] = new Array(applicable.length + 1);
@@ -255,6 +365,10 @@ export function buildTimeline(
       if (bounds[i + 1] <= bounds[i]) continue;
       segments.push({ from: bounds[i], to: bounds[i + 1], mrr: values[i] });
     }
+    // A pause that has already ended is a hole in the timeline, not an end of
+    // it: the months either side of it are unaffected, and the months inside it
+    // earned nothing.
+    segments = carve(segments, pauses);
   }
 
   return {
@@ -267,7 +381,9 @@ export function buildTimeline(
     live_from: liveFrom,
     live_to: end.because === 'never_started' ? liveFrom : liveTo,
     ended_because: end.because,
+    pauses: end.pause && !pauses.includes(end.pause) ? [...pauses, end.pause] : pauses,
     current_mrr: countsAsRevenue(sub.status) ? contracted : 0,
+    tax_inclusive_mrr: countsAsRevenue(sub.status) ? taxInclusiveMrr(sub, book) : 0,
     contracted_mrr: contracted,
     segments,
     changes: applicable,

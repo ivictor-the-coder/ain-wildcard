@@ -20,7 +20,15 @@
  * And where a number can be wrong, it says so instead of drawing it: monthly
  * movement carries a reconciliation that re-derives the closing figure from the
  * movements and reports the difference, and `balanced: false` is a first-class
- * answer.
+ * answer — reached by checks that can actually fail, never by an identity
+ * dressed up as proof.
+ *
+ * The rule underneath all of it is in `currency.ts`: **a money figure is stated
+ * in a currency or it is not stated.** A workspace billing in three currencies
+ * has no single MRR, so every money scalar comes back `null` and the
+ * `by_currency` block — exact and separately reconciled in each currency — is
+ * the answer. `?currency=eur` brings the scalars back, because then they mean
+ * something.
  */
 import { defineModule } from '../../kernel/module';
 import type { Ctx } from '../../kernel/context';
@@ -48,6 +56,8 @@ export interface RevenueService {
   summary(orgId: string, query?: RevenueQuery): ReturnType<Revenue['summary']>;
   /** The same arithmetic narrowed to one account. */
   account(orgId: string, customerId: string, query?: RevenueQuery): ReturnType<Revenue['account']>;
+  /** MRR by account, grouped by currency because size only compares inside one. */
+  accounts(orgId: string, query?: Parameters<Revenue['accounts']>[1]): ReturnType<Revenue['accounts']>;
 }
 
 declare module '../../kernel/services' {
@@ -114,7 +124,7 @@ export default defineModule({
   name: 'revenue',
   title: 'Revenue reporting',
   description:
-    'MRR and ARR normalised exactly across every billing interval, monthly movement that reconciles opening to closing or says why it does not, logo and revenue churn with gross and net retention, a cohort retention matrix, daily revenue recognition against every invoice line, receivables ageing with DSO and dunning exposure, and the usage economics of a metered book — every figure carrying the basis it was computed on and the row counts it came from.',
+    'MRR and ARR normalised exactly across every billing interval, monthly movement that reconciles opening to closing or says why it does not, logo and revenue churn with gross and net retention, a cohort retention matrix, daily revenue recognition against every invoice line, receivables ageing with DSO and dunning exposure, and the usage economics of a metered book — every figure carrying the basis it was computed on, the row counts it came from, and the currency it is actually in, because a book billing in three currencies has no single total and this module will not invent one.',
   dependsOn: ['core', 'billing', 'payments', 'metering', 'credits'],
 
   boot(ctx) {
@@ -129,6 +139,7 @@ export default defineModule({
       usage: (orgId, q) => revenue.usage(orgId, q ?? {}),
       summary: (orgId, q) => revenue.summary(orgId, q ?? {}),
       account: (orgId, customerId, q) => revenue.account(orgId, customerId, q ?? {}),
+      accounts: (orgId, q) => revenue.accounts(orgId, q ?? {}),
     };
     ctx.provide('revenue', service);
   },
@@ -142,7 +153,9 @@ export default defineModule({
         'Contracted monthly recurring revenue: every interval normalised to a month with exact rationals, metered items ' +
         'excluded and reported separately on their own stated basis, trials and paused subscriptions shown as contracted ' +
         'but not recognised. Today\'s figure is billing\'s own subscriptionMrr(), so it cannot disagree with ' +
-        '/v1/subscriptions/overview. History is reconstructed from the dated contract changes in the proration ledger.',
+        '/v1/subscriptions/overview. History is reconstructed from the dated contract changes in the proration ledger and ' +
+        'from the pause and resume events, so a closed month never moves. A book in more than one currency reports every ' +
+        'money figure in by_currency and nulls the scalars; ?currency=eur brings them back.',
     });
 
     router.get('/v1/revenue/movement', (req: Req, c: Ctx) => revenueStore(c).movement(req.auth.orgId, query(req) as RevenueQuery & { top_movers?: number }), {
@@ -211,42 +224,41 @@ export default defineModule({
     });
 
     router.get('/v1/revenue/accounts', (req: Req, c: Ctx) => {
-      const orgId = req.auth.orgId;
-      const store = revenueStore(c);
       const q = query(req) as RevenueQuery & { limit?: number };
-      const book = store.book(orgId, q, { fullHistory: true });
-      const rows = [...book.customers.values()]
-        .map((customer) => {
-          const lines = book.timelines.filter((line) => line.customer === customer.id);
-          const mrr = lines.reduce((sum, line) => sum + line.current_mrr, 0);
-          const series = book.matrix.values.get(customer.id);
-          const previous = series ? series[Math.max(0, series.length - 2)] : 0;
-          return {
-            object: 'revenue_account_row' as const,
-            customer: customer.id,
-            name: customer.name,
-            currency: customer.currency,
-            mrr,
-            arr: mrr * 12,
-            previous_month_mrr: previous,
-            change: mrr - previous,
-            subscriptions: lines.filter((line) => line.current_mrr !== 0).length,
-            first_revenue_at: book.matrix.firstRevenue.get(customer.id) ?? null,
-          };
-        })
-        .filter((row) => row.mrr !== 0 || row.previous_month_mrr !== 0)
-        .sort((a, b) => b.mrr - a.mrr || a.name.localeCompare(b.name));
+      const { rows, groups, scope } = revenueStore(c).accounts(req.auth.orgId, q);
       const limit = Math.min(q.limit ?? 100, 500);
-      return list(rows.slice(0, limit), {
-        hasMore: rows.length > limit,
-        totalCount: rows.length,
-        url: '/v1/revenue/accounts',
-      });
+      return {
+        ...list(rows.slice(0, limit), {
+          hasMore: rows.length > limit,
+          totalCount: rows.length,
+          url: '/v1/revenue/accounts',
+        }),
+        currency: scope.single,
+        groups,
+        basis: {
+          currency: scope,
+          rules: [
+            'Every row carries its own currency and its own real MRR; nothing here is converted.',
+            scope.single
+              ? 'One currency is in scope, so the list is a straight ranking by size.'
+              : 'More than one currency is in scope, so the list is grouped by currency and ranked inside each group. '
+                + 'Ranking across currencies would put a ¥100,000 account level with a $1,000.00 one. Pass ?currency='
+                + `${scope.currencies[0]} for a single ranked list.`,
+          ],
+        },
+        warnings: scope.single
+          ? []
+          : [`This workspace bills in ${scope.currencies.map((currency) => currency.toUpperCase()).join(', ')}, so these `
+            + 'accounts are grouped by currency rather than ranked against each other. `groups` gives the size of each book.'],
+      };
     }, {
-      summary: 'MRR by account, largest first',
+      summary: 'MRR by account, grouped by currency and largest first inside each',
       tags: ['revenue'],
       query: v.object({ ...RANGE, limit: v.optional(v.int({ min: 1, max: 500 })) }),
-      description: 'Every account carrying recurring revenue now or last month, with the month-on-month change beside it.',
+      description:
+        'Every account carrying recurring revenue now or last month, with the month-on-month change beside it. A mixed '
+        + 'book is grouped by currency and ranked inside each group, never ranked across them; ?currency=eur gives one '
+        + 'ranked list.',
     });
 
     router.get('/v1/revenue/accounts/:id', (req: Req, c: Ctx) => {
@@ -263,8 +275,21 @@ export default defineModule({
   },
 
   tools(ctx) {
-    const money_ = (amount: number, currency: string, orgId: string) =>
+    const display = (amount: number, currency: string, orgId: string) =>
       formatMoney(money(amount, currency), { locale: localeOf(ctx, orgId) });
+
+    /**
+     * A formatted amount, or nothing at all.
+     *
+     * The copilot's job here is to state a figure a person can act on, and the
+     * fastest way to lose that person's trust is to hand them "$56,437.83" for a
+     * book that is part euros and part pounds. So a `*_display` string exists
+     * only where one currency is in scope; where several are, the tool returns
+     * the per-currency breakdown and the note that says why, and the model has
+     * nothing to round up into a single wrong sentence.
+     */
+    const scalar = (amount: number | null, currency: string | null, orgId: string, key: string) =>
+      (amount !== null && currency !== null ? { [key]: display(amount, currency, orgId) } : {});
 
     return [
       {
@@ -272,20 +297,36 @@ export default defineModule({
         description:
           'The revenue half of the business: MRR, ARR, net and gross revenue retention, receivables, DSO, deferred ' +
           'balance and overage share, with the basis each was computed on. Use this before answering anything about ' +
-          'how the business is doing.',
+          'how the business is doing. When the workspace bills in more than one currency there is no single MRR ' +
+          'figure and the money fields come back null — report the by_currency rows, one amount per currency, and ' +
+          'never add them together.',
         input: v.object({ months: v.optional(v.int({ min: 1, max: 60 })), currency: v.optional(v.currency()) }),
         readOnly: true,
         tags: ['revenue', 'reporting'],
         run(args: { months?: number; currency?: string }, c: Ctx, meta) {
           const report = revenueStore(c).summary(meta.orgId, args);
+          const scope = report.basis.currency;
           return {
             ...report.headline,
             currency: report.currency,
-            mrr_display: money_(report.headline.mrr, report.currency, meta.orgId),
-            arr_display: money_(report.headline.arr, report.currency, meta.orgId),
+            currency_mode: scope.mode,
+            ...scalar(report.headline.mrr, scope.single, meta.orgId, 'mrr_display'),
+            ...scalar(report.headline.arr, scope.single, meta.orgId, 'arr_display'),
+            ...scalar(report.headline.receivables, scope.single, meta.orgId, 'receivables_display'),
+            by_currency: report.by_currency.map((row) => ({
+              currency: row.currency,
+              mrr: row.mrr,
+              arr: row.arr,
+              accounts: row.accounts,
+              mrr_display: display(row.mrr, row.currency, meta.orgId),
+              arr_display: display(row.arr, row.currency, meta.orgId),
+              receivables_display: display(row.receivables, row.currency, meta.orgId),
+              net_revenue_retention: row.net_revenue_retention.percent,
+              gross_revenue_retention: row.gross_revenue_retention.percent,
+            })),
             balanced: report.balanced,
             basis: report.basis.summary,
-            currency_note: report.basis.currency.note,
+            currency_note: scope.note,
             warnings: report.warnings,
           };
         },
@@ -294,17 +335,27 @@ export default defineModule({
         name: 'revenue_movement',
         description:
           'Month-by-month MRR movement — new, expansion, contraction, churn and reactivation — with the accounts that ' +
-          'moved each month and a reconciliation proving opening plus movements equals closing.',
+          'moved each month and a reconciliation proving opening plus movements equals closing. In a multi-currency ' +
+          'workspace the monthly figures come back per currency and each mover names its own.',
         input: v.object({ months: v.optional(v.int({ min: 1, max: 60 })), currency: v.optional(v.currency()) }),
         readOnly: true,
         tags: ['revenue', 'reporting'],
         run(args: { months?: number; currency?: string }, c: Ctx, meta) {
           const report = revenueStore(c).movement(meta.orgId, args);
+          const scope = report.basis.currency;
           return {
             currency: report.currency,
+            currency_mode: scope.mode,
             balanced: report.balanced,
             warning: report.warning,
             totals: report.totals,
+            by_currency: report.by_currency.map((row) => ({
+              currency: row.currency,
+              opening: display(row.totals.opening, row.currency, meta.orgId),
+              net: display(row.totals.net, row.currency, meta.orgId),
+              closing: display(row.totals.closing, row.currency, meta.orgId),
+              balanced: row.balanced,
+            })),
             months: report.series.map((row) => ({
               month: row.month,
               opening: row.opening,
@@ -314,9 +365,14 @@ export default defineModule({
               contraction: row.contraction,
               churn: row.churn,
               closing: row.closing,
+              by_currency: row.by_currency,
               reconciled: row.reconciliation.balanced,
-              movers: row.top_movers.map((mover) => `${mover.name}: ${mover.kind} ${money_(mover.amount, report.currency, meta.orgId)}`),
+              movers: row.top_movers.map((mover) => `${mover.name}: ${mover.kind} ${
+                mover.currency ? display(mover.amount, mover.currency, meta.orgId) : mover.amount
+              }`),
             })),
+            currency_note: scope.note,
+            warnings: report.warnings,
           };
         },
       },
@@ -324,24 +380,45 @@ export default defineModule({
         name: 'revenue_collections',
         description:
           'What is owed and how old it is: receivables ageing, days sales outstanding, failed-payment exposure and the ' +
-          'rate dunning is recovering at.',
+          'rate dunning is recovering at. A multi-currency book has no single outstanding figure and no single DSO; ' +
+          'both come back per currency.',
         input: v.object({ months: v.optional(v.int({ min: 1, max: 60 })), currency: v.optional(v.currency()) }),
         readOnly: true,
         tags: ['revenue', 'payments'],
         run(args: { months?: number; currency?: string }, c: Ctx, meta) {
           const report = revenueStore(c).collections(meta.orgId, args);
+          const scope = report.basis.currency;
           return {
             currency: report.currency,
+            currency_mode: scope.mode,
             outstanding: report.totals.outstanding,
-            outstanding_display: money_(report.totals.outstanding, report.currency, meta.orgId),
+            ...scalar(report.totals.outstanding, scope.single, meta.orgId, 'outstanding_display'),
             past_due: report.totals.past_due,
-            dso_days: report.totals.dso.display,
+            dso_days: report.totals.dso?.display ?? null,
             ageing: report.ageing.buckets.map((bucket) => ({
-              bucket: bucket.label, invoices: bucket.invoices, amount: bucket.amount, share: bucket.share.percent,
+              bucket: bucket.label,
+              invoices: bucket.invoices,
+              amount: bucket.amount,
+              share: bucket.share?.percent ?? null,
+            })),
+            by_currency: report.by_currency.map((row) => ({
+              currency: row.currency,
+              outstanding: row.totals.outstanding,
+              outstanding_display: display(row.totals.outstanding, row.currency, meta.orgId),
+              past_due: row.totals.past_due,
+              past_due_display: display(row.totals.past_due, row.currency, meta.orgId),
+              dso_days: row.totals.dso.display,
+              failed_payment_exposure: row.exposure.failed_payments,
+              recovery_rate: row.recovery.recovery_rate.percent,
+              ageing: row.ageing.buckets.map((bucket) => ({
+                bucket: bucket.label, invoices: bucket.invoices, amount: bucket.amount,
+              })),
             })),
             failed_payment_exposure: report.exposure.failed_payments,
-            recovery_rate: report.recovery.recovery_rate.percent,
+            recovery_rate: report.recovery.recovery_rate?.percent ?? null,
             note: report.exposure.note,
+            currency_note: scope.note,
+            warnings: report.warnings,
           };
         },
       },
