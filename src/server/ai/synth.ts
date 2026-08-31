@@ -450,7 +450,8 @@ interface BillingCustomerSummary {
   balance: { amount: number; credit: boolean; description: string };
   lifetime_value: { amount: number; periods_billed: number };
   next_invoice: { date: number; estimated_total: number; note: string } | null;
-  open_invoices: { total: number; oldest_due: number | null };
+  /** `total` here is money still owed, not a row count — the rows are `data`. */
+  open_invoices: { data: { id: string }[]; total: number; oldest_due: number | null };
   attention: string[];
 }
 
@@ -541,9 +542,9 @@ function invoiceBlocks(entry: { list: BillingInvoiceList; args: Record<string, u
   const { list, args } = entry;
   const shown = list.invoices;
   const status = typeof args.status === 'string' ? args.status : null;
-  const scope = status === 'open_like' ? 'still open'
+  const scope = args.due_before ? `past ${list.total === 1 ? 'its' : 'their'} due date`
+    : status === 'open_like' ? 'still open'
     : status && status !== 'all' ? `at status ${humanise(status).toLowerCase()}`
-    : args.due_before ? 'past their due date'
     : 'in the book';
   if (!list.total || !shown.length) {
     return [`No invoice in ${workspace.name} is ${scope}${args.customer ? ' for that account' : ''}.`];
@@ -607,32 +608,42 @@ function upcomingBlocks(invoice: BillingUpcomingInvoice): string[] {
   return blocks;
 }
 
-function summaryBlocks(summary: BillingCustomerSummary, facts: Facts): string[] {
-  const blocks = [`${summary.customer.name} — ${summary.headline}`];
+function summaryBlocks(summary: BillingCustomerSummary, facts: Facts, upcomingShown: boolean): string[] {
+  const blocks: string[] = [];
   const commercial: string[] = [];
   if (summary.subscriptions.live) {
-    commercial.push(`${countOf(summary.subscriptions.live, 'live subscription')} of ${summary.subscriptions.total}`);
+    commercial.push(summary.subscriptions.total > summary.subscriptions.live
+      ? `${countOf(summary.subscriptions.live, 'live subscription')} of ${summary.subscriptions.total}`
+      : countOf(summary.subscriptions.live, 'live subscription'));
   }
   if (summary.mrr) commercial.push(`${facts.money(summary.mrr)} a month, ${facts.money(summary.arr)} annualised`);
   if (summary.lifetime_value.periods_billed) {
     commercial.push(`${facts.money(summary.lifetime_value.amount)} billed across ${countOf(summary.lifetime_value.periods_billed, 'period')}`);
   }
-  if (commercial.length) blocks.push(`${sentenceJoin([listPhrase(commercial)])}`);
+  // Composed from the fields rather than from the ledger's own headline, so the
+  // same two facts are not stated twice in two different roundings.
+  blocks.push(commercial.length
+    ? `${summary.customer.name} — ${listPhrase(commercial)}.`
+    : `${summary.customer.name} — ${summary.headline}`);
   if (summary.balance.amount !== 0) blocks.push(summary.balance.description);
-  if (summary.open_invoices.total) {
-    blocks.push(`${countOf(summary.open_invoices.total, 'invoice')} still open${summary.open_invoices.oldest_due ? `, the oldest due ${facts.day(summary.open_invoices.oldest_due)}` : ''}.`);
+  if (summary.open_invoices.data.length) {
+    blocks.push(`${countOf(summary.open_invoices.data.length, 'invoice')} still open, ${facts.money(summary.open_invoices.total)} outstanding${summary.open_invoices.oldest_due ? `, the oldest due ${facts.day(summary.open_invoices.oldest_due)}` : ''}.`);
   }
-  if (summary.next_invoice) {
+  // The preview tool says the same thing in more detail; saying it twice, with
+  // two roundings of the same date, reads as two different bills.
+  if (summary.next_invoice && !upcomingShown) {
     blocks.push(`Next invoice ${facts.day(summary.next_invoice.date)} for about ${facts.money(summary.next_invoice.estimated_total)} — ${summary.next_invoice.note}`);
   }
-  if (summary.attention.length) blocks.push(`Needs attention: ${listPhrase(summary.attention)}.`);
+  if (summary.attention.length) {
+    blocks.push(`Needs attention: ${listPhrase(summary.attention.map((line) => line.trim().replace(/\.$/, '')))}.`);
+  }
   return blocks;
 }
 
 /** Everything the ledger returned in this run, as sentences. */
 function billingAnswer(found: BillingFound, facts: Facts, workspace: WorkspaceProfile): string[] {
   const blocks: string[] = [];
-  for (const summary of found.summaries.slice(0, 2)) blocks.push(...summaryBlocks(summary, facts));
+  for (const summary of found.summaries.slice(0, 2)) blocks.push(...summaryBlocks(summary, facts, found.upcoming.length > 0));
   for (const entry of found.subscriptions.slice(0, 2)) blocks.push(...subscriptionBlocks(entry, workspace));
   for (const entry of found.invoices.slice(0, 2)) blocks.push(...invoiceBlocks(entry, workspace));
   for (const invoice of found.explanations.slice(0, 2)) blocks.push(...explanationBlocks(invoice));
@@ -1012,6 +1023,9 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
     }
 
     case 'lookup': {
+      // A lookup can still have a number in it — "what does X pay us each
+      // month" is answered by the metric, then by the record it is about.
+      if (metrics.length && input.metric) blocks.push(...metricSentence(metrics[0], input, facts));
       if (profiles.length) {
         blocks.push(...profileParagraph(profiles[0], facts, input.workspace));
         const profile = profiles[0];
@@ -1035,7 +1049,16 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
           if (!list.records.length) {
             // The CRM has no such object type — but another tool in this run may
             // have the rows, and it answers rather than this sentence.
-            if (rows === 0) blocks.push(`No ${list.object_type} records match that.`);
+            if (rows > 0) continue;
+            blocks.push(`No ${list.object_type} records match that.`);
+            // A tool that was pointed at a named record and could not read it
+            // is the actual answer, and it is more use than a generic nothing.
+            for (const failure of input.steps.filter((s) => !s.ok && s.error)) {
+              const named = Object.values(failure.args).find((v) => typeof v === 'string' && looksLikeId(v));
+              if (!named) continue;
+              blocks.push(`${failure.tool} could not read ${named} either: ${failure.error?.message}`);
+              break;
+            }
             continue;
           }
           const args = input.steps.find((s) => s.result === list)?.args ?? {};

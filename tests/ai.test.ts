@@ -2042,14 +2042,27 @@ describe('a tool is never called with the question in its arguments', () => {
     });
   }
 
-  test('a tool that cannot be armed is reported, not run with the sentence', async () => {
-    const answer = await ask('Show me the upcoming invoice for Sakamoto Seiki');
-    assert.ok(!answer.trace.some((s: { kind: string; name: string }) => s.kind === 'tool' && s.name === 'billing_upcoming_invoice'),
-      'a tool needing a sub_ id the question does not contain is not called at all');
+  test('a tool needing an id the question does not carry is not called with the sentence', async () => {
+    const answer = await ask('Show me the upcoming invoice');
     const skipped = answer.analysis.skipped.find((s: { tool: string }) => s.tool === 'billing_upcoming_invoice');
     assert.ok(skipped, `expected billing_upcoming_invoice to be reported as skipped, got ${JSON.stringify(answer.analysis.skipped)}`);
     assert.deepEqual(skipped.missing, ['subscription']);
+    assert.ok(!answer.trace.some((s: { kind: string; name: string }) => s.kind === 'tool' && s.name === 'billing_upcoming_invoice'),
+      'with dozens of subscriptions and no account named, there is no one subscription it could mean');
     assert.match(answer.content, /I did not run `billing_upcoming_invoice`/);
+  });
+
+  test('naming the account arms the tool from the ledger, with a real id', async () => {
+    const answer = await ask('Show me the upcoming invoice for Sakamoto Seiki');
+    const preview = answer.trace.find((s: { name: string }) => s.name === 'billing_upcoming_invoice');
+    assert.ok(preview, 'listing the account\'s subscriptions gives the second pass the id it needed');
+    assert.equal(preview.ok, true);
+    assert.match(String(preview.args.subscription), /^sub_/);
+    const subscription = await expectOk('GET', `/v1/subscriptions/${preview.args.subscription}`);
+    const customer = await expectOk('GET', `/v1/customers/${subscription.customer}`);
+    assert.match(customer.name, /Sakamoto/,
+      'the subscription it previewed belongs to the account in the question');
+    assert.match(answer.content, /The next invoice is dated/);
   });
 });
 

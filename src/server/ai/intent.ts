@@ -116,6 +116,10 @@ const SIGNALS: SignalDef[] = [
   S('act.create', 'act', 3.4, /\b(creat(?:e|es|ing)|add(?:s|ing)?|log(?:s|ged|ging)?|record\s+(?:a|the)|open\s+a\s+ticket|book\\s+(?:a|the)|schedul(?:e|es|ing)|set\s+up|enroll|start\s+a)\b/i),
   S('act.update', 'act', 3.4, /\b(updat(?:e|es|ing)|chang(?:e|es|ing)|edit(?:s|ing)?|set\s+the|mov(?:e|es|ing)|assign(?:s|ing)?|reassign|clos(?:e|ing)\s+(?:the|this)|mark(?:s|ing)?|archiv(?:e|es|ing)|delet(?:e|es|ing)|remov(?:e|es|ing)|merg(?:e|es|ing)|appl(?:y|ies|ying)|issue\s+a\s+(?:credit|refund)|void)\b/i),
   S('act.remind', 'act', 2.4, /\b(remind\s+me|follow\s+up\s+(?:in|on)\s+\d|snooze|chase|ping\s+me)\b/i),
+  // Destructive verbs are act, whatever else the sentence looks like. A request
+  // to cancel that reads as a lookup is answered with a list and no word about
+  // the fact that nothing was cancelled, which is the wrong silence to keep.
+  S('act.destructive', 'act', 3.4, /\b(cancel(?:s|led|ling|ing)?|terminat(?:e|es|ing)|refund(?:s|ed|ing)?|pause\s+(?:the|every|all)|write\s+off|churn\s+(?:them|the))\b/i),
   S('act.send', 'act', 2.0, /\b(send|deliver|dispatch|fire\s+off)\b/i),
 
   // ------------------------------------------------------ troubleshoot

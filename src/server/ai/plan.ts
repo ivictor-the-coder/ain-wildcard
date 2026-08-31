@@ -506,6 +506,14 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
       }
       if (subject) {
         steps.push(builtin('account_profile', { id: subject.id }, `"${subject.label}" resolved to a record; load its full profile.`));
+        // "What does Rheinwerk pay us each month?" is a lookup with a number in
+        // it. The profile alone answers the first half of that question.
+        // A snapshot metric — what they are on right now — is a fact about the
+        // record. A windowed one is a different question, and "the upcoming
+        // invoice" is not a request for what was invoiced last quarter.
+        if (metric?.metric.snapshot) {
+          steps.push(metricStep(subject.id, `"${metric.matched}" is the ${metric.metric.label} metric for ${subject.label}.`));
+        }
         // "What are their open tickets?" names a type as well as an account.
         // The profile mentions the count; only the list answers the question.
         const scopedType = input.types.find((t) => t !== 'activity' && t !== 'customer' && t !== 'company');
@@ -526,7 +534,32 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
         steps.push(builtin('workspace_search', { query: input.question, limit: 8 }, 'The question names something that did not resolve to one record — search the workspace first.'));
       }
       if (!subject && input.types.length) {
-        const objectType = input.types[0] === 'activity' ? 'meeting' : input.types[0];
+        // "Customer" is a billing word for a CRM company; searching crm_records
+        // for an object type nothing writes there returns zero, every time.
+        const named = input.types[0];
+        const objectType = named === 'activity' ? 'meeting' : named === 'customer' ? 'company' : named;
+        // "Which customers are past due?" is a question about the ledger's own
+        // state, and the subscription rows carry both the status and the name.
+        const ledgerType = named === 'customer' && BILLING_STATE.test(input.question) ? 'subscription' : named;
+        const candidate = ledgerListTool(input.tools, ledgerType);
+        const ledger = candidate && (!input.allowedTools || input.allowedTools.has(candidate.name)) ? candidate : undefined;
+        let fromLedger = false;
+        if (ledger) {
+          const filled = fillArguments(ledger, fillContextOf(input));
+          if (!filled.missing.length) {
+            steps.push({
+              tool: ledger.name,
+              args: filled.args,
+              why: `${ledgerType} records live in the ledger rather than in the CRM, so "${ledger.name}" is where the rows are.`,
+              builtin: null,
+              relevance: 0.95,
+            });
+            fromLedger = true;
+          }
+        }
+        // Searching `crm_records` for rows the ledger owns returns zero every
+        // time, and a zero next to the real list is noise at best.
+        if (fromLedger) break;
         const conditions = inferConditions(input.question, objectType, input.stages);
         // "which deals are slipping this quarter" is about the deals due to
         // close in that quarter, not about every open deal on the book.
@@ -650,6 +683,7 @@ const TYPE_HINTS: Record<string, string[]> = {
   invoice: ['invoice', 'billing', 'payment'],
   subscription: ['subscription', 'plan'],
   product: ['product', 'price', 'catalog', 'catalogue'],
+  customer: ['customer', 'account', 'subscriber', 'billing'],
 };
 
 /** How well a tool matches the question, 0–1. */
@@ -807,6 +841,33 @@ function fillField(name: string, node: SchemaNode, context: FillContext): unknow
   return undefined;
 }
 
+/**
+ * A registered tool that lists an object type the CRM does not hold.
+ *
+ * Subscriptions and invoices live in the ledger, not in `crm_records`, so a
+ * question that names them has to reach the module that owns them. Matched on
+ * the catalogue's naming convention rather than on a module's tool names, so
+ * the engine stays ignorant of which module happens to be installed.
+ */
+const BILLING_STATE = /\b(past\s+due|overdue|delinquent|dunning|churn(?:ed|ing)?|trialing|trialling|in\s+trial|paused|cancell?ed|unpaid|on\s+trial)\b/i;
+
+export function ledgerListTool(tools: AiToolDef[], objectType: string): AiToolDef | undefined {
+  const wanted = [`list_${objectType}s`, `list_${objectType}`, `${objectType}s_list`];
+  return tools.find((tool) => tool.readOnly && wanted.some((suffix) => tool.name.endsWith(suffix)));
+}
+
+export const fillContextOf = (input: PlanInput): FillContext => ({
+  question: input.question,
+  window: input.window,
+  now: input.workspace.now,
+  entities: input.entities,
+  subject: input.subject,
+  metric: input.metric,
+  groupBy: input.groupBy,
+  types: input.types,
+  readOnly: true,
+});
+
 export interface FilledArguments {
   args: Record<string, unknown>;
   missing: string[];
@@ -910,16 +971,60 @@ export function planTools(input: PlanInput): PlanResult {
     planned.add(candidate.tool.name);
   }
 
+  // A capability the question asked for by name, needing a typed id the
+  // question does not carry, gets a finder in front of it: list the records of
+  // that kind for the account that did resolve, and the second pass arms the
+  // tool from the single row that comes back.
+  for (const candidate of skipped) {
+    if (steps.length >= input.maxSteps) break;
+    if (!askedFor(candidate.tool, input.question)) continue;
+    for (const missing of candidate.missing) {
+      const finder = ledgerListTool(input.tools, missing);
+      if (!finder || planned.has(finder.name) || !allowed(finder.name)) continue;
+      const filled = fillArguments(finder, context);
+      if (filled.missing.length) continue;
+      steps.push({
+        tool: finder.name,
+        args: filled.args,
+        why: `"${candidate.tool}" needs a ${missing} the question does not name; this lists the ${missing} records it could mean.`,
+        builtin: null,
+        relevance: 0.8,
+      });
+      planned.add(finder.name);
+    }
+  }
+
   return { steps: steps.slice(0, input.maxSteps), skipped };
 }
 
 export const planSteps = (input: PlanInput): PlannedStep[] => planTools(input).steps;
 
+/** Words in a tool name that describe the call, not the thing it reads. */
+const GENERIC_TOOL_WORDS = new Set([
+  'list', 'get', 'find', 'search', 'for', 'period', 'check', 'preview', 'explain',
+  'summary', 'info', 'record', 'records', 'at', 'of', 'by',
+]);
+
+/**
+ * Whether the question asked for this capability in its own words.
+ *
+ * A tool that could not be armed is worth a sentence in the answer when the
+ * person asked for it — "show me the upcoming invoice" and no `sub_` id — and
+ * is noise when they did not. Relevance cannot tell those apart: the scorer
+ * gives `billing_customer_summary` 0.75 on "what is our MRR?".
+ */
+export function askedFor(tool: string, question: string): boolean {
+  const words = tool.split(/[._]/).slice(1).filter((word) => !GENERIC_TOOL_WORDS.has(word));
+  if (!words.length) return false;
+  const asked = new Set(contentWords(question).map(stem));
+  return words.every((word) => asked.has(stem(word)));
+}
+
 /** Every id a first pass returned, so a second pass can arm a typed parameter. */
 export function harvestIds(results: unknown[]): string[] {
   const found = new Set<string>();
   const walk = (value: unknown, depth: number): void => {
-    if (found.size >= 40 || depth > 4) return;
+    if (found.size >= 80 || depth > 4) return;
     if (typeof value === 'string') {
       if (/^[a-z][a-z_]{1,14}_[A-Za-z0-9][A-Za-z0-9_]{1,40}$/.test(value)) found.add(value);
       return;
@@ -928,7 +1033,15 @@ export function harvestIds(results: unknown[]): string[] {
     if (value && typeof value === 'object') for (const item of Object.values(value as Record<string, unknown>)) walk(item, depth + 1);
   };
   for (const result of results) walk(result, 0);
-  return [...found];
+  // Only an id with no rival of its kind can arm a second pass. A list of 35
+  // subscriptions does not tell you which one the question meant, and picking
+  // the first is how a run answers confidently about the wrong account.
+  const byPrefix = new Map<string, string[]>();
+  for (const id of found) {
+    const prefix = id.slice(0, id.indexOf('_'));
+    byPrefix.set(prefix, [...(byPrefix.get(prefix) ?? []), id]);
+  }
+  return [...byPrefix.values()].filter((ids) => ids.length === 1).map((ids) => ids[0]);
 }
 
 /**

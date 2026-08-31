@@ -54,11 +54,16 @@ test('prepaid credit is reported in the workspace currency, not the first pot th
 
 const panel = (page: Page) => page.locator('.shell-search__panel');
 
+/**
+ * The pinned "see everything" row is painted before the API answers, so waiting
+ * for a row is not waiting for results — wait for a source group.
+ */
 const openTypeahead = async (page: Page, query: string) => {
   await page.keyboard.press('/');
   await page.keyboard.type(query, { delay: 30 });
   await expect(panel(page)).toBeVisible();
-  await expect(page.locator('.shell-search__row').last()).toBeVisible();
+  await expect(page.locator('.shell-search__group').first()).toBeVisible();
+  await expect(page.locator('.shell-search__panel .ain-spinner')).toHaveCount(0);
 };
 
 test('typing answers under the field, grouped by object type', async ({ page }) => {

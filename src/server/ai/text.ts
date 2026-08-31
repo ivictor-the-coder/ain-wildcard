@@ -248,7 +248,13 @@ export function humanise(value: string): string {
 }
 
 export function plural(count: number, singular: string, pluralForm?: string): string {
-  return count === 1 ? singular : pluralForm ?? `${singular}s`;
+  if (count === 1) return singular;
+  if (pluralForm) return pluralForm;
+  // "companys" in a sentence a board reads is the same class of carelessness as
+  // a wrong number, and object type names reach this from the record layer.
+  if (/[^aeiou]y$/i.test(singular)) return `${singular.slice(0, -1)}ies`;
+  if (/(s|x|z|ch|sh)$/i.test(singular)) return `${singular}es`;
+  return `${singular}s`;
 }
 
 export function countOf(count: number, singular: string, pluralForm?: string): string {

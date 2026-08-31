@@ -420,7 +420,7 @@ function recurringRevenue(input: MetricInput, months: 1 | 12): MetricResult {
     count: counted,
     ids: ids.slice(0, 12),
     groups,
-    source: `${counted} ${counted === 1 ? 'subscription' : 'subscriptions'} billing recurring revenue`,
+    source: `${counted} ${counted === 1 ? 'subscription' : 'subscriptions'} still billing`,
     sourceKind: 'subscriptions',
   });
 }
@@ -815,7 +815,8 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'mrr', label: 'Monthly recurring revenue', unit: 'money', supportsSubject: true, snapshot: true,
-    patterns: [/\bmrr\b/i, /\bmonthly\s+recurring\b/i, /\bmonthly\s+run\s?rate\b/i, /\brecurring\s+revenue\b/i],
+    patterns: [/\bmrr\b/i, /\bmonthly\s+recurring\b/i, /\bmonthly\s+run\s?rate\b/i, /\brecurring\s+revenue\b/i,
+      /\bpay(?:s|ing)?\s+(?:us\s+)?(?:each|per|a)\s+month\b/i, /\bmonthly\s+(?:spend|fee|bill|subscription)\b/i],
     keywords: ['mrr'],
     compute: (input) => recurringRevenue(input, 1),
   },

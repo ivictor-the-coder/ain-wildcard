@@ -287,10 +287,11 @@ function Home() {
       });
     }
     if (credits.data) {
-      // The overview answers per currency. Picking the first row would show
-      // whichever currency sorts first — the tile read "£0.00" beside six USD
-      // figures while the workspace held $1,250.00 — so the pot is chosen by
-      // currency and anything the single number leaves out is said out loud.
+      // The overview answers per currency, sorted by currency code. Taking the
+      // first row showed whichever code sorts first: this tile read "£0.00"
+      // next to an MRR and a pipeline in USD while the workspace held $1,250.00
+      // of USD credit. The pot is chosen by currency now, and whatever a single
+      // figure leaves out is said in the caption rather than dropped.
       const credit = creditOutstanding(credits.data.outstanding, session.currency);
       const grants = credits.data.grants;
       const clauses = [

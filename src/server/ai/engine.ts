@@ -24,7 +24,7 @@ import {
   type GroupBy, type MetricDetection, type MetricSubject,
 } from './metrics';
 import { comprehend, isUsableEntity, refusalFor, workspaceVocabulary, type Refusal } from './clarify';
-import { planTools, planWrite, replan, isWriteBlocked, type BuiltinTool, type PlannedStep, type SkippedTool, type WindowPair, type WriteBlocked } from './plan';
+import { askedFor, planTools, planWrite, replan, isWriteBlocked, type BuiltinTool, type PlannedStep, type SkippedTool, type WindowPair, type WriteBlocked } from './plan';
 import { propertyMap } from './query';
 import {
   accountProfile, businessMetric, recordAggregate, recordSearch, recordTimeline, workspaceSearch,
@@ -418,7 +418,7 @@ export function builtinEngine(): AiProvider {
       const plan = planned.steps;
       // A tool the question wanted but could not arm is reported, not run with
       // the sentence in its parameters. The trace and the answer both say so.
-      const skipped = planned.skipped.filter((s) => s.relevance >= 0.55).slice(0, 2);
+      const skipped = planned.skipped.filter((s) => askedFor(s.tool, question)).slice(0, 2);
       if (planned.skipped.length) {
         reasoning.push(`Not planned: ${planned.skipped.map((s) => `${s.tool} (no value for ${s.missing.join(', ')})`).join('; ')}.`);
       }
@@ -502,7 +502,8 @@ export function builtinEngine(): AiProvider {
             pendingApprovals: (call.pendingApprovals ?? []) as PendingApproval[],
             writeBlocked,
             scopedTools,
-            skippedTools: skipped,
+            // A tool the second pass managed to arm is not a tool that was skipped.
+            skippedTools: skipped.filter((s) => !steps.some((step) => step.tool === s.tool && step.ok)),
             carriedSubject: carried ? { label: carried.entity.label, pinned: call.subjectId === carried.entity.id } : null,
           });
 
