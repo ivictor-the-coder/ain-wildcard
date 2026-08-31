@@ -294,7 +294,7 @@ export class Gateway {
         throw conflict('payment_intent_canceled', `Payment intent ${id} was cancelled, so it cannot be confirmed. Create a new one.`);
       }
       if (intent.status === 'processing') {
-        throw conflict('payment_intent_processing', `Payment intent ${id} is with the bank and will settle in a few working days. Confirming it again would present the debit twice.`);
+        throw conflict('payment_intent_processing', `Payment intent ${id} is with the bank and will settle in a few days. Confirming it again would present the debit twice.`);
       }
       const methodId = opts.payment_method ?? intent.payment_method;
       if (!methodId) {

@@ -1833,3 +1833,285 @@ describe('the documented prompt limit and the run budget agree', () => {
     assert.equal(execution.error?.recoverable, false);
   });
 });
+
+/* --------------------- the revenue half of the workspace ------------------ */
+
+describe('the ledger answers, instead of being found and thrown away', () => {
+  const runtime = () => aiRuntime(app.ctx);
+  const overview = () => expectOk('GET', '/v1/subscriptions/overview');
+
+  test('"list our subscriptions" returns the subscriptions, not an emptiness message', async () => {
+    const live = await expectOk('GET', '/v1/subscriptions?status=active_like&limit=100');
+    assert.ok(live.total_count > 0, 'the demo workspace has a subscription book');
+
+    const answer = await ask('List our subscriptions');
+    const ledger = answer.trace.find((s: { name: string }) => s.name === 'billing_list_subscriptions');
+    assert.ok(ledger?.ok, 'the ledger tool ran and succeeded');
+    assert.ok(!/No subscription records match that/.test(answer.content),
+      `the ledger returned rows in this same run; the answer must not claim otherwise:\n${answer.content}`);
+    assert.ok(answer.content.includes(`${live.total_count} subscriptions`),
+      `expected the answer to state ${live.total_count} subscriptions, got:\n${answer.content.slice(0, 400)}`);
+    const first = live.data[0];
+    const named = await expectOk('GET', `/v1/customers/${first.customer}`);
+    assert.ok(answer.content.includes(named.name) || answer.content.split('•').length > 3,
+      'the answer lists the subscriptions by account, not just a count');
+    assert.ok(answer.citations.length > 0, 'the rows the answer read are cited');
+  });
+
+  test('MRR and ARR agree with /v1/subscriptions/overview to the cent', async () => {
+    const book = await overview();
+    assert.ok(book.mrr > 0, 'the demo workspace bills recurring revenue');
+
+    const mrr = await runtime().execute('business_metric', { metric: 'mrr' }, callContext());
+    assert.equal((mrr.result as { value: number }).value, book.mrr,
+      'the copilot and the subscriptions overview compute MRR from the same ledger');
+    const arr = await runtime().execute('business_metric', { metric: 'arr' }, callContext());
+    assert.equal((arr.result as { value: number }).value, book.arr);
+
+    const answer = await ask('What is our MRR?');
+    assert.equal(answer.analysis.metric.id, 'mrr');
+    assert.ok(answer.content.includes(money(book.mrr)),
+      `expected ${money(book.mrr)} in:\n${answer.content}`);
+    assert.ok(!/not installed here/.test(answer.content),
+      'the subscription ledger is installed, so the answer may never say it is not');
+    assert.ok(!/no monthly recurring revenue/i.test(answer.content));
+
+    const annual = await ask('What is our ARR?');
+    assert.equal(annual.analysis.metric.id, 'arr', 'ARR is its own metric, not MRR under another label');
+    assert.ok(annual.content.includes(money(book.arr)), `expected ${money(book.arr)} in:\n${annual.content}`);
+  });
+
+  test('"which invoices are overdue" lists the overdue ones, not the whole book', async () => {
+    const everything = await runtime().execute('billing_list_invoices', { status: 'all', limit: 50 }, callContext());
+    const overdue = await runtime().execute('billing_list_invoices',
+      { status: 'open_like', due_before: app.ctx.now(), limit: 50 }, callContext());
+    const total = (overdue.result as { total: number }).total;
+    assert.ok(total < (everything.result as { total: number }).total,
+      'the seed has invoices that are not overdue, so filtering has to change the answer');
+
+    const answer = await ask('Which invoices are overdue?');
+    const step = answer.trace.find((s: { name: string }) => s.name === 'billing_list_invoices');
+    assert.ok(step?.ok);
+    assert.equal(step.args.status, 'open_like', '"overdue" has to reach the status filter');
+    assert.ok(Number(step.args.due_before) <= app.ctx.now(), '"overdue" means due before now');
+    assert.ok(!/No invoice records match that/.test(answer.content), answer.content);
+    assert.ok(answer.content.includes(`${total} invoice`),
+      `expected ${total} overdue invoices in:\n${answer.content.slice(0, 400)}`);
+  });
+
+  test('a run scoped to a ledger tool answers from it', async () => {
+    const answer = await ask('list invoices', { tools: ['billing_list_invoices'] });
+    assert.deepEqual(answer.analysis.scoped_tools, ['billing_list_invoices']);
+    assert.ok(!/none of those can answer that/.test(answer.content),
+      `the scoped tool ran and returned rows:\n${answer.content.slice(0, 300)}`);
+    const step = answer.trace.find((s: { name: string }) => s.name === 'billing_list_invoices');
+    assert.ok(answer.content.includes(`${(step.summary.match(/total=(\d+)/) ?? [])[1]} invoices`));
+  });
+
+  test('an invoice named by id is explained, and the id reaches the tool', async () => {
+    const invoices = await expectOk('GET', '/v1/invoices?limit=1');
+    const invoice = invoices.data[0];
+    const answer = await ask(`Explain invoice ${invoice.id}`);
+    const step = answer.trace.find((s: { name: string }) => s.name === 'billing_explain_invoice');
+    assert.ok(step, 'the invoice tool was planned');
+    assert.equal(step.args.invoice, invoice.id, 'the id in the question is the id the tool receives');
+    assert.equal(step.ok, true);
+    assert.ok(answer.content.startsWith(`Invoice ${invoice.number}`),
+      `the answer is about the invoice that was named:\n${answer.content.slice(0, 300)}`);
+    assert.ok(!/closed-won|pipeline/i.test(answer.content),
+      'a question about one bill is not answered with the quarter\'s bookings');
+  });
+
+  test('when every list-returning tool really is empty, the answer still says so', async () => {
+    const answer = await ask('List our subscriptions', { tools: ['record_search'] });
+    const ran = answer.trace.filter((s: { kind: string }) => s.kind === 'tool');
+    assert.deepEqual(ran.map((s: { name: string }) => s.name), ['record_search']);
+    assert.equal((ran[0].summary.match(/total=(\d+)/) ?? [])[1], '0', 'the CRM holds no subscription records');
+    assert.match(answer.content, /No subscription records match that/,
+      'the emptiness message is gated on the run, not deleted');
+  });
+});
+
+/* ------------- a conversation keeps hold of what it is about -------------- */
+
+describe('a follow-up is answered about the account the conversation is on', () => {
+  const rheinwerk = () => app.ctx.db.get<{ id: string; display_name: string }>(
+    `SELECT id, display_name FROM crm_records WHERE org_id = ? AND object_type = 'company' AND display_name LIKE 'Rheinwerk%'`,
+    ORG)!;
+
+  const openTicketsOn = (recordId: string) => app.ctx.db.count(
+    `SELECT COUNT(*) FROM crm_associations a JOIN crm_records r ON r.id = a.from_id
+     WHERE a.org_id = ? AND a.to_id = ? AND r.object_type = 'ticket'
+       AND json_extract(r.properties, '$.status') IN ('new','waiting_on_us','waiting_on_customer','escalated')`,
+    ORG, recordId);
+
+  test('a thread pinned to an account answers "how much have they spent" about that account', async () => {
+    const account = rheinwerk();
+    const thread = await expectOk('POST', '/v1/ai/threads', {
+      subject_id: account.id, subject_type: 'company', message: 'Where does this account stand?',
+    });
+    assert.ok(thread.messages[1].content.includes(account.display_name),
+      `the first turn of a pinned thread is about the account it is pinned to:\n${thread.messages[1].content.slice(0, 200)}`);
+
+    const reply = await expectOk('POST', `/v1/ai/threads/${thread.id}/messages`, { content: 'How much have they spent?' });
+    const analysed = await ask('How much have they spent?', { thread_id: thread.id });
+    assert.equal(analysed.analysis.subject.id, account.id,
+      `"they" resolved to ${analysed.analysis.subject?.label ?? 'the whole workspace'}`);
+    assert.equal(analysed.analysis.carried_subject.id, account.id);
+    assert.ok(reply.message.content.includes(account.display_name));
+    assert.ok(!/^Northwind Robotics (spent|collected)/.test(reply.message.content),
+      `a pinned thread must not widen to the workspace:\n${reply.message.content.slice(0, 200)}`);
+    assert.match(reply.message.content, /Scoped to Rheinwerk/);
+  });
+
+  test('"what are their open tickets" lists that account\'s tickets, not the workspace\'s', async () => {
+    const account = rheinwerk();
+    const mine = openTicketsOn(account.id);
+    const everyone = app.ctx.db.count(
+      `SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'ticket'
+         AND json_extract(properties, '$.status') IN ('new','waiting_on_us','waiting_on_customer','escalated')`, ORG);
+    assert.ok(mine > 0 && mine < everyone, 'the account has some, but not all, of the open tickets');
+
+    const thread = await expectOk('POST', '/v1/ai/threads', {
+      subject_id: account.id, subject_type: 'company', message: 'Where does this account stand?',
+    });
+    const reply = await expectOk('POST', `/v1/ai/threads/${thread.id}/messages`, { content: 'What are their open tickets?' });
+    const run = await expectOk('GET', `/v1/ai/runs/${reply.run_id}`);
+    const search = run.trace.find((s: { name: string }) => s.name === 'record_search');
+    assert.ok(search, `no record_search in ${run.trace.map((s: { name: string }) => s.name).join(', ')}`);
+    assert.equal(search.args.associated_to, account.id, 'the ticket search is scoped to the account');
+    assert.ok(reply.message.content.includes(`${mine} ticket`),
+      `expected ${mine} tickets on ${account.display_name}, got:\n${reply.message.content.slice(0, 400)}`);
+    assert.ok(!reply.message.content.includes(`${everyone} tickets`), 'the workspace backlog is a different question');
+  });
+
+  test('an unpinned thread carries the account the previous turn established', async () => {
+    const account = rheinwerk();
+    const thread = await expectOk('POST', '/v1/ai/threads', { message: `Where does ${account.display_name} stand?` });
+    const reply = await expectOk('POST', `/v1/ai/threads/${thread.id}/messages`, { content: 'Who owns it?' });
+    const analysed = await ask('Who owns it?', { thread_id: thread.id });
+    assert.equal(analysed.analysis.subject.id, account.id,
+      `"it" resolved to ${analysed.analysis.subject?.label ?? 'nothing'}`);
+    assert.ok(reply.message.content.includes(account.display_name));
+
+    const brief = await expectOk('POST', `/v1/ai/threads/${thread.id}/messages`, { content: 'Summarise that in one line' });
+    assert.ok(brief.message.content.includes(account.display_name),
+      `a summary of this conversation is about this account:\n${brief.message.content}`);
+    assert.equal(brief.message.content.split('\n\n').length, 1,
+      `"in one line" is an instruction:\n${brief.message.content}`);
+  });
+
+  test('a pronoun with nothing behind it is refused, never widened to the workspace', async () => {
+    const answer = await ask('How much have they spent?');
+    assert.equal(answer.analysis.refusal.code, 'unresolved_reference');
+    assert.equal(answer.trace.filter((s: { kind: string }) => s.kind === 'tool').length, 0, 'nothing was measured');
+    assert.match(answer.content, /I do not know what "they" refers to/);
+    assert.ok(!/\$/.test(answer.content), `no number is invented for an unresolved subject:\n${answer.content}`);
+
+    const thread = await expectOk('POST', '/v1/ai/threads', { message: 'How much have they spent?' });
+    assert.match(thread.messages[1].content, /I do not know what "they" refers to/,
+      'an unpinned thread with no history cannot answer a pronoun either');
+  });
+});
+
+/* ------------- arguments are extracted, never the whole sentence ---------- */
+
+describe('a tool is never called with the question in its arguments', () => {
+  /** Parameters whose value genuinely is the sentence the person typed. */
+  const FREE_TEXT = new Set(['query', 'q', 'search', 'text', 'term', 'question', 'prompt', 'message', 'body', 'content', 'input', 'instruction']);
+
+  const prompts = [
+    'What is our MRR?',
+    'Show me the upcoming invoice for Sakamoto Seiki',
+    'How many customers are on the Scale plan?',
+    'Which invoices are overdue?',
+  ];
+
+  for (const prompt of prompts) {
+    test(`"${prompt}" arms every tool it runs`, async () => {
+      const answer = await ask(prompt);
+      for (const span of answer.trace.filter((s: { kind: string }) => s.kind === 'tool')) {
+        for (const [key, value] of Object.entries(span.args ?? {})) {
+          if (FREE_TEXT.has(key) || typeof value !== 'string') continue;
+          assert.notEqual(value, prompt,
+            `${span.name} was called with the whole question as \`${key}\``);
+        }
+        assert.ok(span.ok || span.error?.code !== 'invalid_arguments',
+          `${span.name} failed argument validation: ${span.error?.message}`);
+      }
+    });
+  }
+
+  test('a tool that cannot be armed is reported, not run with the sentence', async () => {
+    const answer = await ask('Show me the upcoming invoice for Sakamoto Seiki');
+    assert.ok(!answer.trace.some((s: { kind: string; name: string }) => s.kind === 'tool' && s.name === 'billing_upcoming_invoice'),
+      'a tool needing a sub_ id the question does not contain is not called at all');
+    const skipped = answer.analysis.skipped.find((s: { tool: string }) => s.tool === 'billing_upcoming_invoice');
+    assert.ok(skipped, `expected billing_upcoming_invoice to be reported as skipped, got ${JSON.stringify(answer.analysis.skipped)}`);
+    assert.deepEqual(skipped.missing, ['subscription']);
+    assert.match(answer.content, /I did not run `billing_upcoming_invoice`/);
+  });
+});
+
+/* ---------------- the gates hold for a tool nobody registered ------------- */
+
+describe('the read-only, allowlist and approval gates cover every tool, registered or not', () => {
+  let ran = 0;
+  const privateRead = {
+    name: 'private_read', description: 'A tool the caller supplied rather than registered.',
+    readOnly: true, input: v.object({ id: v.string() }),
+    run: () => { ran += 1; return { ok: true }; },
+  };
+  const privateWrite = { ...privateRead, name: 'private_write', readOnly: false };
+
+  test('a caller-supplied tool outside the allowlist never runs', async () => {
+    ran = 0;
+    const execution = await aiRuntime(app.ctx).execute('private_read', { id: 'x' },
+      callContext({ restrictTools: ['workspace_search'] }), privateRead);
+    assert.equal(execution.ok, false);
+    assert.equal(execution.error?.code, 'tool_not_permitted');
+    assert.equal(ran, 0, 'the gate runs before the tool does');
+  });
+
+  test('an empty allowlist stops a caller-supplied tool as well as a registered one', async () => {
+    ran = 0;
+    const execution = await aiRuntime(app.ctx).execute('private_read', { id: 'x' },
+      callContext({ restrictTools: [] }), privateRead);
+    assert.equal(execution.error?.code, 'tool_not_permitted');
+    assert.equal(ran, 0);
+  });
+
+  test('a write is refused on a read-only run and stopped at the approval gate on a write run', async () => {
+    ran = 0;
+    const readOnlyRun = await aiRuntime(app.ctx).execute('private_write', { id: 'x' }, callContext(), privateWrite);
+    assert.equal(readOnlyRun.error?.code, 'write_not_permitted');
+    assert.equal(ran, 0);
+
+    const context = callContext({ allowWrites: true });
+    const unapproved = await aiRuntime(app.ctx).execute('private_write', { id: 'x' }, context, privateWrite);
+    assert.equal(unapproved.error?.code, 'approval_required');
+    assert.equal(ran, 0, 'nothing is written before a person approves it');
+    assert.equal(context.pendingApprovals?.[0].tool, 'private_write');
+
+    const approved = await aiRuntime(app.ctx).execute('private_write', { id: 'x' },
+      callContext({ allowWrites: true, approvals: ['private_write'] }), privateWrite);
+    assert.equal(approved.ok, true);
+    assert.equal(ran, 1, 'and it runs once the approval is in hand');
+  });
+
+  test('the step budget applies to a caller-supplied tool too', async () => {
+    ran = 0;
+    const context = callContext({ budget: { steps: 1 } });
+    assert.equal((await aiRuntime(app.ctx).execute('private_read', { id: 'x' }, context, privateRead)).ok, true);
+    const second = await aiRuntime(app.ctx).execute('private_read', { id: 'x' }, context, privateRead);
+    assert.equal(second.error?.code, 'step_budget_exhausted');
+    assert.equal(ran, 1);
+  });
+
+  test('arguments are validated before a caller-supplied tool sees them', async () => {
+    ran = 0;
+    const execution = await aiRuntime(app.ctx).execute('private_read', { id: 42 }, callContext(), privateRead);
+    assert.equal(execution.error?.code, 'invalid_arguments');
+    assert.equal(ran, 0);
+  });
+});

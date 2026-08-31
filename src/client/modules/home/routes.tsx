@@ -294,7 +294,9 @@ function Home() {
       const credit = creditOutstanding(credits.data.outstanding, session.currency);
       const grants = credits.data.grants;
       const clauses = [
-        `${f.number(grants.active)} active ${grants.active === 1 ? 'grant' : 'grants'}${credit.unitGrants ? ` (${f.number(credit.unitGrants)} in units)` : ''}`,
+        // Unit grants hold a meter's own units, so no money figure can express
+        // them — the count is the only honest way to say they are also there.
+        `${f.number(grants.active)} active ${grants.active === 1 ? 'grant' : 'grants'}${credit.unitGrants ? `, ${f.number(credit.unitGrants)} of them in meter units` : ''}`,
         `${f.number(grants.scheduled)} scheduled`,
       ];
       if (credit.note) clauses.push(credit.note);

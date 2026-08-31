@@ -168,7 +168,7 @@ export type SimulationResult =
   | { result: 'requires_action'; description: string }
   | { result: 'processing'; settlesInDays: number; outcome: ChargeOutcome };
 
-/** How long a direct debit sits in `processing` before the bank answers. */
+/** Days a direct debit sits in `processing` before the bank answers either way. */
 export const BANK_DEBIT_SETTLEMENT_DAYS = 3;
 
 const riskOf = (intentId: string): { score: number; level: RiskLevel } => {
@@ -204,10 +204,10 @@ export function successOutcome(ctx: AttemptContext, network: NetworkStatus = 'ap
     risk_level: risk.level,
     risk_score: risk.score,
     seller_message: network === 'pending_settlement'
-      ? 'The bank accepted the debit instruction and will confirm settlement in a few working days.'
+      ? 'The bank accepted the debit instruction and will confirm settlement in a few days.'
       : 'Payment complete.',
     explanation: network === 'pending_settlement'
-      ? `The mandate was accepted, so the debit is on its way. Direct debits clear in ${BANK_DEBIT_SETTLEMENT_DAYS} working days and can still be returned inside that window.`
+      ? `The mandate was accepted, so the debit is on its way. This one clears in ${BANK_DEBIT_SETTLEMENT_DAYS} days and can still be returned unpaid inside that window.`
       : `Authorised by the issuer on the first presentation${ctx.priorCharges > 0 ? `, after ${ctx.priorCharges} earlier attempt${ctx.priorCharges === 1 ? '' : 's'} on this method` : ''}.`,
   };
 }
