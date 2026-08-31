@@ -1,6 +1,6 @@
 {
-  "updated": "2026-08-30T23:43:37.249918",
-  "headline": "Wave 1 shipped 40,000 lines and every critic still chose HubSpot or Stripe. That is the system working: they found popovers that never flip, a CRM timeline keyed off a millisecond clock, pricing prose that contradicts the billing engine, and an AI tool allowlist that was not enforced. All four are back in with the gaps named.",
+  "updated": "2026-08-31T00:03:08.993751",
+  "headline": "Two waves now running side by side. Wave 1b is closing the gaps the first round of critics found; Wave 2a is building the revenue spine against Stripe Billing \u2014 proration to the cent, exactly-once metering, credit burn-down order, gapless invoice numbering and a dunning schedule you can reason about.",
   "stats": {
     "server modules": 4,
     "api routes": 28,
@@ -129,57 +129,36 @@
     },
     {
       "name": "Wave 2 \u00b7 Revenue",
-      "status": "queued",
-      "note": "Stripe Billing parity, piece by piece. Each one is judged against the real thing.",
+      "status": "active",
+      "note": "Two dependency chains in parallel: customers/subscriptions to invoicing to payments to revenue, alongside metering/credits to entitlements. Every critic attacks the arithmetic first.",
       "pieces": [
         {
           "id": "subscriptions",
-          "title": "Subscription lifecycle",
-          "status": "queued",
+          "title": "Customers, subscriptions & proration",
+          "status": "building",
           "rounds": 0,
-          "note": "Trials, activation, pause, resume, cancel, schedules and phases"
+          "note": "Anchor-day cycles, trials, schedules with phases, and one proration function shared by preview and charge"
         },
         {
-          "id": "proration",
-          "title": "Mid-cycle changes & proration",
-          "status": "queued",
+          "id": "metering-credits",
+          "title": "Usage metering & prepaid credits",
+          "status": "building",
           "rounds": 0,
-          "note": "Upgrades, downgrades, quantity changes, credit proration, invoice-now vs next cycle"
+          "note": "Exactly-once ingestion, incremental hourly rollups, an append-only credit ledger and a documented burn-down order"
         },
         {
-          "id": "metering",
-          "title": "Usage metering",
+          "id": "invoicing-tax",
+          "title": "Invoicing, credit notes & tax",
           "status": "queued",
           "rounds": 0,
-          "note": "Meters, event ingestion, idempotency, aggregation formulas, backdating"
-        },
-        {
-          "id": "credits",
-          "title": "Usage credits & grants",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Prepaid balances, burn-down order, expiry, rollover, top-ups, overage"
-        },
-        {
-          "id": "invoicing",
-          "title": "Invoicing & credit notes",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Draft to paid, line items, discounts, credit notes, a printable invoice"
+          "note": "Gapless numbering, an enforced lines-equal-total invariant, credit notes that cannot over-credit, and a printable document"
         },
         {
           "id": "payments",
-          "title": "Payments & smart dunning",
+          "title": "Payments, retries & dunning",
           "status": "queued",
           "rounds": 0,
           "note": "Payment methods, failures, retry strategy, recovery, grace periods"
-        },
-        {
-          "id": "tax",
-          "title": "Tax",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Inclusive and exclusive rates, tax IDs, reverse charge, per-line tax breakdown"
         },
         {
           "id": "entitlements",
