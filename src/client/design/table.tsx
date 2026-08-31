@@ -265,7 +265,12 @@ function DataTableGrid<T>({
   });
 
   useEffect(() => { setFocusIndex(-1); }, [query, sort, filters]);
-  useEffect(() => { setMeasuredRow(null); }, [density]);
+  // Measuring a row *after* `--row-height` has been applied to it can only ever
+  // ratchet upwards: the CSS height it set is the floor of the next measurement.
+  // Dropping the measurement whenever the row's content can change lets it fall
+  // again — hide the column that was wrapping onto two lines and the grid
+  // tightens back up instead of keeping the taller rows for good.
+  useEffect(() => { setMeasuredRow(null); }, [density, visibleColumns]);
 
   const toggleRow = (id: string, shiftKey: boolean) => {
     if (shiftKey && selectionAnchor.current) {

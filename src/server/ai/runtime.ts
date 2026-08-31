@@ -69,6 +69,12 @@ export interface AiRunStart {
 export interface AiRunFinish {
   runId: string;
   orgId: string;
+  /**
+   * The provider that actually produced this answer, which is not the one the
+   * run started with when the preferred provider failed and another took over.
+   * Cost and the run record follow this, never the intended provider.
+   */
+  provider: string;
   model: string;
   status: 'succeeded' | 'failed' | 'needs_approval';
   answer: string;
@@ -507,6 +513,10 @@ export function createAiRuntime(config: Config): AinAiRuntime {
         const finish: AiRunFinish = {
           runId: call.runId,
           orgId: call.orgId,
+          // A degraded run is billed and recorded as what answered it, not as
+          // the hosted model that 401'd — otherwise the usage report invoices
+          // Claude prices for work the local engine did for nothing.
+          provider: degraded ? degraded.answeredBy : provider.id,
           model: completion.model,
           status: call.pendingApprovals.length ? 'needs_approval' : 'succeeded',
           answer: completion.content,
@@ -536,7 +546,7 @@ export function createAiRuntime(config: Config): AinAiRuntime {
         const message = (e as Error).message;
         try {
           sink?.runFinished({
-            runId: call.runId, orgId: call.orgId, model, status: 'failed', answer: '',
+            runId: call.runId, orgId: call.orgId, provider: provider.id, model, status: 'failed', answer: '',
             usage: { inputTokens: 0, outputTokens: 0, costCents: 0, credits: 0 },
             reasoning: [], citations: [], spans: call.spans, steps: call.steps ?? 0,
             durationMs: elapsedMs(call.startedNs), finishedAt: call.ctx.now(), error: message,

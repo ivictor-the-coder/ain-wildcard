@@ -1,6 +1,6 @@
 import {
   cloneElement, isValidElement, useCallback, useEffect, useId, useLayoutEffect, useMemo,
-  useRef, useState, type CSSProperties, type ReactElement, type ReactNode, type RefObject,
+  useRef, useState, type CSSProperties, type MutableRefObject, type ReactElement, type ReactNode, type RefObject,
 } from 'react';
 import { createPortal } from 'react-dom';
 import { cx } from './layout';
@@ -8,7 +8,10 @@ import { Button, IconButton, Kbd } from './controls';
 import { AlertTriangleIcon, ArrowRightIcon, ChevronDownIcon, ChevronRightIcon, Icons } from './icons';
 import { useClickOutside, useFocusTrap, useIsomorphicLayoutEffect, useScrollLock } from './hooks';
 import { computePosition, floatingElement, rectOf, repositionFloating, viewportSize, type Placement } from './position';
-import { rankCommands } from './overlays-core';
+import {
+  emptyTypeahead, menuKeyAction, rankCommands,
+  type MenuNavItem, type MenuTypeahead,
+} from './overlays-core';
 import './overlays.css';
 
 /* ================================ Portal ================================== */
@@ -34,6 +37,22 @@ export function Portal({ children }: { children: ReactNode }) {
  * always paints above it without anyone hand-tuning a z-index.
  */
 let openLayers = 0;
+
+/**
+ * The overlays Escape is allowed to close, in the order they were opened —
+ * portal hosts are appended to `body` on mount, so DOM order is open order.
+ * Tooltips are deliberately not in the list: one showing over a popover's
+ * trigger must not swallow the Escape that belongs to the popover.
+ */
+const DISMISSABLE_LAYER = '.ain-modal, .ain-drawer, .ain-popover';
+
+function isTopLayer(el: HTMLElement | null): boolean {
+  if (!el) return false;
+  const hosts = Array.from(document.querySelectorAll('[data-ain-portal]'))
+    .filter((host) => host.querySelector(DISMISSABLE_LAYER));
+  return hosts.length === 0 || hosts[hosts.length - 1].contains(el);
+}
+
 function useLayer(active: boolean, base = 600): number {
   const [depth, setDepth] = useState(0);
   useEffect(() => {
@@ -87,8 +106,7 @@ export function Modal({
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       // Only the topmost overlay reacts, so Esc peels one layer at a time.
-      const portals = document.querySelectorAll('[data-ain-portal]');
-      if (portals.length && !portals[portals.length - 1].contains(dialogRef.current)) return;
+      if (!isTopLayer(dialogRef.current)) return;
       e.stopPropagation();
       onClose();
     };
@@ -286,6 +304,22 @@ export interface PopoverProps {
   flush?: boolean;
   /** Keep focus where it is — for hover cards and inline pickers. */
   autoFocus?: boolean;
+  /**
+   * Focus this on open instead of the first focusable child. A menu hands over
+   * its active row, so the element that holds focus is the element the
+   * highlight is on — and the one arrow keys are delivered to.
+   */
+  initialFocus?: RefObject<HTMLElement | null>;
+  /**
+   * Key handler on the popover container itself. Anything focused inside
+   * bubbles up to here, which is the point: a handler bound to a descendant of
+   * the focused node never runs.
+   */
+  onKeyDown?: (e: React.KeyboardEvent) => void;
+  /** Clicks inside these count as inside — an open submenu, a raised picker. */
+  ignore?: RefObject<HTMLElement | null>[];
+  /** Mirrors the container element out for a parent that needs to measure it. */
+  elementRef?: MutableRefObject<HTMLDivElement | null>;
   role?: 'dialog' | 'menu' | 'listbox' | 'none';
   ariaLabel?: string;
   className?: string;
@@ -296,14 +330,22 @@ export interface PopoverProps {
 
 export function Popover({
   open, onClose, anchor, placement = 'bottom-start', offset = 6, matchWidth,
-  title, footer, flush, autoFocus = true, role = 'dialog', ariaLabel, className, style, children, id,
+  title, footer, flush, autoFocus = true, initialFocus, onKeyDown, ignore, elementRef,
+  role = 'dialog', ariaLabel, className, style, children, id,
 }: PopoverProps) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ x: number; y: number; maxHeight: number; width?: number } | null>(null);
   const z = useLayer(open, 700);
 
-  useClickOutside([ref, anchor], onClose, open);
-  useFocusTrap(ref, open && autoFocus, { autoFocus, restoreFocus: true });
+  const outsideRefs = useMemo(() => [ref, anchor, ...(ignore ?? [])], [anchor, ignore]);
+  useClickOutside(outsideRefs, onClose, open);
+  useFocusTrap(ref, open && autoFocus, { autoFocus, initialFocus, restoreFocus: true });
+
+  useIsomorphicLayoutEffect(() => {
+    if (!elementRef) return;
+    elementRef.current = ref.current;
+    return () => { elementRef.current = null; };
+  }, [elementRef, open]);
 
   const reposition = useCallback(() => {
     const anchorEl = anchor.current;
@@ -348,7 +390,13 @@ export function Popover({
 
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.stopPropagation(); onClose(); } };
+    const onKey = (e: KeyboardEvent) => {
+      // A submenu raised from this popover is the layer Escape belongs to;
+      // it closes, this one stays, and focus lands back on the row that opened it.
+      if (e.key !== 'Escape' || !isTopLayer(ref.current)) return;
+      e.stopPropagation();
+      onClose();
+    };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
   }, [open, onClose]);
@@ -362,6 +410,7 @@ export function Popover({
         id={id}
         role={role === 'none' ? undefined : role}
         aria-label={ariaLabel}
+        onKeyDown={onKeyDown}
         className={cx('ain-popover', className)}
         style={{
           left: pos?.x ?? -9999, top: pos?.y ?? -9999, zIndex: z,
@@ -405,26 +454,56 @@ export interface MenuSection {
 
 export interface MenuProps {
   open: boolean;
+  /** Dismiss the whole stack — a leaf was chosen, or the pointer went elsewhere. */
   onClose: () => void;
+  /**
+   * Fold one level back instead of dismissing: Escape and ArrowLeft inside a
+   * submenu return to the row that opened it. Submenus get this automatically;
+   * a root menu leaves it unset and closes.
+   */
+  onCollapse?: () => void;
   anchor: RefObject<HTMLElement | null>;
   sections: MenuSection[];
   placement?: Placement;
   ariaLabel: string;
   matchWidth?: boolean;
+  /** The popover element, mirrored out so a parent menu can tell its own
+   *  click-outside that a click inside this submenu is not outside. */
+  popoverRef?: MutableRefObject<HTMLDivElement | null>;
   className?: string;
 }
 
 const flatten = (sections: MenuSection[]): MenuItemDef[] => sections.flatMap((s) => s.items);
 const textOf = (item: MenuItemDef): string => item.searchText ?? (typeof item.label === 'string' ? item.label : '');
 
-export function Menu({ open, onClose, anchor, sections, placement = 'bottom-start', ariaLabel, matchWidth, className }: MenuProps) {
+export function Menu({
+  open, onClose, onCollapse, anchor, sections, placement = 'bottom-start', ariaLabel, matchWidth, popoverRef, className,
+}: MenuProps) {
   const items = useMemo(() => flatten(sections).filter((i) => !i.disabled), [sections]);
+  const navItems = useMemo<MenuNavItem[]>(
+    () => items.map((i) => ({ id: i.id, text: textOf(i), hasSubmenu: !!i.items?.length })),
+    [items],
+  );
   const [active, setActive] = useState(0);
   const [submenu, setSubmenu] = useState<string | null>(null);
-  const submenuAnchor = useRef<HTMLDivElement>(null);
-  const typed = useRef({ query: '', at: 0 });
+  const submenuAnchor = useRef<HTMLDivElement | null>(null);
+  const submenuPopover = useRef<HTMLDivElement | null>(null);
+  // The row the highlight is on, handed to the popover as its focus target so
+  // `is-active` and `document.activeElement` are always the same element.
+  const activeItem = useRef<HTMLDivElement | null>(null);
+  const typeahead = useRef<MenuTypeahead>(emptyTypeahead());
+  const baseId = useId();
+  const itemDomId = (id: string) => `${baseId}${id}`;
 
-  useEffect(() => { if (open) { setActive(0); setSubmenu(null); } }, [open]);
+  // Synchronous, so the reset lands before the popover's focus trap picks a
+  // target — reopening a menu always starts on the first row, not on whichever
+  // row the last visit left behind.
+  useIsomorphicLayoutEffect(() => {
+    if (!open) return;
+    setActive(0);
+    setSubmenu(null);
+    typeahead.current = emptyTypeahead();
+  }, [open]);
 
   const select = useCallback((item: MenuItemDef) => {
     if (item.disabled) return;
@@ -433,19 +512,31 @@ export function Menu({ open, onClose, anchor, sections, placement = 'bottom-star
     onClose();
   }, [onClose]);
 
+  const activeId = items[active]?.id;
+
+  // Follow the highlight with real focus, but never steal it: the menu only
+  // moves focus that is already inside it.
+  useEffect(() => {
+    if (!open) return;
+    const node = activeItem.current;
+    const root = node?.closest('.ain-popover');
+    if (!node || !root || !root.contains(document.activeElement)) return;
+    if (document.activeElement !== node) node.focus({ preventScroll: true });
+    node.scrollIntoView?.({ block: 'nearest' });
+  }, [open, active, activeId]);
+
   const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'ArrowDown') { e.preventDefault(); setActive((i) => (i + 1) % items.length); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); setActive((i) => (i - 1 + items.length) % items.length); }
-    else if (e.key === 'Home') { e.preventDefault(); setActive(0); }
-    else if (e.key === 'End') { e.preventDefault(); setActive(items.length - 1); }
-    else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); const item = items[active]; if (item) select(item); }
-    else if (e.key === 'ArrowRight') { const item = items[active]; if (item?.items?.length) { e.preventDefault(); setSubmenu(item.id); } }
-    else if (e.key === 'ArrowLeft') { if (submenu) { e.preventDefault(); setSubmenu(null); } }
-    else if (e.key.length === 1 && !e.metaKey && !e.ctrlKey) {
-      const now = Date.now();
-      typed.current = { query: now - typed.current.at < 800 ? typed.current.query + e.key : e.key, at: now };
-      const match = items.findIndex((i) => textOf(i).toLowerCase().startsWith(typed.current.query.toLowerCase()));
-      if (match >= 0) setActive(match);
+    if (submenu) return; // the open submenu owns the keyboard until it closes
+    const result = menuKeyAction(navItems, { active, typeahead: typeahead.current, nested: !!onCollapse }, e, Date.now());
+    typeahead.current = result.typeahead;
+    if (result.handled) { e.preventDefault(); e.stopPropagation(); }
+    if (result.active !== active) setActive(result.active);
+    switch (result.action.kind) {
+      case 'select': { const item = items[result.action.index]; if (item) select(item); break; }
+      case 'open-submenu': { const item = items[result.action.index]; if (item) setSubmenu(item.id); break; }
+      case 'close-submenu': (onCollapse ?? onClose)(); break;
+      case 'close': onClose(); break;
+      default: break;
     }
   };
 
@@ -455,7 +546,7 @@ export function Menu({ open, onClose, anchor, sections, placement = 'bottom-star
     <>
       <Popover
         open={open}
-        onClose={onClose}
+        onClose={onCollapse ?? onClose}
         anchor={anchor}
         placement={placement}
         matchWidth={matchWidth}
@@ -463,24 +554,41 @@ export function Menu({ open, onClose, anchor, sections, placement = 'bottom-star
         flush
         className={cx('ain-menu-pop', className)}
         autoFocus
+        initialFocus={activeItem}
+        onKeyDown={onKeyDown}
+        ignore={[submenuPopover]}
+        elementRef={popoverRef}
       >
-        <div className="ain-menu" role="menu" aria-label={ariaLabel} tabIndex={-1} onKeyDown={onKeyDown}>
+        <div
+          className="ain-menu"
+          role="menu"
+          aria-label={ariaLabel}
+          aria-activedescendant={activeId ? itemDomId(activeId) : undefined}
+          tabIndex={-1}
+        >
           {sections.map((section) => (
             <div className="ain-menu__section" key={section.id} role="group" aria-label={section.label}>
               {section.label && <div className="ain-menu__label">{section.label}</div>}
               {section.items.map((item) => {
                 const index = items.indexOf(item);
+                const isActive = index >= 0 && index === active;
                 return (
                   <div
                     key={item.id}
-                    ref={item.id === submenu ? submenuAnchor : undefined}
+                    id={itemDomId(item.id)}
+                    ref={(node) => {
+                      if (item.id === submenu) submenuAnchor.current = node;
+                      if (isActive) activeItem.current = node;
+                    }}
                     role={item.checked !== undefined ? 'menuitemcheckbox' : 'menuitem'}
                     aria-checked={item.checked}
                     aria-disabled={item.disabled || undefined}
                     aria-haspopup={item.items?.length ? 'menu' : undefined}
                     aria-expanded={item.items?.length ? item.id === submenu : undefined}
-                    tabIndex={-1}
-                    className={cx('ain-menu__item', index === active && index >= 0 && 'is-active', item.danger && 'is-danger')}
+                    // Roving tabindex: exactly one row is reachable, and it is
+                    // the highlighted one, so Tab and the highlight agree.
+                    tabIndex={isActive ? 0 : -1}
+                    className={cx('ain-menu__item', isActive && 'is-active', item.danger && 'is-danger')}
                     onPointerEnter={() => { if (index >= 0) setActive(index); if (!item.items?.length) setSubmenu(null); }}
                     onClick={() => select(item)}
                   >
@@ -507,7 +615,11 @@ export function Menu({ open, onClose, anchor, sections, placement = 'bottom-star
       {openSubmenuItem?.items && (
         <Menu
           open
+          // Choosing a leaf dismisses the whole stack; Escape and ArrowLeft fold
+          // one level back and hand focus to the row that opened it.
           onClose={() => { setSubmenu(null); onClose(); }}
+          onCollapse={() => setSubmenu(null)}
+          popoverRef={submenuPopover}
           anchor={submenuAnchor}
           placement="right-start"
           ariaLabel={typeof openSubmenuItem.label === 'string' ? openSubmenuItem.label : 'Submenu'}

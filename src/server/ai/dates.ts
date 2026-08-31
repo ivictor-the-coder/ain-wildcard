@@ -50,7 +50,10 @@ const quarterLabel = (ts: number): string => `Q${quarterIndex(ts) + 1} ${new Dat
 const monthLabel = (ts: number): string => formatDate(ts, { timeZone: 'UTC' }).replace(/\s\d+,/, '');
 
 function makeWindow(start: number, end: number, label: string, grain: WindowGrain, matched: string, now: number): TimeWindow {
-  return { start, end, label, grain, matched, partial: end > now };
+  // A window is partial when the clock is inside it. A wholly future period —
+  // "next quarter" — is not a period-to-date figure, it is a period with
+  // nothing in it yet, and the answer has to read differently.
+  return { start, end, label, grain, matched, partial: end > now && start <= now };
 }
 
 /** Format a window the way a finance analyst writes a period. */
@@ -107,9 +110,9 @@ const RULES: Rule[] = [
     },
   },
   {
-    re: /\b(?:this|current|the\s+current)\s+(quarter|month|year|week)\b|\b(qtd|mtd|ytd|wtd)\b/i,
+    re: /\b(?:this|current|the\s+current)\s+(quarter|month|year|week)\b|\b(quarter|month|year|week)\s+to\s+date\b|\b(qtd|mtd|ytd|wtd)\b/i,
     build(m, now) {
-      const key = (m[1] || m[2] || '').toLowerCase();
+      const key = (m[1] || m[2] || m[3] || '').toLowerCase();
       if (key === 'quarter' || key === 'qtd') {
         const start = startOfQuarter(now);
         return makeWindow(start, addQuarters(start, 1), `${quarterLabel(start)} to date`, 'quarter', m[0], now);
@@ -160,6 +163,54 @@ const RULES: Rule[] = [
     },
   },
   {
+    // "the second quarter of 2026" is Q2 2026. Before this rule existed the
+    // year inside it was the only thing that parsed, and the answer came back
+    // about the whole of 2026.
+    re: /\b(?:the\s+)?(first|second|third|fourth)\s+quarter(?:\s+(?:of|in)\s+(?:fy\s*)?((?:19|20)\d{2}))?\b/i,
+    build(m, now) {
+      const q = ['first', 'second', 'third', 'fourth'].indexOf(m[1].toLowerCase());
+      const year = m[2] ? Number(m[2]) : new Date(now).getUTCFullYear();
+      const start = Date.UTC(year, q * 3, 1);
+      if (!m[2] && start > now) {
+        const prior = Date.UTC(year - 1, q * 3, 1);
+        return makeWindow(prior, addQuarters(prior, 1), quarterLabel(prior), 'quarter', m[0], now);
+      }
+      return makeWindow(start, addQuarters(start, 1), quarterLabel(start), 'quarter', m[0], now);
+    },
+  },
+  {
+    // Nothing in this platform carries a fiscal calendar offset — every module
+    // buckets on calendar months — so a fiscal year is the calendar year here,
+    // and the label says which one it used rather than implying an offset.
+    re: /\b(?:fiscal\s+year\s*|fy\s*'?)((?:19|20)?\d{2})\b/i,
+    build(m, now) {
+      const raw = Number(m[1]);
+      const year = raw < 100 ? 2000 + raw : raw;
+      if (year < 1990 || year > 2100) return null;
+      return makeWindow(Date.UTC(year, 0, 1), Date.UTC(year + 1, 0, 1), `FY${year} (the calendar year ${year})`, 'year', m[0], now);
+    },
+  },
+  {
+    re: /\b(?:next|the\s+coming|the\s+following)\s+(quarter|month|year|week)\b/i,
+    build(m, now) {
+      const key = m[1].toLowerCase();
+      if (key === 'quarter') {
+        const start = addQuarters(now, 1);
+        return makeWindow(start, addQuarters(start, 1), quarterLabel(start), 'quarter', m[0], now);
+      }
+      if (key === 'month') {
+        const start = addInterval(startOfMonth(now), interval('month', 1), 1);
+        return makeWindow(start, addInterval(start, interval('month', 1), 1), `${monthLabel(start)} ${new Date(start).getUTCFullYear()}`, 'month', m[0], now);
+      }
+      if (key === 'week') {
+        const start = startOfWeek(now) + 7 * DAY;
+        return makeWindow(start, start + 7 * DAY, 'next week', 'week', m[0], now);
+      }
+      const year = new Date(now).getUTCFullYear() + 1;
+      return makeWindow(Date.UTC(year, 0, 1), Date.UTC(year + 1, 0, 1), String(year), 'year', m[0], now);
+    },
+  },
+  {
     re: /\b(yesterday|today)\b/i,
     build(m, now) {
       const isToday = m[1].toLowerCase() === 'today';
@@ -168,7 +219,10 @@ const RULES: Rule[] = [
     },
   },
   {
-    re: /\b(?:in|during|for|of)\s+((?:19|20)\d{2})\b/i,
+    // The trailing guard stops "in 2026-02-30" being read as the year 2026:
+    // half of a date is not a period, and a half-parsed date is exactly how an
+    // answer ends up about a range nobody asked for.
+    re: /\b(?:in|during|for|of)\s+((?:19|20)\d{2})\b(?!-\d)/i,
     build(m, now) {
       const year = Number(m[1]);
       return makeWindow(Date.UTC(year, 0, 1), Date.UTC(year + 1, 0, 1), String(year), 'year', m[0], now);
@@ -226,7 +280,14 @@ const RULES: Rule[] = [
  * first. Overlapping matches are resolved leftmost-longest — "in March 2025"
  * is one period, not a month and a year.
  */
-export function resolveWindows(text: string, now: number, limit = 3): TimeWindow[] {
+export interface WindowSpan {
+  window: TimeWindow;
+  /** Where in the question the phrase that produced this window sits. */
+  at: number;
+  to: number;
+}
+
+export function resolveWindowSpans(text: string, now: number, limit = 3): WindowSpan[] {
   const found: { at: number; to: number; rule: number; window: TimeWindow }[] = [];
   RULES.forEach((rule, index) => {
     const flags = rule.re.flags.includes('g') ? rule.re.flags : `${rule.re.flags}g`;
@@ -239,7 +300,7 @@ export function resolveWindows(text: string, now: number, limit = 3): TimeWindow
   });
   found.sort((a, b) => a.at - b.at || (b.to - b.at) - (a.to - a.at) || a.rule - b.rule);
 
-  const out: TimeWindow[] = [];
+  const out: WindowSpan[] = [];
   const seen = new Set<string>();
   let consumed = -1;
   for (const candidate of found) {
@@ -248,10 +309,14 @@ export function resolveWindows(text: string, now: number, limit = 3): TimeWindow
     const key = `${candidate.window.start}:${candidate.window.end}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push(candidate.window);
+    out.push({ window: candidate.window, at: candidate.at, to: candidate.to });
     if (out.length >= limit) break;
   }
   return out;
+}
+
+export function resolveWindows(text: string, now: number, limit = 3): TimeWindow[] {
+  return resolveWindowSpans(text, now, limit).map((span) => span.window);
 }
 
 /**
@@ -281,7 +346,7 @@ const PERIOD_MENTIONS: RegExp[] = [
   /\bweek\s+\d{1,2}\b/gi,
 ];
 
-export interface PeriodMention { text: string; at: number }
+export interface PeriodMention { text: string; at: number; to: number }
 
 export function periodMentions(text: string): PeriodMention[] {
   const spans: PeriodMention[] = [];
@@ -300,9 +365,47 @@ export function periodMentions(text: string): PeriodMention[] {
   for (const span of raw) {
     if (span.at < consumed) continue;
     consumed = span.to;
-    spans.push({ text: span.text, at: span.at });
+    spans.push({ text: span.text, at: span.at, to: span.to });
   }
   return spans;
+}
+
+/**
+ * Period phrases the question named that no resolved window covers.
+ *
+ * This is the whole-engine guard against substitution. Counting is not enough:
+ * "the second quarter of 2026" names one period and used to resolve one window
+ * — the year 2026 — so the counts agreed while the answer was about a different
+ * range. A mention only counts as resolved when a window's own matched span
+ * contains it, which is the only way to know the engine measured the phrase the
+ * caller wrote rather than a fragment of it.
+ */
+export function unresolvedPeriods(text: string, now: number, limit = 8): PeriodMention[] {
+  const spans = resolveWindowSpans(text, now, limit);
+  return periodMentions(text).filter((mention) =>
+    !spans.some((span) => span.at <= mention.at && span.to >= mention.to));
+}
+
+/**
+ * An explicit range written backwards — "between 2026-12-31 and 2020-01-01".
+ * It parses as two dates and resolves to nothing, so the refusal can say why
+ * instead of only saying that it could not.
+ */
+export function reversedRange(text: string): { from: string; to: string } | null {
+  for (const match of text.matchAll(/\bbetween\s+((?:19|20)\d{2}-\d{2}-\d{2})\s+and\s+((?:19|20)\d{2}-\d{2}-\d{2})\b/gi)) {
+    const start = Date.parse(`${match[1]}T00:00:00Z`);
+    const end = Date.parse(`${match[2]}T00:00:00Z`);
+    if (Number.isFinite(start) && Number.isFinite(end) && end < start) return { from: match[1], to: match[2] };
+  }
+  return null;
+}
+
+/**
+ * Everything on the books, for a question that ranks accounts without naming a
+ * period. "Who is my biggest customer?" is not a question about this quarter.
+ */
+export function allTimeWindow(now: number): TimeWindow {
+  return makeWindow(0, now, 'all time', 'range', '', now);
 }
 
 /** The same window one or more years earlier — "the same period last year". */

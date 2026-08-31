@@ -627,10 +627,14 @@ export class Catalog {
     return row ? hydratePrice(row) : null;
   }
 
-  pricesFor(orgId: string, productId: string, opts: { activeOnly?: boolean } = {}): Price[] {
+  /** `active` is a tri-state: omit it for the whole history of the product. */
+  pricesFor(orgId: string, productId: string, opts: { active?: boolean } = {}): Price[] {
+    const clause = opts.active === undefined ? '' : ' AND active = ?';
+    const params: unknown[] = [orgId, productId];
+    if (opts.active !== undefined) params.push(opts.active ? 1 : 0);
     return this.ctx.db.all<any>(
-      `SELECT * FROM catalog_prices WHERE org_id = ? AND product_id = ?${opts.activeOnly ? ' AND active = 1' : ''} ORDER BY created ASC, id ASC`,
-      orgId, productId,
+      `SELECT * FROM catalog_prices WHERE org_id = ? AND product_id = ?${clause} ORDER BY created ASC, id ASC`,
+      ...(params as any[]),
     ).map(hydratePrice);
   }
 

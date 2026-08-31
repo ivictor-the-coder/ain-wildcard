@@ -15,7 +15,7 @@
  *     `transform_quantity` bills in packages; the copy converts every rate and
  *     every tier boundary back into the units the customer counts in.
  */
-import { exponentOf, ratRound, type Rational } from '../../../shared/money';
+import { exponentOf, rat, ratCmp, ratRound, ratSub, type Rational } from '../../../shared/money';
 import {
   decimalToRat, exactAmount, pluralUnit, ratToDecimal, resolveForCurrency, tierCap, tierFlat, tierUnit,
 } from './engine';
@@ -131,6 +131,147 @@ function bandLabel(band: TierBand, unitNoun: string, locale: string, only: boole
   return `${qty(band.lower, locale)}–${qty(band.upper, locale)}`;
 }
 
+/* ------------------------------ where it steps ---------------------------- */
+
+/** A band the summary names, and what the customer notices on reaching it. */
+type TierStep =
+  | { index: number; direction: 'falling' | 'rising' }
+  /** A band that keeps the rate but charges `oneOff` to enter. */
+  | { index: number; direction: 'plus'; oneOff: Rational };
+
+/**
+ * Every band after the entry clause where the engine's real cost changes, in
+ * the order a customer meets them, and whether each one costs less or more.
+ *
+ * Returning only the cheapest band is what made the summary lie: a ladder that
+ * dips to $0.50 at 1,000 and climbs to $2.00 at 10,000 was advertised as
+ * "falling to $0.50", a rate the price has already abandoned by the time the
+ * invoice is cut. The whole remaining ladder is returned instead, so whatever
+ * the sentence says along the way, the last rate it quotes is the one the
+ * customer keeps paying.
+ *
+ * A tier's own `unit_amount` cannot answer which way a band moves: a volume
+ * tier that cuts the rate from $0.50 to $0.10 and adds a $500 base charge bills
+ * 33x more at the boundary, not less. So both figures come out of the engine,
+ * and each mode is measured the way it actually bills — volume re-prices the
+ * whole quantity, so what changes either side of the step is the total per
+ * unit; graduated leaves every earlier unit at its own rate, so what changes is
+ * the price of the next unit. Each band is measured against the last one the
+ * sentence quoted rather than against the opening, because that is the number
+ * the reader is comparing it with. Nothing is "falling" unless the figure it
+ * compares really fell, and a band that keeps the rate but charges to enter is
+ * reported as the one-off it is rather than passed over in silence.
+ */
+function stepLadder(
+  price: Price,
+  currency: string,
+  unitNoun: string,
+  bands: TierBand[],
+  entryIndex: number,
+  entryRate: Rational,
+  volumePriced: boolean,
+): TierStep[] {
+  const transform = activeTransform(price.transform_quantity);
+  // A package price charges per package: one package is its smallest real step.
+  const stride = transform ? transform.divide_by : 1;
+
+  const perUnitAt = (quantity: number): Rational | null => {
+    if (quantity < 1) return null;
+    const exact = exactAt(price, quantity, currency, unitNoun);
+    return exact === null ? null : rat(exact.n, exact.d * BigInt(quantity));
+  };
+
+  /**
+   * The cost of one more rate-unit to a customer already inside the band. Both
+   * quantities sit in the same band, so the band's own entry charge cancels and
+   * what is left is the rate the customer keeps paying.
+   */
+  const marginalIn = (i: number): Rational | null => {
+    const { lower, upper } = bands[i];
+    if (upper !== null && upper - lower < stride) return null;
+    const before = exactAt(price, lower, currency, unitNoun);
+    const after = exactAt(price, lower + stride, currency, unitNoun);
+    return before === null || after === null ? null : ratSub(after, before);
+  };
+
+  /*
+   * The rate a customer was on before band `i`. A band too narrow to hold a
+   * whole rate-unit has no rate to measure, so the search walks back to the
+   * last band that does, and falls back to the entry rate the summary has
+   * already quoted — which is the figure the reader is comparing against.
+   */
+  const rateBefore = (i: number): Rational => {
+    for (let j = i - 1; j >= entryIndex; j--) {
+      const marginal = marginalIn(j);
+      if (marginal !== null) return marginal;
+    }
+    return entryRate;
+  };
+
+  /** What the customer pays to go from the last unit before a band to its first. */
+  const crossingInto = (i: number): Rational | null => {
+    const after = exactAt(price, bands[i].lower, currency, unitNoun);
+    const before = exactAt(price, bands[i].lower - 1, currency, unitNoun);
+    return after === null || before === null ? null : ratSub(after, before);
+  };
+
+  /*
+   * What a clause about band `i` commits the price to, at the last quantity it
+   * covers — the figure the next band is compared against. On volume that is
+   * the cost per unit at the top of the band, which is where a base charge has
+   * spread as thin as it ever will; on graduated it is simply the band's rate.
+   */
+  const committedBy = (i: number): Rational | null => (volumePriced
+    ? perUnitAt(bands[i].upper ?? bands[i].lower)
+    : marginalIn(i) ?? (i === entryIndex ? entryRate : null));
+
+  let quoted = committedBy(entryIndex);
+  const steps: TierStep[] = [];
+
+  for (let i = entryIndex + 1; i < bands.length; i++) {
+    const cost = volumePriced ? perUnitAt(bands[i].lower) : marginalIn(i);
+    if (cost === null) {
+      // Too narrow to hold a whole rate-unit, so it has no rate of its own —
+      // but a band one unit wide can still carry a base charge, and a customer
+      // who steps into it pays that on top of the rate they were already on.
+      const crossing = volumePriced ? null : crossingInto(i);
+      const oneOff = crossing === null ? null : ratSub(crossing, rateBefore(i));
+      if (oneOff && oneOff.n > 0n) steps.push({ index: i, direction: 'plus', oneOff });
+      continue;
+    }
+    let moved = quoted === null ? 0 : ratCmp(cost, quoted);
+    if (moved === 0 && volumePriced) {
+      /*
+       * The cost per unit can land on the same number either side of a volume
+       * step and still be a different price: a band that carries a base charge
+       * keeps getting cheaper per unit inside itself, and a band that drops the
+       * base while doubling the rate can match at the boundary and diverge from
+       * there. So look one unit deeper, then at the rate the band charges.
+       */
+      const { lower, upper } = bands[i];
+      const deeper = upper === null || lower + 1 <= upper ? perUnitAt(lower + 1) : null;
+      moved = deeper === null ? 0 : ratCmp(deeper, cost);
+      if (moved === 0) {
+        const rate = marginalIn(i);
+        moved = rate === null ? 0 : ratCmp(rate, rateBefore(i));
+      }
+    }
+    if (moved !== 0) {
+      steps.push({ index: i, direction: moved < 0 ? 'falling' : 'rising' });
+      quoted = committedBy(i) ?? cost;
+      continue;
+    }
+    if (!volumePriced) {
+      // The rate did not move, but crossing still costs: a base charge on the
+      // band that reading the rate alone would never reveal.
+      const crossing = crossingInto(i);
+      const oneOff = crossing === null ? null : ratSub(crossing, cost);
+      if (oneOff && oneOff.n > 0n) steps.push({ index: i, direction: 'plus', oneOff });
+    }
+  }
+  return steps;
+}
+
 /* --------------------------------- display -------------------------------- */
 
 export interface PriceDisplay {
@@ -169,7 +310,7 @@ export interface PriceDisplay {
   cheapest_unit: string | null;
 }
 
-interface Charge { display: string; amount: number }
+interface Charge { display: string; amount: number; exact: Rational }
 
 /**
  * What the engine really bills for `quantity` — the anchor for all "from" copy.
@@ -177,15 +318,18 @@ interface Charge { display: string; amount: number }
  * never drift from the invoice line it is describing.
  */
 function chargeAt(price: Price, quantity: number, currency: string, locale: string, unitLabel: string): Charge | null {
-  try {
-    const exact = exactAmount(price, quantity, currency, { unitLabel });
-    return {
-      display: formatMinorDecimal(ratToDecimal(exact), currency, locale),
-      amount: Number(ratRound(exact, 'half_up')),
-    };
-  } catch {
-    return null;
-  }
+  const exact = exactAt(price, quantity, currency, unitLabel);
+  if (exact === null) return null;
+  return {
+    display: formatMinorDecimal(ratToDecimal(exact), currency, locale),
+    amount: Number(ratRound(exact, 'half_up')),
+    exact,
+  };
+}
+
+function exactAt(price: Price, quantity: number, currency: string, unitLabel: string): Rational | null {
+  try { return exactAmount(price, quantity, currency, { unitLabel }); }
+  catch { return null; }
 }
 
 /** Everything a pricing page needs to render a price without doing maths. */
@@ -287,17 +431,26 @@ export function describePrice(price: Price, currency: string, locale = 'en-US', 
     if (!anyPaidUnit) {
       const totals = bands.map((band) => chargeAt(price, band.lower, resolved.currency, locale, unitNoun));
       const first = totals[0];
-      const last = totals[totals.length - 1];
+      /*
+       * Two tiers that bill the same amount are one price to the customer.
+       * Counting them separately advertises a step at a quantity where the
+       * engine charges no differently than it did the unit before.
+       */
+      const steps = totals.reduce<number[]>((keep, total, i) => {
+        if (i === 0 || (total && totals[keep[keep.length - 1]]?.amount !== total.amount)) keep.push(i);
+        return keep;
+      }, []);
+      const last = totals[steps[steps.length - 1]];
       const head = first?.display ?? zeroMoney;
-      const firstUpper = bands[0].upper;
-      const lastLower = bands[bands.length - 1].lower;
       let summary = `${head}${intervalSuffix}`;
-      if (bands.length > 1 && firstUpper !== null && last) {
-        const direction = first && last.amount < first.amount ? 'falling' : 'rising';
-        const opening = `${head}${intervalSuffix} up to ${qty(firstUpper, locale)} ${pluralUnit(unitNoun, firstUpper)}`;
-        summary = bands.length === 2
+      if (steps.length > 1 && first && last) {
+        const changesAt = bands[steps[1]].lower - 1;
+        const direction = last.amount < first.amount ? 'falling' : 'rising';
+        const opening = `${head}${intervalSuffix} up to ${qty(changesAt, locale)} ${pluralUnit(unitNoun, changesAt)}`;
+        const reachedAt = bands[steps[steps.length - 1]].lower - 1;
+        summary = steps.length === 2
           ? `${opening}, then ${last.display}${intervalSuffix}`
-          : `${opening}, ${direction} through ${bands.length} tiers to ${last.display}${intervalSuffix} above ${qty(lastLower - 1, locale)} ${pluralUnit(unitNoun, 2)}`;
+          : `${opening}, ${direction} through ${steps.length} tiers to ${last.display}${intervalSuffix} above ${qty(reachedAt, locale)} ${pluralUnit(unitNoun, 2)}`;
       }
       return {
         amount: head,
@@ -318,20 +471,43 @@ export function describePrice(price: Price, currency: string, locale = 'en-US', 
     /* The usual shape: a per-unit rate, possibly over a base and an allowance. */
     const entryIndex = tiers.findIndex((_, i) => paidUnit(i));
     const entryRate = money(units[entryIndex]!);
-    const base = paidFlat(0) ? money(flats[0]!) : null;
     /*
      * Everything under the first paid tier is an allowance, whether it is
      * priced at zero or carries no per-unit rate at all — either way the
      * customer is not charged per unit until this many units have gone by.
      */
     const allowance = entryIndex > 0 && bands[entryIndex].lower > 1 ? bands[entryIndex].lower - 1 : null;
+    /*
+     * What the allowance really costs, from the engine. The entry tier's own
+     * flat amount cannot answer that: a base charge sitting on a tier in
+     * between belongs to the allowance too, and reading only the first tier
+     * calls a band that bills $500 "free".
+     */
+    const allowanceExact = allowance === null ? null : exactAt(price, allowance, resolved.currency, unitNoun);
+    const freeAllowance = allowanceExact !== null && allowanceExact.n === 0n ? allowance : null;
+    const base = allowance === null
+      ? (paidFlat(0) ? money(flats[0]!) : null)
+      : (allowanceExact !== null && allowanceExact.n !== 0n ? money(allowanceExact) : null);
     const volumePriced = price.tiers_mode === 'volume';
     const inUnits = (n: number) => `${qty(n, locale)} ${pluralUnit(unitNoun, n)}`;
-    const entryFlat = entryIndex > 0 && paidFlat(entryIndex) ? money(flats[entryIndex]!) : null;
+
+    /**
+     * What a customer inside band `i` pays, in the words the mode makes true.
+     * Volume re-prices the whole quantity, so its rate is charged "for every"
+     * unit; graduated charges it only on the units inside the band.
+     */
+    const ratePhrase = (i: number): string => {
+      const flat = paidFlat(i) ? `${money(flats[i]!)} base` : null;
+      const unit = paidUnit(i) ? `${money(units[i]!)}${volumePriced ? ` for every ${rateNoun}` : ` ${perRate}`}` : null;
+      if (flat && unit) return `${flat} + ${unit}`;
+      if (flat) return `${flat} and no ${noChargeNoun}`;
+      return unit ?? 'no charge at all';
+    };
+
     // Volume tiering re-prices every unit at the tier it lands in, so "then
     // $1.00 per event" would understate it: every event costs $1.00, not just
     // the ones past the allowance.
-    const thenRate = `${entryFlat ? `${entryFlat} base + ` : ''}${entryRate}${volumePriced ? ` for every ${rateNoun}` : ` ${perRate}`}`;
+    const thenRate = ratePhrase(entryIndex);
 
     const clauses: string[] = [];
     if (base && allowance !== null) {
@@ -340,22 +516,58 @@ export function describePrice(price: Price, currency: string, locale = 'en-US', 
         : `${base}${intervalSuffix} including the first ${inUnits(allowance)}, then ${thenRate}`);
     } else if (base) {
       clauses.push(`${base}${intervalSuffix} + ${entryRate} ${perRate}`);
-    } else if (allowance !== null) {
+    } else if (freeAllowance !== null) {
       clauses.push(volumePriced
-        ? `Free up to ${inUnits(allowance)}, then ${thenRate}`
-        : `First ${inUnits(allowance)} included, then ${thenRate}`);
+        ? `Free up to ${inUnits(freeAllowance)}, then ${thenRate}`
+        : `First ${inUnits(freeAllowance)} included, then ${thenRate}`);
     } else {
       clauses.push(`${entryRate} ${perRate}${intervalSuffix}`);
     }
 
-    if (cheapestUnitIndex > entryIndex) {
-      const target = paidFlat(cheapestUnitIndex)
-        ? `${money(flats[cheapestUnitIndex]!)} base + ${cheapestUnit} ${perRate}`
-        : cheapestUnit!;
-      const from = bands[cheapestUnitIndex].lower - 1;
-      clauses.push(volumePriced
-        ? `falling to ${target} for every ${rateNoun} once you pass ${qty(from, locale)}`
-        : `falling to ${target} for ${pluralUnit(unitNoun, 2)} beyond ${qty(from, locale)}`);
+    /*
+     * The whole remaining ladder, not just its cheapest rung. Consecutive bands
+     * that move the same way collapse into one clause — the wording the ladder
+     * of base charges above already uses — while a change of direction always
+     * earns a clause of its own, and the final band always gets one. That is
+     * what keeps the last rate the sentence quotes the rate the customer is
+     * still paying at the top of the range.
+     */
+    const steps = stepLadder(price, resolved.currency, unitNoun, bands, entryIndex, units[entryIndex]!, volumePriced);
+    const runs = steps.reduce<TierStep[][]>((grouped, step) => {
+      const open = grouped[grouped.length - 1];
+      if (open && step.direction !== 'plus' && open[0].direction === step.direction) open.push(step);
+      else grouped.push([step]);
+      return grouped;
+    }, []);
+
+    const stepClause = (run: TierStep[]): string => {
+      const last = run[run.length - 1];
+      const from = bands[last.index].lower - 1;
+      if (last.direction === 'plus') {
+        return `plus a ${money(last.oneOff)} base once you pass ${qty(from, locale)}`;
+      }
+      // A run covers the band it stepped away from as well as the ones it reached.
+      const reached = run.length === 1
+        ? `${last.direction} to`
+        : `${last.direction} through ${run.length + 1} tiers to`;
+      return volumePriced
+        ? `${reached} ${ratePhrase(last.index)} once you pass ${qty(from, locale)}`
+        : `${reached} ${ratePhrase(last.index)} beyond ${inUnits(from)}`;
+    };
+
+    /*
+     * A ladder that changes direction over and over would run the sentence off
+     * the card, so past three turns the middle is counted rather than spelled
+     * out — `tiers` below still lists every band — and the final one is always
+     * spelled out, because that is the rate the reader will budget against.
+     */
+    if (runs.length <= 3) {
+      for (const run of runs) clauses.push(stepClause(run));
+    } else {
+      clauses.push(stepClause(runs[0]));
+      const between = runs.slice(1, -1).reduce((n, run) => n + run.length, 0);
+      clauses.push(`${qty(between, locale)} more price changes`);
+      clauses.push(`then ${stepClause(runs[runs.length - 1])}`);
     }
 
     /*

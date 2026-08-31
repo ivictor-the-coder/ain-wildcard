@@ -26,7 +26,10 @@ import {
 } from '../src/client/design/calendar-core';
 import { computeWindow, matchesHotkey } from '../src/client/design/hooks';
 import { ICON_NAMES, Icons, iconByName } from '../src/client/design/icons';
-import { rankCommands } from '../src/client/design/overlays-core';
+import {
+  emptyTypeahead, menuKeyAction, menuTypeaheadIndex, rankCommands,
+  MENU_TYPEAHEAD_RESET_MS, type MenuNavItem,
+} from '../src/client/design/overlays-core';
 
 const DAY = 86_400_000;
 
@@ -437,6 +440,41 @@ describe('overlay positioning', () => {
     });
   });
 
+  describe('a popover taller than the whole viewport', () => {
+    // 1280x460 with the Issued chip at y 90 and a date editor that wants 508px:
+    // taller than either side, so it gets clamped. Clamping the placement with
+    // the *natural* height slid it to y=8, on top of the chip that opened it.
+    const short = { width: 1280, height: 460 };
+    const chip = { x: 300, y: 90, width: 96, height: 24 };
+    const overlaps = (result: { y: number; maxHeight: number }, natural: number) =>
+      result.y < chip.y + chip.height && result.y + Math.min(natural, result.maxHeight) > chip.y;
+
+    it('never crosses the anchor it belongs to', () => {
+      const result = computePosition(chip, { width: 294, height: 508 }, short, { placement: 'bottom-start' });
+      assert.equal(overlaps(result, 508), false, `${result.y}..${result.y + Math.min(508, result.maxHeight)} covers the chip at ${chip.y}`);
+      assert.equal(result.y, chip.y + chip.height + 6, 'it stays directly under the chip');
+      assert.ok(result.y + result.maxHeight <= short.height - 8, 'and its clamped box still ends on screen');
+    });
+
+    it('holds at every short viewport the critic measured', () => {
+      for (const height of [400, 460, 480, 520]) {
+        const result = computePosition(chip, { width: 294, height: 508 }, { width: 1280, height }, { placement: 'bottom-start' });
+        assert.equal(overlaps(result, 508), false, `overlaps at 1280x${height}`);
+        assert.ok(result.y + result.maxHeight <= height - 8, `runs off the bottom at 1280x${height}`);
+      }
+    });
+
+    it('places a clamped box flipped above an anchor at the box\u2019s clamped height, not its natural one', () => {
+      // Anchor low on a short screen: the box flips up, and the top of the box
+      // is the padding, not `anchor.y - 508`.
+      const low = { x: 300, y: 380, width: 96, height: 24 };
+      const result = computePosition(low, { width: 294, height: 508 }, short, { placement: 'bottom-start' });
+      assert.equal(result.placement, 'top-start');
+      assert.equal(result.y, 8);
+      assert.equal(result.y + result.maxHeight, low.y - 6, 'the clamped box ends exactly at the gap above the anchor');
+    });
+  });
+
   it('ranks command matches by where the query hits', () => {
     const entries = [
       { id: '1', title: 'Create invoice', group: 'Create', onSelect: () => {} },
@@ -448,6 +486,152 @@ describe('overlay positioning', () => {
     assert.equal(results.length, 3);
     assert.equal(results[0].id, '1');
     assert.equal(rankCommands(entries, '').length, 4);
+  });
+});
+
+/* ------------------------------ menu keyboard ---------------------------- */
+
+describe('menu keyboard', () => {
+  // The account menu the docs demo everywhere: two sections, a submenu, a
+  // danger row. `menuKeyAction` never sees the icons or the React nodes.
+  const items: MenuNavItem[] = [
+    { id: 'rename', text: 'Rename account' },
+    { id: 'owner', text: 'Change owner' },
+    { id: 'merge', text: 'Merge into…', hasSubmenu: true },
+    { id: 'auto', text: 'Auto-charge on renewal' },
+    { id: 'dunning', text: 'Automatic dunning' },
+    { id: 'export', text: 'Export statement' },
+    { id: 'delete', text: 'Delete account' },
+  ];
+
+  /** Threads state through a key sequence the way the component does. */
+  const drive = (keys: string[], opts: { nested?: boolean; clock?: number[] } = {}) => {
+    let state = { active: 0, typeahead: emptyTypeahead(), nested: opts.nested };
+    const actions: string[] = [];
+    const seen: string[] = [];
+    keys.forEach((key, i) => {
+      const result = menuKeyAction(items, state, { key }, opts.clock?.[i] ?? i * 60);
+      state = { active: result.active, typeahead: result.typeahead, nested: opts.nested };
+      actions.push(result.action.kind);
+      seen.push(items[result.active]?.text ?? 'none');
+    });
+    return { ...state, actions, seen, last: actions[actions.length - 1] };
+  };
+
+  it('moves the highlight on ArrowDown and fires the row Enter lands on', () => {
+    // The critic's exact sequence — open, ArrowDown ×3, Enter — which used to
+    // leave the highlight parked on "Rename account" and select nothing.
+    const run = drive(['ArrowDown', 'ArrowDown', 'ArrowDown', 'Enter']);
+    assert.deepEqual(run.seen, ['Change owner', 'Merge into…', 'Auto-charge on renewal', 'Auto-charge on renewal']);
+    assert.deepEqual(run.actions, ['move', 'move', 'move', 'select']);
+    const enter = menuKeyAction(items, { active: 3, typeahead: emptyTypeahead() }, { key: 'Enter' }, 0);
+    assert.deepEqual(enter.action, { kind: 'select', index: 3 }, 'Enter selects the row the highlight is on');
+    assert.equal(enter.handled, true, 'and the browser must not also act on the key');
+  });
+
+  it('wraps at both ends and jumps with Home and End', () => {
+    assert.equal(drive(['ArrowUp']).active, items.length - 1);
+    assert.equal(drive(new Array(items.length).fill('ArrowDown')).active, 0);
+    assert.equal(drive(['End']).active, items.length - 1);
+    assert.equal(drive(['End', 'Home']).active, 0);
+  });
+
+  it('jumps to a typed prefix, and keeps refining it while the typing continues', () => {
+    assert.equal(items[drive(['d', 'e', 'l']).active].text, 'Delete account');
+    // "au" must not stop at "Automatic dunning" just because "a" matched it.
+    assert.equal(items[drive(['a', 'u', 't', 'o']).active].text, 'Auto-charge on renewal');
+    assert.equal(items[drive(['a', 'u', 't', 'o', 'm']).active].text, 'Automatic dunning');
+    // A pause resets the buffer, so the next letter starts a fresh search.
+    assert.equal(items[drive(['d', 'e'], { clock: [0, MENU_TYPEAHEAD_RESET_MS + 1] }).active].text, 'Export statement');
+  });
+
+  it('cycles through the rows sharing a first letter when that letter is repeated', () => {
+    const run = drive(['a', 'a', 'a']);
+    assert.deepEqual(run.seen, ['Auto-charge on renewal', 'Automatic dunning', 'Auto-charge on renewal']);
+  });
+
+  it('folds diacritics, so a US keyboard reaches an accented row', () => {
+    const owners: MenuNavItem[] = [{ id: 'd', text: 'Dana Whitfield' }, { id: 'n', text: 'Nina Kovač' }];
+    assert.equal(menuTypeaheadIndex(owners, 'kova', 0), -1, 'prefix, not substring');
+    assert.equal(menuTypeaheadIndex(owners, 'nina kovac', 0), 1);
+  });
+
+  it('leaves a key it does not own alone, so page shortcuts still fire', () => {
+    const result = menuKeyAction(items, { active: 0, typeahead: emptyTypeahead() }, { key: 'k', metaKey: true }, 0);
+    assert.equal(result.handled, false);
+    assert.deepEqual(result.action, { kind: 'ignore' });
+  });
+
+  it('opens a submenu on Enter and ArrowRight, and folds it back on ArrowLeft', () => {
+    const toSubmenu = drive(['ArrowDown', 'ArrowDown', 'ArrowRight']);
+    assert.equal(toSubmenu.last, 'open-submenu');
+    assert.equal(drive(['ArrowDown', 'ArrowDown', 'Enter']).last, 'open-submenu', 'Enter on a parent row opens it rather than selecting it');
+    assert.equal(drive(['ArrowLeft']).last, 'ignore', 'a root menu has nothing to fold back into');
+    assert.equal(drive(['ArrowLeft'], { nested: true }).last, 'close-submenu');
+  });
+
+  it('peels one layer on Escape and leaves entirely on Tab', () => {
+    assert.equal(drive(['Escape']).last, 'close');
+    assert.equal(drive(['Escape'], { nested: true }).last, 'close-submenu');
+    assert.equal(drive(['Tab']).last, 'close');
+    assert.equal(drive(['Tab'], { nested: true }).last, 'close', 'Tab always leaves the whole stack');
+  });
+
+  it('still answers Escape when every row is disabled and there is nothing to highlight', () => {
+    const empty = menuKeyAction([], { active: 0, typeahead: emptyTypeahead() }, { key: 'Escape' }, 0);
+    assert.deepEqual(empty.action, { kind: 'close' });
+    assert.deepEqual(menuKeyAction([], { active: 0, typeahead: emptyTypeahead() }, { key: 'ArrowDown' }, 0).action, { kind: 'ignore' });
+  });
+});
+
+/* ----------------------------- menu key wiring --------------------------- */
+
+/**
+ * The model above is only reachable if the handler is bound to an element that
+ * keydown actually passes through. It was not: every row is a
+ * `div[tabindex="-1"]`, so `focusableWithin` came back empty, the focus trap
+ * parked focus on the `.ain-popover` container, and the handler sat on the
+ * `.ain-menu` div *inside* it — an ancestor's keydown never reaches a
+ * descendant. Arrows, typeahead and Enter all did nothing, on every menu in the
+ * product. These read the source the way the RTL test reads the stylesheets.
+ */
+describe('menu key wiring', () => {
+  const source = readFileSync(new URL('../src/client/design/overlays.tsx', import.meta.url), 'utf8');
+  const menu = source.slice(source.indexOf('export function Menu({'), source.indexOf('export interface MenuButtonProps'));
+  assert.ok(menu.length > 0, 'Menu is still in overlays.tsx');
+
+  /** The opening JSX tag containing `marker`, braces balanced. */
+  const tagAround = (marker: string): string => {
+    const at = menu.indexOf(marker);
+    assert.ok(at >= 0, `${marker} is gone from Menu`);
+    const start = menu.lastIndexOf('<', at);
+    let depth = 0;
+    for (let i = start; i < menu.length; i++) {
+      const char = menu[i];
+      if (char === '{') depth += 1;
+      else if (char === '}') depth -= 1;
+      else if (char === '>' && depth === 0 && menu[i - 1] !== '=') return menu.slice(start, i + 1);
+    }
+    return assert.fail(`the tag around ${marker} never closes`);
+  };
+
+  it('hands the key handler to the popover container, which is what keydown bubbles to', () => {
+    const popover = tagAround('className={cx(\'ain-menu-pop\'');
+    assert.match(popover, /onKeyDown=\{onKeyDown\}/, 'the handler must be on the element focus is inside');
+    assert.match(popover, /initialFocus=\{activeItem\}/, 'and the popover must focus the highlighted row');
+  });
+
+  it('does not bind the handler to the inner menu div, which never receives the event', () => {
+    const menuDiv = tagAround('className="ain-menu"');
+    assert.ok(!menuDiv.includes('onKeyDown'), 'a handler here only runs when the menu div itself has focus');
+    assert.match(menuDiv, /aria-activedescendant=/, 'the active row has to be announced');
+    assert.match(menuDiv, /role="menu"/);
+  });
+
+  it('gives every row an id and the highlighted row real focus', () => {
+    const row = tagAround('className={cx(\'ain-menu__item\'');
+    assert.match(row, /id=\{itemDomId\(item\.id\)\}/, 'aria-activedescendant needs an id to point at');
+    assert.match(row, /tabIndex=\{isActive \? 0 : -1\}/, 'roving tabindex: the highlighted row is the focusable one');
   });
 });
 

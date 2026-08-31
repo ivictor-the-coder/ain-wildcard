@@ -6,7 +6,7 @@ import {
   aggregateUsage, applyTransform, computeLineAmount, previewCurve, ratToDecimal, decimalToRat,
 } from '../src/server/modules/catalog/engine';
 import { describePrice, formatMinor, formatMinorDecimal } from '../src/server/modules/catalog/format';
-import type { CurrencyOption, Price, PriceTier, Product } from '../src/server/modules/catalog/types';
+import type { CurrencyOption, Price, PriceTier, Product, TransformQuantity } from '../src/server/modules/catalog/types';
 
 const ORG = 'org_demo';
 const DANA: Auth = { kind: 'session', orgId: ORG, userId: 'usr_seed01', role: 'owner', scopes: ['*'], livemode: true };
@@ -1006,7 +1006,7 @@ describe('the pricing copy says what the engine bills', () => {
     assert.equal(display.from_amount, computeLineAmount(baseAndRate, 1, 'usd').amount);
     assert.equal(computeLineAmount(baseAndRate, 10, 'usd').amount, 1500);
     assert.equal(display.summary,
-      '$10.00 per month + $0.50 per event, falling to $5.00 base + $0.25 per event for events beyond 10');
+      '$10.00 per month + $0.50 per event, falling to $5.00 base + $0.25 per event beyond 10 events');
     assert.deepEqual(display.tiers, [
       'first 10 events: $10.00 base + $0.50 per event',
       '11 and above: $5.00 base + $0.25 per event',
@@ -1043,7 +1043,9 @@ describe('the pricing copy says what the engine bills', () => {
     const display = describePrice(packagedTiers, 'usd', 'en-US', events);
     assert.equal(display.unit, 'per 100 events');
     assert.equal(display.headline, '$10.00 per 100 events');
-    assert.equal(display.summary, '$10.00 per 100 events per month, falling to $5.00 for events beyond 500');
+    // The rate the second tier steps down to is per package, and says so: the
+    // engine bills $5.00 for a hundred events, not $5.00 for one.
+    assert.equal(display.summary, '$10.00 per 100 events per month, falling to $5.00 per 100 events beyond 500 events');
     assert.doesNotMatch(display.summary, /\$10\.00 per event\b/);
     // Tier 1 ends at package 5 — that is event 500, not event 5.
     assert.deepEqual(display.tiers, [
@@ -1096,12 +1098,102 @@ describe('the pricing copy says what the engine bills', () => {
     assert.equal(display.tiers![0], 'first 10,000 events: $99.00 base, no per-event charge');
   });
 
+  /*
+   * The shape every usage-priced vendor ships and the one the summary used to
+   * lie about: a volume discount that reverses into an overage rate. Quoting
+   * only the cheapest band told a customer at 50,000 events to expect $25,000
+   * on a price that bills $100,000, so the line has to walk the whole ladder.
+   */
+  test('a ladder that dips and then climbs quotes the band it ends on, not the cheapest one', () => {
+    const overage: PriceTier[] = [
+      { up_to: 1_000, unit_amount: 100 }, { up_to: 10_000, unit_amount: 50 }, { up_to: 'inf', unit_amount: 200 },
+    ];
+    const byVolume = priceOf({ id: 'price_dip_volume', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'volume', tiers: overage });
+    const volumeCopy = describePrice(byVolume, 'usd', 'en-US', events);
+    assert.equal(volumeCopy.summary,
+      '$1.00 per event per month, falling to $0.50 for every event once you pass 1,000, rising to $2.00 for every event once you pass 10,000');
+    assert.equal(computeLineAmount(byVolume, 10_000, 'usd', { unitLabel: 'event' }).amount, 500_000);
+    assert.equal(computeLineAmount(byVolume, 10_001, 'usd', { unitLabel: 'event' }).amount, 2_000_200);
+    // The rate the line ends on is the whole bill above 10,000, to the cent.
+    assert.equal(computeLineAmount(byVolume, 50_000, 'usd', { unitLabel: 'event' }).amount, 200 * 50_000);
+
+    const byTier = priceOf({ id: 'price_dip_graduated', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'graduated', tiers: overage });
+    const graduatedCopy = describePrice(byTier, 'usd', 'en-US', events);
+    assert.equal(graduatedCopy.summary,
+      '$1.00 per event per month, falling to $0.50 per event beyond 1,000 events, rising to $2.00 per event beyond 10,000 events');
+    const at10k = computeLineAmount(byTier, 10_000, 'usd', { unitLabel: 'event' }).amount;
+    assert.equal(at10k, 100 * 1_000 + 50 * 9_000);
+    assert.equal(computeLineAmount(byTier, 50_000, 'usd', { unitLabel: 'event' }).amount - at10k, 200 * 40_000);
+  });
+
+  test('a rising ladder says how far it climbs, and stops on the rate that keeps applying', () => {
+    const climbing = priceOf({
+      id: 'price_climbing', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'volume',
+      tiers: [{ up_to: 10, unit_amount: 10 }, { up_to: 20, unit_amount: 100 }, { up_to: 'inf', unit_amount: 1000 }],
+    });
+    const display = describePrice(climbing, 'usd', 'en-US', events);
+    assert.equal(display.summary, '$0.10 per event per month, rising through 3 tiers to $10.00 for every event once you pass 20');
+    assert.equal(computeLineAmount(climbing, 10, 'usd', { unitLabel: 'event' }).amount, 100);
+    assert.equal(computeLineAmount(climbing, 21, 'usd', { unitLabel: 'event' }).amount, 21_000);
+    assert.equal(computeLineAmount(climbing, 100, 'usd', { unitLabel: 'event' }).amount, 100_000);
+  });
+
+  test('a ladder that keeps turning counts the changes in the middle and spells out the last', () => {
+    const zigzag: PriceTier[] = [
+      { up_to: 10, unit_amount: 100 }, { up_to: 20, unit_amount: 50 }, { up_to: 30, unit_amount: 200 },
+      { up_to: 40, unit_amount: 25 }, { up_to: 50, unit_amount: 300 }, { up_to: 60, unit_amount: 10 },
+      { up_to: 'inf', unit_amount: 400 },
+    ];
+    const byVolume = priceOf({ id: 'price_zigzag_volume', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'volume', tiers: zigzag });
+    const display = describePrice(byVolume, 'usd', 'en-US', events);
+    assert.equal(display.summary,
+      '$1.00 per event per month, falling to $0.50 for every event once you pass 10, 4 more price changes, then rising to $4.00 for every event once you pass 60');
+    // Every band is still spelled out where a reader can see it.
+    assert.equal(display.tiers?.length, 7);
+    assert.equal(computeLineAmount(byVolume, 120, 'usd', { unitLabel: 'event' }).amount, 400 * 120);
+
+    const byTier = priceOf({ id: 'price_zigzag_graduated', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'graduated', tiers: zigzag });
+    const graduatedCopy = describePrice(byTier, 'usd', 'en-US', events);
+    assert.equal(graduatedCopy.summary,
+      '$1.00 per event per month, falling to $0.50 per event beyond 10 events, 4 more price changes, then rising to $4.00 per event beyond 60 events');
+    const at60 = computeLineAmount(byTier, 60, 'usd', { unitLabel: 'event' }).amount;
+    assert.equal(computeLineAmount(byTier, 120, 'usd', { unitLabel: 'event' }).amount - at60, 400 * 60);
+  });
+
+  test('a band that drops the rate but adds a base charge quotes the base too', () => {
+    // The rate falls 200x at 74 events and the bill still goes up by $500.
+    const withBase = priceOf({
+      id: 'price_base_on_step', model: 'tiered', billing_scheme: 'tiered', tiers_mode: 'graduated',
+      tiers: [
+        { up_to: 38, unit_amount: 1000, flat_amount: 50_000 }, { up_to: 74, unit_amount: 0 },
+        { up_to: 76, unit_amount: 5, flat_amount: 50_000 }, { up_to: 'inf', unit_amount: 0 },
+      ],
+    });
+    const display = describePrice(withBase, 'usd', 'en-US', events);
+    assert.equal(display.summary,
+      '$500.00 per month + $10.00 per event, falling to no charge at all beyond 38 events, '
+      + 'rising to $500.00 base + $0.05 per event beyond 74 events, falling to no charge at all beyond 76 events');
+    const at76 = computeLineAmount(withBase, 76, 'usd', { unitLabel: 'event' }).amount;
+    assert.equal(at76, 50_000 + 1000 * 38 + 50_000 + 5 * 2);
+    // "no charge at all beyond 76" is a claim about every quantity above it.
+    assert.equal(computeLineAmount(withBase, 152, 'usd', { unitLabel: 'event' }).amount, at76);
+    assert.equal(computeLineAmount(withBase, 100_000, 'usd', { unitLabel: 'event' }).amount, at76);
+  });
+
   test('the seeded metered price names its allowance, its rate and where it steps down', () => {
     const price = app.ctx.svc.catalog.requirePrice(ORG, 'price_nw_telemetry_events');
     const product = app.ctx.svc.catalog.product(ORG, price.product);
     const display = app.ctx.svc.catalog.describe(price, 'usd', 'en-US', product);
+    // Three paid bands, so the line says how far the rate walks down and where
+    // it stops: $0.00019 is the rate the customer is still paying at 50m events.
     assert.equal(display.summary,
-      'First 500,000 events included, then $0.0004 per event, falling to $0.00019 for events beyond 25,000,000 — billed monthly');
+      'First 500,000 events included, then $0.0004 per event, falling through 3 tiers to $0.00019 per event beyond 25,000,000 events — billed monthly');
+    // The rate the line ends on is the one the engine keeps charging above it:
+    // 25m more events past 25m at $0.00019 is exactly what the invoice adds.
+    const at25m = computeLineAmount(price, 25_000_000, 'usd', { unitLabel: 'event' }).amount;
+    const at50m = computeLineAmount(price, 50_000_000, 'usd', { unitLabel: 'event' }).amount;
+    assert.equal(at25m, 740_000);
+    assert.equal(at50m - at25m, 475_000);
     assert.equal(display.cheapest_unit, '$0.00019');
     assert.deepEqual(display.tiers, [
       'first 500,000 events: included',
@@ -1143,6 +1235,328 @@ describe('the pricing copy says what the engine bills', () => {
       }
     }
     assert.ok(checked >= 30, `expected to check every currency of every price, checked ${checked}`);
+  });
+});
+
+/* -------------- the summary, read back as claims about the engine --------- */
+
+/*
+ * The one line a pricing page prints verbatim is generated from the price, so
+ * the way to trust it is to feed it ladders nobody wrote by hand and read the
+ * prose back as a set of claims: every figure it quotes, every threshold it
+ * names and the direction word it chooses are re-derived from
+ * computeLineAmount. Three shapes this caught: a volume tier that halves the
+ * rate and adds a base charge was advertised as "falling to" while the engine
+ * billed 33x more at the boundary; a volume ladder that re-prices every unit
+ * 10x higher was summarised with no step clause at all; and a ladder that fell
+ * and then rose again was summarised at its cheapest band, quoting a rate the
+ * price had already abandoned — a third of every generated step clause ended
+ * on a rate the engine no longer charged, understating the bill by up to
+ * 1000x. That last one is what the closing check below exists to prevent.
+ */
+describe('a generated summary agrees with the engine on every number it prints', () => {
+  const events = productOf('event');
+  const MONEY = String.raw`\$[\d,]+(?:\.\d+)?`;
+
+  /** Every amount in a generated ladder is a whole number of minor units. */
+  const minor = (text: string) => Math.round(Number(text.replace(/[^0-9.]/g, '')) * 100);
+  const count = (text: string) => Number(text.replace(/,/g, ''));
+
+  const qty = (n: number) => n.toLocaleString('en-US');
+
+  /** The rate phrase the line opens with, before any step clause moves it. */
+  const lastOpeningClause = (summary: string): string => {
+    const head = summary.replace(/ — billed \w+$/, '').split(/, (?:falling|rising) (?:to|through) |, plus a /)[0];
+    return head.includes(', then ') ? head.slice(head.lastIndexOf(', then ') + 7) : head;
+  };
+
+  /** The allowance the opening names, which is where its rate starts applying. */
+  const allowanceOf = (summary: string): number | null => {
+    const found = /\b(?:up to|the first) ([\d,]+)/.exec(summary);
+    return found ? count(found[1]) : null;
+  };
+
+  /** The per-unit rate the line opens with, before any step clause moves it. */
+  const openingRateOf = (summary: string): number | null => {
+    const rates = [...lastOpeningClause(summary).matchAll(new RegExp(`(${MONEY}) (?:per|for every) `, 'g'))];
+    return rates.length ? minor(rates[rates.length - 1][1]) : null;
+  };
+
+  /** mulberry32: a seeded PRNG, so a failing ladder is reproducible by seed. */
+  function rng(seed: number): () => number {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const UNIT_AMOUNTS = [undefined, 0, 0, 1, 5, 25, 50, 100, 250, 500, 1000];
+  const FLAT_AMOUNTS = [undefined, undefined, undefined, 0, 500, 1000, 5000, 50_000];
+  const TRANSFORMS: (TransformQuantity | null)[] = [
+    null, null, null, null, { divide_by: 10, round: 'up' }, { divide_by: 20, round: 'down' },
+  ];
+
+  function ladder(next: () => number): Price {
+    const pick = <T>(from: readonly T[]): T => from[Math.floor(next() * from.length)];
+    const tierCount = 1 + Math.floor(next() * 4);
+    const tiers: PriceTier[] = [];
+    let cap = 0;
+    for (let i = 0; i < tierCount; i++) {
+      cap += 1 + Math.floor(next() * 40);
+      const last = i === tierCount - 1;
+      let unit_amount = pick(UNIT_AMOUNTS);
+      const flat_amount = pick(FLAT_AMOUNTS);
+      // validateTiers: a tier priced at nothing at all is not a tier.
+      if (unit_amount === undefined && flat_amount === undefined) unit_amount = 100;
+      tiers.push({
+        up_to: last ? 'inf' : cap,
+        ...(unit_amount === undefined ? {} : { unit_amount }),
+        ...(flat_amount === undefined ? {} : { flat_amount }),
+      } as PriceTier);
+    }
+    return priceOf({
+      id: 'price_generated', model: 'tiered', billing_scheme: 'tiered',
+      tiers, tiers_mode: next() < 0.5 ? 'volume' : 'graduated',
+      transform_quantity: pick(TRANSFORMS),
+      recurring: next() < 0.3
+        ? { interval: 'month', interval_count: 1, usage_type: 'metered', aggregate_usage: 'sum', trial_period_days: null, meter: 'generated' }
+        : { interval: 'month', interval_count: 1, usage_type: 'licensed', aggregate_usage: null, trial_period_days: null, meter: null },
+    });
+  }
+
+  test('every threshold, figure and direction word survives being checked', () => {
+    const next = rng(20260831);
+    let withStepClause = 0;
+    let withFallingClause = 0;
+    let withRisingClause = 0;
+    let withEntryCharge = 0;
+    let withLadderClause = 0;
+
+    for (let sample = 0; sample < 2500; sample++) {
+      const price = ladder(next);
+      const label = `${price.tiers_mode} ${JSON.stringify(price.tiers)}${price.transform_quantity ? ` /${price.transform_quantity.divide_by}` : ''}`;
+      const stride = price.transform_quantity && price.transform_quantity.divide_by > 1 ? price.transform_quantity.divide_by : 1;
+      const caps = price.tiers!.filter((t) => t.up_to !== 'inf').map((t) => Number(t.up_to));
+      const top = ((caps[caps.length - 1] ?? 10) + 5) * stride * 2;
+
+      const billed = new Map<number, number>();
+      const bill = (q: number): number => {
+        let amount = billed.get(q);
+        if (amount === undefined) {
+          amount = computeLineAmount(price, q, 'usd', { unitLabel: 'event' }).amount;
+          billed.set(q, amount);
+        }
+        return amount;
+      };
+      const packages = (q: number) => applyTransform(q, price.transform_quantity);
+
+      const display = describePrice(price, 'usd', 'en-US', events);
+      const summary = display.summary;
+
+      /* The floor a card prints as "from" is the line the engine really bills. */
+      assert.equal(display.from_amount, bill(1), `${label}: from_amount`);
+      assert.ok(minor(display.from!) >= bill(1), `${label}: "${display.from}" undersells ${bill(1)}`);
+
+      /* Nothing is called included unless it is free at every quantity. */
+      if (/^Included —/.test(summary)) {
+        for (const q of [1, 3, stride * 3, top]) {
+          assert.equal(bill(q), 0, `${label}: "${summary}" but ${q} costs ${bill(q)}`);
+        }
+      }
+
+      /* An allowance is only an allowance if it is genuinely not charged for. */
+      const free = new RegExp(`^(?:First ([\\d,]+) [^,]+ included|Free up to ([\\d,]+) [^,]+), then`).exec(summary);
+      if (free) {
+        const upTo = count(free[1] ?? free[2]);
+        assert.equal(bill(upTo), 0, `${label}: "${summary}" but ${upTo} events cost ${bill(upTo)}`);
+      }
+
+      /* A base charge that "buys" an allowance is what the engine bills there. */
+      const included = new RegExp(`^(${MONEY})(?: per \\w+)? (?:up to|including the first) ([\\d,]+)`).exec(summary);
+      if (included) {
+        const upTo = count(included[2]);
+        assert.equal(bill(upTo), minor(included[1]),
+          `${label}: "${summary}" quotes ${included[1]} for ${upTo} events, engine bills ${bill(upTo)}`);
+      }
+
+      /* A ladder of base charges quotes the next band's total, not its rate. */
+      const thenTotal = new RegExp(`up to ([\\d,]+) [^,]+, then (${MONEY})(?: per (?:day|week|month|year))?(?: — billed \\w+)?$`).exec(summary);
+      if (thenTotal) {
+        const from = count(thenTotal[1]);
+        assert.equal(bill(from + 1), minor(thenTotal[2]),
+          `${label}: "${summary}" quotes ${thenTotal[2]} past ${from}, engine bills ${bill(from + 1)}`);
+      }
+
+      /*
+       * Every rate the prose quotes is checked where the prose says it applies:
+       * volume re-prices the whole quantity, so the quoted base and rate are
+       * the entire bill past the threshold; graduated leaves earlier units
+       * alone, so crossing buys one rate-unit at the new rate plus the band's
+       * base, once.
+       */
+      const predicts = (phrase: string, from: number) => {
+        const flatMatch = new RegExp(`^(${MONEY}) base`).exec(phrase);
+        const unitMatch = new RegExp(`(?:^|\\+ )(${MONEY}) (?:for every|per) `).exec(phrase);
+        const flat = flatMatch ? minor(flatMatch[1]) : 0;
+        const unit = unitMatch ? minor(unitMatch[1]) : 0;
+        const claimed = price.tiers_mode === 'volume'
+          ? flat + unit * packages(from + 1)
+          : flat + unit * (packages(from + 1) - packages(from));
+        const charged = price.tiers_mode === 'volume' ? bill(from + 1) : bill(from + 1) - bill(from);
+        assert.equal(charged, claimed,
+          `${label}: "${summary}" predicts ${claimed} past ${from}, engine charges ${charged}`);
+        return unit;
+      };
+
+      /* The rate an allowance gives way to, checked at the first unit it bills. */
+      const then = new RegExp(`(?:up to|the first) ([\\d,]+)[^,]*, then (.+?)(?:, (?:falling|rising) (?:to|through) |, plus a |$)`).exec(summary);
+      // A flat ladder's "then" is a total, checked above; only a rate phrase —
+      // one that names a base or a unit — is a claim about what a unit costs.
+      const isRate = then && (/ base\b/.test(then[2]) || / for every /.test(then[2])
+        || new RegExp(` per (?!day|week|month|year)`).test(then[2]));
+      if (isRate) predicts(then[2], count(then[1]));
+
+      /*
+       * Every step clause in the line, not just the first: its amounts, its
+       * threshold and its direction word, each checked where that clause says
+       * it applies and against the rate the clause before it left the reader
+       * holding.
+       */
+      const stepsInProse = [...summary.matchAll(
+        new RegExp(`(falling|rising)(?: through (\\d+) tiers)? to (.+?) (?:once you pass|beyond) ([\\d,]+)`, 'g'))];
+      if (stepsInProse.length > 1 || stepsInProse.some((s) => s[2])) withLadderClause++;
+      let quoted = openingRateOf(summary);
+      for (const step of stepsInProse) {
+        withStepClause++;
+        if (step[1] === 'falling') withFallingClause++; else withRisingClause++;
+        // A run of bands that all move the same way covers itself plus the one
+        // it stepped away from, so it can never claim fewer than two tiers.
+        if (step[2]) assert.ok(Number(step[2]) >= 2, `${label}: "${summary}" claims a run of ${step[2]} tiers`);
+        const from = count(step[4]);
+        const unit = predicts(step[3], from);
+
+        if (price.tiers_mode === 'volume') {
+          // "falling" has to mean the cost per unit actually fell — at the
+          // step, or one unit later when the step itself is a wash.
+          const cheaper = (a: number, aq: number, b: number, bq: number) => a * bq < b * aq;
+          const expected = bill(from + 1) * from === bill(from) * (from + 1)
+            ? (cheaper(bill(from + 2), from + 2, bill(from + 1), from + 1) ? 'falling' : 'rising')
+            : (cheaper(bill(from + 1), from + 1, bill(from), from) ? 'falling' : 'rising');
+          assert.equal(step[1], expected,
+            `${label}: "${summary}" — ${from} events cost ${bill(from)}, ${from + 1} cost ${bill(from + 1)}, ${from + 2} cost ${bill(from + 2)}`);
+        } else if (quoted !== null) {
+          // Graduated quotes rates the customer pays per unit, so "falling"
+          // has to mean cheaper than the rate the same line last quoted.
+          assert.equal(step[1], unit < quoted ? 'falling' : 'rising',
+            `${label}: "${summary}" — the line quotes ${quoted} before ${from} and ${unit} after`);
+        }
+        quoted = unit;
+      }
+
+      /* Every band that keeps the rate but charges to enter says so, and by how much. */
+      for (const oneOff of summary.matchAll(new RegExp(`plus a (${MONEY}) base once you pass ([\\d,]+)`, 'g'))) {
+        withEntryCharge++;
+        const from = count(oneOff[2]);
+        const sameBandBefore = from - 2 * stride >= 1
+          && bill(from) - bill(from - stride) === bill(from - stride) - bill(from - 2 * stride);
+        if (sameBandBefore) {
+          const rate = bill(from) - bill(from - stride);
+          assert.equal(bill(from + 1) - bill(from), minor(oneOff[1]) + rate,
+            `${label}: "${summary}" — crossing ${from} costs ${bill(from + 1) - bill(from)}, not ${oneOff[1]} over a rate of ${rate}`);
+        }
+      }
+
+      /*
+       * Every quantity the prose names is a boundary the customer can feel —
+       * re-derived from the tiers here rather than taken from the formatter —
+       * and a ladder that changes shape somewhere never gets to stay silent.
+       */
+      const named = [...summary.matchAll(/\b(?:up to|first|beyond|once you pass|above) ([\d,]+)/gi)]
+        .map((m) => count(m[1]));
+      const slack = price.transform_quantity?.round === 'down' ? stride - 1 : 0;
+      const boundaries = new Set(caps.map((cap) => cap * stride + slack));
+      for (const quantity of named) {
+        assert.ok(boundaries.has(quantity),
+          `${label}: "${summary}" names ${quantity}, which is not a tier boundary (${[...boundaries]})`);
+      }
+      /*
+       * The closing promise, and the assertion that shuts this whole class:
+       * whatever the line says along the way, the last rate it quotes is the
+       * one a reader carries past the last threshold it names, so extrapolating
+       * that rate out to twice that threshold must never come in under the
+       * invoice. The summary that stopped at the cheapest band failed exactly
+       * here — it quoted $0.50 an event for a ladder billing $2.00 above
+       * 10,000, and a customer reading the plan card budgeted a quarter of
+       * what the renewal charged.
+       */
+      if (named.length) {
+        const anchor = Math.max(...named);
+        const far = anchor * 2;
+        const monies = [...summary.matchAll(new RegExp(MONEY, 'g'))].map((m) => minor(m[0]));
+        if (display.cheapest_unit === null) {
+          // A ladder of base charges quotes totals, not rates: the total it
+          // ends on is a fixed charge that holds at every quantity above.
+          assert.ok(monies[monies.length - 1] >= bill(far),
+            `${label}: "${summary}" ends on ${monies[monies.length - 1]}, but ${far} events cost ${bill(far)}`);
+        } else {
+          const closing = stepsInProse.length
+            ? stepsInProse[stepsInProse.length - 1][3]
+            : lastOpeningClause(summary);
+          const appliesFrom = stepsInProse.length
+            ? count(stepsInProse[stepsInProse.length - 1][4])
+            : (allowanceOf(summary) ?? anchor);
+          const rateMatch = new RegExp(`(?:^|\\+ )(${MONEY}) (?:for every|per) (?!day|week|month|year)`).exec(closing);
+          const rate = rateMatch ? minor(rateMatch[1]) : 0;
+          const baseMatch = new RegExp(`^(${MONEY}) base`).exec(closing);
+          const base = baseMatch ? minor(baseMatch[1]) : 0;
+          // A base named at the very threshold we extrapolate from has not been
+          // billed yet, so the reader adds it; anything earlier is in bill(anchor).
+          const entering = new RegExp(`plus a (${MONEY}) base once you pass ${qty(anchor)}\\b`).exec(summary);
+          const stillToCome = (anchor === appliesFrom ? base : 0) + (entering ? minor(entering[1]) : 0);
+          const reads = price.tiers_mode === 'volume'
+            ? base + rate * packages(far)
+            : bill(anchor) + stillToCome + rate * (packages(far) - packages(anchor));
+          assert.ok(reads >= bill(far),
+            `${label}: "${summary}" reads as ${reads} at ${far} events, engine bills ${bill(far)}`);
+        }
+      }
+
+      /*
+       * A line with no threshold in it is a promise about every quantity, so
+       * it has to survive being extrapolated: multiply the rate it quotes by
+       * what the customer buys at the top of the range and the engine has to
+       * agree. This is the check the 10x volume step failed — it quoted
+       * $0.50 an event on a price that bills $5.00 an event past ten.
+       */
+      if (named.length === 0) {
+        const claim = summary.replace(/ — billed \w+$/, '');
+        const interval = String.raw`(?: per (?:day|week|month|year))?`;
+        const flatOnly = new RegExp(`^(${MONEY})${interval}$`).exec(claim);
+        const baseAndRate = new RegExp(`^(${MONEY})${interval} \\+ (${MONEY}) per [^,+]+$`).exec(claim);
+        const perUnit = new RegExp(`^(${MONEY}) per [^,+]+?${interval}$`).exec(claim);
+        if (flatOnly) {
+          assert.equal(bill(top), minor(flatOnly[1]),
+            `${label}: "${summary}" is the whole price, but ${top} events cost ${bill(top)}`);
+        } else if (baseAndRate || perUnit) {
+          const rate = minor((baseAndRate ?? perUnit)![baseAndRate ? 2 : 1]);
+          const claimed = (baseAndRate ? minor(baseAndRate[1]) : 0) + rate * packages(top);
+          assert.ok(Math.abs(bill(top) - claimed) <= claimed * 0.02 + rate,
+            `${label}: "${summary}" extrapolates to ${claimed} at ${top} events, engine bills ${bill(top)}`);
+        }
+      }
+    }
+
+    // The corpus has to exercise both directions, or it proves nothing.
+    assert.ok(withFallingClause >= 250, `expected falling ladders in the corpus, got ${withFallingClause}`);
+    assert.ok(withRisingClause >= 250, `expected rising ladders in the corpus, got ${withRisingClause}`);
+    assert.ok(withStepClause >= 500, `expected step clauses to be common, got ${withStepClause}`);
+    assert.ok(withEntryCharge >= 20, `expected bands that charge to enter, got ${withEntryCharge}`);
+    // And the corpus has to contain ladders that keep moving after the first
+    // step, or the sequence the summary now renders is never exercised.
+    assert.ok(withLadderClause >= 250, `expected multi-band ladders in the corpus, got ${withLadderClause}`);
   });
 });
 

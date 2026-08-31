@@ -7,6 +7,7 @@ import type { CrmRecord, FilterNode } from '../src/server/modules/crm/types';
 const ORG = 'org_demo';
 const DANA: Auth = { kind: 'session', orgId: ORG, userId: 'usr_seed01', role: 'owner', scopes: ['*'], livemode: true };
 const MARCUS: Auth = { ...DANA, userId: 'usr_seed02' };
+const PRIYA: Auth = { ...DANA, userId: 'usr_seed03' };
 
 let app: App;
 
@@ -1424,6 +1425,64 @@ describe('history is ordered by the write, not by the clock', () => {
   });
 });
 
+/**
+ * The pager measures `has_more` by reading a row it will not show, so the row
+ * read has to be allowed one past the page ceiling. Clamping both to 500 made
+ * the largest page the one page that could never report more, and the deepest
+ * trails are exactly the ones a compliance reviewer asks for in one gulp.
+ */
+describe('the biggest history page is as honest as the small ones', () => {
+  // Priya works this deal, and her request budget is her own: filling a trail
+  // past the page ceiling takes more saves than one minute of Dana's.
+  let dealId = '';
+  let rows: string[] = [];
+
+  before(async () => {
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Audit depth probe', amount: 90_000_00, deal_stage: 'qualification' },
+    }, PRIYA);
+    dealId = deal.id;
+    const STAGES = ['qualification', 'discovery', 'technical_validation', 'proposal', 'negotiation'];
+    for (let i = 0; i < 80; i++) {
+      await expectOk('PATCH', `/v1/records/deal/${dealId}`, {
+        properties: {
+          deal_stage: STAGES[(i + 1) % STAGES.length],
+          next_step: `Confirm the cell ${i + 1} readings with controls`,
+          close_date: `2026-${String(2 + (i % 10)).padStart(2, '0')}-2${i % 8}`,
+          amount: 90_000_00 + (i + 1) * 1_000_00,
+        },
+      }, PRIYA);
+    }
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const page = await expectOk('GET',
+        `/v1/records/deal/${dealId}/history?limit=250${cursor ? `&after=${encodeURIComponent(cursor)}` : ''}`,
+        undefined, PRIYA);
+      rows.push(...page.data.map((r: { id: string }) => r.id));
+      cursor = page.next_cursor;
+      pages++;
+    } while (cursor && pages < 20);
+    assert.ok(rows.length > 500, `this only bites past the 500-row ceiling; the trail is ${rows.length} rows`);
+  });
+
+  test('a full page at the ceiling still hands back the cursor for the rest', async () => {
+    const page = await expectOk('GET', `/v1/records/deal/${dealId}/history?limit=500`, undefined, PRIYA);
+    assert.equal(page.data.length, 500);
+    assert.equal(page.has_more, true, 'the largest page claimed the trail ended at exactly 500 rows');
+    assert.ok(page.next_cursor, 'a page with more behind it must hand back a cursor');
+
+    const rest = await expectOk('GET',
+      `/v1/records/deal/${dealId}/history?limit=500&after=${encodeURIComponent(page.next_cursor)}`, undefined, PRIYA);
+    assert.equal(rest.data.length, rows.length - 500);
+    assert.equal(rest.has_more, false);
+    assert.deepEqual(
+      [...page.data, ...rest.data].map((r: { id: string }) => r.id), rows,
+      'paging at the ceiling did not reproduce the trail',
+    );
+  });
+});
+
 describe('the timeline pages on a position, not on a timestamp', () => {
   const AT = Date.UTC(2026, 4, 29, 9, 0, 0);
   let dealId = '';
@@ -1494,6 +1553,201 @@ describe('the timeline pages on a position, not on a timestamp', () => {
   });
 });
 
+/**
+ * A page limit counts items a person reads; the audit trail counts rows a save
+ * wrote. Sizing the history read as `limit * 4` rows confused the two: one
+ * stage change writes about ten rows, so a page of fifty items ran out of
+ * window after forty-five and the response then said `has_more: false` on a
+ * deal with sixteen more saves behind it. Worse, the row window landed inside
+ * a save, and the fragment it caught folded into a second entry titled after
+ * `weighted_amount` — a calculated property nobody typed — standing in for the
+ * stage move that produced it. Both are the same bug, so both are tested here.
+ */
+describe('a timeline page is measured in items, not in audit rows', () => {
+  const STAGES = ['qualification', 'discovery', 'technical_validation', 'proposal', 'negotiation'];
+  let dealId = '';
+  let whole: { id: string; kind: string; title: string; data: Record<string, unknown> }[] = [];
+
+  before(async () => {
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Pager probe', amount: 200_000_00, deal_stage: 'qualification' },
+    });
+    dealId = deal.id;
+    // Twelve stage moves, each its own PATCH, each carrying what a rep
+    // actually types when a deal moves: the new stage, the next step, a fresh
+    // close date and the number the customer just quoted back. Ain then
+    // restamps probability, weighted amount, forecast category and
+    // stage_entered_at, so one save is eight audit rows and one timeline line.
+    for (let i = 0; i < 12; i++) {
+      await expectOk('PATCH', `/v1/records/deal/${dealId}`, {
+        properties: {
+          deal_stage: STAGES[(i + 1) % STAGES.length],
+          next_step: `Walk cell ${i + 1} with the plant manager`,
+          close_date: `2026-${String(3 + (i % 9)).padStart(2, '0')}-1${i % 9}`,
+          amount: 200_000_00 + (i + 1) * 5_000_00,
+        },
+      });
+    }
+    whole = (await expectOk('GET', `/v1/records/deal/${dealId}/timeline?limit=200`)).data;
+  });
+
+  test('one save writes more audit rows than a page has room for', async () => {
+    // The point of the scenario: a page limit counts lines a person reads, and
+    // every one of those lines is several rows of audit trail. The read that
+    // fills a page has to be measured in the first unit, not the second. If a
+    // save here ever stops being many rows, the paging tests below go quietly
+    // vacuous, so the shape of the fixture is asserted rather than assumed.
+    const rows = await allHistory(dealId);
+    const perSave = new Map<string, number>();
+    for (const row of rows) perSave.set(row.write_id, (perSave.get(row.write_id) ?? 0) + 1);
+    assert.equal(perSave.size, 13, 'twelve stage moves plus the create');
+    const thinnest = Math.min(...perSave.values());
+    assert.ok(thinnest >= 5,
+      `every save here should be at least five rows for this to bite; the thinnest wrote ${thinnest}`);
+    assert.equal(whole.filter((i) => i.kind === 'property_change').length, 12,
+      'twelve saves after the create is twelve lines — the create is already told by its event');
+  });
+
+  test('walking limit=5 to exhaustion returns exactly what limit=200 does', async () => {
+    for (const limit of [1, 5, 10]) {
+      const walked: string[] = [];
+      const flags: boolean[] = [];
+      let cursor: string | null = null;
+      let pages = 0;
+      do {
+        const page = await expectOk('GET',
+          `/v1/records/deal/${dealId}/timeline?limit=${limit}${cursor ? `&after=${encodeURIComponent(cursor)}` : ''}`);
+        walked.push(...page.data.map((i: { id: string }) => i.id));
+        flags.push(page.has_more);
+        assert.equal(page.next_cursor === null, !page.has_more,
+          `has_more and next_cursor disagreed at limit ${limit}`);
+        cursor = page.next_cursor;
+        pages++;
+      } while (cursor && pages <= whole.length + 2);
+
+      assert.deepEqual(walked, whole.map((i) => i.id),
+        `paging at limit ${limit} did not reproduce the whole timeline`);
+      assert.equal(new Set(walked).size, walked.length, `limit ${limit} handed back an item twice`);
+      assert.equal(flags[flags.length - 1], false, `the last page at limit ${limit} still claimed more`);
+      assert.ok(flags.slice(0, -1).every(Boolean), `a middle page at limit ${limit} dead-ended`);
+    }
+  });
+
+  test('no page size invents an entry that no other page size has', async () => {
+    const known = new Set(whole.map((i) => i.id));
+    for (const limit of [1, 3, 5, 7, 10, 20, 50]) {
+      const page = await expectOk('GET', `/v1/records/deal/${dealId}/timeline?limit=${limit}`);
+      for (const item of page.data as { id: string; title: string; kind: string }[]) {
+        assert.ok(known.has(item.id),
+          `limit ${limit} produced "${item.title}", which exists at no other page size`);
+      }
+      const titles = new Set((page.data as { kind: string; title: string }[])
+        .filter((i) => i.kind === 'property_change').map((i) => i.title));
+      assert.deepEqual([...titles], ['Stage changed'],
+        `every save here was a stage move, but limit ${limit} titled one ${[...titles].join(', ')}`);
+    }
+  });
+
+  test('every entry is a whole save — the row count matches what /history reports', async () => {
+    const rows = await allHistory(dealId);
+    const perWrite = new Map<string, number>();
+    for (const row of rows) perWrite.set(row.write_id, (perWrite.get(row.write_id) ?? 0) + 1);
+
+    for (const limit of [1, 5, 200]) {
+      let cursor: string | null = null;
+      let pages = 0;
+      do {
+        const page = await expectOk('GET',
+          `/v1/records/deal/${dealId}/timeline?limit=${limit}${cursor ? `&after=${encodeURIComponent(cursor)}` : ''}`);
+        for (const item of page.data as { kind: string; title: string; data: Record<string, unknown> }[]) {
+          if (item.kind !== 'property_change') continue;
+          const writeId = item.data.write_id as string;
+          const folded = 1 + ((item.data.also as unknown[] | undefined)?.length ?? 0);
+          assert.equal(folded, perWrite.get(writeId),
+            `"${item.title}" folded ${folded} of the ${perWrite.get(writeId)} rows save ${writeId} wrote`);
+        }
+        cursor = page.next_cursor;
+        pages++;
+      } while (cursor && pages <= whole.length + 2);
+    }
+  });
+});
+
+/**
+ * A company's account timeline is where an AE checks what the whole account
+ * has been up to. Reading the first hundred links and calling that a page left
+ * thirty contacts off a 130-contact account and reported `has_more: false`,
+ * while `/associations?limit=200` cheerfully returned all 130.
+ */
+describe('an account timeline reaches every contact on the account', () => {
+  const SIZE = 130;
+  let companyId = '';
+
+  // Marcus owns this account, and every call in here is his: the request
+  // budget is per user, and a 130-row import plus the reads that check it does
+  // not belong on the same minute as the rest of the suite.
+  before(async () => {
+    const company = await expectOk('POST', '/v1/records/company', {
+      properties: { name: 'Bigco Fabrication', domain: 'bigco-fabrication.test', industry: 'metals' },
+    }, MARCUS);
+    companyId = company.id;
+    const roster = Array.from({ length: SIZE }, (_, i) => ({
+      properties: { first_name: 'Line', last_name: `Operator ${i}`, email: `operator.${i}@bigco-fabrication.test` },
+    }));
+    const imported = await expectOk('POST', '/v1/records/contact/batch',
+      { operation: 'create', records: roster }, MARCUS);
+    assert.equal(imported.created, SIZE, 'the roster import did not land');
+    for (const row of imported.results as { id: string }[]) {
+      await expectOk('POST', '/v1/associations', { from_id: companyId, to_id: row.id }, MARCUS);
+    }
+  });
+
+  test('all 130 links are on the timeline, not the first hundred', async () => {
+    const edges = await expectOk('GET', `/v1/records/company/${companyId}/associations?limit=200`, undefined, MARCUS);
+    assert.equal(edges.data.length, SIZE);
+
+    const whole = await expectOk('GET', `/v1/records/company/${companyId}/timeline?limit=200`, undefined, MARCUS);
+    const links = whole.data.filter((i: { kind: string }) => i.kind === 'association');
+    assert.equal(links.length, SIZE, 'the account timeline stopped short of the account');
+    assert.equal(
+      new Set(links.map((i: { record_id: string }) => i.record_id)).size,
+      new Set(edges.data.map((e: { record_id: string }) => e.record_id)).size,
+    );
+  });
+
+  test('paging the account timeline reaches the same set the whole page does', async () => {
+    const whole = (await expectOk('GET', `/v1/records/company/${companyId}/timeline?limit=200`, undefined, MARCUS))
+      .data.map((i: { id: string }) => i.id);
+    const walked: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const page = await expectOk('GET',
+        `/v1/records/company/${companyId}/timeline?limit=25${cursor ? `&after=${encodeURIComponent(cursor)}` : ''}`,
+        undefined, MARCUS);
+      walked.push(...page.data.map((i: { id: string }) => i.id));
+      cursor = page.next_cursor;
+      pages++;
+    } while (cursor && pages <= 40);
+    assert.deepEqual(walked, whole, 'paging an account timeline lost or repeated a link');
+  });
+});
+
+/** Every audit row on a record, walked through the cursor the endpoint emits. */
+async function allHistory(recordId: string): Promise<{ id: string; write_id: string; seq: number }[]> {
+  const rows: { id: string; write_id: string; seq: number }[] = [];
+  let cursor: string | null = null;
+  let pages = 0;
+  do {
+    const page = await expectOk('GET',
+      `/v1/records/deal/${recordId}/history?limit=100${cursor ? `&after=${encodeURIComponent(cursor)}` : ''}`);
+    rows.push(...page.data);
+    cursor = page.next_cursor;
+    pages++;
+  } while (cursor && pages < 50);
+  return rows;
+}
+
 describe('an amount has a ceiling, so no rollup can go non-finite', () => {
   const assertFinite = (value: unknown, path: string): void => {
     if (typeof value === 'number') {
@@ -1537,6 +1791,13 @@ describe('an amount has a ceiling, so no rollup can go non-finite', () => {
       '/v1/pipelines/deal/new_business/velocity',
       `/v1/records/deal/${deal.id}`,
       `/v1/records/deal/${deal.id}/timeline?limit=50`,
+      `/v1/records/deal/${deal.id}/history?limit=50`,
+      `/v1/records/deal/${deal.id}/stage-history`,
+      `/v1/records/deal/${deal.id}/similar`,
+      '/v1/records/deal?limit=25',
+      '/v1/records/company?limit=25',
+      '/v1/crm/schema',
+      '/v1/objects/deal',
     ]) {
       assertFinite(await expectOk('GET', path), path);
     }

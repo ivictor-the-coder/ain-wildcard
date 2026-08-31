@@ -7,7 +7,7 @@ import { useFieldControl } from './fields';
 import { formatDate, formatDateRange, useFormat } from './format';
 import { startOfDay } from '../../shared/time';
 import {
-  addDays, addMonths, dayOf, inRange, isSameDay, monthMatrix, monthOf, nextRange,
+  addDays, addMonths, dayOf, inRange, isSameDay, isTimestamp, monthMatrix, monthOf, nextRange,
   startOfMonthUtc, weekdayLabels, RANGE_PRESETS, type DateRange,
 } from './calendar-core';
 import './fields.css';
@@ -33,13 +33,22 @@ export interface CalendarProps {
 }
 
 export function Calendar({
-  value, onSelect, range, hoverTs, onHover, month, onMonthChange, min, max,
+  value, onSelect, range, hoverTs, onHover, month: monthProp, onMonthChange, min, max,
   locale = 'en-US', weekStartsOn = 0, today = Date.now(), hideNav = 'none', className,
 }: CalendarProps) {
+  // The month is a caller's number — an API field, a decoded query string, a bad
+  // import. Out of range it makes every `getUTC*` NaN and throws in the month
+  // label, which unmounts the tree that rendered the calendar. Fall back to the
+  // month of today instead of taking the page down.
+  const now = isTimestamp(today) ? today : Date.now();
+  const month = isTimestamp(monthProp) ? monthProp : startOfMonthUtc(now);
   const days = useMemo(() => monthMatrix(month, weekStartsOn), [month, weekStartsOn]);
   const labels = useMemo(() => weekdayLabels(locale, weekStartsOn), [locale, weekStartsOn]);
   const gridRef = useRef<HTMLDivElement>(null);
-  const [focusTs, setFocusTs] = useState<number>(() => value ?? range?.start ?? startOfDay(today));
+  const [focusTs, setFocusTs] = useState<number>(() => {
+    const wanted = value ?? range?.start ?? now;
+    return startOfDay(isTimestamp(wanted) ? wanted : now);
+  });
 
   useEffect(() => {
     if (monthOf(focusTs) !== monthOf(month)) setFocusTs(startOfMonthUtc(month));
@@ -95,7 +104,7 @@ export function Calendar({
           const isStart = effectiveRange?.start != null && isSameDay(d.ts, effectiveRange.start);
           const isEnd = effectiveRange?.end != null && isSameDay(d.ts, effectiveRange.end);
           const within = effectiveRange ? inRange(d.ts, effectiveRange) : false;
-          const isToday = isSameDay(d.ts, today);
+          const isToday = isSameDay(d.ts, now);
           return (
             <button
               key={d.ts}

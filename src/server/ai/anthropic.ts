@@ -231,7 +231,10 @@ const SYSTEM_PREAMBLE =
   'Be specific and brief — an operator reading your answer should be able to act on it without opening another screen.';
 
 export function anthropicProvider(config: Config): AiProvider {
-  const baseUrl = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
+  // The endpoint is read per call, like the key, so pointing the platform at a
+  // gateway takes effect on the next request instead of on the next restart —
+  // and the endpoint can never disagree with the key it is sent with.
+  const baseUrl = (): string => process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
   return {
     id: 'anthropic',
     label: 'Claude (Anthropic)',
@@ -265,7 +268,7 @@ export function anthropicProvider(config: Config): AiProvider {
       for (let step = 0; step < budget.steps; step++) {
         const response = await callApi({
           apiKey,
-          baseUrl,
+          baseUrl: baseUrl(),
           onDelta: call?.onDelta,
           body: {
             model,

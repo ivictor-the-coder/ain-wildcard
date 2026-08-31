@@ -16,6 +16,7 @@ import { describeWindow } from './dates';
 import type { MetricDetection, MetricSubject } from './metrics';
 import type { AccountProfileResult, MetricToolResult, RecordSearchResult, TimelineItem, WorkspaceSearchResult, RecordAggregateResult } from './functions';
 import type { ResolvedEntity } from './resolve';
+import type { WindowPair } from './plan';
 import type { DraftResult } from './draft';
 import type { PendingApproval } from './runtime';
 import { countOf, formatSignedPercent, humanise, listPhrase, sentenceJoin, truncate } from './text';
@@ -38,6 +39,12 @@ export interface SynthesisInput {
   intent: IntentResult;
   workspace: WorkspaceProfile;
   window: TimeWindow;
+  /** Every period the question named, in the order it named them. */
+  windows?: TimeWindow[];
+  /** The two periods a comparison measured, when this is one. */
+  comparison?: WindowPair | null;
+  /** True when the question asks who is biggest rather than what the total is. */
+  ranking?: boolean;
   subject: MetricSubject | null;
   entities: ResolvedEntity[];
   steps: StepResult[];
@@ -82,6 +89,21 @@ export class Facts {
 
 const bullet = (line: string) => `• ${line}`;
 
+/**
+ * A database id, in the place a name belongs.
+ *
+ * Nothing an answer says out loud may be one of these. When a side of a
+ * comparison, a group or a write target has no resolvable name, the answer says
+ * so rather than printing the row's primary key into a sentence a board reads.
+ */
+export const RAW_ID = /^[a-z][a-z_]{1,12}_[A-Za-z0-9_]{2,40}$/;
+
+export const looksLikeId = (value: string): boolean => RAW_ID.test(value.trim());
+
+/** A label safe to say out loud, or `null` when the record has no name. */
+const namedOrNull = (label: string | null | undefined): string | null =>
+  label && !looksLikeId(label) ? label : null;
+
 /** How each metric reads with two periods either side of it. */
 const COMPARE_VERB: Record<string, string> = {
   spend: 'spent', revenue: 'collected', invoiced: 'invoiced', closed_won: 'booked',
@@ -113,10 +135,11 @@ export function describeWrite(
   args: Record<string, unknown>,
   nameOf: (id: string) => string | null = () => null,
 ): string[] {
-  const named = (id: string) => {
-    const label = nameOf(id);
-    return label ? `${label} (${id})` : id;
-  };
+  // The card a human approves has to read as records, not as primary keys. An
+  // id that resolves to nothing is a target that has changed since the write
+  // was prepared, and saying so is the point of showing the card at all. The
+  // ids stay in `pending_approvals[].args`, where a machine reads them.
+  const named = (id: string) => namedOrNull(nameOf(id)) ?? 'a record I can no longer name';
   const value = (key: string) => (args[key] === undefined || args[key] === null ? '' : String(args[key]));
   if (tool === 'add_note') {
     const ids = Array.isArray(args.record_ids) ? (args.record_ids as unknown[]).map(String) : [];
@@ -204,6 +227,71 @@ function metricSentence(metric: MetricToolResult, input: SynthesisInput, facts: 
   }
   if (metric.window.partial && !metric.snapshot) lines.push(`${period} is still running, so this is a period-to-date figure.`);
   if (metric.note) lines.push(metric.note);
+  return lines;
+}
+
+const NUMBER_WORDS = ['no', 'one', 'two', 'three', 'four', 'five', 'six'];
+const numberWord = (n: number): string => NUMBER_WORDS[n] ?? String(n);
+
+/**
+ * A comparison measures two periods. When the question named more, the answer
+ * has to say which ones it left out — a period the caller named, parsed, and
+ * then never saw again is the same silent substitution as measuring the wrong
+ * quarter, just later in the sentence.
+ */
+function droppedPeriods(input: SynthesisInput, measured: string[]): string[] {
+  const named = input.windows ?? [];
+  if (named.length <= measured.length) return [];
+  const dropped = named.filter((w) => !measured.includes(w.label));
+  if (!dropped.length) return [];
+  return [[
+    `You named ${numberWord(named.length)} periods; I compared ${listPhrase(measured)} and left ${listPhrase(dropped.map((w) => w.label))} out —`,
+    `a comparison is between two periods.`,
+    `Ask again naming two, or ask about ${listPhrase(dropped.map((w) => w.label), 'or')} on ${dropped.length === 1 ? 'its' : 'their'} own.`,
+  ].join(' ')];
+}
+
+/**
+ * The ranked answer: who is biggest, in order, with the money on every row.
+ * This is what "which accounts booked the most" has to return — the total alone
+ * does not answer it, and a list of records ordered by recency answers a
+ * different question entirely.
+ */
+function rankedAnswer(metric: MetricToolResult, input: SynthesisInput): string[] {
+  const grouped = metric.groups.length ? metric.groups : metric.top_accounts.map((a) => ({
+    key: a.id, label: a.label, formatted: a.formatted, value: 0, count: 0,
+  }));
+  const rows = grouped.filter((row) => !looksLikeId(row.label));
+  const period = metric.snapshot ? 'right now' : metric.window.label === 'all time' ? 'across all time' : `in ${metric.window.label}`;
+  const noun = metric.label.toLowerCase();
+  if (!rows.length) {
+    return grouped.length
+      ? [
+          `I can rank ${countOf(grouped.length, 'group')} by ${noun} ${period}, but none of them carries a name I can print — every row came back as a bare id.`,
+          `I will not put primary keys in a ranking, so here is the total instead: ${metric.formatted} from ${metric.source}.`,
+        ]
+      : [
+          `Nothing to rank: no account has any ${noun} ${period}, so the total is ${metric.formatted} and the list would be empty.`,
+          `That is the honest answer rather than a ranking of records by how recently they were touched.`,
+        ];
+  }
+  // "Top 5" means five. Asking for a number and getting eight is the same class
+  // of not-listening as asking for a quarter and getting a year.
+  const asked = Number(input.question.match(/\btop\s+(\d{1,2})\b/i)?.[1] ?? 0);
+  const shown = rows.slice(0, asked > 0 ? asked : 8);
+  const [top, ...rest] = shown;
+  const lines = [
+    `${top.label} is the biggest by ${noun} ${period}, at ${top.formatted}${metric.value > 0 && metric.unit === 'money' ? ` of ${metric.formatted} across the workspace` : ''}.`,
+  ];
+  lines.push(shown.map((row, index) =>
+    `${index + 1}. ${row.label} — ${row.formatted}${row.count ? ` from ${countOf(row.count, metric.sourceKind === 'invoices' ? 'invoice' : 'deal')}` : ''}`).join('\n'));
+  if (asked > 0 && rows.length > asked) {
+    lines.push(`${countOf(rows.length - asked, 'other account')} had ${noun} ${period}; say a larger number and I will show them.`);
+  }
+  if (!rest.length) lines.push(`Only one account has any ${noun} ${period}, so there is nothing behind it to rank.`);
+  if (!(input.windows ?? []).length && !metric.snapshot) {
+    lines.push(`You named no period, so this covers ${metric.window.label} — name a quarter or a year and I will re-rank on it.`);
+  }
   return lines;
 }
 
@@ -429,6 +517,19 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
     return { content: drafted, citations: citationsFrom(input, drafted) };
   }
 
+  // A ranking question is answered by the ranking, whatever the classifier
+  // called the sentence it arrived in — but only when the metric actually came
+  // back grouped. A "ranking" of nothing next to a workspace total is a
+  // sentence that contradicts itself, so that case takes the ordinary path.
+  const rankable = input.ranking && !input.pendingApprovals.length
+    ? metrics.filter((m) => m.groups.length || m.top_accounts.length).slice(-1)[0]
+    : undefined;
+  if (rankable) {
+    const ranked = rankedAnswer(rankable, input);
+    const content = ranked.join('\n\n');
+    return { content, citations: citationsFrom(input, content) };
+  }
+
   switch (input.intent.intent) {
     case 'compare': {
       const periods = periodPair(metrics);
@@ -454,10 +555,24 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
         for (const metric of [a, b]) {
           if (metric.groups.length) blocks.push(`${metric.window.label} breakdown: ${metric.groups.slice(0, 6).map((g) => `${g.label} ${g.formatted}`).join(' · ')}.`);
         }
+        blocks.push(...droppedPeriods(input, [a.window.label, b.window.label]));
         break;
       }
       if (metrics.length >= 2) {
         const [a, b] = metrics;
+        const sideOf = (metric: MetricToolResult): string | null =>
+          metric.subject ? namedOrNull(metric.subject.label) : input.workspace.name;
+        // A side with no name is not a side. Printing its id in the sentence
+        // where a company name goes is how a comparison stops being readable.
+        if (!sideOf(a) || !sideOf(b)) {
+          const nameless = [a, b].filter((m) => !sideOf(m)).map((m) => m.subject?.id ?? 'an unidentified record');
+          blocks.push([
+            `I will not put ${countOf(nameless.length, 'record')} in a comparison without a name for ${nameless.length === 1 ? 'it' : 'them'}.`,
+            `One side of this resolved to ${listPhrase(nameless)}, which carries no display name in ${input.workspace.name}, so I have not written the sentence.`,
+            `Name both accounts as they appear in the CRM and I will run it.`,
+          ].join(' '));
+          break;
+        }
         const leader = a.value >= b.value ? a : b;
         const trailer = a.value >= b.value ? b : a;
         const gap = Math.abs(a.value - b.value);
@@ -465,10 +580,16 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
         const percent = trailer.value !== 0 ? `, ${((gap / Math.abs(trailer.value)) * 100).toFixed(0)}% ahead` : '';
         const scope = a.snapshot ? 'right now' : `in ${a.window.label}`;
         blocks.push(gap === 0
-          ? `${leader.subject?.label ?? input.workspace.name} and ${trailer.subject?.label ?? 'the other account'} are level on ${a.label.toLowerCase()} ${scope}, both at ${leader.formatted}.`
-          : `On ${a.label.toLowerCase()} ${scope}, ${leader.subject?.label ?? input.workspace.name} leads with ${leader.formatted} against ${trailer.subject?.label ?? 'the other account'} at ${trailer.formatted} — a gap of ${gapText}${percent}.`);
+          ? `${sideOf(leader)} and ${sideOf(trailer)} are level on ${a.label.toLowerCase()} ${scope}, both at ${leader.formatted}.`
+          : `On ${a.label.toLowerCase()} ${scope}, ${sideOf(leader)} leads with ${leader.formatted} against ${sideOf(trailer)} at ${trailer.formatted} — a gap of ${gapText}${percent}.`);
         for (const metric of [leader, trailer]) {
-          blocks.push(bullet(`${metric.subject?.label ?? input.workspace.name}: ${metric.formatted} from ${metric.source}${metric.change ? `, ${metric.change.delta >= 0 ? 'up' : 'down'} on ${metric.change.previous_formatted} the period before` : ''}`));
+          // "up on $0" is not what a flat line says. A zero delta is unchanged.
+          const movement = metric.change
+            ? metric.change.delta === 0
+              ? `, unchanged on ${metric.change.previous_formatted} the period before`
+              : `, ${metric.change.delta > 0 ? 'up' : 'down'} on ${metric.change.previous_formatted} the period before`
+            : '';
+          blocks.push(bullet(`${sideOf(metric)}: ${metric.formatted} from ${metric.source}${movement}`));
         }
       } else if (metrics.length === 1) {
         const metric = metrics[0];
@@ -644,7 +765,10 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
           ? `Approve or edit ${countOf(input.pendingApprovals.length, 'pending write')} from the approvals queue and I will finish the job.`
           : 'Approve it from the approvals queue and I will write it; decline and nothing happens.');
       } else if (written.length) {
-        blocks.push(`Done — ${listPhrase(written.map((s) => describeWrite(s.tool, s.args, nameOf)[0] ?? s.tool)).toLowerCase()}.`);
+        // Only the leading word is lowercased. Lowercasing the whole phrase
+        // turned "Rheinwerk Antriebstechnik" into "rheinwerk antriebstechnik".
+        const lowerFirst = (s: string) => (s ? s[0].toLowerCase() + s.slice(1) : s);
+        blocks.push(`Done — ${listPhrase(written.map((s) => lowerFirst(describeWrite(s.tool, s.args, nameOf)[0] ?? s.tool)))}.`);
         for (const step of written) blocks.push(describeWrite(step.tool, step.args, nameOf).join('\n'));
       } else {
         const failed = input.steps.filter((s) => !s.ok && s.write);

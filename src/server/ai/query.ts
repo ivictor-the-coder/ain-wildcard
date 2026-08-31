@@ -259,6 +259,32 @@ export function getRecord(ctx: Ctx, orgId: string, id: string): RecordSummary | 
   };
 }
 
+export interface RecordStanding {
+  id: string;
+  state: 'live' | 'archived' | 'merged' | 'missing';
+  name: string | null;
+  /** Where a merged record's history now lives. */
+  mergedInto: string | null;
+}
+
+/**
+ * What has become of a record id.
+ *
+ * An approval can sit in the queue while the record it names is archived,
+ * merged away or deleted, and `getRecord` answers "does a row exist" rather
+ * than "is this still a record a write may land on". Executing onto an archived
+ * account writes into a timeline nobody reads.
+ */
+export function recordStanding(ctx: Ctx, orgId: string, id: string): RecordStanding {
+  if (!hasTable(ctx.db, 'crm_records')) return { id, state: 'missing', name: null, mergedInto: null };
+  const row = ctx.db.get<{ display_name: string; archived: number; merged_into: string | null }>(
+    `SELECT display_name, archived, merged_into FROM crm_records WHERE org_id = ? AND id = ?`, orgId, id);
+  if (!row) return { id, state: 'missing', name: null, mergedInto: null };
+  if (row.merged_into) return { id, state: 'merged', name: row.display_name, mergedInto: row.merged_into };
+  if (row.archived) return { id, state: 'archived', name: row.display_name, mergedInto: null };
+  return { id, state: 'live', name: row.display_name, mergedInto: null };
+}
+
 /** Records associated with `recordId`, optionally of one object type. */
 export function associatedRecords(ctx: Ctx, orgId: string, recordId: string, objectType?: string, limit = 50): RecordSummary[] {
   if (!hasTable(ctx.db, 'crm_associations')) return [];

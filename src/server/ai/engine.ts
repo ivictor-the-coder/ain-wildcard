@@ -14,13 +14,13 @@ import type { Ctx } from '../kernel/context';
 import type { AiCallContext, AinAiRuntime, PendingApproval, AiTraceSpan } from './runtime';
 import { classifyIntent, describeIntent, type IntentResult, type TaskIntent } from './intent';
 import {
-  asksYearOverYear, defaultWindow, describeWindow, periodMentions, previousWindow,
-  resolveWindows, shiftWindowYears, type TimeWindow,
+  allTimeWindow, asksYearOverYear, defaultWindow, describeWindow, periodMentions, previousWindow,
+  resolveWindows, reversedRange, shiftWindowYears, unresolvedPeriods, type TimeWindow,
 } from './dates';
 import { entityIndex, workspaceProfile, type WorkspaceProfile } from './grounding';
 import { extractMentions, mentionedTypes, resolveEntities, type ResolvedEntity } from './resolve';
 import {
-  detectGrouping, detectMetric, metricById, metricIds, stageSets,
+  detectGrouping, detectMetric, isRankingQuestion, metricById, metricIds, stageSets,
   type GroupBy, type MetricDetection, type MetricSubject,
 } from './metrics';
 import { comprehend, isUsableEntity, refusalFor, workspaceVocabulary, type Refusal } from './clarify';
@@ -222,16 +222,25 @@ export function builtinEngine(): AiProvider {
       runtime?.note(call, 'plan', 'classify_intent', describeIntent(intent));
 
       /* 2. what period — every one the question names, in the order it names them */
-      const windows = resolveWindows(question, workspace.now, 3);
+      const windows = resolveWindows(question, workspace.now, 6);
       const mentions = periodMentions(question);
+      const unresolved = unresolvedPeriods(question, workspace.now);
+      const backwards = reversedRange(question);
+      const groupBy = detectGrouping(question);
+      const ranking = isRankingQuestion(question);
       const explicit = windows[0] ?? null;
-      const window = explicit ?? defaultWindow(workspace.now);
+      // A ranking question with no period in it is not a question about this
+      // quarter: "who is my biggest customer" means on the books, all told.
+      const fallbackWindow = ranking && groupBy === 'account'
+        ? allTimeWindow(workspace.now)
+        : defaultWindow(workspace.now);
+      const window = explicit ?? fallbackWindow;
       const comparison = intent.intent === 'compare' ? comparisonWindows(question, windows, workspace.now) : null;
       reasoning.push(explicit
         ? `Period${windows.length > 1 ? 's' : ''} ${windows.map((w) => `"${w.matched.trim()}" → ${w.label} (${describeWindow(w, workspace.locale)})`).join('; ')}.`
         : `No period in the question; defaulting to ${window.label}.`);
-      if (mentions.length > windows.length) {
-        reasoning.push(`Period expressions found: ${mentions.map((m) => `"${m.text}"`).join(', ')}; ${windows.length} of ${mentions.length} resolved to a date range.`);
+      if (unresolved.length) {
+        reasoning.push(`Period expressions found: ${mentions.map((m) => `"${m.text}"`).join(', ')}; ${mentions.length - unresolved.length} of ${mentions.length} resolved to a date range. Unparsed: ${unresolved.map((m) => `"${m.text}"`).join(', ')}.`);
       }
       if (comparison) {
         reasoning.push(`Comparison windows: ${comparison.a.label} against ${comparison.b.label} (${comparison.source.replace(/_/g, ' ')}).`);
@@ -253,9 +262,9 @@ export function builtinEngine(): AiProvider {
       }
 
       /* 4. which metric and grouping */
-      const groupBy = detectGrouping(question);
       if (metric) reasoning.push(`Metric: ${metric.metric.label} (matched "${metric.matched}", score ${metric.score})${metric.alternatives.length ? `, over ${metric.alternatives.map((a) => a.id).join(', ')}` : ''}.`);
       if (groupBy !== 'none') reasoning.push(`Grouping requested: by ${groupBy}.`);
+      if (ranking) reasoning.push(`The question asks for a ranking, so the answer leads with the ordered groups rather than a list of records.`);
 
       /* 5. can this be answered at all, or must it be refused */
       const index = entityIndex(ctx, orgId);
@@ -263,6 +272,7 @@ export function builtinEngine(): AiProvider {
       const countableTypes = types.filter((t) => t !== 'activity' && t !== 'customer');
       const refusal: Refusal | null = refusalFor({
         question, workspace, intent, comprehension, metric, entities, types, windows, mentions,
+        unresolved, reversedRange: backwards,
         metrics: metricIds().map((id) => metricById(id)?.label ?? id),
         countableTypes,
       });
@@ -280,6 +290,7 @@ export function builtinEngine(): AiProvider {
       const toolIndex = new Map(available.map((tool) => [tool.name, tool]));
       const planInput = {
         question, intent: intent.intent, window, windows, comparison, entities, subject, metric, groupBy, types,
+        ranking,
         stages: stageSets(ctx, orgId),
         namedSomething: extractMentions(question).some((mention) => mention.kind !== 'ngram'),
         tools: available, workspace, maxSteps: Math.max(1, budget.steps - 1),
@@ -370,7 +381,7 @@ export function builtinEngine(): AiProvider {
       const synthesis = refusal
         ? { content: refusal.content, citations: [] }
         : synthesise({
-            question, intent, workspace, window, subject, entities, steps, metric, draft,
+            question, intent, workspace, window, windows, comparison, ranking, subject, entities, steps, metric, draft,
             pendingApprovals: (call.pendingApprovals ?? []) as PendingApproval[],
             writeBlocked,
             scopedTools,
@@ -429,7 +440,9 @@ export function builtinEngine(): AiProvider {
         writeBlocked,
         scopedTools,
         budgetExhausted,
-        windowFromQuestion: !!explicit,
+        // A refused period is never "from the question": the caller has to be
+        // able to see, in one field, that nothing they named was measured.
+        windowFromQuestion: !!explicit && refusal?.code !== 'period_unresolved',
         entities: entities.map((e) => ({ id: e.entity.id, label: e.entity.label, type: e.entity.type, score: e.score, rule: e.rule, mention: e.mention })),
         subject,
         metric: metric ? { id: metric.metric.id, label: metric.metric.label, matched: metric.matched, score: metric.score } : null,

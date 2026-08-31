@@ -1010,10 +1010,13 @@ export default defineModule({
         next_page: page.next_cursor
           ? `/v1/records/${req.params.type}/${req.params.id}/timeline?after=${encodeURIComponent(page.next_cursor)}&limit=${limit}${carry}`
           : null,
+        // An account with more children than one roll-up can anchor says so
+        // here, rather than letting `has_more: false` imply the story is over.
+        ...(page.roll_up_truncated ? { roll_up_truncated: true, roll_up_anchors: page.roll_up_anchors } : {}),
       };
     }, {
       summary: 'The merged timeline: activities, property changes, events and associations', tags: ['crm'],
-      description: 'A company timeline rolls up the activity logged against its contacts, deals and tickets. Pass `roll_up=false` for only what is attached directly. Every item carries the `cursor` that resumes right after it, and paging goes through `after` — never through `at`, because an import that backfills a day of calls stamps them all with one millisecond and a timestamp filter drops every item but the first. `has_more` is measured by reading an item the page does not show.',
+      description: 'A company timeline rolls up the activity logged against its contacts, deals and tickets. Pass `roll_up=false` for only what is attached directly. Every item carries the `cursor` that resumes right after it, and paging goes through `after` — never through `at`, because an import that backfills a day of calls stamps them all with one millisecond and a timestamp filter drops every item but the first. `has_more` is measured by reading an item the page does not show — every leg of the merge walks its own cursor until it holds a full page, so a page is never cut short by how many audit rows one save happened to write. An account whose roll-up hits the anchor ceiling reports `roll_up_truncated` with the number of children it read through.',
       query: v.object({
         limit: v.optional(v.int({ min: 1, max: 200 })),
         before: v.optional(instant()),
@@ -1045,7 +1048,7 @@ export default defineModule({
       };
     }, {
       summary: 'Every recorded change to a record, with who changed it and how', tags: ['crm'],
-      description: 'Newest first, totally ordered on `(changed_at, seq)` — a monotonic write sequence, because a millisecond clock cannot order an audit trail and paging on one silently drops every row that shares a tick with a page boundary. Page by passing the previous page’s `next_cursor` back as `after`; `has_more` is measured by reading one row past the page, not inferred from its length. `before`/`since` are time filters and accept unix milliseconds or ISO-8601. Rows carry `write_id`, so every property one save touched can be pulled out together.',
+      description: 'Newest first, totally ordered on `(changed_at, seq)` — a monotonic write sequence, because a millisecond clock cannot order an audit trail and paging on one silently drops every row that shares a tick with a page boundary. Page by passing the previous page’s `next_cursor` back as `after`, or follow `next_page`; `has_more` is measured by reading one row past the page, not inferred from its length. `before`/`since` are time filters, not pagers — they accept unix milliseconds or ISO-8601, and walking one forward by the `changed_at` of the last row drops every other row that shares that millisecond. Rows carry `write_id`, so every property one save touched can be pulled out together.',
       query: v.object({
         limit: v.optional(v.int({ min: 1, max: 500 })),
         property: v.optional(v.string({ max: 60 })),

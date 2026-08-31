@@ -37,7 +37,7 @@ export interface CatalogService {
   price(orgId: string, id: string): Price | null;
   requirePrice(orgId: string, id: string): Price;
   priceByLookupKey(orgId: string, lookupKey: string): Price | null;
-  pricesFor(orgId: string, productId: string, opts?: { activeOnly?: boolean }): Price[];
+  pricesFor(orgId: string, productId: string, opts?: { active?: boolean }): Price[];
 
   createProduct(orgId: string, input: ProductInput): Product;
   createPrice(orgId: string, input: PriceInput): Price;
@@ -201,18 +201,71 @@ const previewBody = v.object({
   proration: v.optional(v.object({ numerator: v.int({ min: 0 }), denominator: v.int({ min: 1 }) })),
 });
 
+/* --------------------------------- queries -------------------------------- */
+
+const expandQuery = v.object({ expand: v.optional(v.string({ max: 120 })) });
+
+const productListQuery = v.object({
+  active: v.optional(v.boolean()),
+  category: v.optional(v.enum(PRODUCT_CATEGORIES)),
+  query: v.optional(v.string({ max: 120 })),
+  limit: v.optional(v.int({ min: 1, max: 200 })),
+  cursor: v.optional(v.string({ max: 200 })),
+  expand: v.optional(v.string({ max: 120 })),
+});
+
+const productPricesQuery = v.object({ active: v.optional(v.boolean()) });
+
+const priceListQuery = v.object({
+  product: v.optional(v.id('prod')),
+  active: v.optional(v.boolean()),
+  type: v.optional(v.enum(PRICE_TYPES)),
+  model: v.optional(v.enum(PRICE_MODELS)),
+  currency: v.optional(currencyCode()),
+  lookup_key: v.optional(v.string({ max: 80 })),
+  limit: v.optional(v.int({ min: 1, max: 200 })),
+  cursor: v.optional(v.string({ max: 200 })),
+});
+
+const curveQuery = v.object({
+  from: v.optional(v.int({ min: 0 })),
+  to: v.optional(v.int({ min: 1 })),
+  points: v.optional(v.int({ min: 2, max: 250 })),
+  quantities: v.optional(v.string({ max: 600 })),
+  currency: v.optional(currencyCode()),
+  custom_unit_amount: v.optional(v.int({ min: 0 })),
+});
+
+const catalogQuery = v.object({
+  currency: v.optional(currencyCode()),
+  include_inactive: v.optional(v.boolean()),
+});
+
+/**
+ * `Req.query` is declared as raw strings, but by the time a handler runs the
+ * router has replaced it with the output of the route's own query validator:
+ * `?active=true` arrives as the boolean `true`, and comparing it to the string
+ * "true" silently matches nothing. Reading the query back through the same
+ * validator is what carries the coerced types into the handler, so that
+ * comparison stops compiling instead of quietly filtering the list wrong.
+ */
+const queryOf = <T>(req: Req, schema: Validator<T>): T => schema.parse(req.query);
+
 /* ------------------------------ presentation ------------------------------ */
 
 const expandList = (req: Req): string[] =>
   String(req.query.expand ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 
-function productPayload(ctx: Ctx, orgId: string, product: Product, expand: string[]): Record<string, unknown> {
+function productPayload(
+  ctx: Ctx, orgId: string, product: Product, expand: string[], active?: boolean,
+): Record<string, unknown> {
   if (!expand.includes('prices')) return { ...product };
   const store = catalogStore(ctx);
   const locale = localeOf(ctx, orgId);
   return {
     ...product,
-    prices: store.pricesFor(orgId, product.id).map((p) => pricePayload(p, product, locale)),
+    // An archived price inlined under ?active=true would contradict the filter.
+    prices: store.pricesFor(orgId, product.id, { active }).map((p) => pricePayload(p, product, locale)),
   };
 }
 
@@ -295,29 +348,22 @@ export default defineModule({
     /* -------------------------------- products ---------------------------- */
 
     router.get('/v1/products', (req: Req, c: Ctx) => {
-      const q = req.query as Record<string, string>;
+      const q = queryOf(req, productListQuery);
       const page = catalogStore(c).listProducts(req.auth.orgId, {
-        active: q.active === undefined ? undefined : q.active === 'true',
-        category: q.category as ProductListFilter['category'],
+        active: q.active,
+        category: q.category,
         query: q.query,
-        limit: q.limit ? Number(q.limit) : undefined,
+        limit: q.limit,
         cursor: q.cursor ?? null,
       });
       const expand = expandList(req);
-      return list(page.data.map((p) => productPayload(c, req.auth.orgId, p, expand)), {
+      return list(page.data.map((p) => productPayload(c, req.auth.orgId, p, expand, q.active)), {
         hasMore: page.hasMore, nextCursor: page.nextCursor, totalCount: page.totalCount, url: '/v1/products',
       });
     }, {
       summary: 'List products', tags: ['catalog'],
-      description: 'Ordered the way the pricing page shows them. Pass expand=prices to inline every price on each product.',
-      query: v.object({
-        active: v.optional(v.boolean()),
-        category: v.optional(v.enum(PRODUCT_CATEGORIES)),
-        query: v.optional(v.string({ max: 120 })),
-        limit: v.optional(v.int({ min: 1, max: 200 })),
-        cursor: v.optional(v.string({ max: 200 })),
-        expand: v.optional(v.string({ max: 120 })),
-      }),
+      description: 'Ordered the way the pricing page shows them. Pass active=true for the live book, active=false for what has been archived, and expand=prices to inline each product’s prices under the same filter.',
+      query: productListQuery,
     });
 
     router.post('/v1/products', (req: Req, c: Ctx) => {
@@ -344,7 +390,7 @@ export default defineModule({
       return productPayload(c, req.auth.orgId, product, expand.length ? expand : ['prices']);
     }, {
       summary: 'Retrieve a product', tags: ['catalog'],
-      query: v.object({ expand: v.optional(v.string({ max: 120 })) }),
+      query: expandQuery,
     });
 
     router.patch('/v1/products/:id', (req: Req, c: Ctx) =>
@@ -362,24 +408,30 @@ export default defineModule({
     router.get('/v1/products/:id/prices', (req: Req, c: Ctx) => {
       const s = catalogStore(c);
       const product = s.requireProduct(req.auth.orgId, req.params.id);
+      const q = queryOf(req, productPricesQuery);
       const locale = localeOf(c, req.auth.orgId);
-      return list(s.pricesFor(req.auth.orgId, product.id).map((p) => pricePayload(p, product, locale)),
-        { url: `/v1/products/${product.id}/prices` });
-    }, { summary: 'List a product’s prices', tags: ['catalog'] });
+      const prices = s.pricesFor(req.auth.orgId, product.id, { active: q.active });
+      return list(prices.map((p) => pricePayload(p, product, locale)),
+        { totalCount: prices.length, url: `/v1/products/${product.id}/prices` });
+    }, {
+      summary: 'List a product’s prices', tags: ['catalog'],
+      description: 'Oldest first, so a price history reads in the order it happened. Pass active=true for the prices a new subscription may use; the default keeps archived prices, which is what old invoices still reference.',
+      query: productPricesQuery,
+    });
 
     /* --------------------------------- prices ----------------------------- */
 
     router.get('/v1/prices', (req: Req, c: Ctx) => {
-      const q = req.query as Record<string, string>;
+      const q = queryOf(req, priceListQuery);
       const s = catalogStore(c);
       const page = s.listPrices(req.auth.orgId, {
         product: q.product,
-        active: q.active === undefined ? undefined : q.active === 'true',
-        type: q.type as PriceListFilter['type'],
-        model: q.model as PriceListFilter['model'],
+        active: q.active,
+        type: q.type,
+        model: q.model,
         currency: q.currency,
         lookupKey: q.lookup_key,
-        limit: q.limit ? Number(q.limit) : undefined,
+        limit: q.limit,
         cursor: q.cursor ?? null,
       });
       const locale = localeOf(c, req.auth.orgId);
@@ -391,16 +443,8 @@ export default defineModule({
       return list(data, { hasMore: page.hasMore, nextCursor: page.nextCursor, totalCount: page.totalCount, url: '/v1/prices' });
     }, {
       summary: 'List prices', tags: ['catalog'],
-      query: v.object({
-        product: v.optional(v.id('prod')),
-        active: v.optional(v.boolean()),
-        type: v.optional(v.enum(PRICE_TYPES)),
-        model: v.optional(v.enum(PRICE_MODELS)),
-        currency: v.optional(currencyCode()),
-        lookup_key: v.optional(v.string({ max: 80 })),
-        limit: v.optional(v.int({ min: 1, max: 200 })),
-        cursor: v.optional(v.string({ max: 200 })),
-      }),
+      description: 'Newest first. active=true is the book a new subscription can buy from; active=false is what has been archived and still appears on historical invoices.',
+      query: priceListQuery,
     });
 
     router.post('/v1/prices', (req: Req, c: Ctx) =>
@@ -496,16 +540,16 @@ export default defineModule({
       const s = catalogStore(c);
       const price = s.requirePrice(req.auth.orgId, req.params.id);
       const product = s.product(req.auth.orgId, price.product);
-      const q = req.query as Record<string, string>;
+      const q = queryOf(req, curveQuery);
       const quantities = q.quantities
         ? q.quantities.split(',').map((n) => Number(n.trim())).filter((n) => Number.isFinite(n))
         : undefined;
       const curve = previewCurve(price, q.currency, {
-        from: q.from ? Number(q.from) : undefined,
-        to: q.to ? Number(q.to) : undefined,
-        points: q.points ? Number(q.points) : undefined,
+        from: q.from,
+        to: q.to,
+        points: q.points,
         quantities,
-        customUnitAmount: q.custom_unit_amount ? Number(q.custom_unit_amount) : null,
+        customUnitAmount: q.custom_unit_amount ?? null,
         unitLabel: product?.unit_label ?? null,
       });
       const locale = localeOf(c, req.auth.orgId);
@@ -524,32 +568,22 @@ export default defineModule({
     }, {
       summary: 'Effective unit-cost curve across a quantity range', tags: ['catalog'],
       description: 'Powers the "what would 25,000 events cost?" widget. Tier boundaries are always sampled, so the steps land exactly where the price changes.',
-      query: v.object({
-        from: v.optional(v.int({ min: 0 })),
-        to: v.optional(v.int({ min: 1 })),
-        points: v.optional(v.int({ min: 2, max: 250 })),
-        quantities: v.optional(v.string({ max: 600 })),
-        currency: v.optional(currencyCode()),
-        custom_unit_amount: v.optional(v.int({ min: 0 })),
-      }),
+      query: curveQuery,
     });
 
     /* -------------------------------- catalog ----------------------------- */
 
     router.get('/v1/catalog', (req: Req, c: Ctx) => {
-      const q = req.query as Record<string, string>;
+      const q = queryOf(req, catalogQuery);
       return catalogStore(c).catalogView(req.auth.orgId, {
         currency: q.currency || currencyOf(c, req.auth.orgId),
         locale: localeOf(c, req.auth.orgId),
-        includeInactive: q.include_inactive === 'true',
+        includeInactive: q.include_inactive,
       });
     }, {
       summary: 'The whole price book, shaped for a pricing page', tags: ['catalog'],
-      description: 'Plans with their base and per-seat prices, shared metered components, add-ons, services, credit packs, a feature comparison matrix and the annual saving, all computed from the stored prices.',
-      query: v.object({
-        currency: v.optional(currencyCode()),
-        include_inactive: v.optional(v.boolean()),
-      }),
+      description: 'Plans with their base and per-seat prices, shared metered components, add-ons, services, credit packs, a feature comparison matrix and the annual saving, all computed from the stored prices. include_inactive=true adds the archived products and prices, for an internal price-book view.',
+      query: catalogQuery,
     });
 
     router.get('/v1/catalog/currencies', (req: Req, c: Ctx) => {
@@ -673,7 +707,7 @@ export default defineModule({
               category: product.category,
               unit_label: product.unit_label,
               features: product.features.map((f) => f.name),
-              prices: s.pricesFor(meta.orgId, product.id, { activeOnly: true })
+              prices: s.pricesFor(meta.orgId, product.id, { active: true })
                 .filter((p) => p.currency === currency || !!p.currency_options[currency])
                 .map((p) => ({
                   id: p.id, lookup_key: p.lookup_key, nickname: p.nickname, model: p.model,

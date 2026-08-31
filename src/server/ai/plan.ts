@@ -70,6 +70,30 @@ export interface PlanInput {
   dealStages: { value: string; label: string }[];
   /** Whether this run may change data at all. */
   allowWrites: boolean;
+  /** True when the question asks who is biggest, not what the total is. */
+  ranking: boolean;
+}
+
+/**
+ * One account, once.
+ *
+ * A company and its billing customer are two rows with the same name, and the
+ * resolver returns both. Pairing them produced a "comparison" of an account
+ * against itself, labelled on one side with a raw `cus_` id, while the second
+ * account the question actually named was pushed out of the pair entirely.
+ * CRM records win because they are the ones with a display name.
+ */
+export function distinctAccounts(entities: ResolvedEntity[]): ResolvedEntity[] {
+  const rank: Record<string, number> = { company: 0, contact: 1, customer: 2 };
+  const best = new Map<string, ResolvedEntity>();
+  for (const entity of entities) {
+    const key = normalise(entity.entity.label);
+    const held = best.get(key);
+    if (!held) { best.set(key, entity); continue; }
+    const better = (rank[entity.entity.type] ?? 3) < (rank[held.entity.type] ?? 3);
+    if (better) best.set(key, entity);
+  }
+  return entities.filter((entity) => best.get(normalise(entity.entity.label)) === entity);
 }
 
 const OPEN_TICKET_STATUSES = ['new', 'waiting_on_us', 'waiting_on_customer', 'escalated'];
@@ -362,9 +386,9 @@ export const isWriteBlocked = (value: WriteAction | WriteBlocked | null): value 
 function canonicalPlan(input: PlanInput): PlannedStep[] {
   const steps: PlannedStep[] = [];
   const { subject, window, metric, groupBy, intent, entities } = input;
-  const comparisonSubjects = entities
-    .filter((e) => ['company', 'contact', 'customer'].includes(e.entity.type))
-    .slice(0, 3);
+  const comparisonSubjects = distinctAccounts(
+    entities.filter((e) => ['company', 'contact', 'customer'].includes(e.entity.type)),
+  ).slice(0, 3);
 
   const metricStep = (subjectId: string | undefined, label: string, over: TimeWindow = window, compare = true) =>
     builtin('business_metric', {
@@ -376,6 +400,22 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
       group_by: groupBy,
       compare,
     }, label);
+
+  // "Which accounts booked the most in 2025?" is a metric question wearing a
+  // question word. Whatever the classifier called it, it is answered by the
+  // grouped metric and ranked — never by a listing of the object type ordered
+  // by recency, which is a confident answer to a question nobody asked.
+  if (input.ranking && groupBy !== 'none' && intent !== 'act' && intent !== 'draft' && !subject) {
+    const ranked = builtin('business_metric', {
+      metric: metric?.metric.id ?? 'closed_won',
+      start: window.start,
+      end: window.end,
+      window_label: window.label,
+      group_by: groupBy,
+      compare: window.grain !== 'range' || window.start > 0,
+    }, `The question asks which ${groupBy === 'account' ? 'accounts are' : `${groupBy} is`} biggest, so ${metric?.metric.label ?? 'closed-won bookings'} is computed for ${window.label} and grouped by ${groupBy} to rank them.`);
+    return [ranked];
+  }
 
   switch (intent) {
     case 'aggregate': {
@@ -555,7 +595,12 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
 
   // "How are we doing?" names nothing at all. Answer it with the state of the
   // business rather than with an apology.
-  if (!steps.length) {
+  //
+  // An `act` request is the exception: when nothing writable could be prepared
+  // the honest answer is that nothing changed, and reading the quarter's
+  // bookings to fill the silence would spend the budget and hang citations for
+  // records the answer never mentions off a sentence about a failed write.
+  if (!steps.length && intent !== 'act') {
     steps.push(metricStep(undefined, `Nothing specific was named, so the answer opens with ${metric?.metric.label ?? 'bookings'} for ${window.label}.`));
     steps.push(builtin('record_search', {
       object_type: 'deal',

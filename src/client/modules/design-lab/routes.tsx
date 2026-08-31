@@ -565,6 +565,18 @@ const API: Record<string, ApiSpec[]> = {
       ],
     },
     {
+      name: 'Menu / MenuButton',
+      summary: 'Arrow keys walk the rows, typed letters jump, Enter fires, Escape peels one layer. The highlighted row is the focused element, so what a screen reader announces and what the highlight shows can never drift apart.',
+      rows: [
+        { name: 'sections', type: 'MenuSection[]', required: true, note: 'Grouped rows; a row carrying items of its own opens a submenu.' },
+        { name: 'anchor', type: 'RefObject<HTMLElement>', required: true, note: 'The trigger. Focus returns to it on Escape, Tab or a selection.' },
+        { name: 'ariaLabel', type: 'string', required: true, note: 'Names the role="menu" container.' },
+        { name: 'item.onSelect', type: '() => void', note: 'Fires on click or Enter, then the whole stack closes.' },
+        { name: 'item.searchText', type: 'string', note: 'What typeahead matches when the label is a node. Folded, so "kovac" finds "Kovač".' },
+        { name: 'item.disabled', type: 'boolean', note: 'Skipped by the arrows and by typeahead, not just dimmed.' },
+      ],
+    },
+    {
       name: 'useToast()',
       summary: 'Imperative feedback for things that already happened. Never for validation — that belongs on the field.',
       rows: [
@@ -1340,6 +1352,7 @@ function PickersSection() {
 function DisplaySection({ data }: { data: Derived }) {
   const fmt = useFormat();
   const top = data.topAccounts[0];
+  const accountMenu = useAccountMenu(data.topAccounts);
   const currentLabel = data.monthLabels[data.monthLabels.length - 2] ?? '';
   const priorLabel = data.monthLabels[data.monthLabels.length - 3] ?? '';
   const { invoice, lines, subtotal, tax, total, includedUnits } = data.featured;
@@ -1420,7 +1433,7 @@ function DisplaySection({ data }: { data: Derived }) {
 
       <Demo title="Records">
         <div className="sg__grid2">
-          <Card title="Account" description={top.company} actions={<MenuButton label="Account actions" sections={ACCOUNT_MENU} />}>
+          <Card title="Account" description={top.company} actions={<MenuButton label="Account actions" sections={accountMenu} />}>
             <DescriptionList
               items={[
                 { term: 'Owner', value: <Inline gap={3}><Avatar name={top.owner} size={20} /> {top.owner}</Inline> },
@@ -1494,29 +1507,98 @@ function DisplaySection({ data }: { data: Derived }) {
   );
 }
 
-const ACCOUNT_MENU: MenuSection[] = [
-  {
-    id: 'edit',
-    items: [
-      { id: 'rename', label: 'Rename account', icon: <Icons.edit size={14} />, shortcut: 'mod+e' },
-      { id: 'owner', label: 'Change owner', icon: <Icons.user size={14} /> },
-      { id: 'merge', label: 'Merge into…', icon: <Icons.layers size={14} />, items: [
-        { id: 'm1', label: 'Halden Metalworks' },
-        { id: 'm2', label: 'Kestrel Logistics' },
-      ] },
-    ],
-  },
-  {
-    id: 'billing',
-    label: 'Billing',
-    items: [
-      { id: 'auto', label: 'Auto-charge on renewal', checked: true },
-      { id: 'dunning', label: 'Automatic dunning', checked: false },
-      { id: 'export', label: 'Export statement', icon: <Icons.download size={14} />, shortcut: 'mod+shift+e' },
-    ],
-  },
-  { id: 'danger', items: [{ id: 'delete', label: 'Delete account', icon: <Icons.trash size={14} />, danger: true }] },
-];
+/**
+ * The account menu the docs use in three places. Every row does something and
+ * the two checkboxes really toggle: a menu of inert rows cannot show that Enter
+ * fires the item the highlight is on, which is the whole point of the keyboard
+ * story. Merge targets are the next real accounts in the workspace.
+ */
+function useAccountMenu(accounts: Derived['topAccounts']): MenuSection[] {
+  const toast = useToast();
+  const [autoCharge, setAutoCharge] = useState(true);
+  const [dunning, setDunning] = useState(true);
+  const account = accounts[0];
+  return [
+    {
+      id: 'edit',
+      items: [
+        {
+          id: 'rename',
+          label: 'Rename account',
+          icon: <Icons.edit size={14} />,
+          shortcut: 'mod+e',
+          onSelect: () => toast.info('Rename account', `The header of ${account.company} becomes an editable field.`),
+        },
+        {
+          id: 'owner',
+          label: 'Change owner',
+          icon: <Icons.user size={14} />,
+          onSelect: () => toast.info('Change owner', `${account.company} is owned by ${account.owner} today.`),
+        },
+        {
+          id: 'merge',
+          label: 'Merge into…',
+          icon: <Icons.layers size={14} />,
+          items: accounts.slice(1, 4).map((target) => ({
+            id: `merge-${target.company}`,
+            label: target.company,
+            onSelect: () => toast.warning(
+              'Merge queued',
+              `${formatNumber(account.invoices)} invoices move from ${account.company} to ${target.company}.`,
+            ),
+          })),
+        },
+      ],
+    },
+    {
+      id: 'billing',
+      label: 'Billing',
+      items: [
+        {
+          id: 'auto',
+          label: 'Auto-charge on renewal',
+          checked: autoCharge,
+          onSelect: () => {
+            setAutoCharge((v) => !v);
+            toast.success(
+              autoCharge ? 'Auto-charge turned off' : 'Auto-charge turned on',
+              `${account.company} renews on ${account.plan}.`,
+            );
+          },
+        },
+        {
+          id: 'dunning',
+          label: 'Automatic dunning',
+          checked: dunning,
+          onSelect: () => {
+            setDunning((v) => !v);
+            toast.success(
+              dunning ? 'Dunning paused' : 'Dunning resumed',
+              dunning ? 'Failed payments stop retrying until this is switched back on.' : 'Failed payments retry on the workspace dunning schedule.',
+            );
+          },
+        },
+        {
+          id: 'export',
+          label: 'Export statement',
+          icon: <Icons.download size={14} />,
+          shortcut: 'mod+shift+e',
+          onSelect: () => toast.info('Statement queued', `${formatNumber(account.invoices)} invoices for ${account.company}, as CSV.`),
+        },
+      ],
+    },
+    {
+      id: 'danger',
+      items: [{
+        id: 'delete',
+        label: 'Delete account',
+        icon: <Icons.trash size={14} />,
+        danger: true,
+        onSelect: () => toast.error('Cannot delete', `${account.company} still has ${formatNumber(account.invoices)} invoices attached.`),
+      }],
+    },
+  ];
+}
 
 const DEFAULT_INVOICE_SORT = { columnId: 'issuedAt', direction: 'desc' as const };
 
@@ -1652,15 +1734,15 @@ function TableSection({ data }: { data: Derived }) {
           )}
           rowActions={(row) => [
             { id: 'open', items: [
-              { id: 'view', label: 'Open invoice', icon: <Icons.external size={14} />, shortcut: 'mod+o' },
-              { id: 'pdf', label: 'Download PDF', icon: <Icons.download size={14} /> },
-              { id: 'copy', label: 'Copy payment link', icon: <Icons.link size={14} /> },
+              { id: 'view', label: 'Open invoice', icon: <Icons.external size={14} />, shortcut: 'mod+o', onSelect: () => toast.info(row.number, `${row.company} · ${fmt.money(row.amount)} · ${humanize(row.status)}`) },
+              { id: 'pdf', label: 'Download PDF', icon: <Icons.download size={14} />, onSelect: () => toast.success('PDF ready', `${row.number} for ${row.company}.`) },
+              { id: 'copy', label: 'Copy invoice number', icon: <Icons.link size={14} />, onSelect: () => { void copyLink(row.number); toast.success('Copied', `${row.number} is on the clipboard.`); } },
             ] },
             { id: 'act', label: 'Collection', items: [
-              { id: 'remind', label: 'Send reminder', icon: <Icons.mail size={14} />, onSelect: () => toast.success(`Reminder sent for ${row.number}`) },
-              { id: 'charge', label: 'Charge saved card', icon: <CreditCardIcon size={14} />, disabled: row.status === 'paid' },
+              { id: 'remind', label: 'Send reminder', icon: <Icons.mail size={14} />, onSelect: () => toast.success(`Reminder sent for ${row.number}`, `${row.company} · due ${fmt.date(row.dueAt)}`) },
+              { id: 'charge', label: 'Charge saved card', icon: <CreditCardIcon size={14} />, disabled: row.status === 'paid', onSelect: () => toast.success('Charge started', `${fmt.money(row.amount)} on the card ${row.company} has on file.`) },
             ] },
-            { id: 'danger', items: [{ id: 'void', label: 'Void invoice', icon: <Icons.trash size={14} />, danger: true, disabled: row.status === 'paid' }] },
+            { id: 'danger', items: [{ id: 'void', label: 'Void invoice', icon: <Icons.trash size={14} />, danger: true, disabled: row.status === 'paid', onSelect: () => toast.error(`${row.number} voided`, 'It stays on the account as a voided document and stops accruing dunning steps.') }] },
           ]}
           toolbar={<span className="sg__label">Invoices</span>}
         />
@@ -1867,6 +1949,7 @@ function OverlaysSection({ data }: { data: Derived }) {
   const { invoice, total } = data.featured;
   const topAccount = data.topAccounts[0];
   const pastDueCount = data.invoices.filter((i) => i.status === 'past_due').length;
+  const accountMenu = useAccountMenu(data.topAccounts);
   const toast = useToast();
   const [modal, setModal] = useState<null | 'sm' | 'md' | 'lg'>(null);
   const [drawer, setDrawer] = useState<null | 'right' | 'bottom'>(null);
@@ -1907,8 +1990,6 @@ function OverlaysSection({ data }: { data: Derived }) {
         </Inline>
         <Inline gap={4} wrap>
           <Button ref={popAnchor} variant="secondary" iconLeft={<Icons.filter size={14} />} onClick={() => setPopover((v) => !v)}>Popover</Button>
-          <Button ref={menuAnchor} variant="secondary" iconRight={<ChevronDownIcon size={14} />} onClick={() => setMenuOpen((v) => !v)}>Menu with sections</Button>
-          <MenuButton label="Row actions" sections={ACCOUNT_MENU} />
           <Tooltip content="Usage is rated when the period closes, not as it arrives." shortcut="mod+u">
             <Button variant="ghost" iconLeft={<Icons.help size={14} />}>Hover or focus me</Button>
           </Tooltip>
@@ -1927,6 +2008,25 @@ function OverlaysSection({ data }: { data: Derived }) {
           >
             Promise toast
           </Button>
+        </Inline>
+      </Demo>
+
+      <Demo
+        title="Menus"
+        note="The highlighted row is the focused element. Every row here really fires — the toast says which one."
+        code={"<Menu\n  open={open}\n  onClose={() => setOpen(false)}\n  anchor={trigger}\n  ariaLabel=\"Account actions\"\n  sections={[\n    { id: 'edit', items: [{ id: 'rename', label: 'Rename account', shortcut: 'mod+e', onSelect: rename }] },\n    { id: 'billing', label: 'Billing', items: [{ id: 'auto', label: 'Auto-charge on renewal', checked, onSelect: toggle }] },\n  ]}\n/>\n\n// or trigger and menu in one, for the row-actions case:\n<MenuButton label=\"Row actions\" sections={sections} />"}
+      >
+        <Inline gap={4} wrap>
+          <Button ref={menuAnchor} variant="secondary" iconRight={<ChevronDownIcon size={14} />} onClick={() => setMenuOpen((v) => !v)}>Menu with sections</Button>
+          <MenuButton label="Row actions" sections={accountMenu} />
+        </Inline>
+        <Inline gap={6} wrap>
+          <span className="sg__label">Keyboard</span>
+          <span className="sg__demonote"><Kbd>↑</Kbd> <Kbd>↓</Kbd> move</span>
+          <span className="sg__demonote">type to jump — “del”, “auto”</span>
+          <span className="sg__demonote"><Kbd>↵</Kbd> fire the row</span>
+          <span className="sg__demonote"><Kbd>→</Kbd> submenu, <Kbd>←</Kbd> back</span>
+          <span className="sg__demonote"><Kbd combo="esc" /> peel one layer</span>
         </Inline>
       </Demo>
 
@@ -2036,7 +2136,7 @@ function OverlaysSection({ data }: { data: Derived }) {
         </Stack>
       </Popover>
 
-      <Menu open={menuOpen} onClose={() => setMenuOpen(false)} anchor={menuAnchor} sections={ACCOUNT_MENU} ariaLabel="Account actions" />
+      <Menu open={menuOpen} onClose={() => setMenuOpen(false)} anchor={menuAnchor} sections={accountMenu} ariaLabel="Account actions" />
     </Doc>
   );
 }

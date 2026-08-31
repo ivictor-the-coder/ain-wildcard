@@ -123,7 +123,31 @@ export const publicRun = (row: RunRow, spans?: SpanRow[]) => ({
   ...(spans ? { trace: spans.map(publicSpan) } : {}),
 });
 
-export const publicApproval = (row: ApprovalRow) => ({
+/**
+ * Names for the ids inside a queued write.
+ *
+ * The approval card is the last thing a person reads before the write lands, so
+ * it has to say "Rheinwerk Antriebstechnik", not "cmp_nw_21". Archived and
+ * merged records still resolve here on purpose: an approval whose target has
+ * moved is refused at execution, and the card reads better naming what it was
+ * prepared against than showing a primary key.
+ */
+export function recordNamer(ctx: Ctx, orgId: string): (id: string) => string | null {
+  const cache = new Map<string, string | null>();
+  return (id: string) => {
+    if (cache.has(id)) return cache.get(id) ?? null;
+    const record = ctx.db.get<{ display_name: string }>(
+      `SELECT display_name FROM crm_records WHERE org_id = ? AND id = ?`, orgId, id);
+    const user = record ? null : ctx.db.get<{ name: string }>(
+      `SELECT u.name AS name FROM users u JOIN memberships m ON m.user_id = u.id
+       WHERE m.org_id = ? AND u.id = ?`, orgId, id);
+    const name = record?.display_name || user?.name || null;
+    cache.set(id, name);
+    return name;
+  };
+}
+
+export const publicApproval = (row: ApprovalRow, nameOf: (id: string) => string | null = () => null) => ({
   object: 'ai_approval' as const,
   id: row.id,
   run_id: row.run_id,
@@ -131,7 +155,7 @@ export const publicApproval = (row: ApprovalRow) => ({
   tool: row.tool,
   args: parseJson<Record<string, unknown>>(row.args, {}),
   /** The write in plain English, so a person can approve it without reading JSON. */
-  preview: describeWrite(row.tool, parseJson<Record<string, unknown>>(row.args, {})),
+  preview: describeWrite(row.tool, parseJson<Record<string, unknown>>(row.args, {}), nameOf),
   reason: row.reason,
   status: row.status,
   outcome: row.outcome,
@@ -235,6 +259,10 @@ export class AiStore {
 
   finishRun(finish: AiRunFinish, costMicros: number): void {
     this.ctx.db.patch('ai_runs', 'id', finish.runId, {
+      // The row is stamped with whoever answered, so a run that fell back to
+      // the local engine is not filed under the provider that refused it.
+      provider: finish.provider,
+      model: finish.model,
       status: finish.status,
       answer: finish.answer.slice(0, 20_000),
       intent: finish.intent,

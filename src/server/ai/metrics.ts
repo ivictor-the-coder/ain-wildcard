@@ -173,6 +173,22 @@ function ownerLabeller(input: MetricInput): (key: string) => string {
   return (key) => byId.get(key) ?? humanise(key);
 }
 
+/**
+ * Billing customer ids are not names. A breakdown that reads "cus_7zob… $127,840"
+ * is a database row leaking into a sentence a board sees, so every account group
+ * is resolved back to the customer's own name before it reaches the answer.
+ */
+function customerLabeller(input: MetricInput): (key: string) => string {
+  const customers = billingSources(input.ctx.db).customers;
+  if (!customers?.nameColumn) return (key) => humanise(key);
+  const byId = new Map<string, string>();
+  for (const row of input.ctx.db.all<{ id: string; nm: string | null }>(
+    `SELECT id, ${customers.nameColumn} AS nm FROM ${customers.table} WHERE org_id = ?`, input.workspace.orgId)) {
+    if (row.nm) byId.set(row.id, row.nm);
+  }
+  return (key) => byId.get(key) ?? humanise(key);
+}
+
 function timeLabeller(): (key: string) => string {
   return (key) => {
     if (/^\d{4}-\d{2}-\d{2}$/.test(key)) return formatDate(Date.parse(`${key}T00:00:00Z`), { timeZone: 'UTC' });
@@ -340,6 +356,11 @@ function result(input: MetricInput, def: Pick<MetricDefinition, 'id' | 'label' |
 function moneyIn(input: MetricInput, opts: { paidOnly?: boolean; outstanding?: boolean }, def: Pick<MetricDefinition, 'id' | 'label' | 'unit'>): MetricResult {
   const invoices = invoiceFacts(input, opts);
   if (invoices.available) {
+    const labeller = input.groupBy === 'time'
+      ? timeLabeller()
+      : input.groupBy === 'account'
+        ? customerLabeller(input)
+        : (key: string) => humanise(key);
     return result(input, def, {
       value: invoices.total,
       count: invoices.count,
@@ -348,7 +369,7 @@ function moneyIn(input: MetricInput, opts: { paidOnly?: boolean; outstanding?: b
       ids: invoices.ids,
       groups: invoices.groups.map((g) => ({
         key: g.key,
-        label: input.groupBy === 'time' ? timeLabeller()(g.key) : humanise(g.key),
+        label: labeller(g.key),
         value: g.value,
         count: g.count,
         formatted: money(g.value, input.workspace),
@@ -791,6 +812,7 @@ export function detectGrouping(message: string): GroupBy {
   const text = message.toLowerCase();
   if (/\bby\s+(month|quarter|week|day|year)\b|\bover\s+time\b|\btrend(?:ed|ing|line)?\b|\bmonth\s+by\s+month\b/.test(text)) return 'time';
   if (/\bby\s+(rep|owner|ae|seller|person|teammate)\b|\bper\s+rep\b|\bwho\s+(?:closed|sold|won)\b/.test(text)) return 'owner';
+  if (/\b(top|biggest|largest|highest|best|worst|lowest)\s+\d*\s*(reps?|owners?|sellers?|aes?|salespeople|people)\b/.test(text)) return 'owner';
   if (/\bby\s+stage\b|\bstage\s+by\s+stage\b|\bfunnel\b/.test(text)) return 'stage';
   if (/\bby\s+industr(?:y|ies)\b|\bby\s+vertical\b|\bby\s+segment\b/.test(text)) return 'industry';
   if (/\bby\s+(account|customer|company|logo)\b/.test(text)) return 'account';
@@ -800,6 +822,27 @@ export function detectGrouping(message: string): GroupBy {
   if (/\bby\s+priorit(?:y|ies)\b/.test(text)) return 'priority';
   if (/\bby\s+source\b|\bby\s+channel\b/.test(text)) return 'source';
   return 'none';
+}
+
+/**
+ * Does the question ask for a ranking rather than a total?
+ *
+ * "Which accounts booked the most in 2025" is the single most common question a
+ * revenue leader asks, and it used to fall through to a list of company records
+ * ordered by recency with no money in it at all. A ranking question routes to
+ * the grouped metric and the answer leads with the order.
+ */
+export function isRankingQuestion(message: string): boolean {
+  const text = normalise(message);
+  return (
+    // Bounded to eight words so a later sentence in a long prompt cannot turn
+    // an unrelated "which" into a ranking request.
+    /\b(?:which|what|who)\b(?:\s+[a-z0-9]+){0,8}?\s+(?:most|biggest|largest|highest|best|top|greatest)\b/.test(text)
+    || /\btop\s+\d{1,3}\b/.test(text)
+    || /\b(?:top|biggest|largest|highest|best)\s+\d*\s*(?:accounts?|customers?|companies|logos?|deals?|reps?|owners?)\b/.test(text)
+    || /\b(?:rank(?:ed)?|order(?:ed)?|sort(?:ed)?)\s+(?:by|on)\b/.test(text)
+    || /\bwho\s+(?:is|are|was|were)\s+(?:my|our|the)\s+(?:biggest|largest|best|top)\b/.test(text)
+  );
 }
 
 /** Top accounts for a metric — the "who" behind an aggregate. */

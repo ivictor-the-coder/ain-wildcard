@@ -141,11 +141,15 @@ function scoreMention(mention: Mention, entity: EntityRef, idf: Map<string, numb
     return null;
   }
 
+  // The name is checked before the aliases: a record whose alias list repeats
+  // its own name must not score below a record that only has the name, or which
+  // of two same-named records an answer is about turns on how they were seeded.
+  if (value === keys.normalised) return { score: 1, rule: 'name_exact', detail: `exact name` };
+
   for (const alias of keys.aliasKeys) {
     if (alias && alias === value) return { score: 0.95, rule: 'alias_exact', detail: `alias "${alias}"` };
   }
 
-  if (value === keys.normalised) return { score: 1, rule: 'name_exact', detail: `exact name` };
   if (value === keys.core && keys.core) return { score: 0.94, rule: 'core_exact', detail: `name without suffixes` };
 
   const tokens = value.split(' ').filter(Boolean);
@@ -247,7 +251,18 @@ export function resolveEntities(message: string, index: EntityIndex, opts: Resol
     if (winner && winner.score >= minScore) best.set(entity.id, winner);
   }
 
-  const ranked = [...best.values()].sort((a, b) => b.score - a.score || a.entity.label.localeCompare(b.entity.label));
+  // A CRM company and a billing customer can carry the same name and the same
+  // score. Which one the answer is about must come from the caller's stated
+  // preference order and then from a fixed rule — never from the order rows
+  // happen to sit in the index, which changes as other modules seed.
+  const preferRank = new Map((opts.prefer ?? []).map((type, index) => [type, index] as const));
+  const rankOf = (candidate: ResolvedEntity): number => preferRank.get(candidate.entity.type) ?? preferRank.size;
+  const ranked = [...best.values()].sort((a, b) =>
+    b.score - a.score
+    || rankOf(a) - rankOf(b)
+    || typePrior(b.entity.type) - typePrior(a.entity.type)
+    || a.entity.label.localeCompare(b.entity.label)
+    || a.entity.id.localeCompare(b.entity.id));
 
   // A confident top hit suppresses the long tail of weak partial matches.
   const top = ranked[0];

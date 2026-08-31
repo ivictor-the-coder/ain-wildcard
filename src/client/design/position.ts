@@ -40,6 +40,13 @@ const parse = (placement: Placement): [Side, Alignment] => {
 
 const OPPOSITE: Record<Side, Side> = { top: 'bottom', bottom: 'top', left: 'right', right: 'left' };
 
+/**
+ * A floating box never shrinks below this, even where there is less room: a
+ * 30px-tall menu is not a menu. It is the one case where a side-placed box can
+ * still cross its anchor, and only on a viewport too short to hold both.
+ */
+const MIN_HEIGHT = 120;
+
 function place(anchor: Rect, size: Size, side: Side, align: Alignment, offset: number): { x: number; y: number } {
   let x = 0;
   let y = 0;
@@ -88,16 +95,23 @@ export function computePosition(
     }
   }
 
-  let { x, y } = place(anchor, box, side, align, offset);
+  // The height the box will actually render at is its content clipped by the
+  // room on the side we just chose — so that is the height to place and clamp
+  // with. Using the natural height instead is what slid a 508px date editor
+  // over the chip that opened it: on a 460px window `viewport.height - 508 -
+  // padding` is negative, the clamp collapsed to `padding`, and the box landed
+  // at y=8 covering its own anchor and the whole filter bar.
+  const available = spaceOn(anchor, side, viewport, padding) - offset;
+  const maxHeight = side === 'top' || side === 'bottom'
+    ? Math.max(MIN_HEIGHT, available)
+    : Math.max(MIN_HEIGHT, viewport.height - padding * 2);
+  const height = Math.min(box.height, maxHeight);
+
+  let { x, y } = place(anchor, { width: box.width, height }, side, align, offset);
 
   // Slide along the cross axis instead of letting the box hang off-screen.
   x = Math.min(Math.max(padding, x), Math.max(padding, viewport.width - box.width - padding));
-  y = Math.min(Math.max(padding, y), Math.max(padding, viewport.height - box.height - padding));
-
-  const available = spaceOn(anchor, side, viewport, padding) - offset;
-  const maxHeight = side === 'top' || side === 'bottom'
-    ? Math.max(120, available)
-    : Math.max(120, viewport.height - padding * 2);
+  y = Math.min(Math.max(padding, y), Math.max(padding, viewport.height - height - padding));
 
   return {
     x: Math.round(x),

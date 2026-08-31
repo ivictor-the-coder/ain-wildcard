@@ -98,6 +98,10 @@ export interface RefusalInput {
   types: string[];
   windows: TimeWindow[];
   mentions: PeriodMention[];
+  /** Period phrases no resolved window covers — the substitution guard. */
+  unresolved: PeriodMention[];
+  /** Set when the question wrote an explicit range back to front. */
+  reversedRange: { from: string; to: string } | null;
   /** Labels of the metrics this workspace can actually compute. */
   metrics: string[];
   /** Object types that can be counted or listed. */
@@ -160,17 +164,42 @@ export function refusalFor(input: RefusalInput): Refusal | null {
     };
   }
 
-  if (intent.intent === 'compare' && input.mentions.length >= 2 && input.windows.length < 2) {
-    const resolved = input.windows.map((w) => w.label);
+  // The substitution guard, and it is not a comparison rule.
+  //
+  // Any question that names a period the parser cannot turn into a range is
+  // refused, whatever its intent: answering "How much did we book in H1 2026?"
+  // about the current quarter is the same failure as answering a two-period
+  // comparison on one period, and it is worse, because a single figure with no
+  // caveat reads as authoritative and gets quoted. Nothing is measured; the
+  // phrase that did not parse is named back to the caller.
+  if (input.unresolved.length) {
     const named = input.mentions.map((m) => m.text);
+    const missed = input.unresolved.map((m) => m.text);
+    const resolved = input.windows.map((w) => w.label);
+    const comparison = intent.intent === 'compare' && named.length >= 2;
+    const vocabulary =
+      `I understand quarters ("Q1 2026"), months ("March 2025"), years ("2025"), relative periods ("last quarter", "the last 30 days") and explicit ranges ("between 2026-01-01 and 2026-03-31").`;
+    const backwards = input.reversedRange
+      ? `The range "${input.reversedRange.from} to ${input.reversedRange.to}" runs backwards — it ends before it starts.`
+      : '';
     return {
       code: 'period_unresolved',
-      why: `The question named ${named.length} periods (${named.join(', ')}) and only ${resolved.length} resolved.`,
-      content: [
-        `You asked me to compare ${quoteList(named.slice(0, 3))}, and I could only resolve ${resolved.length ? quoteList(resolved) : 'none of them'} to a date range.`,
-        `I will not answer on one period and present it as a comparison.`,
-        `I understand quarters ("Q1 2026"), months ("March 2025"), years ("2025"), relative periods ("last quarter", "the last 30 days") and explicit ranges ("between 2026-01-01 and 2026-03-31").`,
-      ].join(' '),
+      why: `The question named ${named.length} ${named.length === 1 ? 'period' : 'periods'} (${named.join(', ')}) and ${resolved.length === 0 ? 'none' : `only ${resolved.length}`} resolved: ${missed.join(', ')} did not parse.`,
+      content: comparison
+        ? [
+            `You asked me to compare ${quoteList(named.slice(0, 3))}, and I could only resolve ${resolved.length ? quoteList(resolved) : 'none of them'} to a date range.`,
+            backwards,
+            `I will not answer on one period and present it as a comparison.`,
+            vocabulary,
+          ].filter(Boolean).join(' ')
+        : [
+            `You named ${quoteList(missed.slice(0, 3))}, which I could not resolve to ${missed.length === 1 ? 'a date range' : 'date ranges'}.`,
+            backwards,
+            resolved.length
+              ? `I did resolve ${quoteList(resolved)}, but I will not measure a period you did not ask for and report it as the answer, so I have run nothing.`
+              : `I have not measured anything on a default period instead — a number about the wrong quarter is worse than no number.`,
+            vocabulary,
+          ].filter(Boolean).join(' '),
     };
   }
 

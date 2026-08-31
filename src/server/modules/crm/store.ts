@@ -719,14 +719,14 @@ export class Crm {
     const rows = this.ctx.db.all<HistoryRow>(
       `SELECT * FROM crm_property_history WHERE ${clauses.join(' AND ')}
         ORDER BY changed_at ${direction}, seq ${direction} LIMIT ?`,
-      ...(params as never[]), Math.min(Math.max(opts.limit ?? 100, 1), 500),
+      ...(params as never[]), Math.min(Math.max(opts.limit ?? 100, 1), HISTORY_PAGE_MAX + 1),
     );
     return rows.map((row) => this.hydrateHistory(orgId, row));
   }
 
   /** One page plus the cursor that fetches the next, with an honest `has_more`. */
   historyPage(orgId: string, recordId: string, opts: HistoryQuery = {}): HistoryPage {
-    const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+    const limit = Math.min(Math.max(opts.limit ?? 100, 1), HISTORY_PAGE_MAX);
     // Peek one row past the page: `has_more` should be a fact, not a guess
     // from whether the page came back exactly full.
     const rows = this.history(orgId, recordId, { ...opts, limit: limit + 1 });
@@ -1204,6 +1204,15 @@ function signatureOf(objectType: string, query: SearchQuery): string {
   for (const key of SIGNATURE_KEYS) shape[key] = (query as Record<string, unknown>)[key] ?? null;
   return createHash('sha1').update(JSON.stringify(shape)).digest('base64url').slice(0, 12);
 }
+
+/**
+ * The largest page `/history` will answer with. The row read is allowed one
+ * past it, because the pager measures `has_more` by fetching a row it will not
+ * show — clamping both to the same number made the maximum page the one page
+ * that could never say there was more, and a deal with 800 audit rows ended at
+ * 500 with `next_cursor: null`.
+ */
+const HISTORY_PAGE_MAX = 500;
 
 /**
  * A history cursor is the exact position of the last row returned, not a

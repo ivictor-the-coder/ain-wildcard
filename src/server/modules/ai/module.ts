@@ -7,7 +7,7 @@ import type { SchemaNode } from '../../../shared/validate';
 import v from '../../../shared/validate';
 import { DAY, dayKey, formatDate } from '../../../shared/time';
 import { AI_MIGRATIONS } from './schema';
-import { AiStore, publicApproval, publicMessage, publicRun, publicSpan, publicThread } from './store';
+import { AiStore, publicApproval, publicMessage, publicRun, publicSpan, publicThread, recordNamer } from './store';
 import { aiTools, metricCatalogue } from './tools';
 import {
   aiRuntime, type AiCallContext, type AiTraceSink, type AinCompletion, type PendingApproval,
@@ -17,8 +17,39 @@ import { workspaceProfile } from '../../ai/grounding';
 import { stageSets } from '../../ai/metrics';
 import { invalidateIndex } from '../../ai/grounding';
 import { accountProfile, recordSearch, recordTimeline } from '../../ai/functions';
+import { recordStanding, type RecordStanding } from '../../ai/query';
 import { composeDraft, detectDraftKind, detectTone, DRAFT_KINDS, TONES, type DraftKind, type DraftResult, type Tone } from '../../ai/draft';
 import { truncate } from '../../ai/text';
+
+/**
+ * Argument fields that name a record a write will land on.
+ *
+ * `assignee_id` and `owner_id` point at users rather than CRM records, so they
+ * are deliberately absent: this list is the set of things whose disappearance
+ * makes the write itself wrong.
+ */
+const TARGET_FIELDS = ['record_id', 'record_ids', 'id', 'associate_to', 'associated_to', 'parent_id'];
+
+/** Every CRM record id an approval's arguments will write to. */
+function writeTargets(args: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  for (const field of TARGET_FIELDS) {
+    const value = args[field];
+    if (typeof value === 'string') out.push(value);
+    else if (Array.isArray(value)) for (const item of value) if (typeof item === 'string') out.push(item);
+  }
+  return [...new Set(out)];
+}
+
+/** How a target that has moved under the approval reads to the person approving. */
+function describeStanding(standing: RecordStanding): string {
+  switch (standing.state) {
+    case 'missing': return `${standing.id} no longer exists`;
+    case 'archived': return `${standing.name ?? standing.id} has been archived`;
+    case 'merged': return `${standing.name ?? standing.id} was merged into ${standing.mergedInto}`;
+    default: return `${standing.name ?? standing.id} is unchanged`;
+  }
+}
 
 /* -------------------------------- service -------------------------------- */
 
@@ -172,7 +203,10 @@ export default defineModule({
       span(span) { store.recordSpan(span); },
       runFinished(finish) {
         const row = store.run(finish.orgId, finish.runId);
-        const model = row?.model ?? finish.model;
+        // Costed against the model that answered. When a hosted provider fails
+        // and the local engine takes over, the run is free and must be recorded
+        // that way, whatever model the run was started with.
+        const model = finish.model;
         const { costMicros } = accountUsage(model, finish.usage.inputTokens, finish.usage.outputTokens);
         store.finishRun(finish, costMicros);
         store.recordUsage({
@@ -668,7 +702,8 @@ export default defineModule({
       const spans = store.spans(req.auth.orgId, run.id);
       return {
         ...publicRun(run, spans),
-        approvals: store.approvals(req.auth.orgId).filter((a) => a.run_id === run.id).map(publicApproval),
+        approvals: store.approvals(req.auth.orgId).filter((a) => a.run_id === run.id)
+          .map((a) => publicApproval(a, recordNamer(ctx, req.auth.orgId))),
         timings: {
           total_ms: run.duration_ms,
           tool_ms: spans.filter((s) => s.kind === 'tool').reduce((a, s) => a + s.duration_ms, 0),
@@ -681,7 +716,8 @@ export default defineModule({
 
     router.get('/v1/ai/approvals', (req: Req) => {
       const q = req.query as { status?: string };
-      return list(store.approvals(req.auth.orgId, q.status ?? 'pending').map(publicApproval));
+      const nameOf = recordNamer(ctx, req.auth.orgId);
+      return list(store.approvals(req.auth.orgId, q.status ?? 'pending').map((a) => publicApproval(a, nameOf)));
     }, {
       summary: 'Writes an agent is waiting to make', tags: ['ai'],
       query: v.object({ status: v.optional(v.enum(['pending', 'approved', 'declined'] as const)) }),
@@ -699,7 +735,7 @@ export default defineModule({
         c.emit(req.auth.orgId, 'ai.approval.declined', { id: approval.id, tool: approval.tool, run_id: approval.run_id }, {
           objectId: approval.id, objectType: 'ai_approval', actorId: req.auth.userId, actorType: 'user',
         });
-        return publicApproval(store.approval(req.auth.orgId, approval.id)!);
+        return publicApproval(store.approval(req.auth.orgId, approval.id)!, recordNamer(c, req.auth.orgId));
       }
 
       // Arguments are re-validated here, not just when the plan was made: an
@@ -723,6 +759,28 @@ export default defineModule({
         throw badRequest(
           'approval_arguments_invalid',
           `This approval cannot run: ${message} It has been declined rather than executed with bad arguments.`,
+          'args',
+        );
+      }
+
+      // Shape is not the only thing that can change under a queued approval.
+      // The record it names can be archived, merged or deleted while it waits,
+      // and a note written onto a record that is gone is a write nobody asked
+      // for landing where nobody will read it.
+      const moved = writeTargets(args)
+        .map((id) => recordStanding(c, req.auth.orgId, id))
+        .filter((standing) => standing.state !== 'live');
+      if (moved.length) {
+        const why = moved.map(describeStanding).join('; ');
+        store.decideApproval(req.auth.orgId, approval.id, 'declined', req.auth.userId ?? null,
+          `Blocked: ${why}.`);
+        c.emit(req.auth.orgId, 'ai.approval.declined', {
+          id: approval.id, tool: approval.tool, run_id: approval.run_id, reason: 'target_changed',
+          targets: moved.map((s) => ({ id: s.id, state: s.state })),
+        }, { objectId: approval.id, objectType: 'ai_approval', actorId: req.auth.userId, actorType: 'user' });
+        throw badRequest(
+          'approval_target_changed',
+          `This approval cannot run: ${why}. It was prepared against ${moved.length === 1 ? 'a record' : 'records'} that changed while it waited, so it has been declined rather than written to ${moved.length === 1 ? 'the wrong place' : 'the wrong places'}. Ask again and I will prepare it against what is there now.`,
           'args',
         );
       }
@@ -760,7 +818,7 @@ export default defineModule({
         requestId: req.requestId,
       });
       return {
-        ...publicApproval(store.approval(req.auth.orgId, approval.id)!),
+        ...publicApproval(store.approval(req.auth.orgId, approval.id)!, recordNamer(c, req.auth.orgId)),
         executed: execution.ok,
         result: execution.ok ? execution.result : null,
         error: execution.error ?? null,

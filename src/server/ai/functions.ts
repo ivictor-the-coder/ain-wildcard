@@ -11,7 +11,7 @@
 import type { Ctx } from '../kernel/context';
 import { DAY, formatDate, formatRelative } from '../../shared/time';
 import { formatMoney } from '../../shared/money';
-import { entityIndex, workspaceProfile, type WorkspaceProfile } from './grounding';
+import { billingSources, entityIndex, workspaceProfile, type WorkspaceProfile } from './grounding';
 import { resolveEntities, type ResolvedEntity } from './resolve';
 import {
   accountSnapshot, detectGrouping, metricById, metricIds, topAccounts,
@@ -173,6 +173,19 @@ export interface MetricToolResult extends Omit<MetricResult, 'window'> {
   evidence: { id: string; label: string; type: string }[];
 }
 
+/**
+ * The name behind a billing customer id. A subject that is not a CRM record is
+ * still something with a name, and an answer that prints the id instead is a
+ * database row in a sentence a board reads.
+ */
+function customerName(ctx: Ctx, orgId: string, id: string): string | null {
+  const customers = billingSources(ctx.db).customers;
+  if (!customers?.nameColumn) return null;
+  const row = ctx.db.get<{ nm: string | null }>(
+    `SELECT ${customers.nameColumn} AS nm FROM ${customers.table} WHERE org_id = ? AND id = ?`, orgId, id);
+  return row?.nm?.trim() || null;
+}
+
 /** Resolve record ids to display names so citations read as records, not ids. */
 function labelIds(ctx: Ctx, orgId: string, ids: string[], fallbackType: string): { id: string; label: string; type: string }[] {
   if (!ids.length) return [];
@@ -191,8 +204,19 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
   const definition = metricById(args.metric);
   if (!definition) return { error: `Unknown metric "${args.metric}".`, available: metricIds() };
   const workspace = workspaceProfile(ctx, orgId);
-  const window: TimeWindow = args.start && args.end
-    ? { start: args.start, end: args.end, label: args.window_label ?? 'the selected period', grain: 'range', matched: '', partial: args.end > workspace.now }
+  // `start: 0` is a real window — "all time" begins at the epoch — so this
+  // guard tests for a number rather than for truthiness. Reading it as "no
+  // window given" is what made a ranking over all time report this quarter.
+  const bounded = Number.isFinite(args.start) && Number.isFinite(args.end) && Number(args.end) > Number(args.start);
+  const window: TimeWindow = bounded
+    ? {
+        start: args.start as number,
+        end: args.end as number,
+        label: args.window_label ?? 'the selected period',
+        grain: 'range',
+        matched: '',
+        partial: (args.end as number) > workspace.now && (args.start as number) <= workspace.now,
+      }
     : defaultWindow(workspace.now);
 
   let subject: MetricSubject | null = null;
@@ -200,7 +224,7 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
     const record = getRecord(ctx, orgId, args.subject_id);
     subject = record
       ? { id: record.id, type: record.object_type, label: record.display_name }
-      : { id: args.subject_id, type: 'customer', label: args.subject_id };
+      : { id: args.subject_id, type: 'customer', label: customerName(ctx, orgId, args.subject_id) ?? args.subject_id };
   }
 
   const input = { ctx, workspace, window, subject, groupBy: args.group_by ?? 'none' };

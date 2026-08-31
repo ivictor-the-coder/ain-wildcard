@@ -176,7 +176,11 @@
 .ain-filtered__hint {
   padding: 0 var(--space-5) var(--space-4); font-size: var(--text-xs); color: var(--text-tertiary);
 }
+/* Sticky, because a short window clamps the popover and the editor scrolls
+   inside it: Clear and Done stay reachable without hunting for the bottom of a
+   calendar. */
 .ain-filtered__foot {
+  position: sticky; bottom: 0; z-index: 1;
   display: flex; align-items: center; gap: var(--space-3);
   padding: var(--space-3) var(--space-4); border-top: 1px solid var(--border-subtle); background: var(--bg-subtle);
 }

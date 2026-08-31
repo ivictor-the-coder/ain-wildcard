@@ -1,5 +1,5 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { api, invalidate, useQuery } from './api';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { api, invalidate, useAuthLoss, useQuery, type ApiClientError, type AuthLoss } from './api';
 
 export interface SessionUser {
   id: string; email: string; name: string; avatar_url: string | null; title: string | null;
@@ -25,6 +25,19 @@ export interface SessionValue {
   me: Me | null;
   loading: boolean;
   signedIn: boolean;
+  /**
+   * Set when a call came back 401 on a workspace that *was* signed in — the
+   * session died rather than never existing. The sign-in screen says so, with
+   * the server's own message and request id, instead of pretending you arrived.
+   */
+  sessionEnded: AuthLoss | null;
+  /**
+   * Set when `/v1/me` failed for a reason that is not "you are signed out" —
+   * a 429, a 500, a dead connection. Showing a sign-in form for one of those
+   * blames the operator for an outage and invites them to type a password that
+   * would not have worked either.
+   */
+  unreachable: ApiClientError | null;
   refresh: () => void;
   signIn: (email: string, password: string) => Promise<void>;
   signInDemo: () => Promise<void>;
@@ -61,7 +74,29 @@ const readStored = <T,>(key: string, fallback: T): T => {
 const writeStored = (key: string, value: unknown) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* private mode */ } };
 
 export function SessionProvider({ children }: { children: ReactNode }) {
-  const { data, loading, refetch } = useQuery<Me>('/v1/me');
+  const { data, loading, error, refetch } = useQuery<Me>('/v1/me');
+  const authLoss = useAuthLoss();
+  // Hold the last answer while a new one is in flight. Without this, anything
+  // that drops the client cache — the time machine, a refresh — briefly makes
+  // `me` null, and the shell tears itself down to the boot spinner, losing the
+  // operator's scroll position and every open overlay.
+  //
+  // The pin has to break the moment the server says 401, though. Held through a
+  // dead session it is what let the time machine walk the clock past the
+  // session's own expiry and leave a signed-out browser rendering a full shell
+  // over nine empty panels.
+  const known = useRef<Me | null>(null);
+  const handledLoss = useRef(0);
+  const everSignedIn = useRef(false);
+  const [deliberateSignOut, setDeliberateSignOut] = useState(false);
+  if (authLoss && authLoss.at !== handledLoss.current) {
+    handledLoss.current = authLoss.at;
+    known.current = null;
+  }
+  if (data) { known.current = data; if (data.user) everSignedIn.current = true; }
+  const me = data ?? known.current;
+  const sessionEnded = authLoss && everSignedIn.current && !deliberateSignOut ? authLoss : null;
+  const unreachable = error && error.status !== 401 && !me?.user ? error : null;
   const [themeState, setThemeState] = useState<Theme>(() => readStored<Theme>('ain.theme', 'system'));
   const [density, setDensityState] = useState<Density>(() => readStored<Density>('ain.density', 'comfortable'));
   const [systemDark, setSystemDark] = useState(() => window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false);
@@ -89,19 +124,38 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const setDensity = useCallback((d: Density) => { setDensityState(d); writeStored('ain.density', d); }, []);
 
   const value = useMemo<SessionValue>(() => ({
-    me: data ?? null,
-    loading,
-    signedIn: !!data?.user,
+    me,
+    loading: loading && !me,
+    signedIn: !!me?.user,
+    sessionEnded,
+    unreachable,
     refresh: () => { invalidate('/v1/me'); refetch(); },
-    async signIn(email, password) { await api.post('/v1/auth/login', { email, password }); invalidate(); refetch(); },
-    async signInDemo() { await api.post('/v1/auth/demo'); invalidate(); refetch(); },
-    async signOut() { await api.post('/v1/auth/logout'); invalidate(); refetch(); },
+    async signIn(email, password) {
+      await api.post('/v1/auth/login', { email, password });
+      setDeliberateSignOut(false);
+      invalidate();
+      refetch();
+    },
+    async signInDemo() {
+      await api.post('/v1/auth/demo');
+      setDeliberateSignOut(false);
+      invalidate();
+      refetch();
+    },
+    async signOut() {
+      setDeliberateSignOut(true);
+      everSignedIn.current = false;
+      await api.post('/v1/auth/logout');
+      known.current = null;
+      invalidate();
+      refetch();
+    },
     theme: themeState, setTheme, resolvedTheme, density, setDensity,
     now: () => Date.now() + offset,
-    currency: data?.org?.default_currency ?? 'usd',
-    locale: data?.org?.locale ?? 'en-US',
-    timeZone: data?.org?.timezone ?? 'UTC',
-  }), [data, loading, refetch, themeState, setTheme, resolvedTheme, density, setDensity, offset]);
+    currency: me?.org?.default_currency ?? 'usd',
+    locale: me?.org?.locale ?? 'en-US',
+    timeZone: me?.org?.timezone ?? 'UTC',
+  }), [me, loading, sessionEnded, unreachable, refetch, themeState, setTheme, resolvedTheme, density, setDensity, offset]);
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
 }
