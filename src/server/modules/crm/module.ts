@@ -4,11 +4,12 @@ import { created, list, noContent, type Req } from '../../kernel/http';
 import { ApiError, badRequest, isApiError, notFound } from '../../../shared/errors';
 import v from '../../../shared/validate';
 import { CRM_MIGRATIONS } from './schema';
-import { Crm, type HistoryQuery } from './store';
+import { Crm, type AssociationWrite, type HistoryQuery } from './store';
 import { buildTimeline, buildTimelinePage, type TimelineOptions, type TimelinePage } from './timeline';
 import { findSimilar, mergeRecords, type MergeResult, type SimilarMatch } from './dedupe';
 import { installBuiltins, seedCrm } from './seed';
 import { EXPRESSION_FUNCTIONS } from './expr';
+import { ValueFormatter } from './format';
 import { BUILTIN_PROPERTY_NAMES, suggestProperty } from './filter';
 import { FILTER_OPERATORS } from './types';
 import { CUSTOM_PIPELINE_PROPERTIES, safeMinorUnits, type PipelineInput, type PipelinePatch, type StageUsage } from './pipelines';
@@ -60,7 +61,7 @@ export interface CrmService {
   search(orgId: string, objectType: string, query?: SearchQuery): SearchResult;
   count(orgId: string, objectType: string, filter?: FilterNode, opts?: { includeArchived?: boolean }): number;
 
-  associate(orgId: string, input: { fromId: string; toId: string; associationType?: string; primary?: boolean }, opts?: WriteOptions): AssociationSummary;
+  associate(orgId: string, input: { fromId: string; toId: string; associationType?: string; primary?: boolean }, opts?: WriteOptions): AssociationWrite;
   disassociate(orgId: string, filter: { id?: string; fromId?: string; toId?: string; associationType?: string }, opts?: WriteOptions): number;
   associations(orgId: string, recordId: string, opts?: { objectType?: string; associationType?: string; limit?: number }): AssociationSummary[];
   associated(orgId: string, recordId: string, objectType: string, limit?: number): CrmRecord[];
@@ -133,6 +134,21 @@ const instant = () => v.transform(
 const splitList = (value: unknown): string[] =>
   typeof value === 'string' && value.trim() ? value.split(',').map((s) => s.trim()).filter(Boolean) : [];
 
+/**
+ * The rollup half of "create a property": an aggregate over associated records.
+ * Same vocabulary as an association filter — pick the object on the other end,
+ * pick the aggregate, name the property to aggregate, and narrow it — so an
+ * admin who can write "companies whose open deals sum over $75k" can store
+ * that number on the company without learning a second language.
+ */
+const rollupBody = v.object({
+  association: v.string({ min: 1, max: 60 }),
+  aggregate: v.enum(['count', 'sum', 'avg', 'min', 'max'] as const),
+  property: v.optional(v.string({ min: 1, max: 60 })),
+  direction: v.optional(v.enum(['outgoing', 'incoming', 'both'] as const)),
+  filter: v.optional(v.any()),
+}, { strict: true });
+
 const propertyBody = v.object({
   name: v.string({ min: 1, max: 60 }),
   label: v.string({ min: 1, max: 120 }),
@@ -158,6 +174,7 @@ const propertyBody = v.object({
     pattern: v.optional(v.string({ max: 240 })), allow_other: v.optional(v.boolean()),
   })),
   calculated: v.optional(v.string({ max: 1000 })),
+  rollup: v.optional(rollupBody),
   normalize: v.optional(v.enum(['none', 'lower', 'upper', 'domain', 'digits'] as const)),
   currency: v.optional(v.currency()),
   position: v.optional(v.int({ min: 0, max: 10_000 })),
@@ -362,19 +379,29 @@ export default defineModule({
     router.post('/v1/objects/:type/properties', (req: Req) => {
       const body = req.body as Parameters<Crm['defineProperty']>[2];
       return created({ object: 'property', ...ctx.atomic(() => crm.defineProperty(req.auth.orgId, req.params.type, body)) });
-    }, { summary: 'Create a property', tags: ['crm'], roles: ['admin'], body: propertyBody });
+    }, {
+      summary: 'Create a property', tags: ['crm'], roles: ['admin'], body: propertyBody,
+      description: 'A `calculated` formula is evaluated in dependency order, so a formula reading another formula always sees the value from the same save, and one that would close a loop is refused with `expression_cycle`. A `rollup` aggregates a property across associated records — `{"association":"deal","aggregate":"sum","property":"amount","filter":{"property":"deal_status","operator":"eq","value":"open"}}` puts total open pipeline on the company, where it can be displayed, sorted, filtered, used as a view column and read by a formula. Creating either backfills it across the records that already exist; the response says how many moved in `records_recalculated`.',
+    });
 
     router.get('/v1/objects/:type/properties/:name', (req: Req) => {
       const prop = crm.property(req.auth.orgId, req.params.type, req.params.name);
       const usage = ctx.db.count(
         `SELECT COUNT(*) FROM crm_record_values WHERE org_id = ? AND object_type = ? AND property = ?`,
         req.auth.orgId, req.params.type, req.params.name);
-      return { object: 'property', ...prop, records_with_value: usage };
-    }, { summary: 'Retrieve one property', tags: ['crm'] });
+      // The formula graph, both ways round: what this property reads, and what
+      // would move if it changed. It is the same graph the evaluator sorts on.
+      const graph = crm.formulaGraph(req.auth.orgId, req.params.type, req.params.name);
+      return { object: 'property', ...prop, records_with_value: usage, ...graph };
+    }, {
+      summary: 'Retrieve one property', tags: ['crm'],
+      description: 'Includes `records_with_value`, and the dependency graph both ways round: `depends_on` is what this property reads — the properties a formula names, or the far-side `deal.amount`, `deal.deal_status` a rollup aggregates and filters on — and `used_by` names the formulas that read it, the properties that would be rewritten if this one changed and the ones that block deleting it. `in_cycle` flags a formula that cannot be ordered and is therefore left unevaluated; new formulas that would close a loop are refused with `expression_cycle`.',
+    });
 
     router.patch('/v1/objects/:type/properties/:name', (req: Req) =>
       ({ object: 'property', ...ctx.atomic(() => crm.updateProperty(req.auth.orgId, req.params.type, req.params.name, req.body as Partial<PropertyDef>)) }), {
       summary: 'Update a property', tags: ['crm'], roles: ['admin'],
+      description: 'Changing `calculated` or `rollup` recomputes the property — and every formula downstream of it — across the records that already exist, and reports the count in `records_recalculated`. A formula that would make the property depend on itself, however long the chain, is refused with `expression_cycle`. Pass `rollup: null` to turn a rollup back into an ordinary stored property.',
       body: v.object({
         label: v.optional(v.string({ min: 1, max: 120 })),
         description: v.optional(v.string({ max: 500 })),
@@ -391,6 +418,7 @@ export default defineModule({
         default_value: v.optional(v.any()),
         validation: v.optional(v.any()),
         calculated: v.optional(v.string({ max: 1000 })),
+        rollup: v.optional(v.nullable(rollupBody)),
         position: v.optional(v.int({ min: 0, max: 10_000 })),
       }, { strict: true }),
     });
@@ -1233,20 +1261,24 @@ export default defineModule({
     });
 
     router.post('/v1/associations', (req: Req) => {
-      const body = req.body as { from_id: string; to_id: string; association_type?: string; primary?: boolean };
+      const body = req.body as { from_id: string; to_id: string; association_type?: string; primary?: boolean; is_primary?: boolean };
       const edge = ctx.atomic(() => crm.associate(req.auth.orgId, {
         fromId: body.from_id, toId: body.to_id,
-        associationType: body.association_type, primary: body.primary,
+        associationType: body.association_type, primary: body.primary ?? body.is_primary,
       }, writeOptions(req)));
-      return created({ object: 'association', ...edge });
+      // A write that removed an existing link is a replace, not a create, and
+      // 201 with no mention of what went is how an account swap reads exactly
+      // like an account added.
+      return edge.replaced.length ? { object: 'association', ...edge } : created({ object: 'association', ...edge });
     }, {
       summary: 'Associate two records', tags: ['crm'], roles: ['member'],
-      description: 'The association type is inferred from the two object types when it is not given. One-to-many labels replace the existing edge rather than erroring.',
+      description: 'The association type is inferred from the two object types when it is not given. A `many_to_one` or `one_to_one` label holds a single edge, so pointing a deal at a different account replaces the existing link: the response is 200 with the removed edges in `replaced`, and the primary flag moves across with the slot rather than being dropped. `is_primary` is accepted as an alias for `primary`, so the field you read back is the field you can send.',
       body: v.object({
         from_id: v.string({ min: 1, max: 80 }),
         to_id: v.string({ min: 1, max: 80 }),
         association_type: v.optional(v.string({ max: 60 })),
         primary: v.optional(v.boolean()),
+        is_primary: v.optional(v.boolean()),
       }, { strict: true }),
     });
 
@@ -1336,7 +1368,7 @@ export default defineModule({
     return [
       {
         name: 'search_records',
-        description: 'Search CRM records of one object type using the platform filter engine. Supports nested and/or groups, 19 operators, relative dates like "-30d" or "start_of_quarter", and association-aware conditions such as counting a company\'s open deals. Returns matching records with their properties.',
+        description: 'Search CRM records of one object type using the platform filter engine. Supports nested and/or groups, 19 operators, relative dates like "-30d" or "start_of_quarter", and association-aware conditions such as counting a company\'s open deals. Each record comes back twice over: `properties` holds the stored values to filter and compute with — money in integer minor units, instants in epoch milliseconds, enums as machine values — and `formatted` holds the same fields written out. Quote `formatted` to a person; an amount of 8000000 is $80,000.00, not eight million dollars.',
         readOnly: true,
         tags: ['crm'],
         input: v.object({
@@ -1350,16 +1382,23 @@ export default defineModule({
           const result = crm.search(meta.orgId, args.object_type, {
             filter: args.filter, query: args.query, sort: args.sort, limit: args.limit ?? 20,
           });
+          const formatter = new ValueFormatter(ctx, meta.orgId);
+          const index = crm.propertyIndex(meta.orgId, args.object_type);
           return {
             total: result.total,
             returned: result.records.length,
-            records: result.records.map((r) => ({ id: r.id, display_name: r.display_name, owner_id: r.owner_id, properties: r.properties })),
+            records: result.records.map((r) => ({
+              id: r.id, display_name: r.display_name, owner_id: r.owner_id,
+              owner: r.owner_id ? formatter.user(r.owner_id) : null,
+              properties: r.properties,
+              formatted: formatter.record(index, r.properties),
+            })),
           };
         },
       },
       {
         name: 'get_record',
-        description: 'Fetch one CRM record by id with every property, its associations to other records, and the most recent timeline activity.',
+        description: 'Fetch one CRM record by id with every property, its associations to other records, and the most recent timeline activity. `properties` holds the stored values (money in integer minor units, instants in epoch milliseconds, enums as machine values); `formatted` holds the same fields as a person reads them, and is what to quote back.',
         readOnly: true,
         tags: ['crm'],
         input: v.object({
@@ -1369,8 +1408,11 @@ export default defineModule({
         }),
         run(args: { object_type: string; id: string; include_timeline?: boolean }, _c, meta) {
           const record = crm.require(meta.orgId, args.object_type, args.id);
+          const formatter = new ValueFormatter(ctx, meta.orgId);
           return {
             ...record,
+            formatted: formatter.record(crm.propertyIndex(meta.orgId, record.object_type), record.properties),
+            owner: record.owner_id ? formatter.user(record.owner_id) : null,
             associations: crm.associationsOf(meta.orgId, record.id, { limit: 50 }),
             ...(args.include_timeline ? { timeline: buildTimeline(ctx, crm, meta.orgId, record, { limit: 15 }) } : {}),
           };
@@ -1386,6 +1428,9 @@ export default defineModule({
           return crm.properties(meta.orgId, args.object_type).map((p) => ({
             name: p.name, label: p.label, type: p.type, group: p.group, required: p.required,
             read_only: p.read_only, calculated: p.calculated,
+            ...(p.rollup ? { rollup: p.rollup } : {}),
+            ...(p.type === 'currency' ? { currency: p.currency, note: 'Stored in integer minor units.' } : {}),
+            ...(p.calculated || p.rollup ? { depends_on: crm.formulaGraph(meta.orgId, args.object_type, p.name).depends_on } : {}),
             options: p.options.map((o) => ({ value: o.value, label: o.label })),
           }));
         },

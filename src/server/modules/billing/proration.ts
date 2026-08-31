@@ -282,10 +282,11 @@ export function previewChange(input: PreviewInput): ChangePreview {
     { book: input.book, currency: input.currency, locale: input.locale },
   );
 
-  // A negative proration set is a credit, and a credit is never a payment: it
-  // lands on the customer's balance and reduces what the next invoice collects.
+  // Every proration line goes onto a bill, whichever way the set nets, so the
+  // rate engine taxes a credit exactly as it taxed the charge it reverses. The
+  // customer balance is no longer part of this decision: it takes only what an
+  // invoice cannot carry, which is decided after tax, on the bill itself.
   const settles = input.behavior === 'always_invoice';
-  const balanceApplied = set.net < 0 ? set.net : 0;
   const amountDueNow = settles && set.net > 0 ? set.net : 0;
 
   const notices = [...set.notices];
@@ -298,10 +299,11 @@ export function previewChange(input: PreviewInput): ChangePreview {
       `${describeCadence(input.intervalAfter)}.`,
     );
   }
-  if (balanceApplied < 0) {
+  if (set.net < 0) {
     notices.push(
-      `This change is worth ${formatMoney(money(-balanceApplied, input.currency), { locale: input.locale })} back to the customer. ` +
-      'Credits are never paid out — it goes onto the account balance and comes off the next invoice.',
+      `This change is worth ${formatMoney(money(-set.net, input.currency), { locale: input.locale })} back to the customer before tax. ` +
+      'Credits are never paid out — the lines go onto a bill, which taxes them exactly as it taxed the charge they reverse, ' +
+      `and whatever ${settles ? 'that bill' : 'the next invoice'} cannot absorb stays on the account balance.`,
     );
   }
   if (!settles && set.net !== 0 && set.lines.length) {
@@ -324,9 +326,7 @@ export function previewChange(input: PreviewInput): ChangePreview {
     charge_total: set.chargeTotal,
     net: set.net,
     amount_due_now: amountDueNow,
-    balance_applied: balanceApplied,
-    customer_balance_before: input.customerBalance,
-    customer_balance_after: input.customerBalance + balanceApplied,
+    customer_balance: input.customerBalance,
     next_invoice: {
       date: input.nextInvoiceDate,
       currency: input.currency,

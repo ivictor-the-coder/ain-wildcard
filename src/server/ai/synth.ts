@@ -55,6 +55,10 @@ export interface SynthesisInput {
   writeBlocked?: { wanted: string; reason: string } | null;
   /** Tool names this run was scoped to, when the caller restricted it. */
   scopedTools?: string[] | null;
+  /** Tools the question matched but could not arm, so the answer can say so. */
+  skippedTools?: { tool: string; missing: string[] }[];
+  /** The record carried in from the conversation when this turn named none. */
+  carriedSubject?: { label: string; pinned: boolean } | null;
 }
 
 export interface SynthesisOutput {
@@ -108,12 +112,18 @@ const namedOrNull = (label: string | null | undefined): string | null =>
 const COMPARE_VERB: Record<string, string> = {
   spend: 'spent', revenue: 'collected', invoiced: 'invoiced', closed_won: 'booked',
   closed_lost: 'lost', outstanding: 'carried', pipeline: 'carried', weighted_pipeline: 'carried',
-  avg_deal_size: 'averaged', sales_cycle: 'averaged', win_rate: 'closed', mrr: 'held',
+  avg_deal_size: 'averaged', sales_cycle: 'averaged', win_rate: 'closed', mrr: 'held', arr: 'held',
   new_customers: 'added', customers: 'had', deal_count: 'had', open_tickets: 'had',
   tickets_created: 'logged', resolution_time: 'averaged', csat: 'averaged',
 };
 
 const verb = (metric: MetricToolResult): string => COMPARE_VERB[metric.metric] ?? 'recorded';
+
+/** What one row of a ranking is, per the source the number came from. */
+const ROW_NOUN: Record<string, string> = {
+  invoices: 'invoice', subscriptions: 'subscription', deals: 'deal', tickets: 'ticket',
+  activities: 'activity', records: 'record',
+};
 
 /**
  * Two runs of the same metric over different periods — the shape a real period
@@ -196,6 +206,7 @@ function headline(metric: MetricToolResult, who: string, period: string, hasSubj
     case 'sales_cycle': return `${who} took ${value} on average to close a deal in ${period}`;
     case 'win_rate': return `${who} closed ${value} of the deals it decided in ${period}`;
     case 'mrr': return `${who} has ${value} in monthly recurring revenue`;
+    case 'arr': return `${who} has ${value} in annual recurring revenue`;
     case 'csat': return `Customer satisfaction in ${period} averaged ${value} out of 5`;
     case 'resolution_time': return `${who} took ${value} on average to resolve a ticket in ${period}`;
     default:
@@ -284,7 +295,7 @@ function rankedAnswer(metric: MetricToolResult, input: SynthesisInput): string[]
     `${top.label} is the biggest by ${noun} ${period}, at ${top.formatted}${metric.value > 0 && metric.unit === 'money' ? ` of ${metric.formatted} across the workspace` : ''}.`,
   ];
   lines.push(shown.map((row, index) =>
-    `${index + 1}. ${row.label} — ${row.formatted}${row.count ? ` from ${countOf(row.count, metric.sourceKind === 'invoices' ? 'invoice' : 'deal')}` : ''}`).join('\n'));
+    `${index + 1}. ${row.label} — ${row.formatted}${row.count ? ` from ${countOf(row.count, ROW_NOUN[metric.sourceKind] ?? 'record')}` : ''}`).join('\n'));
   if (asked > 0 && rows.length > asked) {
     lines.push(`${countOf(rows.length - asked, 'other account')} had ${noun} ${period}; say a larger number and I will show them.`);
   }
@@ -372,6 +383,332 @@ function recordLines(list: RecordSearchResult, facts: Facts, workspace: Workspac
   });
 }
 
+/* ----------------------------- billing answers ---------------------------- */
+
+/**
+ * The revenue half of the platform answers in its own shapes.
+ *
+ * A run whose trace reads `billing_list_subscriptions ok=true => total=35` above
+ * the sentence "No subscription records match that" did not fail to find the
+ * rows — it found them and then threw them away, because only CRM-shaped
+ * payloads had a renderer. These are the renderers for the other half, matched
+ * structurally rather than by tool name so a tool that returns the same shape
+ * under another name still gets an answer.
+ */
+interface BillingSubscriptionRow {
+  id: string;
+  customer_name?: string | null;
+  status?: string;
+  items?: string[];
+  mrr_display?: string;
+  current_period_end?: string;
+  cancel_at_period_end?: boolean;
+}
+interface BillingSubscriptionList { total: number; subscriptions: BillingSubscriptionRow[] }
+
+interface BillingInvoiceRow {
+  id: string;
+  number?: string | null;
+  customer_name?: string | null;
+  status?: string;
+  total_display?: string;
+  amount_due_display?: string;
+  due?: string;
+  billing_reason?: string;
+}
+interface BillingInvoiceList { total: number; outstanding_display?: string; invoices: BillingInvoiceRow[] }
+
+interface BillingInvoiceExplanation {
+  number: string;
+  customer_name?: string | null;
+  status: string;
+  covers: string;
+  lines: { description: string; amount_display: string; proration?: boolean; why?: string }[];
+  subtotal_display: string;
+  tax_display?: string;
+  balance_applied_display?: string;
+  total_display: string;
+  adds_up?: boolean;
+}
+
+interface BillingUpcomingInvoice {
+  due: string;
+  covers: string;
+  lines: string[];
+  subtotal_display: string;
+  balance_applied_display?: string;
+  total_display: string;
+}
+
+interface BillingCustomerSummary {
+  object: 'customer_summary';
+  headline: string;
+  customer: { id?: string; name: string };
+  mrr: number;
+  arr: number;
+  subscriptions: { total: number; live: number };
+  balance: { amount: number; credit: boolean; description: string };
+  lifetime_value: { amount: number; periods_billed: number };
+  next_invoice: { date: number; estimated_total: number; note: string } | null;
+  open_invoices: { total: number; oldest_due: number | null };
+  attention: string[];
+}
+
+const field = (value: unknown, key: string): boolean =>
+  !!value && typeof value === 'object' && key in (value as object);
+const arrayField = (value: unknown, key: string): boolean =>
+  field(value, key) && Array.isArray((value as Record<string, unknown>)[key]);
+
+const isSubscriptionList = (v: unknown): boolean => arrayField(v, 'subscriptions') && field(v, 'total');
+const isInvoiceList = (v: unknown): boolean => arrayField(v, 'invoices') && field(v, 'total');
+const isCustomerSummary = (v: unknown): boolean =>
+  !!v && typeof v === 'object' && (v as { object?: unknown }).object === 'customer_summary';
+const isInvoiceExplanation = (v: unknown): boolean =>
+  arrayField(v, 'lines') && field(v, 'total_display') && field(v, 'covers') && field(v, 'number');
+const isUpcomingInvoice = (v: unknown): boolean =>
+  arrayField(v, 'lines') && field(v, 'total_display') && field(v, 'due') && !field(v, 'number');
+
+interface BillingFound {
+  subscriptions: { list: BillingSubscriptionList; args: Record<string, unknown> }[];
+  invoices: { list: BillingInvoiceList; args: Record<string, unknown> }[];
+  summaries: BillingCustomerSummary[];
+  explanations: BillingInvoiceExplanation[];
+  upcoming: BillingUpcomingInvoice[];
+  /** Rows the ledger actually returned in this run. */
+  rows: number;
+}
+
+function gatherBilling(steps: StepResult[]): BillingFound {
+  const found: BillingFound = { subscriptions: [], invoices: [], summaries: [], explanations: [], upcoming: [], rows: 0 };
+  for (const step of steps) {
+    if (!ok(step)) continue;
+    const value = step.result;
+    if (isSubscriptionList(value)) {
+      const list = value as BillingSubscriptionList;
+      found.subscriptions.push({ list, args: step.args });
+      found.rows += list.subscriptions.length;
+    } else if (isInvoiceList(value)) {
+      const list = value as BillingInvoiceList;
+      found.invoices.push({ list, args: step.args });
+      found.rows += list.invoices.length;
+    } else if (isCustomerSummary(value)) {
+      found.summaries.push(value as BillingCustomerSummary);
+      found.rows += 1;
+    } else if (isInvoiceExplanation(value)) {
+      found.explanations.push(value as BillingInvoiceExplanation);
+      found.rows += 1;
+    } else if (isUpcomingInvoice(value)) {
+      found.upcoming.push(value as BillingUpcomingInvoice);
+      found.rows += 1;
+    }
+  }
+  return found;
+}
+
+/** How the ledger was filtered, said out loud so the count can be trusted. */
+function subscriptionScope(args: Record<string, unknown>): string {
+  const status = typeof args.status === 'string' ? args.status : 'active_like';
+  if (status === 'all') return 'on the books, whatever their status';
+  if (status === 'active_like') return 'still running — everything not cancelled or expired';
+  return `at status ${humanise(status).toLowerCase()}`;
+}
+
+function subscriptionBlocks(entry: { list: BillingSubscriptionList; args: Record<string, unknown> }, workspace: WorkspaceProfile): string[] {
+  const { list, args } = entry;
+  const shown = list.subscriptions;
+  if (!list.total || !shown.length) {
+    return [`No subscription in ${workspace.name} is ${subscriptionScope(args)}${args.customer ? ' for that account' : ''}.`];
+  }
+  const blocks = [
+    `${countOf(list.total, 'subscription')} ${list.total === 1 ? 'is' : 'are'} ${subscriptionScope(args)}`
+    + `${shown.length < list.total ? `. ${shown.length} of them:` : ':'}`,
+  ];
+  blocks.push(shown.map((row) => {
+    const parts: string[] = [];
+    if (row.status) parts.push(humanise(row.status));
+    if (row.items?.length) parts.push(row.items.join(' + '));
+    if (row.mrr_display) parts.push(`${row.mrr_display} a month`);
+    if (row.current_period_end) parts.push(`${row.cancel_at_period_end ? 'ends' : 'renews'} ${row.current_period_end}`);
+    return bullet(`${row.customer_name ?? row.id}${parts.length ? ` — ${parts.join(' · ')}` : ''}`);
+  }).join('\n'));
+  if (shown.length < list.total) {
+    blocks.push(`${countOf(list.total - shown.length, 'other subscription')} sit behind those — name a status such as past due, or an account, and I will narrow it.`);
+  }
+  return blocks;
+}
+
+function invoiceBlocks(entry: { list: BillingInvoiceList; args: Record<string, unknown> }, workspace: WorkspaceProfile): string[] {
+  const { list, args } = entry;
+  const shown = list.invoices;
+  const status = typeof args.status === 'string' ? args.status : null;
+  const scope = status === 'open_like' ? 'still open'
+    : status && status !== 'all' ? `at status ${humanise(status).toLowerCase()}`
+    : args.due_before ? 'past their due date'
+    : 'in the book';
+  if (!list.total || !shown.length) {
+    return [`No invoice in ${workspace.name} is ${scope}${args.customer ? ' for that account' : ''}.`];
+  }
+  const blocks = [
+    `${countOf(list.total, 'invoice')} ${list.total === 1 ? 'is' : 'are'} ${scope}`
+    + `${shown.length < list.total ? `. ${shown.length} of them` : ''}`
+    // The tool totals only the rows it returned, so the answer says which rows
+    // that figure covers rather than implying it is the whole ledger's balance.
+    + `${list.outstanding_display ? `${shown.length < list.total ? '' : ', which'} carr${shown.length === 1 ? 'ies' : 'y'} ${list.outstanding_display} still due` : ''}:`,
+  ];
+  blocks.push(shown.map((row) => {
+    const parts: string[] = [];
+    if (row.customer_name) parts.push(row.customer_name);
+    if (row.status) parts.push(humanise(row.status));
+    if (row.status === 'paid' || !row.amount_due_display || row.amount_due_display === row.total_display) {
+      if (row.total_display) parts.push(row.total_display);
+    } else {
+      parts.push(`${row.amount_due_display} still due of ${row.total_display}`);
+    }
+    if (row.due) parts.push(`due ${row.due}`);
+    return bullet(`${row.number ?? row.id}${parts.length ? ` — ${parts.join(' · ')}` : ''}`);
+  }).join('\n'));
+  if (shown.length < list.total) {
+    blocks.push(`${countOf(list.total - shown.length, 'other invoice')} sit behind those — name an account or a status and I will narrow it.`);
+  }
+  return blocks;
+}
+
+function explanationBlocks(invoice: BillingInvoiceExplanation): string[] {
+  const blocks = [
+    `Invoice ${invoice.number}${invoice.customer_name ? ` for ${invoice.customer_name}` : ''} — ${humanise(invoice.status).toLowerCase()}, covering ${invoice.covers}.`,
+  ];
+  if (invoice.lines.length) {
+    blocks.push(invoice.lines.slice(0, 8).map((line) =>
+      bullet(`${line.description} — ${line.amount_display}${line.proration ? ' (proration)' : ''}${line.why ? `: ${line.why}` : ''}`)).join('\n'));
+  }
+  const totals = [`subtotal ${invoice.subtotal_display}`];
+  if (invoice.tax_display) totals.push(`tax ${invoice.tax_display}`);
+  if (invoice.balance_applied_display) totals.push(`account balance ${invoice.balance_applied_display}`);
+  blocks.push(`${listPhrase(totals)} — ${invoice.total_display} in total.`);
+  // A bill whose lines do not sum to its total is the one thing a customer will
+  // find, so it is said out loud rather than left for them to notice.
+  if (invoice.adds_up === false) {
+    blocks.push('The lines on this invoice do not add up to the total it states. Do not send it out before someone has looked at it.');
+  }
+  return blocks;
+}
+
+function upcomingBlocks(invoice: BillingUpcomingInvoice): string[] {
+  const blocks = [`The next invoice is dated ${invoice.due} and covers ${invoice.covers}.`];
+  if (invoice.lines.length) blocks.push(invoice.lines.slice(0, 8).map((line) => bullet(line)).join('\n'));
+  const parts = [`subtotal ${invoice.subtotal_display}`];
+  if (invoice.balance_applied_display) parts.push(`account balance ${invoice.balance_applied_display}`);
+  blocks.push(`${listPhrase(parts)} — ${invoice.total_display} will be charged. Nothing has been billed yet; this is the bill as it stands.`);
+  return blocks;
+}
+
+function summaryBlocks(summary: BillingCustomerSummary, facts: Facts): string[] {
+  const blocks = [`${summary.customer.name} — ${summary.headline}`];
+  const commercial: string[] = [];
+  if (summary.subscriptions.live) {
+    commercial.push(`${countOf(summary.subscriptions.live, 'live subscription')} of ${summary.subscriptions.total}`);
+  }
+  if (summary.mrr) commercial.push(`${facts.money(summary.mrr)} a month, ${facts.money(summary.arr)} annualised`);
+  if (summary.lifetime_value.periods_billed) {
+    commercial.push(`${facts.money(summary.lifetime_value.amount)} billed across ${countOf(summary.lifetime_value.periods_billed, 'period')}`);
+  }
+  if (commercial.length) blocks.push(`${sentenceJoin([listPhrase(commercial)])}`);
+  if (summary.balance.amount !== 0) blocks.push(summary.balance.description);
+  if (summary.open_invoices.total) {
+    blocks.push(`${countOf(summary.open_invoices.total, 'invoice')} still open${summary.open_invoices.oldest_due ? `, the oldest due ${facts.day(summary.open_invoices.oldest_due)}` : ''}.`);
+  }
+  if (summary.next_invoice) {
+    blocks.push(`Next invoice ${facts.day(summary.next_invoice.date)} for about ${facts.money(summary.next_invoice.estimated_total)} — ${summary.next_invoice.note}`);
+  }
+  if (summary.attention.length) blocks.push(`Needs attention: ${listPhrase(summary.attention)}.`);
+  return blocks;
+}
+
+/** Everything the ledger returned in this run, as sentences. */
+function billingAnswer(found: BillingFound, facts: Facts, workspace: WorkspaceProfile): string[] {
+  const blocks: string[] = [];
+  for (const summary of found.summaries.slice(0, 2)) blocks.push(...summaryBlocks(summary, facts));
+  for (const entry of found.subscriptions.slice(0, 2)) blocks.push(...subscriptionBlocks(entry, workspace));
+  for (const entry of found.invoices.slice(0, 2)) blocks.push(...invoiceBlocks(entry, workspace));
+  for (const invoice of found.explanations.slice(0, 2)) blocks.push(...explanationBlocks(invoice));
+  for (const invoice of found.upcoming.slice(0, 2)) blocks.push(...upcomingBlocks(invoice));
+  return blocks;
+}
+
+/**
+ * How many rows every list-returning tool in this run came back with.
+ *
+ * The "nothing matched" sentence is gated on this rather than on one CRM
+ * search, because a run that found 341 invoices has not found nothing.
+ */
+function rowsReturned(steps: StepResult[]): number {
+  let rows = 0;
+  for (const step of steps) {
+    if (!ok(step)) continue;
+    const value = step.result;
+    if (isRecordList(value)) { rows += (value as RecordSearchResult).records.length; continue; }
+    if (isSearch(value)) { rows += (value as WorkspaceSearchResult).matches.length; continue; }
+    if (isAggregate(value)) { rows += (value as RecordAggregateResult).matched_records; continue; }
+    if (isTimeline(value)) { rows += (value as { items: TimelineItem[] }).items.length; continue; }
+    if (isMetric(value) || isProfile(value)) continue;
+    if (Array.isArray(value)) { rows += value.length; continue; }
+    if (value && typeof value === 'object') {
+      for (const inner of Object.values(value as Record<string, unknown>)) {
+        if (Array.isArray(inner)) rows += inner.length;
+      }
+    }
+  }
+  return rows;
+}
+
+/**
+ * A tool succeeded, nothing above knows how to read its shape, and the run
+ * would otherwise answer "I found nothing". Saying what came back is worth more
+ * than a template, and it is still only facts the tool returned.
+ */
+function otherResults(steps: StepResult[]): string[] {
+  const blocks: string[] = [];
+  for (const step of steps) {
+    if (!ok(step) || blocks.length >= 4) continue;
+    const value = step.result;
+    if (isRecordList(value) || isSearch(value) || isAggregate(value) || isMetric(value) || isProfile(value) || isTimeline(value)) continue;
+    if (isSubscriptionList(value) || isInvoiceList(value) || isCustomerSummary(value) || isInvoiceExplanation(value) || isUpcomingInvoice(value)) continue;
+    const lines: string[] = [];
+    const describe = (entry: unknown): string | null => {
+      if (entry === null || entry === undefined) return null;
+      if (typeof entry !== 'object') return String(entry);
+      const row = entry as Record<string, unknown>;
+      const parts: string[] = [];
+      for (const [key, item] of Object.entries(row)) {
+        if (parts.length >= 4 || item === null || item === undefined || typeof item === 'object') continue;
+        parts.push(`${humanise(key)} ${item}`);
+      }
+      return parts.length ? parts.join(' · ') : null;
+    };
+    if (Array.isArray(value)) {
+      if (!value.length) continue;
+      for (const entry of value.slice(0, 5)) {
+        const line = describe(entry);
+        if (line) lines.push(bullet(line));
+      }
+    } else if (value && typeof value === 'object') {
+      const line = describe(value);
+      if (line) lines.push(bullet(line));
+      for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+        if (!Array.isArray(inner) || !inner.length || lines.length > 5) continue;
+        for (const entry of inner.slice(0, 4)) {
+          const row = describe(entry);
+          if (row) lines.push(bullet(`${humanise(key)}: ${row}`));
+        }
+      }
+    }
+    if (!lines.length) continue;
+    blocks.push(`\`${step.tool}\` returned:`);
+    blocks.push(lines.join('\n'));
+  }
+  return blocks;
+}
+
 /**
  * Citations are provenance, not a list of everything the resolver considered.
  * A record only earns one if the answer actually names it, or if it is one of
@@ -411,6 +748,18 @@ function citationsFrom(input: SynthesisInput, content: string): Citation[] {
       for (const item of (value as { items: TimelineItem[] }).items.slice(0, 4)) add(item.id, item.title, item.kind);
     } else if (isAggregate(value)) {
       for (const id of (value as RecordAggregateResult).sample_ids.slice(0, 4)) add(id, 'matched record', 'record', true);
+    } else if (isSubscriptionList(value)) {
+      for (const row of (value as BillingSubscriptionList).subscriptions.slice(0, 8)) {
+        add(row.id, row.customer_name ?? row.id, 'subscription', true);
+      }
+    } else if (isInvoiceList(value)) {
+      for (const row of (value as BillingInvoiceList).invoices.slice(0, 8)) add(row.id, row.number ?? row.id, 'invoice', true);
+    } else if (isInvoiceExplanation(value)) {
+      const invoice = value as BillingInvoiceExplanation;
+      if (typeof step.args.invoice === 'string') add(step.args.invoice, invoice.number, 'invoice', true);
+    } else if (isCustomerSummary(value)) {
+      const summary = value as BillingCustomerSummary;
+      add(summary.customer.id ?? null, summary.customer.name, 'customer', true);
     }
   }
   if (input.subject) {
@@ -502,6 +851,11 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
   const searches = input.steps.filter((s) => ok(s) && isSearch(s.result)).map((s) => s.result as WorkspaceSearchResult);
   const lists = input.steps.filter((s) => ok(s) && isRecordList(s.result)).map((s) => s.result as RecordSearchResult);
   const aggregates = input.steps.filter((s) => ok(s) && isAggregate(s.result)).map((s) => s.result as RecordAggregateResult);
+  const billing = gatherBilling(input.steps);
+  const billingBlocks = billingAnswer(billing, facts, input.workspace);
+  // Every row every list-returning tool came back with. "Nothing matched" is a
+  // claim about the whole run, not about one CRM search inside it.
+  const rows = rowsReturned(input.steps);
   const blocks: string[] = [];
 
   if (input.draft) {
@@ -535,8 +889,12 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
       const periods = periodPair(metrics);
       if (periods) {
         const [a, b] = periods;
-        const delta = b.value - a.value;
-        const percent = a.value === 0 ? null : (delta / Math.abs(a.value)) * 100;
+        // The first period the question named is the subject; the second is the
+        // baseline it is measured against. Reading those two the other way round
+        // is how an 81% collapse got reported as 435% growth: both the sign of
+        // the delta and the denominator of the percentage follow this line.
+        const delta = a.value - b.value;
+        const percent = b.value === 0 ? null : (delta / Math.abs(b.value)) * 100;
         const who = a.subject ? a.subject.label : input.workspace.name;
         const deltaText = a.unit === 'money'
           ? facts.money(Math.abs(delta))
@@ -544,7 +902,8 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
         const direction = delta > 0 ? 'up' : delta < 0 ? 'down' : 'level';
         blocks.push(delta === 0
           ? `${who} ${verb(a)} the same ${a.label.toLowerCase()} in both periods: ${a.formatted} in ${a.window.label} and in ${b.window.label}.`
-          : `${who} ${verb(a)} ${a.formatted} in ${a.window.label} and ${b.formatted} in ${b.window.label} — ${direction} ${deltaText}${percent === null ? '' : ` (${formatSignedPercent(percent)})`}.`);
+          : `${who} ${verb(a)} ${a.formatted} in ${a.window.label} and ${b.formatted} in ${b.window.label}`
+            + ` — ${a.window.label} is ${direction} ${deltaText}${percent === null ? '' : ` (${formatSignedPercent(percent)})`} on ${b.window.label}.`);
         for (const metric of [a, b]) {
           blocks.push(bullet(`${metric.window.label}: ${metric.formatted}${metric.count ? ` from ${metric.source}` : ' — nothing recorded'}${metric.window.partial ? ' (period still running)' : ''}`));
         }
@@ -651,7 +1010,13 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
       if (profiles.length) {
         blocks.push(...profileParagraph(profiles[0], facts, input.workspace));
         const profile = profiles[0];
-        if (profile.open_deals.length > 1) {
+        // A question that named a type as well as an account is answered by the
+        // rows of that type, not by the count of them inside a profile.
+        const typed = lists.find((l) => l.records.length && l.object_type !== 'company');
+        if (typed) {
+          blocks.push(`${countOf(typed.total, typed.object_type)} on ${profile.name}:`);
+          blocks.push(...recordLines(typed, facts, input.workspace, 6));
+        } else if (profile.open_deals.length > 1) {
           blocks.push(...profile.open_deals.slice(0, 4).map((deal) =>
             bullet(`${deal.name} — ${deal.amount_formatted}, ${deal.stage.toLowerCase()}${deal.close_date ? `, closes ${facts.day(deal.close_date)}` : ''}${deal.owner ? `, ${deal.owner}` : ''}`)));
         }
@@ -663,7 +1028,9 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
       } else if (lists.length && !metrics.length) {
         for (const list of lists.slice(0, 2)) {
           if (!list.records.length) {
-            blocks.push(`No ${list.object_type} records match that.`);
+            // The CRM has no such object type — but another tool in this run may
+            // have the rows, and it answers rather than this sentence.
+            if (rows === 0) blocks.push(`No ${list.object_type} records match that.`);
             continue;
           }
           const args = input.steps.find((s) => s.result === list)?.args ?? {};
@@ -786,7 +1153,11 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
       break;
   }
 
+  // Rows the ledger returned belong in the answer whatever the classifier
+  // called the sentence they arrived in.
+  if (billingBlocks.length && input.intent.intent !== 'act') blocks.push(...billingBlocks);
   if (!blocks.length) blocks.push(...overview(input, facts, { metrics, profiles, lists, aggregates, searches }));
+  if (!blocks.length && rows > 0) blocks.push(...otherResults(input.steps));
   if (!blocks.length && input.scopedTools) {
     blocks.push(input.scopedTools.length
       ? `This run was scoped to ${listPhrase(input.scopedTools.map((t) => `\`${t}\``))}, and none of those can answer that. Nothing else ran — the allowlist is enforced on the plan, not just on what I was offered.`
@@ -794,10 +1165,34 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
   }
   if (!blocks.length) blocks.push(emptyAnswer(input, facts));
 
+  // The account a follow-up was scoped to is stated, because the alternative is
+  // a number about a different company that reads exactly like the right one.
+  if (input.carriedSubject && blocks.length) {
+    blocks.push(input.carriedSubject.pinned
+      ? `Scoped to ${input.carriedSubject.label}, the record this conversation is pinned to. Name another account to move off it.`
+      : `That question named no account, so I stayed on ${input.carriedSubject.label} from earlier in this conversation.`);
+  }
+  for (const step of input.skippedTools ?? []) {
+    blocks.push(`I did not run \`${step.tool}\`: it needs ${listPhrase(step.missing.map((m) => `a ${m.replace(/_/g, ' ')}`))} and nothing in the question or the records it resolved to gives me one. Say it explicitly and I will run it.`);
+  }
+
   if (input.pendingApprovals.length && input.intent.intent !== 'act') {
     blocks.push(`${countOf(input.pendingApprovals.length, 'step')} needs approval before it can run: ${input.pendingApprovals.map((p) => p.tool).join(', ')}. Nothing was written.`);
   }
 
-  const content = blocks.filter(Boolean).join('\n\n');
+  const content = brevity(input.question, blocks.filter(Boolean));
   return { content, citations: citationsFrom(input, content) };
+}
+
+/** "in one line" is an instruction about the answer, and it is worth obeying. */
+const BREVITY = /\b(in\s+(?:one|a|a\s+single)\s+(?:line|sentence)|one[-\s]?liner|one\s+sentence|briefly|in\s+brief|tl;?dr|in\s+a\s+nutshell)\b/i;
+
+export function brevity(question: string, blocks: string[]): string {
+  const full = blocks.join('\n\n');
+  if (!BREVITY.test(question) || !blocks.length) return full;
+  // A heading is not a summary: "Where X stands today:" answers nothing.
+  const lead = blocks.find((block) => !block.startsWith('•') && !block.trimEnd().endsWith(':')) ?? blocks[0];
+  // One line means one sentence, not the first paragraph of five.
+  const first = lead.split('\n')[0].match(/^.*?[.!?](?=\s|$)/)?.[0] ?? lead.split('\n')[0];
+  return first.trim();
 }

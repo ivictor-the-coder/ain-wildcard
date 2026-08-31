@@ -8,7 +8,11 @@ import {
   pluralType, recordRouteCandidates, routeSetFrom, scoreEntry, serves, setupProgress, shortcutSheet,
   type SetupStep,
 } from '../src/client/kernel/shell-core';
-import { buildSources, hitsFrom, mergeHits, prettyValue, type CrmObjectType, type SearchHit } from '../src/client/kernel/search-core';
+import {
+  buildSources, hitsFrom, mergeHits, prettyValue, typeaheadTargets,
+  type CrmObjectType, type SearchHit, type SearchSource,
+} from '../src/client/kernel/search-core';
+import { creditOutstanding, type CreditPot } from '../src/client/modules/home/home-core';
 import type { NavItem } from '../src/client/kernel/registry-types';
 import { DAY } from '../src/shared/time';
 
@@ -348,5 +352,138 @@ describe('workspace niceties', () => {
     assert.equal(avatarSrc(null), undefined);
     assert.equal(avatarSrc('https://cdn.example.com/a.png'), 'https://cdn.example.com/a.png');
     assert.equal(avatarSrc('/uploads/a.png'), '/uploads/a.png');
+  });
+});
+
+/* ============================ dashboard tiles ============================= */
+
+describe('prepaid credit tile', () => {
+  const pot = (currency: string, amount: number, display: string, unit_pots = 0): CreditPot =>
+    ({ currency, monetary_outstanding: amount, unit_pots, monetary_outstanding_display: display });
+
+  // The exact payload GET /v1/credits/overview returns for the demo workspace:
+  // pots sorted alphabetically, so the empty GBP pot sorts first.
+  const northwind = [pot('gbp', 0, '£0.00', 1), pot('usd', 125000, '$1,250.00', 1)];
+
+  it('shows the workspace currency, not whichever pot the server listed first', () => {
+    const chosen = creditOutstanding(northwind, 'usd');
+    assert.equal(chosen.pot?.currency, 'usd');
+    assert.equal(chosen.pot?.monetary_outstanding_display, '$1,250.00');
+    // The regression this replaced: outstanding[0] is the empty GBP pot.
+    assert.equal(northwind[0].monetary_outstanding_display, '£0.00');
+    assert.notEqual(chosen.pot, northwind[0]);
+  });
+
+  it('says nothing extra when the workspace currency is the only pot holding money', () => {
+    assert.equal(creditOutstanding(northwind, 'usd').note, null);
+    assert.deepEqual(creditOutstanding(northwind, 'usd').others, []);
+  });
+
+  it('counts unit grants across every currency, because money cannot express them', () => {
+    assert.equal(creditOutstanding(northwind, 'usd').unitGrants, 2);
+  });
+
+  it('keeps the workspace currency even when another pot holds more', () => {
+    const pots = [pot('eur', 900000, '€9,000.00'), pot('usd', 5000, '$50.00')];
+    const chosen = creditOutstanding(pots, 'usd');
+    assert.equal(chosen.pot?.currency, 'usd');
+    assert.equal(chosen.isDefaultCurrency, true);
+    assert.equal(chosen.note, 'plus €9,000.00 in EUR');
+  });
+
+  it('falls back to the largest pot when the workspace currency holds nothing, and says so', () => {
+    const pots = [pot('eur', 9000, '€90.00'), pot('gbp', 41200, '£412.00'), pot('usd', 0, '$0.00')];
+    const chosen = creditOutstanding(pots, 'usd');
+    assert.equal(chosen.pot?.currency, 'gbp');
+    assert.equal(chosen.isDefaultCurrency, false);
+    assert.equal(chosen.note, 'shown in GBP — no USD credit is outstanding · plus €90.00 in EUR');
+  });
+
+  it('ranks pots in major units, so ¥100,000 outranks $5,000', () => {
+    const pots = [pot('jpy', 100000, '¥100,000'), pot('usd', 500000, '$5,000.00')];
+    assert.equal(creditOutstanding(pots, 'chf').pot?.currency, 'jpy');
+  });
+
+  it('names two other currencies and counts the rest', () => {
+    const pots = [
+      pot('usd', 100, '$1.00'), pot('gbp', 41200, '£412.00'),
+      pot('eur', 9000, '€90.00'), pot('cad', 800, 'CA$8.00'), pot('aud', 700, 'A$7.00'),
+    ];
+    assert.equal(
+      creditOutstanding(pots, 'usd').note,
+      'plus £412.00 in GBP, €90.00 in EUR and 2 more currencies',
+    );
+    assert.equal(creditOutstanding(pots.slice(0, 4), 'usd').note?.endsWith('and 1 more currency'), true);
+  });
+
+  it('shows the workspace’s own zero when every pot is empty', () => {
+    const chosen = creditOutstanding([pot('gbp', 0, '£0.00', 1), pot('usd', 0, '$0.00')], 'usd');
+    assert.equal(chosen.pot?.currency, 'usd');
+    assert.equal(chosen.isDefaultCurrency, true);
+    assert.equal(chosen.note, null);
+  });
+
+  it('has no pot to show when the credits module returned none', () => {
+    assert.deepEqual(creditOutstanding([], 'usd'), { pot: null, isDefaultCurrency: true, others: [], unitGrants: 0, note: null });
+    assert.equal(creditOutstanding(undefined, 'usd').pot, null);
+  });
+
+  it('matches currencies by code, not by case or stray spacing', () => {
+    const pots = [pot('GBP', 0, '£0.00'), pot(' usd ', 125000, '$1,250.00')];
+    assert.equal(creditOutstanding(pots, 'USD').pot?.monetary_outstanding_display, '$1,250.00');
+    assert.equal(creditOutstanding(pots, 'USD').isDefaultCurrency, true);
+  });
+
+  it('does not invent a workspace currency when the session has not loaded one', () => {
+    const chosen = creditOutstanding([pot('gbp', 41200, '£412.00')], undefined);
+    assert.equal(chosen.pot?.currency, 'gbp');
+    assert.equal(chosen.isDefaultCurrency, true);
+    assert.equal(chosen.note, null);
+  });
+});
+
+/* ============================= search typeahead ============================ */
+
+describe('top-bar typeahead', () => {
+  const source = (id: string, label: string): SearchSource => ({
+    id, label, singular: label, icon: 'building', requires: `GET /v1/${id}`, path: `/v1/${id}`,
+    queryKey: 'q', detailPattern: null, map: (row) => ({ id: String(row.id), title: String(row.id) }),
+  });
+  const hit = (type: string, id: string, href: string | null): SearchHit =>
+    ({ id, type, typeLabel: type, title: id, href, icon: 'building' });
+
+  const groups = [
+    { source: source('company', 'Companies'), hits: [hit('company', 'cmp_1', '/companies/cmp_1'), hit('company', 'cmp_2', null)] },
+    { source: source('invoice', 'Invoices'), hits: [hit('invoice', 'in_9', '/invoices/in_9')] },
+  ];
+
+  it('puts every openable hit under the highlight, in painted order', () => {
+    assert.deepEqual(
+      typeaheadTargets(groups, 'north').slice(0, 2).map((t) => t.href),
+      ['/companies/cmp_1', '/invoices/in_9'],
+    );
+  });
+
+  it('never highlights a record no installed module can open', () => {
+    assert.equal(typeaheadTargets(groups, 'north').some((t) => t.hit?.id === 'cmp_2'), false);
+  });
+
+  it('always ends on the full search page, so the four-per-source cap is never the whole answer', () => {
+    const targets = typeaheadTargets(groups, 'north');
+    assert.equal(targets.length, 3);
+    assert.deepEqual(targets[2], { id: 'everything', href: '/search?q=north', hit: null });
+  });
+
+  it('escapes the query it hands to the results page', () => {
+    assert.equal(typeaheadTargets([], 'a&b c').at(-1)!.href, '/search?q=a%26b%20c');
+  });
+
+  it('offers the results page even when nothing matched', () => {
+    assert.deepEqual(typeaheadTargets([], 'zzz').map((t) => t.id), ['everything']);
+  });
+
+  it('has no page to offer when nothing was typed', () => {
+    assert.deepEqual(typeaheadTargets(groups, '   ').map((t) => t.id), ['company:cmp_1', 'invoice:in_9']);
+    assert.deepEqual(typeaheadTargets([], ''), []);
   });
 });

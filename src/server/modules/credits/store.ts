@@ -35,8 +35,9 @@ import {
   ALL_CHARGES, type Applicability, type BalanceBucket, type BillableItem, type BillableItemKind,
   type BillableItemStatus, type ChargeTarget, type CreditApplication, type CreditBalance,
   type CreditGrant, type CreditKind, type GrantInput, type GrantStatus, type LedgerEntry,
-  type LedgerEntryType, type Settlement, type SettlementSkip, type SettlementStatus,
-  type SettleUsageInput, type SkipSettlementInput, type TierBasis, type TopUpInput, type TopUpResult,
+  type LedgerEntryType, type Settlement, type SettlementDrift, type SettlementResult,
+  type SettlementSkip, type SettlementStatus, type SettleUsageInput, type SkipSettlementInput,
+  type TierBasis, type TopUpInput, type TopUpResult,
 } from './types';
 import type { TrueUpRequest, TrueUpResult } from '../metering/types';
 
@@ -786,11 +787,15 @@ export class Credits {
    * and the two invoice lines that come out — the credit-covered portion and
    * the charged portion — always add back up to what the period would have cost
    * with no credits at all.
+   *
+   * Settling a metered window also freezes it, unless the caller says not to:
+   * the moment a meter's total is put on an invoice is the moment later usage
+   * has to become a true-up rather than a number that disagrees with the bill.
    */
-  settleUsage(orgId: string, input: SettleUsageInput): Settlement {
+  settleUsage(orgId: string, input: SettleUsageInput): SettlementResult {
     const idemKey = input.idem_key
       ?? `${input.customer}:${input.price}:${input.period_start}:${input.period_end}`;
-    return this.ctx.atomic(() => {
+    return this.ctx.atomic<SettlementResult>(() => {
       if (!(input.period_end > input.period_start)) {
         throw badRequest('parameter_invalid', 'A billing period ends after it starts.', 'period_end');
       }
@@ -801,7 +806,7 @@ export class Credits {
       // period — and settling it again would spend the customer's money twice
       // for usage they have already paid for.
       const already = this.settlementForPeriod(orgId, input.customer, price.id, input.period_start, input.period_end);
-      if (already && already.status === 'settled') return this.hydrateSettlement(orgId, already);
+      if (already && already.status === 'settled') return this.replay(orgId, already);
       if (already) {
         // This exact window has already been declined once and the reason has
         // not gone anywhere. Point at the record rather than deciding again.
@@ -814,7 +819,7 @@ export class Credits {
 
       const existing = this.ctx.db.get<SettlementRow>(
         `SELECT ${SETTLEMENT_COLUMNS} FROM credit_settlements WHERE org_id = ? AND idem_key = ?`, orgId, idemKey);
-      if (existing) return this.hydrateSettlement(orgId, existing);
+      if (existing) return this.replay(orgId, existing);
 
       // A window that overlaps a settled one without matching it is a boundary
       // that has moved — a retry that lost its place, a period recomputed
@@ -822,13 +827,19 @@ export class Credits {
       // billed, so it is a loud 409 rather than a second quiet draw.
       const clash = this.overlappingSettlement(orgId, input.customer, price.id, input.period_start, input.period_end);
       if (clash) {
+        // A caller settling a sliver of a billed month is nearly always after
+        // usage they think was missed. Refusing without saying where that usage
+        // actually went is how a real hole and an imagined one look identical,
+        // so the drift — and the entry that will bill it — comes with the 409.
+        const drift = this.driftOf(orgId, clash);
         throw conflict(
           'usage_period_already_settled',
-          `Settlement ${clash.id} already covers ${new Date(clash.period_start).toISOString()} to ${new Date(clash.period_end).toISOString()} for this customer on price ${price.id}, which overlaps the period you asked to settle. Settling it again would draw credit twice for usage that is already billed.`,
+          `Settlement ${clash.id} already covers ${new Date(clash.period_start).toISOString()} to ${new Date(clash.period_end).toISOString()} for this customer on price ${price.id}, which overlaps the period you asked to settle. Settling it again would draw credit twice for usage that is already billed.${drift ? ` ${drift.message}` : ''}`,
           {
             settlement: clash.id, period_start: clash.period_start, period_end: clash.period_end,
             requested_start: input.period_start, requested_end: input.period_end,
             covered_amount: clash.covered_amount, charged_amount: clash.charged_amount,
+            drift,
           },
         );
       }
@@ -1005,19 +1016,41 @@ export class Credits {
         });
       }
 
-      if (input.close_period && meter) {
-        // The price travels with the closure so that a late event months from
-        // now can be re-priced against exactly what this invoice was drawn on.
-        this.ctx.svc.metering.closePeriod(orgId, {
-          meter: meter.id, customer: input.customer,
-          period_start: input.period_start, period_end: input.period_end,
-          price: price.id, currency,
-          // The rung travels with the closure too, so a late event months from
-          // now is re-priced from where this window sat on the ladder rather
-          // than from the bottom of it.
-          prior_quantity: microToDecimal(basis.priorMicro),
-          ref_type: 'credit_settlement', ref_id: settlementId,
-        });
+      // Freezing is the default, not a favour the caller has to ask for. The
+      // window has just been priced onto an invoice line; anything that lands
+      // in it from here is drift against a number somebody has been billed,
+      // and the only way to notice that is to have written down what was
+      // billed. A caller pricing a window they are not invoicing — a quote, or
+      // a quantity they supplied by hand against a meter the bill is not drawn
+      // from — passes `close_period: false` and gets the old behaviour.
+      if ((input.close_period ?? true) && meter) {
+        try {
+          // The price travels with the closure so that a late event months from
+          // now can be re-priced against exactly what this invoice was drawn on.
+          this.ctx.svc.metering.closePeriod(orgId, {
+            meter: meter.id, customer: input.customer,
+            period_start: input.period_start, period_end: input.period_end,
+            price: price.id, currency,
+            // The rung travels with the closure too, so a late event months from
+            // now is re-priced from where this window sat on the ladder rather
+            // than from the bottom of it.
+            prior_quantity: microToDecimal(basis.priorMicro),
+            ref_type: 'credit_settlement', ref_id: settlementId,
+          });
+        } catch (e) {
+          // Two prices billing one meter over the *same* window share a
+          // closure, and that is fine — metering hands back the one that is
+          // already there. Two prices billing it over windows that only
+          // partly overlap is the other thing: whichever closure a late event
+          // landed in would decide what it is worth. Rather than freeze the
+          // wrong one, the settlement stops and names the way through.
+          if (!isApiError(e) || e.code !== 'meter_period_overlaps_closure') throw e;
+          throw conflict(
+            'meter_period_overlaps_closure',
+            `${e.message} Nothing was billed for this window: freezing it would leave the same usage under two closures, and a late event would be priced against whichever one caught it. If this price is deliberately billed alongside another on the same meter, settle it with \`close_period: false\` and leave the freeze to the price that owns it.`,
+            e.detail,
+          );
+        }
       }
 
       const settlement = this.hydrateSettlement(orgId, row);
@@ -1029,8 +1062,80 @@ export class Credits {
           covered_amount: coveredAmount, charged_amount: chargedAmount, currency,
         }, { objectId: settlementId, objectType: 'credit_settlement' });
       }
-      return settlement;
+      return { settlement, created: true, drift: null };
     });
+  }
+
+  /**
+   * A window that is already settled, handed back with what has happened to it
+   * since.
+   *
+   * Nothing is written here — the period is the identity of a settlement and it
+   * settles once — so the honest answer to a second request is the first
+   * settlement plus, when the meter has moved underneath it, exactly how far.
+   * A caller re-settling a drifted period is usually a human trying to recover
+   * usage they suspect was missed, and "created, 100 units" when the meter says
+   * 600 is the one answer that leaves them none the wiser.
+   */
+  private replay(orgId: string, row: SettlementRow): SettlementResult {
+    return { settlement: this.hydrateSettlement(orgId, row), created: false, drift: this.driftOf(orgId, row) };
+  }
+
+  /**
+   * What the meter says about a settled window now, against what was billed.
+   *
+   * Re-aggregated rather than summed from the late-arrival queue, for the same
+   * reason metering re-aggregates: on `max` a late reading below the peak moves
+   * nothing and on `last` it moves the total to itself, so only the aggregation
+   * can say what the window is worth today.
+   */
+  private driftOf(orgId: string, row: SettlementRow): SettlementDrift | null {
+    if (!row.meter_id) return null;
+    const meter = this.ctx.svc.metering.meter(orgId, row.meter_id);
+    if (!meter) return null;
+    const usage = this.ctx.svc.metering.usageForPeriod(
+      orgId, meter.id, row.customer_id, row.period_start, row.period_end);
+    const live = parseMicro(usage.value_decimal, 'quantity');
+    const settled = bigOf(row.quantity_micro);
+    if (live === settled) return null;
+
+    const closure = usage.closed;
+    const open = closure
+      ? this.ctx.svc.metering.lateArrivals(orgId, {
+          meter: meter.id, customer: row.customer_id, resolution: 'open', limit: 200,
+        }).filter((late) => late.period_start === row.period_start && late.period_end === row.period_end)
+      : [];
+    const detail = closure ? this.ctx.svc.metering.closureDetail(orgId, closure.id) : null;
+    const delta = live - settled;
+    const magnitude = delta < 0n ? -delta : delta;
+    const noun = meter.unit_label ?? 'unit';
+    const moved = `${microToDecimal(magnitude)} ${noun}${magnitude === MICRO ? '' : 's'}`;
+    const direction = delta > 0n ? 'arrived in' : 'been withdrawn from';
+    const owed = detail?.outstanding_amount ?? 0;
+    const worth = owed === 0
+      ? ''
+      : owed > 0
+        ? `, worth ${formatMoney(money(owed, row.currency))}`
+        : `, worth ${formatMoney(money(-owed, row.currency))} back to the customer`;
+    const headline = `This window was billed at ${microToDecimal(settled)} and the meter now reads ${microToDecimal(live)}.`;
+    const message = open.length
+      ? `${headline} ${moved} have ${direction} the period since it was closed and are filed as ${open.length === 1 ? 'late arrival' : 'late arrivals'} ${open.map((l) => l.id).join(', ')}${worth}. Resolve ${open.length === 1 ? 'it' : 'them'} through POST /v1/meter-late-arrivals/:id/resolve to settle the difference in money.`
+      : closure
+        ? `${headline} The period is closed and every late arrival against it has been resolved, so the difference is already on a true-up line rather than waiting for one.`
+        : `${headline} It was settled with \`close_period: false\`, so ${moved} have ${direction} it with nothing filed to catch them — bill the difference as its own window, or credit-note the invoice this period is on.`;
+    return {
+      settled_quantity: microToNumber(settled),
+      settled_quantity_decimal: microToDecimal(settled),
+      live_quantity: microToNumber(live),
+      live_quantity_decimal: microToDecimal(live),
+      delta: microToNumber(delta),
+      delta_decimal: microToDecimal(delta),
+      closure: closure?.id ?? null,
+      open_late_arrivals: open.map((late) => late.id),
+      outstanding_amount: detail?.outstanding_amount ?? null,
+      currency: row.currency,
+      message,
+    };
   }
 
   /**
@@ -1138,6 +1243,19 @@ export class Credits {
     return row ? this.hydrateSettlement(orgId, row) : null;
   }
 
+  /**
+   * Has this exact window already been answered — billed, or refused?
+   *
+   * The gap filler asks before it enqueues. A window that has been settled
+   * needs nothing, and one that was refused has been asked once and given a
+   * reason; asking again every morning would turn a refusal into a job that
+   * runs forever and an event nobody can act on.
+   */
+  settlementForWindow(orgId: string, customer: string, priceId: string, start: number, end: number): Settlement | null {
+    const row = this.settlementForPeriod(orgId, customer, priceId, start, end);
+    return row ? this.hydrateSettlement(orgId, row) : null;
+  }
+
   /** The settlement for exactly this window, settled or refused. */
   private settlementForPeriod(orgId: string, customer: string, priceId: string, start: number, end: number): SettlementRow | undefined {
     return this.ctx.db.get<SettlementRow>(
@@ -1204,6 +1322,10 @@ export class Credits {
         superseded_by: input.superseded_by ?? null,
         subscription: input.subscription ?? null,
         subscription_item: input.subscription_item ?? null,
+        // The one fact about the refusal that cannot be worked out later: which
+        // cycle the run thought this window belonged to. A gap filled months
+        // from now is priced from where that cycle had already climbed.
+        billing_period: input.billing_period ?? null,
       };
       const row: SettlementRow = {
         id: newId('usage'),
@@ -1276,11 +1398,12 @@ export class Credits {
     const stored = parseJson<StoredSkip>(row.skip_detail ?? '{}', {
       reason: row.skip_reason ?? 'usage_period_already_settled', message: '',
       superseded_by: row.superseded_by, subscription: row.subscription_id,
-      subscription_item: row.subscription_item_id,
+      subscription_item: row.subscription_item_id, billing_period: null,
     });
     const cover = this.coverageOf(orgId, row.customer_id, row.price_id, row.period_start, row.period_end);
     return {
       ...stored,
+      billing_period: stored.billing_period ?? null,
       superseded_by: stored.superseded_by ?? cover.covered_by[0] ?? null,
       covered_by: cover.covered_by,
       window_ms: cover.window_ms,
@@ -1867,6 +1990,7 @@ interface StoredSkip {
   superseded_by: string | null;
   subscription: string | null;
   subscription_item: string | null;
+  billing_period: { start: number; end: number } | null;
 }
 
 interface Coverage {
@@ -1924,7 +2048,7 @@ function describeCoverage(cover: Coverage): string {
   if (!overdue.length) {
     return `${cover.coverage_percent}% of this period is billed elsewhere; ${spans(cover.gaps)} is waiting for the next cycle of the subscription that superseded it.`;
   }
-  return `${cover.coverage_percent}% of this period is billed elsewhere; ${spans(overdue)} has outlived a full billing cycle unbilled and needs a settlement of its own.`;
+  return `${cover.coverage_percent}% of this period is billed elsewhere; ${spans(overdue)} has outlived a full billing cycle unbilled, so the settlement watch bills it as a window of its own, priced against the cycle this period belonged to.`;
 }
 
 function statusOf(row: GrantState, balance: bigint, now: number): GrantStatus {

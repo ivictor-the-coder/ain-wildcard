@@ -1,8 +1,14 @@
 import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createApp, type App } from '../src/server/app';
+import { crmEngine } from '../src/server/modules/crm/module';
 import type { Auth } from '../src/server/kernel/http';
 import type { CrmRecord, FilterNode } from '../src/server/modules/crm/types';
+
+// One suite, one session key, several hundred calls in a few seconds: the
+// per-key limiter is a production concern and would otherwise decide which of
+// these assertions runs. Set before the app boots, since it reads it once.
+process.env.AIN_RATE_LIMIT ||= '100000';
 
 const ORG = 'org_demo';
 const DANA: Auth = { kind: 'session', orgId: ORG, userId: 'usr_seed01', role: 'owner', scopes: ['*'], livemode: true };
@@ -1812,5 +1818,700 @@ describe('an amount has a ceiling, so no rollup can go non-finite', () => {
     assert.ok(overview.open_pipeline.amount >= 10_000_000_000_000, 'the ceiling deal is counted, not dropped');
 
     await expectOk('DELETE', `/v1/records/deal/${deal.id}?permanent=true`);
+  });
+});
+
+/* ------------------------- calculated properties -------------------------- */
+
+/**
+ * A formula that reads another formula is the ordinary case, not the exotic
+ * one: `weighted_amount` reads `probability`, and a commission field reads
+ * `weighted_amount`. Because calculated values are persisted on the row, an
+ * evaluation order that is not the dependency order does not merely display a
+ * stale number — it writes one, and every list, filter, report and workflow
+ * trigger downstream then reads it.
+ */
+describe('calculated properties are a dependency graph', () => {
+  before(async () => {
+    await expectOk('POST', '/v1/objects', {
+      name: 'reactor_cell', label: 'Reactor cell', plural_label: 'Reactor cells',
+      description: 'One electrolysis cell on a customer skid.', icon: 'box',
+    });
+    await expectOk('POST', '/v1/objects/reactor_cell/properties', {
+      name: 'capacity', label: 'Capacity', type: 'number', group: 'Ratings',
+    });
+    // `stack_total` reads `double_capacity` but sorts *above* it, so the index
+    // hands the reader over first and only the dependency graph can save it.
+    await expectOk('POST', '/v1/objects/reactor_cell/properties', {
+      name: 'double_capacity', label: 'Double capacity', type: 'number', group: 'Ratings',
+      position: 30, calculated: 'capacity * 2',
+    });
+    await expectOk('POST', '/v1/objects/reactor_cell/properties', {
+      name: 'stack_total', label: 'Stack total', type: 'number', group: 'Ratings',
+      position: 20, calculated: 'double_capacity + 1',
+    });
+  });
+
+  test('a chain of formulas settles inside the save that started it', async () => {
+    const cell = await expectOk('POST', '/v1/records/reactor_cell', {
+      properties: { name: 'Cell A1', capacity: 5 },
+    });
+    assert.equal(cell.properties.double_capacity, 10);
+    assert.equal(cell.properties.stack_total, 11, 'the reader saw this save, not the last one');
+
+    for (const [capacity, double, total] of [[7, 14, 15], [11, 22, 23], [20, 40, 41]] as const) {
+      const saved = await expectOk('PATCH', `/v1/records/reactor_cell/${cell.id}`, { properties: { capacity } });
+      assert.equal(saved.properties.double_capacity, double);
+      assert.equal(saved.properties.stack_total, total, `stack_total lagged behind capacity=${capacity}`);
+    }
+
+    // The lag was persisted, so a fresh read is the test that matters.
+    const fresh = await expectOk('GET', `/v1/records/reactor_cell/${cell.id}`);
+    assert.equal(fresh.properties.double_capacity, 40);
+    assert.equal(fresh.properties.stack_total, 41);
+
+    const filtered = await search('reactor_cell', {
+      filter: { property: 'stack_total', operator: 'eq', value: 41 }, limit: 5,
+    });
+    assert.equal(filtered.total_count, 1, 'the value index has to agree with the record');
+  });
+
+  test('saving a record twice with the same values changes nothing', async () => {
+    const cell = await expectOk('POST', '/v1/records/reactor_cell', {
+      properties: { name: 'Cell B2', capacity: 3 },
+    });
+    const rows = () => expectOk('GET', `/v1/records/reactor_cell/${cell.id}/history?limit=100`);
+    const before = (await rows()).data.length;
+    for (let i = 0; i < 3; i++) {
+      const saved = await expectOk('PATCH', `/v1/records/reactor_cell/${cell.id}`, { properties: { capacity: 3 } });
+      assert.equal(saved.properties.double_capacity, 6);
+      assert.equal(saved.properties.stack_total, 7);
+    }
+    assert.equal((await rows()).data.length, before, 'a no-op save must not write property history');
+  });
+
+  test('a formula that would close a loop is refused, and the error names the loop', async () => {
+    await expectOk('POST', '/v1/objects/reactor_cell/properties', {
+      name: 'loop_a', label: 'Loop A', type: 'number', position: 40, calculated: 'capacity + 1',
+    });
+    await expectOk('POST', '/v1/objects/reactor_cell/properties', {
+      name: 'loop_b', label: 'Loop B', type: 'number', position: 41, calculated: 'loop_a + 1',
+    });
+
+    const closed = await call('PATCH', '/v1/objects/reactor_cell/properties/loop_a', { calculated: 'loop_b + 1' });
+    assert.equal(closed.status, 400);
+    assert.equal(closed.body.error.code, 'expression_cycle');
+    assert.match(closed.body.error.message, /loop_a → loop_b → loop_a/);
+
+    const born = await call('POST', '/v1/objects/reactor_cell/properties', {
+      name: 'loop_c', label: 'Loop C', type: 'number', position: 42, calculated: 'loop_d + 1',
+    });
+    assert.equal(born.status, 400, 'a formula may not read a property that does not exist yet');
+    assert.equal(born.body.error.code, 'expression_unknown_property');
+
+    // The refusal has to leave the formula it refused untouched.
+    const unchanged = await expectOk('GET', '/v1/objects/reactor_cell/properties/loop_a');
+    assert.equal(unchanged.calculated, 'capacity + 1');
+  });
+
+  test('a new formula is backfilled across the records that already exist', async () => {
+    const before = await search('reactor_cell', { limit: 50 });
+    const withCapacity = (before.data as CrmRecord[]).filter((r) => typeof r.properties.capacity === 'number');
+    assert.ok(withCapacity.length >= 2, 'need existing records to backfill');
+
+    const created = await expectOk('POST', '/v1/objects/reactor_cell/properties', {
+      name: 'triple_capacity', label: 'Triple capacity', type: 'number', position: 50,
+      calculated: 'capacity * 3',
+    });
+    assert.equal(created.records_recalculated, withCapacity.length);
+
+    for (const record of withCapacity) {
+      const filled = await expectOk('GET', `/v1/records/reactor_cell/${record.id}`);
+      assert.equal(filled.properties.triple_capacity, Number(record.properties.capacity) * 3,
+        `${record.display_name} was left blank until someone re-saved it`);
+    }
+    const byFormula = await search('reactor_cell', {
+      filter: { property: 'triple_capacity', operator: 'gt', value: 0 }, limit: 50,
+    });
+    assert.equal(byFormula.total_count, withCapacity.length, 'the backfill has to reach the value index too');
+  });
+
+  test('editing a formula rewrites it and everything downstream of it', async () => {
+    const cell = await expectOk('POST', '/v1/records/reactor_cell', {
+      properties: { name: 'Cell C3', capacity: 6 },
+    });
+    assert.equal(cell.properties.stack_total, 13);
+
+    const patched = await expectOk('PATCH', '/v1/objects/reactor_cell/properties/double_capacity', {
+      calculated: 'capacity * 10',
+    });
+    assert.ok(patched.records_recalculated >= 1);
+
+    const after = await expectOk('GET', `/v1/records/reactor_cell/${cell.id}`);
+    assert.equal(after.properties.double_capacity, 60);
+    assert.equal(after.properties.stack_total, 61, 'the formula that reads it has to move with it');
+
+    await expectOk('PATCH', '/v1/objects/reactor_cell/properties/double_capacity', { calculated: 'capacity * 2' });
+    const restored = await expectOk('GET', `/v1/records/reactor_cell/${cell.id}`);
+    assert.equal(restored.properties.stack_total, 13);
+  });
+
+  test('a formula that pre-dates the cycle check is left unevaluated, not oscillating', async () => {
+    // Written straight into the schema table, which is the only way a loop can
+    // exist now that the API refuses one. A record must still be stable: an
+    // unordered formula has no fixed point, so evaluating it "once anyway"
+    // turns every save — including a save that changes nothing — into a
+    // permanent mutation of the record and a fresh page of history.
+    const crm = crmEngine(app.ctx);
+    app.ctx.db.run(
+      `UPDATE crm_properties SET calculated = ? WHERE org_id = ? AND object_type = ? AND name = ?`,
+      'loop_b + 1', ORG, 'reactor_cell', 'loop_a',
+    );
+    crm.reloadSchema();
+    try {
+      const cell = await expectOk('POST', '/v1/records/reactor_cell', {
+        properties: { name: 'Cell D4', capacity: 4 },
+      });
+      assert.equal(cell.properties.loop_a, undefined, 'a formula on a loop produces no value');
+      assert.equal(cell.properties.loop_b, undefined);
+      assert.equal(cell.properties.stack_total, 9, 'the formulas that can be ordered still run');
+
+      const rows = () => expectOk('GET', `/v1/records/reactor_cell/${cell.id}/history?limit=100`);
+      const before = (await rows()).data.length;
+      for (let i = 0; i < 3; i++) {
+        const saved = await expectOk('PATCH', `/v1/records/reactor_cell/${cell.id}`, { properties: { capacity: 4 } });
+        assert.equal(saved.properties.loop_a, undefined);
+      }
+      assert.equal((await rows()).data.length, before, 'a record on a loop must not drift on every save');
+
+      const flagged = await expectOk('GET', '/v1/objects/reactor_cell/properties/loop_a');
+      assert.equal(flagged.in_cycle, true, 'the admin has to be told why the column is empty');
+    } finally {
+      app.ctx.db.run(
+        `UPDATE crm_properties SET calculated = ? WHERE org_id = ? AND object_type = ? AND name = ?`,
+        'capacity + 1', ORG, 'reactor_cell', 'loop_a',
+      );
+      crm.reloadSchema();
+    }
+  });
+
+  test('the graph is readable, and an input a formula reads cannot be deleted', async () => {
+    const capacity = await expectOk('GET', '/v1/objects/reactor_cell/properties/capacity');
+    assert.deepEqual(capacity.depends_on, []);
+    assert.deepEqual(capacity.used_by.sort(), ['double_capacity', 'loop_a', 'triple_capacity']);
+
+    const total = await expectOk('GET', '/v1/objects/reactor_cell/properties/stack_total');
+    assert.deepEqual(total.depends_on, ['double_capacity']);
+    assert.equal(total.in_cycle, false);
+
+    const refused = await call('DELETE', '/v1/objects/reactor_cell/properties/double_capacity');
+    assert.equal(refused.status, 409);
+    assert.equal(refused.body.error.code, 'property_in_use_by_formula');
+    assert.match(refused.body.error.message, /stack_total/);
+  });
+});
+
+/* -------------------------- reading, not storage -------------------------- */
+
+/**
+ * Money is integer minor units, an instant is epoch milliseconds, an enum is a
+ * machine value and an owner is a user id. Every one of those is right to
+ * store and wrong to show, and a timeline that prints them raw tells an
+ * account manager their $80,000 deal moved from 8000000 to 8000001.
+ */
+describe('the timeline prints values a person can read', () => {
+  let dealId = '';
+
+  before(async () => {
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: {
+        name: 'Halvorsen Marine — telemetry retrofit', amount: 1_234_567,
+        deal_stage: 'qualification', close_date: '2026-09-21',
+      },
+    });
+    dealId = deal.id;
+    await expectOk('PATCH', `/v1/records/deal/${dealId}`, { properties: { amount: 9_876_543 } });
+    await expectOk('PATCH', `/v1/records/deal/${dealId}`, { properties: { close_date: '2026-11-30' } });
+    await expectOk('PATCH', `/v1/records/deal/${dealId}`, { owner_id: 'usr_seed03' });
+  });
+
+  test('currency renders through the workspace currency, not as minor units', async () => {
+    const page = await expectOk('GET', `/v1/records/deal/${dealId}/timeline?limit=20&kinds=property_change`);
+    const amount = (page.data as Array<{ title: string; body: string }>).find((i) => i.title === 'Amount changed');
+    assert.ok(amount, 'the amount change is on the timeline');
+    assert.match(amount.body, /\$12,345\.67 → \$98,765\.43/);
+    assert.doesNotMatch(amount.body, /1234567|9876543/, 'no raw minor units anywhere in the line');
+    // The stage restamped the weighted amount in the same save; it is money too.
+    assert.match(amount.body, /Weighted amount \$1,234\.57 → \$9,876\.54/);
+  });
+
+  test('dates, enums, owners and flags all render through their type', async () => {
+    const page = await expectOk('GET', `/v1/records/deal/${dealId}/timeline?limit=20&kinds=property_change`);
+    const lines = page.data as Array<{ title: string; body: string }>;
+    const closeDate = lines.find((i) => i.title === 'Close date changed');
+    assert.ok(closeDate);
+    assert.equal(closeDate.body, 'Sep 21, 2026 → Nov 30, 2026');
+
+    const owner = lines.find((i) => i.title === 'Owner changed');
+    assert.ok(owner, 'an owner change is on the timeline');
+    assert.equal(owner.body, 'empty → Priya Raman', 'an owner reads as a teammate, not a user id');
+    assert.doesNotMatch(owner.body, /usr_/);
+
+    const contact = await expectOk('POST', '/v1/records/contact', {
+      properties: { first_name: 'Ola', last_name: 'Halvorsen', email: 'ola@halvorsen-marine.test' },
+    });
+    await expectOk('PATCH', `/v1/records/contact/${contact.id}`, {
+      properties: { email_opt_in: true, lifecycle_stage: 'sales_qualified_lead' },
+    });
+    const timeline = await expectOk('GET', `/v1/records/contact/${contact.id}/timeline?limit=20&kinds=property_change`);
+    const body = (timeline.data as Array<{ body: string }>).map((i) => i.body).join(' | ');
+    assert.match(body, /Yes/, 'a boolean reads as Yes, never as "true"');
+    assert.doesNotMatch(body, /\btrue\b/);
+    assert.match(body, /Sales qualified lead/, 'an enum reads as its option label');
+    assert.doesNotMatch(body, /sales_qualified_lead/);
+  });
+
+  test('the audit trail carries both the stored value and the readable one', async () => {
+    const history = await expectOk('GET', `/v1/records/deal/${dealId}/history?limit=50&property=amount`);
+    const [latest] = history.data as Array<{ from_value: string; to_value: string; from_display: string; to_display: string }>;
+    assert.equal(latest.from_value, '1234567', 'the stored form stays exact for re-import and diffing');
+    assert.equal(latest.to_value, '9876543');
+    assert.equal(latest.from_display, '$12,345.67');
+    assert.equal(latest.to_display, '$98,765.43');
+  });
+
+  test('the agent tools quote formatted money beside the stored value', async () => {
+    const tool = app.ctx.ai.tool('search_records');
+    assert.ok(tool, 'the CRM registers its search tool');
+    const found = await tool.run(
+      { object_type: 'deal', query: 'Halvorsen Marine', limit: 5 }, app.ctx, { orgId: ORG },
+    ) as { records: Array<{ id: string; properties: Record<string, unknown>; formatted: Record<string, string>; owner: string }> };
+    const record = found.records.find((r) => r.id === dealId);
+    assert.ok(record, 'the tool finds the deal');
+    assert.equal(record.properties.amount, 9_876_543, 'the machine value stays exact');
+    assert.equal(record.formatted.amount, '$98,765.43');
+    assert.equal(record.formatted.close_date, 'Nov 30, 2026');
+    assert.equal(record.owner, 'Priya Raman');
+  });
+});
+
+/* ------------------------------- rollups ---------------------------------- */
+
+/**
+ * The number every account list is ranked by lives on the other side of an
+ * association, where a formula cannot see it. The filter engine has always been
+ * able to *find* "companies whose open deals sum over $75,000"; until a rollup
+ * could store that sum on the company, it could not be shown in a column,
+ * sorted on, reported on or read by a formula. These tests hold the two halves
+ * to the same answer, and hold the stored half to every write that can move it.
+ */
+describe('rollup properties aggregate associated records', () => {
+  /** The same aggregate asked of the filter engine, for one company. */
+  const pipelineOf = async (companyId: string, value: number) =>
+    (await search('company', {
+      filter: {
+        op: 'and',
+        filters: [
+          { property: 'id', operator: 'eq', value: companyId },
+          {
+            association: 'deal', aggregate: 'sum', aggregate_property: 'amount', operator: 'eq', value,
+            where: { op: 'and', filters: [{ property: 'deal_status', operator: 'eq', value: 'open' }] },
+          },
+        ],
+      },
+      limit: 1,
+    })).total_count as number;
+
+  test('the seed ships pipeline rollups and they agree with the filter engine', async () => {
+    const page = await search('company', { limit: 200 });
+    assert.ok(page.data.length >= 40);
+    let withPipeline = 0;
+    for (const company of page.data as CrmRecord[]) {
+      const stored = Number(company.properties.total_open_deal_value ?? 0);
+      assert.equal(await pipelineOf(company.id, stored), 1,
+        `${company.display_name} stores ${stored} but the filter engine disagrees`);
+      if (stored > 0) withPipeline += 1;
+    }
+    assert.ok(withPipeline >= 10, 'the demo book of business has real pipeline on it');
+  });
+
+  test('an account list can be ranked by pipeline, which is the whole point', async () => {
+    const ranked = await search('company', {
+      sort: [{ property: 'total_open_deal_value', direction: 'desc' }],
+      properties: ['name', 'total_open_deal_value', 'open_deal_count'],
+      limit: 10,
+    });
+    const values = (ranked.data as CrmRecord[]).map((r) => Number(r.properties.total_open_deal_value ?? 0));
+    assert.ok(values[0] > 0, 'the top account has pipeline');
+    for (let i = 1; i < values.length; i++) assert.ok(values[i - 1] >= values[i], 'the sort is not ordered');
+
+    const top = ranked.data[0] as CrmRecord;
+    const openOnAccount = await search('deal', {
+      filter: { property: 'deal_status', operator: 'eq', value: 'open' },
+      associated_to: top.id, limit: 200,
+    });
+    assert.equal(Number(top.properties.open_deal_count), openOnAccount.total_count);
+  });
+
+  test('the shipped view uses the rollup as a column, a filter and a sort', async () => {
+    const views = await expectOk('GET', '/v1/views?object_type=company');
+    const view = (views.data as Array<{ id: string; name: string; columns: string[]; sort: Array<{ property: string }> }>)
+      .find((v) => v.name === 'Open pipeline over $75k');
+    assert.ok(view, 'the account-pipeline view ships with the workspace');
+    assert.ok(view.columns.includes('total_open_deal_value'));
+    assert.equal(view.sort[0].property, 'total_open_deal_value');
+    const applied = await expectOk('GET', `/v1/records/company?view=${view.id}&limit=200`);
+    assert.ok(applied.total_count > 0);
+    for (const row of applied.data as CrmRecord[]) {
+      assert.ok(Number(row.properties.total_open_deal_value) > 7_500_000);
+    }
+  });
+
+  test('a deal write moves its account inside the same request', async () => {
+    const ranked = await search('company', {
+      sort: [{ property: 'total_open_deal_value', direction: 'desc' }], limit: 1,
+    });
+    const account = ranked.data[0] as CrmRecord;
+    const before = Number(account.properties.total_open_deal_value);
+    const openDeals = await search('deal', {
+      filter: { property: 'deal_status', operator: 'eq', value: 'open' },
+      associated_to: account.id, limit: 5,
+    });
+    const deal = openDeals.data[0] as CrmRecord;
+    const amount = Number(deal.properties.amount);
+
+    await expectOk('PATCH', `/v1/records/deal/${deal.id}`, { properties: { amount: amount + 100_000 } });
+    const raised = await expectOk('GET', `/v1/records/company/${account.id}`);
+    assert.equal(Number(raised.properties.total_open_deal_value), before + 100_000);
+    assert.equal(await pipelineOf(account.id, before + 100_000), 1);
+
+    // Closing it lost takes it out of "open", which the rollup's filter reads.
+    await expectOk('PATCH', `/v1/records/deal/${deal.id}`, { properties: { deal_stage: 'closed_lost' } });
+    const closed = await expectOk('GET', `/v1/records/company/${account.id}`);
+    assert.equal(Number(closed.properties.total_open_deal_value), before - amount);
+    assert.equal(Number(closed.properties.open_deal_count), Number(account.properties.open_deal_count) - 1);
+
+    await expectOk('PATCH', `/v1/records/deal/${deal.id}`, { properties: { deal_stage: 'negotiation' } });
+    assert.equal(
+      Number((await expectOk('GET', `/v1/records/company/${account.id}`)).properties.total_open_deal_value),
+      before + 100_000,
+    );
+
+    // Archiving is not a value change, and it still has to move the total.
+    await expectOk('DELETE', `/v1/records/deal/${deal.id}`);
+    assert.equal(
+      Number((await expectOk('GET', `/v1/records/company/${account.id}`)).properties.total_open_deal_value),
+      before - amount,
+    );
+    await expectOk('POST', `/v1/records/deal/${deal.id}/restore`);
+    assert.equal(
+      Number((await expectOk('GET', `/v1/records/company/${account.id}`)).properties.total_open_deal_value),
+      before + 100_000,
+    );
+    await expectOk('PATCH', `/v1/records/deal/${deal.id}`, { properties: { amount } });
+  });
+
+  test('re-pointing a deal moves the total off one account and onto the other', async () => {
+    const [from, to] = (await search('company', {
+      sort: [{ property: 'total_open_deal_value', direction: 'desc' }], limit: 2,
+    })).data as CrmRecord[];
+    const deal = (await search('deal', {
+      filter: { property: 'deal_status', operator: 'eq', value: 'open' },
+      associated_to: from.id, limit: 1,
+    })).data[0] as CrmRecord;
+    const amount = Number(deal.properties.amount);
+
+    const moved = await expectOk('POST', '/v1/associations', {
+      from_id: deal.id, to_id: to.id, association_type: 'deal_to_company',
+    });
+    assert.equal(moved.replaced[0].record_id, from.id);
+    assert.equal(
+      Number((await expectOk('GET', `/v1/records/company/${from.id}`)).properties.total_open_deal_value),
+      Number(from.properties.total_open_deal_value) - amount,
+    );
+    assert.equal(
+      Number((await expectOk('GET', `/v1/records/company/${to.id}`)).properties.total_open_deal_value),
+      Number(to.properties.total_open_deal_value) + amount,
+    );
+
+    await expectOk('POST', '/v1/associations', {
+      from_id: deal.id, to_id: from.id, association_type: 'deal_to_company', primary: true,
+    });
+  });
+
+  test('a rollup is defined through the API, backfilled, and readable by a formula', async () => {
+    const defined = await expectOk('POST', '/v1/objects/company/properties', {
+      name: 'largest_open_deal', label: 'Largest open deal', type: 'currency', currency: 'usd', group: 'Pipeline',
+      rollup: {
+        association: 'deal', aggregate: 'max', property: 'amount',
+        filter: { property: 'deal_status', operator: 'eq', value: 'open' },
+      },
+    });
+    assert.ok(defined.records_recalculated > 0, 'a new rollup fills in across the records that already exist');
+    assert.equal(defined.read_only, true);
+
+    // A formula reading a rollup is the reason rollups evaluate first.
+    const formula = await expectOk('POST', '/v1/objects/company/properties', {
+      name: 'concentration', label: 'Largest deal share', type: 'number', group: 'Pipeline',
+      calculated: 'if(total_open_deal_value > 0, round(largest_open_deal * 100 / total_open_deal_value), 0)',
+    });
+    assert.ok(formula.records_recalculated > 0);
+
+    const withPipeline = await search('company', {
+      filter: { property: 'total_open_deal_value', operator: 'gt', value: 0 },
+      sort: [{ property: 'total_open_deal_value', direction: 'desc' }], limit: 5,
+    });
+    for (const row of withPipeline.data as CrmRecord[]) {
+      const largest = Number(row.properties.largest_open_deal);
+      const total = Number(row.properties.total_open_deal_value);
+      assert.ok(largest > 0 && largest <= total, `${row.display_name}: largest ${largest} of ${total}`);
+      assert.equal(Number(row.properties.concentration), Math.round((largest * 100) / total));
+    }
+
+    // And the whole chain re-settles when a child deal changes.
+    const account = withPipeline.data[0] as CrmRecord;
+    const deal = (await search('deal', {
+      filter: { property: 'deal_status', operator: 'eq', value: 'open' },
+      sort: [{ property: 'amount', direction: 'desc' }],
+      associated_to: account.id, limit: 1,
+    })).data[0] as CrmRecord;
+    const raised = Number(deal.properties.amount) + 500_000;
+    await expectOk('PATCH', `/v1/records/deal/${deal.id}`, { properties: { amount: raised } });
+    const after = await expectOk('GET', `/v1/records/company/${account.id}`);
+    assert.equal(Number(after.properties.largest_open_deal), raised);
+    assert.equal(
+      Number(after.properties.concentration),
+      Math.round((raised * 100) / Number(after.properties.total_open_deal_value)),
+    );
+    await expectOk('PATCH', `/v1/records/deal/${deal.id}`, { properties: { amount: Number(deal.properties.amount) } });
+  });
+
+  test('a rollup names what it reads across the object boundary, both ways round', async () => {
+    const prop = await expectOk('GET', '/v1/objects/company/properties/total_open_deal_value');
+    assert.deepEqual(prop.depends_on, ['deal.amount', 'deal.deal_status']);
+    assert.equal(prop.rollup.aggregate, 'sum');
+    assert.equal(prop.read_only, true);
+
+    // Deleting the far-side property a rollup aggregates is the cross-object
+    // version of deleting a formula's input, and it is refused the same way.
+    await expectOk('POST', '/v1/objects/deal/properties', {
+      name: 'services_amount', label: 'Services amount', type: 'currency', currency: 'usd', group: 'Deal information',
+    });
+    await expectOk('POST', '/v1/objects/company/properties', {
+      name: 'services_pipeline', label: 'Services pipeline', type: 'currency', currency: 'usd', group: 'Pipeline',
+      rollup: { association: 'deal', aggregate: 'sum', property: 'services_amount' },
+    });
+    const refused = await call('DELETE', '/v1/objects/deal/properties/services_amount');
+    assert.equal(refused.status, 409);
+    assert.equal(refused.body.error.code, 'property_in_use_by_rollup');
+    assert.match(refused.body.error.message, /company\.services_pipeline/);
+
+    await expectOk('DELETE', '/v1/objects/company/properties/services_pipeline');
+    await expectOk('DELETE', '/v1/objects/deal/properties/services_amount');
+  });
+
+  test('a rollup over a rollup settles all the way up the association chain', async () => {
+    await expectOk('POST', '/v1/objects/company/properties', {
+      name: 'group_pipeline', label: 'Group pipeline', type: 'currency', currency: 'usd', group: 'Pipeline',
+      rollup: {
+        association: 'company_to_company', aggregate: 'sum',
+        property: 'total_open_deal_value', direction: 'incoming',
+      },
+    });
+    const parent = await expectOk('POST', '/v1/records/company', {
+      properties: { name: 'Cordova Industrial Group', domain: 'cordovagroup.test' },
+    });
+    const subsidiary = await expectOk('POST', '/v1/records/company', {
+      properties: { name: 'Cordova Bearings', domain: 'cordovabearings.test' },
+    });
+    await expectOk('POST', '/v1/associations', {
+      from_id: subsidiary.id, to_id: parent.id, association_type: 'company_to_company',
+    });
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Cordova line 3 retrofit', amount: 640_000, close_date: '2027-06-01' },
+    });
+
+    const group = async () => Number((await expectOk('GET', `/v1/records/company/${parent.id}`)).properties.group_pipeline ?? 0);
+    assert.equal(await group(), 0);
+
+    // Two hops: the deal moves the subsidiary's total, which moves the group's.
+    await expectOk('POST', '/v1/associations', {
+      from_id: deal.id, to_id: subsidiary.id, association_type: 'deal_to_company', primary: true,
+    });
+    assert.equal(await group(), 640_000);
+    await expectOk('PATCH', `/v1/records/deal/${deal.id}`, { properties: { amount: 900_000 } });
+    assert.equal(await group(), 900_000);
+    await expectOk('PATCH', `/v1/records/deal/${deal.id}`, { properties: { deal_stage: 'closed_won' } });
+    assert.equal(await group(), 0, 'winning the deal takes it out of open pipeline everywhere');
+  });
+
+  test('a rollup over a category of objects follows a wildcard association', async () => {
+    const defined = await expectOk('POST', '/v1/objects/company/properties', {
+      name: 'logged_activity_count', label: 'Logged activities', type: 'number', group: 'Engagement',
+      rollup: { association: 'activity', aggregate: 'count' },
+    });
+    assert.ok(defined.records_recalculated > 0);
+    const busiest = (await search('company', {
+      sort: [{ property: 'logged_activity_count', direction: 'desc' }], limit: 1,
+    })).data[0] as CrmRecord;
+    const before = Number(busiest.properties.logged_activity_count);
+    assert.ok(before > 0);
+
+    await expectOk('POST', `/v1/records/company/${busiest.id}/activities`, {
+      type: 'note', subject: 'Site walk', body: 'Toured line 4 with the plant manager.',
+    });
+    const after = await expectOk('GET', `/v1/records/company/${busiest.id}`);
+    assert.equal(Number(after.properties.logged_activity_count), before + 1);
+  });
+
+  test('a rollup cannot be written directly and refuses a definition that will not run', async () => {
+    const company = (await search('company', { limit: 1 })).data[0] as CrmRecord;
+    const written = await call('PATCH', `/v1/records/company/${company.id}`, {
+      properties: { total_open_deal_value: 1 },
+    });
+    assert.equal(written.status, 400);
+    assert.equal(written.body.error.code, 'property_read_only');
+    assert.match(written.body.error.message, /rolled up/);
+
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ association: 'unicorn', aggregate: 'count' }, 'association_unknown'],
+      [{ association: 'deal', aggregate: 'sum' }, 'filter_aggregate_property_missing'],
+      [{ association: 'deal', aggregate: 'sum', property: 'nonexistent' }, 'property_unknown'],
+      [{ association: 'deal', aggregate: 'count', filter: { property: 'ghost', operator: 'eq', value: 1 } }, 'property_unknown'],
+    ];
+    for (const [rollup, code] of cases) {
+      const bad = await call('POST', '/v1/objects/company/properties', {
+        name: 'bad_rollup', label: 'Bad rollup', type: 'number', rollup,
+      });
+      assert.equal(bad.status, 400, JSON.stringify(bad.body));
+      assert.equal(bad.body.error.code, code, JSON.stringify(bad.body));
+    }
+
+    const both = await call('POST', '/v1/objects/company/properties', {
+      name: 'two_sources', label: 'Two sources', type: 'number',
+      calculated: 'employee_count', rollup: { association: 'deal', aggregate: 'count' },
+    });
+    assert.equal(both.status, 400);
+    assert.equal(both.body.error.code, 'property_source_conflict');
+
+    // An aggregate stored as text would sort "$1,000,000" below "$9".
+    const asText = await call('POST', '/v1/objects/company/properties', {
+      name: 'text_rollup', label: 'Text rollup', type: 'string',
+      rollup: { association: 'deal', aggregate: 'count' },
+    });
+    assert.equal(asText.status, 400);
+    assert.equal(asText.body.error.code, 'rollup_type_invalid');
+
+    const summedDate = await call('POST', '/v1/objects/company/properties', {
+      name: 'summed_dates', label: 'Summed dates', type: 'date',
+      rollup: { association: 'deal', aggregate: 'sum', property: 'close_date' },
+    });
+    assert.equal(summedDate.status, 400);
+    assert.equal(summedDate.body.error.code, 'rollup_aggregate_invalid');
+    assert.match(summedDate.body.error.message, /min.*max|max.*min/);
+  });
+});
+
+/* --------------------------- association writes --------------------------- */
+
+describe('moving a record to a different parent', () => {
+  test('keeps the primary flag, reports what it replaced, and is not a 201', async () => {
+    const [from, to] = (await search('company', { limit: 2 })).data as CrmRecord[];
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Halstead line 4 retrofit', amount: 4_400_000, close_date: '2027-02-15' },
+    });
+    const first = await call('POST', '/v1/associations', {
+      from_id: deal.id, to_id: from.id, association_type: 'deal_to_company', is_primary: true,
+    });
+    assert.equal(first.status, 201, 'a link that replaced nothing is a create');
+    assert.equal(first.body.is_primary, true, '`is_primary` is accepted as an alias for `primary`');
+
+    const moved = await call('POST', '/v1/associations', {
+      from_id: deal.id, to_id: to.id, association_type: 'deal_to_company',
+    });
+    assert.equal(moved.status, 200, 'a replace is not a create');
+    assert.deepEqual(moved.body.replaced.map((r: { record_id: string }) => r.record_id), [from.id]);
+    assert.equal(moved.body.replaced[0].display_name, from.display_name);
+    assert.equal(moved.body.is_primary, true, 'the primary account survives being moved');
+
+    const edges = await expectOk('GET', `/v1/records/deal/${deal.id}/associations`);
+    const accounts = (edges.data as Array<{ association_type: string; record_id: string; is_primary: boolean }>)
+      .filter((e) => e.association_type === 'deal_to_company');
+    assert.equal(accounts.length, 1);
+    assert.equal(accounts[0].record_id, to.id);
+    assert.equal(accounts[0].is_primary, true, 'a deal must never end up with no primary account');
+  });
+
+  test('one link change is one act on the timeline, and both ends are named', async () => {
+    const [from, to] = (await search('company', { limit: 2 })).data as CrmRecord[];
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Sakamoto cell 7 telemetry', amount: 2_750_000, close_date: '2027-03-01' },
+    });
+    await expectOk('POST', '/v1/associations', {
+      from_id: deal.id, to_id: from.id, association_type: 'deal_to_company', primary: true,
+    });
+    await expectOk('POST', '/v1/associations', {
+      from_id: deal.id, to_id: to.id, association_type: 'deal_to_company',
+    });
+
+    const timeline = await expectOk('GET', `/v1/records/deal/${deal.id}/timeline?limit=50`);
+    const items = timeline.data as Array<{ kind: string; title: string; body: string | null; data: Record<string, unknown> }>;
+
+    // The record was created minutes ago, but not by an association event.
+    const created = items.filter((i) => i.title === 'Record created');
+    assert.equal(created.length, 1, 'only the record itself is a record creation');
+    assert.equal((created[0].data as { type: string }).type, 'deal.created');
+
+    assert.equal(items.filter((i) => i.title === 'Deleted').length, 0, '"Deleted" names nothing');
+    const unlinked = items.find((i) => i.title === `Unlinked ${from.display_name}`);
+    assert.ok(unlinked, 'the removed account is named on the timeline');
+    assert.equal(unlinked.body, 'Account', 'and the relationship it was removed from is on the card');
+    assert.equal((unlinked.data as { record_id: string }).record_id, from.id);
+
+    // The link that is still there is rendered once, by the association lane.
+    const linked = items.filter((i) => i.title === `Linked to ${to.display_name}`);
+    assert.equal(linked.length, 1, 'one link is one line');
+    assert.equal(linked[0].kind, 'association');
+
+    // The link that is gone is still in the record's history — as itself.
+    const historic = items.filter((i) => i.title === `Linked to ${from.display_name}`);
+    assert.equal(historic.length, 1);
+    assert.equal(historic[0].kind, 'event');
+  });
+
+  test('an event-lane card says what happened to which record', async () => {
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Whitcombe spindle monitoring', amount: 1_900_000, close_date: '2027-04-20' },
+    });
+    await expectOk('DELETE', `/v1/records/deal/${deal.id}`);
+    const timeline = await expectOk('GET', `/v1/records/deal/${deal.id}/timeline?limit=20&kinds=event`);
+    const archived = (timeline.data as Array<{ title: string; body: string | null }>)
+      .find((i) => i.title === 'Record archived');
+    assert.ok(archived, 'archiving a record reaches the event lane');
+    assert.equal(archived.body, 'Whitcombe spindle monitoring', 'the card names the record, not nothing');
+  });
+});
+
+/* ---------------------------- saved view columns -------------------------- */
+
+describe('a saved view cannot promise a column that does not exist', () => {
+  test('an unknown column is refused where the sort key already was', async () => {
+    const bad = await call('POST', '/v1/views', {
+      object_type: 'company', name: 'Blank column', columns: ['name', 'deal_sum'],
+    });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.error.code, 'property_unknown');
+    assert.match(bad.body.error.message, /deal_sum/);
+
+    const good = await expectOk('POST', '/v1/views', {
+      object_type: 'company', name: 'Pipeline desk',
+      columns: ['name', 'total_open_deal_value', 'open_deal_count', 'owner_id'],
+      sort: [{ property: 'total_open_deal_value', direction: 'desc' }],
+    });
+    assert.equal(good.columns.length, 4);
+
+    const patched = await call('PATCH', `/v1/views/${good.id}`, { columns: ['name', 'still_not_a_property'] });
+    assert.equal(patched.status, 400);
+    assert.equal(patched.body.error.code, 'property_unknown');
   });
 });

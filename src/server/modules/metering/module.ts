@@ -3,7 +3,7 @@ import type { Ctx } from '../../kernel/context';
 import type { AinEvent } from '../../kernel/events';
 import { created, list, status as httpStatus, type Req } from '../../kernel/http';
 import { badRequest, notFound } from '../../../shared/errors';
-import { DAY, HOUR } from '../../../shared/time';
+import { DAY, HOUR, interval, periodFor, type IntervalUnit } from '../../../shared/time';
 import v, { type Validator } from '../../../shared/validate';
 import { instant } from './query';
 import { METERING_MIGRATIONS } from './schema';
@@ -98,6 +98,57 @@ interface CanceledSubscriptionEvent {
   items?: { id: string; price: string; metered: boolean }[];
 }
 
+/**
+ * The subscription object as `subscription.updated` carries it. `previous`
+ * holds the cycle it was in the middle of when a plan change moved the anchor.
+ */
+interface UpdatedSubscriptionEvent {
+  id?: string;
+  customer?: string;
+  currency?: string;
+  current_period_start?: number;
+  items?: { id: string; price: string; metered: boolean }[];
+}
+
+/**
+ * The little of a subscription this module needs to place a window inside the
+ * cycle it belongs to. Declared structurally rather than imported so metering
+ * keeps working — falling back to the window itself — in a build with no
+ * subscriptions module installed.
+ */
+interface AnchorReader {
+  subscription(orgId: string, id: string): {
+    billing_cycle_anchor: number;
+    billing_cycle_anchor_day: number;
+    interval: IntervalUnit;
+    interval_count: number;
+  } | null;
+}
+
+/**
+ * The billing cycle a window sits inside.
+ *
+ * A graduated price gives its first units away once per cycle, not once per
+ * window, so a window that is only part of a cycle has to be priced against
+ * the whole of it. The window cannot say where the cycle begins — a
+ * subscription cancelled on the 4th and restarted onto the same anchor bills
+ * two windows that both look like whole periods from the inside — but the
+ * anchor can, and it is stable across cancellation, restart and renewal.
+ *
+ * Falls back to the window when there is no subscription behind it, or when
+ * the cadence has moved since and no current cycle contains it.
+ */
+function cycleOf(
+  ctx: Ctx, orgId: string, subscriptionId: string | null, window: { start: number; end: number },
+): { start: number; end: number } {
+  if (!subscriptionId) return window;
+  const sub = (ctx.svc as { billing?: AnchorReader }).billing?.subscription(orgId, subscriptionId);
+  if (!sub || !Number.isFinite(sub.billing_cycle_anchor) || !sub.interval) return window;
+  const iv = interval(sub.interval, sub.interval_count > 0 ? sub.interval_count : 1);
+  const cycle = periodFor(sub.billing_cycle_anchor, iv, window.start, sub.billing_cycle_anchor_day);
+  return cycle.start <= window.start && cycle.end >= window.end ? cycle : window;
+}
+
 export interface SettlePeriodJob {
   customer: string;
   price: string;
@@ -113,6 +164,12 @@ export interface SettlePeriodJob {
    * prices the stub from where the cycle had already reached.
    */
   billing_period?: { start: number; end: number } | null;
+  /**
+   * The refused settlement whose unbilled hours this window fills, when the
+   * settlement watch raised it rather than a cycle turning over. Carried so the
+   * fill can take back the alert that named the hole the moment it is billed.
+   */
+  fills_gap_in?: string | null;
 }
 
 /**
@@ -134,6 +191,11 @@ function settleArrearsOnInvoice(event: AinEvent<InvoiceDueEvent>, ctx: Ctx): voi
   const data = event.data ?? {};
   const period = data.arrears_period;
   if (!period || !data.customer || !Number.isFinite(period.start) || !Number.isFinite(period.end)) return;
+  // Not `period` itself: the window that just closed can be a stub of a longer
+  // cycle — the days after a subscription was restarted onto the anchor it
+  // already had — and pricing a stub as a cycle of its own hands out the free
+  // tier a second time inside one month.
+  const cycle = cycleOf(ctx, event.org_id, data.subscription ?? null, period);
   for (const line of data.lines ?? []) {
     if (!line?.metered || !line.price) continue;
     enqueueSettlement(ctx, event.org_id, {
@@ -144,7 +206,7 @@ function settleArrearsOnInvoice(event: AinEvent<InvoiceDueEvent>, ctx: Ctx): voi
       subscription_item: line.subscription_item,
       period_start: period.start,
       period_end: period.end,
-      billing_period: { start: period.start, end: period.end },
+      billing_period: cycle,
     });
   }
 }
@@ -162,9 +224,54 @@ function settleFinalPeriodOnCancel(event: AinEvent<CanceledSubscriptionEvent>, c
   // The stub is part of the cycle it was cancelled out of, not a cycle of its
   // own, so the metered price's tiers are shared with whatever else of that
   // cycle has already been billed.
-  const cycle = typeof sub.current_period_end === 'number' && sub.current_period_end >= end
+  const held = typeof sub.current_period_end === 'number' && sub.current_period_end >= end
     ? { start, end: sub.current_period_end }
     : { start, end };
+  const cycle = cycleOf(ctx, event.org_id, sub.id ?? null, held);
+  for (const item of sub.items ?? []) {
+    if (!item?.metered || !item.price) continue;
+    enqueueSettlement(ctx, event.org_id, {
+      customer: sub.customer,
+      price: item.price,
+      currency: sub.currency ?? null,
+      subscription: sub.id ?? null,
+      subscription_item: item.id,
+      period_start: start,
+      period_end: end,
+      billing_period: cycle,
+    });
+  }
+}
+
+/**
+ * A plan change that moves the billing anchor abandons the rest of the cycle
+ * the subscription was in the middle of.
+ *
+ * Nothing else will ever ask for that window: the next renewal bills the
+ * arrears of the *new* cycle, and the old one no longer exists. Left alone,
+ * every metered event between the old period's start and the day the anchor
+ * moved is usage the platform recorded, showed on a dashboard and never
+ * charged a cent for. So the abandoned window is settled here, against the
+ * cycle it belonged to, which is also what stops its usage from being handed
+ * the free tier a second time on the new cycle.
+ *
+ * `previous.current_period_start` is only present when the cycle was actually
+ * rebased — an explicit `billing_cycle_anchor=now`, or a move onto a different
+ * interval — so an ordinary update enqueues nothing. The items are the ones
+ * the subscription holds now: a metered price swapped in the same call is the
+ * only price this event carries, and billing what the meter recorded on the
+ * price standing today beats billing nobody for it at all.
+ */
+function settleRebasedPeriodOnUpdate(event: AinEvent<UpdatedSubscriptionEvent>, ctx: Ctx): void {
+  const sub = event.data ?? {};
+  const before = event.previous ?? {};
+  const start = before.current_period_start;
+  const end = sub.current_period_start;
+  if (!sub.customer || typeof start !== 'number' || typeof end !== 'number' || !(end > start)) return;
+  const heldEnd = typeof before.current_period_end === 'number' && before.current_period_end >= end
+    ? before.current_period_end
+    : end;
+  const cycle = { start, end: heldEnd };
   for (const item of sub.items ?? []) {
     if (!item?.metered || !item.price) continue;
     enqueueSettlement(ctx, event.org_id, {
@@ -675,14 +782,16 @@ export default defineModule({
   },
 
   /**
-   * A metered period that nobody closes is usage nobody bills. These two
+   * A metered period that nobody closes is usage nobody bills. These three
    * subscriptions are what make the whole engine run without a person holding
-   * a curl command: billing says a cycle turned over or a subscription ended,
-   * and every metered period it names becomes a settlement job.
+   * a curl command: billing says a cycle turned over, a subscription ended, or
+   * a plan change moved the anchor and left the rest of a cycle behind, and
+   * every metered period they name becomes a settlement job.
    */
   on: {
     'subscription.invoice_due': settleArrearsOnInvoice,
     'subscription.canceled': settleFinalPeriodOnCancel,
+    'subscription.updated': settleRebasedPeriodOnUpdate,
   },
 
   tools(ctx) {

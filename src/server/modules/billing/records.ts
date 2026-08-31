@@ -9,13 +9,16 @@
  */
 import { parseJson } from '../../kernel/db';
 import type { Price, ProrationBehavior, TaxBehavior } from '../catalog/types';
-import { summariseTax, type TaxExemption, type TaxReason, type TaxType } from './tax';
+import {
+  defaultVerificationNote, pendingVerification, summariseTax,
+  type TaxExemption, type TaxReason, type TaxSummaryRow, type TaxType,
+} from './tax';
 import type {
   BalanceTransaction, BalanceTransactionType, BilledPeriod, CancellationReason, CollectionMethod,
   CreditNote, CreditNoteLine, CreditNoteReason, CreditNoteStatus,
   Customer, Invoice, InvoiceBillingReason, InvoiceLine, InvoiceLineKind, InvoiceLineSource,
   InvoiceStatus, PaymentBehavior, PendingInvoiceItem, PendingItemStatus, PeriodStatus, Subscription,
-  SubscriptionItem, SubscriptionStatus, TrialEndBehavior,
+  SubscriptionItem, SubscriptionStatus, TaxId, TaxIdVerification, TrialEndBehavior,
 } from './types';
 
 /* ---------------------------------- inputs -------------------------------- */
@@ -172,6 +175,34 @@ export interface Page<T> {
 
 const asBool = (v: unknown): boolean => !!v;
 
+/** A tax id as it may sit in the column, including rows written before it carried a verification. */
+type StoredTaxId = { type?: string; value?: string; country?: string | null; verification?: Partial<TaxIdVerification> };
+
+/**
+ * A registration number always answers "has this been checked?", whatever the
+ * row holds. A stored number with no verification on it has not been checked —
+ * that is the safe reading and the true one — so it hydrates as pending rather
+ * than as a field the tax engine has to test for.
+ */
+function hydrateTaxId(stored: StoredTaxId): TaxId {
+  const type = String(stored.type ?? 'unknown');
+  const held = stored.verification;
+  return {
+    type,
+    value: String(stored.value ?? ''),
+    country: stored.country ?? null,
+    verification: held?.status
+      ? {
+        status: held.status,
+        verified_name: held.verified_name ?? null,
+        verified_address: held.verified_address ?? null,
+        checked_at: held.checked_at ?? null,
+        note: held.note ?? defaultVerificationNote(held.status, String(stored.value ?? '')),
+      }
+      : pendingVerification(type),
+  };
+}
+
 export function hydrateCustomer(row: any): Customer {
   const settings = parseJson<Partial<Customer['invoice_settings']>>(row.invoice_settings, {});
   return {
@@ -185,7 +216,7 @@ export function hydrateCustomer(row: any): Customer {
     currency_locked: asBool(row.currency_locked),
     address: parseJson<Customer['address']>(row.address, null),
     shipping: parseJson<Customer['shipping']>(row.shipping, null),
-    tax_ids: parseJson<Customer['tax_ids']>(row.tax_ids, []),
+    tax_ids: parseJson<StoredTaxId[]>(row.tax_ids, []).map(hydrateTaxId),
     tax_exempt: (row.tax_exempt ?? 'none') as TaxExemption,
     invoice_settings: {
       default_payment_method: settings.default_payment_method ?? null,
@@ -404,6 +435,26 @@ export function hydrateCreditNote(row: any, lines: CreditNoteLine[]): CreditNote
   };
 }
 
+/**
+ * One row per rate that touched a set of lines. Shared by the stored invoice and
+ * by the upcoming-invoice preview, so a preview can never summarise its tax
+ * differently from the bill it is predicting.
+ */
+export function taxSummaryOf(lines: InvoiceLine[]): TaxSummaryRow[] {
+  return summariseTax(lines.map((line) => ({
+    tax_rate: line.tax.rate,
+    tax_display_name: line.tax.display_name,
+    tax_jurisdiction: line.tax.jurisdiction,
+    tax_percentage: line.tax.percentage,
+    tax_type: line.tax.tax_type,
+    tax_reason: line.tax.reason,
+    tax_behavior: line.tax.behavior,
+    amount: line.amount,
+    tax_amount: line.tax.amount,
+    currency: line.currency,
+  })));
+}
+
 export function hydrateInvoice(row: any, lines: InvoiceLine[]): Invoice {
   return {
     object: 'invoice',
@@ -423,18 +474,7 @@ export function hydrateInvoice(row: any, lines: InvoiceLine[]): Invoice {
     lines,
     subtotal: Number(row.subtotal),
     tax: Number(row.tax ?? 0),
-    total_taxes: summariseTax(lines.map((line) => ({
-      tax_rate: line.tax.rate,
-      tax_display_name: line.tax.display_name,
-      tax_jurisdiction: line.tax.jurisdiction,
-      tax_percentage: line.tax.percentage,
-      tax_type: line.tax.tax_type,
-      tax_reason: line.tax.reason,
-      tax_behavior: line.tax.behavior,
-      amount: line.amount,
-      tax_amount: line.tax.amount,
-      currency: line.currency,
-    }))),
+    total_taxes: taxSummaryOf(lines),
     balance_applied: Number(row.balance_applied),
     total: Number(row.total),
     total_excluding_tax: Number(row.total) - Number(row.tax ?? 0),

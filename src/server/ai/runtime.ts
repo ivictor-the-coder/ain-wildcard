@@ -112,6 +112,9 @@ export interface AiCallContext {
   actorId?: string | null;
   actorType?: 'user' | 'api_key' | 'system' | 'agent' | 'workflow';
   threadId?: string | null;
+  /** The record a conversation is pinned to — what "they" means in turn two. */
+  subjectId?: string | null;
+  subjectType?: string | null;
   runId?: string;
   /** What used the model — copilot, agent, workflow, scoring, seed. */
   feature?: string;

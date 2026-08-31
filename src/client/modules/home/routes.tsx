@@ -29,6 +29,7 @@ import {
   ProgressBar, SegmentedControl, Skeleton, SkeletonText, Stat, Page, formatCompact, humanize,
   iconByName, toMajorUnits, useFormat, useToast,
 } from '../../design';
+import { creditOutstanding } from './home-core';
 import './home.css';
 
 /* ------------------------------ API payloads ----------------------------- */
@@ -286,14 +287,24 @@ function Home() {
       });
     }
     if (credits.data) {
-      const pot = credits.data.outstanding[0];
+      // The overview answers per currency. Picking the first row would show
+      // whichever currency sorts first — the tile read "£0.00" beside six USD
+      // figures while the workspace held $1,250.00 — so the pot is chosen by
+      // currency and anything the single number leaves out is said out loud.
+      const credit = creditOutstanding(credits.data.outstanding, session.currency);
+      const grants = credits.data.grants;
+      const clauses = [
+        `${f.number(grants.active)} active ${grants.active === 1 ? 'grant' : 'grants'}${credit.unitGrants ? ` (${f.number(credit.unitGrants)} in units)` : ''}`,
+        `${f.number(grants.scheduled)} scheduled`,
+      ];
+      if (credit.note) clauses.push(credit.note);
       out.push({
         key: 'credits',
         node: <Stat
           label="Prepaid credit outstanding"
-          value={pot ? pot.monetary_outstanding_display : f.money(0)}
+          value={credit.pot ? credit.pot.monetary_outstanding_display : f.money(0)}
           icon={<Glyph name="coins" />}
-          caption={`${f.number(credits.data.grants.active)} active grants · ${f.number(credits.data.grants.scheduled)} scheduled`}
+          caption={clauses.join(' · ')}
         />,
       });
     }
@@ -309,7 +320,7 @@ function Home() {
       });
     }
     return out;
-  }, [billing.data, crm.data, metering.data, credits.data, ai.data, f]);
+  }, [billing.data, crm.data, metering.data, credits.data, ai.data, session.currency, f]);
 
   /* -------------------------------- setup -------------------------------- */
 

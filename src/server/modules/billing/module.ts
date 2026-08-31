@@ -1,6 +1,6 @@
 import { defineModule } from '../../kernel/module';
 import type { Ctx } from '../../kernel/context';
-import { created, list, type Req } from '../../kernel/http';
+import { created, list, status as httpStatus, type Req } from '../../kernel/http';
 import { notFound } from '../../../shared/errors';
 import { formatMoney, money } from '../../../shared/money';
 import v from '../../../shared/validate';
@@ -12,16 +12,23 @@ import type {
   CustomerInput, CustomerListFilter, InvoiceListFilter, SubscriptionCreateInput, SubscriptionListFilter,
   SubscriptionUpdateInput,
 } from './records';
+import type { CreditNoteInput, CreditNoteListFilter } from './credit-notes';
+import { renderInvoice } from './render';
 import { Schedules, type ScheduleCreateInput, type ScheduleListFilter, type ScheduleUpdateInput } from './schedules';
+import {
+  TaxRates, TAX_EXEMPTIONS, TAX_ID_TYPES, TAX_ID_VERIFICATION_STATUSES, TAX_TYPES, formatPercentage,
+  type TaxIdVerificationStatus, type TaxRate, type TaxRateInput,
+} from './tax';
 import { buildCustomerSummary, type CustomerSummary, type InvoiceReader } from './summary';
 import { countsAsRevenue, describeStatus, isTerminal, legalTransitions } from './status';
 import { seedBilling } from './seed';
 import {
-  BALANCE_TRANSACTION_TYPES, CANCELLATION_REASONS, COLLECTION_METHODS, INVOICE_BILLING_REASONS,
+  BALANCE_TRANSACTION_TYPES, CANCELLATION_REASONS, COLLECTION_METHODS, CREDIT_NOTE_REASONS,
+  INVOICE_BILLING_REASONS,
   INVOICE_STATUSES, PAUSE_BEHAVIORS,
   PAYMENT_BEHAVIORS, SCHEDULE_END_BEHAVIORS, SCHEDULE_STATUSES, SUBSCRIPTION_STATUSES, TRIAL_END_BEHAVIORS,
-  type BalanceTransaction, type BilledPeriod, type ChangePreview, type Customer, type Invoice,
-  type InvoiceStatus, type PendingInvoiceItem,
+  type BalanceTransaction, type BilledPeriod, type ChangePreview, type CreditNote, type Customer,
+  type Invoice, type InvoiceStatus, type PendingInvoiceItem,
   type Subscription, type SubscriptionSchedule, type SubscriptionStatus,
 } from './types';
 
@@ -140,10 +147,11 @@ const CUSTOMER_FIELDS = {
     address: v.optional(addressBody),
   })),
   tax_ids: v.optional(v.array(v.object({
-    type: v.string({ min: 2, max: 40, description: 'eu_vat, gb_vat, us_ein, au_abn, in_gst …' }),
-    value: v.string({ min: 2, max: 60 }),
+    type: v.string({ min: 2, max: 40, description: `The kind of registration. Checked against its authority's format for: ${TAX_ID_TYPES.join(', ')}.` }),
+    value: v.string({ min: 2, max: 60, description: 'The number as the register writes it — DE811907980, GB123456789, 12-3456789. Spaces and dots are removed; a number that is not the shape its authority issues is refused.' }),
     country: v.optional(v.string({ max: 80 })),
   }), { max: 10 })),
+  tax_exempt: v.optional(v.enum(TAX_EXEMPTIONS)),
   invoice_settings: v.optional(invoiceSettingsBody),
   preferred_locales: v.optional(v.array(v.string({ max: 12 }), { max: 6 })),
   metadata: v.metadata(),
@@ -267,6 +275,32 @@ const invoicePreviewBody = v.object({
   billing_cycle_anchor: v.optional(v.enum(['now', 'unchanged'] as const)),
 });
 
+const taxRateBody = v.object({
+  display_name: v.string({ min: 1, max: 60, description: 'What appears on the invoice: "VAT", "OH sales tax".' }),
+  description: v.optional(v.string({ max: 300 })),
+  jurisdiction: v.string({ min: 1, max: 80, description: 'The place, for a human: "Germany", "New York".' }),
+  country: v.string({ min: 2, max: 80, description: 'An ISO-3166 two-letter code, or a country name this workspace can match.' }),
+  state: v.optional(v.string({ max: 80, description: 'Spelled the way customer addresses spell it, since that is what it is matched against.' })),
+  tax_type: v.optional(v.enum(TAX_TYPES)),
+  percentage: v.string({ min: 1, max: 12, description: 'An exact decimal, never a float: "19", "8.875".' }),
+  reverse_charge: v.optional(v.boolean()),
+  active: v.optional(v.boolean()),
+  metadata: v.metadata(),
+});
+
+const creditNoteBody = v.object({
+  invoice: v.id('in'),
+  amount: v.optional(v.int({ min: 1, max: 1_000_000_000, description: 'The gross to credit, tax included, spread across the invoice lines in proportion to what each has left.' })),
+  lines: v.optional(v.array(v.object({
+    invoice_line_item: v.id('il'),
+    amount: v.optional(v.int({ min: 1, max: 1_000_000_000, description: 'Gross, tax included. Left out, the line is credited in full.' })),
+    quantity: v.optional(v.int({ min: 1, max: 1_000_000, description: 'Credit this many of the units billed, priced pro rata.' })),
+  }), { min: 1, max: 100 })),
+  reason: v.optional(v.enum(CREDIT_NOTE_REASONS)),
+  memo: v.optional(v.string({ max: 600 })),
+  metadata: v.metadata(),
+});
+
 const balanceBody = v.object({
   amount: v.int({ min: -100_000_000, max: 100_000_000, description: 'Signed minor units. Negative grants credit.' }),
   description: v.string({ min: 3, max: 300 }),
@@ -315,7 +349,7 @@ export default defineModule({
   name: 'billing',
   title: 'Customers, subscriptions & invoices',
   description:
-    'The customer record, the subscription lifecycle and the bill at the end of it: billing-cycle anchors that survive February, trials and their conversion, pausing, cancellation, exact mid-cycle proration that previews and charges through one function, multi-phase schedules that replay under the time machine, and invoices whose lines always add up to their total.',
+    'The customer record, the subscription lifecycle and the bill at the end of it: billing-cycle anchors that survive February, trials and their conversion, pausing, cancellation, exact mid-cycle proration that previews and charges through one function, multi-phase schedules that replay under the time machine, tax resolved from the customer\u2019s own address and snapshotted onto every line, credit notes as the only way to reduce a finalised bill, and invoices whose lines always add up to their total.',
   dependsOn: ['core', 'catalog', 'crm'],
   migrations: BILLING_MIGRATIONS,
 
@@ -533,6 +567,23 @@ export default defineModule({
         summary: 'Update a customer', tags: ['billing'], roles: ['member'], body: customerUpdateBody,
         description: 'Currency can only be changed while the customer has never been billed.',
       });
+
+    router.post('/v1/customers/:id/tax_ids/verify', (req: Req, c: Ctx) => {
+      const body = req.body as { value: string; status: TaxIdVerificationStatus; verified_name?: string | null; verified_address?: string | null; note?: string | null };
+      return billingStore(c).billing.verifyTaxId(req.auth.orgId, req.params.id, body, writeMeta(req));
+    }, {
+      summary: 'Record what the register said about a tax registration',
+      tags: ['billing'], roles: ['member'],
+      body: v.object({
+        value: v.string({ min: 2, max: 60, description: 'The registration number already on the account.' }),
+        status: v.enum(TAX_ID_VERIFICATION_STATUSES),
+        verified_name: v.optional(v.string({ max: 200, description: 'The name the register holds, when it gave one back.' })),
+        verified_address: v.optional(v.string({ max: 400 })),
+        note: v.optional(v.string({ max: 400, description: 'Overrides the sentence the invoice prints about this registration.' })),
+      }),
+      description:
+        'A registration number is supplied by the customer; whether it is real is answered by the register that issued it. Only a `verified` number moves the tax onto the customer under the reverse charge — everything else is charged as normal, because the supplier is who the authority collects from. Point a VIES or HMRC connector at this route, or record a check a human made.',
+    });
 
     router.del('/v1/customers/:id', (req: Req, c: Ctx) =>
       billingStore(c).billing.deleteCustomer(req.auth.orgId, req.params.id, writeMeta(req)),
@@ -817,7 +868,7 @@ export default defineModule({
         billingStore(c).billing.invoices.voidInvoice(req.auth.orgId, req.params.id, writeMeta(req)))),
       {
         summary: 'Withdraw an invoice that should not have been sent', tags: ['billing'], roles: ['member'],
-        description: 'The prorations it claimed go back to waiting and any balance it drew down is returned, so the next invoice bills them properly. A paid invoice cannot be voided.',
+        description: 'The prorations it claimed go back to waiting and any balance it drew down is returned, so the next invoice bills them properly. A paid invoice cannot be voided — credit it with POST /v1/credit_notes instead.',
       });
 
     router.post('/v1/invoices/:id/mark_uncollectible', (req: Req, c: Ctx) =>
@@ -826,6 +877,106 @@ export default defineModule({
       {
         summary: 'Write an invoice off', tags: ['billing'], roles: ['member'],
         description: 'The bill stands and still counts as billed; it is simply not going to be collected. The subscription moves to unpaid.',
+      });
+
+
+    router.get('/v1/invoices/:id/render', (req: Req, c: Ctx) => {
+      const store = billingStore(c).billing;
+      const invoice = store.invoices.require(req.auth.orgId, req.params.id);
+      return httpStatus(200, renderInvoice(c, req.auth.orgId, store, invoice), {
+        'content-type': 'text/html; charset=utf-8',
+      });
+    }, {
+      summary: 'The invoice as a printable document', tags: ['billing'],
+      description:
+        'One self-contained HTML page — no stylesheet to fetch, no script to run — with the issuer and bill-to blocks, every line with the window it covers and its per-tier breakdown, the tax grouped by rate with the reason behind every zero, the totals, any credit notes raised against it and how to pay. This is what a finance team sends a customer.',
+    });
+
+    /* ------------------------------ credit notes -------------------------- */
+
+    // Registered before /v1/credit_notes/:id so "preview" is never read as an id.
+    router.post('/v1/credit_notes/preview', (req: Req, c: Ctx) =>
+      creditNotePayload(c, req.auth.orgId, billingStore(c).billing.creditNotes.preview(req.auth.orgId, req.body as CreditNoteInput)),
+      {
+        summary: 'Price a credit note without writing one', tags: ['billing'],
+        body: creditNoteBody,
+        description:
+          'The same arithmetic POST /v1/credit_notes runs, with nothing written — including the refusal, so an over-credit is a 400 here too rather than a surprise at the moment of issue.',
+      });
+
+    router.get('/v1/credit_notes', (req: Req, c: Ctx) => {
+      const q = req.query as CreditNoteListFilter;
+      const page = billingStore(c).billing.creditNotes.list(req.auth.orgId, { ...q, cursor: q.cursor ?? null });
+      return list(page.data.map((note) => creditNotePayload(c, req.auth.orgId, note)), {
+        hasMore: page.hasMore, nextCursor: page.nextCursor, totalCount: page.totalCount, url: '/v1/credit_notes',
+      });
+    }, {
+      summary: 'List credit notes', tags: ['billing'],
+      description: 'Every reduction ever made to a finalised invoice, newest first. Filter by invoice or by customer.',
+      query: v.object({
+        invoice: v.optional(v.id('in')),
+        customer: v.optional(v.id('cus')),
+        status: v.optional(v.enum(['issued', 'void', 'all'] as const)),
+        limit: v.optional(v.int({ min: 1, max: 200 })),
+        cursor: v.optional(v.string({ max: 200 })),
+      }),
+    });
+
+    router.post('/v1/credit_notes', (req: Req, c: Ctx) =>
+      created(creditNotePayload(c, req.auth.orgId,
+        billingStore(c).billing.creditNotes.issue(req.auth.orgId, req.body as CreditNoteInput, writeMeta(req)))),
+      {
+        summary: 'Credit a finalised invoice', tags: ['billing'], roles: ['member'], idempotent: true,
+        body: creditNoteBody,
+        description:
+          'Name an amount to spread across the invoice, or name the lines to reduce. On a bill that has not been collected the credit comes off amount_due; on one already paid it goes onto the customer balance and comes off the next invoice. Tax is reversed in the proportion the line was billed in. A note that would credit more than the invoice has left is refused, never clamped.',
+      });
+
+    router.get('/v1/credit_notes/:id', (req: Req, c: Ctx) =>
+      creditNotePayload(c, req.auth.orgId, billingStore(c).billing.creditNotes.require(req.auth.orgId, req.params.id)),
+      { summary: 'Retrieve a credit note', tags: ['billing'] });
+
+    router.post('/v1/credit_notes/:id/void', (req: Req, c: Ctx) =>
+      creditNotePayload(c, req.auth.orgId,
+        billingStore(c).billing.creditNotes.void(req.auth.orgId, req.params.id, writeMeta(req))),
+      {
+        summary: 'Withdraw a credit note', tags: ['billing'], roles: ['member'],
+        description: 'Puts back exactly what the note took: the amount returns to amount_due, or comes back off the balance it was pushed onto, and an invoice the note had settled goes back to open.',
+      });
+
+    /* -------------------------------- tax rates --------------------------- */
+
+    router.get('/v1/tax_rates', (req: Req, c: Ctx) => {
+      const q = req.query as { country?: string; active?: boolean; limit?: number };
+      const data = new TaxRates(c, req.auth.orgId).list(q);
+      return list(data.map(taxRatePayload), { totalCount: data.length, url: '/v1/tax_rates' });
+    }, {
+      summary: 'Where this workspace is registered to collect tax', tags: ['billing'],
+      description: 'A customer address is matched against these: the most specific active rate wins, state before country. An address that matches nothing is charged nothing, and the invoice says so.',
+      query: v.object({
+        country: v.optional(v.string({ min: 2, max: 2 })),
+        active: v.optional(v.boolean()),
+        limit: v.optional(v.int({ min: 1, max: 500 })),
+      }),
+    });
+
+    router.post('/v1/tax_rates', (req: Req, c: Ctx) =>
+      created(taxRatePayload(c.atomic(() => new TaxRates(c, req.auth.orgId).create(req.body as TaxRateInput, c.now())))),
+      {
+        summary: 'Register a tax rate', tags: ['billing'], roles: ['admin'], idempotent: true, body: taxRateBody,
+        description:
+          'One active rate per country and state, so an address can never match two. The percentage is stored as an exact decimal string and snapshotted onto every line it touches, which is why retiring a rate never changes an invoice already raised under it.',
+      });
+
+    router.get('/v1/tax_rates/:id', (req: Req, c: Ctx) =>
+      taxRatePayload(new TaxRates(c, req.auth.orgId).require(req.params.id)),
+      { summary: 'Retrieve a tax rate', tags: ['billing'] });
+
+    router.post('/v1/tax_rates/:id/deactivate', (req: Req, c: Ctx) =>
+      taxRatePayload(c.atomic(() => new TaxRates(c, req.auth.orgId).setActive(req.params.id, false, c.now()))),
+      {
+        summary: 'Retire a tax rate', tags: ['billing'], roles: ['admin'],
+        description: 'Stops the rate matching new invoices. Every invoice already raised under it keeps its own snapshot and still explains itself.',
       });
 
     /* -------------------------------- schedules --------------------------- */
@@ -1039,10 +1190,19 @@ export default defineModule({
               why: line.explanation,
             })),
             subtotal_display: show(invoice.subtotal),
+            tax_display: show(invoice.tax),
+            taxes: invoice.total_taxes.map((row) => ({
+              display_name: row.display_name,
+              percentage: `${row.percentage}%`,
+              jurisdiction: row.jurisdiction,
+              amount_display: show(row.amount),
+              why: row.explanation,
+            })),
             balance_applied_display: show(invoice.balance_applied),
             total_display: show(invoice.total),
             adds_up: invoice.lines.reduce((total, line) => total + line.amount, 0) === invoice.subtotal
-              && invoice.subtotal + invoice.balance_applied === invoice.total,
+              && invoice.lines.reduce((total, line) => total + line.tax.amount, 0) === invoice.tax
+              && invoice.subtotal + invoice.tax + invoice.balance_applied === invoice.total,
           };
         },
       },
@@ -1138,7 +1298,7 @@ export default defineModule({
             settled: {
               net: result.preview.net,
               net_display: displayMoney(result.preview.net, result.preview.currency),
-              balance_applied: result.preview.balance_applied,
+              amount_due_now: result.preview.amount_due_now,
               lines: result.preview.lines.map((line) => `${line.description}: ${displayMoney(line.amount, line.currency)}`),
             },
             billing_cycle: {
@@ -1208,18 +1368,64 @@ function invoicePayload(ctx: Ctx, orgId: string, invoice: Invoice) {
   const locale = localeOf(ctx, orgId);
   const display = (amount: number) => formatMoney(money(amount, invoice.currency), { locale });
   const lineTotal = invoice.lines.reduce((total, line) => total + line.amount, 0);
+  const lineTax = invoice.lines.reduce((total, line) => total + line.tax.amount, 0);
   const store = billingStore(ctx).billing;
   return {
     ...invoice,
     customer_name: store.customer(orgId, invoice.customer)?.name ?? null,
     subtotal_display: display(invoice.subtotal),
+    tax_display: display(invoice.tax),
     total_display: display(invoice.total),
+    total_excluding_tax_display: display(invoice.total_excluding_tax),
     amount_due_display: display(invoice.amount_due),
     balance_applied_display: display(invoice.balance_applied),
-    lines: invoice.lines.map((line) => ({ ...line, amount_display: display(line.amount) })),
+    total_taxes: invoice.total_taxes.map((row) => ({ ...row, amount_display: display(row.amount) })),
+    lines: invoice.lines.map((line) => ({
+      ...line,
+      amount_display: display(line.amount),
+      tax: { ...line.tax, amount_display: display(line.tax.amount) },
+      amount_including_tax: line.amount + line.tax.amount,
+    })),
     period_display: `${longDate(invoice.period.start, locale)} to ${longDate(invoice.period.end, locale)}`,
     status_detail: describeInvoiceStatus(invoice, locale),
-    reconciles: lineTotal === invoice.subtotal && invoice.subtotal + invoice.balance_applied === invoice.total,
+    document_url: `/v1/invoices/${invoice.id}/render`,
+    reconciles: lineTotal === invoice.subtotal && lineTax === invoice.tax
+      && invoice.subtotal + invoice.tax + invoice.balance_applied === invoice.total
+      && (invoice.status === 'void'
+        || invoice.amount_paid + invoice.pre_payment_credit_notes_amount + invoice.amount_due === invoice.total),
+  };
+}
+
+function creditNotePayload(ctx: Ctx, orgId: string, note: CreditNote) {
+  const locale = localeOf(ctx, orgId);
+  const display = (amount: number) => formatMoney(money(amount, note.currency), { locale });
+  const store = billingStore(ctx).billing;
+  const invoice = store.invoices.invoice(orgId, note.invoice);
+  return {
+    ...note,
+    customer_name: store.customer(orgId, note.customer)?.name ?? null,
+    invoice_number: invoice?.number ?? null,
+    subtotal_display: display(note.subtotal),
+    tax_display: display(note.tax),
+    total_display: display(note.total),
+    lines: note.lines.map((line) => ({ ...line, amount_including_tax_display: display(line.amount_including_tax) })),
+    // What is left on the bill after this note, so a caller never has to guess
+    // how much more it could still credit.
+    remaining_creditable: invoice ? store.creditNotes.creditable(orgId, invoice) : 0,
+    routing_detail: note.post_payment_amount > 0
+      ? `${display(note.post_payment_amount)} was put onto the customer's balance, because the invoice had already been paid. It comes off the next one.`
+      : `${display(note.pre_payment_amount)} came off what the invoice asks for; nothing had been collected yet.`,
+  };
+}
+
+function taxRatePayload(rate: TaxRate) {
+  return {
+    ...rate,
+    percentage_display: `${formatPercentage(rate.percentage)}%`,
+    applies_to: rate.state ? `${rate.state}, ${rate.country}` : rate.country,
+    detail: rate.reverse_charge
+      ? `${rate.display_name} ${formatPercentage(rate.percentage)}% in ${rate.jurisdiction}, reverse charged for a business that supplies a registration number.`
+      : `${rate.display_name} ${formatPercentage(rate.percentage)}% in ${rate.jurisdiction}.`,
   };
 }
 

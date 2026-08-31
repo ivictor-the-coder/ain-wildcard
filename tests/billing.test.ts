@@ -85,6 +85,7 @@ const allInvoices = async (ws: Workspace, query = ''): Promise<Invoice[]> => {
 };
 
 const sumLines = (invoice: Invoice): number => invoice.lines.reduce((total, line) => total + line.amount, 0);
+const sumTax = (invoice: Invoice): number => invoice.lines.reduce((total, line) => total + line.tax.amount, 0);
 
 /** Exactly halfway through a subscription's current period. */
 const midpointOf = (sub: Subscription): number =>
@@ -489,14 +490,16 @@ describe('proration', () => {
     assert.ok(Math.abs(scaleCharged - scaleExact) <= 1,
       `Scale should cost ${scaleExact} for the ten days held, got ${scaleCharged}`);
 
-    // And the whole cycle nets out to the three stretches actually held. The
-    // second change was a downgrade, so its net sits on the account balance;
-    // the customer's position is the invoice plus that credit.
+    // And the whole cycle nets out to the three stretches actually held. Both
+    // changes wait as invoice items — the second netted negative, and a credit
+    // is a line on a bill, not a number moved to the balance where the tax on
+    // it would be left behind.
     const pending = await ws.ok('GET', `/v1/customers/${sub.customer}/pending_items`);
     const prorations = (pending.data as { amount: number }[]).reduce((total, item) => total + item.amount, 0);
     const account = await ws.ok('GET', `/v1/customers/${sub.customer}`);
-    assert.equal(account.balance, secondProration.net, 'the downgrade half of the cycle became credit');
-    const wholeCycle = GROWTH + prorations + account.balance;
+    assert.equal(account.balance, 0, 'nothing was routed around the invoice');
+    assert.equal(pending.data.length, 4, 'both halves of both changes are waiting to be billed');
+    const wholeCycle = GROWTH + prorations;
     const exact = GROWTH * (t1 - PERIOD_START) / PERIOD_MS
       + SCALE * (t2 - t1) / PERIOD_MS
       + STARTER * (PERIOD_END - t2) / PERIOD_MS;
@@ -536,7 +539,7 @@ describe('proration', () => {
     assert.deepEqual(stored, preview.lines.map((line) => [line.description, line.amount]));
   });
 
-  test('a downgrade becomes customer balance, never a payment', async () => {
+  test('a downgrade is invoiced as a credit line, never collected and never routed around the bill', async () => {
     const sub = await subscribe([{ price: 'scale_monthly' }]);
     const before = await ws.ok('GET', `/v1/customers/${sub.customer}`);
     assert.equal(before.balance, 0);
@@ -549,9 +552,9 @@ describe('proration', () => {
     assert.equal(preview.net, STARTER / 2 - SCALE / 2);
     assert.ok(preview.net < 0);
     assert.equal(preview.amount_due_now, 0, 'a credit is never collected');
-    assert.equal(preview.balance_applied, preview.net);
-    assert.equal(preview.customer_balance_after, preview.net);
+    assert.equal(preview.customer_balance, 0, 'and the change itself moves nothing on the balance');
     assert.match(preview.notices.join(' '), /Credits are never paid out/);
+    assert.match(preview.notices.join(' '), /taxes them exactly as it taxed the charge/);
 
     await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
       items: [{ id: sub.items[0].id, price: 'starter_monthly' }],
@@ -559,18 +562,28 @@ describe('proration', () => {
       proration_behavior: 'always_invoice',
     });
 
+    // always_invoice means what it says whichever way the set nets: the credit
+    // is a document, with both halves of the change on it as lines.
+    const credit = (await allInvoices(ws, `&subscription=${sub.id}`))
+      .find((invoice) => invoice.billing_reason === 'subscription_update');
+    assert.ok(credit, 'the change was invoiced');
+    assert.equal(credit.subtotal, preview.net);
+    assert.deepEqual(credit.lines.map((line) => line.kind).sort(), ['remaining_time', 'unused_time']);
+    assert.equal(credit.total, 0, 'a bill is never negative');
+    assert.equal(credit.balance_applied, -preview.net, 'what it cannot carry is what reaches the account');
+
     const after = await ws.ok('GET', `/v1/customers/${sub.customer}`);
-    assert.equal(after.balance, preview.net, 'the credit landed on the balance');
+    assert.equal(after.balance, preview.net, 'and the customer holds the credit');
 
     const ledger = await ws.ok('GET', `/v1/customers/${sub.customer}/balance_transactions`);
     assert.equal(ledger.data.length, 1);
     assert.equal(ledger.data[0].amount, preview.net);
-    assert.equal(ledger.data[0].type, 'proration_credit');
+    assert.equal(ledger.data[0].type, 'applied_to_invoice');
+    assert.equal(ledger.data[0].invoice, credit.id);
     assert.equal(ledger.data[0].ending_balance, preview.net);
 
-    // The lines are kept for the explanation but can never reach an invoice.
     const stillPending = await ws.ok('GET', `/v1/customers/${sub.customer}/pending_items`);
-    assert.equal(stillPending.data.length, 0, 'a settled credit is not waiting for an invoice');
+    assert.equal(stillPending.data.length, 0, 'the invoice claimed both lines');
 
     const summary = await ws.ok('GET', `/v1/customers/${sub.customer}/summary`);
     assert.equal(summary.balance.credit, true);
@@ -934,10 +947,27 @@ describe('the subscription lifecycle', () => {
       prorate: true, cancellation_reason: 'went_out_of_business',
     });
     assert.equal(canceled.status, 'canceled');
+    const unused = -Math.round(SCALE * (sub.current_period_end - at) / period);
+
+    // The remainder goes back through a bill, not around one: a final invoice
+    // carrying the credit line, which is what lets a taxed account get the tax
+    // back with it. The bill itself can never go below zero, so what it is
+    // worth lands on the balance.
+    const final = (await allInvoices(ws, `&subscription=${sub.id}`))
+      .find((invoice) => invoice.billing_reason === 'subscription_update');
+    assert.ok(final, 'cancelling with prorate raises the final bill');
+    assert.equal(final.subtotal, unused);
+    assert.equal(final.lines.length, 1);
+    assert.equal(final.lines[0].kind, 'unused_time');
+    assert.equal(final.total, 0, 'an invoice is never negative');
+    assert.equal(final.balance_applied, -unused);
+
     const account = await ws.ok('GET', `/v1/customers/${customer.id}`);
-    assert.equal(account.balance, -Math.round(SCALE * (sub.current_period_end - at) / period));
+    assert.equal(account.balance, unused);
     const ledger = await ws.ok('GET', `/v1/customers/${customer.id}/balance_transactions`);
-    assert.equal(ledger.data[0].type, 'cancellation_credit');
+    assert.equal(ledger.data[0].type, 'applied_to_invoice');
+    assert.equal(ledger.data[0].invoice, final.id);
+    assert.match(ledger.data[0].description, /placed on the account/);
   });
 
   test('an incomplete subscription expires if the first payment never arrives', async () => {
@@ -1318,20 +1348,19 @@ describe('what billing refuses to do', () => {
 
   test('a flat plan fee has no quantity — the engine bills it the same at any number', async () => {
     const customer = await ws.customer('Five Growths');
-    const growth = await priceIdOf(ws, 'growth_monthly');
-    // The price itself is the proof: quantity does not move the number.
-    for (const quantity of [0, 1, 5]) {
-      const priced = await ws.ok('POST', `/v1/prices/${growth}/preview`, { quantity });
-      assert.equal(priced.amount, GROWTH, `a flat fee is ${GROWTH} at any quantity, including ${quantity}`);
-    }
-    // So carrying one would let the two halves of a change disagree — proration
-    // crediting a whole plan back while the recurring line goes on charging it.
+    // Carrying a quantity would let the two halves of a change disagree —
+    // proration crediting a whole plan back while the recurring line goes on
+    // charging it — so billing refuses one rather than discarding it.
     await ws.fail('POST', '/v1/subscriptions',
       { customer: customer.id, items: [{ price: 'growth_monthly', quantity: 5 }] }, 400, 'flat_price_quantity');
 
     const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
       customer: customer.id, items: [{ price: 'growth_monthly' }],
     });
+    // The bill is the proof: one flat fee, at the price, with no quantity in it.
+    const first = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    assert.equal(first.subtotal, GROWTH);
+    assert.equal(first.lines[0].quantity, 1);
     const error = await ws.fail('PATCH', `/v1/subscriptions/${sub.id}`,
       { items: [{ id: sub.items[0].id, quantity: 0 }], proration_behavior: 'always_invoice' },
       400, 'flat_price_quantity');
@@ -1374,7 +1403,10 @@ describe('what billing refuses to do', () => {
     assert.equal(after.items[1].amount, 0, 'the credit and the charge tell the same story');
     assert.equal(after.recurring_subtotal, GROWTH);
     const account = await ws.ok('GET', `/v1/customers/${customer.id}`);
-    assert.equal(account.balance, -(4 * GROWTH_SEAT) / 2);
+    assert.equal(account.balance, 0, 'the credit is a line waiting for a bill, not a balance movement');
+    const waiting = await ws.ok('GET', `/v1/customers/${customer.id}/pending_items`);
+    assert.equal(waiting.data.length, 1);
+    assert.equal(waiting.data[0].amount, -(4 * GROWTH_SEAT) / 2);
   });
 
   test('a one-time price belongs on an invoice, not a subscription', async () => {
@@ -1652,32 +1684,41 @@ describe('invoices', () => {
     }
   });
 
-  test('a downgrade becomes account credit, and the next invoice draws it down', async () => {
+  test('a downgrade rides the next invoice as a credit line, and nets against the new plan', async () => {
     const customer = await ws.customer('Downgrade Credit');
     const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
       customer: customer.id, items: [{ price: 'scale_monthly' }],
     });
+    // Three quarters of the way in, so the quarter-period credit for Scale is
+    // smaller than the month of Growth the renewal charges and the two meet on
+    // one bill rather than one of them spilling onto the account.
+    const period = sub.current_period_end - sub.current_period_start;
+    const at = sub.current_period_start + Math.floor((period * 3) / 4);
+    const remaining = sub.current_period_end - at;
     await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
-      items: [{ id: sub.items[0].id, price: 'growth_monthly' }], proration_date: midpointOf(sub),
+      items: [{ id: sub.items[0].id, price: 'growth_monthly' }], proration_date: at,
     });
+    const net = Math.round(GROWTH * remaining / period) - Math.round(SCALE * remaining / period);
+    assert.ok(net < 0 && GROWTH + net > 0);
     const credited = await ws.ok('GET', `/v1/customers/${customer.id}`);
-    assert.ok(credited.balance < 0, 'a negative proration is credit, never a payment');
+    assert.equal(credited.balance, 0, 'a negative proration waits on a bill, it does not move the balance');
 
     await ws.travelTo(sub.current_period_end + 60_000);
     const renewal = (await allInvoices(ws, `&subscription=${sub.id}`))
       .find((invoice) => invoice.billing_reason === 'subscription_cycle');
     assert.ok(renewal);
-    assert.equal(renewal.subtotal, GROWTH, 'the new plan, billed in advance');
-    assert.equal(renewal.starting_balance, credited.balance);
-    assert.equal(renewal.balance_applied, Math.max(credited.balance, -GROWTH));
-    assert.equal(renewal.subtotal + renewal.balance_applied, renewal.total);
-    assert.equal(renewal.total, Math.max(0, GROWTH + credited.balance));
+    // The renewal carries the new plan and both halves of the change, so the
+    // credit is a line the tax engine has been through rather than a number
+    // subtracted after tax.
+    assert.equal(renewal.subtotal, GROWTH + net);
+    assert.equal(sumLines(renewal), renewal.subtotal);
+    assert.equal(renewal.lines.filter((line) => line.proration).length, 2);
+    assert.equal(renewal.starting_balance, 0);
+    assert.equal(renewal.balance_applied, 0);
+    assert.equal(renewal.total, GROWTH + net);
 
     const after = await ws.ok('GET', `/v1/customers/${customer.id}`);
-    assert.equal(after.balance, renewal.ending_balance, 'what the invoice did not use stays on the account');
-    const ledger = await ws.ok('GET', `/v1/customers/${customer.id}/balance_transactions`);
-    assert.equal(ledger.data[0].type, 'applied_to_invoice');
-    assert.equal(ledger.data[0].invoice, renewal.id);
+    assert.equal(after.balance, 0, 'nothing was left floating on the account');
   });
 
   test('an invoice a credit balance covers in full is settled at zero, not paid out', async () => {
@@ -1797,8 +1838,30 @@ describe('invoices', () => {
     const numbers = new Set<string>();
     for (const invoice of invoices) {
       assert.equal(sumLines(invoice), invoice.subtotal, `${invoice.number}: lines do not add up to the subtotal`);
-      assert.equal(invoice.subtotal + invoice.balance_applied, invoice.total, `${invoice.number}: does not reconcile`);
+      assert.equal(sumTax(invoice), invoice.tax, `${invoice.number}: the lines' tax does not add up to the tax total`);
+      assert.equal(invoice.subtotal + invoice.tax + invoice.balance_applied, invoice.total, `${invoice.number}: does not reconcile`);
+      assert.equal(invoice.total_excluding_tax, invoice.total - invoice.tax, `${invoice.number}: total excluding tax`);
+      assert.equal(
+        invoice.total_taxes.reduce((sum, row) => sum + row.amount, 0), invoice.tax,
+        `${invoice.number}: the tax summary does not add up to the tax charged`,
+      );
+      assert.ok(
+        ws.app.ctx.db.count(
+          `SELECT COALESCE(SUM(total), 0) FROM billing_credit_notes WHERE org_id = ? AND invoice_id = ? AND status = 'issued'`,
+          ORG, invoice.id,
+        ) <= invoice.total,
+        `${invoice.number}: credited for more than it was billed`,
+      );
       assert.ok(invoice.total >= 0, `${invoice.number}: an invoice can never be negative`);
+      // Cash and credit together account for the whole bill, so no invoice can
+      // ever report collecting more than it was possible to collect.
+      if (invoice.status !== 'void') {
+        assert.equal(
+          invoice.amount_paid + invoice.pre_payment_credit_notes_amount + invoice.amount_due, invoice.total,
+          `${invoice.number}: collected + credited + still due is not what it was billed`,
+        );
+      }
+      assert.ok(invoice.amount_paid <= invoice.total, `${invoice.number}: collected more than it billed`);
       assert.equal(invoice.ending_balance, invoice.starting_balance - invoice.balance_applied, `${invoice.number}: balance`);
       assert.ok(!numbers.has(invoice.number), `${invoice.number} was issued twice`);
       numbers.add(invoice.number);
@@ -1864,6 +1927,10 @@ describe('invoices', () => {
         `SELECT COALESCE(SUM(subtotal), 0) FROM billing_invoices
           WHERE org_id = ? AND customer_id = ? AND status IN ('open','paid','uncollectible')`, ORG, customer.id,
       );
+      const taxed = ws.app.ctx.db.count(
+        `SELECT COALESCE(SUM(tax), 0) FROM billing_invoices
+          WHERE org_id = ? AND customer_id = ? AND status IN ('open','paid','uncollectible')`, ORG, customer.id,
+      );
       const asked = ws.app.ctx.db.count(
         `SELECT COALESCE(SUM(total), 0) FROM billing_invoices
           WHERE org_id = ? AND customer_id = ? AND status IN ('open','paid','uncollectible')`, ORG, customer.id,
@@ -1872,9 +1939,9 @@ describe('invoices', () => {
         `SELECT COALESCE(SUM(amount), 0) FROM billing_balance_transactions
           WHERE org_id = ? AND customer_id = ? AND type != 'applied_to_invoice'`, ORG, customer.id,
       );
-      // Everything that moved has exactly one home: the bill, the credit that
-      // reduced it, or the balance still sitting on the account.
-      assert.equal(asked + customer.balance, billed + granted, `${customer.name} does not reconcile`);
+      // Everything that moved has exactly one home: the bill, the tax on it,
+      // the credit that reduced it, or the balance still on the account.
+      assert.equal(asked + customer.balance, billed + taxed + granted, `${customer.name} does not reconcile`);
     }
   });
 });
@@ -2013,5 +2080,878 @@ describe("Northwind's book of business", () => {
     assert.equal(tools.tool('billing_preview_subscription_change')!.readOnly, true);
     assert.equal(tools.tool('billing_update_subscription')!.readOnly, false);
     assert.equal(tools.tool('billing_update_subscription')!.requiresApproval, true);
+  });
+});
+
+/* ========================================================================== *
+ * 8. Tax
+ * ========================================================================== */
+
+describe('tax', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 9, 1)); });
+  after(() => ws.close());
+
+  /** Two prices identical but for the one field the whole engine turns on. */
+  const benchPrice = async (behavior: 'inclusive' | 'exclusive'): Promise<string> => {
+    const growth = await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly');
+    const price = await ws.ok('POST', '/v1/prices', {
+      product: growth.data[0].product,
+      currency: 'usd',
+      model: 'flat',
+      unit_amount: 10_000,
+      nickname: `Line-check plan — tax ${behavior}`,
+      lookup_key: `line_check_${behavior}`,
+      recurring: { interval: 'month' },
+      tax_behavior: behavior,
+    });
+    return price.id as string;
+  };
+
+  const AUSTRALIA = {
+    address: { line1: '4 Dock Road', city: 'Melbourne', state: 'Victoria', postal_code: '3000', country: 'Australia' },
+  };
+
+  /** 10% GST, a jurisdiction the seeded book is deliberately not registered in. */
+  const registerGst = () => ws.ok('POST', '/v1/tax_rates', {
+    display_name: 'GST', jurisdiction: 'Australia', country: 'AU', tax_type: 'gst', percentage: '10',
+  });
+
+  const billFor = async (customerId: string, priceId: string): Promise<Invoice> => {
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customerId, items: [{ price: priceId }],
+    });
+    const invoices = await allInvoices(ws, `&subscription=${sub.id}`);
+    assert.equal(invoices.length, 1);
+    return invoices[0];
+  };
+
+  test('the seeded workspace collects where it is registered, and nowhere else', async () => {
+    const rates = await ws.ok('GET', '/v1/tax_rates');
+    assert.ok(rates.data.length >= 15, `expected a real registration footprint, got ${rates.data.length}`);
+    const germany = (rates.data as { country: string; percentage: string; reverse_charge: boolean }[])
+      .find((rate) => rate.country === 'DE');
+    assert.ok(germany, 'Northwind is VAT-registered in Germany');
+    assert.equal(germany.percentage, '19');
+    assert.equal(germany.reverse_charge, true);
+    // One active rate per jurisdiction, so an address can never match two.
+    await ws.fail('POST', '/v1/tax_rates', {
+      display_name: 'VAT', jurisdiction: 'Germany', country: 'DE', percentage: '19',
+    }, 409, 'tax_rate_exists');
+  });
+
+  test('an exclusive price adds tax on top; an inclusive one has it taken out', async () => {
+    await registerGst();
+    const exclusivePrice = await benchPrice('exclusive');
+    const inclusivePrice = await benchPrice('inclusive');
+
+    const first = await ws.customer('Barwon Automation', AUSTRALIA);
+    const second = await ws.customer('Yarra Controls', AUSTRALIA);
+    const exclusive = await billFor(first.id, exclusivePrice);
+    const inclusive = await billFor(second.id, inclusivePrice);
+
+    // The critic's exact case: same unit_amount, one field apart, and the two
+    // invoices must not be the same invoice.
+    assert.notDeepEqual(
+      [exclusive.subtotal, exclusive.tax, exclusive.total],
+      [inclusive.subtotal, inclusive.tax, inclusive.total],
+    );
+    for (const invoice of [exclusive, inclusive]) {
+      assert.ok(Object.keys(invoice).some((key) => /tax/i.test(key)), 'an invoice has to say something about tax');
+    }
+
+    // Exclusive: the listed price is the base and 10% is added to it.
+    assert.equal(exclusive.subtotal, 10_000);
+    assert.equal(exclusive.tax, 1_000);
+    assert.equal(exclusive.total, 11_000);
+    assert.equal(exclusive.total_excluding_tax, 10_000);
+    assert.equal(exclusive.lines[0].amount, 10_000);
+    assert.equal(exclusive.lines[0].tax.amount, 1_000);
+    assert.equal(exclusive.lines[0].tax.behavior, 'exclusive');
+    assert.match(exclusive.lines[0].tax.explanation ?? '', /added on top/);
+
+    // Inclusive: the customer pays the listed price and the tax comes out of it.
+    // 10,000 x 100/110 = 9,090.909… → 9,091, and the rest is the tax.
+    assert.equal(inclusive.subtotal, 9_091);
+    assert.equal(inclusive.tax, 909);
+    assert.equal(inclusive.total, 10_000, 'an inclusive price never changes what is charged');
+    assert.equal(inclusive.lines[0].amount + inclusive.lines[0].tax.amount, 10_000, 'base plus tax is the listed price, to the cent');
+    assert.equal(inclusive.lines[0].tax.behavior, 'inclusive');
+    assert.match(inclusive.lines[0].tax.explanation ?? '', /included in the price/);
+
+    // Both bills carry the snapshot that explains them, grouped by rate.
+    for (const invoice of [exclusive, inclusive]) {
+      assert.equal(invoice.total_taxes.length, 1);
+      const [summary] = invoice.total_taxes;
+      assert.equal(summary.display_name, 'GST');
+      assert.equal(summary.percentage, '10');
+      assert.equal(summary.jurisdiction, 'Australia');
+      assert.equal(summary.amount, invoice.tax);
+      assert.equal(summary.taxable_amount, invoice.subtotal);
+      assert.equal(summary.inclusive, invoice.lines[0].tax.behavior === 'inclusive');
+      assert.equal(invoice.subtotal + invoice.tax + invoice.balance_applied, invoice.total);
+    }
+  });
+
+  test('the previewed invoice matches the issued one to the cent, tax included', async () => {
+    const customer = await ws.customer('Otway Pressing', AUSTRALIA);
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'scale_monthly' }, { price: 'scale_seat_monthly', quantity: 7 }],
+    });
+    // A mid-cycle expansion, so the next bill carries taxed prorations too.
+    await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+      items: [{ id: sub.items[1].id, quantity: 13 }], proration_date: midpointOf(sub),
+    });
+
+    const preview: Invoice = await ws.ok('POST', '/v1/invoices/create_preview', { subscription: sub.id });
+    assert.ok(preview.tax > 0, 'a preview for a taxed account has to show the tax');
+    assert.equal(sumTax(preview), preview.tax);
+    assert.equal(preview.subtotal + preview.tax + preview.balance_applied, preview.total);
+
+    await ws.travelTo(sub.current_period_end + 60_000);
+    const issued = (await allInvoices(ws, `&subscription=${sub.id}`))
+      .find((invoice) => invoice.billing_reason === 'subscription_cycle');
+    assert.ok(issued, 'the renewal raised the invoice the preview described');
+    assert.equal(issued.subtotal, preview.subtotal);
+    assert.equal(issued.tax, preview.tax, 'the preview and the bill are taxed by one function');
+    assert.equal(issued.total, preview.total);
+    assert.equal(issued.total_excluding_tax, preview.total_excluding_tax);
+    assert.equal(issued.balance_applied, preview.balance_applied);
+    assert.deepEqual(
+      issued.lines.map((line) => [...shapeOf(line), line.tax.amount, line.tax.percentage, line.tax.reason]),
+      preview.lines.map((line) => [...shapeOf(line), line.tax.amount, line.tax.percentage, line.tax.reason]),
+    );
+    assert.deepEqual(
+      issued.total_taxes.map((row) => [row.percentage, row.taxable_amount, row.amount]),
+      preview.total_taxes.map((row) => [row.percentage, row.taxable_amount, row.amount]),
+    );
+  });
+
+  test('an EU business with a verified VAT number is reverse charged, and the invoice says so', async () => {
+    const customer = await ws.customer('Rheintal Steuerung', {
+      currency: 'eur',
+      address: { line1: 'Industriestraße 8', city: 'Stuttgart', state: 'Baden-Württemberg', postal_code: '70565', country: 'Germany' },
+      tax_ids: [{ type: 'eu_vat', value: 'DE811907980', country: 'Germany' }],
+    });
+    // A number that is on file but has not been checked does not move the tax:
+    // the register is what makes it a registration, and until it answers, the
+    // supplier is the one the authority collects from.
+    assert.equal(customer.tax_ids[0].verification.status, 'pending');
+    const unchecked: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'starter_monthly' }],
+    });
+    const charged = (await allInvoices(ws, `&subscription=${unchecked.id}`))[0];
+    assert.equal(charged.tax, Math.round(charged.subtotal * 0.19), 'unverified, so 19% is charged');
+    assert.ok(charged.tax > 0);
+    assert.equal(charged.lines[0].tax.reason, 'taxable');
+    assert.match(charged.lines[0].tax.explanation ?? '', /has not been confirmed against the register/);
+
+    const verified = await ws.ok('POST', `/v1/customers/${customer.id}/tax_ids/verify`, {
+      value: 'DE811907980', status: 'verified', verified_name: 'Rheintal Steuerung GmbH',
+    });
+    assert.equal(verified.tax_ids[0].verification.status, 'verified');
+    assert.equal(verified.tax_ids[0].verification.verified_name, 'Rheintal Steuerung GmbH');
+    assert.equal(verified.tax_ids[0].verification.checked_at, ws.now());
+
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+    });
+    const invoice = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+
+    assert.equal(invoice.tax, 0, 'the customer accounts for the tax, so nothing is charged');
+    assert.equal(invoice.total, invoice.subtotal);
+    const [line] = invoice.lines;
+    assert.equal(line.tax.reason, 'reverse_charge');
+    assert.equal(line.tax.percentage, '19', 'the rate that would have applied is still named');
+    assert.equal(line.tax.display_name, 'VAT');
+    assert.match(line.tax.explanation ?? '', /reverse charged/);
+    // A zero that is still a row, because a silent bill cannot be sent to the EU.
+    assert.equal(invoice.total_taxes.length, 1);
+    assert.equal(invoice.total_taxes[0].reason, 'reverse_charge');
+    assert.equal(invoice.total_taxes[0].amount, 0);
+    assert.match(invoice.total_taxes[0].explanation, /customer accounts for it/);
+  });
+
+  test('an exempt account names the rate it would have paid and is charged nothing', async () => {
+    await registerGst().catch(() => undefined);
+    const customer = await ws.customer('Bellarine Foods', { ...AUSTRALIA, tax_exempt: 'exempt' });
+    assert.equal(customer.tax_exempt, 'exempt');
+    const invoice = await billFor(customer.id, await priceIdOf(ws, 'growth_monthly'));
+
+    assert.equal(invoice.tax, 0);
+    assert.equal(invoice.total, invoice.subtotal);
+    assert.equal(invoice.lines[0].tax.reason, 'exempt');
+    assert.equal(invoice.lines[0].tax.percentage, '10');
+    assert.match(invoice.lines[0].tax.explanation ?? '', /registered as exempt/);
+  });
+
+  test('an address with no registered rate is charged nothing, and the line says why', async () => {
+    const customer = await ws.customer('Aotearoa Robotics', {
+      address: { line1: '12 Quay Street', city: 'Auckland', country: 'NZ' },
+    });
+    const invoice = await billFor(customer.id, await priceIdOf(ws, 'growth_monthly'));
+    assert.equal(invoice.tax, 0);
+    assert.equal(invoice.total_taxes.length, 0, 'nothing to summarise where there is no rate');
+    assert.equal(invoice.lines[0].tax.reason, 'no_rate');
+    assert.match(invoice.lines[0].tax.explanation ?? '', /No tax rate is registered for NZ/);
+  });
+
+  test('an invoice keeps the rate it was raised under after that rate is retired', async () => {
+    const rate = await ws.ok('POST', '/v1/tax_rates', {
+      display_name: 'IVA', jurisdiction: 'Colombia', country: 'CO', tax_type: 'vat', percentage: '19',
+    });
+    const customer = await ws.customer('Andes Manufactura', {
+      address: { line1: 'Calle 26 #92', city: 'Bogotá', country: 'Colombia' },
+    });
+    const invoice = await billFor(customer.id, await priceIdOf(ws, 'starter_monthly'));
+    assert.equal(invoice.tax, Math.round(STARTER * 0.19));
+    assert.equal(invoice.lines[0].tax.rate, rate.id);
+
+    await ws.ok('POST', `/v1/tax_rates/${rate.id}/deactivate`);
+    const rates = await ws.ok('GET', '/v1/tax_rates?country=CO&active=true');
+    assert.equal(rates.data.length, 0, 'the rate no longer matches a new bill');
+
+    const after: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(after.tax, invoice.tax, 'a historical document does not change when a rate does');
+    assert.equal(after.lines[0].tax.percentage, '19');
+    assert.equal(after.lines[0].tax.display_name, 'IVA');
+  });
+
+  test('a mid-cycle downgrade credits the tax it charged, and the sign of the net changes nothing', async () => {
+    // Two identical German accounts at 19%, one month, one changed at the exact
+    // midpoint. The supply is 5000 + 2500 + 5000 = 12500 for the downgrade and
+    // 10000 + 10000 + 30000 = 50000 for the upgrade; the VAT on each is 19% of
+    // what was supplied, not of what was invoiced before a credit came off.
+    const germany = {
+      currency: 'eur',
+      address: { line1: 'Ostendstraße 25', city: 'Berlin', postal_code: '12459', country: 'Germany' },
+    };
+    const product = (await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly')).data[0].product;
+    const priceOf = async (amount: number, key: string) => (await ws.ok('POST', '/v1/prices', {
+      product, currency: 'eur', model: 'flat', unit_amount: amount,
+      nickname: `Tax bench ${key}`, lookup_key: `tax_bench_${key}`, recurring: { interval: 'month' },
+    })).id as string;
+    const hundred = await priceOf(10_000, 'de_100');
+    const fifty = await priceOf(5_000, 'de_50');
+    const threeHundred = await priceOf(30_000, 'de_300');
+
+    const run = async (name: string, to: string) => {
+      const customer = await ws.customer(name, germany);
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: hundred }],
+      });
+      await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+        items: [{ id: sub.items[0].id, price: to }], proration_date: midpointOf(sub),
+      });
+      await ws.travelTo(sub.current_period_end + 60_000);
+      const bills = await allInvoices(ws, `&subscription=${sub.id}`);
+      return {
+        base: bills.reduce((total, invoice) => total + invoice.subtotal, 0),
+        tax: bills.reduce((total, invoice) => total + invoice.tax, 0),
+        charged: bills.reduce((total, invoice) => total + invoice.total, 0),
+        balance: (await ws.ok('GET', `/v1/customers/${customer.id}`)).balance as number,
+        bills,
+      };
+    };
+
+    const down = await run('Spreewerk Antriebe', fifty);
+    assert.equal(down.base, 12_500, 'the taxable supply is what was supplied');
+    assert.equal(down.tax, 2_375, '19% of 12,500 — not 19% of 15,000');
+    assert.equal(down.charged, 14_875);
+    assert.equal(down.balance, 0, 'nothing was routed around the invoice');
+    const credit = down.bills.find((invoice) => invoice.lines.some((line) => line.kind === 'unused_time'));
+    assert.ok(credit, 'the credit is a line on a bill');
+    const unused = credit.lines.find((line) => line.kind === 'unused_time');
+    assert.ok(unused);
+    assert.equal(unused.amount, -5_000);
+    assert.equal(unused.tax.amount, -950, 'a negative line carries negative tax');
+    assert.equal(unused.tax.reason, 'taxable');
+
+    const up = await run('Uckermark Fertigung', threeHundred);
+    assert.equal(up.base, 50_000, 'the mirror-image upgrade, on the same instant');
+    assert.equal(up.tax, 9_500);
+    assert.equal(up.charged, 59_500);
+
+    // And a full credit note against the downgraded bill reverses exactly the
+    // tax it charged, because the total and the lines' gross now agree.
+    const second = down.bills.find((invoice) => invoice.subtotal === 2_500);
+    assert.ok(second);
+    const note = await ws.ok('POST', '/v1/credit_notes', { invoice: second.id, amount: second.total });
+    assert.equal(note.total, second.total);
+    assert.equal(note.tax, second.tax, 'a full credit reverses the whole of the tax and no more');
+    assert.equal(note.subtotal, second.subtotal);
+  });
+
+  test('a registration number that is not one is refused before it can zero-rate anything', async () => {
+    const berlin = {
+      currency: 'eur',
+      address: { line1: 'Chausseestraße 1', city: 'Berlin', postal_code: '10115', country: 'Germany' },
+    };
+    const account = await ws.customer('Format Check Antriebe', berlin);
+
+    for (const value of ['DE', 'DEnot-a-number-at-all', 'DE81190798', 'FR811907980', 'ZZ811907980']) {
+      const error = await ws.fail('PATCH', `/v1/customers/${account.id}`,
+        { tax_ids: [{ type: 'eu_vat', value }] }, 400, 'tax_id_invalid');
+      assert.equal(error.param, 'tax_ids');
+      assert.ok(error.message.length > 40, 'the refusal says what the right shape is');
+    }
+    // The shapes each member state actually issues are different lengths, and
+    // the check knows the difference rather than counting characters.
+    await ws.ok('PATCH', `/v1/customers/${account.id}`, {
+      tax_ids: [{ type: 'eu_vat', value: 'NL123456789B01' }],
+    });
+    await ws.fail('PATCH', `/v1/customers/${account.id}`,
+      { tax_ids: [{ type: 'eu_vat', value: 'NL123456789' }] }, 400, 'tax_id_invalid');
+    // And spaces are how a human writes one, not how a register holds one.
+    const tidied = await ws.ok('PATCH', `/v1/customers/${account.id}`, {
+      tax_ids: [{ type: 'eu_vat', value: 'de 811 907 980' }],
+    });
+    assert.equal(tidied.tax_ids[0].value, 'DE811907980');
+    assert.equal(tidied.tax_ids[0].verification.status, 'pending', 'a new number is never born verified');
+    await ws.fail('PATCH', `/v1/customers/${account.id}`, {
+      tax_ids: [{ type: 'eu_vat', value: 'DE811907980' }, { type: 'eu_vat', value: 'DE 811907980' }],
+    }, 400, 'tax_id_duplicated');
+  });
+
+  test('reverse charge needs a verified number and a border to cross', async () => {
+    const berlin = {
+      currency: 'eur',
+      address: { line1: 'Hafenstraße 3', city: 'Hamburg', postal_code: '20457', country: 'Germany' },
+      tax_ids: [{ type: 'eu_vat', value: 'DE811907980', country: 'Germany' }],
+    };
+    const account = await ws.customer('Nordbau Steuerung', berlin);
+    const bill = async (): Promise<Invoice> => {
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: account.id, items: [{ price: 'starter_monthly' }],
+      });
+      return (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    };
+
+    const unchecked = await bill();
+    assert.equal(unchecked.lines[0].tax.reason, 'taxable', 'unverified is not verified');
+    assert.ok(unchecked.tax > 0);
+    assert.match(unchecked.lines[0].tax.explanation ?? '', /not been confirmed against the register/);
+    assert.match(unchecked.lines[0].tax.explanation ?? '', /tax_ids\/verify/, 'and it says how to fix it');
+
+    await ws.fail('POST', `/v1/customers/${account.id}/tax_ids/verify`,
+      { value: 'DE999999999', status: 'verified' }, 400, 'tax_id_not_on_customer');
+
+    await ws.ok('POST', `/v1/customers/${account.id}/tax_ids/verify`, {
+      value: 'DE811907980', status: 'verified', verified_name: 'Nordbau Steuerung GmbH',
+    });
+    assert.equal((await bill()).lines[0].tax.reason, 'reverse_charge');
+
+    // The register can also say no, and then the supplier charges the tax again.
+    await ws.ok('POST', `/v1/customers/${account.id}/tax_ids/verify`, {
+      value: 'DE811907980', status: 'unverified',
+    });
+    const rejected = await bill();
+    assert.equal(rejected.lines[0].tax.reason, 'taxable');
+    assert.match(rejected.lines[0].tax.explanation ?? '', /register did not recognise it/);
+
+    // Finally, the rule is cross-border. A supplier established in Germany
+    // charges German VAT on a German supply however good the number is.
+    await ws.ok('POST', `/v1/customers/${account.id}/tax_ids/verify`, {
+      value: 'DE811907980', status: 'verified',
+    });
+    assert.equal((await bill()).lines[0].tax.reason, 'reverse_charge');
+    ws.app.ctx.svc.core.setSetting(ORG, 'billing.issuer', {
+      legal_name: 'Northwind Robotics GmbH', city: 'Berlin', country: 'Germany',
+    });
+    const domestic = await bill();
+    assert.equal(domestic.lines[0].tax.reason, 'taxable', 'a domestic B2B supply is taxed, not zero-rated');
+    assert.ok(domestic.tax > 0);
+    assert.match(domestic.lines[0].tax.explanation ?? '', /domestic supply/);
+    ws.app.ctx.svc.core.setSetting(ORG, 'billing.issuer', {
+      legal_name: 'Northwind Robotics, Inc.', city: 'Cleveland', country: 'United States',
+    });
+  });
+
+  test('a credit is taxed the way the charge it reverses was, whatever the currency does', async () => {
+    // Three decimals, and a rate that does not divide evenly into anything.
+    await ws.ok('POST', '/v1/tax_rates', {
+      display_name: 'VAT', jurisdiction: 'Bahrain', country: 'BH', tax_type: 'vat', percentage: '19',
+    });
+    const product = (await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly')).data[0].product;
+    const make = async (amount: number, key: string, behavior?: 'inclusive') => (await ws.ok('POST', '/v1/prices', {
+      product, currency: 'bhd', model: 'flat', unit_amount: amount, nickname: `Bahrain ${key}`,
+      lookup_key: `bhd_${key}`, recurring: { interval: 'month' }, ...(behavior ? { tax_behavior: behavior } : {}),
+    })).id as string;
+    const customer = await ws.customer('Manama Automation', {
+      currency: 'bhd', address: { line1: '1 Bab Al Bahrain', city: 'Manama', country: 'BH' },
+    });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: await make(12_345, 'high') }],
+    });
+    const change = await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+      items: [{ id: sub.items[0].id, price: await make(6_000, 'low') }],
+      proration_date: midpointOf(sub), proration_behavior: 'always_invoice',
+    });
+    const credit = (await allInvoices(ws, `&subscription=${sub.id}`))
+      .find((invoice) => invoice.billing_reason === 'subscription_update');
+    assert.ok(credit);
+    assert.equal(credit.subtotal, (change.proration as ChangePreview).net);
+    assert.ok(credit.subtotal < 0);
+    assert.equal(credit.tax, Math.round(credit.subtotal * 0.19), 'exact at three decimals, rounded once');
+    assert.equal(credit.total, 0, 'a bill is never negative');
+    const account = await ws.ok('GET', `/v1/customers/${customer.id}`);
+    assert.equal(account.balance, credit.subtotal + credit.tax, 'the credit that reaches the account includes its tax');
+  });
+
+  test('a percentage has to be an exact decimal, and a country has to be one we can match', async () => {
+    await ws.fail('POST', '/v1/tax_rates', {
+      display_name: 'Sales tax', jurisdiction: 'Nowhere', country: 'Freedonia', percentage: '5',
+    }, 400, 'tax_country_unknown');
+    await ws.fail('POST', '/v1/tax_rates', {
+      display_name: 'Sales tax', jurisdiction: 'Kentucky', country: 'US', state: 'Kentucky', percentage: '6.0000001',
+    }, 400, 'tax_percentage_invalid');
+  });
+});
+
+/* ========================================================================== *
+ * 9. Credit notes
+ * ========================================================================== */
+
+describe('credit notes', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 9, 1)); });
+  after(() => ws.close());
+
+  const TEXAS = {
+    address: { line1: '901 Congress Avenue', city: 'Austin', state: 'Texas', postal_code: '78701', country: 'United States' },
+  };
+
+  /** A finalised, taxed invoice to correct. Texas is 6.25% in the seeded book. */
+  const taxedInvoice = async (name: string, collection: 'send_invoice' | 'charge_automatically' = 'send_invoice') => {
+    const customer = await ws.customer(name, TEXAS);
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }, { price: 'growth_seat_monthly', quantity: 5 }],
+      collection_method: collection,
+      days_until_due: 30,
+    });
+    const invoice = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    assert.ok(invoice.tax > 0, 'the fixture has to actually carry tax');
+    return { customer, sub, invoice };
+  };
+
+  test('an open invoice is reduced, and the note carries the tax it reversed', async () => {
+    const { customer, invoice } = await taxedInvoice('Guadalupe Instruments');
+    assert.equal(invoice.status, 'open');
+    const seats = invoice.lines.find((line) => line.description.includes('seat'));
+    assert.ok(seats);
+
+    const preview = await ws.ok('POST', '/v1/credit_notes/preview', {
+      invoice: invoice.id,
+      lines: [{ invoice_line_item: seats.id, quantity: 2 }],
+      reason: 'order_change',
+    });
+    const note = await ws.ok('POST', '/v1/credit_notes', {
+      invoice: invoice.id,
+      lines: [{ invoice_line_item: seats.id, quantity: 2 }],
+      reason: 'order_change',
+      memo: 'Two seats were never provisioned.',
+    });
+
+    // The preview and the note are one function, so they cannot disagree.
+    assert.equal(note.subtotal, preview.subtotal);
+    assert.equal(note.tax, preview.tax);
+    assert.equal(note.total, preview.total);
+
+    // Two of five seats, gross, with the tax reversed in the same proportion.
+    const seatGross = seats.amount + seats.tax.amount;
+    assert.equal(note.total, Math.round((seatGross * 2) / 5));
+    assert.equal(note.subtotal + note.tax, note.total);
+    assert.equal(note.tax, Math.round((note.total * seats.tax.amount) / seatGross));
+    assert.ok(note.tax > 0, 'a partial credit of a taxed line credits tax with it');
+    assert.equal(note.lines[0].tax_percentage, seats.tax.percentage);
+    assert.match(note.lines[0].explanation, /credited back/);
+    assert.match(note.number, /^NR-CN-\d{6}$/);
+
+    // Nothing was collected, so it comes off what is owed.
+    assert.equal(note.pre_payment_amount, note.total);
+    assert.equal(note.post_payment_amount, 0);
+    const after: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(after.pre_payment_credit_notes_amount, note.total);
+    assert.equal(after.amount_due, invoice.total - note.total);
+    assert.equal(after.total, invoice.total, 'the bill itself is never rewritten');
+    assert.equal(after.status, 'open');
+
+    // The balance was not touched: a pre-payment credit reduces, it does not grant.
+    const account = await ws.ok('GET', `/v1/customers/${customer.id}`);
+    assert.equal(account.balance, 0);
+  });
+
+  test('a paid invoice is credited onto the account balance instead', async () => {
+    const { customer, invoice } = await taxedInvoice('Llano Valve Works', 'charge_automatically');
+    await ws.ok('POST', `/v1/invoices/${invoice.id}/pay`, { note: 'Card on file.' });
+
+    const note = await ws.ok('POST', '/v1/credit_notes', {
+      invoice: invoice.id, amount: 20_000, reason: 'product_unsatisfactory',
+    });
+    assert.equal(note.post_payment_amount, 20_000);
+    assert.equal(note.pre_payment_amount, 0);
+    assert.ok(note.balance_transaction, 'the movement is a row in the balance ledger, not a silent change');
+
+    const account = await ws.ok('GET', `/v1/customers/${customer.id}`);
+    assert.equal(account.balance, -20_000, 'credit the customer holds is negative, Stripe-style');
+    const after: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(after.post_payment_credit_notes_amount, 20_000);
+    assert.equal(after.amount_paid, invoice.total, 'the money really was collected, and still was');
+    assert.equal(after.amount_due, 0);
+
+    // And the credit lands on the next bill rather than being paid out.
+    const ledger = await ws.ok('GET', `/v1/customers/${customer.id}/balance_transactions`);
+    assert.equal(ledger.data[0].type, 'credit_note');
+    assert.equal(ledger.data[0].amount, -20_000);
+  });
+
+  test('paying a bill a credit note already reduced collects the reduced amount, never the face value', async () => {
+    const { customer, invoice } = await taxedInvoice('Frio River Controls');
+    assert.equal(invoice.amount_paid, 0);
+    assert.equal(invoice.amount_due, invoice.total);
+
+    const note = await ws.ok('POST', '/v1/credit_notes', {
+      invoice: invoice.id, amount: 3_000, reason: 'order_change',
+    });
+    const credited: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(credited.amount_due, invoice.total - 3_000);
+
+    const before = (await ws.ok('GET', '/v1/subscriptions/overview')).invoices.collected;
+    const paid: Invoice = await ws.ok('POST', `/v1/invoices/${invoice.id}/pay`, { note: 'Bank transfer.' });
+    const after = (await ws.ok('GET', '/v1/subscriptions/overview')).invoices.collected;
+
+    // Only what was collectable was ever going to arrive, so only that is cash.
+    assert.equal(paid.amount_paid, invoice.total - 3_000);
+    assert.equal(paid.amount_due, 0);
+    assert.equal(paid.status, 'paid');
+    assert.equal(after - before, invoice.total - 3_000, 'the workspace collected figure moves by the cash');
+    assert.equal(paid.amount_paid + paid.pre_payment_credit_notes_amount + paid.amount_due, paid.total);
+    assert.equal((paid as unknown as { reconciles: boolean }).reconciles, true);
+
+    // Withdrawing the note makes the difference owed again: it cannot simply
+    // disappear, with no line, no balance entry and no re-bill.
+    await ws.ok('POST', `/v1/credit_notes/${note.id}/void`);
+    const reopened: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(reopened.status, 'open');
+    assert.equal(reopened.amount_due, 3_000);
+    assert.equal(reopened.amount_paid, invoice.total - 3_000, 'what was collected stays collected');
+    assert.equal(reopened.pre_payment_credit_notes_amount, 0);
+    assert.equal(reopened.amount_paid + reopened.amount_due, reopened.total);
+    const account = await ws.ok('GET', `/v1/customers/${customer.id}`);
+    assert.equal(account.balance, 0, 'nothing was quietly parked on the balance');
+  });
+
+  test('a credit note is refused, never clamped, when it exceeds what is left', async () => {
+    const { invoice } = await taxedInvoice('Pedernales Assembly');
+    const tooMuch = await ws.fail('POST', '/v1/credit_notes',
+      { invoice: invoice.id, amount: invoice.total + 1 }, 400, 'credit_note_amount_too_large');
+    assert.match(tooMuch.message, /more than/);
+    assert.equal(
+      (await ws.ok('GET', '/v1/credit_notes?invoice=' + invoice.id)).data.length, 0,
+      'a refusal writes nothing',
+    );
+
+    // Credit most of it, then ask for the rest plus a cent.
+    await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: invoice.total - 500 });
+    const second = await ws.fail('POST', '/v1/credit_notes',
+      { invoice: invoice.id, amount: 501 }, 400, 'credit_note_amount_too_large');
+    assert.equal(second.param, 'amount');
+    // The last 500 is still creditable, exactly.
+    const rest = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 500 });
+    assert.equal(rest.total, 500);
+    await ws.fail('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 1 }, 400, 'credit_note_nothing_creditable');
+
+    const after: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(after.pre_payment_credit_notes_amount, invoice.total);
+    assert.equal(after.amount_due, 0);
+    assert.equal(after.status, 'paid', 'a bill credited to nothing is not owed any more');
+    assert.equal(after.amount_paid, 0, 'and nothing was collected — that is the difference');
+  });
+
+  test('a line can only be credited for what it was billed, and only on its own invoice', async () => {
+    const { invoice } = await taxedInvoice('Blanco Toolworks');
+    const other = await taxedInvoice('Comal Fabrication');
+    const [plan] = invoice.lines;
+
+    await ws.fail('POST', '/v1/credit_notes', {
+      invoice: invoice.id,
+      lines: [{ invoice_line_item: other.invoice.lines[0].id }],
+    }, 400, 'credit_note_line_not_on_invoice');
+
+    await ws.fail('POST', '/v1/credit_notes', {
+      invoice: invoice.id,
+      lines: [{ invoice_line_item: plan.id, amount: plan.amount + plan.tax.amount + 1 }],
+    }, 400, 'credit_note_line_amount_too_large');
+
+    await ws.fail('POST', '/v1/credit_notes', {
+      invoice: invoice.id,
+      lines: [{ invoice_line_item: plan.id }, { invoice_line_item: plan.id }],
+    }, 400, 'credit_note_line_duplicated');
+
+    await ws.fail('POST', '/v1/credit_notes', { invoice: invoice.id }, 400, 'credit_note_amount_or_lines');
+    await ws.fail('POST', '/v1/credit_notes',
+      { invoice: invoice.id, amount: 100, lines: [{ invoice_line_item: plan.id }] }, 400, 'credit_note_amount_or_lines');
+  });
+
+  test('voiding a note puts back exactly what it took', async () => {
+    const { customer, invoice } = await taxedInvoice('Nueces Drive Systems');
+    const note = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: invoice.total });
+    const settled: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(settled.status, 'paid');
+    assert.equal(settled.amount_due, 0);
+
+    const voided = await ws.ok('POST', `/v1/credit_notes/${note.id}/void`);
+    assert.equal(voided.status, 'void');
+    assert.ok(voided.voided_at);
+
+    const reopened: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(reopened.status, 'open', 'withdrawing the note makes the bill owed again');
+    assert.equal(reopened.amount_due, invoice.total);
+    assert.equal(reopened.pre_payment_credit_notes_amount, 0);
+    const account = await ws.ok('GET', `/v1/customers/${customer.id}`);
+    assert.equal(account.balance, 0);
+
+    // And the full amount is creditable again, because nothing stands against it.
+    const again = await ws.ok('POST', '/v1/credit_notes/preview', { invoice: invoice.id, amount: invoice.total });
+    assert.equal(again.total, invoice.total);
+  });
+
+  test('a draft or voided invoice cannot be credited at all', async () => {
+    const { invoice } = await taxedInvoice('Frio River Controls');
+    await ws.ok('POST', `/v1/invoices/${invoice.id}/void`);
+    await ws.fail('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 100 }, 400, 'credit_note_invoice_void');
+  });
+
+  test('every credit note is listed, retrievable and attached to its invoice', async () => {
+    const { customer, invoice } = await taxedInvoice('Sabinal Gearworks');
+    const note = await ws.ok('POST', '/v1/credit_notes', {
+      invoice: invoice.id, amount: 1_000, reason: 'duplicate', memo: 'Billed twice for March.',
+    });
+    const fetched = await ws.ok('GET', `/v1/credit_notes/${note.id}`);
+    assert.equal(fetched.id, note.id);
+    assert.equal(fetched.invoice_number, invoice.number);
+    assert.equal(fetched.customer_name, customer.name);
+    assert.equal(fetched.remaining_creditable, invoice.total - 1_000);
+
+    const byInvoice = await ws.ok('GET', `/v1/credit_notes?invoice=${invoice.id}`);
+    assert.equal(byInvoice.data.length, 1);
+    const byCustomer = await ws.ok('GET', `/v1/credit_notes?customer=${customer.id}`);
+    assert.equal(byCustomer.data.length, 1);
+    assert.equal(byCustomer.data[0].memo, 'Billed twice for March.');
+  });
+});
+
+/* ========================================================================== *
+ * 10. A cancellation date that has already passed
+ * ========================================================================== */
+
+describe('cancel_at in the past', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 9, 1)); });
+  after(() => ws.close());
+
+  const THREE_YEARS_AGO = () => UTC(2026, 9, 1) - 3 * 365 * DAY;
+
+  test('creating a subscription with a cancel_at that has passed is refused', async () => {
+    const customer = await ws.customer('Backdated Cancellation');
+    const error = await ws.fail('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }],
+      cancel_at: THREE_YEARS_AGO(),
+    }, 400, 'cancel_at_in_past');
+    assert.equal(error.param, 'cancel_at');
+    assert.match(error.message, /already passed/);
+
+    // And nothing was written: no subscription, no invoice, no counted cancellation.
+    const subs = await ws.ok('GET', `/v1/subscriptions?customer=${customer.id}&status=all`);
+    assert.equal(subs.data.length, 0, 'a refused create leaves no subscription behind');
+    assert.equal((await allInvoices(ws, `&customer=${customer.id}`)).length, 0);
+  });
+
+  test('patching a subscription onto a past cancel_at is refused', async () => {
+    const customer = await ws.customer('Patch Cancellation');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+    });
+    await ws.fail('PATCH', `/v1/subscriptions/${sub.id}`, { cancel_at: THREE_YEARS_AGO() }, 400, 'cancel_at_in_past');
+    const after: Subscription = await ws.ok('GET', `/v1/subscriptions/${sub.id}`);
+    assert.equal(after.cancel_at, null);
+    assert.equal(after.status, 'active');
+  });
+
+  test('scheduling a cancellation in the past through /cancel is refused', async () => {
+    const customer = await ws.customer('Schedule Cancellation');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+    });
+    await ws.fail('POST', `/v1/subscriptions/${sub.id}/cancel`, { cancel_at: THREE_YEARS_AGO() }, 400, 'cancel_at_in_past');
+    const after: Subscription = await ws.ok('GET', `/v1/subscriptions/${sub.id}`);
+    assert.equal(after.cancel_at, null);
+    assert.equal(after.status, 'active');
+
+    // A future date is still accepted, so the guard refuses the contradiction
+    // and nothing else.
+    const scheduled = await ws.ok('POST', `/v1/subscriptions/${sub.id}/cancel`, { cancel_at: ws.now() + 45 * DAY });
+    assert.equal(scheduled.cancel_at, ws.now() + 45 * DAY);
+  });
+
+  test('no cancellation in the whole seeded book predates the subscription it ends', async () => {
+    const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+    assert.ok(overview.scheduled_to_cancel >= 0);
+    const subs = await ws.ok('GET', '/v1/subscriptions?status=all&limit=200');
+    for (const sub of subs.data as Subscription[]) {
+      if (sub.cancel_at === null) continue;
+      assert.ok(sub.cancel_at > sub.created, `${sub.id} is set to cancel before it was created`);
+    }
+  });
+});
+
+/* ========================================================================== *
+ * 11. The invoice document
+ * ========================================================================== */
+
+describe('the invoice document', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 9, 1)); });
+  after(() => ws.close());
+
+  const render = async (id: string): Promise<{ status: number; html: string; type: string }> => {
+    const res = await ws.call('GET', `/v1/invoices/${id}/render`);
+    return { status: res.status, html: String(res.body), type: String((res as { headers?: Record<string, string> }).headers?.['content-type'] ?? '') };
+  };
+
+  test('renders a complete printable bill with the tax on it', async () => {
+    const customer = await ws.customer('Housatonic Machine', {
+      address: { line1: '55 Water Street', city: 'New York', state: 'New York', postal_code: '10041', country: 'United States' },
+    });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'scale_monthly' }, { price: 'scale_seat_monthly', quantity: 12 }],
+      collection_method: 'send_invoice',
+      days_until_due: 45,
+    });
+    const invoice = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    assert.ok(invoice.tax > 0, 'New York is a registered jurisdiction, so this bill carries tax');
+
+    const { status, html, type } = await render(invoice.id);
+    assert.equal(status, 200);
+    assert.match(type, /text\/html/);
+
+    // A whole document, not a fragment.
+    assert.ok(html.startsWith('<!doctype html>'), 'it has to be a document a browser can open');
+    assert.match(html, /<html lang='en'>/);
+    assert.ok(html.trimEnd().endsWith('</html>'));
+    assert.match(html, /<style>/, 'self-contained: no stylesheet to fetch');
+    assert.ok(!/<script/i.test(html), 'nothing to run — this is a document, not an app');
+    assert.ok(!/https?:\/\//.test(html), 'nothing to fetch from anywhere else');
+    assert.match(html, /@media print/);
+
+    // The platform's HTTP layer serialises every response body with
+    // JSON.stringify, so the document is built to contain nothing JSON has to
+    // escape: the same bytes are a valid page in process and over the wire.
+    assert.equal(JSON.stringify(html), `"${html}"`, 'the document must survive JSON encoding unchanged');
+    assert.ok(!html.includes('"') && !html.includes('\\'), 'single-quoted attributes, no backslashes');
+
+    // Issuer, bill-to and the invoice's own identity.
+    assert.ok(html.includes('Northwind Robotics, Inc.'));
+    assert.ok(html.includes('1200 Superior Avenue East'));
+    assert.ok(html.includes('Housatonic Machine'));
+    assert.ok(html.includes('55 Water Street'));
+    assert.ok(html.includes('New York, New York 10041'));
+    assert.ok(html.includes(invoice.number));
+
+    // Every line, with its window, its per-tier breakdown and its tax.
+    for (const line of invoice.lines) {
+      assert.ok(html.includes(line.description.replace(/&/g, '&amp;')), `the document is missing "${line.description}"`);
+    }
+    assert.ok(html.includes('at the tier 1 rate'), 'the seat line shows the tier it was priced on');
+    assert.match(html, /Service period/);
+    assert.match(html, /Tax summary/);
+    assert.ok(html.includes('NY sales tax'));
+    assert.ok(html.includes('4%'));
+
+    // The totals a finance team reconciles against.
+    const show = (amount: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount / 100);
+    assert.ok(html.includes(show(invoice.subtotal)), 'the subtotal is on the page');
+    assert.ok(html.includes(show(invoice.tax)), 'so is the tax');
+    assert.ok(html.includes(show(invoice.total)), 'and the total');
+    assert.match(html, /Amount due/);
+    assert.match(html, /Payment/);
+    assert.match(html, /Please pay/);
+    assert.match(html, /Due/);
+  });
+
+  test('the document shows a credit note raised against the bill, and escapes what a customer typed', async () => {
+    const customer = await ws.customer('Ampersand & <Sons> Robotics', {
+      address: { line1: '2 Mill Street', city: 'Austin', state: 'Texas', postal_code: '78701', country: 'United States' },
+    });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], collection_method: 'send_invoice',
+    });
+    const invoice = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    const note = await ws.ok('POST', '/v1/credit_notes', {
+      invoice: invoice.id, amount: 2_500, reason: 'product_unsatisfactory', memo: 'Agreed with <Priya> & the account team.',
+    });
+
+    const { html } = await render(invoice.id);
+    assert.ok(html.includes('Ampersand &amp; &lt;Sons&gt; Robotics'), 'a customer name is escaped, never injected');
+    assert.ok(!html.includes('<Sons>'));
+    assert.ok(html.includes('Agreed with &lt;Priya&gt; &amp; the account team.'));
+    assert.ok(html.includes(note.number));
+    assert.match(html, /Credit notes against this invoice/);
+    assert.match(html, /Credited before payment/);
+  });
+
+  test('a reverse-charged bill explains its zero on the page', async () => {
+    const customer = await ws.customer('Bruges Aandrijving', {
+      currency: 'eur',
+      address: { line1: 'Havenlaan 3', city: 'Eindhoven', postal_code: '5503 LN', country: 'Netherlands' },
+      tax_ids: [{ type: 'eu_vat', value: 'NL004495445B01', country: 'Netherlands' }],
+    });
+    await ws.ok('POST', `/v1/customers/${customer.id}/tax_ids/verify`, {
+      value: 'NL004495445B01', status: 'verified', verified_name: 'Bruges Aandrijving BV',
+    });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+    });
+    const invoice = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    assert.equal(invoice.tax, 0);
+
+    const { html } = await render(invoice.id);
+    assert.ok(html.includes('BTW'), 'the Dutch rate is named even though nothing is charged');
+    assert.ok(html.includes('21%'));
+    assert.match(html, /reverse charged/);
+    assert.match(html, /EU VAT NL004495445B01/, 'the registration number that shifted the tax is printed');
+  });
+
+  test('a bill that is worth money back says so, and says where the money went', async () => {
+    const customer = await ws.customer('Abgang Antriebe', {
+      currency: 'eur',
+      address: { line1: 'Ostendstraße 25', city: 'Berlin', postal_code: '12459', country: 'Germany' },
+    });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+    });
+    await ws.travelTo(ws.now() + 5 * DAY);
+    await ws.ok('POST', `/v1/subscriptions/${sub.id}/cancel`, { prorate: true, cancellation_reason: 'downgraded' });
+    const final = (await allInvoices(ws, `&subscription=${sub.id}`))
+      .find((invoice) => invoice.billing_reason === 'subscription_update');
+    assert.ok(final);
+    assert.ok(final.subtotal < 0 && final.tax < 0, 'the credit line carries the tax it reverses');
+    assert.equal(final.total, 0);
+
+    const { html } = await render(final.id);
+    assert.ok(html.includes('Credit for unused time'), 'the credit is a line on the document');
+    assert.ok(html.includes('Placed on the account balance'), 'and the document says where its value went');
+    assert.ok(!html.includes('carried forward'), 'which is the opposite of carrying a debt forward');
+    const account = await ws.ok('GET', `/v1/customers/${customer.id}`);
+    assert.equal(account.balance, final.subtotal + final.tax, 'base and tax both came back');
+  });
+
+  test('an invoice that does not exist is a 404, not an empty page', async () => {
+    const res = await ws.call('GET', '/v1/invoices/in_doesnotexist000000/render');
+    assert.equal(res.status, 404);
   });
 });

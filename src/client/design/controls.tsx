@@ -147,15 +147,21 @@ export function SegmentedControl<T extends string>({
 }: SegmentedControlProps<T>) {
   const ref = useRef<HTMLDivElement>(null);
 
+  // Every route into the group selects *and* focuses. Home and End used to call
+  // `onChange` alone, which handed the only tabindex="0" to the newly checked
+  // segment while the focus ring stayed behind on the old one.
+  const pick = (next: string) => {
+    onChange(next as T);
+    requestAnimationFrame(() => {
+      ref.current?.querySelector<HTMLButtonElement>(`[data-value="${CSS.escape(next)}"]`)?.focus();
+    });
+  };
+
   const move = (delta: number) => {
     const enabled = options.filter((o) => !o.disabled);
     if (!enabled.length) return;
     const idx = enabled.findIndex((o) => o.value === value);
-    const next = enabled[(idx + delta + enabled.length) % enabled.length];
-    onChange(next.value);
-    requestAnimationFrame(() => {
-      ref.current?.querySelector<HTMLButtonElement>(`[data-value="${CSS.escape(next.value)}"]`)?.focus();
-    });
+    pick(enabled[(idx + delta + enabled.length) % enabled.length].value);
   };
 
   return (
@@ -167,8 +173,8 @@ export function SegmentedControl<T extends string>({
       onKeyDown={(e) => {
         if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); move(1); }
         else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); move(-1); }
-        else if (e.key === 'Home') { e.preventDefault(); const f = options.find((o) => !o.disabled); if (f) onChange(f.value); }
-        else if (e.key === 'End') { e.preventDefault(); const l = [...options].reverse().find((o) => !o.disabled); if (l) onChange(l.value); }
+        else if (e.key === 'Home') { e.preventDefault(); const f = options.find((o) => !o.disabled); if (f) pick(f.value); }
+        else if (e.key === 'End') { e.preventDefault(); const l = [...options].reverse().find((o) => !o.disabled); if (l) pick(l.value); }
       }}
     >
       {options.map((option) => {
@@ -420,7 +426,10 @@ export function Kbd({ combo, children }: { combo?: string; children?: ReactNode 
   if (!combo) return <kbd className="ain-kbd">{children}</kbd>;
   const keys = combo.split('+').map((k) => KEY_GLYPH[k.toLowerCase()] ?? (k.length === 1 ? k.toUpperCase() : k));
   return (
-    <span className="u-row" style={{ gap: 2 }}>
+    // inline-flex, not `.u-row`: a block-level flex box inside a sentence forces
+    // a line break around itself, which split "Esc hands focus back" onto two
+    // lines wherever a combo is quoted mid-sentence.
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2, verticalAlign: 'middle' }}>
       {keys.map((k, i) => <kbd className="ain-kbd" key={i}>{k}</kbd>)}
     </span>
   );

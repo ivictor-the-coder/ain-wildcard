@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createApp, frozenClock, type App } from '../src/server/app';
 import type { Auth } from '../src/server/kernel/http';
 import { DAY, startOfDay } from '../src/shared/time';
-import { orderCandidates } from '../src/server/modules/credits/burn';
+import { BURN_ORDER, orderCandidates } from '../src/server/modules/credits/burn';
 import type { BillableItem, CreditGrant, LedgerEntry, Settlement } from '../src/server/modules/credits/types';
 
 const ORG = 'org_demo';
@@ -245,6 +245,53 @@ describe('burn-down order', () => {
     });
     assert.equal(settlement.applications.length, 0);
     assert.equal(settlement.charged_amount, 10_000);
+  });
+
+  test('the settlement returns the order it used, and the draw follows every rung of it', async () => {
+    const { usagePrice } = await fixture();
+    const customer = nextName('cus');
+    const soon = T0 + 10 * DAY;
+    const later = T0 + 30 * DAY;
+    const pot = (over: Record<string, unknown>) =>
+      expectOk('POST', '/v1/credit-grants', { customer, amount: 1_000, currency: 'usd', ...over });
+
+    // Each of these differs from the next by exactly one rung of the published
+    // order, so the sequence the settlement draws in can only come out right if
+    // every rung is applied, in the order the API says it is.
+    const expiringSoon = await pot({ category: 'paid', expires_at: soon, name: 'Lapses in ten days' });
+    const prioritised = await pot({ category: 'paid', expires_at: later, priority: -5, name: 'Spend me early' });
+    const promotional = await pot({ category: 'promotional', expires_at: later, name: 'Onboarding credit' });
+    const paid = await pot({ category: 'paid', expires_at: later, name: 'Prepaid balance' });
+    const openEnded = await pot({ category: 'paid', name: 'Never lapses' });
+    const wrongCharge = await pot({
+      category: 'promotional', expires_at: T0 + DAY, name: 'Only pays for support hours',
+      applicability: { scope: 'targeted', products: ['prod_support_hours'] },
+    });
+
+    // 2,000 units: 1,000 free, 1,000 at 10 minor units = $100.00, against $50.00
+    // of eligible credit spread over five grants.
+    const settlement: Settlement = await expectOk('POST', '/v1/credit-settlements', {
+      customer, price: usagePrice.id, quantity: 2000, period_start: period.start, period_end: period.end,
+    });
+
+    assert.deepEqual(settlement.burn_order, BURN_ORDER, 'the response documents the order it used');
+    assert.deepEqual(
+      settlement.applications.map((a) => a.grant),
+      [expiringSoon.id, prioritised.id, promotional.id, paid.id, openEnded.id],
+      'expiry, then priority, then promotional before paid, then the open-ended grant last',
+    );
+    assert.deepEqual(settlement.applications.map((a) => a.balance_after), [0, 0, 0, 0, 0]);
+    assert.equal(settlement.covered_amount, 5_000);
+    assert.equal(settlement.charged_amount, 5_000);
+    assert.equal(settlement.full_amount, 10_000);
+    assert.equal(settlement.lines.reduce((acc, line) => acc + line.amount, 0), settlement.full_amount);
+
+    const untouched: CreditGrant = await expectOk('GET', `/v1/credit-grants/${wrongCharge.id}`);
+    assert.equal(untouched.balance, 1_000, 'a grant that does not apply is skipped however soon it lapses');
+
+    // And the balance a customer reads quotes the same order as the settlement.
+    const balance = await expectOk('GET', `/v1/customers/${customer}/credit-balance`);
+    assert.deepEqual(balance.burn_order, BURN_ORDER);
   });
 
   test('the ordering is a pure, testable function', () => {
@@ -1096,41 +1143,313 @@ describe('a refused period is a row, not a line in the log', () => {
     assert.equal(later.status, 'settled');
   });
 
-  test('a hole that outlives a billing cycle raises an event, and is retracted when it is filled', async () => {
+  test('a hole that outlives a billing cycle is billed, not just named', async () => {
     const fx = await fixture(clock);
     const customer = nextName('cus');
     // A month that has only just ended, so nothing is overdue yet.
     const end = clock.ctx.now();
     const start = end - 31 * DAY;
     const mid = end - 12 * DAY;
-    await expectOk('POST', '/v1/credit-settlements', {
-      customer, price: fx.usagePrice.id, quantity: 10, period_start: mid, period_end: end,
+    // 800 units of it are billed under the window that superseded the refusal.
+    const covering: Settlement = await expectOk('POST', '/v1/credit-settlements', {
+      customer, price: fx.usagePrice.id, quantity: 800, period_start: mid, period_end: end,
     }, clock);
-    // The 19 days before it were never settled by anything.
+    // And 400 units sit in the 19 days nothing settled at all.
+    for (const [i, units] of [250, 150].entries()) {
+      await expectOk('POST', '/v1/meter-events', {
+        event_name: fx.eventName, customer, identifier: `${customer}_hole_${i}`,
+        timestamp: start + (i + 1) * DAY, payload: { units },
+      }, clock);
+    }
     const skip: Settlement = clock.ctx.svc.credits.recordSkippedSettlement(ORG, {
       customer, price: fx.usagePrice.id, period_start: start, period_end: end,
       reason: 'usage_period_already_settled', message: 'overlaps a settled window',
+      billing_period: { start, end },
     });
     assert.equal(skip.skip?.gaps.length, 1);
     assert.equal(skip.skip?.gaps[0].overdue, false, 'not yet — the next cycle may still fill it');
+    assert.deepEqual(skip.skip?.billing_period, { start, end }, 'the cycle it belonged to is kept');
 
     await clock.travel(70 * DAY);
-    const aged: Settlement = await expectOk('GET', `/v1/credit-settlements/${skip.id}`, undefined, clock);
-    assert.equal(aged.skip?.gaps[0].overdue, true);
-    assert.match(aged.skip?.summary ?? '', /outlived a full billing cycle/);
+
     const raised = clock.ctx.events.list(ORG, { types: ['credit.settlement_gap'], objectId: skip.id, limit: 5 });
     assert.equal(raised.length, 1, 'raised once per episode, not once a morning');
-    assert.equal((raised[0].data as { uncovered_ms: number }).uncovered_ms, mid - start);
+    const alert = raised[0].data as { uncovered_ms: number; filling: { start: number; end: number }[] };
+    assert.equal(alert.uncovered_ms, mid - start);
+    assert.deepEqual(alert.filling, [{ start, end: mid }], 'and it names the settlement it scheduled');
 
-    // Somebody settles the hole. The alert is taken back.
-    await expectOk('POST', '/v1/credit-settlements', {
-      customer, price: fx.usagePrice.id, quantity: 5, period_start: start, period_end: mid,
-    }, clock);
-    await clock.travel(2 * DAY);
+    // The watch did not stop at the alert: the uncovered hours are a settlement.
+    const settled = await expectOk(
+      'GET', `/v1/credit-settlements?customer=${customer}&status=settled`, undefined, clock);
+    const fills: Settlement[] = settled.data.filter((s: Settlement) => s.period_start === start && s.period_end === mid);
+    assert.equal(fills.length, 1, 'the hole is billed exactly once');
+    assert.equal(fills[0].quantity, 400, 'for exactly the usage in it');
+    // Priced from where the cycle had already climbed: the covering window
+    // spent 800 of the 1,000 free units, so these 400 pay for 200 of them.
+    assert.equal(fills[0].tier_basis.prior_quantity, 800);
+    assert.deepEqual(fills[0].tier_basis.settlements, [covering.id]);
+    assert.equal(fills[0].full_amount, 2_000);
+    assert.equal(fills[0].charged_amount, 2_000, 'and it is money somebody can be invoiced for');
+    const line = (await expectOk(
+      'GET', `/v1/credit-billable-items?customer=${customer}&settlement=${fills[0].id}`, undefined, clock)).data[0];
+    assert.equal(line.billed_amount, 2_000);
+    assert.equal(line.status, 'pending', 'waiting for the next invoice like any other line');
+
+    // And the alert is taken back the moment the money exists, not a day later.
+    const closed = clock.ctx.events.list(ORG, { types: ['credit.settlement_gap_closed'], objectId: skip.id, limit: 5 });
+    assert.equal(closed.length, 1);
+    assert.equal((closed[0].data as { coverage_percent: number }).coverage_percent, 100);
     const filled: Settlement = await expectOk('GET', `/v1/credit-settlements/${skip.id}`, undefined, clock);
     assert.deepEqual(filled.skip?.gaps, []);
     assert.equal(filled.skip?.coverage_percent, 100);
-    assert.equal(clock.ctx.events.list(ORG, { types: ['credit.settlement_gap_closed'], objectId: skip.id, limit: 5 }).length, 1);
+    const overview = await expectOk('GET', '/v1/credits/overview', undefined, clock);
+    assert.equal(
+      overview.skipped_settlements.unbilled_windows.filter((w: { settlement: string }) => w.settlement === skip.id).length,
+      0, 'and the front page stops asking a human to do it');
+
+    // Asked once and no more: a week of further watches bills nothing again.
+    await clock.travel(7 * DAY);
+    const again = await expectOk(
+      'GET', `/v1/credit-settlements?customer=${customer}&status=settled`, undefined, clock);
+    assert.equal(again.data.filter((s: Settlement) => s.period_start === start).length, 1);
+    assert.equal(
+      clock.ctx.events.list(ORG, { types: ['credit.settlement_gap_closed'], objectId: skip.id, limit: 5 }).length, 1);
+  });
+});
+
+/* ---------------- settling a metered period is billing it ----------------- */
+
+describe('settling a metered period through the API freezes it', () => {
+  const MAY = Date.UTC(2026, 4, 1);
+  const JUNE = Date.UTC(2026, 5, 1);
+
+  /** A meter and a flat 10-minor-unit price, so every figure is arithmetic. */
+  async function metered() {
+    const eventName = nextName('fz');
+    const meter = await expectOk('POST', '/v1/meters', {
+      name: 'Freeze meter', event_name: eventName, aggregation: 'sum', value_key: 'units',
+      unit_label: 'unit', acceptance_window_ms: 90 * DAY,
+    });
+    const product = await expectOk('POST', '/v1/products', {
+      name: 'Freeze telemetry', unit_label: 'unit', category: 'component',
+    });
+    const price = await expectOk('POST', '/v1/prices', {
+      product: product.id, currency: 'usd', model: 'usage', type: 'recurring', unit_amount: 10,
+      nickname: 'Freeze usage',
+      recurring: { interval: 'month', usage_type: 'metered', aggregate_usage: 'sum', meter: eventName },
+    });
+    return { meter, price, eventName, customer: nextName('cus') };
+  }
+
+  const record = (fx: { eventName: string; customer: string }, id: string, units: number, at: number) =>
+    call('POST', '/v1/meter-events', {
+      event_name: fx.eventName, customer: fx.customer, identifier: `${fx.customer}_${id}`,
+      timestamp: at, payload: { units },
+    });
+
+  const usageOf = (fx: { meter: { id: string }; customer: string }) =>
+    expectOk('GET', `/v1/meters/${fx.meter.id}/usage?customer=${fx.customer}&start=${MAY}&end=${JUNE}`);
+
+  test('usage that lands after the period is billed is a true-up, not a silent number', async () => {
+    const fx = await metered();
+    await record(fx, 'first', 100, MAY + DAY);
+    const settlement: Settlement = await expectOk('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fx.price.id, period_start: MAY, period_end: JUNE,
+    });
+    assert.equal(settlement.quantity, 100);
+    assert.equal(settlement.full_amount, 1_000, '100 units at 10');
+
+    // Nobody asked for the freeze, because billing a metered period is what
+    // asks for it: the window is closed on the price it was billed against.
+    const closures = await expectOk('GET', `/v1/meter-period-closures?customer=${fx.customer}`);
+    assert.equal(closures.data.length, 1);
+    assert.equal(closures.data[0].total, 100);
+    assert.equal(closures.data[0].price, fx.price.id);
+    assert.equal(closures.data[0].ref_id, settlement.id);
+
+    // 500 units for May turn up after the invoice went out.
+    const late = await record(fx, 'late', 500, MAY + 20 * DAY);
+    assert.equal(late.status, 201);
+    assert.equal(late.body.event.late, true, 'the event is accepted and flagged');
+    assert.equal(late.body.late_arrival.value, 500);
+    assert.equal(late.body.late_arrival.resolution, 'open');
+
+    const usage = await usageOf(fx);
+    assert.equal(usage.value, 600, 'the meter moves');
+    assert.equal(usage.closed.total, 100, 'the invoiced total does not');
+    assert.equal(usage.late_adjustment.value, 500, 'and the difference is stated, not lost');
+    const health = await expectOk('GET', '/v1/metering/overview');
+    assert.ok(health.open_late_arrivals >= 1, 'the health page counts it');
+
+    // The 500 units are recoverable to the cent, on the price the period was
+    // billed on — which is the whole difference the freeze makes.
+    const resolved = await expectOk('POST', `/v1/meter-late-arrivals/${late.body.late_arrival.id}/resolve`, {
+      resolution: 'rebilled',
+    });
+    assert.equal(resolved.amount, 5_000);
+    const after: Settlement = await expectOk('GET', `/v1/credit-settlements/${settlement.id}`);
+    assert.equal(after.true_ups.length, 1);
+    assert.equal(after.net_amount, 6_000, 'the period is now worth what the meter reads');
+    assert.equal(after.net_charged_amount, 6_000);
+  });
+
+  test('`close_period: false` prices a window without claiming it was billed', async () => {
+    const fx = await metered();
+    await record(fx, 'first', 100, MAY + DAY);
+    const quoted: Settlement = await expectOk('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fx.price.id, period_start: MAY, period_end: JUNE, close_period: false,
+    });
+    assert.equal(quoted.full_amount, 1_000);
+    const closures = await expectOk('GET', `/v1/meter-period-closures?customer=${fx.customer}`);
+    assert.equal(closures.data.length, 0, 'nothing claims this window has been billed');
+
+    const late = await record(fx, 'late', 500, MAY + 20 * DAY);
+    assert.equal(late.body.event.late, false, 'with no closure there is nothing to be late for');
+    assert.equal(late.body.late_arrival, null);
+    assert.equal((await usageOf(fx)).value, 600);
+
+    // The escape hatch is honest about what it costs: re-settling says the
+    // period has moved and that nothing was filed to catch it.
+    const replay = await call('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fx.price.id, period_start: MAY, period_end: JUNE, close_period: false,
+    });
+    assert.equal(replay.status, 200);
+    assert.equal(replay.body.drift.live_quantity, 600);
+    assert.equal(replay.body.drift.closure, null);
+    assert.deepEqual(replay.body.drift.open_late_arrivals, []);
+    assert.match(replay.body.drift.message, /close_period: false/);
+  });
+
+  test('re-settling a period whose meter has moved is a 200 that names the drift', async () => {
+    const fx = await metered();
+    const grant: CreditGrant = await expectOk('POST', '/v1/credit-grants', {
+      customer: fx.customer, amount: 10_000, currency: 'usd', category: 'paid', name: 'Drift probe',
+    });
+    await record(fx, 'first', 100, MAY + DAY);
+    const settlement: Settlement = await expectOk('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fx.price.id, period_start: MAY, period_end: JUNE,
+    });
+    assert.equal(settlement.covered_amount, 1_000);
+    assert.equal((await expectOk('GET', `/v1/credit-grants/${grant.id}`)).balance, 9_000);
+    await record(fx, 'late', 500, MAY + 20 * DAY);
+
+    const again = await call('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fx.price.id, period_start: MAY, period_end: JUNE,
+    });
+    assert.equal(again.status, 200, 'nothing was created, so it does not say 201');
+    assert.equal(again.body.id, settlement.id);
+    assert.equal(again.body.replayed, true);
+    assert.equal(again.body.quantity, 100, 'the settlement still says what it billed');
+    assert.equal(again.body.drift.settled_quantity, 100);
+    assert.equal(again.body.drift.live_quantity, 600, 'and the drift says what the meter says');
+    assert.equal(again.body.drift.delta, 500);
+    assert.equal(again.body.drift.outstanding_amount, 5_000);
+    assert.equal(again.body.drift.open_late_arrivals.length, 1);
+    assert.match(again.body.drift.message, /Resolve it through POST/);
+    assert.equal((await expectOk('GET', `/v1/credit-grants/${grant.id}`)).balance, 9_000,
+      'and the balance was not drawn a second time');
+    const rows = await expectOk('GET', `/v1/credit-settlements?customer=${fx.customer}&status=all`);
+    assert.equal(rows.data.length, 1, 'one window, one settlement');
+
+    // Settling just the sliver the late event sits in is still refused — it
+    // would draw credit twice — but the refusal now points at the recovery.
+    const sliver = await expectError('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fx.price.id,
+      period_start: MAY + 19 * DAY, period_end: MAY + 21 * DAY,
+    }, 409, 'usage_period_already_settled');
+    assert.equal(sliver.detail.drift.live_quantity, 600);
+    assert.equal(sliver.detail.drift.open_late_arrivals.length, 1);
+    assert.match(sliver.message, /filed as late arrival/);
+  });
+
+  test('usage withdrawn from a billed period reads as money owed back', async () => {
+    const fx = await metered();
+    await record(fx, 'only', 300, MAY + DAY);
+    await expectOk('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fx.price.id, period_start: MAY, period_end: JUNE,
+    });
+    await expectOk('POST', '/v1/meter-event-adjustments', { cancel: { identifier: `${fx.customer}_only` } });
+
+    const again = await call('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fx.price.id, period_start: MAY, period_end: JUNE,
+    });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.drift.live_quantity, 0);
+    assert.equal(again.body.drift.delta, -300);
+    assert.equal(again.body.drift.outstanding_amount, -3_000, 'the customer was billed for usage that was unsaid');
+    assert.match(again.body.drift.message, /back to the customer/);
+  });
+
+  test('two prices on one meter share the window they both bill, and cannot half-share it', async () => {
+    const fx = await metered();
+    // A surcharge billed off the same meter, monthly like the first.
+    const surcharge = await expectOk('POST', '/v1/prices', {
+      product: fx.price.product, currency: 'usd', model: 'usage', type: 'recurring', unit_amount: 2,
+      nickname: 'Freeze surcharge',
+      recurring: { interval: 'month', usage_type: 'metered', aggregate_usage: 'sum', meter: fx.eventName },
+    });
+    await record(fx, 'first', 100, MAY + DAY);
+    const base: Settlement = await expectOk('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fx.price.id, period_start: MAY, period_end: JUNE,
+    });
+    const extra: Settlement = await expectOk('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: surcharge.id, period_start: MAY, period_end: JUNE,
+    });
+    assert.equal(base.full_amount, 1_000);
+    assert.equal(extra.full_amount, 200, 'both prices bill the same 100 units, each on its own rate');
+    const closures = await expectOk('GET', `/v1/meter-period-closures?customer=${fx.customer}`);
+    assert.equal(closures.data.length, 1, 'one window, one freeze — the second settlement joined it');
+
+    // Half-overlapping windows are the case that cannot be shared: a late
+    // event would be priced against whichever closure happened to catch it.
+    // A third price on the same meter, billed fortnightly, is how that shape
+    // turns up — nothing about its own windows is wrong, so the settlement
+    // guard lets it through and the freeze is what refuses.
+    const fortnightly = await expectOk('POST', '/v1/prices', {
+      product: fx.price.product, currency: 'usd', model: 'usage', type: 'recurring', unit_amount: 1,
+      nickname: 'Freeze fortnightly',
+      recurring: { interval: 'week', interval_count: 2, usage_type: 'metered', aggregate_usage: 'sum', meter: fx.eventName },
+    });
+    const clash = await expectError('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fortnightly.id,
+      period_start: MAY + 15 * DAY, period_end: MAY + 29 * DAY,
+    }, 409, 'meter_period_overlaps_closure');
+    assert.match(clash.message, /close_period: false/);
+    assert.equal(
+      (await expectOk('GET', `/v1/credit-settlements?customer=${fx.customer}&status=all`)).data.length, 2,
+      'and the refusal wrote nothing',
+    );
+    // Which is exactly what the escape hatch is for.
+    const priced: Settlement = await expectOk('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fortnightly.id, close_period: false,
+      period_start: MAY + 15 * DAY, period_end: MAY + 29 * DAY,
+    });
+    assert.equal(priced.status, 'settled');
+    assert.equal((await expectOk('GET', `/v1/meter-period-closures?customer=${fx.customer}`)).data.length, 1,
+      'the price that owns the freeze still owns it');
+  });
+
+  test('a price with no meter behind it settles on the quantity given, and closes nothing', async () => {
+    const product = await expectOk('POST', '/v1/products', {
+      name: 'Manual telemetry', unit_label: 'unit', category: 'component',
+    });
+    const price = await expectOk('POST', '/v1/prices', {
+      product: product.id, currency: 'usd', model: 'usage', type: 'recurring', unit_amount: 10,
+      nickname: 'Manual usage', recurring: { interval: 'month', usage_type: 'metered', aggregate_usage: 'sum' },
+    });
+    const customer = nextName('cus');
+    const settled: Settlement = await expectOk('POST', '/v1/credit-settlements', {
+      customer, price: price.id, quantity: 250, period_start: MAY, period_end: JUNE,
+    });
+    assert.equal(settled.meter, null);
+    assert.equal(settled.full_amount, 2_500);
+    assert.equal((await expectOk('GET', `/v1/meter-period-closures?customer=${customer}`)).data.length, 0);
+    // ...and with no meter there is nothing to aggregate, so the quantity is
+    // required rather than assumed.
+    const error = await expectError('POST', '/v1/credit-settlements', {
+      customer, price: price.id, period_start: JUNE, period_end: Date.UTC(2026, 6, 1),
+    }, 400, 'meter_required');
+    assert.match(error.message, /names no meter/);
   });
 });
 
@@ -1380,7 +1699,7 @@ describe('the Northwind workspace', () => {
     assert.equal(line.billed_amount + line.credit_applied, line.amount, 'the halves of a true-up add up too');
 
     const settlement: Settlement | undefined = (await expectOk('GET', '/v1/credit-settlements?limit=200')).data
-      .find((s: Settlement) => s.true_ups.length > 0);
+      .find((s: Settlement) => s.true_ups.some((l) => l.id === credited.billable_item));
     assert.ok(settlement, 'the settlement carries the correction beside the original lines');
     assert.equal(settlement.lines.reduce((acc, l) => acc + l.amount, 0), settlement.full_amount);
     assert.equal(settlement.net_amount, settlement.full_amount + settlement.true_ups.reduce((acc, l) => acc + l.amount, 0));
@@ -1657,74 +1976,113 @@ describe('the tier ladder belongs to the billing period, not to the window', () 
   });
 
   /**
-   * The property, not an example of it: however a month is cut up, and in
-   * whatever order the pieces are settled, the pieces cost what the month
-   * costs. Seeded, so a failure is reproducible.
+   * The property, not an example of it.
+   *
+   * Two hundred generated cases, each with its own graduated ladder and its own
+   * month of usage, settled four ways: as one window, as two, as five, and one
+   * window per day. All four have to come to the same money, to the cent, or a
+   * customer's bill depends on how many pieces their billing system happened to
+   * cut the month into. The pieces after the first are settled in a shuffled
+   * order too, because a period billed back to front is still that period.
+   *
+   * Seeded from a constant, so a failure is reproducible: the case number in
+   * the assertion message is the one to re-run.
    */
-  test('any partition, settled in any order, on a three-tier ladder', async () => {
-    // Its own workspace: a few hundred settlements is more than one API key is
-    // allowed to make in a minute, and the point here is the arithmetic.
-    const bench = await createApp({ db: 'memory', clock: frozenClock(T0), config: { env: 'test' } });
+  test('any ladder, any total: one window, two, five and one a day agree to the cent', async () => {
+    // Its own workspace, and its own rate limit: eight thousand settlements is
+    // far more than one key may make in a minute, and the point here is the
+    // arithmetic rather than the throttle in front of it.
+    const limitBefore = process.env.AIN_RATE_LIMIT;
+    process.env.AIN_RATE_LIMIT = '200000';
+    let bench: App;
     try {
-    const eventName = nextName('fuzz');
-    await expectOk('POST', '/v1/meters', {
-      name: 'Partition meter', event_name: eventName, aggregation: 'sum', value_key: 'units', unit_label: 'unit',
-    }, bench);
-    const product = await expectOk('POST', '/v1/products', { name: 'Partition telemetry', unit_label: 'unit', category: 'component' }, bench);
-    const price = await expectOk('POST', '/v1/prices', {
-      product: product.id, currency: 'usd', model: 'usage', type: 'recurring', tiers_mode: 'graduated',
-      nickname: 'Three rungs',
-      tiers: [
-        { up_to: 1000, unit_amount_decimal: '0' },
-        { up_to: 5000, unit_amount_decimal: '10' },
-        { up_to: 'inf', unit_amount_decimal: '3.5' },
-      ],
-      recurring: { interval: 'month', usage_type: 'metered', aggregate_usage: 'sum', meter: eventName },
-    }, bench);
-
-    let seed = 0xc0ffee;
-    const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
-
-    for (let trial = 0; trial < 60; trial++) {
-      const parts = 1 + Math.floor(rand() * 6);
-      const total = Math.floor(rand() * 20_000);
-      const quantities: number[] = [];
-      let left = total;
-      for (let i = 0; i < parts - 1; i++) {
-        const q = Math.floor(rand() * (left + 1));
-        quantities.push(q);
-        left -= q;
-      }
-      quantities.push(left);
-
-      const whole: Settlement = await expectOk('POST', '/v1/credit-settlements', {
-        customer: `cus_whole_${trial}`, price: price.id, quantity: total,
-        period_start: MAY.start, period_end: MAY.end,
-      }, bench);
-      const edges = quantities.map((_, i) => MAY.start + Math.round((i * SPAN) / parts));
-      edges.push(MAY.end);
-      const order = quantities.map((_, i) => i);
-      for (let i = order.length - 1; i > 0; i--) {
-        const j = Math.floor(rand() * (i + 1));
-        [order[i], order[j]] = [order[j], order[i]];
-      }
-
-      let money = 0;
-      let units = 0;
-      for (const i of order) {
-        const piece: Settlement = await expectOk('POST', '/v1/credit-settlements', {
-          customer: `cus_part_${trial}`, price: price.id, quantity: quantities[i],
-          period_start: edges[i], period_end: edges[i + 1],
-        }, bench);
-        money += piece.full_amount;
-        units += piece.billed_quantity;
-      }
-      assert.equal(
-        money, whole.full_amount,
-        `trial ${trial}: ${JSON.stringify(quantities)} settled in order ${JSON.stringify(order)} billed ${money}, not ${whole.full_amount}`,
-      );
-      assert.equal(units, total, `trial ${trial}: the windows bill ${units} units, not ${total}`);
+      bench = await createApp({ db: 'memory', clock: frozenClock(T0), config: { env: 'test' } });
+    } finally {
+      if (limitBefore === undefined) delete process.env.AIN_RATE_LIMIT;
+      else process.env.AIN_RATE_LIMIT = limitBefore;
     }
+    try {
+      const eventName = nextName('prop');
+      await expectOk('POST', '/v1/meters', {
+        name: 'Property meter', event_name: eventName, aggregation: 'sum', value_key: 'units', unit_label: 'unit',
+      }, bench);
+      const product = await expectOk('POST', '/v1/products', {
+        name: 'Property telemetry', unit_label: 'unit', category: 'component',
+      }, bench);
+
+      let seed = 0x5eed1e;
+      const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+      const pick = (n: number) => Math.floor(rand() * n);
+      /** Minor units per unit: often free, otherwise anything up to $5 a unit. */
+      const rate = () => (rand() < 0.3 ? '0' : (pick(50_000) / 100).toFixed(2));
+
+      const CASES = 200;
+      /** May has 31 days, so the daily partition lands on real day boundaries. */
+      const DAILY = 31;
+      assert.equal(SPAN, DAILY * DAY);
+
+      for (let index = 0; index < CASES; index++) {
+        // A ladder of two to five rungs with strictly rising bounds. The rates
+        // do not have to rise: a volume discount that gets cheaper further up
+        // is exactly the shape a marginal ladder is easiest to get wrong on.
+        const rungs = 2 + pick(4);
+        const tiers: { up_to: number | 'inf'; unit_amount_decimal: string }[] = [];
+        let bound = 0;
+        for (let i = 0; i < rungs - 1; i++) {
+          bound += 1 + pick(4000);
+          tiers.push({ up_to: bound, unit_amount_decimal: rate() });
+        }
+        tiers.push({ up_to: 'inf', unit_amount_decimal: rate() });
+
+        const price = await expectOk('POST', '/v1/prices', {
+          product: product.id, currency: 'usd', model: 'usage', type: 'recurring', tiers_mode: 'graduated',
+          nickname: `Ladder ${index}`, tiers,
+          recurring: { interval: 'month', usage_type: 'metered', aggregate_usage: 'sum', meter: eventName },
+        }, bench);
+        const total = pick(20_000);
+
+        /** Cut `total` into `parts` non-negative windows and settle them shuffled. */
+        const settle = async (parts: number): Promise<number> => {
+          const quantities: number[] = [];
+          let left = total;
+          for (let i = 0; i < parts - 1; i++) {
+            const q = pick(left + 1);
+            quantities.push(q);
+            left -= q;
+          }
+          quantities.push(left);
+          const edges = quantities.map((_, i) => MAY.start + Math.round((i * SPAN) / parts));
+          edges.push(MAY.end);
+
+          const order = quantities.map((_, i) => i);
+          for (let i = order.length - 1; i > 0; i--) {
+            const j = pick(i + 1);
+            [order[i], order[j]] = [order[j], order[i]];
+          }
+
+          const customer = `cus_${index}_${parts}`;
+          let money = 0;
+          let units = 0;
+          for (const i of order) {
+            const piece: Settlement = await expectOk('POST', '/v1/credit-settlements', {
+              customer, price: price.id, quantity: quantities[i],
+              period_start: edges[i], period_end: edges[i + 1],
+            }, bench);
+            money += piece.full_amount;
+            units += piece.billed_quantity;
+          }
+          assert.equal(units, total, `case ${index} in ${parts}: the windows bill ${units} units, not ${total}`);
+          return money;
+        };
+
+        const whole = await settle(1);
+        for (const parts of [2, 5, DAILY]) {
+          assert.equal(
+            await settle(parts), whole,
+            `case ${index}: ${total} units on ${JSON.stringify(tiers)} cost ${whole} as one window, but a different amount in ${parts}`,
+          );
+        }
+      }
     } finally {
       bench.close();
     }
@@ -1774,6 +2132,129 @@ describe('the tier ladder belongs to the billing period, not to the window', () 
         .find((c: { period_start: number }) => c.period_start === mid).id}`);
     assert.equal(closure.prior_quantity, 900, 'the closure remembers the rung it was billed from');
     assert.equal(closure.outstanding_amount, 0, 'and the invoice and the meter agree again');
+  });
+});
+
+/* ------------- one cycle, one free tier, whatever happens in it ----------- */
+
+/**
+ * The two ways a real subscription splits a billing cycle without anybody
+ * asking for a split: it is cancelled and taken out again on the anchor it
+ * already had, or a plan change moves the anchor and walks away from the rest
+ * of the cycle. Both used to hand the graduated price's free tier out twice —
+ * and the second one used to throw the abandoned window's usage away entirely.
+ */
+describe('a subscription that restarts mid-cycle is still one billing period', () => {
+  let clock: App;
+  before(async () => { clock = await createApp({ db: 'memory', clock: frozenClock(T0), config: { env: 'test' } }); });
+  after(() => clock.close());
+
+  /** 2,400 units on the fixture price: 1,000 free, 1,400 at 10 minor units. */
+  const CYCLE_AMOUNT = 14_000;
+
+  const send = (eventName: string, customer: string, identifier: string, timestamp: number, units: number) =>
+    expectOk('POST', '/v1/meter-events', {
+      event_name: eventName, identifier, timestamp, payload: { customer_id: customer, units },
+    }, clock);
+
+  test('cancelled and taken out again on the same anchor, the free tier is given once', async () => {
+    const fx = await fixture(clock);
+    const customer = await expectOk('POST', '/v1/customers', { name: 'Kestrel Foundry', currency: 'usd' }, clock);
+    const first = await expectOk('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: fx.usagePrice.id }],
+    }, clock);
+    const cycle = { start: first.current_period_start, end: first.current_period_end };
+
+    await clock.travel(3 * DAY);
+    await send(fx.eventName, customer.id, 'kestrel_before', cycle.start + 2 * DAY, 1200);
+    await clock.travel(7 * DAY);
+    await expectOk('POST', `/v1/subscriptions/${first.id}/cancel`, {}, clock);
+
+    // Taken out again the same week, on the billing day they already had.
+    const again = await expectOk('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: fx.usagePrice.id }], billing_cycle_anchor: cycle.end,
+    }, clock);
+    assert.equal(again.current_period_end, cycle.end, 'the restart lands back on the original billing day');
+    await clock.travel(2 * DAY);
+    await send(fx.eventName, customer.id, 'kestrel_after', again.current_period_start + DAY, 1200);
+    await clock.travel(40 * DAY);
+
+    const settled: Settlement[] = (await expectOk('GET', `/v1/credit-settlements?customer=${customer.id}`, undefined, clock))
+      .data.filter((s: Settlement) => s.status === 'settled');
+    assert.equal(settled.length, 2, 'the stub and the restart are two windows of one cycle');
+    assert.equal(settled.reduce((acc, s) => acc + s.billed_quantity, 0), 2400);
+    assert.equal(
+      settled.reduce((acc, s) => acc + s.full_amount, 0), CYCLE_AMOUNT,
+      'cancelling and coming back does not buy a second 1,000 free units',
+    );
+
+    const stub = settled.find((s) => s.period_start === cycle.start);
+    const restart = settled.find((s) => s.period_start === again.current_period_start);
+    assert.ok(stub && restart, 'both windows are on record');
+    assert.equal(stub.tier_basis.prior_quantity, 0);
+    assert.equal(stub.full_amount, 2_000, '1,200 units into a fresh ladder is 200 chargeable');
+    assert.equal(restart.tier_basis.prior_quantity, 1200);
+    assert.equal(restart.tier_basis.prior_amount, 2_000);
+    assert.equal(restart.full_amount, 12_000, 'and the restart pays the marginal rate on all 1,200 of its own');
+    assert.deepEqual(restart.tier_basis.settlements, [stub.id]);
+    assert.equal(restart.tier_basis.period_start, cycle.start, 'both windows name the cycle they share');
+    assert.equal(restart.tier_basis.period_end, cycle.end);
+  });
+
+  test('a plan change that moves the anchor still bills the cycle it walked away from', async () => {
+    const fx = await fixture(clock);
+    const flat = await expectOk('POST', '/v1/prices', {
+      product: fx.product.id, currency: 'usd', model: 'per_unit', type: 'recurring', unit_amount: 50_000,
+      nickname: 'Standard platform', recurring: { interval: 'month' },
+    }, clock);
+    const upgrade = await expectOk('POST', '/v1/prices', {
+      product: fx.product.id, currency: 'usd', model: 'per_unit', type: 'recurring', unit_amount: 90_000,
+      nickname: 'Enterprise platform', recurring: { interval: 'month' },
+    }, clock);
+
+    const customer = await expectOk('POST', '/v1/customers', { name: 'Braithwaite Conveyors', currency: 'usd' }, clock);
+    const sub = await expectOk('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: fx.usagePrice.id }, { price: flat.id }],
+    }, clock);
+    const cycle = { start: sub.current_period_start, end: sub.current_period_end };
+
+    await clock.travel(3 * DAY);
+    await send(fx.eventName, customer.id, 'braithwaite_before', cycle.start + 2 * DAY, 1200);
+    await clock.travel(7 * DAY);
+
+    // Upgrading and re-anchoring on the same day: the cycle they were ten days
+    // into stops here and a new one starts.
+    const flatItem = sub.items.find((item: { price: string }) => item.price === flat.id);
+    await expectOk('PATCH', `/v1/subscriptions/${sub.id}`, {
+      items: [{ id: flatItem.id, price: upgrade.id }],
+      billing_cycle_anchor: 'now', proration_behavior: 'always_invoice',
+    }, clock);
+    const after = await expectOk('GET', `/v1/subscriptions/${sub.id}`, undefined, clock);
+    assert.ok(after.current_period_start > cycle.start, 'the anchor moved');
+
+    await clock.travel(3 * DAY);
+    await send(fx.eventName, customer.id, 'braithwaite_after', after.current_period_start + 2 * DAY, 1200);
+    await clock.travel(40 * DAY);
+
+    const settled: Settlement[] = (await expectOk('GET', `/v1/credit-settlements?customer=${customer.id}`, undefined, clock))
+      .data.filter((s: Settlement) => s.status === 'settled');
+    const abandoned = settled.find((s) => s.period_start === cycle.start);
+    assert.ok(abandoned, 'the ten days the upgrade walked away from are billed, not dropped');
+    assert.equal(abandoned.period_end, after.current_period_start);
+    assert.equal(abandoned.billed_quantity, 1200);
+    assert.equal(abandoned.tier_basis.period_end, cycle.end, 'and priced against the cycle they belonged to');
+
+    assert.equal(
+      settled.reduce((acc, s) => acc + s.billed_quantity, 0), 2400,
+      'every metered unit the fleet sent is on exactly one settlement',
+    );
+    // Two genuine cycles, so two ladders: 1,200 units each is $20 each.
+    assert.equal(settled.reduce((acc, s) => acc + s.full_amount, 0), 4_000);
+
+    // And the meter agrees: both windows are frozen, so anything later is a
+    // true-up rather than a number that disagrees with an invoice.
+    const closures = await expectOk('GET', `/v1/meter-period-closures?customer=${customer.id}`, undefined, clock);
+    assert.equal(closures.data.length, settled.length);
   });
 });
 

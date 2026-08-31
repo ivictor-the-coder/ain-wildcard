@@ -111,6 +111,31 @@ function buildInvoices(now: number, count = 1240): Invoice[] {
   return rows.sort((a, b) => b.issuedAt - a.issuedAt);
 }
 
+/** Minor units to a plain decimal string, by integer arithmetic only. */
+const decimalOf = (minor: number): string =>
+  `${(minor - (minor % 100)) / 100}.${String(Math.abs(minor % 100)).padStart(2, '0')}`;
+
+const csvCell = (value: string | number): string =>
+  (/[",\n]/.test(String(value)) ? `"${String(value).replace(/"/g, '""')}"` : String(value));
+
+/** Hands the browser a real file. Both export affordances on this page use it. */
+function downloadCsv(filename: string, header: string[], rows: (string | number)[][]): void {
+  const text = [header, ...rows].map((row) => row.map(csvCell).join(',')).join('\n');
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+const INVOICE_CSV_HEADER = ['Invoice', 'Account', 'Owner', 'Plan', 'Status', 'Amount (USD)', 'Issued', 'Due'];
+
+const invoiceCsvRows = (invoices: Invoice[]): (string | number)[][] => invoices.map((i) => [
+  i.number, i.company, i.owner.name, i.plan, i.status, decimalOf(i.amount),
+  new Date(i.issuedAt).toISOString().slice(0, 10), new Date(i.dueAt).toISOString().slice(0, 10),
+]);
+
 interface InvoiceLine { label: string; detail: string; amount: number }
 
 interface Derived {
@@ -537,6 +562,7 @@ const API: Record<string, ApiSpec[]> = {
         { name: 'virtualiseAfter', type: 'number', def: '120', note: 'Above this row count only the visible window is in the DOM.' },
         { name: 'error / onRetry', type: '{ message, code, requestId } / () => void', note: 'Renders the error state with the request id support will ask for.' },
         { name: 'stickyFooter', type: 'boolean', def: 'true', note: 'Totals recompute over the filtered set, not the raw rows.' },
+        { name: 'keyboard', type: '↑ ↓ · PgUp PgDn · Home End · Space · ⌘A · Esc', note: 'The sticky header and totals row are measured, so a moved row lands in the band between them.' },
       ],
     },
     {
@@ -582,8 +608,8 @@ const API: Record<string, ApiSpec[]> = {
       rows: [
         { name: 'toast.success', type: '(title, body?, opts?) => string', note: 'Returns the id so you can dismiss it early.' },
         { name: 'toast.error', type: '(title, body?, opts?) => string', note: 'Sticky by default; errors should not vanish before they are read.' },
-        { name: 'opts.action', type: '{ label, onClick }', note: 'One action, usually Undo.' },
-        { name: 'opts.duration', type: 'number', def: '5200', note: 'Milliseconds. 0 keeps it until dismissed.' },
+        { name: 'opts.action', type: '{ label, onClick }', note: 'One action, usually Undo. F6 puts focus on it; carrying one lifts the toast to 12s.' },
+        { name: 'opts.duration', type: 'number', def: 'by tone: 4s success, 5s info, 7s warning, 9s danger, pinned while loading', note: 'Milliseconds. 0 keeps it until dismissed; hover or focus freezes the countdown.' },
       ],
     },
   ],
@@ -1259,7 +1285,7 @@ function FieldsSection() {
 
       <Demo title="Composite controls">
         <div className="sg__formgrid">
-          <Field label="Account owner" hint="Type to search the workspace.">
+          <Field label="Account owner" hint="Type to search, arrows to move, Home and End to jump, Enter to pick.">
             <Combobox
               aria-label="Account owner"
               value={owner}
@@ -1310,7 +1336,7 @@ function PickersSection() {
     <Doc
       id="pickers"
       title="Date pickers"
-      description="Real calendars: arrow keys move a day, Page Up and Page Down move a month, and every date is computed in UTC so a workspace in another timezone never sees the day shift."
+      description="Real calendars: opening a picker lands on the selected day, arrow keys move a day, Page Up and Page Down move a month, and every date is computed in UTC so a workspace in another timezone never sees the day shift."
       imports="Calendar, DatePicker, DateRangePicker, RANGE_PRESETS, type DateRange"
       api={API.pickers}
     >
@@ -1687,7 +1713,7 @@ function TableSection({ data }: { data: Derived }) {
     <Doc
       id="table"
       title="Data table"
-      description={`${formatNumber(data.invoices.length)} rows rendered from one windowed list: sticky header, pinned first column, a typed filter stack, sticky totals, selection with a bulk bar, and full keyboard navigation. Arrow keys move, Space selects, Shift+Arrow extends, ⌘A selects the page, Escape clears.`}
+      description={`${formatNumber(data.invoices.length)} rows rendered from one windowed list: sticky header, pinned first column, a typed filter stack, sticky totals, selection with a bulk bar, and full keyboard navigation. Tab reaches the grid, arrow keys move, Page Up and Page Down move a screenful, Space selects, Shift+Arrow extends, ⌘A selects the page, Escape clears. The focused row is scrolled clear of the sticky header and the totals row, never behind them.`}
       imports="DataTable, encodeTableState, decodeTableState, type DataTableColumn, type TableState"
       api={API.table}
     >
@@ -1728,7 +1754,18 @@ function TableSection({ data }: { data: Derived }) {
           bulkActions={(ids) => (
             <>
               <Button size="sm" variant="ghost" iconLeft={<Icons.send size={14} />} onClick={() => toast.success(`Reminder queued for ${ids.length} invoices`)}>Send reminder</Button>
-              <Button size="sm" variant="ghost" iconLeft={<Icons.download size={14} />}>Export</Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                iconLeft={<Icons.download size={14} />}
+                onClick={() => {
+                  const chosen = data.invoices.filter((row) => ids.includes(row.id));
+                  downloadCsv('northwind-selection.csv', INVOICE_CSV_HEADER, invoiceCsvRows(chosen));
+                  toast.success(`${formatNumber(chosen.length)} invoices exported`, 'northwind-selection.csv');
+                }}
+              >
+                Export
+              </Button>
               <Button size="sm" variant="ghost" iconLeft={<Icons.trash size={14} />} onClick={() => toast.error(`Voiding ${ids.length} invoices`, 'Only rows the current filter shows are included.')}>Void</Button>
             </>
           )}
@@ -1746,6 +1783,14 @@ function TableSection({ data }: { data: Derived }) {
           ]}
           toolbar={<span className="sg__label">Invoices</span>}
         />
+        <Inline gap={6} wrap>
+          <span className="sg__label">Keyboard</span>
+          <span className="sg__demonote"><Kbd>↑</Kbd> <Kbd>↓</Kbd> row</span>
+          <span className="sg__demonote"><Kbd>PgUp</Kbd> <Kbd>PgDn</Kbd> a screenful, focus intact</span>
+          <span className="sg__demonote"><Kbd>Home</Kbd> <Kbd>End</Kbd> ends of the list</span>
+          <span className="sg__demonote"><Kbd combo="space" /> select, <Kbd>⇧</Kbd> extends</span>
+          <span className="sg__demonote"><Kbd>↵</Kbd> open the row</span>
+        </Inline>
       </Demo>
 
       <div className="sg__grid2">
@@ -1997,7 +2042,23 @@ function OverlaysSection({ data }: { data: Derived }) {
         <Inline gap={4} wrap>
           <Button variant="secondary" onClick={() => toast.success('Invoice sent', `${invoice.number} was emailed to ap@${invoice.company.toLowerCase().replace(/[^a-z]/g, '')}.io`)}>Success toast</Button>
           <Button variant="secondary" onClick={() => toast.error('Card declined', 'insufficient_funds · retry scheduled for tomorrow 09:00')}>Danger toast</Button>
-          <Button variant="secondary" onClick={() => toast.show({ title: 'Export ready', description: `${formatNumber(data.invoices.length)} invoices as CSV`, tone: 'info', action: { label: 'Download', onClick: () => undefined } })}>Toast with action</Button>
+          <Button
+            variant="secondary"
+            onClick={() => toast.show({
+              title: 'Export ready',
+              description: `${formatNumber(data.invoices.length)} invoices as CSV`,
+              tone: 'info',
+              action: {
+                label: 'Download',
+                onClick: () => {
+                  downloadCsv('northwind-invoices.csv', INVOICE_CSV_HEADER, invoiceCsvRows(data.invoices));
+                  toast.success('northwind-invoices.csv', `${formatNumber(data.invoices.length)} rows, ${INVOICE_CSV_HEADER.length} columns.`);
+                },
+              },
+            })}
+          >
+            Toast with action
+          </Button>
           <Button
             variant="secondary"
             onClick={() => void toast.promise(new Promise((r) => setTimeout(r, 1600)), {
@@ -2008,6 +2069,13 @@ function OverlaysSection({ data }: { data: Derived }) {
           >
             Promise toast
           </Button>
+        </Inline>
+        <Inline gap={6} wrap>
+          <span className="sg__label">Keyboard</span>
+          <span className="sg__demonote"><Kbd>F6</Kbd> focus the newest toast</span>
+          <span className="sg__demonote">the timer freezes while it holds focus</span>
+          <span className="sg__demonote"><Kbd>↵</Kbd> fire the action</span>
+          <span className="sg__demonote"><Kbd combo="esc" /> hand focus back</span>
         </Inline>
       </Demo>
 

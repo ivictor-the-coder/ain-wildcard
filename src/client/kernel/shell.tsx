@@ -13,8 +13,8 @@ import {
 import {
   AlertTriangleIcon, Avatar, Badge, Banner, Button, Card, ChevronRightIcon, ChevronsLeftIcon, ChevronsRightIcon, Divider,
   ErrorBoundary, ErrorState, Icons, IconButton, Kbd,
-  Menu, Modal, Popover, Portal, SegmentedControl, Skeleton, SkeletonText, Toaster, Tooltip,
-  computePosition, formatNumber, rectOf, useFormat, useHotkey, useLocalStorage, useToast, viewportSize,
+  Menu, Modal, Popover, Portal, SegmentedControl, Skeleton, SkeletonText, Spinner, Toaster, Tooltip,
+  computePosition, formatNumber, rectOf, useFormat, useHotkey, useIsNarrow, useLocalStorage, useMediaQuery, useToast, viewportSize,
   type MenuSection,
 } from '../design';
 import { Link, matchRoute, useRouter } from './router';
@@ -24,9 +24,10 @@ import { COMMANDS, NAV, ROUTES, SETTINGS_PAGES } from '../generated/registry';
 import type { NavItem, RouteDef } from './registry-types';
 import {
   TIME_JUMPS, activeNavItem, avatarSrc, clockOutcome, crumbsFor, eventSubject, eventTitle, fillParams,
-  firstRegistered, groupNav, isPathActive, jumpBindings, recordRouteCandidates, shortcutSheet,
+  firstRegistered, groupNav, isPathActive, jumpBindings, railState, recordRouteCandidates, shortcutSheet,
 } from './shell-core';
-import { usePlatform, useCreateActions, useSearchSources, useTimeMachine } from './platform';
+import { usePlatform, useCreateActions, useGlobalSearch, useSearchSources, useTimeMachine } from './platform';
+import { typeaheadTargets, type SearchSource, type TypeaheadTarget } from './search-core';
 import { CommandPalette, type PaletteEntry } from './palette';
 import { TimeMachine, aftermathOf } from './time-machine';
 import { LoginPage } from './login';
@@ -117,12 +118,31 @@ function SignedInShell() {
   const toast = useToast();
   const f = useFormat();
 
-  const [rail, setRail] = useLocalStorage('ain.nav.rail', false);
+  const [railPref, setRailPref] = useLocalStorage('ain.nav.rail', false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [clockOpen, setClockOpen] = useState(false);
   const [chord, setChord] = useState(false);
+  const [drawer, setDrawer] = useState(false);
+  const [announcement, setAnnouncement] = useState('');
   const searchRef = useRef<HTMLInputElement>(null);
+  const mainRef = useRef<HTMLElement>(null);
+
+  // One boolean drives the width, the labels, the flyouts and every collapsed
+  // `aria-label`: a sidebar 56px wide while the app believes it is showing
+  // labels is a strip of anonymous glyphs. The drawer is how the labels come
+  // back on a narrow window, without a wider one.
+  const narrow = useIsNarrow();
+  const rail = railState(railPref, narrow, drawer);
+  // Under 680px the top bar squeezes the search field to a four-pixel sliver
+  // that is still in the tab order. A control you cannot aim at is worse than
+  // one button that opens the search screen.
+  const compact = useMediaQuery('(max-width: 680px)');
+
+  const toggleRail = useCallback(() => {
+    if (narrow) setDrawer((open) => !open);
+    else setRailPref(!railPref);
+  }, [narrow, railPref, setRailPref]);
 
   const platform = usePlatform(true);
   const sources = useSearchSources(platform);
@@ -140,8 +160,8 @@ function SignedInShell() {
 
   useHotkey('mod+k', () => setPaletteOpen(true), { allowInInput: true });
   useHotkey(['shift+?', '?'], () => setShortcutsOpen(true));
-  useHotkey('/', () => searchRef.current?.focus());
-  useHotkey('mod+\\', () => setRail(!rail), { allowInInput: true });
+  useHotkey('/', () => (searchRef.current ? searchRef.current.focus() : navigate('/search')));
+  useHotkey('mod+\\', toggleRail, { allowInInput: true });
   useHotkey('mod+shift+t', () => setClockOpen(true), { allowInInput: true });
   useHotkey('mod+shift+l', () => session.setTheme(session.resolvedTheme === 'dark' ? 'light' : 'dark'), { allowInInput: true });
 
@@ -296,11 +316,12 @@ function SignedInShell() {
     entries.push({
       id: 'run.rail',
       title: rail ? 'Expand the sidebar' : 'Collapse the sidebar to icons',
+      subtitle: narrow ? 'This window is too narrow for a docked sidebar, so it opens over the page' : undefined,
       group: 'Run',
       verb: 'Run',
       icon: rail ? 'chevrons-right' : 'chevrons-left',
       shortcut: 'mod+\\',
-      run: () => setRail(!rail),
+      run: toggleRail,
     });
     entries.push({
       id: 'run.shortcuts',
@@ -330,7 +351,7 @@ function SignedInShell() {
     });
 
     return entries;
-  }, [flatNav, jumpKeyFor, createActions, navigate, session, rail, setRail, refreshAll, toast, advance, f]);
+  }, [flatNav, jumpKeyFor, createActions, navigate, session, rail, narrow, toggleRail, refreshAll, toast, advance, f]);
 
   /* ------------------------------ breadcrumbs ----------------------------- */
 
@@ -352,6 +373,43 @@ function SignedInShell() {
     return typeof title === 'string' ? title : null;
   }), [location.path, navByPath, route, params]);
 
+  /* --------------------- navigation: focus and announce -------------------- */
+
+  const trail = crumbs.map((crumb) => crumb.label).join(' · ');
+  const announced = useRef(location.path);
+
+  useEffect(() => {
+    if (announced.current === location.path) return;
+    announced.current = location.path;
+    setDrawer(false);
+    // Replacing the whole main region without moving the caret leaves a
+    // keyboard or screen-reader user parked on a control that is now describing
+    // a screen they cannot see. Move to the new region and say what it is —
+    // unless the screen itself put the caret somewhere on purpose.
+    setAnnouncement(trail);
+    const main = mainRef.current;
+    if (!main) return;
+    main.scrollTop = 0;
+    const focused = document.activeElement;
+    if (!focused || focused === document.body || !main.contains(focused)) main.focus({ preventScroll: true });
+  }, [location.path, trail]);
+
+  useEffect(() => { if (!narrow) setDrawer(false); }, [narrow]);
+
+  useEffect(() => {
+    if (!drawer) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setDrawer(false); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [drawer]);
+
+  const skipToContent = useCallback(() => {
+    const main = mainRef.current;
+    if (!main) return;
+    main.scrollTop = 0;
+    main.focus();
+  }, []);
+
   const shellApi = useMemo<ShellApi>(() => ({
     openPalette: () => setPaletteOpen(true),
     openSearch: (query?: string) => navigate(query ? `/search?q=${encodeURIComponent(query)}` : '/search'),
@@ -367,14 +425,29 @@ function SignedInShell() {
 
   return (
     <ShellContext.Provider value={shellApi}>
-    <div className="shell" data-rail={String(rail)}>
+    <div className="shell" data-rail={String(rail)} data-narrow={String(narrow)} data-drawer={String(narrow && drawer)}>
+      {/* The first tab stop in the document: one key to step over the chrome
+          instead of twelve, on every navigation. */}
+      <a className="shell-skip" href="#main" onClick={(e) => { e.preventDefault(); skipToContent(); }}>
+        Skip to content
+      </a>
+
       <Sidebar
         rail={rail}
-        onToggleRail={() => setRail(!rail)}
+        narrow={narrow}
+        onToggleRail={toggleRail}
         sections={sections}
         activeItem={activeItem}
         jumpKeyFor={jumpKeyFor}
       />
+      {narrow && drawer && (
+        <button
+          type="button"
+          className="shell-scrim"
+          aria-label="Close the navigation"
+          onClick={() => setDrawer(false)}
+        />
+      )}
 
       <div className="shell-body">
         <header className="shell-top">
@@ -392,10 +465,19 @@ function SignedInShell() {
           </div>
 
           <div className="shell-top__search">
-            <TopSearch inputRef={searchRef} onPalette={() => setPaletteOpen(true)} />
+            {!compact && <TopSearch inputRef={searchRef} sources={sources} onPalette={() => setPaletteOpen(true)} />}
           </div>
 
           <div className="shell-top__actions">
+            {compact && (
+              <Tooltip content="Search everything" shortcut="/" placement="bottom">
+                <IconButton
+                  label="Search everything"
+                  icon={<Icons.search size={16} />}
+                  onClick={() => navigate('/search')}
+                />
+              </Tooltip>
+            )}
             <CreateMenu actions={createActions} mapError={platform.error} onRetry={platform.retry} />
             {clock && (
               <TimeMachine
@@ -410,18 +492,22 @@ function SignedInShell() {
               />
             )}
             <Notifications />
-            <div className="shell-top__divider" aria-hidden />
+            {!compact && <div className="shell-top__divider" aria-hidden />}
             <Appearance />
-            <Tooltip content="Keyboard shortcuts" shortcut="?">
-              <IconButton label="Keyboard shortcuts" icon={<Icons.command size={16} />} onClick={() => setShortcutsOpen(true)} />
-            </Tooltip>
+            {/* A shortcut sheet is chrome for a window with a keyboard attached;
+                on a 400px screen it only crowds out the controls that work. */}
+            {!compact && (
+              <Tooltip content="Keyboard shortcuts" shortcut="?">
+                <IconButton label="Keyboard shortcuts" icon={<Icons.command size={16} />} onClick={() => setShortcutsOpen(true)} />
+              </Tooltip>
+            )}
             <Account />
           </div>
         </header>
 
         <ConnectionBanner onRetry={refreshAll} />
 
-        <main className="shell-main" id="main">
+        <main className="shell-main" id="main" ref={mainRef} tabIndex={-1}>
           <RouteHost route={route} params={params} path={location.path} />
         </main>
       </div>
@@ -464,6 +550,9 @@ function SignedInShell() {
           <span>then a letter — {jumps.slice(0, 4).map((jump) => jump.key).join(', ')}…</span>
         </div>
       )}
+
+      {/* What screen you are now on, for anyone who cannot see that it changed. */}
+      <div className="u-visually-hidden" role="status" aria-live="polite">{announcement}</div>
 
       <Toaster />
     </div>
@@ -571,13 +660,15 @@ function ConnectionBanner({ onRetry }: { onRetry: () => void }) {
 
 interface SidebarProps {
   rail: boolean;
+  /** The window is too narrow to dock a labelled sidebar beside the content. */
+  narrow: boolean;
   onToggleRail: () => void;
   sections: { group: string; label: string; items: NavItem[] }[];
   activeItem: NavItem | null;
   jumpKeyFor: Map<string, string>;
 }
 
-function Sidebar({ rail, onToggleRail, sections, activeItem, jumpKeyFor }: SidebarProps) {
+function Sidebar({ rail, narrow, onToggleRail, sections, activeItem, jumpKeyFor }: SidebarProps) {
   const session = useSession();
   const org = session.me?.org;
   const initial = (org?.name ?? 'Ain').trim().charAt(0).toUpperCase();
@@ -614,11 +705,18 @@ function Sidebar({ rail, onToggleRail, sections, activeItem, jumpKeyFor }: Sideb
 
       <div className="shell-sidefoot">
         {!rail && <span className="shell-sidefoot__spacer" />}
-        <Tooltip content={rail ? 'Expand sidebar' : 'Collapse sidebar'} shortcut="mod+\\" placement="right">
+        <Tooltip
+          content={rail ? (narrow ? 'Show the labels' : 'Expand sidebar') : narrow ? 'Back to icons' : 'Collapse sidebar'}
+          shortcut="mod+\\"
+          placement="right"
+        >
           <IconButton
             size="sm"
-            label={rail ? 'Expand sidebar' : 'Collapse sidebar to icons'}
+            label={rail
+              ? (narrow ? 'Open the navigation over the page' : 'Expand sidebar')
+              : (narrow ? 'Close the navigation' : 'Collapse sidebar to icons')}
             icon={rail ? <ChevronsRightIcon size={15} /> : <ChevronsLeftIcon size={15} />}
+            aria-expanded={narrow ? !rail : undefined}
             onClick={onToggleRail}
           />
         </Tooltip>
@@ -759,11 +857,91 @@ function RailFlyout({ item, jumpKey, children }: { item: NavItem; jumpKey?: stri
 
 /* ================================ top bar ================================= */
 
-function TopSearch({ inputRef, onPalette }: { inputRef: React.RefObject<HTMLInputElement>; onPalette: () => void }) {
+/**
+ * The top bar's search, answering as you type.
+ *
+ * A dashboard's most-used control should not cost a page transition to find one
+ * customer, so this ranks live records under the field, grouped by type: ↑↓
+ * moves, ↵ opens the highlighted one. What it will not do is pretend the four
+ * rows per source it has room for are the whole answer — the last row is always
+ * the full search page, a hit no installed module can open is shown but never
+ * takes the highlight, and a source that failed is named rather than read as
+ * "nothing matched".
+ */
+function TopSearch({ inputRef, sources, onPalette }: {
+  inputRef: React.RefObject<HTMLInputElement>;
+  sources: SearchSource[];
+  onPalette: () => void;
+}) {
   const { navigate, location } = useRouter();
   const [value, setValue] = useState('');
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
+  const listId = useId();
+  const rowId = (id: string) => `${listId}-${id}`;
+
+  const search = useGlobalSearch(value, sources, { perSource: 4, limit: 24, delay: 140 });
+  const typed = value.trim();
+  const targets = useMemo(() => typeaheadTargets(search.groups, typed), [search.groups, typed]);
+  const shown = useMemo(() => search.groups.reduce((n, group) => n + group.hits.length, 0), [search.groups]);
+  // Every hit but no way into any of them: say it once, above the list, rather
+  // than stamping the same sentence on all ten rows.
+  const openable = targets.length - (targets.length && !targets[targets.length - 1].hit ? 1 : 0);
+  const indexOf = useMemo(() => new Map(targets.map((target, i) => [target.id, i])), [targets]);
+
+  const panelOpen = open && typed.length > 0 && sources.length > 0;
+  const at = targets.length ? Math.min(active, targets.length - 1) : -1;
+  const highlighted = at >= 0 ? targets[at] : undefined;
 
   useEffect(() => { if (location.path !== '/search') setValue(''); }, [location.path]);
+  useEffect(() => { setActive(0); }, [typed, shown]);
+
+  const go = (target: TypeaheadTarget) => { setOpen(false); navigate(target.href); };
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (!typed) return;
+      e.preventDefault();
+      setOpen(true);
+      if (!targets.length) return;
+      const step = e.key === 'ArrowDown' ? 1 : -1;
+      setActive((i) => (Math.min(i, targets.length - 1) + step + targets.length) % targets.length);
+    } else if (e.key === 'Enter') {
+      // Nothing under the highlight — no module installed, nothing typed — and
+      // the form's own submit takes the query to the full search page.
+      if (!panelOpen || !highlighted) return;
+      e.preventDefault();
+      go(highlighted);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      if (panelOpen) setOpen(false);
+      else { setValue(''); e.currentTarget.blur(); }
+    } else if (e.key === 'Home' && panelOpen && targets.length) {
+      e.preventDefault();
+      setActive(0);
+    } else if (e.key === 'End' && panelOpen && targets.length) {
+      e.preventDefault();
+      setActive(targets.length - 1);
+    } else if (e.key === 'Tab') {
+      setOpen(false);
+    }
+  };
+
+  const note = search.failures.length
+    ? {
+      tone: 'alert' as const,
+      text: `${search.failures.map((failure) => failure.source.label).join(', ')} could not be searched — ${search.failures[0].error.body.message}`,
+      meta: search.failures[0].error.body.request_id,
+    }
+    : typed.length < 2
+      ? { tone: 'status' as const, text: 'Records are searched from the second character.', meta: null }
+      : search.loading && !shown
+        ? { tone: 'status' as const, text: `Searching ${sources.length} ${sources.length === 1 ? 'source' : 'sources'}…`, meta: null }
+        : !search.loading && !shown
+          ? { tone: 'status' as const, text: `Nothing matches “${typed}” in ${sources.map((source) => source.label.toLowerCase()).join(', ')}.`, meta: null }
+          : shown && !openable
+            ? { tone: 'status' as const, text: 'These match, but no module on this workspace registers a screen for them yet — ↵ opens the full results page.', meta: null }
+            : null;
 
   return (
     <form
@@ -771,7 +949,8 @@ function TopSearch({ inputRef, onPalette }: { inputRef: React.RefObject<HTMLInpu
       role="search"
       onSubmit={(e) => {
         e.preventDefault();
-        navigate(value.trim() ? `/search?q=${encodeURIComponent(value.trim())}` : '/search');
+        setOpen(false);
+        navigate(typed ? `/search?q=${encodeURIComponent(typed)}` : '/search');
       }}
     >
       <Icons.search size={15} />
@@ -781,9 +960,18 @@ function TopSearch({ inputRef, onPalette }: { inputRef: React.RefObject<HTMLInpu
         value={value}
         placeholder="Search records, customers, price book…"
         aria-label="Search everything"
-        onChange={(e) => setValue(e.target.value)}
-        onKeyDown={(e) => { if (e.key === 'Escape') { setValue(''); e.currentTarget.blur(); } }}
+        role="combobox"
+        aria-expanded={panelOpen}
+        aria-controls={listId}
+        aria-autocomplete="list"
+        aria-activedescendant={panelOpen && highlighted ? rowId(highlighted.id) : undefined}
+        autoComplete="off"
+        onChange={(e) => { setValue(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onKeyDown={onKeyDown}
       />
+      {search.loading && panelOpen && <Spinner size={14} label="Searching records" />}
       {value ? <Kbd>↵</Kbd> : (
         <>
           <Kbd>/</Kbd>
@@ -791,6 +979,93 @@ function TopSearch({ inputRef, onPalette }: { inputRef: React.RefObject<HTMLInpu
             <Kbd combo="mod+k" />
           </button>
         </>
+      )}
+
+      {panelOpen && (
+        // Keeping the caret in the field is what makes a click on a row fire at
+        // all: blurring first would close the panel out from under the pointer.
+        <div className="shell-search__panel" onMouseDown={(e) => e.preventDefault()}>
+          {note && (
+            <div className={`shell-search__note${note.tone === 'alert' ? ' is-alert' : ''}`} role={note.tone === 'alert' ? 'alert' : 'status'}>
+              <span>{note.text}</span>
+              {note.meta && <span className="u-mono">{note.meta}</span>}
+            </div>
+          )}
+
+          <div className="shell-search__list" id={listId} role="listbox" aria-label="Search results">
+            {search.groups.map((group) => (
+              <div className="shell-search__group" key={group.source.id} role="group" aria-label={group.source.label}>
+                <div className="shell-search__grouphead" aria-hidden>
+                  <span>{group.source.label}</span>
+                  <span className="shell-search__groupcount">{group.hits.length}</span>
+                </div>
+                {group.hits.map((hit) => {
+                  const i = hit.href ? indexOf.get(`${hit.type}:${hit.id}`) ?? -1 : -1;
+                  return (
+                    <div
+                      key={`${hit.type}:${hit.id}`}
+                      id={i >= 0 ? rowId(`${hit.type}:${hit.id}`) : undefined}
+                      role="option"
+                      aria-selected={i >= 0 && i === at}
+                      aria-disabled={hit.href ? undefined : true}
+                      className={`shell-search__row${i >= 0 && i === at ? ' is-active' : ''}${hit.href ? '' : ' is-unopenable'}`}
+                      onPointerEnter={() => { if (i >= 0) setActive(i); }}
+                      onClick={() => { if (i >= 0) go(targets[i]); }}
+                    >
+                      <span className="shell-search__icon">{renderIcon(hit.icon, 15)}</span>
+                      <span className="shell-search__text">
+                        <span className="shell-search__title u-truncate">{hit.title}</span>
+                        {hit.subtitle && <span className="shell-search__sub u-truncate">{hit.subtitle}</span>}
+                      </span>
+                      <span className="shell-search__aside">
+                        {hit.href
+                          ? <span className="u-mono u-truncate">{hit.id}</span>
+                          : openable > 0 && <span className="shell-search__flag">No screen installed</span>}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+
+            {targets.length > 0 && (() => {
+              const everything = targets[targets.length - 1];
+              const i = targets.length - 1;
+              return (
+                <div
+                  id={rowId(everything.id)}
+                  role="option"
+                  aria-selected={i === at}
+                  className={`shell-search__row shell-search__row--all${i === at ? ' is-active' : ''}`}
+                  onPointerEnter={() => setActive(i)}
+                  onClick={() => go(everything)}
+                >
+                  <span className="shell-search__icon"><Icons.search size={15} /></span>
+                  <span className="shell-search__text">
+                    <span className="shell-search__title u-truncate">
+                      {shown ? <>See every match for “{typed}”</> : <>Search everything for “{typed}”</>}
+                    </span>
+                    <span className="shell-search__sub u-truncate">
+                      The full results page, with the type filter and no per-source cap
+                    </span>
+                  </span>
+                  <span className="shell-search__aside"><Kbd>↵</Kbd></span>
+                </div>
+              );
+            })()}
+          </div>
+
+          <div className="shell-search__foot">
+            <span className="shell-search__hint"><Kbd>↑</Kbd><Kbd>↓</Kbd> move</span>
+            <span className="shell-search__hint"><Kbd>↵</Kbd> open</span>
+            <span className="shell-search__hint"><Kbd combo="esc" /> close</span>
+            <span className="shell-search__count">
+              {shown
+                ? `${shown} shown from ${sources.length} ${sources.length === 1 ? 'source' : 'sources'}`
+                : `${sources.length} ${sources.length === 1 ? 'source' : 'sources'} searched`}
+            </span>
+          </div>
+        </div>
       )}
     </form>
   );

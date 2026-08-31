@@ -14,7 +14,7 @@
 import type { ProrationBehavior, TaxBehavior } from '../catalog/types';
 import type { LineBreakdownRow } from '../catalog/types';
 import type { IntervalUnit } from '../../../shared/time';
-import type { TaxExemption, TaxReason, TaxSummaryRow, TaxType } from './tax';
+import type { TaxExemption, TaxIdVerificationStatus, TaxReason, TaxSummaryRow, TaxType } from './tax';
 
 export type { ProrationBehavior };
 
@@ -78,9 +78,11 @@ export const PENDING_ITEM_KINDS = ['unused_time', 'remaining_time', 'immediate',
 export type PendingItemKind = (typeof PENDING_ITEM_KINDS)[number];
 
 /**
- * `credited` is the resting state of a proration set that netted negative: the
- * lines are kept for the explanation, and the money already moved to the
- * customer's balance, so no invoice may pick them up again.
+ * `pending` is waiting for a bill, `invoiced` has been claimed by one. Nothing
+ * written today is `credited`: that was the resting state of a proration set
+ * that netted negative, back when such a set was moved to the customer balance
+ * instead of being invoiced — which is exactly how the tax on it was lost. The
+ * state stays readable so rows written then still hydrate.
  */
 export const PENDING_ITEM_STATUSES = ['pending', 'invoiced', 'credited', 'voided'] as const;
 export type PendingItemStatus = (typeof PENDING_ITEM_STATUSES)[number];
@@ -105,11 +107,31 @@ export interface Shipping {
   address: Address | null;
 }
 
+/**
+ * What checking a registration number found.
+ *
+ * `pending` is the shape checked and the register not yet asked; `verified` is
+ * the register's own answer, and it is the only state that shifts tax onto the
+ * customer. Anything else and the supplier charges the tax, because the
+ * supplier is the one the tax authority comes to for it.
+ */
+export interface TaxIdVerification {
+  status: TaxIdVerificationStatus;
+  /** The name the register holds, when it gave one back. */
+  verified_name: string | null;
+  verified_address: string | null;
+  /** When the register was asked. Null until it has been. */
+  checked_at: number | null;
+  /** What the status means, in the words the invoice will use. */
+  note: string | null;
+}
+
 /** A registered tax identifier — VAT, GST, EIN, ABN and friends. */
 export interface TaxId {
   type: string;
   value: string;
   country: string | null;
+  verification: TaxIdVerification;
 }
 
 export interface CustomFieldEntry {
@@ -372,12 +394,15 @@ export interface ChangePreview {
   credit_total: number;
   charge_total: number;
   net: number;
-  /** What would be collected immediately, after the customer's balance. */
+  /**
+   * What would be collected immediately. A negative net is never collected and
+   * never paid out: its lines go onto a bill, where they are taxed exactly as
+   * the charges they reverse were taxed, and whatever that bill cannot absorb
+   * is what reaches the customer balance.
+   */
   amount_due_now: number;
-  /** How much of `net` lands on the customer balance instead of an invoice. */
-  balance_applied: number;
-  customer_balance_before: number;
-  customer_balance_after: number;
+  /** What the account holds today — credit is negative, Stripe's convention. */
+  customer_balance: number;
   next_invoice: {
     date: number;
     currency: string;

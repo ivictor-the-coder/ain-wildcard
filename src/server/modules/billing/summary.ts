@@ -191,8 +191,12 @@ export function buildCustomerSummary(
       : recurringLines(upcoming.items, period, { book, currency: upcoming.currency, locale });
     const subtotal = recurringSubtotal(lines);
     // A credit balance is drawn down by the invoice; it can never take a total
-    // below zero, so what is left stays on the account for next time.
-    const balanceApplied = customer.balance < 0 ? Math.max(customer.balance, -(subtotal + uninvoicedTotal)) : customer.balance;
+    // below zero, so what is left stays on the account for next time. The
+    // waiting items can themselves be worth less than nothing — a downgrade is
+    // a credit line now, not a balance movement — and a bill with nothing left
+    // to pay draws nothing down.
+    const room = Math.max(0, subtotal + uninvoicedTotal);
+    const balanceApplied = customer.balance < 0 ? Math.max(customer.balance, -room) : customer.balance;
     const metered = upcoming.items.filter((item) => isMetered(book.price(item.price)));
     nextInvoice = {
       subscription: upcoming.id,

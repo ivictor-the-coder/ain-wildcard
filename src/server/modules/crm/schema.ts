@@ -263,4 +263,20 @@ CREATE INDEX idx_crm_history_seq ON crm_property_history(org_id, record_id, chan
 CREATE INDEX idx_crm_history_write ON crm_property_history(org_id, write_id);
 `,
   },
+  /**
+   * Rollup properties: an aggregate over associated records, stored on the
+   * parent like any other value. A formula can only see the record's own
+   * fields, so "total open deal value" — the number an account list is ranked
+   * by — was computable by the filter engine and unreachable as a column. The
+   * spec lives here as JSON and compiles through the same association
+   * aggregate the filter engine already uses, so the stored number and the
+   * filter that finds the same accounts can never disagree.
+   */
+  {
+    id: 'crm.0004_rollups',
+    sql: `
+ALTER TABLE crm_properties ADD COLUMN rollup TEXT;
+CREATE INDEX idx_crm_properties_rollup ON crm_properties(org_id, object_type) WHERE rollup IS NOT NULL;
+`,
+  },
 ];

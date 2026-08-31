@@ -139,7 +139,9 @@ export function TimeMachine({ open, onOpenChange, now, offsetMs, clockKind, canA
       >
         {shifted ? <span className="shell-clock__dot" aria-hidden /> : <Icons.clock size={14} />}
         <span>{f.date(now, { withYear: false })}</span>
-        {stale ? <span>· not confirmed</span> : shifted ? <span>· simulated</span> : null}
+        {stale
+          ? <span className="shell-clock__suffix">· not confirmed</span>
+          : shifted ? <span className="shell-clock__suffix">· simulated</span> : null}
       </button>
 
       <Popover

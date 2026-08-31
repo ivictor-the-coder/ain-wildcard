@@ -256,6 +256,10 @@ export class CreditNotes {
       throw badRequest(
         'credit_note_amount_too_large',
         `${show(total)} is more than invoice ${invoice.number} has left to credit. It was billed ${show(invoice.total)}${
+          invoice.balance_applied < 0
+            ? ` — its lines come to ${show(invoice.subtotal + invoice.tax)}, and ${show(-invoice.balance_applied)} of that was settled with credit the account already held, which cannot be handed back twice`
+            : ''
+        }${
           invoice.pre_payment_credit_notes_amount + invoice.post_payment_credit_notes_amount > 0
             ? `, ${show(invoice.pre_payment_credit_notes_amount + invoice.post_payment_credit_notes_amount)} of that has already been credited`
             : ''

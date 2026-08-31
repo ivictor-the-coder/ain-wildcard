@@ -17,14 +17,14 @@ import {
   allTimeWindow, asksYearOverYear, defaultWindow, describeWindow, periodMentions, previousWindow,
   resolveWindows, reversedRange, shiftWindowYears, unresolvedPeriods, type TimeWindow,
 } from './dates';
-import { entityIndex, workspaceProfile, type WorkspaceProfile } from './grounding';
+import { entityIndex, workspaceProfile, type EntityIndex, type WorkspaceProfile } from './grounding';
 import { extractMentions, mentionedTypes, resolveEntities, type ResolvedEntity } from './resolve';
 import {
   detectGrouping, detectMetric, isRankingQuestion, metricById, metricIds, stageSets,
   type GroupBy, type MetricDetection, type MetricSubject,
 } from './metrics';
 import { comprehend, isUsableEntity, refusalFor, workspaceVocabulary, type Refusal } from './clarify';
-import { planSteps, planWrite, replan, isWriteBlocked, type PlannedStep, type WindowPair, type WriteBlocked } from './plan';
+import { planTools, planWrite, replan, isWriteBlocked, type PlannedStep, type SkippedTool, type WindowPair, type WriteBlocked } from './plan';
 import { propertyMap } from './query';
 import {
   accountProfile, businessMetric, recordAggregate, recordSearch, recordTimeline, workspaceSearch,
@@ -62,6 +62,10 @@ export interface EngineAnalysis {
   tone: Tone;
   draftKind: DraftKind | null;
   plan: { tool: string; why: string; args: Record<string, unknown> }[];
+  /** Tools the question matched but could not arm, and what they were missing. */
+  skipped: SkippedTool[];
+  /** The record carried in from the conversation when this turn named none. */
+  carriedSubject: MetricSubject | null;
   steps: { tool: string; ok: boolean; code: string | null; ms: number }[];
   passes: number;
 }
@@ -70,6 +74,82 @@ const SUBJECT_TYPES = ['company', 'customer', 'contact'];
 
 const asSubject = (entity: ResolvedEntity | undefined): MetricSubject | null =>
   entity ? { id: entity.entity.id, type: entity.entity.type, label: entity.entity.label } : null;
+
+/**
+ * A word that points at something already on the table.
+ *
+ * "This quarter" and "that many" point at a period and a number, not at an
+ * account, so they are stripped before the test — otherwise every question with
+ * a period in it would look like a follow-up.
+ */
+const DEICTIC = /\b(they|them|their|theirs|it|its|this|that|these|those)\b/i;
+const TIME_DEICTIC = /\b(this|that|these|those|the)\s+(quarter|quarters|month|months|year|years|week|weeks|period|periods|day|days|time|many|much|far|point)\b/gi;
+
+export function deicticMention(text: string): string | null {
+  const hit = text.replace(TIME_DEICTIC, ' ').match(DEICTIC);
+  return hit ? hit[0] : null;
+}
+
+/** The record this conversation is pinned to, as a resolved entity. */
+function pinnedSubject(call: AiCallContext, index: EntityIndex): ResolvedEntity | null {
+  if (!call.subjectId) return null;
+  const entity = index.entities.find((e) => e.id === call.subjectId);
+  if (!entity) return null;
+  return {
+    entity,
+    score: 1,
+    rule: 'id',
+    mention: 'this conversation',
+    explain: `${entity.label} — the record this conversation is pinned to (${entity.id})`,
+  };
+}
+
+/** A hit strong enough to be what this sentence is about, not a near-miss. */
+const STRONG = 0.7;
+
+/**
+ * Which records this turn is about, given that it is turn five of a
+ * conversation about one account.
+ *
+ * A turn that names something outright is about what it names. A turn that says
+ * "they" is about whatever the conversation is already about — the record it is
+ * pinned to, or the last account an earlier turn resolved. Reading only the
+ * literal words of the current turn is what answered "how much have they spent"
+ * with the whole workspace's spend while the thread sat on one account.
+ */
+export function carryConversation(input: {
+  turn: ResolvedEntity[];
+  history: ResolvedEntity[];
+  pinned: ResolvedEntity | null;
+  deictic: string | null;
+}): { entities: ResolvedEntity[]; carried: ResolvedEntity | null } {
+  const strong = input.turn.filter((e) => e.score >= STRONG);
+  const carried = input.pinned
+    ?? input.history.find((e) => SUBJECT_TYPES.includes(e.entity.type))
+    ?? null;
+  if (strong.length) {
+    // The turn named something itself, so nothing is carried into it.
+    return { entities: dedupeEntities([...strong, ...input.turn]), carried: null };
+  }
+  if (carried && (input.deictic || !input.turn.length)) {
+    // A weak match on a word like "line" must not outrank the account the
+    // conversation is pinned to.
+    return { entities: dedupeEntities([carried, ...input.turn.filter((e) => e.score >= STRONG)]), carried };
+  }
+  if (input.turn.length) return { entities: input.turn, carried: null };
+  return { entities: input.history, carried: input.history.length ? null : carried };
+}
+
+function dedupeEntities(entities: ResolvedEntity[]): ResolvedEntity[] {
+  const seen = new Set<string>();
+  const out: ResolvedEntity[] = [];
+  for (const entity of entities) {
+    if (seen.has(entity.entity.id)) continue;
+    seen.add(entity.entity.id);
+    out.push(entity);
+  }
+  return out.slice(0, 6);
+}
 
 /** Run one of the engine's own capabilities directly, by name. */
 function callBuiltin(name: string, args: Record<string, unknown>, ctx: Ctx, orgId: string): unknown {
@@ -177,6 +257,10 @@ export function focusText(text: string): string {
 const conversationContext = (req: AiCompletionRequest): string =>
   req.messages.filter((m) => m.role === 'user').slice(-3).map((m) => focusText(m.content)).join('\n');
 
+/** The turns before this one — what a pronoun in this one can point back at. */
+const priorContext = (req: AiCompletionRequest): string =>
+  req.messages.filter((m) => m.role === 'user').slice(-4, -1).map((m) => focusText(m.content)).join('\n');
+
 /** The two periods a comparison will measure, and how they were chosen. */
 export function comparisonWindows(question: string, windows: TimeWindow[], now: number): WindowPair | null {
   const named = windows.filter((w) => w.end > w.start);
@@ -246,17 +330,29 @@ export function builtinEngine(): AiProvider {
         reasoning.push(`Comparison windows: ${comparison.a.label} against ${comparison.b.label} (${comparison.source.replace(/_/g, ' ')}).`);
       }
 
-      /* 3. which records */
+      /* 3. which records — this turn's, and the ones the thread is already about */
       const types = mentionedTypes(question);
       const metric = detectMetric(question);
       const prefer = metric?.metric.supportsSubject ? ['company', 'customer', 'contact'] : types;
-      const entities = resolveEntities(conversationContext(req), entityIndex(ctx, orgId), {
-        prefer, limit: 6, dedupe: true,
+      const index = entityIndex(ctx, orgId);
+      const options = { prefer, limit: 6, dedupe: true };
+      const deictic = deicticMention(question);
+      const carriedFrom = carryConversation({
+        turn: resolveEntities(question, index, options),
+        history: resolveEntities(priorContext(req), index, options),
+        pinned: pinnedSubject(call, index),
+        deictic,
       });
+      const entities = carriedFrom.entities;
+      const carried = carriedFrom.carried;
       const subject = asSubject(entities.find((e) => SUBJECT_TYPES.includes(e.entity.type)));
       reasoning.push(entities.length
         ? `Resolved ${entities.length} ${entities.length === 1 ? 'record' : 'records'}: ${entities.slice(0, 3).map((e) => `${e.entity.label} (${e.entity.type}, ${e.score.toFixed(2)}, ${e.rule})`).join('; ')}.`
         : 'No workspace record matched the question by id, email, domain, name, acronym or trigram similarity.');
+      if (carried) {
+        reasoning.push(`"${deictic ?? 'this turn'}" names nothing on its own; carried ${carried.entity.label} from ${call.subjectId === carried.entity.id ? 'the record this conversation is pinned to' : 'the previous turn'}, and the answer is scoped to it.`);
+        runtime?.note(call, 'resolve', 'carry_subject', `${carried.entity.label} (${carried.entity.id}) carried into "${truncate(question, 60)}"`);
+      }
       if (entities.length) {
         runtime?.note(call, 'resolve', 'resolve_entities', entities.slice(0, 4).map((e) => e.explain).join(' | '));
       }
@@ -267,10 +363,23 @@ export function builtinEngine(): AiProvider {
       if (ranking) reasoning.push(`The question asks for a ranking, so the answer leads with the ordered groups rather than a list of records.`);
 
       /* 5. can this be answered at all, or must it be refused */
-      const index = entityIndex(ctx, orgId);
       const comprehension = comprehend(question, workspaceVocabulary(index));
       const countableTypes = types.filter((t) => t !== 'activity' && t !== 'customer');
-      const refusal: Refusal | null = refusalFor({
+      // A pronoun with nothing behind it is not a question about the workspace.
+      // Widening "how much have they spent" to every account in the book is how
+      // a follow-up gets answered confidently about the wrong thing.
+      const danglingReference: Refusal | null = deictic && !entities.length && !carried
+        ? {
+            code: 'unresolved_reference',
+            why: `"${deictic}" refers to nothing this conversation has established.`,
+            content: [
+              `I do not know what "${deictic}" refers to. This conversation is not pinned to a record and nothing before it named one,`,
+              `so answering would mean picking an account for you.`,
+              `Name the account, or open the thread on the record you mean and I will hold it for the whole conversation.`,
+            ].join(' '),
+          }
+        : null;
+      const refusal: Refusal | null = danglingReference ?? refusalFor({
         question, workspace, intent, comprehension, metric, entities, types, windows, mentions,
         unresolved, reversedRange: backwards,
         metrics: metricIds().map((id) => metricById(id)?.label ?? id),
@@ -304,7 +413,14 @@ export function builtinEngine(): AiProvider {
       if (writeBlocked) {
         reasoning.push(`No write prepared: the request looks like ${writeBlocked.wanted}, but ${writeBlocked.reason}`);
       }
-      const plan = refusal ? [] : planSteps(planInput);
+      const planned = refusal ? { steps: [] as PlannedStep[], skipped: [] as SkippedTool[] } : planTools(planInput);
+      const plan = planned.steps;
+      // A tool the question wanted but could not arm is reported, not run with
+      // the sentence in its parameters. The trace and the answer both say so.
+      const skipped = planned.skipped.filter((s) => s.relevance >= 0.55).slice(0, 2);
+      if (planned.skipped.length) {
+        reasoning.push(`Not planned: ${planned.skipped.map((s) => `${s.tool} (no value for ${s.missing.join(', ')})`).join('; ')}.`);
+      }
       if (scopedTools) {
         reasoning.push(`Run scoped to ${scopedTools.length ? scopedTools.map((t) => `"${t}"`).join(', ') : 'no tools'}; the plan is filtered against that list, not just the tools offered to the model.`);
       }
@@ -338,7 +454,7 @@ export function builtinEngine(): AiProvider {
       }
 
       const remaining = Math.max(0, budget.steps - (call.steps ?? steps.length));
-      const second = refusal ? [] : replan(planInput, executed, Math.min(remaining, 2));
+      const second = refusal ? [] : replan(planInput, executed, Math.min(remaining, 2), planned.skipped);
       if (second.length) {
         passes += 1;
         reasoning.push(`Second pass: ${second.map((s) => `${s.tool} — ${s.why}`).join(' ')}`);
@@ -385,6 +501,8 @@ export function builtinEngine(): AiProvider {
             pendingApprovals: (call.pendingApprovals ?? []) as PendingApproval[],
             writeBlocked,
             scopedTools,
+            skippedTools: skipped,
+            carriedSubject: carried ? { label: carried.entity.label, pinned: call.subjectId === carried.entity.id } : null,
           });
 
       // A plan that died entirely on the run's budget did not answer the
@@ -451,6 +569,8 @@ export function builtinEngine(): AiProvider {
         tone,
         draftKind,
         plan: plan.map((s) => ({ tool: s.tool, why: s.why, args: s.args })),
+        skipped: planned.skipped,
+        carriedSubject: asSubject(carried ?? undefined),
         steps: traced,
         passes,
       };

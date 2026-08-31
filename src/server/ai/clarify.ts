@@ -78,7 +78,7 @@ export function comprehend(question: string, vocabulary: Set<string>): Comprehen
   };
 }
 
-export type RefusalCode = 'unreadable' | 'injection' | 'unknown_terms' | 'no_measure' | 'period_unresolved';
+export type RefusalCode = 'unreadable' | 'injection' | 'unknown_terms' | 'no_measure' | 'period_unresolved' | 'unresolved_reference';
 
 export interface Refusal {
   code: RefusalCode;

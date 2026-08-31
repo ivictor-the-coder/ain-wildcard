@@ -226,8 +226,12 @@ export interface UsageRecord {
 }
 
 export interface PriceUsage {
-  /** Live references from subscriptions, invoices, quotes and the like. */
+  /** Distinct objects — subscriptions, invoices, quotes — that use the price. */
   count: number;
+  /** That count broken out by object type, largest group first. */
+  by_type: { type: string; count: number }[];
+  /** The same in words: "7 subscriptions and 64 invoices". */
+  summary: string;
   references: { type: string; id: string }[];
   /** True once anything has ever billed against this price. */
   in_use: boolean;

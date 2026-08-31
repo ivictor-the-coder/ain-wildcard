@@ -1166,6 +1166,58 @@ describe('a billed period that drifts is settled in money, not in a word', () =>
       (await expectOk('GET', `/v1/credit-billable-items?customer=${fx.customer}&kind=true_up`)).data.length, 0,
     );
   });
+
+  test('a period billed through the settlement API is closed without being asked', async () => {
+    // 1,000 free units then 10 each, and a month billed in two windows: the
+    // freeze has to carry both the price and the rung the window sat on, or a
+    // true-up on the first half hands the free tier out twice.
+    const fx = await billed({ tiers: [{ up_to: 1000, unit_amount_decimal: '0' }, { up_to: 'inf', unit_amount_decimal: '10' }] });
+    const mid = MAY + 15 * DAY;
+    await ingest([
+      { event_name: fx.eventName, identifier: `${fx.customer}_h1`, timestamp: MAY + DAY, payload: { customer_id: fx.customer, units: 900 } },
+      { event_name: fx.eventName, identifier: `${fx.customer}_h2`, timestamp: mid + DAY, payload: { customer_id: fx.customer, units: 600 } },
+    ]);
+    // Neither call says `close_period`, because billing a metered period is
+    // what says it.
+    const first = await expectOk('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fx.price.id, period_start: MAY, period_end: mid,
+      billing_period_start: MAY, billing_period_end: JUNE,
+    });
+    const second = await expectOk('POST', '/v1/credit-settlements', {
+      customer: fx.customer, price: fx.price.id, period_start: mid, period_end: JUNE,
+      billing_period_start: MAY, billing_period_end: JUNE,
+    });
+    assert.equal(first.full_amount, 0, 'the first 900 units are inside the free tier');
+    assert.equal(second.full_amount, 5_000, 'and 500 of the next 600 are chargeable');
+
+    const closures = await expectOk('GET', `/v1/meter-period-closures?meter=${fx.meter.id}&customer=${fx.customer}`);
+    assert.equal(closures.data.length, 2, 'two windows billed, two windows frozen');
+    const early = closures.data.find((c: { period_start: number }) => c.period_start === MAY);
+    assert.equal(early.total, 900);
+    assert.equal(early.price, fx.price.id);
+    assert.equal(early.prior_quantity, 0);
+    assert.equal(early.ref_type, 'credit_settlement');
+    assert.equal(early.ref_id, first.id);
+    const later = closures.data.find((c: { period_start: number }) => c.period_start === mid);
+    assert.equal(later.prior_quantity, 900, 'the second window remembers the rung it started on');
+    assert.equal(later.ref_id, second.id);
+
+    // A reading for the *first* window turns up after both were invoiced. It
+    // is priced from where that window sat on the ladder — 900 units in, so
+    // 100 of the 200 are free — not from the bottom of it.
+    const late = await expectOk('POST', '/v1/meter-events', {
+      event_name: fx.eventName, identifier: `${fx.customer}_h1_late`,
+      timestamp: MAY + 2 * DAY, payload: { customer_id: fx.customer, units: 200 },
+    });
+    assert.equal(late.event.late, true);
+    assert.equal(late.late_arrival.closure, early.id);
+    const resolved = await expectOk('POST', `/v1/meter-late-arrivals/${late.late_arrival.id}/resolve`, {
+      resolution: 'rebilled',
+    });
+    assert.equal(resolved.amount, 1_000, '100 units past the free tier at 10 each');
+    assert.equal((await expectOk('GET', `/v1/meter-period-closures/${early.id}`)).outstanding_amount, 0,
+      'and the period agrees with itself again');
+  });
 });
 
 function* chunks<T>(items: T[], size: number): Generator<T[]> {

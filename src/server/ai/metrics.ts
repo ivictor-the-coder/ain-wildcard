@@ -351,6 +351,80 @@ function result(input: MetricInput, def: Pick<MetricDefinition, 'id' | 'label' |
   };
 }
 
+/**
+ * Recurring revenue, taken from the billing module's own normalisation.
+ *
+ * MRR is not a column anywhere: a subscription is priced through its items, and
+ * only the ledger knows how a quarterly price annualises or which statuses
+ * count as revenue. Asking the service that owns those rules is what makes the
+ * copilot and `GET /v1/subscriptions/overview` quote the same number to the
+ * cent. With no ledger published, the metric says so instead of reporting zero.
+ */
+function recurringRevenue(input: MetricInput, months: 1 | 12): MetricResult {
+  const def = {
+    snapshot: true,
+    id: months === 12 ? 'arr' : 'mrr',
+    label: months === 12 ? 'Annual recurring revenue' : 'Monthly recurring revenue',
+    unit: 'money' as const,
+  };
+  const orgId = input.workspace.orgId;
+  const billing = input.ctx.svc.billing;
+  if (!billing) {
+    return result(input, def, {
+      value: 0, count: 0, source: 'no subscription ledger in this workspace', sourceKind: 'unavailable',
+      note: 'Recurring revenue needs a subscription ledger and no module in this workspace publishes one. Closed-won bookings and open pipeline are available instead.',
+    });
+  }
+  const customerIds = new Set(linkedCustomerIds(input.ctx, orgId, input.subject));
+  if (input.subject && !customerIds.size) {
+    return result(input, def, {
+      value: 0, count: 0, source: `${input.subject.label} has no billing account`, sourceKind: 'subscriptions',
+      note: `${input.subject.label} is in the CRM but has no customer in the subscription ledger, so it carries no recurring revenue.`,
+    });
+  }
+
+  const perCustomer = new Map<string, { value: number; count: number }>();
+  const ids: string[] = [];
+  let total = 0;
+  let counted = 0;
+  for (const sub of billing.subscriptions(orgId, { status: 'all', limit: 500 })) {
+    if (input.subject && !customerIds.has(sub.customer)) continue;
+    // The ledger returns 0 for a status that is not billing — cancelled,
+    // trialing, incomplete — so a subscription only counts when it is earning.
+    const monthly = billing.mrr(orgId, sub);
+    if (monthly <= 0) continue;
+    total += monthly * months;
+    counted += 1;
+    ids.push(sub.id);
+    const bucket = perCustomer.get(sub.customer) ?? { value: 0, count: 0 };
+    bucket.value += monthly * months;
+    bucket.count += 1;
+    perCustomer.set(sub.customer, bucket);
+  }
+
+  const groups: MetricGroup[] = input.groupBy === 'account'
+    ? [...perCustomer.entries()]
+        .map(([customerId, row]) => ({
+          key: customerId,
+          label: billing.customer(orgId, customerId)?.name ?? customerId,
+          value: row.value,
+          count: row.count,
+          formatted: formatValue(row.value, 'money', input.workspace),
+        }))
+        .sort((a, b) => b.value - a.value || a.label.localeCompare(b.label))
+        .slice(0, 12)
+    : [];
+
+  return result(input, def, {
+    value: total,
+    count: counted,
+    ids: ids.slice(0, 12),
+    groups,
+    source: `${counted} ${counted === 1 ? 'subscription' : 'subscriptions'} billing recurring revenue`,
+    sourceKind: 'subscriptions',
+  });
+}
+
 /* ------------------------------- definitions ------------------------------ */
 
 function moneyIn(input: MetricInput, opts: { paidOnly?: boolean; outstanding?: boolean }, def: Pick<MetricDefinition, 'id' | 'label' | 'unit'>): MetricResult {
@@ -741,32 +815,15 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'mrr', label: 'Monthly recurring revenue', unit: 'money', supportsSubject: true, snapshot: true,
-    patterns: [/\bmrr\b/i, /\bmonthly\s+recurring\b/i, /\barr\b/i, /\brun\s?rate\b/i, /\brecurring\s+revenue\b/i],
-    keywords: ['mrr', 'arr'],
-    compute: (input) => {
-      const sources = billingSources(input.ctx.db);
-      const subs = sources.subscriptions;
-      if (!subs?.amountColumn) {
-        return result(input, { snapshot: true, id: 'mrr', label: 'Monthly recurring revenue', unit: 'money' }, {
-          value: 0, count: 0, source: 'no subscription ledger in this workspace', sourceKind: 'unavailable',
-          note: 'Recurring revenue needs the subscriptions ledger, which is not installed here. Closed-won bookings and open pipeline are available instead.',
-        });
-      }
-      const where = [`org_id = ?`];
-      const params: unknown[] = [input.workspace.orgId];
-      if (subs.statusColumn) where.push(`${subs.statusColumn} IN ('active', 'trialing', 'past_due')`);
-      const customerIds = linkedCustomerIds(input.ctx, input.workspace.orgId, input.subject);
-      if (input.subject && subs.customerColumn && customerIds.length) {
-        where.push(`${subs.customerColumn} IN (${customerIds.map(() => '?').join(', ')})`);
-        params.push(...customerIds);
-      }
-      const row = input.ctx.db.get<{ v: number | null; n: number }>(
-        `SELECT SUM(${subs.amountColumn}) AS v, COUNT(*) AS n FROM ${subs.table} WHERE ${where.join(' AND ')}`, ...(params as never[]));
-      return result(input, { snapshot: true, id: 'mrr', label: 'Monthly recurring revenue', unit: 'money' }, {
-        value: Number(row?.v ?? 0), count: Number(row?.n ?? 0),
-        source: `${row?.n ?? 0} active ${Number(row?.n ?? 0) === 1 ? 'subscription' : 'subscriptions'}`, sourceKind: 'subscriptions',
-      });
-    },
+    patterns: [/\bmrr\b/i, /\bmonthly\s+recurring\b/i, /\bmonthly\s+run\s?rate\b/i, /\brecurring\s+revenue\b/i],
+    keywords: ['mrr'],
+    compute: (input) => recurringRevenue(input, 1),
+  },
+  {
+    id: 'arr', label: 'Annual recurring revenue', unit: 'money', supportsSubject: true, snapshot: true,
+    patterns: [/\barr\b/i, /\bannual(?:ised|ized)?\s+recurring\b/i, /\bannual\s+run\s?rate\b/i, /\bannualised\s+revenue\b/i],
+    keywords: ['arr'],
+    compute: (input) => recurringRevenue(input, 12),
   },
 ];
 

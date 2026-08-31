@@ -216,6 +216,14 @@ export function mergeRecords(
     if (activityTypes.includes(edge.from_type) || activityTypes.includes(edge.to_type)) activitiesMoved++;
   }
 
+  // The loser is archived and its edges now point at the winner, so both of
+  // them and everything that was on the other end of a moved edge is holding a
+  // number computed from a graph that no longer exists.
+  crm.recomputeRollups(orgId, [
+    winner.id, loser.id,
+    ...edges.map((edge) => (edge.from_id === loser.id ? edge.to_id : edge.from_id) as string),
+  ], opts);
+
   // Through the store, so the merge lands in the same totally-ordered audit
   // trail as everything else and pages with the same cursor.
   crm.recordHistory(

@@ -165,6 +165,22 @@ const OBJECT_SEEDS: ObjectTypeSeed[] = [
       { name: 'linkedin_url', label: 'LinkedIn', type: 'url', group: 'Company information', position: 37 },
       { name: 'last_activity_at', label: 'Last activity', type: 'datetime', group: 'Engagement', position: 40, read_only: true },
       { name: 'activity_count', label: 'Activities logged', type: 'number', group: 'Engagement', position: 41, read_only: true, default_value: 0 },
+      {
+        name: 'open_deal_count', label: 'Open deals', type: 'number', group: 'Pipeline', position: 50, read_only: true,
+        description: 'How many deals on this account are still open. Maintained whenever a deal is saved, linked, unlinked or archived.',
+        rollup: { association: 'deal', aggregate: 'count', filter: { property: 'deal_status', operator: 'eq', value: 'open' } },
+      },
+      {
+        name: 'total_open_deal_value', label: 'Total open deal value', type: 'currency', currency: 'usd',
+        group: 'Pipeline', position: 51, read_only: true,
+        description: 'The sum of every open deal on this account, in cents. This is what an account list is ranked by — sort, filter, put it in a view column or read it from a formula.',
+        rollup: { association: 'deal', aggregate: 'sum', property: 'amount', filter: { property: 'deal_status', operator: 'eq', value: 'open' } },
+      },
+      {
+        name: 'associated_contact_count', label: 'Associated contacts', type: 'number', group: 'Pipeline', position: 52, read_only: true,
+        description: 'People linked to this account. An account with pipeline and one contact is a single-threaded deal.',
+        rollup: { association: 'contact', aggregate: 'count' },
+      },
     ],
   },
   {
@@ -465,16 +481,13 @@ export const BUILTIN_VIEWS: ViewSeed[] = [
     sort: [{ property: 'connected_assets', direction: 'desc' }], position: 20,
   },
   {
-    object_type: 'company', name: 'Open pipeline over $75k', description: 'Accounts whose open deals add up to more than $75,000 — the accounts worth a forecast conversation.',
-    columns: ['name', 'industry', 'lifecycle_stage', 'region', 'owner_id'],
+    object_type: 'company', name: 'Open pipeline over $75k', description: 'Accounts whose open deals add up to more than $75,000 — the accounts worth a forecast conversation, biggest pipeline first.',
+    columns: ['name', 'industry', 'open_deal_count', 'total_open_deal_value', 'associated_contact_count', 'owner_id'],
     filter: {
       op: 'and',
-      filters: [{
-        association: 'deal', aggregate: 'sum', aggregate_property: 'amount', operator: 'gt', value: 7_500_000,
-        where: { op: 'and', filters: [{ property: 'deal_status', operator: 'eq', value: 'open' }] },
-      }],
+      filters: [{ property: 'total_open_deal_value', operator: 'gt', value: 7_500_000 }],
     },
-    sort: [{ property: 'name', direction: 'asc' }], position: 30,
+    sort: [{ property: 'total_open_deal_value', direction: 'desc' }], position: 30,
   },
   {
     object_type: 'company', name: 'Gone quiet', description: 'Customers and opportunities with no logged activity in the last 30 days.',

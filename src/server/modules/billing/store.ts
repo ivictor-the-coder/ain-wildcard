@@ -17,16 +17,10 @@ import { cursorOf, newId, parseCursor, randomId } from '../../../shared/ids';
 import { formatMoney, money } from '../../../shared/money';
 import { DAY, HOUR, addInterval, type Interval, type Period } from '../../../shared/time';
 import type { Price, ProrationBehavior } from '../catalog/types';
-import type { InvoiceLineTax } from './types';
-
-/** The zero-tax shape, used wherever tax has not been resolved for a line. */
-const UNTAXED: InvoiceLineTax = {
-  amount: 0, rate: null, display_name: null, jurisdiction: null,
-  percentage: null, tax_type: null, behavior: null, reason: 'no_rate', explanation: null,
-};
+import { CreditNotes } from './credit-notes';
 import {
   hydrateBalanceTransaction, hydrateCustomer, hydrateItem, hydratePendingItem, hydratePeriod,
-  hydrateSubscription, like, normaliseAddress,
+  hydrateSubscription, like, normaliseAddress, taxSummaryOf,
   type AddressInput, type CancelInput, type CustomerInput, type CustomerListFilter, type Page,
   type ResolvedItem, type SubscriptionCreateInput, type SubscriptionItemInput,
   type SubscriptionListFilter, type SubscriptionUpdateInput, type WriteMeta,
@@ -36,9 +30,13 @@ import {
   isRecurring, longDate, periodAt, Pricebook, recurringLines, recurringSubtotal,
   resolveInterval, sameCadence, snapToAnchorDay, subscriptionMrr, type PricedItem,
 } from './cycle';
-import { Invoices, describeWindow } from './invoices';
+import { Invoices, describeWindow, type DraftLine } from './invoices';
 import { previewChange, prorate, type ItemState, type ProrationSet } from './proration';
 import { assertTransition, countsAsRevenue, isTerminal, transitionEvent } from './status';
+import {
+  checkTaxId, defaultVerificationNote, isCheckableTaxIdType, normaliseTaxIdValue, pendingVerification,
+  type TaxIdVerificationStatus,
+} from './tax';
 import {
   type BalanceTransaction, type BalanceTransactionType, type BilledPeriod, type Cadence,
   type CancellationReason,
@@ -46,7 +44,7 @@ import {
   type PauseBehavior, type PaymentBehavior,
   type PendingInvoiceItem, type PendingItemStatus, type PeriodStatus, type ProrationLine,
   type RecurringLine, type SchedulePhase, type Subscription, type SubscriptionItem,
-  type SubscriptionStatus, type TrialEndBehavior,
+  type SubscriptionStatus, type TaxId, type TaxIdVerification, type TrialEndBehavior,
 } from './types';
 
 
@@ -64,8 +62,12 @@ export class Billing {
   /** The invoicing half of the module: assembling, totalling and settling bills. */
   readonly invoices: Invoices;
 
+  /** The only legal way to reduce a finalised bill. */
+  readonly creditNotes: CreditNotes;
+
   constructor(private readonly ctx: Ctx) {
     this.invoices = new Invoices(ctx, this);
+    this.creditNotes = new CreditNotes(ctx, this);
   }
 
   book(orgId: string): Pricebook { return new Pricebook(this.ctx, orgId); }
@@ -172,7 +174,8 @@ export class Billing {
         shipping: input.shipping
           ? { name: input.shipping.name ?? null, phone: input.shipping.phone ?? null, address: input.shipping.address ? normaliseAddress(input.shipping.address) : null }
           : null,
-        tax_ids: (input.tax_ids ?? []).map((t) => ({ type: t.type, value: t.value, country: t.country ?? null })),
+        tax_ids: this.readTaxIds(input.tax_ids ?? [], []),
+        tax_exempt: input.tax_exempt ?? 'none',
         invoice_settings: {
           default_payment_method: input.invoice_settings?.default_payment_method ?? null,
           days_until_due: input.invoice_settings?.days_until_due ?? null,
@@ -222,7 +225,10 @@ export class Billing {
         : input.shipping
           ? { name: input.shipping.name ?? null, phone: input.shipping.phone ?? null, address: input.shipping.address ? normaliseAddress(input.shipping.address) : null }
           : null);
-      set('tax_ids', 'tax_ids', input.tax_ids === undefined ? undefined : input.tax_ids.map((t) => ({ type: t.type, value: t.value, country: t.country ?? null })));
+      set('tax_ids', 'tax_ids', input.tax_ids === undefined
+        ? undefined
+        : this.readTaxIds(input.tax_ids, before.tax_ids));
+      set('tax_exempt', 'tax_exempt', input.tax_exempt);
       set('preferred_locales', 'preferred_locales', input.preferred_locales);
       set('metadata', 'metadata', input.metadata === undefined ? undefined : { ...before.metadata, ...input.metadata });
       set('crm_record_id', 'crm_record_id', input.crm_record_id);
@@ -293,6 +299,117 @@ export class Billing {
         objectId: id, objectType: 'customer', actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
       });
       return { object: 'customer' as const, id, deleted: true as const };
+    });
+  }
+
+  /* -------------------------------- tax ids ------------------------------- */
+
+  /**
+   * Read the registration numbers off a write, refusing anything that is not
+   * one.
+   *
+   * A number that survives this is stored the way its authority writes it, and
+   * carries a verification state that starts at "not confirmed". A number that
+   * is already on the account and comes back unchanged keeps whatever the
+   * register said about it — editing a customer's phone number must not quietly
+   * un-verify their VAT registration — and a number that has *changed* starts
+   * again, because it is a different registration.
+   */
+  private readTaxIds(
+    inputs: { type: string; value: string; country?: string | null }[],
+    existing: TaxId[],
+  ): TaxId[] {
+    const seen = new Map<string, number>();
+    return inputs.map((input, index) => {
+      const check = checkTaxId(input.type, input.value);
+      if (!check.ok) {
+        throw badRequest(
+          'tax_id_invalid',
+          `${check.message} A registration that is not one is worse than none at all: it is what a customer would type to stop being charged tax the supplier still owes.`,
+          'tax_ids',
+          { index, type: input.type, value: input.value },
+        );
+      }
+      const first = seen.get(check.value);
+      if (first !== undefined) {
+        throw badRequest(
+          'tax_id_duplicated',
+          `${check.value} is listed twice on this account, at positions ${first + 1} and ${index + 1}. One registration number, once.`,
+          'tax_ids',
+          { index, value: check.value },
+        );
+      }
+      seen.set(check.value, index);
+      const held = existing.find((t) => t.value === check.value && t.type === input.type);
+      return {
+        type: input.type,
+        value: check.value,
+        country: input.country ?? held?.country ?? null,
+        verification: held?.verification ?? pendingVerification(input.type),
+      };
+    });
+  }
+
+  /**
+   * Record what the register said about a registration number.
+   *
+   * This is a separate, deliberate act rather than a field on the customer for
+   * one reason: the customer supplies the number, and the workspace — or the
+   * connector that queries VIES or HMRC on its behalf — supplies the answer.
+   * Only `verified` shifts the tax, so the two must not arrive in the same
+   * write from the same hand.
+   */
+  verifyTaxId(
+    orgId: string, customerId: string,
+    input: { value: string; status: TaxIdVerificationStatus; verified_name?: string | null; verified_address?: string | null; note?: string | null },
+    meta: WriteMeta = {},
+  ): Customer {
+    return this.ctx.atomic(() => {
+      const customer = this.requireCustomer(orgId, customerId);
+      // Matched the way the number is stored, so "DE 811 907 980" finds the
+      // registration that went in as "de811907980".
+      const index = customer.tax_ids.findIndex(
+        (taxId) => taxId.value === normaliseTaxIdValue(taxId.type, input.value),
+      );
+      if (index < 0) {
+        throw badRequest(
+          'tax_id_not_on_customer',
+          customer.tax_ids.length
+            ? `${customer.name} has no registration ${input.value} on file. It holds ${customer.tax_ids.map((t) => t.value).join(', ')}.`
+            : `${customer.name} has no tax registration on file, so there is nothing to verify. Add one with PATCH /v1/customers/${customerId} first.`,
+          'value',
+        );
+      }
+      const taxId = customer.tax_ids[index];
+      if (input.status === 'verified' && !isCheckableTaxIdType(taxId.type)) {
+        throw badRequest(
+          'tax_id_type_not_checkable',
+          `Ain holds no format for a "${taxId.type}" registration, so it cannot be treated as verified — and an unverified registration never moves the tax off this workspace. Record it under a type Ain knows, or leave the tax charged.`,
+          'status',
+          { type: taxId.type },
+        );
+      }
+      const now = this.ctx.now();
+      const verification: TaxIdVerification = {
+        status: input.status,
+        verified_name: input.verified_name ?? null,
+        verified_address: input.verified_address ?? null,
+        checked_at: now,
+        note: input.note ?? defaultVerificationNote(input.status, taxId.value),
+      };
+      const taxIds = customer.tax_ids.map((held, at) => (at === index ? { ...held, verification } : held));
+      this.ctx.db.patch('billing_customers', 'id', customerId, { tax_ids: taxIds as any, updated: now });
+      const after = this.requireCustomer(orgId, customerId);
+      this.ctx.emit(orgId, 'customer.tax_id_verified', {
+        customer: customerId,
+        tax_id: { type: taxId.type, value: taxId.value, country: taxId.country, verification },
+        reverse_charge_eligible: input.status === 'verified',
+      }, {
+        objectId: customerId, objectType: 'customer',
+        previous: { verification: taxId.verification },
+        actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
+      });
+      return after;
     });
   }
 
@@ -935,10 +1052,13 @@ export class Billing {
           subscription: id, customer: updated.customer, currency: updated.currency,
           proration_date: prorationDate, proration_behavior: behavior,
           credit_total: preview.credit_total, charge_total: preview.charge_total, net: preview.net,
-          balance_applied: settlement.balanceApplied, lines: preview.lines,
+          pending_item_ids: settlement.pendingIds, lines: preview.lines,
         }, { objectId: id, objectType: 'subscription' });
       }
-      if (behavior === 'always_invoice' && preview.net > 0) {
+      // `always_invoice` means what it says whichever way the set nets. A
+      // credit invoiced now is a document with the tax on it; a credit left to
+      // the balance is a number with the tax silently kept.
+      if (behavior === 'always_invoice' && settlement.pendingIds.length) {
         this.requestInvoice(orgId, updated, {
           reason: 'subscription_update',
           period: change.nextPeriod,
@@ -988,17 +1108,21 @@ export class Billing {
   /**
    * Write the proration lines somewhere they can be collected.
    *
-   * A set that nets positive waits as pending invoice items. A set that nets
-   * negative is a credit, and a credit is never a payment: the lines are
-   * recorded as settled and the money goes onto the customer's balance, where
-   * it comes off the next invoice.
+   * Every line waits as a pending invoice item, whichever way the set nets.
+   * That is the whole point: a credit is a line on a bill, so the rate engine
+   * taxes it exactly as it taxed the charge it reverses, and $25.00 of unused
+   * time on a 19% account hands back $29.75. Routing a negative net onto the
+   * customer balance instead — which is what this did — kept the tax on
+   * service that was never supplied, and made the tax outcome depend on the
+   * sign of the net rather than on the supply.
+   *
+   * The balance is still the right home for what an invoice cannot carry, but
+   * that is decided by `Invoices.issue()` after tax, on the residue, not here.
    */
   private settle(
     orgId: string, sub: Subscription, lines: ProrationLine[], behavior: ProrationBehavior, meta: WriteMeta,
-  ): { balanceApplied: number; pendingIds: string[] } {
-    if (behavior === 'none' || !lines.length) return { balanceApplied: 0, pendingIds: [] };
-    const net = lines.reduce((total, line) => total + line.amount, 0);
-    const credited = net < 0;
+  ): { pendingIds: string[] } {
+    if (behavior === 'none' || !lines.length) return { pendingIds: [] };
     const now = this.ctx.now();
     const ids: string[] = [];
     for (const line of lines) {
@@ -1011,21 +1135,11 @@ export class Billing {
         kind: line.kind, period_start: line.period.start, period_end: line.period.end,
         proration_numerator: line.proration.numerator, proration_denominator: line.proration.denominator,
         proration_date: line.proration_date, breakdown: line.breakdown as any,
-        status: credited ? 'credited' : 'pending', invoice_id: null, created: now,
+        status: 'pending', invoice_id: null, created: now,
       } as any);
     }
-    let balanceApplied = 0;
-    if (credited) {
-      balanceApplied = net;
-      const locale = this.locale(orgId);
-      this.adjustBalance(orgId, sub.customer, net, {
-        type: 'proration_credit',
-        description: `Credit from the change to subscription ${sub.id} on ${longDate(now, locale)} — ${formatMoney(money(-net, sub.currency), { locale })} off the next invoice`,
-        subscription: sub.id,
-      });
-    }
     void meta;
-    return { balanceApplied, pendingIds: ids };
+    return { pendingIds: ids };
   }
 
   /* ------------------------------- transitions ---------------------------- */
@@ -1158,7 +1272,7 @@ export class Billing {
         book,
         trialEnd: sub.trial_end,
       });
-      this.settleCancellation(orgId, sub, set);
+      this.settleCancellation(orgId, sub, set, book, meta);
     }
     this.ctx.db.run(
       `UPDATE billing_subscription_periods SET status = 'canceled' WHERE org_id = ? AND subscription_id = ? AND period_end > ?`,
@@ -1170,28 +1284,47 @@ export class Billing {
     return canceled;
   }
 
-  private settleCancellation(orgId: string, sub: Subscription, set: ProrationSet): void {
+  /**
+   * Hand back the unused remainder of a period on the way out.
+   *
+   * The lines are written and invoiced on the spot rather than left waiting,
+   * because a cancelled subscription has no next cycle to sweep them up. Going
+   * through a real bill is also the only way the credit carries its tax: the
+   * final invoice is a document with `unused time -$25.00` and `VAT -$4.75` on
+   * it, and its value lands on the account balance because a bill can never go
+   * below zero. A bare balance adjustment would have handed back the net and
+   * kept the tax on service that was never supplied.
+   */
+  private settleCancellation(
+    orgId: string, sub: Subscription, set: ProrationSet, book: Pricebook, meta: WriteMeta,
+  ): void {
     if (!set.lines.length) return;
     const now = this.ctx.now();
+    const ids: string[] = [];
     for (const line of set.lines) {
+      const id = newId('invoiceitem');
+      ids.push(id);
       this.ctx.db.insert('billing_pending_items', {
-        id: newId('invoiceitem'), org_id: orgId, customer_id: sub.customer, subscription_id: sub.id,
+        id, org_id: orgId, customer_id: sub.customer, subscription_id: sub.id,
         subscription_item_id: line.subscription_item, price_id: line.price, quantity: line.quantity,
         amount: line.amount, currency: line.currency, description: line.description, explanation: line.explanation,
         kind: line.kind, period_start: line.period.start, period_end: line.period.end,
         proration_numerator: line.proration.numerator, proration_denominator: line.proration.denominator,
         proration_date: line.proration_date, breakdown: line.breakdown as any,
-        status: 'credited', invoice_id: null, created: now,
+        status: 'pending', invoice_id: null, created: now,
       } as any);
     }
-    if (set.net < 0) {
-      const locale = this.locale(orgId);
-      this.adjustBalance(orgId, sub.customer, set.net, {
-        type: 'cancellation_credit',
-        description: `Unused time returned when subscription ${sub.id} was cancelled on ${longDate(now, locale)}`,
-        subscription: sub.id,
-      });
-    }
+    this.requestInvoice(orgId, sub, {
+      reason: 'subscription_update',
+      period: { start: sub.current_period_start, end: sub.current_period_end },
+      arrearsPeriod: null,
+      fraction: null,
+      book,
+      immediate: true,
+      pendingItemIds: ids,
+      recurring: false,
+      meta,
+    });
   }
 
   /* ------------------------------ pause / resume -------------------------- */
@@ -1718,15 +1851,15 @@ export class Billing {
       periodFraction(period, change.iv, change.anchorDay), book,
     );
 
-    // Lines already waiting, plus the ones this change would add. A set that
-    // nets negative never reaches an invoice — it becomes account credit — so
-    // it is shown in the balance, not in the lines.
+    // Lines already waiting, plus the ones this change would add — including a
+    // set that nets negative, which reaches the bill as credit lines and is
+    // taxed there rather than being netted off in the balance.
     const waiting = this.pendingItems(orgId, { customer: customer.id, status: 'pending', limit: 500 });
-    const proposed = preview.net > 0 ? preview.lines : [];
-    const drafts = [
+    const proposed = preview.lines;
+    const drafts: DraftLine[] = [
       ...this.invoices.recurringDrafts(orgId, sub.id, upcoming),
       ...this.invoices.prorationDrafts(waiting),
-      ...proposed.map((line, index) => ({
+      ...proposed.map((line) => ({
         source: { type: 'pending_item' as const, id: null },
         subscription: line.subscription,
         subscriptionItem: line.subscription_item,
@@ -1741,14 +1874,40 @@ export class Billing {
         period: line.period,
         fraction: line.proration,
         breakdown: line.breakdown,
-        position: index,
       })),
     ];
 
-    const subtotal = drafts.reduce((total, line) => total + line.amount, 0);
-    const starting = customer.balance + preview.balance_applied;
-    const total = Math.max(0, subtotal + starting);
-    const balanceApplied = total - subtotal;
+    // The same call issuance makes, on the same customer: a preview that taxed
+    // its lines differently from the invoice it predicts would not be a
+    // preview of anything.
+    const taxed = this.invoices.taxDrafts(orgId, customer, drafts);
+    const subtotal = taxed.reduce((total, line) => total + line.amount, 0);
+    const tax = taxed.reduce((total, line) => total + line.tax.amount, 0);
+    const starting = customer.balance;
+    const total = Math.max(0, subtotal + tax + starting);
+    const balanceApplied = total - subtotal - tax;
+
+    const lines = taxed.map((line, index) => ({
+      object: 'invoice_line_item' as const,
+      id: `upcoming_${index}`,
+      invoice: 'upcoming',
+      subscription: line.subscription,
+      subscription_item: line.subscriptionItem,
+      source: line.source,
+      price: line.price,
+      kind: line.kind,
+      proration: line.proration,
+      description: line.description,
+      explanation: line.explanation,
+      quantity: line.quantity,
+      amount: line.amount,
+      currency: line.currency,
+      period: line.period,
+      proration_fraction: line.fraction,
+      breakdown: line.breakdown,
+      tax: line.tax,
+      released: false,
+    }));
 
     return {
       object: 'invoice',
@@ -1763,36 +1922,12 @@ export class Billing {
       collection_method: sub.collection_method,
       period,
       arrears_period: { start: sub.current_period_start, end: sub.current_period_end },
-      lines: drafts.map((line, index) => ({
-        object: 'invoice_line_item' as const,
-        id: `upcoming_${index}`,
-        invoice: 'upcoming',
-        subscription: line.subscription,
-        subscription_item: line.subscriptionItem,
-        source: line.source,
-        price: line.price,
-        kind: line.kind,
-        proration: line.proration,
-        description: line.description,
-        explanation: line.explanation,
-        quantity: line.quantity,
-        amount: line.amount,
-        currency: line.currency,
-        period: line.period,
-        proration_fraction: line.fraction,
-        breakdown: line.breakdown,
-        // Untaxed, exactly like issuance: the rate engine in tax.ts is built but
-        // not yet wired into Invoices.issue(). The preview must mirror whatever
-        // issuance does or it stops being a preview, so this stays zero until
-        // both sides are taxed together.
-        tax: UNTAXED,
-        released: false,
-      })),
+      lines,
       subtotal,
       balance_applied: balanceApplied,
-      tax: 0,
-      total_taxes: [],
-      total_excluding_tax: subtotal,
+      tax,
+      total_taxes: taxSummaryOf(lines),
+      total_excluding_tax: total - tax,
       pre_payment_credit_notes_amount: 0,
       post_payment_credit_notes_amount: 0,
       total,

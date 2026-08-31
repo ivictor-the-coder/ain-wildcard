@@ -34,13 +34,22 @@ export function Tabs<T extends string>({
 }: TabsProps<T>) {
   const ref = useRef<HTMLDivElement>(null);
 
+  // Selecting a tab has to carry focus with it. Home and End used to call
+  // `onChange` on their own, which moved the roving tabindex to the new tab
+  // while `document.activeElement` stayed on the old one — the ring sat on
+  // "Invoices" while "Usage" was selected, and the next Tab left the tablist
+  // from a tab that was no longer part of it.
+  const selectTab = (id: T) => {
+    onChange(id);
+    requestAnimationFrame(() => ref.current?.querySelector<HTMLElement>(`[data-tab="${CSS.escape(id)}"]`)?.focus());
+  };
+
   const move = (delta: number) => {
     const enabled = tabs.filter((t) => !t.disabled);
     const index = enabled.findIndex((t) => t.id === value);
     const next = enabled[(index + delta + enabled.length) % enabled.length];
     if (!next) return;
-    onChange(next.id);
-    requestAnimationFrame(() => ref.current?.querySelector<HTMLElement>(`[data-tab="${next.id}"]`)?.focus());
+    selectTab(next.id);
   };
 
   return (
@@ -53,8 +62,8 @@ export function Tabs<T extends string>({
         onKeyDown={(e) => {
           if (e.key === 'ArrowRight') { e.preventDefault(); move(1); }
           else if (e.key === 'ArrowLeft') { e.preventDefault(); move(-1); }
-          else if (e.key === 'Home') { e.preventDefault(); const f = tabs.find((t) => !t.disabled); if (f) onChange(f.id); }
-          else if (e.key === 'End') { e.preventDefault(); const l = [...tabs].reverse().find((t) => !t.disabled); if (l) onChange(l.id); }
+          else if (e.key === 'Home') { e.preventDefault(); const f = tabs.find((t) => !t.disabled); if (f) selectTab(f.id); }
+          else if (e.key === 'End') { e.preventDefault(); const l = [...tabs].reverse().find((t) => !t.disabled); if (l) selectTab(l.id); }
         }}
       >
         {tabs.map((tab) => {
@@ -64,6 +73,10 @@ export function Tabs<T extends string>({
               key={tab.id}
               type="button"
               data-tab={tab.id}
+              // `TabPanel` labels itself with `aria-labelledby={id}`; without
+              // this the reference pointed at nothing and a screen reader
+              // announced the panel unnamed.
+              id={role === 'tablist' ? tab.id : undefined}
               role={role === 'tablist' ? 'tab' : undefined}
               aria-selected={selected}
               aria-controls={role === 'tablist' ? `panel-${tab.id}` : undefined}

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from 'react';
 import { cx } from './layout';
 import { ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon, Icons, XCircleIcon } from './icons';
 import { Button, IconButton } from './controls';
@@ -29,12 +29,19 @@ export interface CalendarProps {
   today?: number;
   /** Hide the arrows when two calendars share one header. */
   hideNav?: 'left' | 'right' | 'none';
+  /**
+   * Mirrors out the day the roving tabindex is on, so the popover that owns the
+   * calendar can hand focus straight to it. Opening a picker with the keyboard
+   * used to land on "Previous month", two Tabs away from the grid, where the
+   * arrow keys the calendar implements did nothing at all.
+   */
+  dayRef?: MutableRefObject<HTMLButtonElement | null>;
   className?: string;
 }
 
 export function Calendar({
   value, onSelect, range, hoverTs, onHover, month: monthProp, onMonthChange, min, max,
-  locale = 'en-US', weekStartsOn = 0, today = Date.now(), hideNav = 'none', className,
+  locale = 'en-US', weekStartsOn = 0, today = Date.now(), hideNav = 'none', dayRef, className,
 }: CalendarProps) {
   // The month is a caller's number — an API field, a decoded query string, a bad
   // import. Out of range it makes every `getUTC*` NaN and throws in the month
@@ -105,13 +112,15 @@ export function Calendar({
           const isEnd = effectiveRange?.end != null && isSameDay(d.ts, effectiveRange.end);
           const within = effectiveRange ? inRange(d.ts, effectiveRange) : false;
           const isToday = isSameDay(d.ts, now);
+          const hasRovingFocus = isSameDay(d.ts, focusTs);
           return (
             <button
               key={d.ts}
               type="button"
               role="gridcell"
-              data-focus={isSameDay(d.ts, focusTs)}
-              tabIndex={isSameDay(d.ts, focusTs) ? 0 : -1}
+              ref={(node) => { if (dayRef && hasRovingFocus) dayRef.current = node; }}
+              data-focus={hasRovingFocus}
+              tabIndex={hasRovingFocus ? 0 : -1}
               disabled={disabled(d.ts)}
               aria-selected={selected || isStart || isEnd}
               aria-label={formatDate(d.ts, { locale, timeZone: 'UTC' })}
@@ -162,6 +171,7 @@ export function DatePicker({
   const fmt = useFormat();
   const field = useFieldControl({ id, invalid, disabled });
   const anchor = useRef<HTMLButtonElement>(null);
+  const day = useRef<HTMLButtonElement | null>(null);
   const [open, setOpen] = useState(false);
   const [month, setMonth] = useState(() => startOfMonthUtc(value ?? fmt.now()));
 
@@ -199,8 +209,9 @@ export function DatePicker({
           </span>
         )}
       </button>
-      <Popover open={open} onClose={() => setOpen(false)} anchor={anchor} placement="bottom-start" flush ariaLabel="Choose a date">
+      <Popover open={open} onClose={() => setOpen(false)} anchor={anchor} placement="bottom-start" flush ariaLabel="Choose a date" initialFocus={day}>
         <Calendar
+          dayRef={day}
           value={value}
           month={month}
           onMonthChange={setMonth}
@@ -244,6 +255,7 @@ export function DateRangePicker({
 }: DateRangePickerProps) {
   const fmt = useFormat();
   const anchor = useRef<HTMLButtonElement>(null);
+  const day = useRef<HTMLButtonElement | null>(null);
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<DateRange>(value);
   const [hover, setHover] = useState<number | null>(null);
@@ -286,7 +298,7 @@ export function DateRangePicker({
         </span>
         <ChevronDownIcon size={14} className="ain-input__icon" />
       </button>
-      <Popover open={open} onClose={() => setOpen(false)} anchor={anchor} placement="bottom-start" flush ariaLabel="Choose a date range">
+      <Popover open={open} onClose={() => setOpen(false)} anchor={anchor} placement="bottom-start" flush ariaLabel="Choose a date range" initialFocus={day}>
         <div className="ain-daterange__body" style={{ padding: 'var(--space-5)' }}>
           {presets.length > 0 && (
             <div className="ain-daterange__presets">
@@ -304,6 +316,7 @@ export function DateRangePicker({
           )}
           <div className="ain-cal__months">
             <Calendar
+              dayRef={day}
               month={month}
               onMonthChange={setMonth}
               range={draft}

@@ -11,7 +11,7 @@ import { Menu, MenuButton, Popover, type MenuSection } from './overlays';
 import { EmptyState, ErrorState, Skeleton } from './feedback';
 import { ErrorBoundary } from './error-boundary';
 import { formatNumber, humanize, useFormat } from './format';
-import { useDocumentDensity, useIsomorphicLayoutEffect, useVirtualRows } from './hooks';
+import { scrollIntoViewport, useDocumentDensity, useIsomorphicLayoutEffect, useVirtualRows } from './hooks';
 import { DAY, startOfDay } from '../../shared/time';
 import {
   EMPTY_TABLE_STATE, activeFilterCount, dateExtent, describeFilter, extendSelection, filterRows,
@@ -119,6 +119,24 @@ const defaultAccessor = <T,>(column: DataTableColumn<T>) => (row: T): CellValue 
 const columnLabel = <T,>(column: DataTableColumn<T>): string =>
   column.filterLabel ?? column.headerTitle ?? (typeof column.header === 'string' ? column.header : column.id);
 
+/**
+ * The browser scrolls the *control* it just focused into view. These rows are
+ * taller than the 16px checkbox inside them, so clearing the checkbox still
+ * leaves the row it belongs to clipped by the scroller's edge — or under a
+ * sticky Done bar painted over it. Reveal the row instead.
+ */
+const revealRow = (e: React.FocusEvent<HTMLElement>) => scrollIntoViewport(e.currentTarget);
+
+interface StickyChrome { head: number; foot: number }
+
+/** The height a band steals from the viewport — zero unless it is really stuck. */
+const stickyBandHeight = (band: HTMLTableSectionElement | null): number => {
+  if (!band || typeof getComputedStyle === 'undefined') return 0;
+  const cell = band.querySelector<HTMLElement>('th, td');
+  if (!cell || getComputedStyle(cell).position !== 'sticky') return 0;
+  return band.offsetHeight;
+};
+
 const KIND_ICON: Record<FilterKind, keyof typeof Icons> = {
   text: 'file-text', set: 'list', number: 'hash', date: 'calendar',
 };
@@ -202,6 +220,8 @@ function DataTableGrid<T>({
   const columnsAnchor = useRef<HTMLButtonElement>(null);
   const addAnchor = useRef<HTMLButtonElement>(null);
   const bodyRef = useRef<HTMLTableSectionElement>(null);
+  const headRef = useRef<HTMLTableSectionElement>(null);
+  const footRef = useRef<HTMLTableSectionElement>(null);
 
   const workspaceDensity = useDocumentDensity();
   // The workspace setting wins until someone overrides it for this table.
@@ -254,14 +274,22 @@ function DataTableGrid<T>({
   // Rows can be taller than the density constant when a cell stacks two lines,
   // so the window is driven by the height actually rendered, not the guess.
   const [measuredRow, setMeasuredRow] = useState<number | null>(null);
+  // The header and the totals row are pinned *over* the scroll box, so the band
+  // an operator can see is shorter than the box at both ends. Measuring them is
+  // what keeps ArrowDown from parking the focused row underneath the header
+  // instead of above it — off by exactly one header, every row from ~20 on.
+  const [chrome, setChrome] = useState<StickyChrome>({ head: 0, foot: 0 });
   useIsomorphicLayoutEffect(() => {
     const row = bodyRef.current?.querySelector<HTMLElement>('tr[data-index]');
     const height = row?.offsetHeight ?? 0;
     if (height > 0 && height !== measuredRow) setMeasuredRow(height);
+    const next = { head: stickyBandHeight(headRef.current), foot: stickyBandHeight(footRef.current) };
+    setChrome((prev) => (prev.head === next.head && prev.foot === next.foot ? prev : next));
   });
   const rowHeight = measuredRow ?? ROW_HEIGHT[density];
   const virtual = useVirtualRows(scrollRef, {
     count: processed.length, rowHeight, overscan: 8, threshold: virtualiseAfter,
+    headerOffset: chrome.head, footerOffset: chrome.foot,
   });
 
   useEffect(() => { setFocusIndex(-1); }, [query, sort, filters]);
@@ -320,6 +348,13 @@ function DataTableGrid<T>({
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTableSectionElement>) => {
     if (!processed.length) return;
+    const from = focusIndex >= 0 ? focusIndex : virtual.startIndex;
+    // A page is the rows that actually fit between the sticky header and the
+    // totals row — never the whole box, or paging walks the selection under the
+    // chrome it just scrolled past.
+    const box = scrollRef.current;
+    const band = Math.min(box?.clientHeight ?? 0, typeof window === 'undefined' ? Infinity : window.innerHeight);
+    const page = Math.max(1, Math.floor((band - chrome.head - chrome.foot) / rowHeight));
     const moveTo = (next: number) => {
       setFocusIndex(next);
       virtual.scrollToIndex(next);
@@ -333,6 +368,11 @@ function DataTableGrid<T>({
     };
     if (e.key === 'ArrowDown') { e.preventDefault(); moveTo(Math.min(processed.length - 1, focusIndex + 1)); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); moveTo(Math.max(0, focusIndex - 1)); }
+    // Without these two the browser scrolls the box instead: the virtualiser
+    // unmounts the focused row and `document.activeElement` falls to <body>,
+    // which costs a Tab walk back into the grid from the top of the page.
+    else if (e.key === 'PageDown') { e.preventDefault(); moveTo(Math.min(processed.length - 1, from + page)); }
+    else if (e.key === 'PageUp') { e.preventDefault(); moveTo(Math.max(0, from - page)); }
     else if (e.key === 'Home') { e.preventDefault(); moveTo(0); virtual.scrollToIndex(0, 'start'); }
     else if (e.key === 'End') { e.preventDefault(); moveTo(processed.length - 1); }
     else if (e.key === 'Enter' && focusIndex >= 0) { e.preventDefault(); onRowClick?.(processed[focusIndex]); }
@@ -344,8 +384,31 @@ function DataTableGrid<T>({
   useEffect(() => {
     if (focusIndex < 0) return;
     const row = bodyRef.current?.querySelector<HTMLTableRowElement>(`[data-index="${focusIndex}"]`);
-    row?.focus({ preventScroll: true });
+    // Tabbing into a row's checkbox or its "…" button raises `onFocus` on the
+    // row as well, and pulling focus onto the row here swallowed the control
+    // the operator was reaching for — every row cost two Tabs and the checkbox
+    // could never be reached on the first one. Move focus only when it is not
+    // already inside the row.
+    if (!row || row.contains(document.activeElement)) return;
+    row.focus({ preventScroll: true });
+    // `scrollToIndex` has already placed the row inside the scroll box — but a
+    // grid given no `maxHeight` has no box to scroll: it flows down the page,
+    // and the arrows used to march the focused row off the bottom of the
+    // window, 800px past anything the operator could see. `nearest` does
+    // nothing when the row is already visible, so the box case is untouched.
+    const rect = row.getBoundingClientRect();
+    if (rect.top < 0 || rect.bottom > window.innerHeight) row.scrollIntoView({ block: 'nearest' });
   }, [focusIndex, virtual.startIndex]);
+
+  // Roving tabindex needs one row that answers Tab. `focusIndex` is -1 on mount
+  // and again after every search, sort or filter, so keying the tabindex off it
+  // alone left all 30 rows at tabindex="-1": Tab walked straight past the grid
+  // and the arrow-key model below was unreachable — fatally so on a table with
+  // no checkboxes and no row actions, where nothing inside the body is
+  // focusable at all. Fall back to the first row currently rendered.
+  const entryIndex = focusIndex >= virtual.startIndex && focusIndex < virtual.endIndex
+    ? focusIndex
+    : virtual.startIndex;
 
   const windowRows = virtual.virtualised ? processed.slice(virtual.startIndex, virtual.endIndex) : processed;
   const columnCount = visibleColumns.length + (selectable ? 1 : 0) + (rowActions ? 1 : 0);
@@ -430,10 +493,11 @@ function DataTableGrid<T>({
                 placement="bottom-end"
                 title="Visible columns"
                 flush
+                className="ain-colpop"
               >
                 <div className="ain-table__colmenu">
                   {columns.map((column) => (
-                    <label className="ain-table__colitem" key={column.id}>
+                    <label className="ain-table__colitem" key={column.id} onFocus={revealRow}>
                       <Checkbox
                         checked={!hiddenColumns.has(column.id)}
                         disabled={column.hideable === false || column.pinned}
@@ -555,7 +619,13 @@ function DataTableGrid<T>({
       <div
         className="ain-table__scroll"
         ref={scrollRef}
-        style={{ maxHeight: typeof maxHeight === 'number' ? `${maxHeight}px` : maxHeight }}
+        // The same measurements the virtualiser uses, handed to the browser for
+        // the scrolls it performs itself — Tab into a row's checkbox, find in
+        // page, an anchor jump. Without it those land the row under the header.
+        style={{
+          maxHeight: typeof maxHeight === 'number' ? `${maxHeight}px` : maxHeight,
+          scrollPaddingBlock: `${chrome.head}px ${chrome.foot}px`,
+        }}
         onScroll={(e) => setScrolledX(e.currentTarget.scrollLeft > 0)}
       >
         <table
@@ -570,7 +640,7 @@ function DataTableGrid<T>({
             ))}
             {rowActions && <col style={{ width: 44 }} />}
           </colgroup>
-          <thead>
+          <thead ref={headRef}>
             <tr>
               {selectable && (
                 <th className="ain-table__selectcell is-pinned" scope="col">
@@ -639,7 +709,7 @@ function DataTableGrid<T>({
                   data-index={index}
                   aria-rowindex={index + 1}
                   aria-selected={selectable ? isSelected : undefined}
-                  tabIndex={index === focusIndex ? 0 : -1}
+                  tabIndex={index === entryIndex ? 0 : -1}
                   className={cx(
                     onRowClick && 'is-clickable',
                     isSelected && 'is-selected',
@@ -719,7 +789,7 @@ function DataTableGrid<T>({
           </tbody>
 
           {hasTotals && processed.length > 0 && !error && (
-            <tfoot>
+            <tfoot ref={footRef}>
               <tr>
                 {selectable && <td className="ain-table__selectcell is-pinned" />}
                 {visibleColumns.map((column) => (
@@ -815,6 +885,7 @@ function FilterChip<T>({
         title={label}
         flush
         ariaLabel={`${label} filter`}
+        className={`ain-filterpop ain-filterpop--${filter.kind}`}
       >
         <FilterEditor
           column={column}
@@ -907,7 +978,7 @@ function SetEditor<T>({
       <div className="ain-filtered__list" role="group" aria-label={`${columnLabel(column)} values`}>
         {shown.length === 0 && <p className="ain-filtered__none">No value matches “{search.trim()}”.</p>}
         {shown.map((option) => (
-          <div className="ain-filtered__opt" key={option.value}>
+          <div className="ain-filtered__opt" key={option.value} onFocus={revealRow}>
             <Checkbox checked={selectedSet.has(option.value)} onChange={() => toggle(option.value)} label={optionLabel(option.value)} />
             <span className="ain-filtered__count">{formatNumber(option.count)}</span>
           </div>

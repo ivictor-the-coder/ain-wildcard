@@ -417,6 +417,12 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
     return [ranked];
   }
 
+  // "Explain invoice in_…" is a question about one bill. Measuring the
+  // workspace's quarter, listing its open deals and counting its tickets
+  // answers a different question and buries the one that was asked, so a record
+  // named by id is left to the tools that can actually read it.
+  const ledgerRecord = entities.find((e) => e.rule === 'id' && ['invoice', 'subscription', 'product'].includes(e.entity.type));
+
   switch (intent) {
     case 'aggregate': {
       const namedType = input.types.find((t) => t !== 'activity' && t !== 'customer');
@@ -454,7 +460,8 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
       }
       break;
 
-    case 'explain':
+    case 'explain': {
+      if (ledgerRecord && !subject) break;
       steps.push(metricStep(subject?.id, `Measure ${metric?.metric.label ?? 'the trend'} for ${window.label} against the previous period.`));
       steps.push(builtin('record_aggregate', {
         object_type: 'deal',
@@ -477,6 +484,7 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
         end: window.end,
       }, 'Group losses by reason — the usual explanation for a drop.', 0.85));
       break;
+    }
 
     case 'lookup': {
       const person = entities.find((e) => e.entity.type === 'user');
@@ -498,6 +506,19 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
       }
       if (subject) {
         steps.push(builtin('account_profile', { id: subject.id }, `"${subject.label}" resolved to a record; load its full profile.`));
+        // "What are their open tickets?" names a type as well as an account.
+        // The profile mentions the count; only the list answers the question.
+        const scopedType = input.types.find((t) => t !== 'activity' && t !== 'customer' && t !== 'company');
+        if (scopedType) {
+          const conditions = inferConditions(input.question, scopedType, input.stages);
+          steps.push(builtin('record_search', {
+            object_type: scopedType,
+            ...(conditions.length ? { conditions } : {}),
+            associated_to: subject.id,
+            ...(scopedType === 'deal' ? { order_by: 'amount' } : {}),
+            limit: 10,
+          }, `The question asks for ${scopedType} records on ${subject.label}${conditions.length ? `, qualified by ${conditions.map((c) => c.property).join(' and ')}` : ''}.`, 0.9));
+        }
       } else if (input.namedSomething && !input.types.length) {
         // With an object type in the question, a typed list beats a fuzzy
         // workspace search — "which deals are slipping" is about deals, not
@@ -600,7 +621,7 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
   // the honest answer is that nothing changed, and reading the quarter's
   // bookings to fill the silence would spend the budget and hang citations for
   // records the answer never mentions off a sentence about a failed write.
-  if (!steps.length && intent !== 'act') {
+  if (!steps.length && intent !== 'act' && !ledgerRecord) {
     steps.push(metricStep(undefined, `Nothing specific was named, so the answer opens with ${metric?.metric.label ?? 'bookings'} for ${window.label}.`));
     steps.push(builtin('record_search', {
       object_type: 'deal',
@@ -625,7 +646,7 @@ const TYPE_HINTS: Record<string, string[]> = {
   company: ['company', 'account', 'organisation', 'organization'],
   contact: ['contact', 'person', 'people', 'lead'],
   deal: ['deal', 'opportunity', 'pipeline'],
-  ticket: ['ticket', 'support', 'case'],
+  ticket: ['ticket', 'case', 'escalation', 'helpdesk'],
   invoice: ['invoice', 'billing', 'payment'],
   subscription: ['subscription', 'plan'],
   product: ['product', 'price', 'catalog', 'catalogue'],
@@ -643,9 +664,14 @@ export function scoreTool(tool: AiToolDef, input: Pick<PlanInput, 'question' | '
   let score = hits / Math.min(new Set(questionStems).size, 8);
   score = Math.min(score, 1) * 0.7 + trigramSimilarity(input.question, `${tool.name} ${tool.description.slice(0, 120)}`) * 0.3;
 
+  let onTopic = !input.types.length;
   for (const type of input.types) {
-    for (const hint of TYPE_HINTS[type] ?? []) if (haystack.includes(hint)) { score += 0.12; break; }
+    for (const hint of TYPE_HINTS[type] ?? []) if (haystack.includes(hint)) { score += 0.12; onTopic = true; break; }
   }
+  // "What are their open tickets?" is not a question about invoices, however
+  // many of its words a billing tool happens to share. A tool that speaks about
+  // none of the object types the question named starts from further back.
+  if (!onTopic) score *= 0.6;
   // A write is never chosen because it *sounds* relevant. Writes come only from
   // `planWrite`, which has to extract real arguments before it will propose one.
   if (!tool.readOnly) return 0;
@@ -655,6 +681,8 @@ export function scoreTool(tool: AiToolDef, input: Pick<PlanInput, 'question' | '
 interface FillContext {
   question: string;
   window: TimeWindow;
+  /** The workspace clock — "overdue" means before now, not before the window. */
+  now: number;
   entities: ResolvedEntity[];
   subject: MetricSubject | null;
   metric: MetricDetection | null;
@@ -662,18 +690,84 @@ interface FillContext {
   types: string[];
   /** Read tools may fall back to the raw question; writes may never. */
   readOnly: boolean;
+  /** Ids the first pass returned — how a second pass reaches a typed argument. */
+  harvestedIds?: string[];
 }
 
 const ID_FIELD = /(^|_)(id|ids|record_id|customer_id|company_id|account_id|contact_id|deal_id|subject_id|entity_id)$/;
-const QUERY_FIELD = /^(q|query|search|text|term|question|prompt|message|body|content|input)$/;
+/** Fields whose value genuinely is the sentence the person typed. */
+const QUERY_FIELD = /^(q|query|search|text|term|question|prompt|message|body|content|input|instruction)$/;
 const LIMIT_FIELD = /^(limit|max|count|top|size|per_page)$/;
 const START_FIELD = /^(start|from|since|start_at|start_date|after|period_start)$/;
 const END_FIELD = /^(end|to|until|end_at|end_date|before|period_end)$/;
 const TYPE_FIELD = /^(object_type|type|entity_type|record_type|resource)$/;
+/** A parameter that names an account rather than describing one. */
+const ACCOUNT_FIELD = /^(customer|customer_ref|account|client|subscriber)$/;
+const DUE_FIELD = /^(due_before|overdue_before|due_by|before_date)$/;
+const OVERDUE = /\b(overdue|past\s+due|late|owed|owing|outstanding|unpaid|arrears|not\s+paid)\b/i;
+
+/**
+ * An id of a stated kind, written in the question.
+ *
+ * `v.id('in')` publishes its prefix in the schema, so "Explain invoice
+ * in_74A4fHpece5SDbwX" can hand `billing_explain_invoice` the id it contains
+ * instead of the sentence that contains it — which is what the tool rejected.
+ */
+export const idPrefixOf = (node: SchemaNode): string | null =>
+  node.format && node.format.startsWith('id:') ? node.format.slice(3) : null;
+
+export function idOfKind(text: string, prefix: string): string | null {
+  const match = text.match(new RegExp(`\\b${prefix}_[A-Za-z0-9][A-Za-z0-9_]{1,40}\\b`));
+  return match ? match[0] : null;
+}
+
+/**
+ * Words that select an enum member without spelling it. "Which invoices are
+ * overdue" has to reach `status: open_like`, or the answer lists the whole book
+ * and calls it the overdue ones.
+ */
+const ENUM_SYNONYMS: [string, RegExp][] = [
+  ['past_due', /\b(past\s+due|overdue|dunning|failed\s+payment)\b/i],
+  ['uncollectible', /\b(uncollectible|written\s+off|write[-\s]off)\b/i],
+  ['open_like', /\b(open|overdue|past\s+due|outstanding|unpaid|owed|owing|due|not\s+paid)\b/i],
+  ['active_like', /\b(active|live|running|current|still\s+on)\b/i],
+  ['trialing', /\b(trial|trialing|trialling|in\s+trial)\b/i],
+  ['canceled', /\b(cancell?ed|churned|ended)\b/i],
+  ['paused', /\bpaused?\b/i],
+  ['draft', /\bdrafts?\b/i],
+  ['void', /\bvoid(ed)?\b/i],
+  ['paid', /\b(paid|settled|collected)\b/i],
+  ['all', /\b(all|every|any|whole\s+book)\b/i],
+];
+
+function enumFromQuestion(options: readonly string[], question: string): string | undefined {
+  const text = normalise(question);
+  // A member named outright wins over one inferred from a synonym.
+  const named = options.find((option) => option.length > 3 && text.includes(normalise(option)));
+  if (named) return named;
+  for (const [option, pattern] of ENUM_SYNONYMS) {
+    if (options.includes(option) && pattern.test(question)) return option;
+  }
+  return undefined;
+}
 
 function fillField(name: string, node: SchemaNode, context: FillContext): unknown {
   if (node.default !== undefined) return node.default;
 
+  // A typed id is filled from an id of that type, or not at all. Handing a
+  // `sub_`-shaped parameter a company id, or the sentence, is a call that can
+  // only fail — and it failed invisibly, two lines under a confident answer.
+  const prefix = idPrefixOf(node);
+  if (prefix) {
+    return idOfKind(context.question, prefix)
+      ?? context.entities.find((e) => e.entity.id.startsWith(`${prefix}_`))?.entity.id
+      ?? context.harvestedIds?.find((id) => id.startsWith(`${prefix}_`));
+  }
+  if (ACCOUNT_FIELD.test(name)) {
+    return idOfKind(context.question, 'cus')
+      ?? context.entities.find((e) => e.entity.type === 'customer')?.entity.id
+      ?? context.harvestedIds?.find((id) => id.startsWith('cus_'));
+  }
   if (ID_FIELD.test(name)) {
     const wanted = name.replace(/_id$/, '');
     const match = context.entities.find((e) => e.entity.type === wanted) ?? context.entities[0];
@@ -686,28 +780,24 @@ function fillField(name: string, node: SchemaNode, context: FillContext): unknow
   }
   if (QUERY_FIELD.test(name)) return context.question;
   if (LIMIT_FIELD.test(name)) return node.type === 'integer' || node.type === 'number' ? Math.min(node.max ?? 10, 10) : undefined;
+  if (DUE_FIELD.test(name)) return OVERDUE.test(context.question) ? context.now : undefined;
   if (START_FIELD.test(name)) return context.window.start;
   if (END_FIELD.test(name)) return context.window.end;
   if (name === 'metric' && context.metric) return context.metric.metric.id;
   if (name === 'group_by' || name === 'groupby') return context.groupBy === 'none' ? undefined : context.groupBy;
   if (/^(days|days_back|lookback|window_days)$/.test(name)) return Math.max(1, Math.round((context.window.end - context.window.start) / 86_400_000));
 
-  if (node.enum?.length) {
-    const text = normalise(context.question);
-    const hit = node.enum.find((option) => text.includes(normalise(option)));
-    if (hit) return hit;
-  }
+  if (node.enum?.length) return enumFromQuestion(node.enum, context.question);
   if (node.type === 'boolean') return undefined;
   if (node.type === 'integer' || node.type === 'number') {
     const match = context.question.match(/\b(\d{1,6})\b/);
     return match ? Number(match[1]) : undefined;
   }
-  if (node.type === 'string' && !node.optional && context.readOnly) {
-    // A required free-text field on a *read* gets the question itself; on a
-    // write it stays empty, because pasting a prompt into a customer's record
-    // is how an account history becomes unreadable.
-    return context.question;
-  }
+  // Anything else required and free-text — a feature key, a price lookup key, a
+  // meter — has no value that can be read out of the sentence. The step is
+  // dropped rather than run with the prompt in the parameter: a tool call that
+  // can only fail is worse than one that never happened, because it fails
+  // quietly under an answer that looks finished.
   return undefined;
 }
 
@@ -734,11 +824,27 @@ export function fillArguments(tool: AiToolDef, context: FillContext): FilledArgu
   return { args, missing };
 }
 
+/** A tool the question wanted and the question could not arm. */
+export interface SkippedTool {
+  tool: string;
+  /** Parameters nothing in the question or the resolved records could fill. */
+  missing: string[];
+  relevance: number;
+}
+
+export interface PlanResult {
+  steps: PlannedStep[];
+  skipped: SkippedTool[];
+}
+
 /**
  * Build the ordered plan: the canonical steps for the intent, then any
  * registered tool that scores well enough and whose arguments can be filled.
+ * A tool that matches but cannot be armed is reported rather than run with the
+ * question in its parameters — a call that can only fail is worse than one that
+ * never happened, because it fails quietly underneath a finished-looking answer.
  */
-export function planSteps(input: PlanInput): PlannedStep[] {
+export function planTools(input: PlanInput): PlanResult {
   // A caller that scopes a run to two tools gets exactly those two. The
   // allowlist is applied to the canonical plan as well as to the generic
   // matcher, because the built-in capabilities are registered tools like any
@@ -749,6 +855,7 @@ export function planSteps(input: PlanInput): PlannedStep[] {
   const context: FillContext = {
     question: input.question,
     window: input.window,
+    now: input.workspace.now,
     entities: input.entities,
     subject: input.subject,
     metric: input.metric,
@@ -777,12 +884,16 @@ export function planSteps(input: PlanInput): PlannedStep[] {
     .sort((a, b) => b.relevance - a.relevance)
     .slice(0, 4);
 
+  const skipped: SkippedTool[] = [];
   for (const candidate of candidates) {
     if (steps.length >= input.maxSteps) break;
     // Once the canonical plan has real coverage, only a strong match earns a slot.
     if (steps.length >= 2 && candidate.relevance < 0.55) break;
     const { args, missing } = fillArguments(candidate.tool, context);
-    if (missing.length) continue;
+    if (missing.length) {
+      skipped.push({ tool: candidate.tool.name, missing, relevance: candidate.relevance });
+      continue;
+    }
     steps.push({
       tool: candidate.tool.name,
       args,
@@ -793,7 +904,25 @@ export function planSteps(input: PlanInput): PlannedStep[] {
     planned.add(candidate.tool.name);
   }
 
-  return steps.slice(0, input.maxSteps);
+  return { steps: steps.slice(0, input.maxSteps), skipped };
+}
+
+export const planSteps = (input: PlanInput): PlannedStep[] => planTools(input).steps;
+
+/** Every id a first pass returned, so a second pass can arm a typed parameter. */
+export function harvestIds(results: unknown[]): string[] {
+  const found = new Set<string>();
+  const walk = (value: unknown, depth: number): void => {
+    if (found.size >= 40 || depth > 4) return;
+    if (typeof value === 'string') {
+      if (/^[a-z][a-z_]{1,14}_[A-Za-z0-9][A-Za-z0-9_]{1,40}$/.test(value)) found.add(value);
+      return;
+    }
+    if (Array.isArray(value)) { for (const item of value.slice(0, 20)) walk(item, depth + 1); return; }
+    if (value && typeof value === 'object') for (const item of Object.values(value as Record<string, unknown>)) walk(item, depth + 1);
+  };
+  for (const result of results) walk(result, 0);
+  return [...found];
 }
 
 /**
@@ -801,10 +930,50 @@ export function planSteps(input: PlanInput): PlannedStep[] {
  * a search that pinned down one record, an aggregate with an obvious follow-up
  * — so it may plan one more round inside the remaining budget.
  */
-export function replan(input: PlanInput, executed: { tool: string; result: unknown }[], remaining: number): PlannedStep[] {
+export function replan(
+  input: PlanInput,
+  executed: { tool: string; result: unknown }[],
+  remaining: number,
+  skipped: SkippedTool[] = [],
+): PlannedStep[] {
   if (remaining <= 0) return [];
   const done = new Set(executed.map((e) => e.tool));
   const steps: PlannedStep[] = [];
+
+  // A tool the first pass could not arm gets one more chance against what the
+  // first pass returned: "the upcoming invoice for Sakamoto Seiki" names no
+  // `sub_` id, but the step that listed their subscriptions did.
+  const harvested = harvestIds(executed.map((e) => e.result));
+  if (harvested.length) {
+    const context: FillContext = {
+      question: input.question,
+      window: input.window,
+      now: input.workspace.now,
+      entities: input.entities,
+      subject: input.subject,
+      metric: input.metric,
+      groupBy: input.groupBy,
+      types: input.types,
+      readOnly: true,
+      harvestedIds: harvested,
+    };
+    for (const candidate of skipped) {
+      if (steps.length >= remaining || done.has(candidate.tool)) continue;
+      if (input.allowedTools && !input.allowedTools.has(candidate.tool)) continue;
+      const tool = input.tools.find((t) => t.name === candidate.tool);
+      if (!tool || !tool.readOnly) continue;
+      const { args, missing } = fillArguments(tool, context);
+      if (missing.length) continue;
+      steps.push({
+        tool: tool.name,
+        args,
+        why: `The first pass returned the ${candidate.missing.join(' and ')} "${tool.name}" needed, so it can run now.`,
+        builtin: null,
+        relevance: candidate.relevance,
+      });
+      done.add(tool.name);
+    }
+  }
 
   const search = executed.find((e) => e.tool === 'workspace_search');
   if (search && !done.has('account_profile')) {

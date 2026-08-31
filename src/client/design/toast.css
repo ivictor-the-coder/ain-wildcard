@@ -30,3 +30,7 @@
 @media (max-width: 520px) {
   .ain-toaster { inset-inline-start: var(--space-5); inset-inline-end: var(--space-5); bottom: var(--space-5); width: auto; }
 }
+
+/* The stack is reachable with F6, so it needs to show where focus landed. */
+.ain-toast:focus-visible { outline: none; box-shadow: var(--shadow-lg), var(--focus-ring); }
+.ain-toast:focus-within { border-color: var(--border-focus); }

@@ -257,10 +257,16 @@ function rawRowsFor(price: Price, resolved: ResolvedPrice, quantity: number, opt
   if (price.model === 'flat') {
     const unit = resolved.unitAmount;
     if (!unit) throw badRequest('price_incomplete', `Price ${price.id} has no amount in ${resolved.currency.toUpperCase()}.`, 'price');
+    const name = price.nickname || 'Flat fee';
     return {
       billable: 1,
       rows: [{
-        kind: 'flat', label: price.nickname || 'Flat fee', tier: null, up_to: null,
+        kind: 'flat',
+        // The quantity is not billed, so the row that swallowed it says so.
+        label: quantity === 1
+          ? name
+          : `${name} — one charge whatever the quantity (${quantity.toLocaleString('en-US')} ${pluralUnit(unitNoun, quantity)} asked for, 1 billed)`,
+        tier: null, up_to: null,
         quantity: 1, unitDecimal: ratToDecimal(unit), value: unit,
       }],
     };

@@ -44,9 +44,10 @@ export function installBuiltins(ctx: Ctx, crm: Crm, orgId: string): void {
         group_name: prop.group ?? 'Other', options: JSON.stringify(prop.options ?? []),
         reference_type: prop.reference_type ?? null,
         required: prop.required ? 1 : 0, unique_value: prop.unique ? 1 : 0,
-        read_only: prop.read_only || prop.calculated ? 1 : 0, system: 1, hidden: prop.hidden ? 1 : 0,
+        read_only: prop.read_only || prop.calculated || prop.rollup ? 1 : 0, system: 1, hidden: prop.hidden ? 1 : 0,
         default_value: prop.default_value === undefined || prop.default_value === null ? null : JSON.stringify(prop.default_value),
         validation: JSON.stringify(prop.validation ?? {}), calculated: prop.calculated ?? null,
+        rollup: prop.rollup ? JSON.stringify(prop.rollup) : null,
         currency: prop.currency ?? null, normalize: prop.normalize ?? 'none',
         position: prop.position ?? 500, created: now, updated: now,
       });

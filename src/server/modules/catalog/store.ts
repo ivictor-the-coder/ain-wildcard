@@ -10,9 +10,9 @@ import type { Ctx } from '../../kernel/context';
 import { parseJson } from '../../kernel/db';
 import { badRequest, conflict, notFound } from '../../../shared/errors';
 import { cursorOf, newId, parseCursor } from '../../../shared/ids';
-import { rat, ratMul, ratRound, ratSub } from '../../../shared/money';
+import { rat, ratCmp, ratMul, ratRound, ratSub } from '../../../shared/money';
 import { assertCurrency } from './currencies';
-import { decimalToRat, resolveForCurrency, validateTiers } from './engine';
+import { decimalToRat, pluralUnit, resolveForCurrency, validateTiers } from './engine';
 import { anchorUnitDecimal, describePrice, type PriceDisplay } from './format';
 import {
   PRODUCT_CATEGORIES, type CurrencyOption, type CustomUnitAmount, type Price, type PriceModel,
@@ -71,6 +71,8 @@ export interface PriceInput {
   tax_behavior?: TaxBehavior;
   proration_behavior?: ProrationBehavior;
   metadata?: Record<string, string>;
+  /** Take `lookup_key` off whichever price holds it, in this same transaction. */
+  transfer_lookup_key?: boolean;
 }
 
 export interface WriteMeta {
@@ -166,12 +168,62 @@ export function hydratePrice(row: any): Price {
 
 const LOOKUP_RE = /^[a-z0-9][a-z0-9_.-]{1,79}$/;
 
+const MAX_MINOR_UNITS = 1_000_000_000_000;
+
+/**
+ * One sentence for a negative amount, whichever field carried it. The integer
+ * fields are refused by `v.int({ min: 0 })` before a request ever reaches the
+ * store, so this repeats that assertion verbatim and then adds the remedy the
+ * operator actually wants.
+ */
+const NEGATIVE_AMOUNT =
+  'Must be greater than or equal to 0. A negative rate bills the customer backwards — discount with a coupon, refund with a credit note.';
+const HUGE_AMOUNT = 'Amount is implausibly large.';
+
 function checkAmount(value: number | null | undefined, param: string): number | null {
   if (value === null || value === undefined) return null;
   if (!Number.isInteger(value)) throw badRequest('parameter_invalid', 'Amounts are whole numbers of minor units — 1999 means 19.99.', param);
-  if (value < 0) throw badRequest('parameter_invalid', 'Amounts cannot be negative. Use a coupon or a credit note instead.', param);
-  if (value > 1_000_000_000_000) throw badRequest('parameter_invalid', 'Amount is implausibly large.', param);
+  if (value < 0) throw badRequest('parameter_invalid', NEGATIVE_AMOUNT, param);
+  if (value > MAX_MINOR_UNITS) throw badRequest('parameter_invalid', HUGE_AMOUNT, param);
   return value;
+}
+
+/**
+ * The same floor, under a sub-cent rate.
+ *
+ * `unit_amount` is an integer, so the route validator refuses a negative one
+ * before the store sees it. `unit_amount_decimal` is a *string*: the validator
+ * can only check its shape, and `decimalToRat` accepts a leading minus on
+ * purpose, because a proration credit is a genuinely negative rational. That
+ * left the one place where the shape of money is defined able to mint a price
+ * of -$0.04 per unit, which every downstream reader then billed faithfully —
+ * preview, estimate, subscription item and renewal invoice alike, turning a
+ * charge into a refund nobody authorised. So the sign is checked here, on the
+ * way into a price, against the exact rational and never a float; the parser
+ * stays sign-capable for the prorations that need it.
+ */
+function checkDecimalAmount(value: string | null | undefined, param: string): string | null {
+  if (value === null || value === undefined || value === '') return null;
+  const amount = decimalToRat(value, param);
+  if (amount.n < 0n) throw badRequest('parameter_invalid', NEGATIVE_AMOUNT, param);
+  if (ratCmp(amount, rat(MAX_MINOR_UNITS)) > 0) throw badRequest('parameter_invalid', HUGE_AMOUNT, param);
+  return value;
+}
+
+/**
+ * What a card statement can actually print. Both the create and the update path
+ * run this: a descriptor edited in afterwards reaches the same card networks as
+ * one set at creation, and they reject the same characters either way.
+ */
+function checkStatementDescriptor(descriptor: string | null | undefined): string | null {
+  if (descriptor === null || descriptor === undefined) return null;
+  if (descriptor.length > 22) {
+    throw badRequest('parameter_invalid', 'Statement descriptors are limited to 22 characters — that is all a card statement shows.', 'statement_descriptor');
+  }
+  if (/[<>"'*\\]/.test(descriptor)) {
+    throw badRequest('parameter_invalid', 'Statement descriptors cannot contain < > " \' * or \\.', 'statement_descriptor');
+  }
+  return descriptor;
 }
 
 function normalizeTiers(tiers: PriceTier[] | null | undefined, param: string): PriceTier[] | null {
@@ -182,14 +234,12 @@ function normalizeTiers(tiers: PriceTier[] | null | undefined, param: string): P
     if (up_to !== 'inf' && (!Number.isInteger(up_to) || up_to <= 0)) {
       throw badRequest('parameter_invalid', 'up_to must be a positive whole number or "inf".', `${path}.up_to`);
     }
-    if (t.unit_amount_decimal) decimalToRat(t.unit_amount_decimal, `${path}.unit_amount_decimal`);
-    if (t.flat_amount_decimal) decimalToRat(t.flat_amount_decimal, `${path}.flat_amount_decimal`);
     return {
       up_to,
       unit_amount: checkAmount(t.unit_amount, `${path}.unit_amount`),
-      unit_amount_decimal: t.unit_amount_decimal ?? null,
+      unit_amount_decimal: checkDecimalAmount(t.unit_amount_decimal, `${path}.unit_amount_decimal`),
       flat_amount: checkAmount(t.flat_amount, `${path}.flat_amount`),
-      flat_amount_decimal: t.flat_amount_decimal ?? null,
+      flat_amount_decimal: checkDecimalAmount(t.flat_amount_decimal, `${path}.flat_amount_decimal`),
     };
   });
   validateTiers(cleaned, param);
@@ -259,10 +309,9 @@ function normalizeCurrencyOptions(
       throw badRequest('parameter_invalid', `${code.toUpperCase()} is the price's own currency — set unit_amount or tiers directly instead.`, `currency_options.${raw}`);
     }
     const path = `currency_options.${code}`;
-    if (option.unit_amount_decimal) decimalToRat(option.unit_amount_decimal, `${path}.unit_amount_decimal`);
     out[code] = {
       unit_amount: checkAmount(option.unit_amount, `${path}.unit_amount`),
-      unit_amount_decimal: option.unit_amount_decimal ?? null,
+      unit_amount_decimal: checkDecimalAmount(option.unit_amount_decimal, `${path}.unit_amount_decimal`),
       tiers: normalizeTiers(option.tiers, `${path}.tiers`),
       custom_unit_amount: normalizeCustom(option.custom_unit_amount, `${path}.custom_unit_amount`),
       tax_behavior: option.tax_behavior ?? 'unspecified',
@@ -271,13 +320,21 @@ function normalizeCurrencyOptions(
   return out;
 }
 
+/**
+ * The model a payload implies, read the way Stripe reads it.
+ *
+ * The canonical integration sends `{product, currency, unit_amount, recurring:
+ * {interval}}` and means one seat at a time: `billing_scheme: "per_unit"`,
+ * quantity multiplies. So `per_unit` is what an unqualified amount infers, and
+ * a fee that ignores quantity has to say `model: "flat"` out loud — the one
+ * shape whose money does not follow from the fields alone is never guessed.
+ */
 function inferModel(input: PriceInput): PriceModel {
   if (input.model) return input.model;
   if (input.custom_unit_amount?.enabled) return 'custom';
   if (input.tiers?.length) return 'tiered';
   if (input.recurring?.usage_type === 'metered') return 'usage';
   if (input.transform_quantity && input.transform_quantity.divide_by > 1) return 'package';
-  if (input.recurring) return 'flat';
   return 'per_unit';
 }
 
@@ -318,8 +375,7 @@ export function normalizePrice(input: PriceInput): NormalizedPrice {
   const custom = normalizeCustom(input.custom_unit_amount);
   const recurring = normalizeRecurring(input.recurring, model);
   const unit_amount = checkAmount(input.unit_amount, 'unit_amount');
-  if (input.unit_amount_decimal) decimalToRat(input.unit_amount_decimal, 'unit_amount_decimal');
-  const unit_amount_decimal = input.unit_amount_decimal ?? null;
+  const unit_amount_decimal = checkDecimalAmount(input.unit_amount_decimal, 'unit_amount_decimal');
   const hasUnit = unit_amount !== null || !!unit_amount_decimal;
   const billing_scheme = tiers?.length ? 'tiered' : 'per_unit';
 
@@ -379,7 +435,17 @@ export const PRICING_FIELDS = [
 
 /* ---------------------------------- store --------------------------------- */
 
-interface ReferencingTable { table: string; column: string; idColumn: string }
+interface ReferencingTable {
+  table: string;
+  idColumn: string;
+  /** Object type reported for a row counted by its own id. */
+  type: string;
+  /**
+   * Detail tables — `<owner>_items`, `<owner>_lines` — describe an object that
+   * already has a name of its own, so they roll up to it.
+   */
+  owner: { column: string; type: string } | null;
+}
 
 export class Catalog {
   private referencing: ReferencingTable[] | null = null;
@@ -439,13 +505,7 @@ export class Catalog {
     const now = this.ctx.now();
     const name = String(input.name ?? '').trim();
     if (!name) throw badRequest('parameter_missing', 'A product needs a name.', 'name');
-    const descriptor = input.statement_descriptor ?? null;
-    if (descriptor && descriptor.length > 22) {
-      throw badRequest('parameter_invalid', 'Statement descriptors are limited to 22 characters — that is all a card statement shows.', 'statement_descriptor');
-    }
-    if (descriptor && /[<>"'*\\]/.test(descriptor)) {
-      throw badRequest('parameter_invalid', 'Statement descriptors cannot contain < > " \' * or \\.', 'statement_descriptor');
-    }
+    const descriptor = checkStatementDescriptor(input.statement_descriptor ?? null);
     const category = input.category ?? 'plan';
     if (!PRODUCT_CATEGORIES.includes(category)) {
       throw badRequest('parameter_invalid', `Category must be one of: ${PRODUCT_CATEGORIES.join(', ')}.`, 'category');
@@ -491,10 +551,7 @@ export class Catalog {
     }
     if (patch.description !== undefined) changes.description = patch.description;
     if (patch.statement_descriptor !== undefined) {
-      if (patch.statement_descriptor && patch.statement_descriptor.length > 22) {
-        throw badRequest('parameter_invalid', 'Statement descriptors are limited to 22 characters.', 'statement_descriptor');
-      }
-      changes.statement_descriptor = patch.statement_descriptor;
+      changes.statement_descriptor = checkStatementDescriptor(patch.statement_descriptor);
     }
     if (patch.unit_label !== undefined) changes.unit_label = patch.unit_label;
     if (patch.active !== undefined) changes.active = patch.active ? 1 : 0;
@@ -638,22 +695,49 @@ export class Catalog {
     ).map(hydratePrice);
   }
 
+  /**
+   * Hand a lookup key over. The price that loses it is a real change to a real
+   * object — anything resolving prices by key needs to hear about it — so it
+   * emits `price.updated` rather than being edited out from under the event log.
+   */
+  private releaseLookupKey(orgId: string, from: Price, now: number, meta: WriteMeta): void {
+    this.ctx.db.patch('catalog_prices', 'id', from.id, { lookup_key: null, updated: now });
+    const after = this.requirePrice(orgId, from.id);
+    this.ctx.emit(orgId, 'price.updated', after, {
+      objectId: from.id, objectType: 'price', previous: diff(from, after),
+      actorId: meta.actorId ?? null, actorType: meta.actorType ?? 'system', requestId: meta.requestId ?? null,
+    });
+  }
+
   createPrice(orgId: string, input: PriceInput, meta: WriteMeta = {}): Price {
     const product = this.requireProduct(orgId, input.product);
     const normalized = normalizePrice(input);
     const lookupKey = input.lookup_key ?? null;
+    let displaced: Price | null = null;
     if (lookupKey) {
       if (!LOOKUP_RE.test(lookupKey)) {
         throw badRequest('parameter_invalid', 'Lookup keys are lowercase letters, digits, dots, dashes and underscores (2–80 characters).', 'lookup_key');
       }
       const clash = this.priceByLookupKey(orgId, lookupKey);
-      if (clash) throw conflict('lookup_key_in_use', `Lookup key "${lookupKey}" already points at ${clash.id}. Pass transfer_lookup_key to move it.`);
+      if (clash) {
+        if (!input.transfer_lookup_key) {
+          throw conflict(
+            'lookup_key_in_use',
+            `Lookup key "${lookupKey}" already points at ${clash.id}. Pass transfer_lookup_key: true to move it onto the price you are creating.`,
+            { lookup_key: lookupKey, price: clash.id },
+          );
+        }
+        displaced = clash;
+      }
     }
     const id = input.id ?? newId('price');
     if (this.ctx.db.get(`SELECT id FROM catalog_prices WHERE id = ?`, id)) {
       throw conflict('resource_already_exists', `Price ${id} already exists.`);
     }
     const now = this.ctx.now();
+    // Same transaction as the insert: the whole point of the transfer is that
+    // the key is never unowned, not even for the width of a second call.
+    if (displaced) this.releaseLookupKey(orgId, displaced, now, meta);
     this.ctx.db.insert('catalog_prices', {
       id, org_id: orgId, product_id: product.id,
       nickname: input.nickname ?? null,
@@ -694,7 +778,7 @@ export class Catalog {
   updatePrice(
     orgId: string,
     id: string,
-    patch: Partial<PriceInput> & { transfer_lookup_key?: boolean },
+    patch: Partial<PriceInput>,
     meta: WriteMeta = {},
   ): Price {
     const before = this.requirePrice(orgId, id);
@@ -705,8 +789,8 @@ export class Catalog {
     if (touched.length && usage.in_use) {
       throw conflict(
         'price_immutable',
-        `${before.nickname ? `"${before.nickname}"` : id} has already billed ${usage.count} object${usage.count === 1 ? '' : 's'}, so ${touched.join(', ')} cannot change. Create a new price and move the subscriptions across — that keeps every historical invoice reproducible.`,
-        { price: id, field: touched[0], references: usage.references.slice(0, 10) },
+        `${before.nickname ? `"${before.nickname}"` : id} has already billed ${usage.summary}, so ${touched.join(', ')} cannot change. Create a new price and move the subscriptions across — that keeps every historical invoice reproducible.`,
+        { price: id, field: touched[0], count: usage.count, by_type: usage.by_type, references: usage.references.slice(0, REFERENCE_SAMPLE) },
       );
     }
 
@@ -761,9 +845,13 @@ export class Catalog {
         const clash = this.priceByLookupKey(orgId, key);
         if (clash && clash.id !== id) {
           if (!patch.transfer_lookup_key) {
-            throw conflict('lookup_key_in_use', `Lookup key "${key}" already points at ${clash.id}. Pass transfer_lookup_key: true to move it here.`);
+            throw conflict(
+              'lookup_key_in_use',
+              `Lookup key "${key}" already points at ${clash.id}. Pass transfer_lookup_key: true to move it here.`,
+              { lookup_key: key, price: clash.id },
+            );
           }
-          this.ctx.db.patch('catalog_prices', 'id', clash.id, { lookup_key: null, updated: this.ctx.now() });
+          this.releaseLookupKey(orgId, clash, this.ctx.now(), meta);
         }
         changes.lookup_key = key;
       }
@@ -791,8 +879,8 @@ export class Catalog {
     if (usage.in_use) {
       throw conflict(
         'price_in_use',
-        `${price.nickname ? `"${price.nickname}"` : id} is referenced by ${usage.count} object${usage.count === 1 ? '' : 's'} and cannot be deleted. Set active: false so it stops being sold but keeps explaining past invoices.`,
-        { references: usage.references.slice(0, 10) },
+        `${price.nickname ? `"${price.nickname}"` : id} is referenced by ${usage.summary} and cannot be deleted. Set active: false so it stops being sold but keeps explaining past invoices.`,
+        { count: usage.count, by_type: usage.by_type, references: usage.references.slice(0, REFERENCE_SAMPLE) },
       );
     }
     this.ctx.db.run(
@@ -824,29 +912,79 @@ export class Catalog {
   }
 
   /**
-   * Who is billing against this price. Modules register references explicitly,
-   * and any table that carries both `org_id` and `price_id` is also scanned, so
-   * this answer stays true as subscriptions and invoicing land alongside us.
+   * Who is billing against this price — the reason a used price can never be
+   * edited. Modules register references explicitly, and any table carrying both
+   * `org_id` and `price_id` is scanned as well, so the answer stays true as new
+   * modules land alongside us.
+   *
+   * The count is of distinct *objects*, which is the only number that means
+   * anything to the operator reading the refusal. A subscription that registers
+   * itself and also owns a row in `billing_subscription_items` is one
+   * subscription, not two, and sixty-four invoice lines belonging to sixty-four
+   * invoices are counted as the invoices they are printed on.
    */
   priceUsage(orgId: string, priceId: string): PriceUsage {
-    const references: { type: string; id: string }[] = this.ctx.db.all<any>(
-      `SELECT ref_type, ref_id FROM catalog_price_usage WHERE org_id = ? AND price_id = ? LIMIT 50`, orgId, priceId,
-    ).map((r) => ({ type: r.ref_type, id: String(r.ref_id) }));
-    let count = this.ctx.db.count(`SELECT COUNT(*) FROM catalog_price_usage WHERE org_id = ? AND price_id = ?`, orgId, priceId);
+    const registered = `SELECT ref_id FROM catalog_price_usage WHERE org_id = ? AND price_id = ?`;
+    const counts = new Map<string, number>();
+    const references: { type: string; id: string }[] = [];
+    const add = (type: string, n: number) => { if (n > 0) counts.set(type, (counts.get(type) ?? 0) + n); };
+
+    for (const row of this.ctx.db.all<{ ref_type: string; n: number }>(
+      `SELECT ref_type, COUNT(DISTINCT ref_id) AS n FROM catalog_price_usage
+        WHERE org_id = ? AND price_id = ? GROUP BY ref_type`, orgId, priceId,
+    )) add(row.ref_type, Number(row.n));
+
+    for (const row of this.ctx.db.all<{ ref_type: string; ref_id: string }>(
+      `SELECT DISTINCT ref_type, ref_id FROM catalog_price_usage
+        WHERE org_id = ? AND price_id = ? ORDER BY ref_type ASC, ref_id ASC LIMIT ?`,
+      orgId, priceId, REFERENCE_SAMPLE,
+    )) references.push({ type: row.ref_type, id: String(row.ref_id) });
 
     for (const t of this.referencingTables()) {
-      const n = this.ctx.db.count(`SELECT COUNT(*) FROM ${t.table} WHERE org_id = ? AND ${t.column} = ?`, orgId, priceId);
-      if (!n) continue;
-      count += n;
-      for (const row of this.ctx.db.all<any>(
-        `SELECT ${t.idColumn} AS ref FROM ${t.table} WHERE org_id = ? AND ${t.column} = ? LIMIT 10`, orgId, priceId,
-      )) {
-        references.push({ type: t.table, id: String(row.ref) });
+      const owner = t.owner;
+      if (owner) {
+        add(owner.type, this.ctx.db.count(
+          `SELECT COUNT(DISTINCT ${owner.column}) FROM ${t.table}
+            WHERE org_id = ? AND price_id = ? AND ${owner.column} IS NOT NULL
+              AND ${owner.column} NOT IN (${registered})`,
+          orgId, priceId, orgId, priceId,
+        ));
+        for (const row of this.ctx.db.all<{ ref: string }>(
+          `SELECT DISTINCT ${owner.column} AS ref FROM ${t.table}
+            WHERE org_id = ? AND price_id = ? AND ${owner.column} IS NOT NULL
+              AND ${owner.column} NOT IN (${registered}) ORDER BY ref ASC LIMIT ?`,
+          orgId, priceId, orgId, priceId, REFERENCE_SAMPLE,
+        )) references.push({ type: owner.type, id: String(row.ref) });
       }
+      // A detail row with no owner is still a reference; it just has to speak
+      // for itself.
+      const orphaned = owner ? ` AND ${owner.column} IS NULL` : '';
+      add(t.type, this.ctx.db.count(
+        `SELECT COUNT(DISTINCT ${t.idColumn}) FROM ${t.table}
+          WHERE org_id = ? AND price_id = ?${orphaned} AND ${t.idColumn} NOT IN (${registered})`,
+        orgId, priceId, orgId, priceId,
+      ));
+      for (const row of this.ctx.db.all<{ ref: string }>(
+        `SELECT ${t.idColumn} AS ref FROM ${t.table}
+          WHERE org_id = ? AND price_id = ?${orphaned} AND ${t.idColumn} NOT IN (${registered})
+          ORDER BY ref ASC LIMIT ?`,
+        orgId, priceId, orgId, priceId, REFERENCE_SAMPLE,
+      )) references.push({ type: t.type, id: String(row.ref) });
     }
-    return { count, references, in_use: count > 0 };
+
+    const by_type = [...counts.entries()]
+      .map(([type, count]) => ({ type, count }))
+      .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
+    const count = by_type.reduce((total, entry) => total + entry.count, 0);
+    return { count, by_type, summary: describeUsage(by_type), references, in_use: count > 0 };
   }
 
+  /**
+   * Every table that can point at a price, discovered rather than declared, so
+   * a module that migrates in later is found without the catalog knowing it
+   * exists. `billing_invoice_lines` is read as lines belonging to an invoice;
+   * `credit_settlements` has no owner in its name, so it stands for itself.
+   */
   private referencingTables(): ReferencingTable[] {
     if (this.referencing) return this.referencing;
     const safe = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -858,7 +996,14 @@ export class Catalog {
       if (!safe.test(name)) continue;
       const columns = this.ctx.db.all<{ name: string }>(`PRAGMA table_info(${name})`).map((c) => c.name);
       if (!columns.includes('org_id') || !columns.includes('price_id')) continue;
-      out.push({ table: name, column: 'price_id', idColumn: columns.includes('id') ? 'id' : 'rowid' });
+      const detail = /^[a-z]+_(.+)_(?:items|lines)$/.exec(name);
+      const ownerColumn = detail ? `${detail[1]}_id` : null;
+      out.push({
+        table: name,
+        idColumn: columns.includes('id') ? 'id' : 'rowid',
+        type: singularize(name),
+        owner: ownerColumn && columns.includes(ownerColumn) ? { column: ownerColumn, type: detail![1] } : null,
+      });
     }
     this.referencing = out;
     return out;
@@ -1019,6 +1164,25 @@ export interface CatalogView {
 }
 
 /* --------------------------------- helpers -------------------------------- */
+
+/** How many example references a usage answer carries per source. */
+const REFERENCE_SAMPLE = 10;
+
+/** `billing_invoice_lines` → `billing_invoice_line`. */
+function singularize(name: string): string {
+  if (/ies$/.test(name)) return `${name.slice(0, -3)}y`;
+  if (/(ses|xes|zes|ches|shes)$/.test(name)) return name.slice(0, -2);
+  return name.replace(/s$/, '');
+}
+
+/** "64 invoices and 7 subscriptions" — what a refusal needs to say. */
+export function describeUsage(by_type: { type: string; count: number }[]): string {
+  const parts = by_type.map(({ type, count }) =>
+    `${count.toLocaleString('en-US')} ${pluralUnit(type.replace(/_/g, ' '), count)}`);
+  if (!parts.length) return 'nothing';
+  if (parts.length === 1) return parts[0];
+  return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
 
 export const CATEGORY_BASE: Record<ProductCategory, number> = {
   plan: 0, component: 100, add_on: 200, credit_pack: 300, service: 400,

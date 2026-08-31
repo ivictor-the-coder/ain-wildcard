@@ -95,20 +95,24 @@ const currencyCode = (): Validator<string> => ({
   }),
 });
 
+/** Prose on a field, so `/api/openapi.json` explains it and not just its type. */
+const described = <T>(inner: Validator<T>, description: string): Validator<T> =>
+  v.transform(inner, (value) => value, { description });
+
 const tierBody = v.object({
   up_to: v.union(v.int({ min: 1 }), v.literal('inf')),
   unit_amount: v.optional(v.int({ min: 0 })),
   unit_amount_decimal: v.optional(v.string({ max: 40 })),
   flat_amount: v.optional(v.int({ min: 0 })),
   flat_amount_decimal: v.optional(v.string({ max: 40 })),
-});
+}, { strict: true });
 
 const customAmountBody = v.object({
   enabled: v.default(v.boolean(), true),
   minimum: v.optional(v.int({ min: 0 })),
   maximum: v.optional(v.int({ min: 0 })),
   preset: v.optional(v.int({ min: 0 })),
-});
+}, { strict: true });
 
 const recurringBody = v.object({
   interval: v.enum(INTERVAL_UNITS),
@@ -117,7 +121,7 @@ const recurringBody = v.object({
   aggregate_usage: v.optional(v.enum(USAGE_AGGREGATIONS)),
   trial_period_days: v.optional(v.int({ min: 0, max: 730 })),
   meter: v.optional(v.string({ max: 80 })),
-});
+}, { strict: true });
 
 const currencyOptionBody = v.object({
   unit_amount: v.optional(v.int({ min: 0 })),
@@ -125,20 +129,36 @@ const currencyOptionBody = v.object({
   tiers: v.optional(v.array(tierBody, { max: 60 })),
   custom_unit_amount: v.optional(customAmountBody),
   tax_behavior: v.optional(v.enum(TAX_BEHAVIORS)),
-});
+}, { strict: true });
 
 const PRICE_FIELDS = {
   currency: currencyCode(),
-  nickname: v.optional(v.string({ max: 160 })),
-  lookup_key: v.optional(v.string({ max: 80 })),
+  nickname: v.optional(v.nullable(v.string({ max: 160 }))),
+  lookup_key: v.optional(v.nullable(v.string({ max: 80 }))),
+  transfer_lookup_key: v.optional(described(
+    v.boolean(),
+    'Take lookup_key off whichever price currently holds it and give it to this one, in the same transaction. Without it a key already in use is a 409, so the standard "cut the key over to the replacement price" migration is one atomic call on create as well as on update — the key is never briefly unowned.',
+  )),
   active: v.optional(v.boolean()),
   type: v.optional(v.enum(PRICE_TYPES)),
-  model: v.optional(v.enum(PRICE_MODELS)),
-  unit_amount: v.optional(v.int({ min: 0 })),
-  unit_amount_decimal: v.optional(v.string({ max: 40 })),
-  tiers_mode: v.optional(v.enum(TIERS_MODES)),
+  model: v.optional(described(
+    v.enum(PRICE_MODELS),
+    'How a quantity turns into money. Omit it and the payload decides, the way Stripe reads one: tiers → tiered, recurring.usage_type "metered" → usage, transform_quantity → package, custom_unit_amount → custom, and otherwise per_unit — unit_amount multiplied by the quantity. "flat", one charge whatever the quantity, is never inferred: ask for it by name.',
+  )),
+  unit_amount: v.optional(described(
+    v.int({ min: 0 }),
+    'The price of one unit, in integer minor units — 1000 is $10.00. Multiplied by the quantity on every model but "flat".',
+  )),
+  unit_amount_decimal: v.optional(described(
+    v.string({ max: 40 }),
+    'A sub-cent rate as a decimal string of minor units: "0.04" is 0.04 cents, $0.0004 per unit. Up to 12 decimal places, kept exact through the whole calculation.',
+  )),
+  tiers_mode: v.optional(described(
+    v.enum(TIERS_MODES),
+    'How tiers combine: "graduated" charges each tier for the units that fall inside it, "volume" charges every unit at the rate of the tier the total lands in. Defaults to graduated, which bills more than volume on the same ladder.',
+  )),
   tiers: v.optional(v.array(tierBody, { min: 1, max: 60 })),
-  transform_quantity: v.optional(v.object({ divide_by: v.int({ min: 1 }), round: v.enum(['up', 'down'] as const) })),
+  transform_quantity: v.optional(v.object({ divide_by: v.int({ min: 1 }), round: v.enum(['up', 'down'] as const) }, { strict: true })),
   recurring: v.optional(recurringBody),
   currency_options: v.optional(v.record(currencyOptionBody)),
   custom_unit_amount: v.optional(customAmountBody),
@@ -147,35 +167,46 @@ const PRICE_FIELDS = {
   metadata: v.metadata(),
 };
 
-const priceCreateBody = v.object({ product: v.id('prod'), ...PRICE_FIELDS });
-const priceDataBody = v.object(PRICE_FIELDS);
+/**
+ * Every catalog write body is strict. A dropped `tiersMode` is not a typo the
+ * API can shrug off: the price it silently creates is a *graduated* one that
+ * bills half again as much as the volume price the operator meant to write, and
+ * the price it created can never be repriced. Unknown keys are named and
+ * refused, the way Stripe answers `Received unknown parameter`.
+ */
+const priceCreateBody = v.object({ product: v.id('prod'), ...PRICE_FIELDS }, { strict: true });
+const priceDataBody = v.object(PRICE_FIELDS, { strict: true });
 
 const priceUpdateBody = v.object({
   product: v.optional(v.id('prod')),
   currency: v.optional(currencyCode()),
-  transfer_lookup_key: v.optional(v.boolean()),
   ...Object.fromEntries(Object.entries(PRICE_FIELDS).filter(([k]) => k !== 'currency')),
-});
+}, { strict: true });
 
 const featureBody = v.object({
   name: v.string({ min: 1, max: 160 }),
   lookup_key: v.optional(v.string({ min: 1, max: 60 })),
   description: v.optional(v.string({ max: 400 })),
-});
+}, { strict: true });
 
+/**
+ * The fields a product can be edited *back out of* are nullable, not merely
+ * optional: an operator who typed a tagline has to be able to untype it, and
+ * the store has always known how to clear them.
+ */
 const PRODUCT_FIELDS = {
-  description: v.optional(v.string({ max: 2000 })),
-  statement_descriptor: v.optional(v.string({ max: 22 })),
-  unit_label: v.optional(v.string({ max: 40 })),
+  description: v.optional(v.nullable(v.string({ max: 2000 }))),
+  statement_descriptor: v.optional(v.nullable(v.string({ max: 22 }))),
+  unit_label: v.optional(v.nullable(v.string({ max: 40 }))),
   active: v.optional(v.boolean()),
   images: v.optional(v.array(v.string({ max: 500 }), { max: 8 })),
   features: v.optional(v.array(featureBody, { max: 60 })),
   metadata: v.metadata(),
-  tax_code: v.optional(v.string({ max: 60 })),
-  default_price: v.optional(v.id('price')),
+  tax_code: v.optional(v.nullable(v.string({ max: 60 }))),
+  default_price: v.optional(v.nullable(v.id('price'))),
   category: v.optional(v.enum(PRODUCT_CATEGORIES)),
-  tagline: v.optional(v.string({ max: 200 })),
-  url: v.optional(v.string({ max: 500 })),
+  tagline: v.optional(v.nullable(v.string({ max: 200 }))),
+  url: v.optional(v.nullable(v.string({ max: 500 }))),
   position: v.optional(v.int({ min: 0, max: 1_000_000 })),
 };
 
@@ -183,23 +214,25 @@ const productCreateBody = v.object({
   name: v.string({ min: 1, max: 150 }),
   default_price_data: v.optional(priceDataBody),
   ...PRODUCT_FIELDS,
-});
+}, { strict: true });
 
-const productUpdateBody = v.object({ name: v.optional(v.string({ min: 1, max: 150 })), ...PRODUCT_FIELDS });
+const productUpdateBody = v.object(
+  { name: v.optional(v.string({ min: 1, max: 150 })), ...PRODUCT_FIELDS }, { strict: true },
+);
 
 const usageRecordBody = v.object({
   quantity: v.int({ min: 0 }),
   timestamp: v.optional(v.timestamp()),
   key: v.optional(v.string({ max: 120 })),
-});
+}, { strict: true });
 
 const previewBody = v.object({
   quantity: v.optional(v.int({ min: 0 })),
   currency: v.optional(currencyCode()),
   custom_unit_amount: v.optional(v.int({ min: 0 })),
   usage_records: v.optional(v.array(usageRecordBody, { max: 500 })),
-  proration: v.optional(v.object({ numerator: v.int({ min: 0 }), denominator: v.int({ min: 1 }) })),
-});
+  proration: v.optional(v.object({ numerator: v.int({ min: 0 }), denominator: v.int({ min: 1 }) }, { strict: true })),
+}, { strict: true });
 
 /* --------------------------------- queries -------------------------------- */
 
@@ -275,6 +308,24 @@ function pricePayload(price: Price, product: Product | null, locale: string): Re
     currencies: currenciesOf(price),
     display: describePrice(price, price.currency, locale, product),
     ...(product ? { product_name: product.name, unit_label: product.unit_label } : {}),
+  };
+}
+
+/**
+ * What a flat price has to say when it is quoted at a quantity it will not
+ * bill. The subscription route refuses an item carrying one outright; a quote
+ * is a question rather than a purchase, so it answers — and then says plainly
+ * that the number it just gave is one charge, not `quantity` of them.
+ */
+function flatQuantityWarning(
+  price: Price, quantity: number, amount: number, currency: string, locale: string,
+): { code: string; param: string; message: string } | null {
+  if (price.model !== 'flat' || quantity === 1) return null;
+  const asked = quantity.toLocaleString(locale);
+  return {
+    code: 'flat_price_quantity',
+    param: 'quantity',
+    message: `${price.nickname ? `"${price.nickname}"` : price.id} is a flat fee: this is one charge of ${formatMinor(amount, currency, locale)}, not ${asked} of them. A subscription item on a flat price must carry quantity 1 — move the line onto a per-unit price if it should scale.`,
   };
 }
 
@@ -455,7 +506,8 @@ export default defineModule({
       })),
       {
         summary: 'Create a price', tags: ['catalog'], roles: ['member'], idempotent: true,
-        description: 'Amounts are integer minor units; unit_amount_decimal carries sub-cent metered rates ("0.04" = 0.04 cents).',
+        description:
+          'Amounts are integer minor units and never negative, whether written as unit_amount or as unit_amount_decimal, which carries sub-cent metered rates ("0.04" = 0.04 cents). Leave model out and it is read from the payload exactly as Stripe reads one — {unit_amount, recurring} is a per-unit price that multiplies by quantity — so the only model that must be asked for by name is "flat", the one whose money does not follow from the other fields. Unknown parameters are refused rather than dropped: a mistyped tiers_mode would otherwise create a price that bills differently and can never be repriced.',
         body: priceCreateBody,
       });
 
@@ -518,6 +570,7 @@ export default defineModule({
         ...line,
         object: 'price_preview',
         price: price.id,
+        warning: flatQuantityWarning(price, quantity, line.amount, line.currency, locale),
         product: product ? { id: product.id, name: product.name, unit_label: product.unit_label } : null,
         amount_display: formatMinor(line.amount, line.currency, locale),
         effective_unit_display: formatMinorDecimal(line.effective_unit_amount_decimal, line.currency, locale),
@@ -636,6 +689,7 @@ export default defineModule({
           product: product ? { id: product.id, name: product.name, unit_label: product.unit_label } : null,
           interval: price.recurring ? { unit: price.recurring.interval, count: price.recurring.interval_count } : null,
           amount_display: formatMinor(line.amount, currency, locale),
+          warning: flatQuantityWarning(price, input.quantity ?? 1, line.amount, currency, locale),
         };
       });
 
@@ -658,6 +712,9 @@ export default defineModule({
         object: 'catalog_estimate',
         currency,
         lines,
+        // A basket total that is smaller than the quantities asked for has to
+        // say why on the total, not only on the line that shrank.
+        warnings: lines.flatMap((l) => (l.warning ? [{ price: l.price, ...l.warning }] : [])),
         recurring: {
           day: daily, week: weekly, month: monthly, year: yearly,
           monthly_equivalent: monthlyEquivalent,
@@ -677,8 +734,8 @@ export default defineModule({
           price: v.string({ min: 3, max: 120 }),
           quantity: v.optional(v.int({ min: 0 })),
           custom_unit_amount: v.optional(v.int({ min: 0 })),
-        }), { min: 1, max: 50 }),
-      }),
+        }, { strict: true }), { min: 1, max: 50 }),
+      }, { strict: true }),
     });
 
     void store;
@@ -744,6 +801,7 @@ export default defineModule({
             quantity: args.quantity,
             amount: line.amount,
             amount_display: formatMinor(line.amount, currency, locale()),
+            warning: flatQuantityWarning(price, args.quantity, line.amount, currency, locale())?.message ?? null,
             effective_unit_display: formatMinorDecimal(line.effective_unit_amount_decimal, currency, locale()),
             breakdown: line.breakdown.map((row) => `${row.label} — ${formatMinor(row.amount, currency, locale())}`),
           };

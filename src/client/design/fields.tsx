@@ -10,7 +10,7 @@ import { Popover } from './overlays';
 import { Spinner } from './feedback';
 import { currencySymbol, formatMoney, formatNumber, parseMoneyInput } from './format';
 import { exponentOf, type Currency } from '../../shared/money';
-import { useCopyToClipboard, useDebouncedValue } from './hooks';
+import { scrollIntoViewport, useCopyToClipboard, useDebouncedValue } from './hooks';
 import './fields.css';
 
 /* ================================= Field ================================== */
@@ -529,6 +529,7 @@ export function Combobox({
   const [loading, setLoading] = useState(false);
   const debounced = useDebouncedValue(query, 200);
   const listId = useId();
+  const listRef = useRef<HTMLDivElement>(null);
 
   const selected = useMemo(() => (Array.isArray(value) ? value : value ? [value] : []), [value]);
 
@@ -553,7 +554,16 @@ export function Combobox({
 
   const enabled = filtered.filter((o) => !o.disabled);
   const canCreate = !!onCreate && query.trim().length > 0 && !filtered.some((o) => o.label.toLowerCase() === query.trim().toLowerCase());
+  const lastIndex = enabled.length - 1 + (canCreate ? 1 : 0);
   useEffect(() => { setActive(0); }, [query, open]);
+
+  // The list is clamped to whatever room the popover has, so on a short window
+  // the sixth owner sits 189px below the bottom of the box. Arrowing onto a row
+  // nobody can see is the same as not arrowing at all.
+  useEffect(() => {
+    if (!open) return;
+    scrollIntoViewport(listRef.current?.querySelector<HTMLElement>('[data-active="true"]') ?? null);
+  }, [open, active, filtered]);
 
   const labelFor = (v: string) => source.find((o) => o.value === v)?.label ?? options?.find((o) => o.value === v)?.label ?? v;
 
@@ -622,8 +632,18 @@ export function Combobox({
           onFocus={() => setOpen(true)}
           onChange={(e) => { setQuery(e.target.value); setOpen(true); }}
           onKeyDown={(e) => {
-            if (e.key === 'ArrowDown') { e.preventDefault(); setOpen(true); setActive((i) => Math.min(enabled.length - 1 + (canCreate ? 1 : 0), i + 1)); }
-            else if (e.key === 'ArrowUp') { e.preventDefault(); setActive((i) => Math.max(0, i - 1)); }
+            if (e.key === 'ArrowDown') {
+              e.preventDefault();
+              // The first ArrowDown on a closed field opens it on the row the
+              // highlight is already on instead of stepping past it.
+              if (!open) { setOpen(true); return; }
+              setActive((i) => Math.max(0, Math.min(lastIndex, i + 1)));
+            } else if (e.key === 'ArrowUp') { e.preventDefault(); setOpen(true); setActive((i) => Math.max(0, i - 1)); }
+            // Home and End belong to the caret the moment there is text to move
+            // it through; with an empty query there is none, so they jump the
+            // list the way they do everywhere else in the kit.
+            else if (e.key === 'Home' && open && !query) { e.preventDefault(); setActive(0); }
+            else if (e.key === 'End' && open && !query) { e.preventDefault(); setActive(Math.max(0, lastIndex)); }
             else if (e.key === 'Enter') {
               e.preventDefault();
               if (active === enabled.length && canCreate) { onCreate?.(query.trim()); setQuery(''); }
@@ -657,7 +677,7 @@ export function Combobox({
         flush
         placement="bottom-start"
       >
-        <div className="ain-combo__list" role="listbox" id={listId} aria-multiselectable={multiple}>
+        <div className="ain-combo__list" role="listbox" id={listId} ref={listRef} aria-multiselectable={multiple}>
           {loading && filtered.length === 0 && <div className="ain-combo__status">Searching…</div>}
           {!loading && filtered.length === 0 && !canCreate && <div className="ain-combo__status">{emptyMessage}</div>}
           {groups.map(([group, groupOptions]) => (
@@ -673,6 +693,7 @@ export function Combobox({
                     role="option"
                     aria-selected={isSelected}
                     aria-disabled={option.disabled || undefined}
+                    data-active={index === active && index >= 0}
                     className={cx('ain-combo__option', index === active && index >= 0 && 'is-active')}
                     onPointerEnter={() => index >= 0 && setActive(index)}
                     onClick={() => !option.disabled && commit(option)}
@@ -690,6 +711,7 @@ export function Combobox({
           ))}
           {canCreate && (
             <div
+              data-active={active === enabled.length}
               className={cx('ain-combo__create', active === enabled.length && 'is-active')}
               onPointerEnter={() => setActive(enabled.length)}
               onClick={() => { onCreate?.(query.trim()); setQuery(''); }}

@@ -204,3 +204,40 @@ export function mergeHits(groups: SearchHit[][], limit: number): SearchHit[] {
   }
   return merged;
 }
+
+/* ================================ typeahead =============================== */
+
+/** One row the top-bar typeahead can put under the highlight. */
+export interface TypeaheadTarget {
+  /** Stable per row: the DOM id the combobox points `aria-activedescendant` at. */
+  id: string;
+  /** Where ↵ goes. */
+  href: string;
+  /** The record this row shows, or null for the row that opens the full page. */
+  hit: SearchHit | null;
+}
+
+/**
+ * The rows ↑↓ may land on, in the order they are painted.
+ *
+ * A hit whose object type has no screen on this workspace is still shown — it
+ * is a real match — but it is not something ↵ could open, so it never takes the
+ * highlight. The last row is always the full search page: a typeahead that can
+ * only reach the four hits per source it had room for would otherwise be a
+ * narrower search than the one it replaced.
+ */
+export function typeaheadTargets(
+  groups: readonly { source: SearchSource; hits: SearchHit[] }[],
+  query: string,
+): TypeaheadTarget[] {
+  const targets: TypeaheadTarget[] = [];
+  for (const group of groups) {
+    for (const hit of group.hits) {
+      if (!hit.href) continue;
+      targets.push({ id: `${hit.type}:${hit.id}`, href: hit.href, hit });
+    }
+  }
+  const trimmed = query.trim();
+  if (trimmed) targets.push({ id: 'everything', href: `/search?q=${encodeURIComponent(trimmed)}`, hit: null });
+  return targets;
+}

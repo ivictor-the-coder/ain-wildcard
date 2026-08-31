@@ -24,7 +24,8 @@ import { computePosition, repositionFloating, type FloatingElement } from '../sr
 import {
   addDays, addMonths, monthMatrix, nextRange, RANGE_PRESETS, startOfMonthUtc, weekdayLabels,
 } from '../src/client/design/calendar-core';
-import { computeWindow, matchesHotkey } from '../src/client/design/hooks';
+import { computeWindow, matchesHotkey, scrollTopForIndex } from '../src/client/design/hooks';
+import { toastDuration, type ToastRecord } from '../src/client/design/toast-store';
 import { ICON_NAMES, Icons, iconByName } from '../src/client/design/icons';
 import {
   emptyTypeahead, menuKeyAction, menuTypeaheadIndex, rankCommands,
@@ -464,6 +465,38 @@ describe('overlay positioning', () => {
       }
     });
 
+    it('clamps the width the same way, so a side-placed box never crosses its anchor either', () => {
+      // A 900px submenu beside an anchor 700px from the left edge of a 1000px
+      // window. Placed at its natural width the box runs from -206 to 694, the
+      // clamp collapses to the padding, and it lands across the row that opened
+      // it — the height bug, one axis over.
+      const side = { x: 700, y: 200, width: 100, height: 32 };
+      const viewport = { width: 1000, height: 800 };
+      const result = computePosition(side, { width: 900, height: 200 }, viewport, { placement: 'left-start' });
+      assert.equal(result.placement, 'left-start');
+      assert.ok(result.maxWidth < 900, `the box has to be told it is ${result.maxWidth}px wide, not 900`);
+      assert.ok(
+        result.x + Math.min(900, result.maxWidth) <= side.x,
+        `${result.x}..${result.x + Math.min(900, result.maxWidth)} covers the anchor at ${side.x}`,
+      );
+      assert.equal(result.x + result.maxWidth, side.x - 6, 'the clamped box ends exactly at the gap beside the anchor');
+    });
+
+    it('leaves a box that already fits alone, on both axes', () => {
+      const roomy = computePosition({ x: 100, y: 40, width: 120, height: 32 }, { width: 260, height: 200 }, { width: 1440, height: 900 }, { placement: 'bottom-start' });
+      assert.equal(roomy.x, 100);
+      assert.equal(roomy.y, 78);
+      assert.equal(roomy.maxWidth, 1440 - 16, 'a top/bottom box may use the whole width');
+      assert.ok(roomy.maxHeight >= 200);
+    });
+
+    it('never reports a matched width wider than the width it just clamped to', () => {
+      // `matchWidth` is applied as an explicit width; if it outran `maxWidth`
+      // the box would render narrower than the placement arithmetic assumed.
+      const wide = computePosition({ x: 4, y: 40, width: 1200, height: 32 }, { width: 300, height: 120 }, { width: 600, height: 800 }, { matchWidth: true, placement: 'bottom-start' });
+      assert.ok(wide.width !== undefined && wide.width <= wide.maxWidth, `${wide.width} > ${wide.maxWidth}`);
+    });
+
     it('places a clamped box flipped above an anchor at the box\u2019s clamped height, not its natural one', () => {
       // Anchor low on a short screen: the box flips up, and the top of the box
       // is the padding, not `anchor.y - 508`.
@@ -635,6 +668,114 @@ describe('menu key wiring', () => {
   });
 });
 
+/* --------------------------------- toasts -------------------------------- */
+
+describe('toast timing', () => {
+  const record = (over: Partial<ToastRecord> = {}): ToastRecord =>
+    ({ id: 't1', title: 'Export ready', tone: 'info', createdAt: 0, ...over });
+
+  it('keeps the per-tone defaults', () => {
+    assert.equal(toastDuration(record({ tone: 'success' })), 4000);
+    assert.equal(toastDuration(record({ tone: 'danger' })), 9000);
+    assert.equal(toastDuration(record({ tone: 'loading' })), 0, 'loading toasts are pinned');
+  });
+
+  it('gives a toast carrying an action time to be acted on', () => {
+    // 5s was long enough to read and far too short to reach: the hotkey, the
+    // glance and the decision do not fit inside an info toast's lifetime.
+    assert.equal(toastDuration(record({ action: { label: 'Undo', onClick: () => {} } })), 12_000);
+    assert.equal(toastDuration(record({ tone: 'danger', action: { label: 'Undo', onClick: () => {} } })), 12_000);
+  });
+
+  it('never overrides an explicit duration', () => {
+    assert.equal(toastDuration(record({ duration: 0, action: { label: 'Undo', onClick: () => {} } })), 0);
+    assert.equal(toastDuration(record({ duration: 1500 })), 1500);
+  });
+});
+
+/* ------------------------- keyboard wiring elsewhere ---------------------- */
+
+/**
+ * The menu bug was one instance of a shape: a keyboard model that is correct on
+ * paper and never reached, or a highlight that the DOM does not follow. These
+ * pin the wirings that fixed the rest of them. The behaviour itself is driven
+ * from a real browser in `e2e/design-keyboard.spec.ts`; this is the cheap guard
+ * that runs on every `npm test`.
+ */
+describe('keyboard wiring across the kit', () => {
+  const read = (file: string) => readFileSync(new URL(`../src/client/design/${file}`, import.meta.url), 'utf8');
+
+  it('gives the data table one row that answers Tab, whatever the focus state', () => {
+    const table = read('table.tsx');
+    // Keyed off `focusIndex` alone — -1 on mount and after every search, sort
+    // or filter — every row carried tabindex="-1" and the grid was unreachable.
+    assert.match(table, /const entryIndex = focusIndex >= virtual\.startIndex && focusIndex < virtual\.endIndex/);
+    assert.match(table, /tabIndex=\{index === entryIndex \? 0 : -1\}/);
+    assert.ok(!/tabIndex=\{index === focusIndex \? 0 : -1\}/.test(table), 'the entry point must not depend on a row already being focused');
+  });
+
+  it('does not pull focus off a control the operator tabbed into', () => {
+    assert.match(read('table.tsx'), /if \(!row \|\| row\.contains\(document\.activeElement\)\) return;/);
+  });
+
+  it('hands the virtualiser the sticky bands it has to scroll clear of', () => {
+    const table = read('table.tsx');
+    assert.match(table, /headerOffset: chrome\.head, footerOffset: chrome\.foot/);
+    assert.match(table, /scrollPaddingBlock: `\$\{chrome\.head\}px \$\{chrome\.foot\}px`/, 'the browser scrolls this box too');
+  });
+
+  it('answers Page Up and Page Down itself instead of letting the box scroll', () => {
+    const table = read('table.tsx');
+    // Left to the browser, paging scrolls the scroller, the virtualiser
+    // unmounts the focused row and document.activeElement becomes <body>.
+    assert.match(table, /e\.key === 'PageDown'.*e\.preventDefault\(\); moveTo\(/s);
+    assert.match(table, /e\.key === 'PageUp'.*e\.preventDefault\(\); moveTo\(/s);
+  });
+
+  it('gives the toast stack a hotkey, a name that says so, and a home for focus', () => {
+    const toast = read('toast.tsx');
+    assert.match(toast, /TOAST_FOCUS_KEYS = \['F6', 'F8'\]/);
+    assert.match(toast, /aria-label=\{`Notifications \(\$\{TOAST_FOCUS_KEYS\[0\]\}\)`\}/);
+    assert.match(toast, /tabIndex=\{-1\}/);
+    assert.match(toast, /setToastsPaused\(/, 'a four-second timer has to stop while someone is reading');
+  });
+
+  it('measures a highlighted row against the box that scrolls, never offsetTop', () => {
+    const overlays = read('overlays.tsx');
+    const fields = read('fields.tsx');
+    assert.ok(!overlays.includes('el.offsetTop'), 'offsetTop resolves against the nearest positioned ancestor, not the list');
+    assert.match(overlays, /scrollIntoViewport\(/);
+    assert.match(fields, /scrollIntoViewport\(/, 'the combobox highlight has to follow the arrows into view too');
+  });
+
+  it('parks scroll offsets across the measuring pass that removes the clamp', () => {
+    // Unclamping to measure makes the box fit its content for an instant, and a
+    // box that cannot overflow cannot hold a scroll offset.
+    const position = read('position.ts');
+    assert.match(position, /parked = \[el, \.\.\.el\.querySelectorAll<HTMLElement>\('\*'\)\]/);
+    assert.match(position, /for \(const \[node, top\] of parked\) node\.scrollTop = top;/);
+  });
+
+  it('carries focus with the selection in tabs and segmented controls', () => {
+    const nav = read('nav.tsx');
+    const controls = read('controls.tsx');
+    for (const key of ['Home', 'End']) {
+      assert.match(nav, new RegExp(`e\\.key === '${key}'[^\n]*selectTab\\(`), `Tabs must move focus on ${key}`);
+      assert.match(controls, new RegExp(`e\\.key === '${key}'[^\n]*pick\\(`), `SegmentedControl must move focus on ${key}`);
+    }
+  });
+
+  it('labels a tab panel with a tab that exists', () => {
+    assert.match(read('nav.tsx'), /id=\{role === 'tablist' \? tab\.id : undefined\}/);
+  });
+
+  it('opens a date picker onto the day the arrow keys move', () => {
+    const picker = read('datepicker.tsx');
+    assert.match(picker, /initialFocus=\{day\}/);
+    assert.match(picker, /ref=\{\(node\) => \{ if \(dayRef && hasRovingFocus\) dayRef\.current = node; \}\}/);
+  });
+});
+
 /* -------------------------------- calendar ------------------------------- */
 
 describe('calendar', () => {
@@ -693,6 +834,70 @@ describe('virtualisation window', () => {
   it('never runs past the end of the list', () => {
     const { endIndex } = computeWindow(39_600, 600, 1000, 40, 5);
     assert.equal(endIndex, 1000);
+  });
+
+  it('counts rows from below the sticky header, not from the top of the content', () => {
+    // Content begins 36px in, so at scrollTop 36 the first row is row 0 — not
+    // row 0.9 rounded down to 0 by luck, which is what hid the bug for one row
+    // and lost a row from the top of the window for every one after it.
+    assert.equal(computeWindow(36, 520, 1240, 42, 0, 36).startIndex, 0);
+    // Ten pixels into row 20: the header-aware answer is 20, the naive one 21,
+    // and that missing row is the one the operator just arrowed onto.
+    assert.equal(computeWindow(36 + 42 * 20 + 10, 520, 1240, 42, 0, 36).startIndex, 20);
+    assert.equal(computeWindow(36 + 42 * 20 + 10, 520, 1240, 42, 0).startIndex, 21);
+  });
+
+  /**
+   * The numbers here are the ones measured on the live page at 1440x900: a
+   * 520px scroll box holding a 36px sticky `<thead>` and a 38px sticky totals
+   * `<tfoot>`, 42px rows. This is the arithmetic that parked row 20 at
+   * y 907–949 against a viewport ending at 913 — six pixels of a 42px row.
+   */
+  describe('scrollTopForIndex', () => {
+    const grid = { clientHeight: 520, scrollHeight: 36 + 1240 * 42 + 38, rowHeight: 42, headerOffset: 36, footerOffset: 38 };
+
+    it('parks a row moved downwards clear of the sticky footer', () => {
+      const top = scrollTopForIndex(19, 'nearest', { ...grid, scrollTop: 0 });
+      // The row occupies [36 + 19*42, +42) = [834, 876) of the content.
+      // Visible band after the scroll: [top + 36, top + 520 - 38).
+      assert.equal(top, 876 + 38 - 520);
+      assert.ok(834 >= top + 36 && 876 <= top + 520 - 38, 'the whole row must be inside the band');
+    });
+
+    it('parks a row moved upwards clear of the sticky header', () => {
+      const top = scrollTopForIndex(3, 'nearest', { ...grid, scrollTop: 900 });
+      assert.equal(top, 3 * 42);
+      assert.equal(top + 36, 36 + 3 * 42, 'the row starts exactly where the header ends');
+    });
+
+    it('leaves a row that is already in the band alone', () => {
+      assert.equal(scrollTopForIndex(10, 'nearest', { ...grid, scrollTop: 200 }), 200);
+    });
+
+    it('would land 36px short without the header — the shipped bug', () => {
+      const naive = scrollTopForIndex(19, 'nearest', { ...grid, scrollTop: 0, headerOffset: 0, footerOffset: 0 });
+      const real = scrollTopForIndex(19, 'nearest', { ...grid, scrollTop: 0 });
+      assert.equal(real - naive, 36 + 38);
+    });
+
+    it('aligns start and center against the same band', () => {
+      assert.equal(scrollTopForIndex(30, 'start', { ...grid, scrollTop: 0 }), 30 * 42);
+      const centered = scrollTopForIndex(30, 'center', { ...grid, scrollTop: 0 });
+      const rowTop = 36 + 30 * 42 - centered;
+      const band = [36, 520 - 38];
+      assert.ok(Math.abs((rowTop - band[0]) - (band[1] - (rowTop + 42))) <= 1, 'equal space above and below inside the band');
+    });
+
+    it('never scrolls past either end', () => {
+      assert.equal(scrollTopForIndex(0, 'nearest', { ...grid, scrollTop: 400 }), 0);
+      assert.equal(scrollTopForIndex(1239, 'nearest', { ...grid, scrollTop: 0 }), grid.scrollHeight - grid.clientHeight);
+    });
+
+    it('shows the top of a row taller than the band it has to fit in', () => {
+      const cramped = { clientHeight: 90, scrollHeight: 4000, rowHeight: 42, headerOffset: 36, footerOffset: 38 };
+      const top = scrollTopForIndex(9, 'nearest', { ...cramped, scrollTop: 0 });
+      assert.equal(top, 9 * 42, 'aligning the bottom edge would hide the cells under the header');
+    });
   });
 
   it('matches hotkeys with modifiers', () => {

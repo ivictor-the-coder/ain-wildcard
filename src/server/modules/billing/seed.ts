@@ -20,6 +20,7 @@ import { prorate } from './proration';
 import { Billing } from './store';
 import type { SubscriptionCreateInput } from './records';
 import { Schedules } from './schedules';
+import { TaxRates, type TaxRateInput } from './tax';
 import type { CancellationReason, Subscription } from './types';
 
 const MONTH = 30 * DAY;
@@ -47,16 +48,33 @@ function currencyFor(country: string, region: string): string {
   return 'usd';
 }
 
-function taxIdFor(country: string, currency: string, slug: string): { type: string; value: string; country: string } | null {
+/**
+ * A registration number in the shape the country's register actually issues.
+ *
+ * Every member state writes its VAT number differently — nine digits in
+ * Germany, nine digits and a `B` block in the Netherlands, twelve in Sweden —
+ * and the tax engine refuses anything that is not the right shape, so a seed
+ * that invented `EU443216789` would be a seed that could not be saved.
+ */
+function taxIdFor(country: string, slug: string): { type: string; value: string; country: string } | null {
   const digits = slugDigits(slug);
-  if (currency === 'gbp') return { type: 'gb_vat', value: `GB${digits.slice(0, 9)}`, country };
-  if (currency === 'eur') {
-    const prefix = country === 'Germany' ? 'DE' : country === 'France' ? 'FR' : country === 'Netherlands' ? 'NL'
-      : country === 'Italy' ? 'IT' : country === 'Spain' ? 'ES' : country === 'Switzerland' ? 'CHE' : 'EU';
-    return { type: 'eu_vat', value: `${prefix}${digits.slice(0, 9)}`, country };
+  const eu = (value: string) => ({ type: 'eu_vat', value, country });
+  switch (country) {
+    case 'United Kingdom': return { type: 'gb_vat', value: `GB${digits.slice(0, 9)}`, country };
+    case 'Germany': return eu(`DE${digits.slice(0, 9)}`);
+    case 'France': return eu(`FR${digits.slice(0, 2)}${digits.slice(0, 9)}`);
+    case 'Netherlands': return eu(`NL${digits.slice(0, 9)}B${digits.slice(0, 2)}`);
+    case 'Italy': return eu(`IT${digits.slice(0, 10)}${digits.slice(0, 1)}`);
+    case 'Spain': return eu(`ES${digits.slice(0, 9)}`);
+    case 'Ireland': return eu(`IE${digits.slice(0, 7)}A`);
+    case 'Sweden': return eu(`SE${digits.slice(0, 10)}01`);
+    case 'Denmark': return eu(`DK${digits.slice(0, 8)}`);
+    case 'Poland': return eu(`PL${digits.slice(0, 10)}`);
+    case 'Switzerland': return { type: 'ch_vat', value: `CHE${digits.slice(0, 9)}MWST`, country };
+    case 'Türkiye': return { type: 'tr_tin', value: digits.slice(0, 10), country };
+    case 'United States': return { type: 'us_ein', value: `${digits.slice(0, 2)}-${digits.slice(2, 9)}`, country };
+    default: return null;
   }
-  if (country === 'United States') return { type: 'us_ein', value: `${digits.slice(0, 2)}-${digits.slice(2, 9)}`, country };
-  return null;
 }
 
 /** A stable nine-digit-ish string from a slug, so tax ids survive a reseed. */
@@ -84,12 +102,63 @@ interface Plan {
   metered: string[];
 }
 
+/**
+ * Where Northwind is registered to collect tax.
+ *
+ * A US company selling software: sales tax in the eight states it has nexus in,
+ * and VAT registrations across the EU and the UK where every B2B supply against
+ * a valid registration number is reverse charged — the customer accounts for
+ * the tax and the invoice says so. Everywhere else there is simply no rate,
+ * which is the correct answer and the one the invoice prints.
+ */
+const TAX_REGISTRATIONS: TaxRateInput[] = [
+  { display_name: 'OH sales tax', jurisdiction: 'Ohio', country: 'US', state: 'Ohio', tax_type: 'sales_tax', percentage: '5.75', description: 'State rate for the home jurisdiction in Cleveland.' },
+  { display_name: 'TX sales tax', jurisdiction: 'Texas', country: 'US', state: 'Texas', tax_type: 'sales_tax', percentage: '6.25' },
+  { display_name: 'NY sales tax', jurisdiction: 'New York', country: 'US', state: 'New York', tax_type: 'sales_tax', percentage: '4' },
+  { display_name: 'WA sales tax', jurisdiction: 'Washington', country: 'US', state: 'Washington', tax_type: 'sales_tax', percentage: '6.5' },
+  { display_name: 'MI sales tax', jurisdiction: 'Michigan', country: 'US', state: 'Michigan', tax_type: 'sales_tax', percentage: '6' },
+  { display_name: 'TN sales tax', jurisdiction: 'Tennessee', country: 'US', state: 'Tennessee', tax_type: 'sales_tax', percentage: '7' },
+  { display_name: 'PA sales tax', jurisdiction: 'Pennsylvania', country: 'US', state: 'Pennsylvania', tax_type: 'sales_tax', percentage: '6' },
+  { display_name: 'MN sales tax', jurisdiction: 'Minnesota', country: 'US', state: 'Minnesota', tax_type: 'sales_tax', percentage: '6.875' },
+  { display_name: 'VAT', jurisdiction: 'Germany', country: 'DE', tax_type: 'vat', percentage: '19', reverse_charge: true },
+  { display_name: 'TVA', jurisdiction: 'France', country: 'FR', tax_type: 'vat', percentage: '20', reverse_charge: true },
+  { display_name: 'BTW', jurisdiction: 'Netherlands', country: 'NL', tax_type: 'vat', percentage: '21', reverse_charge: true },
+  { display_name: 'VAT', jurisdiction: 'Ireland', country: 'IE', tax_type: 'vat', percentage: '23', reverse_charge: true },
+  { display_name: 'IVA', jurisdiction: 'Italy', country: 'IT', tax_type: 'vat', percentage: '22', reverse_charge: true },
+  { display_name: 'IVA', jurisdiction: 'Spain', country: 'ES', tax_type: 'vat', percentage: '21', reverse_charge: true },
+  { display_name: 'Moms', jurisdiction: 'Sweden', country: 'SE', tax_type: 'vat', percentage: '25', reverse_charge: true },
+  { display_name: 'Moms', jurisdiction: 'Denmark', country: 'DK', tax_type: 'vat', percentage: '25', reverse_charge: true },
+  { display_name: 'VAT', jurisdiction: 'United Kingdom', country: 'GB', tax_type: 'vat', percentage: '20', reverse_charge: true },
+];
+
 export function seedBilling(ctx: Ctx, orgId: string): void {
   const billing = new Billing(ctx);
   const schedules = new Schedules(ctx, billing);
   const book = billing.book(orgId);
   const now = ctx.now();
   const random = rng(0x8f21_44b3);
+
+  // Registered long before the oldest backdated invoice, so every bill in the
+  // book was raised against a rate that already existed.
+  const rates = new TaxRates(ctx, orgId);
+  for (const registration of TAX_REGISTRATIONS) rates.create(registration, now - 460 * DAY);
+
+  // Who the bill comes from. Kept as a workspace setting rather than a constant
+  // so the rendered invoice reads from the same place a settings screen writes.
+  ctx.svc.core.setSetting(orgId, 'billing.issuer', {
+    legal_name: 'Northwind Robotics, Inc.',
+    line1: '1200 Superior Avenue East',
+    line2: 'Suite 1400',
+    city: 'Cleveland',
+    state: 'Ohio',
+    postal_code: '44114',
+    country: 'United States',
+    tax_id: 'EIN 34-2118840',
+    email: 'ar@northwind.io',
+    phone: '+1 216 555 0142',
+    remittance:
+      'Payable by ACH, wire or card in the currency shown. Bank details are on your account under Billing \u2192 Payment methods. Quote the invoice number on the remittance advice, and send queries to ar@northwind.io.',
+  });
 
   const priceOf = (lookupKey: string): string => {
     const price = ctx.svc.catalog.priceByLookupKey(orgId, lookupKey);
@@ -104,6 +173,17 @@ export function seedBilling(ctx: Ctx, orgId: string): void {
 
   if (!companies.length) return;
 
+  // The account with a resale certificate on file. Deliberately one that trades
+  // where Northwind *is* registered, so its lines name the rate that would have
+  // applied and charge nothing — the case a finance team has to point at when
+  // an auditor asks why a US invoice carries no sales tax.
+  const registeredStates = new Set(
+    TAX_REGISTRATIONS.filter((r) => r.country === 'US' && r.state).map((r) => r.state as string),
+  );
+  const exemptCompany = companies.find(
+    (company) => str(company, 'country') === 'United States' && registeredStates.has(str(company, 'state')),
+  )?.id ?? null;
+
   const customers = companies.map((company, index) => {
     const slug = str(company, 'domain').split('.')[0];
     const country = str(company, 'country');
@@ -112,7 +192,7 @@ export function seedBilling(ctx: Ctx, orgId: string): void {
     const assets = num(company, 'connected_assets');
     const rung = rungOf(assets);
     const enterprise = rung === 'enterprise';
-    const taxId = taxIdFor(country, currency, slug);
+    const taxId = taxIdFor(country, slug);
     const createdAt = startOfDay(company.created + 7 * DAY);
 
     const customer = billing.createCustomer(orgId, {
@@ -136,8 +216,22 @@ export function seedBilling(ctx: Ctx, orgId: string): void {
           : null,
       },
       preferred_locales: currency === 'eur' ? ['de-DE', 'en-GB'] : currency === 'gbp' ? ['en-GB'] : ['en-US'],
+      tax_exempt: company.id === exemptCompany ? 'exempt' : 'none',
       metadata: { crm_company: company.id, region, rung, plants: String(num(company, 'plant_count')) },
     }, { actorType: 'system' });
+
+    // Northwind's AP team checked every registration against its own register
+    // when the account was opened — which is the only thing that lets a B2B
+    // supply into the EU be reverse charged, and the reason the seeded German
+    // and Irish bills carry 0% with a sentence saying why.
+    if (taxId) {
+      billing.verifyTaxId(orgId, customer.id, {
+        value: taxId.value,
+        status: 'verified',
+        verified_name: company.display_name,
+        verified_address: `${str(company, 'street')}, ${str(company, 'city')}, ${country}`,
+      }, { actorType: 'system' });
+    }
 
     ctx.db.patch('billing_customers', 'id', customer.id, { created: createdAt, updated: createdAt });
     retimeEvents(ctx, orgId, customer.id, now, createdAt);

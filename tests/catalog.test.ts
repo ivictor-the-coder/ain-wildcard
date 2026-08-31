@@ -762,7 +762,337 @@ describe('prices are immutable once they have billed', () => {
   });
 });
 
+/* ------------------- the price you asked for, exactly --------------------- */
+
+describe('a price is the shape the payload asked for', () => {
+  let relayId = '';
+
+  /** One product to hang the shape tests off, created on first use. */
+  const relay = async (): Promise<string> => {
+    if (!relayId) {
+      const product = await expectOk('POST', '/v1/products', {
+        name: 'Relay operator seat', category: 'add_on', unit_label: 'seat',
+        description: 'A seat on the fleet relay console, sold alongside any plan.',
+      });
+      relayId = product.id;
+    }
+    return relayId;
+  };
+
+  test('the payload every Stripe integration sends is a per-unit price', async () => {
+    const product = await relay();
+    // No `model` anywhere: product + currency + unit_amount + recurring.
+    const price = await expectOk('POST', '/v1/prices', {
+      product, currency: 'usd', unit_amount: 1000, recurring: { interval: 'month' },
+    });
+    assert.equal(price.model, 'per_unit', 'an unqualified unit_amount is a per-unit price, as it is in Stripe');
+    assert.equal(price.billing_scheme, 'per_unit');
+    assert.equal(price.type, 'recurring');
+
+    const preview = await expectOk('POST', `/v1/prices/${price.id}/preview`, { quantity: 100 });
+    assert.equal(preview.amount, 100_000, '100 seats at $10.00 is $1,000.00');
+    assert.equal(preview.billable_quantity, 100);
+    assert.equal(preview.amount_display, '$1,000.00');
+    assert.equal(preview.warning, null);
+
+    const estimate = await expectOk('POST', '/v1/catalog/estimate', { lines: [{ price: price.id, quantity: 10 }] });
+    assert.equal(estimate.due_today_display, '$100.00', 'the calculator quotes ten seats, not one');
+    assert.deepEqual(estimate.warnings, []);
+
+    const curve = await expectOk('GET', `/v1/prices/${price.id}/curve?from=0&to=20&points=3`);
+    assert.deepEqual(curve.points.map((p: any) => [p.quantity, p.amount]), [[0, 0], [10, 10_000], [20, 20_000]]);
+
+    // Saying out loud what the payload already implied changes nothing.
+    const spelled = await expectOk('POST', '/v1/prices', {
+      product, currency: 'usd', model: 'per_unit', unit_amount: 1000, recurring: { interval: 'month' },
+    });
+    const same = await expectOk('POST', `/v1/prices/${spelled.id}/preview`, { quantity: 100 });
+    assert.equal(same.amount, preview.amount, 'the model field restates the payload, it never reprices it');
+
+    await expectOk('DELETE', `/v1/prices/${price.id}`);
+    await expectOk('DELETE', `/v1/prices/${spelled.id}`);
+  });
+
+  test('every model but "flat" follows from the fields, and "flat" has to be asked for', async () => {
+    const product = await relay();
+    const cases: [string, Record<string, unknown>][] = [
+      ['per_unit', { unit_amount: 1000, recurring: { interval: 'month' } }],
+      ['per_unit', { unit_amount: 1000 }],
+      ['tiered', { tiers: [{ up_to: 10, unit_amount: 900 }, { up_to: 'inf', unit_amount: 500 }], recurring: { interval: 'month' } }],
+      ['usage', { unit_amount_decimal: '0.04', recurring: { interval: 'month', usage_type: 'metered' } }],
+      ['package', { unit_amount: 900, transform_quantity: { divide_by: 10, round: 'up' }, recurring: { interval: 'month' } }],
+      ['custom', { custom_unit_amount: { enabled: true, minimum: 100_000 }, recurring: { interval: 'year' } }],
+      ['flat', { model: 'flat', unit_amount: 49_900, recurring: { interval: 'month' } }],
+    ];
+    for (const [expected, body] of cases) {
+      const price = await expectOk('POST', '/v1/prices', { product, currency: 'usd', ...body });
+      assert.equal(price.model, expected, `${JSON.stringify(body)} is a ${expected} price`);
+      await expectOk('DELETE', `/v1/prices/${price.id}`);
+    }
+  });
+
+  test('a flat fee quoted at a quantity says what it just billed', async () => {
+    const product = await relay();
+    const flat = await expectOk('POST', '/v1/prices', {
+      product, currency: 'usd', model: 'flat', unit_amount: 49_900,
+      recurring: { interval: 'month' }, nickname: 'Relay platform fee',
+    });
+    const many = await expectOk('POST', `/v1/prices/${flat.id}/preview`, { quantity: 10 });
+    assert.equal(many.amount, 49_900, 'a flat fee is one charge whatever the quantity');
+    assert.equal(many.billable_quantity, 1);
+    assert.equal(many.warning.code, 'flat_price_quantity');
+    assert.match(many.warning.message, /one charge of \$499\.00, not 10 of them/);
+    assert.match(many.breakdown[0].label, /10 seats asked for, 1 billed/);
+
+    const one = await expectOk('POST', `/v1/prices/${flat.id}/preview`, { quantity: 1 });
+    assert.equal(one.warning, null);
+    assert.equal(one.breakdown[0].label, 'Relay platform fee');
+
+    const estimate = await expectOk('POST', '/v1/catalog/estimate', { lines: [{ price: flat.id, quantity: 10 }] });
+    assert.equal(estimate.due_today, 49_900);
+    assert.equal(estimate.warnings[0].code, 'flat_price_quantity');
+    assert.equal(estimate.warnings[0].price, flat.id);
+
+    const tool = app.ctx.ai.tool('catalog_quote_price');
+    const quoted = await tool!.run({ price: flat.id, quantity: 10 }, app.ctx, { orgId: ORG }) as any;
+    assert.match(quoted.warning, /not 10 of them/, 'the copilot never quotes a flat fee as if it scaled');
+
+    await expectOk('DELETE', `/v1/prices/${flat.id}`);
+  });
+
+  test('a mistyped parameter is refused, never dropped', async () => {
+    const product = await relay();
+    const tiers = [{ up_to: 10, unit_amount: 1000 }, { up_to: 'inf', unit_amount: 500 }];
+    const mistyped = await expectError('POST', '/v1/prices', {
+      product, currency: 'usd', tiersMode: 'volume', tiers, recurring: { interval: 'month' },
+    }, 400, 'parameter_invalid');
+    assert.equal(mistyped.param, 'tiersMode');
+    assert.match(mistyped.message, /unknown parameter: tiersMode/);
+
+    const nested = await expectError('POST', '/v1/prices', {
+      product, currency: 'usd', unit_amount: 900, recurring: { interval: 'month', intervalCount: 3 },
+    }, 400, 'parameter_invalid');
+    assert.equal(nested.param, 'recurring.intervalCount');
+
+    const inTier = await expectError('POST', '/v1/prices', {
+      product, currency: 'usd', tiers: [{ up_to: 'inf', unitAmount: 500 }], recurring: { interval: 'month' },
+    }, 400, 'parameter_invalid');
+    assert.equal(inTier.param, 'tiers[0].unitAmount');
+
+    assert.equal((await expectError('POST', '/v1/products', { name: 'Hijack', id: 'prod_nw_starter' }, 400)).param, 'id');
+    assert.equal((await expectError('PATCH', '/v1/products/prod_nw_starter', { taxCode: 'txcd_10000000' }, 400)).param, 'taxCode');
+    assert.equal((await expectError('PATCH', '/v1/prices/price_nw_starter_monthly', { nickName: 'x' }, 400)).param, 'nickName');
+    assert.equal((await expectError('POST', '/v1/prices/price_nw_starter_monthly/preview', { Quantity: 5 }, 400)).param, 'Quantity');
+    assert.equal((await expectError('POST', '/v1/catalog/estimate', { lines: [{ price: 'growth_monthly', qty: 2 }] }, 400)).param, 'lines[0].qty');
+
+    // Spelled correctly, the operator gets the volume price they were writing —
+    // which bills $100.00 at twenty, where the graduated one bills $150.00.
+    const volume = await expectOk('POST', '/v1/prices', {
+      product, currency: 'usd', tiers_mode: 'volume', tiers, recurring: { interval: 'month' },
+    });
+    assert.equal(volume.tiers_mode, 'volume');
+    assert.equal((await expectOk('POST', `/v1/prices/${volume.id}/preview`, { quantity: 20 })).amount, 10_000);
+    await expectOk('DELETE', `/v1/prices/${volume.id}`);
+  });
+
+  test('a statement descriptor is checked on the way in and on every edit after', async () => {
+    const product = await expectOk('POST', '/v1/products', { name: 'Descriptor probe', category: 'service' });
+    await expectError('POST', '/v1/products', { name: 'Probe', statement_descriptor: 'BAD<script>' }, 400, 'parameter_invalid');
+
+    const patched = await expectError(
+      'PATCH', `/v1/products/${product.id}`, { statement_descriptor: 'BAD<script>"*' }, 400, 'parameter_invalid',
+    );
+    assert.equal(patched.param, 'statement_descriptor');
+    assert.match(patched.message, /cannot contain/);
+    await expectError('PATCH', `/v1/products/${product.id}`, { statement_descriptor: 'NORTHWIND ROBOTICS TELE' }, 400);
+
+    const set = await expectOk('PATCH', `/v1/products/${product.id}`, { statement_descriptor: 'NORTHWIND TELEMETRY' });
+    assert.equal(set.statement_descriptor, 'NORTHWIND TELEMETRY');
+    const cleared = await expectOk('PATCH', `/v1/products/${product.id}`, { statement_descriptor: null });
+    assert.equal(cleared.statement_descriptor, null, 'a descriptor can be taken back off');
+    await expectOk('DELETE', `/v1/products/${product.id}`);
+  });
+
+  test('usage counts objects, not rows', async () => {
+    const priceId = 'price_nw_starter_monthly';
+    const subscriptions = app.ctx.db.count(
+      `SELECT COUNT(DISTINCT subscription_id) FROM billing_subscription_items WHERE org_id = ? AND price_id = ?`,
+      ORG, priceId,
+    );
+    const invoices = app.ctx.db.count(
+      `SELECT COUNT(DISTINCT invoice_id) FROM billing_invoice_lines WHERE org_id = ? AND price_id = ?`,
+      ORG, priceId,
+    );
+    assert.ok(subscriptions > 0 && invoices > 0, 'the seed really does bill Starter monthly');
+
+    const price = await expectOk('GET', `/v1/prices/${priceId}`);
+    assert.equal(price.usage.count, subscriptions + invoices, 'each subscription and each invoice counted once');
+    assert.deepEqual(
+      price.usage.by_type,
+      [{ type: 'invoice', count: invoices }, { type: 'subscription', count: subscriptions }],
+    );
+    assert.equal(price.usage.summary, `${invoices.toLocaleString('en-US')} invoices and ${subscriptions.toLocaleString('en-US')} subscriptions`);
+
+    // A subscription registered by billing and holding a row in
+    // billing_subscription_items is one object, never two.
+    const ids = price.usage.references.map((r: any) => r.id);
+    assert.equal(new Set(ids).size, ids.length, 'no object is listed twice under two names');
+
+    const refused = await expectError('DELETE', `/v1/prices/${priceId}`, undefined, 409, 'price_in_use');
+    assert.equal((refused.detail as any).count, subscriptions + invoices);
+    assert.match(refused.message, new RegExp(`${invoices} invoices and ${subscriptions} subscriptions`));
+  });
+});
+
 /* --------------------------------- the API -------------------------------- */
+
+/* ------------------------- the floor under an amount ---------------------- */
+
+/*
+ * The catalog is the one place in the platform where the shape of money is
+ * defined, so a floor that holds for `unit_amount` and not for
+ * `unit_amount_decimal` is not a floor. `decimalToRat` accepts a leading minus
+ * on purpose — a proration credit is a genuinely negative rational — and the
+ * price-creation path used to call it only to check the *format*, so
+ * `unit_amount_decimal: "-4"` became a live price of -$0.04 per unit whose own
+ * generated headline read "-$0.04 per unit". Everything downstream then billed
+ * it faithfully: the preview quoted -$40.00, the pricing-page calculator quoted
+ * a negative total with no warning, and a renewal produced a paid invoice
+ * carrying a negative line — a refund nobody authorised, issued by a typo.
+ * Every decimal field that can carry a rate is checked here, on both the create
+ * and the update path, against the integer field that sits next to it.
+ */
+describe('no price can be minted that bills negative money', () => {
+  const NEGATIVE = /^Must be greater than or equal to 0\./;
+  const line = (over: Record<string, unknown>) => ({
+    product: 'prod_nw_growth', currency: 'usd', recurring: { interval: 'month' }, ...over,
+  });
+
+  test('the integer amount and the decimal amount refuse the same payload', async () => {
+    const integer = await expectError('POST', '/v1/prices', line({ unit_amount: -500 }), 400, 'parameter_invalid');
+    assert.equal(integer.param, 'unit_amount');
+    assert.match(integer.message, NEGATIVE);
+
+    const decimal = await expectError('POST', '/v1/prices', line({ unit_amount_decimal: '-4' }), 400, 'parameter_invalid');
+    assert.equal(decimal.param, 'unit_amount_decimal');
+    assert.match(decimal.message, NEGATIVE);
+    assert.match(decimal.message, /coupon|credit note/);
+  });
+
+  test('a tier rate cannot be negative, in either of its two decimal fields', async () => {
+    const control = await expectError('POST', '/v1/prices', line({
+      tiers: [{ up_to: 10, flat_amount: -99_999 }, { up_to: 'inf', unit_amount: 5 }],
+    }), 400, 'parameter_invalid');
+    assert.equal(control.param, 'tiers[0].flat_amount');
+
+    const unit = await expectError('POST', '/v1/prices', line({
+      tiers: [{ up_to: 10, unit_amount_decimal: '-100' }, { up_to: 'inf', unit_amount: 5 }],
+    }), 400, 'parameter_invalid');
+    assert.equal(unit.param, 'tiers[0].unit_amount_decimal');
+    assert.match(unit.message, NEGATIVE);
+
+    const flat = await expectError('POST', '/v1/prices', line({
+      tiers: [{ up_to: 10, unit_amount: 5, flat_amount_decimal: '-100' }, { up_to: 'inf', unit_amount: 5 }],
+    }), 400, 'parameter_invalid');
+    assert.equal(flat.param, 'tiers[0].flat_amount_decimal');
+    assert.match(flat.message, NEGATIVE);
+  });
+
+  test('a second currency cannot smuggle one in, flat or tiered', async () => {
+    const control = await expectError('POST', '/v1/prices', line({
+      unit_amount: 500, currency_options: { eur: { unit_amount: -90 } },
+    }), 400, 'parameter_invalid');
+    assert.equal(control.param, 'currency_options.eur.unit_amount');
+
+    const flat = await expectError('POST', '/v1/prices', line({
+      unit_amount: 500, currency_options: { eur: { unit_amount_decimal: '-90' } },
+    }), 400, 'parameter_invalid');
+    assert.equal(flat.param, 'currency_options.eur.unit_amount_decimal');
+    assert.match(flat.message, NEGATIVE);
+
+    const tiered = await expectError('POST', '/v1/prices', line({
+      tiers: [{ up_to: 'inf', unit_amount: 5 }],
+      currency_options: { eur: { tiers: [{ up_to: 'inf', unit_amount_decimal: '-5' }] } },
+    }), 400, 'parameter_invalid');
+    assert.equal(tiered.param, 'currency_options.eur.tiers[0].unit_amount_decimal');
+    assert.match(tiered.message, NEGATIVE);
+  });
+
+  test('an edit cannot turn a good price bad, and leaves it as it was', async () => {
+    const price = await expectOk('POST', '/v1/prices', line({ unit_amount: 500, nickname: 'Sign-floor probe' }));
+    const error = await expectError('PATCH', `/v1/prices/${price.id}`, { unit_amount_decimal: '-3' }, 400, 'parameter_invalid');
+    assert.equal(error.param, 'unit_amount_decimal');
+    assert.match(error.message, NEGATIVE);
+
+    const unchanged = await expectOk('GET', `/v1/prices/${price.id}`);
+    assert.equal(unchanged.unit_amount, 500);
+    assert.equal(unchanged.unit_amount_decimal, null);
+    assert.equal(unchanged.display.headline, '$5.00 per seat');
+    await expectOk('DELETE', `/v1/prices/${price.id}`);
+  });
+
+  test('a product created around a negative price is not created at all', async () => {
+    const before = await expectOk('GET', '/v1/products?limit=200');
+    const error = await expectError('POST', '/v1/products', {
+      name: 'Fleet Insights — negative rate',
+      default_price_data: { currency: 'usd', unit_amount_decimal: '-7', recurring: { interval: 'month' } },
+    }, 400, 'parameter_invalid');
+    assert.match(error.message, NEGATIVE);
+
+    const after = await expectOk('GET', '/v1/products?limit=200');
+    assert.equal(after.total_count, before.total_count, 'the whole call rolls back, product included');
+    assert.ok(!after.data.some((p: any) => p.name === 'Fleet Insights — negative rate'));
+  });
+
+  test('the floor is a floor, not a wall: zero and sub-cent rates still price', async () => {
+    const free = await expectOk('POST', '/v1/prices', line({ unit_amount_decimal: '0' }));
+    assert.equal(free.display.headline, '$0.00 per seat');
+    assert.equal((await expectOk('POST', `/v1/prices/${free.id}/preview`, { quantity: 40 })).amount, 0);
+    const metered = await expectOk('POST', '/v1/prices', line({
+      unit_amount_decimal: '0.04', recurring: { interval: 'month', usage_type: 'metered' },
+    }));
+    const priced = await expectOk('POST', `/v1/prices/${metered.id}/preview`, { quantity: 12_345 });
+    assert.equal(priced.amount, 494);
+    await expectOk('DELETE', `/v1/prices/${free.id}`);
+    await expectOk('DELETE', `/v1/prices/${metered.id}`);
+  });
+
+  test('the ceiling matches the integer field too', async () => {
+    const integer = await expectError('POST', '/v1/prices', line({ unit_amount: 1e18 }), 400, 'parameter_invalid');
+    assert.equal(integer.param, 'unit_amount');
+    const decimal = await expectError('POST', '/v1/prices', line({ unit_amount_decimal: '9999999999999.5' }), 400, 'parameter_invalid');
+    assert.equal(decimal.param, 'unit_amount_decimal');
+    assert.match(decimal.message, /implausibly large/);
+  });
+
+  test('the parser itself stays sign-capable, because prorations need it', () => {
+    const credit = decimalToRat('-2.5');
+    assert.equal(credit.n < 0n, true);
+    assert.equal(ratToDecimal(credit), '-2.5');
+  });
+
+  test('nothing in the whole price book prices below zero, at any quantity', () => {
+    const svc = app.ctx.svc.catalog;
+    const prices = svc.prices(ORG, { limit: 200 });
+    assert.ok(prices.length >= 14, 'expected the seeded price book');
+    let checked = 0;
+    for (const price of prices) {
+      for (const currency of svc.currencies(price)) {
+        for (const quantity of [0, 1, 9, 500_000, 500_001, 5_000_001, 25_000_001]) {
+          let priced;
+          try { priced = svc.compute(price, quantity, currency); }
+          catch { continue; } // custom prices and unpriced currencies say so themselves
+          checked++;
+          assert.ok(priced.amount >= 0, `${price.id} (${currency}) bills ${priced.amount} at quantity ${quantity}`);
+          for (const row of priced.breakdown) {
+            assert.ok(row.amount >= 0, `${price.id} (${currency}): breakdown row "${row.label}" is ${row.amount}`);
+          }
+        }
+      }
+    }
+    assert.ok(checked >= 200, `expected a real sweep of the book, checked ${checked}`);
+  });
+});
 
 describe('the catalog API', () => {
   test('rejects tiers that do not ascend, naming the offending tier', async () => {
@@ -824,6 +1154,49 @@ describe('the catalog API', () => {
     // Put the price book back the way the rest of the suite expects it.
     await expectOk('PATCH', '/v1/prices/price_nw_growth_monthly', { lookup_key: 'growth_monthly', transfer_lookup_key: true });
     await expectOk('DELETE', `/v1/prices/${replacement.id}`);
+  });
+
+  /*
+   * The 409 on create used to name transfer_lookup_key and then refuse it as an
+   * unknown parameter, leaving the operator to clear the key with a PATCH first
+   * — two calls, between which the key belonged to nobody and every integration
+   * resolving prices by key got a 404. The remedy the API prints now works on
+   * the route that prints it.
+   */
+  test('the cut-over the refusal names is one atomic call on create', async () => {
+    const held = await expectOk('GET', '/v1/prices/price_nw_growth_monthly');
+    assert.equal(held.lookup_key, 'growth_monthly');
+    assert.equal(held.usage.in_use, true, 'the key points at the price customers are actually billed on');
+
+    const refusal = await expectError('POST', '/v1/prices', {
+      product: 'prod_nw_growth', currency: 'usd', unit_amount: 100, lookup_key: 'growth_monthly',
+      recurring: { interval: 'month' },
+    }, 409, 'lookup_key_in_use');
+    assert.match(refusal.message, /transfer_lookup_key: true/);
+    assert.equal((refusal.detail as any).price, 'price_nw_growth_monthly');
+
+    const replacement = await expectOk('POST', '/v1/prices', {
+      product: 'prod_nw_growth', currency: 'usd', model: 'flat', unit_amount: 54_900,
+      recurring: { interval: 'month' }, nickname: 'Growth platform fee — 2028 list',
+      lookup_key: 'growth_monthly', transfer_lookup_key: true,
+      currency_options: { eur: { unit_amount: 49_900 }, gbp: { unit_amount: 43_900 } },
+    });
+    assert.equal(replacement.lookup_key, 'growth_monthly');
+
+    const donor = await expectOk('GET', '/v1/prices/price_nw_growth_monthly');
+    assert.equal(donor.lookup_key, null, 'the key moved rather than being duplicated');
+    const byKey = await expectOk('GET', '/v1/prices?lookup_key=growth_monthly');
+    assert.deepEqual(byKey.data.map((p: any) => p.id), [replacement.id]);
+
+    // The price that lost the key changed, so the event stream has to say so.
+    const donorEvents = await expectOk('GET', '/v1/events?object_id=price_nw_growth_monthly&limit=5');
+    assert.ok(donorEvents.data.some((e: any) => e.type === 'price.updated' && e.data.lookup_key === null),
+      'the displaced price emits price.updated');
+
+    await expectOk('PATCH', '/v1/prices/price_nw_growth_monthly', { lookup_key: 'growth_monthly', transfer_lookup_key: true });
+    await expectOk('DELETE', `/v1/prices/${replacement.id}`);
+    const restored = await expectOk('GET', '/v1/prices/price_nw_growth_monthly');
+    assert.equal(restored.lookup_key, 'growth_monthly');
   });
 
   test('metadata merges rather than replacing wholesale', async () => {

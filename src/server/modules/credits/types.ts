@@ -186,6 +186,12 @@ export interface SettlementSkip {
    * hole has outlived a whole billing cycle, so nothing is coming to fill it.
    */
   gaps: { start: number; end: number; overdue: boolean }[];
+  /**
+   * The billing cycle the refused window belonged to, as the run stated it.
+   * A gap filled later is priced against this rather than from the bottom of
+   * the tier ladder, so filling a hole costs what the hole costs.
+   */
+  billing_period: { start: number; end: number } | null;
   summary: string;
 }
 
@@ -371,7 +377,17 @@ export interface SettleUsageInput {
   quantity?: number;
   currency?: string;
   idem_key?: string;
-  /** Freeze the meter period as billed at the same time. */
+  /**
+   * Freeze the meter period as billed at the same time.
+   *
+   * Defaults to true whenever the settlement resolved a meter, because that is
+   * the instant the meter's total goes onto an invoice: from here on, usage
+   * that lands inside the window is a late arrival and a priced true-up rather
+   * than a number that quietly disagrees with a bill already sent. Pass `false`
+   * to price a window without claiming it has been billed — a quote, a
+   * what-if, or a quantity supplied by hand for a price whose meter is not
+   * what the invoice is drawn on.
+   */
   close_period?: boolean;
   /**
    * The billing period this window belongs to, when it is only part of one.
@@ -398,4 +414,49 @@ export interface SkipSettlementInput {
   reason: string;
   message: string;
   superseded_by?: string | null;
+  /**
+   * The cycle the refused window belonged to. Kept because the window itself
+   * is not always the cycle — a stub period after a cancel is part of a longer
+   * one — and a settlement that fills this window's gap later has to climb the
+   * same tier ladder the run would have climbed.
+   */
+  billing_period?: { start: number; end: number } | null;
+}
+
+/**
+ * What a settlement request did.
+ *
+ * A window that has already been settled is never settled again: the first
+ * settlement is handed back exactly as it stands, which is a read and not a
+ * write. The difference matters to the caller — re-settling a period whose
+ * meter has moved since it was billed has to show the movement rather than
+ * look like a fresh success.
+ */
+export interface SettlementResult {
+  settlement: Settlement;
+  /** False when this request found the settlement already there. */
+  created: boolean;
+  /** What the meter says about the window now, when it no longer agrees. */
+  drift: SettlementDrift | null;
+}
+
+/** How far a settled window's meter has moved since it was billed. */
+export interface SettlementDrift {
+  /** The total the settlement was drawn on. */
+  settled_quantity: number;
+  settled_quantity_decimal: string;
+  /** What the same window aggregates to right now. */
+  live_quantity: number;
+  live_quantity_decimal: string;
+  delta: number;
+  delta_decimal: string;
+  /** The closure that froze the window, when it was closed. */
+  closure: string | null;
+  /** Late arrivals filed against that closure and still waiting for a true-up. */
+  open_late_arrivals: string[];
+  /** What the movement is worth on the price the period was billed against. */
+  outstanding_amount: number | null;
+  currency: string;
+  /** The whole thing in one sentence, including what to do about it. */
+  message: string;
 }

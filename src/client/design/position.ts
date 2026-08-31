@@ -30,6 +30,7 @@ export interface PositionResult {
   /** True when the box had to flip to the opposite side. */
   flipped: boolean;
   maxHeight: number;
+  maxWidth: number;
   width?: number;
 }
 
@@ -46,6 +47,13 @@ const OPPOSITE: Record<Side, Side> = { top: 'bottom', bottom: 'top', left: 'righ
  * still cross its anchor, and only on a viewport too short to hold both.
  */
 const MIN_HEIGHT = 120;
+
+/**
+ * The same floor on the other axis. `.ain-menu` sets `min-width: 200px`, so a
+ * max-width under that cannot make the box any narrower — it would only clip
+ * the labels.
+ */
+const MIN_WIDTH = 200;
 
 function place(anchor: Rect, size: Size, side: Side, align: Alignment, offset: number): { x: number; y: number } {
   let x = 0;
@@ -102,15 +110,26 @@ export function computePosition(
   // padding` is negative, the clamp collapsed to `padding`, and the box landed
   // at y=8 covering its own anchor and the whole filter bar.
   const available = spaceOn(anchor, side, viewport, padding) - offset;
-  const maxHeight = side === 'top' || side === 'bottom'
+  const vertical = side === 'top' || side === 'bottom';
+  const maxHeight = vertical
     ? Math.max(MIN_HEIGHT, available)
     : Math.max(MIN_HEIGHT, viewport.height - padding * 2);
+  // Width gets the identical treatment, because a side-placed box is clipped by
+  // the room beside its anchor exactly the way a top/bottom one is clipped by
+  // the room above or below it. Clamping x against an unclamped `box.width` is
+  // the height bug one axis over: `viewport.width - box.width - padding` goes
+  // negative for a box wider than the screen, the clamp collapses to `padding`,
+  // and a submenu lands on top of the menu that opened it.
+  const maxWidth = vertical
+    ? Math.max(MIN_WIDTH, viewport.width - padding * 2)
+    : Math.max(MIN_WIDTH, available);
   const height = Math.min(box.height, maxHeight);
+  const rendered = Math.min(box.width, maxWidth);
 
-  let { x, y } = place(anchor, { width: box.width, height }, side, align, offset);
+  let { x, y } = place(anchor, { width: rendered, height }, side, align, offset);
 
   // Slide along the cross axis instead of letting the box hang off-screen.
-  x = Math.min(Math.max(padding, x), Math.max(padding, viewport.width - box.width - padding));
+  x = Math.min(Math.max(padding, x), Math.max(padding, viewport.width - rendered - padding));
   y = Math.min(Math.max(padding, y), Math.max(padding, viewport.height - height - padding));
 
   return {
@@ -119,7 +138,8 @@ export function computePosition(
     placement: `${side}-${align}` as Placement,
     flipped,
     maxHeight: Math.round(maxHeight),
-    width: opts.matchWidth ? Math.round(width) : undefined,
+    maxWidth: Math.round(maxWidth),
+    width: opts.matchWidth ? Math.round(rendered) : undefined,
   };
 }
 
@@ -166,19 +186,39 @@ export function repositionFloating(
   return result;
 }
 
-/** Wraps a real element as a `FloatingElement`, clamp read from inline style. */
-export const floatingElement = (el: HTMLElement): FloatingElement => ({
-  get clamp(): number | null {
-    const value = Number.parseFloat(el.style.maxHeight);
-    return Number.isFinite(value) ? value : null;
-  },
-  set clamp(value: number | null) {
-    el.style.maxHeight = value === null ? '' : `${value}px`;
-  },
-  get size(): Size {
-    return { width: el.offsetWidth, height: el.offsetHeight };
-  },
-});
+/**
+ * Wraps a real element as a `FloatingElement`, clamp read from inline style.
+ *
+ * Taking the clamp off to measure has a side effect the arithmetic cannot see:
+ * for the instant the box is unclamped, everything inside it fits its own
+ * content, and a box that does not overflow cannot hold a scroll offset — the
+ * browser resets it to 0 and does not put it back when the clamp returns. That
+ * is what threw a combobox list back to the top the moment the highlight was
+ * scrolled onto the sixth owner, and it happened on every pass, because a
+ * re-render repositions. So park the offsets before unclamping and hand them
+ * back once the box can hold them again.
+ */
+export const floatingElement = (el: HTMLElement): FloatingElement => {
+  let parked: [HTMLElement, number][] = [];
+  return {
+    get clamp(): number | null {
+      const value = Number.parseFloat(el.style.maxHeight);
+      return Number.isFinite(value) ? value : null;
+    },
+    set clamp(value: number | null) {
+      if (value === null) {
+        parked = [el, ...el.querySelectorAll<HTMLElement>('*')]
+          .filter((node) => node.scrollTop > 0)
+          .map((node) => [node, node.scrollTop] as [HTMLElement, number]);
+      }
+      el.style.maxHeight = value === null ? '' : `${value}px`;
+      if (value !== null) for (const [node, top] of parked) node.scrollTop = top;
+    },
+    get size(): Size {
+      return { width: el.offsetWidth, height: el.offsetHeight };
+    },
+  };
+};
 
 export const rectOf = (el: Element): Rect => {
   const r = el.getBoundingClientRect();

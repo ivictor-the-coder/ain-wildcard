@@ -6,7 +6,10 @@ import { createPortal } from 'react-dom';
 import { cx } from './layout';
 import { Button, IconButton, Kbd } from './controls';
 import { AlertTriangleIcon, ArrowRightIcon, ChevronDownIcon, ChevronRightIcon, Icons } from './icons';
-import { useClickOutside, useFocusTrap, useIsomorphicLayoutEffect, useScrollLock } from './hooks';
+import {
+  scrollIntoViewport, useClickOutside, useFocusTrap, useIsomorphicLayoutEffect,
+  useScrollLock, useStickyScrollPadding,
+} from './hooks';
 import { computePosition, floatingElement, rectOf, repositionFloating, viewportSize, type Placement } from './position';
 import {
   emptyTypeahead, menuKeyAction, rankCommands,
@@ -334,8 +337,12 @@ export function Popover({
   role = 'dialog', ariaLabel, className, style, children, id,
 }: PopoverProps) {
   const ref = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState<{ x: number; y: number; maxHeight: number; width?: number } | null>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ x: number; y: number; maxHeight: number; maxWidth: number; width?: number } | null>(null);
   const z = useLayer(open, 700);
+  // The body is what scrolls once the box is clamped, so it is the box that has
+  // to know about any footer stuck to its bottom edge.
+  useStickyScrollPadding(bodyRef, [open, children, pos?.maxHeight]);
 
   const outsideRefs = useMemo(() => [ref, anchor, ...(ignore ?? [])], [anchor, ignore]);
   useClickOutside(outsideRefs, onClose, open);
@@ -358,9 +365,10 @@ export function Popover({
     const result = repositionFloating(floatingElement(el), rectOf(anchorEl), viewportSize(), { placement, offset, matchWidth });
     if (!result) return;
     setPos((prev) => (
-      prev && prev.x === result.x && prev.y === result.y && prev.maxHeight === result.maxHeight && prev.width === result.width
+      prev && prev.x === result.x && prev.y === result.y && prev.maxHeight === result.maxHeight
+        && prev.maxWidth === result.maxWidth && prev.width === result.width
         ? prev
-        : { x: result.x, y: result.y, maxHeight: result.maxHeight, width: result.width }
+        : { x: result.x, y: result.y, maxHeight: result.maxHeight, maxWidth: result.maxWidth, width: result.width }
     ));
   }, [anchor, placement, offset, matchWidth]);
 
@@ -414,13 +422,13 @@ export function Popover({
         className={cx('ain-popover', className)}
         style={{
           left: pos?.x ?? -9999, top: pos?.y ?? -9999, zIndex: z,
-          maxHeight: pos?.maxHeight, width: pos?.width,
+          maxHeight: pos?.maxHeight, maxWidth: pos?.maxWidth, width: pos?.width,
           visibility: pos ? 'visible' : 'hidden',
           ...style,
         }}
       >
         {title && <div className="ain-popover__header"><span className="ain-popover__title">{title}</span></div>}
-        <div className={cx('ain-popover__body', flush && 'is-flush')}>{children}</div>
+        <div ref={bodyRef} className={cx('ain-popover__body', flush && 'is-flush')}>{children}</div>
         {footer && <div className="ain-popover__footer">{footer}</div>}
       </div>
     </Portal>
@@ -522,7 +530,7 @@ export function Menu({
     const root = node?.closest('.ain-popover');
     if (!node || !root || !root.contains(document.activeElement)) return;
     if (document.activeElement !== node) node.focus({ preventScroll: true });
-    node.scrollIntoView?.({ block: 'nearest' });
+    scrollIntoViewport(node);
   }, [open, active, activeId]);
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -816,17 +824,15 @@ export function CommandList({
     return [...map.entries()];
   }, [results]);
 
+  // `offsetTop` measures from the nearest *positioned* ancestor, which is not
+  // this list — on the styleguide page it resolved against `#sg` and reported
+  // 18480 for the first row, 32px down. `scrollTop = 18472` clamps to the
+  // bottom of the list, so the palette opened with the highlighted command
+  // scrolled out of sight. `scrollIntoViewport` measures against the box that
+  // actually scrolls, and moves only that box.
   useEffect(() => {
-    const container = listRef.current;
-    const el = container?.querySelector<HTMLElement>('[data-active="true"]');
-    if (!container || !el) return;
-    // Scroll the list itself rather than calling scrollIntoView, which would
-    // also drag the page behind the palette.
-    const top = el.offsetTop;
-    const bottom = top + el.offsetHeight;
-    if (top < container.scrollTop) container.scrollTop = Math.max(0, top - 8);
-    else if (bottom > container.scrollTop + container.clientHeight) container.scrollTop = bottom - container.clientHeight + 8;
-  }, [active]);
+    scrollIntoViewport(listRef.current?.querySelector<HTMLElement>('[data-active="true"]') ?? null);
+  }, [active, results]);
 
   const run = (entry: CommandEntry) => { entry.onSelect(); onDismiss?.(); };
 

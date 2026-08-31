@@ -65,6 +65,19 @@ export function isPathActive(current: string, to: string): boolean {
   return here === there || here.startsWith(there + '/');
 }
 
+/**
+ * One boolean for the collapsed sidebar.
+ *
+ * Below the breakpoint a labelled sidebar leaves no usable content column, so
+ * the rail there is the layout rather than a preference and the stored choice
+ * is ignored until the window is wide again. Deriving it here — rather than
+ * letting a media query narrow the sidebar on its own — is what keeps the
+ * width, the labels, the flyouts and the collapsed `aria-label` from
+ * disagreeing about whether the sidebar is a rail.
+ */
+export const railState = (preference: boolean, narrow: boolean, drawerOpen: boolean): boolean =>
+  (narrow ? !drawerOpen : preference);
+
 /** The deepest nav destination that contains the current path. */
 export function activeNavItem(items: NavItem[], path: string): NavItem | null {
   let best: NavItem | null = null;

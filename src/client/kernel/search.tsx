@@ -38,7 +38,14 @@ export function SearchPage() {
     () => (type ? search.groups.filter((group) => group.source.id === type) : search.groups),
     [search.groups, type],
   );
-  const visible = useMemo(() => groups.flatMap((group) => group.hits), [groups]);
+  const shown = useMemo(() => groups.flatMap((group) => group.hits), [groups]);
+  // A hit whose object type has no screen on this workspace is still a real
+  // match and is still shown — but it is not something ↵ can open, so it stays
+  // out of the arrow-key set rather than being highlighted and then ignored.
+  const visible = useMemo(() => shown.filter((hit) => hit.href), [shown]);
+  const unopenable = shown.length - visible.length;
+
+  useEffect(() => { setActive((i) => (i < visible.length ? i : 0)); }, [visible.length]);
 
   const open = (hit: SearchHit) => { if (hit.href) navigate(hit.href); };
 
@@ -50,6 +57,12 @@ export function SearchPage() {
 
   const total = search.groups.reduce((n, group) => n + group.hits.length, 0);
 
+  const hint = visible.length
+    ? <span className="gsearch__meta"><Kbd>↑</Kbd><Kbd>↓</Kbd> move <Kbd>↵</Kbd> open</span>
+    : unopenable
+      ? <span className="gsearch__meta">Nothing here can be opened — no installed module registers a screen for these records</span>
+      : undefined;
+
   return (
     <Page
       title="Search"
@@ -59,7 +72,7 @@ export function SearchPage() {
           : 'No searchable module is installed on this workspace yet.'
       }
       breadcrumbs={undefined}
-      actions={<span className="gsearch__meta"><Kbd>↑</Kbd><Kbd>↓</Kbd> move <Kbd>↵</Kbd> open</span>}
+      actions={hint}
     >
       <div className="gsearch">
         <div className="gsearch__field">
@@ -93,7 +106,7 @@ export function SearchPage() {
           </PillGroup>
         )}
 
-        {search.loading && !visible.length && (
+        {search.loading && !shown.length && (
           <Card padding="tight">
             <Stack gap={4}>
               {[0, 1, 2, 3].map((row) => <Skeleton key={row} height={38} />)}
@@ -127,45 +140,59 @@ export function SearchPage() {
           />
         )}
 
-        {!search.loading && draft.trim().length >= 2 && !visible.length && !search.failures.length && (
+        {!search.loading && draft.trim().length >= 2 && !shown.length && !search.failures.length && (
           <EmptyState
             title={`Nothing matches “${draft.trim()}”`}
             body="Try a company domain, part of an email address, or an object id such as cmp_ or cus_."
           />
         )}
 
-        {groups.map((group) => (
-          <Card key={group.source.id} title={group.source.label} description={`${group.hits.length} ${group.hits.length === 1 ? 'match' : 'matches'}`} padding="tight">
-            <div>
-              {group.hits.map((hit) => {
-                const index = visible.indexOf(hit);
-                const inner = (
-                  <>
-                    <span className="gsearch__icon">{renderSourceIcon(hit.icon, 16)}</span>
-                    <span className="gsearch__text">
-                      <span className="gsearch__title u-truncate">{hit.title}</span>
-                      {hit.subtitle && <span className="gsearch__sub u-truncate">{hit.subtitle}</span>}
-                    </span>
-                    <span className="gsearch__meta">
-                      <Badge size="sm">{hit.typeLabel}</Badge>
-                      <span className="u-mono">{hit.id}</span>
-                    </span>
-                  </>
-                );
-                const className = `gsearch__hit${index === active ? ' is-active' : ''}`;
-                return hit.href ? (
-                  <Link key={hit.id} to={hit.href} className={className} onPointerEnter={() => setActive(index)}>
-                    {inner}
-                  </Link>
-                ) : (
-                  <div key={hit.id} className={className} title={`No screen is registered for ${group.source.label.toLowerCase()} yet`}>
-                    {inner}
-                  </div>
-                );
-              })}
-            </div>
-          </Card>
-        ))}
+        {groups.map((group) => {
+          const openable = group.hits.some((hit) => hit.href);
+          const count = `${group.hits.length} ${group.hits.length === 1 ? 'match' : 'matches'}`;
+          return (
+            <Card
+              key={group.source.id}
+              title={group.source.label}
+              description={openable ? count : `${count} · no module on this workspace registers a screen for ${group.source.label.toLowerCase()}, so these cannot be opened yet`}
+              padding="tight"
+            >
+              <div>
+                {group.hits.map((hit) => {
+                  const index = visible.indexOf(hit);
+                  const inner = (
+                    <>
+                      <span className="gsearch__icon">{renderSourceIcon(hit.icon, 16)}</span>
+                      <span className="gsearch__text">
+                        <span className="gsearch__title u-truncate">{hit.title}</span>
+                        {hit.subtitle && <span className="gsearch__sub u-truncate">{hit.subtitle}</span>}
+                      </span>
+                      <span className="gsearch__meta">
+                        {!hit.href && <span className="gsearch__note">No screen installed</span>}
+                        <Badge size="sm">{hit.typeLabel}</Badge>
+                        <span className="u-mono">{hit.id}</span>
+                      </span>
+                    </>
+                  );
+                  return hit.href ? (
+                    <Link
+                      key={hit.id}
+                      to={hit.href}
+                      className={`gsearch__hit${index === active ? ' is-active' : ''}`}
+                      onPointerEnter={() => setActive(index)}
+                    >
+                      {inner}
+                    </Link>
+                  ) : (
+                    <div key={hit.id} className="gsearch__hit is-unopenable" aria-disabled="true">
+                      {inner}
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+          );
+        })}
       </div>
     </Page>
   );

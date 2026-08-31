@@ -1,7 +1,7 @@
 import { defineModule } from '../../kernel/module';
 import type { Ctx } from '../../kernel/context';
 import type { AinEvent } from '../../kernel/events';
-import { created, list, type Req } from '../../kernel/http';
+import { created, list, status as httpStatus, type Req } from '../../kernel/http';
 import { isApiError, notFound } from '../../../shared/errors';
 import { formatMoney, money } from '../../../shared/money';
 import { DAY } from '../../../shared/time';
@@ -15,7 +15,8 @@ import {
   BILLABLE_ITEM_KINDS, BILLABLE_ITEM_STATUSES, CREDIT_CATEGORIES, CREDIT_KINDS, GRANT_STATUSES,
   ROLLOVER_POLICIES, SETTLEMENT_STATUSES,
   type BillableItem, type CreditBalance, type CreditGrant, type GrantInput, type LedgerEntry,
-  type Settlement, type SettleUsageInput, type SkipSettlementInput, type TopUpInput, type TopUpResult,
+  type Settlement, type SettlementResult, type SettleUsageInput, type SkipSettlementInput,
+  type TopUpInput, type TopUpResult,
 } from './types';
 
 /* -------------------------------- service --------------------------------- */
@@ -38,8 +39,12 @@ export interface CreditsService {
 
   /** Buy a credit pack: the invoice line and the grant, or neither. */
   topUp(orgId: string, input: TopUpInput): TopUpResult;
-  /** Price a usage period and draw credit against it. */
-  settleUsage(orgId: string, input: SettleUsageInput): Settlement;
+  /**
+   * Price a usage period, draw credit against it and freeze the meter window.
+   * `created` is false when the window was already settled — nothing is written
+   * twice — and `drift` then says how far the meter has moved since.
+   */
+  settleUsage(orgId: string, input: SettleUsageInput): SettlementResult;
   settlement(orgId: string, id: string): Settlement | null;
   settlements(orgId: string, filter?: SettlementListFilter): Settlement[];
   /** Record — as a row, not a log line — a period the run refused to settle. */
@@ -128,6 +133,95 @@ function contentionOf(skipped: Settlement[]): { customer: string; price: string;
     .map((g) => ({ customer: g.customer, price: g.price, subscription_items: [...g.items].sort(), periods_refused: g.periods }));
 }
 
+/**
+ * Raise the alert on a refused period's unbilled hours, or take it back.
+ *
+ * Coverage is worked out on read, so this is a pure function of what the
+ * settlements around this window look like right now: an episode is opened
+ * once, and closed the moment nothing is uncovered any more. Called from the
+ * daily watch, and again the instant a fill settles, so the retraction does not
+ * wait a day behind the money.
+ */
+function reviewSettlementGaps(ctx: Ctx, orgId: string, settlement: Settlement, filling: { start: number; end: number }[] = []): void {
+  const gaps = (settlement.skip?.gaps ?? []).filter((gap) => gap.overdue);
+  const opened = ctx.events.list(orgId, { types: ['credit.settlement_gap'], objectId: settlement.id, limit: 1 })[0];
+  const closed = ctx.events.list(orgId, { types: ['credit.settlement_gap_closed'], objectId: settlement.id, limit: 1 })[0];
+  const outstanding = !!opened && (!closed || closed.created < opened.created);
+  const facts = {
+    settlement: settlement.id, customer: settlement.customer, price: settlement.price,
+    subscription: settlement.subscription, subscription_item: settlement.subscription_item,
+    period_start: settlement.period_start, period_end: settlement.period_end,
+    superseded_by: settlement.skip?.superseded_by ?? null,
+  };
+  // Raised once per episode and taken back when the hole is filled: a monthly
+  // cadence over a short February can leave a sliver uncovered for longer than
+  // a window, and an alert nobody ever retracts is an alert nobody reads.
+  if (gaps.length && !outstanding) {
+    ctx.emit(orgId, 'credit.settlement_gap', {
+      ...facts, gaps,
+      uncovered_ms: gaps.reduce((acc, gap) => acc + (gap.end - gap.start), 0),
+      // What has been scheduled to bill it, so the alert is a work order and
+      // not only a complaint.
+      filling,
+      message: settlement.skip?.summary ?? 'This period has usage nothing has billed.',
+    }, { objectId: settlement.id, objectType: 'credit_settlement' });
+  } else if (!gaps.length && outstanding) {
+    ctx.emit(orgId, 'credit.settlement_gap_closed', {
+      ...facts,
+      coverage_percent: settlement.skip?.coverage_percent ?? 100,
+      covered_by: settlement.skip?.covered_by ?? [],
+      message: settlement.skip?.summary ?? 'Every hour of this period is billed now.',
+    }, { objectId: settlement.id, objectType: 'credit_settlement' });
+  }
+}
+
+/**
+ * Bill the hole, not just name it.
+ *
+ * A refusal is usually right — settling a window whose usage another settlement
+ * already covers would draw a customer's credit twice — but the hours nothing
+ * covers are revenue, and the platform is holding every fact needed to bill
+ * them: the customer, the price, the meter, the exact window and the cycle its
+ * tiers belong to. So each overdue hole becomes a settlement job of its own,
+ * for exactly the uncovered window, priced against the cycle the refused period
+ * belonged to so it climbs the same tier ladder the run would have climbed.
+ *
+ * Asked once per window and no more: a window that has been settled needs
+ * nothing, and one that has been refused has already been given a reason, so a
+ * daily watch cannot turn either into a job that runs forever.
+ */
+function fillSettlementGaps(ctx: Ctx, store: Credits, orgId: string, settlement: Settlement): { start: number; end: number }[] {
+  const enqueued: { start: number; end: number }[] = [];
+  for (const gap of settlement.skip?.gaps ?? []) {
+    if (!gap.overdue || !(gap.end > gap.start)) continue;
+    if (store.settlementForWindow(orgId, settlement.customer, settlement.price, gap.start, gap.end)) continue;
+    const stated = settlement.skip?.billing_period ?? null;
+    const cycle = stated && stated.start <= gap.start && stated.end >= gap.end
+      ? stated
+      : { start: settlement.period_start, end: settlement.period_end };
+    const job: SettlePeriodJob = {
+      customer: settlement.customer,
+      price: settlement.price,
+      currency: settlement.currency,
+      subscription: settlement.subscription,
+      subscription_item: settlement.subscription_item,
+      period_start: gap.start,
+      period_end: gap.end,
+      billing_period: cycle,
+      fills_gap_in: settlement.id,
+    };
+    // Keyed by the window rather than by the refusal that raised it: two
+    // subscription items on one price refuse the same month and leave the same
+    // hole, and that hole is billed once.
+    ctx.enqueue(orgId, 'credits.settle_period', job, {
+      runAt: ctx.now(),
+      idemKey: `credits.gap_fill:${settlement.customer}:${settlement.price}:${gap.start}:${gap.end}`,
+    });
+    enqueued.push({ start: gap.start, end: gap.end });
+  }
+  return enqueued;
+}
+
 const stores = new WeakMap<Ctx, Credits>();
 export function creditsStore(ctx: Ctx): Credits {
   let store = stores.get(ctx);
@@ -199,7 +293,12 @@ const settleBody = v.object({
   quantity: v.optional(v.number({ min: 0 })),
   currency: v.optional(v.currency()),
   idem_key: v.optional(v.string({ max: 200 })),
-  close_period: v.default(v.boolean(), false),
+  /* Left undefined on purpose: the store closes a window whenever it resolved
+     a meter, because pricing a metered period through this endpoint *is*
+     billing it. `false` is the escape hatch for a caller who is pricing a
+     window without invoicing it — a quote, or a quantity supplied by hand
+     against a meter the bill is not drawn from. */
+  close_period: v.optional(v.boolean()),
   billing_period_start: v.optional(v.timestamp()),
   billing_period_end: v.optional(v.timestamp()),
   subscription: v.optional(v.string({ max: 80 })),
@@ -291,7 +390,7 @@ export default defineModule({
     ctx.jobs.handle('credits.settle_period', (payload: SettlePeriodJob, job) => {
       const orgId = job.org_id;
       try {
-        const settlement = store.settleUsage(orgId, {
+        const { settlement, created } = store.settleUsage(orgId, {
           customer: payload.customer,
           price: payload.price,
           currency: payload.currency ?? undefined,
@@ -303,16 +402,27 @@ export default defineModule({
           subscription_item: payload.subscription_item,
           // Freezing the meter period is the point: from here on, usage that
           // lands inside it is a true-up rather than a number that disagrees
-          // with an invoice already sent.
+          // with an invoice already sent. It is the default now, stated here
+          // anyway because this is the path a whole year of invoices runs down.
           close_period: true,
         });
-        ctx.emit(orgId, 'credit.period_settled_automatically', {
-          settlement: settlement.id, customer: settlement.customer, price: settlement.price,
-          subscription: payload.subscription, subscription_item: payload.subscription_item,
-          period_start: settlement.period_start, period_end: settlement.period_end,
-          full_amount: settlement.full_amount, covered_amount: settlement.covered_amount,
-          charged_amount: settlement.charged_amount, currency: settlement.currency,
-        }, { objectId: settlement.id, objectType: 'credit_settlement' });
+        if (created) {
+          ctx.emit(orgId, 'credit.period_settled_automatically', {
+            settlement: settlement.id, customer: settlement.customer, price: settlement.price,
+            subscription: payload.subscription, subscription_item: payload.subscription_item,
+            period_start: settlement.period_start, period_end: settlement.period_end,
+            full_amount: settlement.full_amount, covered_amount: settlement.covered_amount,
+            charged_amount: settlement.charged_amount, currency: settlement.currency,
+            fills_gap_in: payload.fills_gap_in ?? null,
+          }, { objectId: settlement.id, objectType: 'credit_settlement' });
+        }
+        // The hole this window was raised to fill is now billed, so the alert
+        // that named it is taken back on the spot rather than at tomorrow's
+        // watch — the pair of events is what a workflow keys off.
+        if (payload.fills_gap_in) {
+          const source = store.settlement(orgId, payload.fills_gap_in);
+          if (source) reviewSettlementGaps(ctx, orgId, source);
+        }
       } catch (e) {
         // Some failures are business facts rather than transient faults, and
         // retrying one eight times cannot make it true: usage already billed
@@ -339,6 +449,7 @@ export default defineModule({
           reason: e.code,
           message: e.message,
           superseded_by: typeof detail.settlement === 'string' ? detail.settlement : null,
+          billing_period: payload.billing_period ?? null,
         });
       }
     });
@@ -402,41 +513,16 @@ export default defineModule({
      * A period the run refused usually loses nobody anything — the usage is
      * billed once, under the settlement that superseded it, and the sliver at
      * the end is picked up by the next cycle. A hole that survives a whole
-     * billing cycle is the other thing entirely, and this is what makes it
-     * arrive: once per period, on an event type webhooks and workflows can act
-     * on, instead of a count nobody thought to open.
+     * billing cycle is the other thing entirely: usage nothing has billed and
+     * nothing is going to. So each one becomes a settlement job for exactly the
+     * uncovered window and an event that says so — the alert and the invoice
+     * line, not the alert on its own.
      */
     ctx.jobs.handle('credits.settlement_watch', (_payload: Record<string, never>, job) => {
       const orgId = job.org_id;
       const now = ctx.now();
       for (const settlement of store.settlements(orgId, { status: 'skipped', limit: 200 })) {
-        const gaps = (settlement.skip?.gaps ?? []).filter((gap) => gap.overdue);
-        const opened = ctx.events.list(orgId, { types: ['credit.settlement_gap'], objectId: settlement.id, limit: 1 })[0];
-        const closed = ctx.events.list(orgId, { types: ['credit.settlement_gap_closed'], objectId: settlement.id, limit: 1 })[0];
-        const outstanding = !!opened && (!closed || closed.created < opened.created);
-        const facts = {
-          settlement: settlement.id, customer: settlement.customer, price: settlement.price,
-          subscription: settlement.subscription, subscription_item: settlement.subscription_item,
-          period_start: settlement.period_start, period_end: settlement.period_end,
-          superseded_by: settlement.skip?.superseded_by ?? null,
-        };
-        // Raised once per episode and taken back when the hole is filled: a
-        // monthly cadence over a short February can leave a sliver uncovered
-        // for longer than a window, and an alert nobody ever retracts is an
-        // alert nobody reads.
-        if (gaps.length && !outstanding) {
-          ctx.emit(orgId, 'credit.settlement_gap', {
-            ...facts, gaps,
-            uncovered_ms: gaps.reduce((acc, gap) => acc + (gap.end - gap.start), 0),
-            message: settlement.skip?.summary ?? 'This period has usage nothing has billed.',
-          }, { objectId: settlement.id, objectType: 'credit_settlement' });
-        } else if (!gaps.length && outstanding) {
-          ctx.emit(orgId, 'credit.settlement_gap_closed', {
-            ...facts,
-            coverage_percent: settlement.skip?.coverage_percent ?? 100,
-            message: settlement.skip?.summary ?? 'Every hour of this period is billed now.',
-          }, { objectId: settlement.id, objectType: 'credit_settlement' });
-        }
+        reviewSettlementGaps(ctx, orgId, settlement, fillSettlementGaps(ctx, store, orgId, settlement));
       }
       ctx.enqueue(orgId, 'credits.settlement_watch', {}, { runAt: now + DAY, idemKey: 'credits.settlement_watch' });
     });
@@ -609,12 +695,20 @@ export default defineModule({
 
     /* ----------------------------- settlement ----------------------------- */
 
-    router.post('/v1/credit-settlements', (req: Req, c: Ctx) =>
-      created(c.svc.credits.settleUsage(req.auth.orgId, req.body as SettleUsageInput)), {
-      summary: 'Price a usage period and draw credit against it', tags: ['credits'], roles: ['member'],
+    router.post('/v1/credit-settlements', (req: Req, c: Ctx) => {
+      const outcome = c.svc.credits.settleUsage(req.auth.orgId, req.body as SettleUsageInput);
+      // 201 is a promise that something was written. A window that was already
+      // settled is a read, and saying "created" over the top of a stale
+      // quantity is how a period drifts away from its invoice unnoticed — so
+      // the replay is a 200 and it carries what the meter says today.
+      return outcome.created
+        ? created(outcome.settlement)
+        : httpStatus(200, { ...outcome.settlement, replayed: true, drift: outcome.drift });
+    }, {
+      summary: 'Price a usage period, draw credit against it and freeze the meter window', tags: ['credits'], roles: ['member'],
       body: settleBody,
       description:
-        'The window is priced against the billing period’s running total, not from scratch: `tier_basis` says which settled windows of the same cycle came before it and what rung of the price’s tiers this one therefore starts on, so any way you cut a period into windows the pieces cost exactly what the whole costs and a graduated price gives its free tier away once. Pass `billing_period_start`/`billing_period_end` to state the cycle; leave them out and it is derived from the price’s own cadence, ending where this window ends. Unit credits then come off the quantity and monetary credits off the money, in the documented burn-down order, producing two invoice lines — the credit-covered portion and the charged portion — whose amounts always sum to `full_amount`. Settling the same period twice returns the first settlement rather than burning the balance again.',
+        'The window is priced against the billing period’s running total, not from scratch: `tier_basis` says which settled windows of the same cycle came before it and what rung of the price’s tiers this one therefore starts on, so any way you cut a period into windows the pieces cost exactly what the whole costs and a graduated price gives its free tier away once. Pass `billing_period_start`/`billing_period_end` to state the cycle; leave them out and it is derived from the price’s own cadence, ending where this window ends. Unit credits then come off the quantity and monetary credits off the money, in the documented burn-down order, producing two invoice lines — the credit-covered portion and the charged portion — whose amounts always sum to `full_amount`. Pricing a metered period here is billing it, so the meter window is frozen at the same time: usage that lands inside it afterwards is filed as a late arrival and priced as a true-up rather than moving a total an invoice has already been drawn on. Pass `close_period: false` to price a window without claiming it has been billed. Settling the same period twice never draws the balance again: the first settlement comes back as `200 OK` with `replayed: true` and, when the meter no longer agrees with what was billed, a `drift` block naming the live total, what the difference is worth and the late arrivals waiting to be resolved.',
     });
 
     router.get('/v1/credit-settlements', (req: Req, c: Ctx) => {
@@ -624,7 +718,7 @@ export default defineModule({
       summary: 'List settled usage periods — and the ones that were refused', tags: ['credits'],
       query: settlementListQuery,
       description:
-        'A period the automatic run declined is a row here too, with `status: "skipped"`, the settlement that superseded it and how much of its window that settlement covers. `?status=skipped` is the list of every revenue question this platform decided not to answer; a refusal with a `gaps` entry is usage nothing has billed.',
+        'A period the automatic run declined is a row here too, with `status: "skipped"`, the settlement that superseded it and how much of its window that settlement covers. `?status=skipped` is the list of every revenue question this platform decided not to answer — and what it did about each one: a gap that outlives a billing cycle is settled on its own by the daily watch, for exactly the uncovered window and against the cycle the refused period belonged to, so the refusal stays on the record while the usage still gets billed.',
     });
 
     router.get('/v1/credit-settlements/:id', (req: Req, c: Ctx) => {
@@ -750,7 +844,7 @@ export default defineModule({
     }, {
       summary: 'Outstanding credit, what is about to expire and what is waiting for an invoice', tags: ['credits'],
       description:
-        '`skipped_settlements` is the honest half: periods the automatic run refused because their usage is already billed under another window. `fully_covered` lost nobody a cent — the usage is billed once, under the settlement named in `superseded_by`. `with_unbilled_gaps` is the number that needs a human, and `contended_meters` names the customers holding more than one subscription item against the same metered price, which is the condition that causes it. `unbilled_purchases` is the other half: credit somebody bought that nothing has charged for yet, aged, with the grant it is holding unspendable until it clears.',
+        '`skipped_settlements` is the honest half: periods the automatic run refused because their usage is already billed under another window. `fully_covered` lost nobody a cent — the usage is billed once, under the settlement named in `superseded_by`. `with_unbilled_gaps` is usage nothing has billed yet: the daily watch settles each of those windows on its own, so this is what is in flight rather than a queue somebody has to work through, and `contended_meters` names the customers holding more than one subscription item against the same metered price, which is the condition that causes it. `unbilled_purchases` is the other half: credit somebody bought that nothing has charged for yet, aged, with the grant it is holding unspendable until it clears.',
     });
   },
 

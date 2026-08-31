@@ -151,6 +151,8 @@ function describeAnalysis(completion: AinCompletion) {
     tone: analysis.tone,
     draft_kind: analysis.draftKind,
     plan: analysis.plan,
+    skipped: analysis.skipped,
+    carried_subject: analysis.carriedSubject,
     steps: analysis.steps,
     passes: analysis.passes,
   };
@@ -239,17 +241,24 @@ export default defineModule({
     };
     runtime.setTraceSink(sink);
 
-    const callContext = (orgId: string, opts: AskOptions = {}): AiCallContext => ({
-      ctx,
-      orgId,
-      actorId: opts.actorId ?? null,
-      actorType: opts.actorType ?? 'user',
-      threadId: opts.threadId ?? null,
-      feature: opts.feature ?? 'copilot',
-      allowWrites: !!opts.allowWrites,
-      approvals: opts.approvals ?? [],
-      ...(opts.maxSteps ? { budget: { steps: opts.maxSteps } } : {}),
-    });
+    const callContext = (orgId: string, opts: AskOptions = {}): AiCallContext => {
+      // A conversation pinned to an account is pinned for every turn of it.
+      // Turn two says "they", and this is the only place that knows who.
+      const thread = opts.threadId ? store.thread(orgId, opts.threadId) : undefined;
+      return {
+        ctx,
+        orgId,
+        actorId: opts.actorId ?? null,
+        actorType: opts.actorType ?? 'user',
+        threadId: opts.threadId ?? null,
+        subjectId: thread?.subject_id ?? null,
+        subjectType: thread?.subject_type ?? null,
+        feature: opts.feature ?? 'copilot',
+        allowWrites: !!opts.allowWrites,
+        approvals: opts.approvals ?? [],
+        ...(opts.maxSteps ? { budget: { steps: opts.maxSteps } } : {}),
+      };
+    };
 
     /**
      * Resolve a caller's tool allowlist. An unknown name is a 400 rather than a

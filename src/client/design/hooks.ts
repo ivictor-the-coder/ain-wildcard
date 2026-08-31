@@ -265,6 +265,88 @@ export function useFocusTrap<T extends HTMLElement>(
   }, [active, ref, initialFocus, restoreFocus, autoFocus]);
 }
 
+/**
+ * Bring `el` into view inside every box that clips it, and no further.
+ *
+ * Three things go wrong when this is done casually. `offsetTop` is measured
+ * from the nearest *positioned* ancestor, which is almost never the scroller —
+ * in the command palette it resolved against the page and reported 18480 for a
+ * row 32px down the list, which pinned the list to its bottom with the
+ * highlighted command off screen. `scrollIntoView` fixes the arithmetic but
+ * scrolls every ancestor including the document, dragging the page out from
+ * under a fixed popover. And stopping at the *first* scroller is not enough
+ * either: a filter editor clamped to a short window nests a value list inside a
+ * scrolling popover body, and moving only the inner one leaves the row sitting
+ * outside the outer one — visibly focused, invisibly placed.
+ *
+ * So: walk the chain, correct each scroller against the rect the previous
+ * correction produced, and stop at the fixed-position overlay or the document.
+ */
+export function scrollIntoViewport(el: HTMLElement | null, padding = 8): void {
+  if (!el || typeof getComputedStyle === 'undefined') return;
+  const px = (value: string): number => {
+    const n = Number.parseFloat(value);
+    return Number.isFinite(n) ? n : 0;
+  };
+  for (let box = el.parentElement; box; box = box.parentElement) {
+    if (box === document.body || box === document.documentElement) return;
+    const style = getComputedStyle(box);
+    // The overlay itself is the boundary: past it lies the page, which must not
+    // move under the operator.
+    if (style.position === 'fixed') return;
+    const scrolls = (style.overflowY === 'auto' || style.overflowY === 'scroll') && box.scrollHeight > box.clientHeight + 1;
+    if (!scrolls) continue;
+    // Sticky chrome inside the box is already declared as scroll padding;
+    // honour it here too, so this path and the browser's agree on where the
+    // visible band starts and ends.
+    const padStart = px(style.scrollPaddingBlockStart);
+    const padEnd = px(style.scrollPaddingBlockEnd);
+    const boxRect = box.getBoundingClientRect();
+    const rect = el.getBoundingClientRect();
+    const top = rect.top - boxRect.top + box.scrollTop;
+    const bottom = top + rect.height;
+    if (top < box.scrollTop + padStart) box.scrollTop = Math.max(0, top - padStart - padding);
+    else if (bottom > box.scrollTop + box.clientHeight - padEnd) box.scrollTop = bottom + padEnd - box.clientHeight + padding;
+  }
+}
+
+/**
+ * Keep the browser's own scrolling clear of sticky chrome inside `ref`.
+ *
+ * `scroll-padding` is the platform's knob for exactly this: it insets the
+ * scrollport for every scroll the browser performs on that box, including the
+ * one that follows sequential focus. Without it, Tab through a filter editor's
+ * value list lands each checkbox flush with the bottom edge — underneath the
+ * sticky Clear/Done bar painted over it — and the operator is checking a box
+ * they cannot see. The same mistake as a virtual row scrolled under a sticky
+ * header, made by the browser instead of by us.
+ *
+ * Only the scroller's children and grandchildren are inspected: sticky bands
+ * are always the frame around the scrolling content, never buried inside a long
+ * list, and a full-subtree scan would cost a style resolution per option.
+ */
+export function useStickyScrollPadding<T extends HTMLElement>(
+  ref: RefObject<T | null>,
+  deps: DependencyList = [],
+): void {
+  useIsomorphicLayoutEffect(() => {
+    const el = ref.current;
+    if (!el || typeof getComputedStyle === 'undefined') return;
+    let start = 0;
+    let end = 0;
+    for (const child of el.children) {
+      for (const node of [child, ...child.children]) {
+        if (!(node instanceof HTMLElement)) continue;
+        const style = getComputedStyle(node);
+        if (style.position !== 'sticky') continue;
+        if (style.top !== 'auto') start = Math.max(start, node.offsetHeight);
+        if (style.bottom !== 'auto') end = Math.max(end, node.offsetHeight);
+      }
+    }
+    el.style.scrollPaddingBlock = start || end ? `${start}px ${end}px` : '';
+  }, [ref, ...deps]);
+}
+
 /** Locks background scroll while overlays are open; safe to nest. */
 let scrollLocks = 0;
 let priorOverflow = '';
@@ -323,6 +405,15 @@ export interface VirtualRowsOptions {
   overscan?: number;
   /** Below this many rows the list renders in full — virtualising is a cost. */
   threshold?: number;
+  /**
+   * Height of chrome stuck to the top of the scroll box — a table's sticky
+   * `<thead>`. It occupies the first band of the scroll *content* and paints
+   * over the first band of the *viewport*, so a row scrolled flush with either
+   * edge is underneath it rather than in view.
+   */
+  headerOffset?: number;
+  /** The same for chrome stuck to the bottom, such as a totals `<tfoot>`. */
+  footerOffset?: number;
 }
 
 export interface VirtualWindow {
@@ -337,17 +428,69 @@ export interface VirtualWindow {
 
 export function computeWindow(
   scrollTop: number, viewportHeight: number, count: number, rowHeight: number, overscan: number,
+  headerOffset = 0,
 ): { startIndex: number; endIndex: number } {
   const visible = Math.ceil(viewportHeight / rowHeight) + 1;
-  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  // Rows start `headerOffset` into the content, so the row under the scroll
+  // position is that much further up the list than the raw division says.
+  const first = Math.floor(Math.max(0, scrollTop - headerOffset) / rowHeight);
+  const startIndex = Math.max(0, first - overscan);
   const endIndex = Math.min(count, startIndex + visible + overscan * 2);
   return { startIndex, endIndex };
+}
+
+export interface RowScrollGeometry {
+  scrollTop: number;
+  clientHeight: number;
+  scrollHeight: number;
+  rowHeight: number;
+  /** Sticky chrome pinned over the top of the viewport. */
+  headerOffset?: number;
+  /** Sticky chrome pinned over the bottom of the viewport. */
+  footerOffset?: number;
+}
+
+/**
+ * The `scrollTop` that puts row `index` in the band an operator can actually
+ * see.
+ *
+ * The trap here is the same one that slid a tall popover across its anchor:
+ * doing the arithmetic with a number that stopped being true. A row's offset
+ * inside the scroll content is *not* `index * rowHeight` when a sticky header
+ * sits above the first row, and the visible band is *not* `clientHeight` when
+ * that header and a totals footer paint over its ends. Get either wrong and the
+ * downward branch lands the row exactly one header short — 6 of 42 pixels
+ * showing — while the upward branch looks fine because the same error cancels.
+ */
+export function scrollTopForIndex(
+  index: number,
+  align: 'start' | 'center' | 'nearest',
+  geometry: RowScrollGeometry,
+): number {
+  const { scrollTop, clientHeight, scrollHeight, rowHeight } = geometry;
+  const headerOffset = geometry.headerOffset ?? 0;
+  const footerOffset = geometry.footerOffset ?? 0;
+  const limit = Math.max(0, scrollHeight - clientHeight);
+  const clamp = (value: number) => Math.max(0, Math.min(value, limit));
+
+  const start = headerOffset + index * rowHeight;
+  const end = start + rowHeight;
+  const toTop = start - headerOffset;
+  const toBottom = end + footerOffset - clientHeight;
+
+  if (align === 'start') return clamp(toTop);
+  if (align === 'center') return clamp(toTop - (clientHeight - headerOffset - footerOffset - rowHeight) / 2);
+  if (start < scrollTop + headerOffset) return clamp(toTop);
+  // `min` keeps the row's *top* in view when the band is shorter than a row:
+  // showing its bottom edge would hide the cells under the header.
+  if (end > scrollTop + clientHeight - footerOffset) return clamp(Math.min(toBottom, toTop));
+  return clamp(scrollTop);
 }
 
 /** Windows a long list inside a scroll container without measuring each row. */
 export function useVirtualRows<T extends HTMLElement>(
   scrollRef: RefObject<T | null>,
-  { count, rowHeight, overscan = 6, threshold = 80 }: VirtualRowsOptions,
+  { count, rowHeight, overscan = 6, threshold = 80, headerOffset = 0, footerOffset = 0 }: VirtualRowsOptions,
 ): VirtualWindow {
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
@@ -377,13 +520,19 @@ export function useVirtualRows<T extends HTMLElement>(
   const scrollToIndex = useCallback((index: number, align: 'start' | 'center' | 'nearest' = 'nearest') => {
     const el = scrollRef.current;
     if (!el) return;
-    const top = index * rowHeight;
-    const bottom = top + rowHeight;
-    if (align === 'start') el.scrollTop = top;
-    else if (align === 'center') el.scrollTop = top - el.clientHeight / 2 + rowHeight / 2;
-    else if (top < el.scrollTop) el.scrollTop = top;
-    else if (bottom > el.scrollTop + el.clientHeight) el.scrollTop = bottom - el.clientHeight;
-  }, [scrollRef, rowHeight]);
+    el.scrollTop = scrollTopForIndex(index, align, {
+      scrollTop: el.scrollTop,
+      clientHeight: el.clientHeight,
+      scrollHeight: el.scrollHeight,
+      rowHeight,
+      headerOffset,
+      footerOffset,
+    });
+    // Move the window in this commit rather than on the next frame's scroll
+    // event: a jump of more than a screenful unmounts the row the caller is
+    // about to focus, and focus falls to <body> in the gap.
+    setScrollTop(el.scrollTop);
+  }, [scrollRef, rowHeight, headerOffset, footerOffset]);
 
   return useMemo(() => {
     if (!virtualised) {
@@ -392,7 +541,7 @@ export function useVirtualRows<T extends HTMLElement>(
         totalHeight: count * rowHeight, virtualised: false, scrollToIndex,
       };
     }
-    const { startIndex, endIndex } = computeWindow(scrollTop, viewportHeight || 600, count, rowHeight, overscan);
+    const { startIndex, endIndex } = computeWindow(scrollTop, viewportHeight || 600, count, rowHeight, overscan, headerOffset);
     return {
       startIndex, endIndex,
       paddingTop: startIndex * rowHeight,
@@ -401,7 +550,7 @@ export function useVirtualRows<T extends HTMLElement>(
       virtualised: true,
       scrollToIndex,
     };
-  }, [virtualised, scrollTop, viewportHeight, count, rowHeight, overscan, scrollToIndex]);
+  }, [virtualised, scrollTop, viewportHeight, count, rowHeight, overscan, headerOffset, scrollToIndex]);
 }
 
 /* --------------------------------- toasts -------------------------------- */

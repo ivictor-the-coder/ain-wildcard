@@ -76,7 +76,7 @@ export function seedCredits(ctx: Ctx, orgId: string): void {
     // is charged — the two lines are what the customer's invoice shows.
     const periodEnd = startOfDay(now) - DAY;
     const periodStart = periodEnd - 30 * DAY;
-    const settlement = credits.settleUsage(orgId, {
+    const { settlement } = credits.settleUsage(orgId, {
       customer: meridian.id,
       price: TELEMETRY_PRICE,
       meter: TELEMETRY_METER,

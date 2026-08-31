@@ -39,6 +39,28 @@ export interface PropertyValidation {
   allow_other?: boolean;
 }
 
+/**
+ * An aggregate over associated records, stored as an ordinary property.
+ *
+ * "Total open deal value" is the number every account list is ranked by, and a
+ * formula cannot reach it: the expression language sees the record's own fields
+ * and nothing else. A rollup is the other half — it is compiled by the same
+ * filter engine that already answers "companies whose open deals sum over
+ * $75k", and the answer is written onto the company, so it can be displayed,
+ * sorted, filtered, put in a view column, reported on and triggered from.
+ */
+export interface PropertyRollup {
+  /** Associated object type (`deal`) or association type name (`deal_to_company`). */
+  association: string;
+  aggregate: 'count' | 'sum' | 'avg' | 'min' | 'max';
+  /** Property on the associated record to aggregate; required unless `count`. */
+  property?: string;
+  /** Which way to walk the graph. `both` is the default and the usual answer. */
+  direction?: 'outgoing' | 'incoming' | 'both';
+  /** Restrict which associated records count — "open deals", not "deals". */
+  filter?: FilterNode;
+}
+
 export interface PropertyDef {
   org_id: string;
   object_type: string;
@@ -59,6 +81,12 @@ export interface PropertyDef {
   validation: PropertyValidation;
   /** Expression evaluated on every write; makes the property derived. */
   calculated: string | null;
+  /**
+   * Aggregate over associated records, maintained whenever a record on the
+   * other end of the association is written, linked, unlinked or archived.
+   * Mutually exclusive with `calculated` — a property has one source of truth.
+   */
+  rollup: PropertyRollup | null;
   /** Canonical form applied on write, before uniqueness and indexing. */
   normalize: PropertyNormaliser;
   currency: string | null;
@@ -208,6 +236,14 @@ export interface HistoryEntry {
   property_label: string;
   from_value: PropertyValue;
   to_value: PropertyValue;
+  /**
+   * The same two values as a person reads them — money through the workspace
+   * currency, dates through its locale, enums as their option label, users by
+   * name. `from_value`/`to_value` stay stored-form so a client can compare or
+   * re-import them; these are what a timeline or an audit export prints.
+   */
+  from_display: string | null;
+  to_display: string | null;
   changed_at: number;
   /**
    * Monotonic write order. `changed_at` alone cannot order an audit trail:
@@ -280,7 +316,13 @@ export interface PropertyCondition {
   compare_property?: string;
 }
 
-export interface AssociationCondition {
+/**
+ * One aggregate over a record's associations. A filter compares it to a value;
+ * a rollup property stores it. Both compile to the same correlated subquery,
+ * which is why "companies whose open deals sum over $75k" and the
+ * `total_open_deal_value` column on those companies can never disagree.
+ */
+export interface AggregateSpec {
   /** Associated object type (`deal`) or association type name (`deal_to_company`). */
   association: string;
   /** Which way to walk the graph. `both` is the default and the usual answer. */
@@ -291,6 +333,9 @@ export interface AssociationCondition {
   aggregate?: 'count' | 'sum' | 'avg' | 'min' | 'max';
   /** Property on the associated record to aggregate; required unless `count`. */
   aggregate_property?: string;
+}
+
+export interface AssociationCondition extends AggregateSpec {
   operator: FilterOperator;
   value?: unknown;
   values?: unknown[];

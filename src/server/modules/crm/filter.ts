@@ -1,7 +1,7 @@
 import { badRequest } from '../../../shared/errors';
 import type {
-  AssociationCondition, FilterGroup, FilterNode, FilterOperator, PropertyCondition,
-  PropertyDef, RelativeUnit, SortSpec,
+  AggregateSpec, AssociationCondition, FilterGroup, FilterNode, FilterOperator, PropertyCondition,
+  PropertyDef, PropertyRollup, RelativeUnit, SortSpec,
 } from './types';
 import { FILTER_OPERATORS } from './types';
 import { MULTI_SEP, columnFor, resolveDate, shiftByUnit } from './values';
@@ -50,6 +50,15 @@ const MAX_CONDITIONS = 80;
 /** Emits a column reference, binding any parameters it needs at the point of use. */
 type ColRef = () => string;
 
+interface AggregateCompileOptions {
+  /** Error `param` prefix — `filter` for a condition, `rollup` for a property. */
+  param: string;
+  /** Whether an empty far side reads as 0 rather than as nothing. */
+  coalesceZero: boolean;
+  /** What the caller's vocabulary calls the aggregated property. */
+  propertyField: string;
+}
+
 /** Columns that live on `crm_records` itself rather than in the value index. */
 interface BuiltinColumn { column: string; type: PropertyDef['type']; label: string }
 
@@ -94,6 +103,9 @@ class Compiler {
   private alias(prefix: string): string { return `${prefix}${++this.aliasSeq}`; }
 
   private bind(value: unknown): string { this.params.push(value); return '?'; }
+
+  /** Bind a value from outside the tree — the anchor id of a standalone aggregate. */
+  bindValue(value: unknown): string { return this.bind(value); }
 
   node(node: FilterNode, alias: string, objectType: string, depth: number): string {
     if (!node || typeof node !== 'object') {
@@ -294,33 +306,47 @@ class Compiler {
 
   /* ----------------------------- associations ---------------------------- */
 
-  private association(cond: AssociationCondition, alias: string, objectType: string, depth: number): string {
-    const target = this.env.resolveAssociation(objectType, cond.association);
+  /**
+   * The correlated aggregate itself: one scalar subquery over the records on
+   * the other end of an association. A filter compares it, a rollup property
+   * stores it, and both get it from here — which is why an account list
+   * filtered on "open deals over $75k" and the `total_open_deal_value` column
+   * beside it can never disagree.
+   *
+   * `anchor` is the parent record's id as SQL: `r.id` when the aggregate is
+   * correlated against a row being scanned, a bound literal when one record is
+   * being recomputed on its own.
+   */
+  aggregate(spec: AggregateSpec, anchor: ColRef, objectType: string, depth: number, opts: AggregateCompileOptions): {
+    ref: ColRef; aggProp: PropertyDef | null; aggregate: string;
+  } {
+    const { param, coalesceZero, propertyField } = opts;
+    const target = this.env.resolveAssociation(objectType, spec.association);
     if (!target.objectTypes.length && !target.associationTypes.length) {
-      throw badRequest('association_unknown', `"${cond.association}" is neither an object type nor an association type reachable from ${objectType}.`, 'filter.association');
+      throw badRequest('association_unknown', `"${spec.association}" is neither an object type nor an association type reachable from ${objectType}.`, `${param}.association`);
     }
-    const direction = cond.direction ?? 'both';
+    const direction = spec.direction ?? 'both';
     if (!['outgoing', 'incoming', 'both'].includes(direction)) {
-      throw badRequest('filter_direction_invalid', 'Association direction must be "outgoing", "incoming" or "both".', 'filter.direction');
+      throw badRequest('filter_direction_invalid', 'Association direction must be "outgoing", "incoming" or "both".', `${param}.direction`);
     }
-    const aggregate = cond.aggregate ?? 'count';
+    const aggregate = spec.aggregate ?? 'count';
     if (!['count', 'sum', 'avg', 'min', 'max'].includes(aggregate)) {
-      throw badRequest('filter_aggregate_invalid', 'Aggregate must be one of: count, sum, avg, min, max.', 'filter.aggregate');
+      throw badRequest('filter_aggregate_invalid', 'Aggregate must be one of: count, sum, avg, min, max.', `${param}.aggregate`);
     }
-    const subType = target.objectTypes.length === 1 ? target.objectTypes[0] : cond.association;
+    const subType = target.objectTypes.length === 1 ? target.objectTypes[0] : spec.association;
     const subProps = this.env.propertiesOf(subType);
-    const aggProp = aggregate === 'count' ? null : this.aggregateProperty(cond, subProps, subType);
+    const aggProp = aggregate === 'count' ? null : this.aggregateProperty(spec, subProps, subType, param, propertyField);
 
     // Rebuilt (and re-bound) on every use so operators that mention the column
     // twice — `between`, `neq` — stay parameter-correct.
-    const subquery: ColRef = () => {
+    const ref: ColRef = () => {
       const edge = this.alias('a');
       const rec = this.alias('ar');
+      // Every fragment is built in the order it appears in the SQL text,
+      // because `anchor` may itself bind a parameter: a subquery assembled in
+      // one order and bound in another is an aggregate over the wrong record.
       const other = direction === 'outgoing' ? `${edge}.to_id` : direction === 'incoming' ? `${edge}.from_id`
-        : `CASE WHEN ${edge}.from_id = ${alias}.id THEN ${edge}.to_id ELSE ${edge}.from_id END`;
-      const anchor = direction === 'outgoing' ? `${edge}.from_id = ${alias}.id`
-        : direction === 'incoming' ? `${edge}.to_id = ${alias}.id`
-        : `(${edge}.from_id = ${alias}.id OR ${edge}.to_id = ${alias}.id)`;
+        : `CASE WHEN ${edge}.from_id = ${anchor()} THEN ${edge}.to_id ELSE ${edge}.from_id END`;
 
       let selectExpr = 'COUNT(*)';
       let valueJoin = '';
@@ -331,32 +357,45 @@ class Compiler {
         selectExpr = `${aggregate.toUpperCase()}(${av}.${column})`;
       }
 
-      const clauses: string[] = [`${edge}.org_id = ${this.bind(this.env.orgId)}`, anchor, `${rec}.archived = 0`];
+      const clauses: string[] = [`${edge}.org_id = ${this.bind(this.env.orgId)}`];
+      clauses.push(direction === 'outgoing' ? `${edge}.from_id = ${anchor()}`
+        : direction === 'incoming' ? `${edge}.to_id = ${anchor()}`
+        : `(${edge}.from_id = ${anchor()} OR ${edge}.to_id = ${anchor()})`);
+      clauses.push(`${rec}.archived = 0`);
       if (target.associationTypes.length) {
         clauses.push(`${edge}.association_type IN (${target.associationTypes.map((t) => this.bind(t)).join(', ')})`);
       }
       if (target.objectTypes.length) {
         clauses.push(`${rec}.object_type IN (${target.objectTypes.map((t) => this.bind(t)).join(', ')})`);
       }
-      if (cond.where) clauses.push(this.node(cond.where, rec, subType, depth + 1));
+      if (spec.where) clauses.push(this.node(spec.where, rec, subType, depth + 1));
 
-      return `(SELECT COALESCE(${selectExpr}, 0) FROM crm_associations ${edge} JOIN crm_records ${rec} ON ${rec}.id = ${other}${valueJoin} WHERE ${clauses.join(' AND ')})`;
+      const body = `SELECT ${coalesceZero ? `COALESCE(${selectExpr}, 0)` : selectExpr} FROM crm_associations ${edge} JOIN crm_records ${rec} ON ${rec}.id = ${other}${valueJoin} WHERE ${clauses.join(' AND ')}`;
+      return `(${body})`;
     };
-
-    const operator = this.operator(cond.operator);
-    if (operator === 'is_set') return `${subquery()} > 0`;
-    if (operator === 'is_not_set') return `${subquery()} = 0`;
-    const numeric = pseudoProperty(cond.association, aggProp && (aggProp.type === 'date' || aggProp.type === 'datetime') ? 'datetime' : 'number', `${cond.association} ${aggregate}`, objectType);
-    return this.predicate(subquery, numeric, operator, cond, alias, false);
+    return { ref, aggProp, aggregate };
   }
 
-  private aggregateProperty(cond: AssociationCondition, props: PropertyIndex, subType: string): PropertyDef {
-    if (!cond.aggregate_property) {
-      throw badRequest('filter_aggregate_property_missing', `The "${cond.aggregate}" aggregate needs an \`aggregate_property\`.`, 'filter.aggregate_property');
+  private association(cond: AssociationCondition, alias: string, objectType: string, depth: number): string {
+    // `COALESCE(…, 0)` on every aggregate, so "count = 0" and "sum < 100" both
+    // match an account with no deals at all rather than dropping it.
+    const { ref, aggProp, aggregate } = this.aggregate(cond, () => `${alias}.id`, objectType, depth, {
+      param: 'filter', coalesceZero: true, propertyField: 'aggregate_property',
+    });
+    const operator = this.operator(cond.operator);
+    if (operator === 'is_set') return `${ref()} > 0`;
+    if (operator === 'is_not_set') return `${ref()} = 0`;
+    const numeric = pseudoProperty(cond.association, aggProp && (aggProp.type === 'date' || aggProp.type === 'datetime') ? 'datetime' : 'number', `${cond.association} ${aggregate}`, objectType);
+    return this.predicate(ref, numeric, operator, cond, alias, false);
+  }
+
+  private aggregateProperty(spec: AggregateSpec, props: PropertyIndex, subType: string, param: string, field: string): PropertyDef {
+    if (!spec.aggregate_property) {
+      throw badRequest('filter_aggregate_property_missing', `The "${spec.aggregate}" aggregate needs a \`${field}\` — which property of ${subType} to add up.`, `${param}.${field}`);
     }
-    const prop = props.get(cond.aggregate_property);
+    const prop = props.get(spec.aggregate_property);
     if (!prop) {
-      throw badRequest('property_unknown', `"${cond.aggregate_property}" is not a property of ${subType}. ${suggestProperty(cond.aggregate_property, props, subType)}`, 'filter.aggregate_property');
+      throw badRequest('property_unknown', `"${spec.aggregate_property}" is not a property of ${subType}. ${suggestProperty(spec.aggregate_property, props, subType)}`, `${param}.${field}`);
     }
     return prop;
   }
@@ -367,7 +406,7 @@ function pseudoProperty(name: string, type: PropertyDef['type'], label: string, 
     org_id: '', object_type: objectType, name, id: name, label, description: null, type,
     group: 'System', options: [], reference_type: null, required: false, unique: false,
     read_only: true, system: true, hidden: false, default_value: null, validation: {},
-    calculated: null, currency: null, normalize: 'none', position: 0, created: 0, updated: 0,
+    calculated: null, rollup: null, currency: null, normalize: 'none', position: 0, created: 0, updated: 0,
   };
 }
 
@@ -403,6 +442,74 @@ export function compileFilter(filter: FilterNode | undefined, env: CompileEnv, a
   const compiler = new Compiler(env);
   const sql = compiler.node(filter, alias, env.objectType, 0);
   return { sql, params: compiler.params };
+}
+
+/* -------------------------------- rollups --------------------------------- */
+
+/** A rollup definition read as the aggregate the filter engine understands. */
+export const rollupSpec = (rollup: PropertyRollup): AggregateSpec => ({
+  association: rollup.association,
+  direction: rollup.direction,
+  where: rollup.filter,
+  aggregate: rollup.aggregate,
+  aggregate_property: rollup.property,
+});
+
+export interface CompiledAggregate extends CompiledSql {
+  /** The aggregated property on the far side — null for `count`. */
+  aggregateProperty: PropertyDef | null;
+}
+
+/**
+ * One aggregate as a standalone scalar expression, for storing rather than
+ * comparing. `anchor` names the parent: `{ alias }` correlates it against a row
+ * the caller is already scanning, `{ recordId }` binds one record so the
+ * expression can be selected on its own — including for a record that has not
+ * been inserted yet, which is how a brand-new account starts life with zero
+ * deals rather than with an empty column.
+ *
+ * `count` and `sum` come back as 0 when there is nothing on the other end,
+ * because a company with no deals genuinely has none and is worth $0. `avg`,
+ * `min` and `max` come back NULL: the average of nothing is not zero, and a
+ * "most recent close date" of 1 January 1970 is worse than an empty cell.
+ */
+export function compileAggregate(
+  spec: AggregateSpec, env: CompileEnv, anchor: { alias: string } | { recordId: string },
+  names: { param: string; propertyField: string } = { param: 'rollup', propertyField: 'property' },
+): CompiledAggregate {
+  const compiler = new Compiler(env);
+  const anchorRef: ColRef = 'alias' in anchor
+    ? () => `${anchor.alias}.id`
+    : () => compiler.bindValue(anchor.recordId);
+  const { ref, aggProp } = compiler.aggregate(spec, anchorRef, env.objectType, 0, {
+    param: names.param,
+    propertyField: names.propertyField,
+    coalesceZero: (spec.aggregate ?? 'count') === 'count' || spec.aggregate === 'sum',
+  });
+  return { sql: ref(), params: compiler.params, aggregateProperty: aggProp };
+}
+
+/**
+ * Every property name a filter tree reads on the records it is applied to.
+ * A rollup only has to be recomputed when a child write touched one of these,
+ * so logging a call against a deal does not re-sum the account's pipeline.
+ */
+export function filterProperties(node: FilterNode | undefined): string[] {
+  const names = new Set<string>();
+  const walk = (n: FilterNode | undefined, depth: number): void => {
+    if (!n || typeof n !== 'object' || depth > MAX_DEPTH) return;
+    if (isGroup(n)) { for (const child of n.filters ?? []) walk(child, depth + 1); return; }
+    if (isAssociation(n)) {
+      // A nested association walks a further edge; its own aggregate property
+      // belongs to that far object type, not to this one.
+      if (n.aggregate_property) names.add(n.aggregate_property);
+      return;
+    }
+    if (n.property) names.add(n.property);
+    if (n.compare_property) names.add(n.compare_property);
+  };
+  walk(node, 0);
+  return [...names];
 }
 
 /* --------------------------------- sorting -------------------------------- */

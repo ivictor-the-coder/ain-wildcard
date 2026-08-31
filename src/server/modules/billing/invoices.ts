@@ -12,29 +12,42 @@
  *  3. whatever the credits module has in its outbox for this customer — the
  *     usage it settled in arrears, the credit it covered, the packs it sold.
  *
- * Two identities hold on every row this file writes, and they are asserted
+ * Every line is then taxed by the customer's own rate before any of it is
+ * written, so the subtotal this file records is a taxable base and never a
+ * number that quietly contains tax.
+ *
+ * Five identities hold on every row this file writes, and they are asserted
  * before the transaction is allowed to commit:
  *
- *     sum(lines.amount) === subtotal
- *     subtotal + balance_applied === total,  with total >= 0
+ *     sum(lines.amount)     === subtotal
+ *     sum(lines.tax_amount) === tax
+ *     subtotal + tax + balance_applied === total,  with total >= 0
+ *     amount_paid + pre_payment_credit_notes_amount + amount_due === total
+ *     sum(issued credit notes.total) <= total
  *
- * The second is what makes the customer balance honest: `balance_applied` is
+ * The third is what makes the customer balance honest: `balance_applied` is
  * whatever it takes to carry the difference, so a credit that exceeds the bill
  * leaves the remainder on the account instead of paying money out, and a
- * negative subtotal becomes credit rather than a negative invoice.
+ * negative subtotal becomes credit rather than a negative invoice. The fourth
+ * is what makes the *cash* honest — it is impossible to record more collected
+ * than the bill could ever have collected, which is what a credit note raised
+ * before payment changes. The fifth stops a bill being credited for more than
+ * it was ever worth.
  */
 import type { Ctx } from '../../kernel/context';
 import { badRequest, conflict, internal, notFound } from '../../../shared/errors';
-import { cursorOf, newId, parseCursor, randomId } from '../../../shared/ids';
+import { cursorOf, newId, parseCursor } from '../../../shared/ids';
 import { formatMoney, money } from '../../../shared/money';
 import { DAY, type Period } from '../../../shared/time';
+import type { TaxBehavior } from '../catalog/types';
 import type { BillableItem } from '../credits/types';
 import { longDate } from './cycle';
 import { hydrateInvoice, hydrateInvoiceLine, like, type InvoiceListFilter, type Page, type WriteMeta } from './records';
 import type { Billing } from './store';
+import { TaxRates, type ResolvedRate } from './tax';
 import type {
-  CollectionMethod, Invoice, InvoiceBillingReason, InvoiceLine, InvoiceLineKind, InvoiceLineSource,
-  InvoiceStatus, PauseBehavior, PendingInvoiceItem, RecurringLine, Subscription,
+  CollectionMethod, Customer, Invoice, InvoiceBillingReason, InvoiceLine, InvoiceLineKind, InvoiceLineSource,
+  InvoiceLineTax, InvoiceStatus, PauseBehavior, PendingInvoiceItem, RecurringLine, Subscription,
 } from './types';
 
 /** The one call this file makes into another module, named so it is obvious. */
@@ -58,6 +71,16 @@ export interface DraftLine {
   period: { start: number; end: number };
   fraction: { numerator: number; denominator: number } | null;
   breakdown: InvoiceLine['breakdown'];
+}
+
+/**
+ * A draft after the rate engine has been through it. `amount` is now the
+ * taxable base — for an inclusive price that is less than the number the
+ * pricing engine produced, because the tax has been taken out of it — and
+ * `tax` is the snapshot that explains the rest.
+ */
+export interface TaxedLine extends DraftLine {
+  tax: InvoiceLineTax;
 }
 
 export interface IssueInvoiceInput {
@@ -305,6 +328,49 @@ export class Invoices {
     });
   }
 
+  /* ----------------------------------- tax --------------------------------- */
+
+  /**
+   * Tax every line by the rate this customer actually pays.
+   *
+   * One resolution for the whole document — the address, the registration
+   * numbers and any exemption are read once — and then one split per line,
+   * against the `tax_behavior` the catalog recorded on the price that produced
+   * it. An exclusive line keeps its amount and gains tax on top; an inclusive
+   * line keeps its *gross* and gives up part of it, so its taxable base drops
+   * and the customer pays exactly the listed price. A line with no price behind
+   * it (a usage true-up, a manual item) has no behaviour to honour and is
+   * treated as exclusive-by-default, which is what `unspecified` means.
+   *
+   * The rate is snapshotted onto every line rather than referenced, so an
+   * invoice raised at 19% still says 19% after the rate is changed to 20%.
+   */
+  taxDrafts(orgId: string, customer: Customer, drafts: DraftLine[]): TaxedLine[] {
+    const rates = new TaxRates(this.ctx, orgId);
+    const resolved = rates.forCustomer(customer);
+    const book = this.billing.book(orgId);
+    const where = describeJurisdiction(customer, resolved);
+    return drafts.map((draft) => {
+      const behavior: TaxBehavior = draft.price ? book.find(draft.price)?.tax_behavior ?? 'unspecified' : 'unspecified';
+      const split = rates.split(draft.amount, behavior, draft.currency, resolved);
+      return {
+        ...draft,
+        amount: split.base,
+        tax: {
+          amount: split.tax,
+          rate: split.rate?.id ?? null,
+          display_name: split.rate?.display_name ?? null,
+          jurisdiction: split.rate?.jurisdiction ?? null,
+          percentage: split.rate?.percentage ?? null,
+          tax_type: split.rate?.tax_type ?? null,
+          behavior: split.behavior,
+          reason: split.reason,
+          explanation: rates.explain(split, where),
+        },
+      };
+    });
+  }
+
   /* --------------------------------- issuing ------------------------------- */
 
   /**
@@ -343,13 +409,15 @@ export class Invoices {
     ];
     if (!drafts.length) return null;
 
-    const subtotal = drafts.reduce((total, line) => total + line.amount, 0);
+    const lines = this.taxDrafts(orgId, customer, drafts);
+    const subtotal = lines.reduce((total, line) => total + line.amount, 0);
+    const tax = lines.reduce((total, line) => total + line.tax.amount, 0);
     const starting = customer.balance;
     // One formula, and both invariants fall out of it: the invoice never goes
-    // below zero, and whatever the bill and the balance cannot settle between
-    // them stays on the account.
-    const total = Math.max(0, subtotal + starting);
-    const balanceApplied = total - subtotal;
+    // below zero, and whatever the bill, its tax and the balance cannot settle
+    // between them stays on the account.
+    const total = Math.max(0, subtotal + tax + starting);
+    const balanceApplied = total - subtotal - tax;
     const ending = starting - balanceApplied;
 
     const dueDate = input.collectionMethod === 'send_invoice'
@@ -372,10 +440,13 @@ export class Invoices {
       arrears_period_start: input.arrearsPeriod?.start ?? null,
       arrears_period_end: input.arrearsPeriod?.end ?? null,
       subtotal,
+      tax,
       balance_applied: balanceApplied,
       total,
       amount_paid: 0,
       amount_due: total,
+      pre_payment_credit_notes_amount: 0,
+      post_payment_credit_notes_amount: 0,
       starting_balance: starting,
       ending_balance: ending,
       due_date: dueDate,
@@ -398,9 +469,9 @@ export class Invoices {
     );
     this.ctx.db.patch('billing_invoices', 'id', id, { sequence, number: this.numberFor(orgId, sequence) });
 
-    drafts.forEach((line, position) => {
+    lines.forEach((line, position) => {
       this.ctx.db.insert('billing_invoice_lines', {
-        id: randomId('lineitem'),
+        id: newId('lineitem'),
         org_id: orgId,
         invoice_id: id,
         subscription_id: line.subscription,
@@ -420,6 +491,15 @@ export class Invoices {
         proration_numerator: line.fraction?.numerator ?? null,
         proration_denominator: line.fraction?.denominator ?? null,
         breakdown: line.breakdown,
+        tax_amount: line.tax.amount,
+        tax_rate: line.tax.rate,
+        tax_percentage: line.tax.percentage,
+        tax_display_name: line.tax.display_name,
+        tax_jurisdiction: line.tax.jurisdiction,
+        tax_type: line.tax.tax_type,
+        tax_behavior: line.tax.behavior,
+        tax_reason: line.tax.reason,
+        tax_explanation: line.tax.explanation,
         released: 0,
         position,
         created: createdAt,
@@ -427,11 +507,17 @@ export class Invoices {
     });
 
     if (balanceApplied !== 0) {
+      const shown = formatMoney(money(Math.abs(balanceApplied), input.currency), { locale });
       this.billing.adjustBalance(orgId, customer.id, -balanceApplied, {
         type: 'applied_to_invoice',
         description: balanceApplied < 0
-          ? `${formatMoney(money(-balanceApplied, input.currency), { locale })} of account credit applied to invoice ${this.numberFor(orgId, sequence)}`
-          : `${formatMoney(money(balanceApplied, input.currency), { locale })} carried forward onto invoice ${this.numberFor(orgId, sequence)}`,
+          ? `${shown} of account credit applied to invoice ${this.numberFor(orgId, sequence)}`
+          // A bill whose lines are worth less than nothing — a mid-cycle
+          // downgrade, a cancellation — cannot be a negative invoice, so what
+          // it is worth goes onto the account instead of being paid out.
+          : subtotal + tax < 0
+            ? `${shown} placed on the account by invoice ${this.numberFor(orgId, sequence)}, where it comes off the next bill`
+            : `${shown} carried forward onto invoice ${this.numberFor(orgId, sequence)}`,
         subscription: input.subscription?.id ?? null,
         invoice: id,
         createdAt,
@@ -464,7 +550,12 @@ export class Invoices {
 
     const open = this.finalize(orgId, id, input.meta, createdAt);
     if (open.total === 0) {
-      return this.pay(orgId, id, { note: 'Nothing to collect — the balance covered it in full.', at: createdAt }, input.meta);
+      return this.pay(orgId, id, {
+        note: subtotal + tax < 0
+          ? `Nothing to collect — this bill is worth ${formatMoney(money(-(subtotal + tax), input.currency), { locale })} back to the customer, which went onto the account balance.`
+          : 'Nothing to collect — the balance covered it in full.',
+        at: createdAt,
+      }, input.meta);
     }
     if (input.paidAt !== undefined && input.paidAt !== null) {
       return this.pay(orgId, id, { note: 'Collected on the day it was raised.', at: input.paidAt }, input.meta);
@@ -490,6 +581,15 @@ export class Invoices {
     return after;
   }
 
+  /**
+   * Collect what is left to collect — never the face value of the bill.
+   *
+   * A credit note raised before the money arrived took its amount off what the
+   * customer was ever going to pay, so recording `total` here would book cash
+   * that never landed and overstate the workspace's collected figure by exactly
+   * the credited amount. What is collectable is `total` less the pre-payment
+   * credit notes, which is what `amount_due` has been carrying all along.
+   */
   pay(orgId: string, id: string, opts: { note?: string | null; at?: number } = {}, meta?: WriteMeta): Invoice {
     const invoice = this.require(orgId, id);
     if (invoice.status === 'paid') return invoice;
@@ -497,8 +597,9 @@ export class Invoices {
       throw conflict('invoice_void', `Invoice ${invoice.number} was voided, so it cannot be paid. Raise a new one.`, { status: invoice.status });
     }
     const now = opts.at ?? this.ctx.now();
+    const collected = invoice.total - invoice.pre_payment_credit_notes_amount;
     this.ctx.db.patch('billing_invoices', 'id', id, {
-      status: 'paid', amount_paid: invoice.total, amount_due: 0,
+      status: 'paid', amount_paid: collected, amount_due: 0,
       finalized_at: invoice.finalized_at ?? now, paid_at: now,
       payment_note: opts.note ?? invoice.payment_note, updated: now,
     });
@@ -518,7 +619,11 @@ export class Invoices {
     const invoice = this.require(orgId, id);
     if (invoice.status === 'void') return invoice;
     if (invoice.status === 'paid') {
-      throw conflict('invoice_paid', `Invoice ${invoice.number} has been paid. Issue a credit rather than voiding it.`, { status: invoice.status });
+      throw conflict(
+        'invoice_paid',
+        `Invoice ${invoice.number} has been paid, so withdrawing it would erase a bill the money was collected against. Credit it instead: POST /v1/credit_notes with { "invoice": "${invoice.id}" }.`,
+        { status: invoice.status },
+      );
     }
     const now = at ?? this.ctx.now();
     this.ctx.db.patch('billing_invoices', 'id', id, {
@@ -567,7 +672,7 @@ export class Invoices {
   /* --------------------------------- guards -------------------------------- */
 
   /**
-   * The two identities, checked against what was actually written rather than
+   * The five identities, checked against what was actually written rather than
    * against what was computed. An invoice that does not add up is a bug that
    * must never reach a customer, so it takes the transaction down with it.
    */
@@ -580,10 +685,48 @@ export class Invoices {
         { invoice: id, lines: lineTotal, subtotal: invoice.subtotal },
       );
     }
-    if (invoice.subtotal + invoice.balance_applied !== invoice.total || invoice.total < 0) {
+    const lineTax = invoice.lines.reduce((total, line) => total + line.tax.amount, 0);
+    if (lineTax !== invoice.tax) {
       throw internal(
-        `Invoice ${invoice.number} does not reconcile: ${invoice.subtotal} + ${invoice.balance_applied} is not ${invoice.total}.`,
-        { invoice: id, subtotal: invoice.subtotal, balance_applied: invoice.balance_applied, total: invoice.total },
+        `Invoice ${invoice.number}'s lines carry ${lineTax} of tax but its tax total says ${invoice.tax}.`,
+        { invoice: id, lines: lineTax, tax: invoice.tax },
+      );
+    }
+    if (invoice.subtotal + invoice.tax + invoice.balance_applied !== invoice.total || invoice.total < 0) {
+      throw internal(
+        `Invoice ${invoice.number} does not reconcile: ${invoice.subtotal} + ${invoice.tax} + ${invoice.balance_applied} is not ${invoice.total}.`,
+        {
+          invoice: id, subtotal: invoice.subtotal, tax: invoice.tax,
+          balance_applied: invoice.balance_applied, total: invoice.total,
+        },
+      );
+    }
+    // Cash and credit together account for the whole bill. Without this, an
+    // invoice can record more collected than it was ever possible to collect —
+    // a credit note raised before payment reduces what arrives, and `amount_paid`
+    // is what the workspace's collected figure is summed from.
+    if (invoice.status !== 'void'
+      && invoice.amount_paid + invoice.pre_payment_credit_notes_amount + invoice.amount_due !== invoice.total) {
+      throw internal(
+        `Invoice ${invoice.number} does not account for itself: ${invoice.amount_paid} collected + ${invoice.pre_payment_credit_notes_amount} credited before payment + ${invoice.amount_due} still due is not the ${invoice.total} it was billed.`,
+        {
+          invoice: id, amount_paid: invoice.amount_paid, amount_due: invoice.amount_due,
+          pre_payment_credit_notes_amount: invoice.pre_payment_credit_notes_amount, total: invoice.total,
+        },
+      );
+    }
+    // Nothing may be credited that was not billed. The ceiling is the bill
+    // itself, so an invoice that account credit already paid down cannot hand
+    // that same credit back a second time through a credit note.
+    const credited = this.ctx.db.count(
+      `SELECT COALESCE(SUM(total), 0) FROM billing_credit_notes
+        WHERE org_id = ? AND invoice_id = ? AND status = 'issued'`,
+      orgId, id,
+    );
+    if (credited > invoice.total) {
+      throw internal(
+        `Invoice ${invoice.number} has been credited ${credited}, which is more than the ${invoice.total} it was billed.`,
+        { invoice: id, credited, total: invoice.total },
       );
     }
   }
@@ -644,4 +787,16 @@ export function orgPrefix(name: string): string {
 
 export const describeWindow = (period: { start: number; end: number }, locale: string): string =>
   `${longDate(period.start, locale)} to ${longDate(period.end, locale)}`;
+
+/**
+ * The place a tax decision was made about, in the words the line will use when
+ * there is no rate to name — "Iowa, US" rather than a bare country code, so
+ * "why is there no tax on this?" is answered by the invoice.
+ */
+function describeJurisdiction(customer: Customer, resolved: ResolvedRate): string | null {
+  if (resolved.rate) return resolved.rate.jurisdiction;
+  if (!resolved.country) return null;
+  const state = customer.address?.state?.trim();
+  return state ? `${state}, ${resolved.country}` : resolved.country;
+}
 

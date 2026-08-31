@@ -12,11 +12,15 @@
   overflow: hidden;
   background: var(--bg-app);
 }
-.shell[data-rail='true'] { --shell-nav: var(--nav-width-collapsed); }
+.shell[data-rail='true'],
+.shell[data-narrow='true'] { --shell-nav: var(--nav-width-collapsed); }
 
 /* -------------------------------- sidebar -------------------------------- */
 
 .shell-side {
+  /* Named explicitly so the body keeps its column when the drawer lifts the
+     sidebar out of flow. */
+  grid-column: 1;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -231,9 +235,54 @@
 .shell[data-rail='true'] .shell-navitem.is-active::before { inset-inline-start: calc(-1 * var(--space-3)); }
 .shell[data-rail='true'] .shell-sidefoot { flex-direction: column; }
 
+/* Narrow windows keep the rail's column width and float the labelled sidebar
+   over the content, so opening the navigation never reflows the page under it. */
+.shell[data-drawer='true'] .shell-side {
+  position: fixed;
+  inset-block: 0;
+  inset-inline-start: 0;
+  width: var(--nav-width);
+  z-index: var(--z-drawer);
+  box-shadow: var(--shadow-lg);
+  animation: shell-drawer-in var(--dur-normal) var(--ease-out);
+}
+/* Enters from the inline start, so it comes from the right in an RTL document. */
+@keyframes shell-drawer-in {
+  from { transform: translateX(calc(-100% * var(--dir-x))); }
+  to { transform: none; }
+}
+.shell-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--z-drawer) - 1);
+  background: var(--bg-overlay);
+  animation: ain-fade-in var(--dur-fast) var(--ease-out);
+  cursor: default;
+}
+
+/* Off screen until it is focused; never removed from the tab order. */
+.shell-skip {
+  position: fixed;
+  inset-block-start: var(--space-4);
+  inset-inline-start: var(--space-4);
+  z-index: var(--z-command);
+  padding: var(--space-3) var(--space-5);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-raised);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  /* Parked above the viewport; the shadow only exists once it is on screen, so
+     none of it bleeds over the top of the brand. */
+  transform: translateY(calc(-100% - var(--space-7)));
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.shell-skip:focus { transform: none; text-decoration: none; box-shadow: var(--shadow-lg), var(--focus-ring); }
+
 /* --------------------------------- body ---------------------------------- */
 
-.shell-body { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.shell-body { grid-column: 2; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
 .shell-top {
   display: flex;
@@ -251,6 +300,7 @@
 .shell-top__divider { width: 1px; height: 18px; background: var(--border-default); margin-inline: var(--space-2); }
 
 .shell-search {
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -275,6 +325,107 @@
   color: var(--text-primary);
 }
 .shell-search__input::placeholder { color: var(--text-placeholder); }
+
+/* ---------------------------- search typeahead ---------------------------- */
+/* The panel hangs off the field, so the field is the positioning context and
+   the top bar must not clip it. */
+.shell-search__panel {
+  position: absolute;
+  top: calc(100% + var(--space-3));
+  inset-inline: 0;
+  z-index: var(--z-dropdown);
+  display: flex;
+  flex-direction: column;
+  max-height: min(64vh, 460px);
+  overflow: hidden;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  cursor: default;
+}
+.shell-search__note {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  line-height: var(--leading-snug);
+}
+.shell-search__note.is-alert { color: var(--text-danger); }
+.shell-search__note .u-mono { flex: 0 0 auto; font-size: var(--text-2xs); color: var(--text-tertiary); }
+.shell-search__list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: var(--space-3); }
+.shell-search__group + .shell-search__group { margin-top: var(--space-3); }
+.shell-search__grouphead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4) var(--space-2);
+  background: var(--bg-surface);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+.shell-search__groupcount { color: var(--text-placeholder); font-weight: var(--weight-normal); }
+.shell-search__row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  width: 100%;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  text-align: start;
+  color: var(--text-primary);
+}
+.shell-search__row.is-active { background: var(--bg-selected); }
+.shell-search__row.is-active .shell-search__title { color: var(--text-brand); }
+.shell-search__row.is-unopenable { cursor: default; color: var(--text-secondary); }
+.shell-search__row--all { margin-top: var(--space-2); border-top: 1px solid var(--border-subtle); border-radius: 0 0 var(--radius-md) var(--radius-md); }
+.shell-search__icon {
+  display: grid;
+  place-items: center;
+  width: 26px; height: 26px;
+  flex: 0 0 auto;
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  color: var(--text-secondary);
+}
+.shell-search__row.is-active .shell-search__icon { background: var(--bg-surface); color: var(--text-brand); }
+.shell-search__text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.shell-search__title { font-size: var(--text-md); }
+.shell-search__sub { font-size: var(--text-xs); color: var(--text-tertiary); }
+.shell-search__aside {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--text-2xs);
+  color: var(--text-placeholder);
+}
+.shell-search__flag { color: var(--text-tertiary); white-space: nowrap; }
+.shell-search__foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  flex: 0 0 auto;
+  padding: var(--space-3) var(--space-5);
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+.shell-search__hint { display: inline-flex; align-items: center; gap: var(--space-2); }
+.shell-search__count { margin-inline-start: auto; }
 
 .shell-main { flex: 1 1 auto; min-height: 0; overflow: auto; }
 .shell-main:focus-visible { box-shadow: none; }
@@ -319,6 +470,12 @@
   width: 6px; height: 6px; border-radius: var(--radius-full);
   background: var(--amber-500);
   animation: ain-pulse 2.4s var(--ease-in-out) infinite;
+}
+/* On a phone-width top bar the word would push the account button off the
+   edge. The chip still reads as shifted (amber, pulsing dot) or unconfirmed
+   (dashed, red) — and a refused workspace states it in full in the banner. */
+@media (max-width: 420px) {
+  .shell-clock__suffix { display: none; }
 }
 
 .tm { display: flex; flex-direction: column; gap: var(--space-5); width: 340px; }
@@ -527,6 +684,18 @@
 .gsearch__title { font-size: var(--text-md); font-weight: var(--weight-medium); }
 .gsearch__sub { font-size: var(--text-xs); color: var(--text-tertiary); }
 .gsearch__meta { flex: 0 0 auto; display: flex; align-items: center; gap: var(--space-4); font-size: var(--text-xs); color: var(--text-tertiary); }
+/* A match whose object type has no screen installed: still listed, because it
+   really did match, but visibly not something ↵ can open. */
+.gsearch__hit.is-unopenable { color: var(--text-secondary); cursor: default; }
+.gsearch__hit.is-unopenable:hover { background: none; }
+.gsearch__hit.is-unopenable .gsearch__icon { opacity: 0.65; }
+.gsearch__note {
+  padding: 1px var(--space-3);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-full);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
 
 /* --------------------------------- login --------------------------------- */
 
@@ -602,7 +771,10 @@
 .notfound__where { margin-inline-start: auto; font-family: var(--font-mono); font-size: var(--text-xs); color: var(--text-tertiary); }
 
 @media (max-width: 900px) {
-  .shell { grid-template-columns: var(--nav-width-collapsed) minmax(0, 1fr); }
+  /* The width lives on `data-narrow`, set from the same media query in React, so
+     one boolean drives the column, the labels, the flyouts and the aria labels.
+     A width changed here alone is how the sidebar became 56px of anonymous
+     glyphs while the app still believed it was showing labels. */
   .shell-top__crumbs { display: none; }
 }
 

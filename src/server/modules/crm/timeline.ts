@@ -1,9 +1,9 @@
 import type { Ctx } from '../../kernel/context';
 import { parseJson } from '../../kernel/db';
 import { badRequest } from '../../../shared/errors';
-import { formatDate, formatDateTime } from '../../../shared/time';
+import { ValueFormatter } from './format';
 import { encodeHistoryCursor, type Crm } from './store';
-import type { CrmRecord, HistoryEntry, PropertyDef, PropertyValue, TimelineItem } from './types';
+import type { CrmRecord, HistoryEntry, PropertyValue, TimelineItem } from './types';
 
 /**
  * The timeline is the reason people trust a CRM: one column that merges what
@@ -101,11 +101,20 @@ function decodeCursor(cursor: string | undefined): TimelineCursor | null {
   return { at: Number(at), rank: Number(rank), id };
 }
 
-const EVENT_TITLES: Record<string, string> = {
+/**
+ * Titles for `<object type>.<verb>` events — the ones whose subject is the
+ * record the timeline belongs to. They are keyed on the verb, so they may only
+ * be consulted once the prefix is known to be an object type: `association.
+ * created` is not a record being created, and titling it off its last
+ * dot-segment is how a deal opened in March grew a "Record created" dated
+ * today.
+ */
+const RECORD_EVENT_TITLES: Record<string, string> = {
   created: 'Record created',
   updated: 'Record updated',
   archived: 'Record archived',
   restored: 'Record restored',
+  deleted: 'Record deleted',
   merged: 'Duplicate merged in',
 };
 
@@ -232,6 +241,7 @@ function collect(ctx: Ctx, crm: Crm, orgId: string, record: CrmRecord, options: 
       }
     }
     const viaRecords = new Map<string, CrmRecord>();
+    const formatter = new ValueFormatter(ctx, orgId);
     for (const row of best.values()) {
       const props = parseJson<Record<string, PropertyValue>>(row.properties, {});
       let via: TimelineItem['via'] = null;
@@ -255,7 +265,14 @@ function collect(ctx: Ctx, crm: Crm, orgId: string, record: CrmRecord, options: 
         actor_type: 'user',
         record_id: row.rid,
         via,
-        data: { object_type: row.object_type, properties: props },
+        // A call's properties are stored to be computed with — `duration_minutes`
+        // as a number, `outcome` as a machine value — so the card gets both:
+        // the raw map, and the same fields as the person reads them.
+        data: {
+          object_type: row.object_type,
+          properties: props,
+          formatted: formatter.record(crm.propertyIndex(orgId, row.object_type), props),
+        },
       });
     }
   }
@@ -265,22 +282,36 @@ function collect(ctx: Ctx, crm: Crm, orgId: string, record: CrmRecord, options: 
   }
 
   if (wanted.has('event')) {
-    for (const row of readEvents(ctx, orgId, record.id, before, cursor, limit)) {
-      const suffix = row.type.split('.').pop() ?? row.type;
-      const data = parseJson<unknown>(row.data, {});
+    const objectTypeNames = new Set(crm.objectTypes(orgId).map((t) => t.name));
+    const associationLabels = new Map(crm.associationTypes(orgId).map((t) => [t.name, t]));
+    const eventRows = readEvents(ctx, orgId, record.id, before, cursor, limit);
+    // The association lane renders every link that still exists, so a
+    // `association.created` event for one of them is the same fact twice — one
+    // POST used to print three lines. The event is kept for links that are
+    // *gone*, which is the only place the timeline can still say they existed.
+    const shadowed = wanted.has('association')
+      ? liveAssociations(ctx, orgId, eventRows.map((row) => parseJson<Record<string, unknown>>(row.data, {})))
+      : new Set<string>();
+    for (const row of eventRows) {
+      const data = parseJson<Record<string, unknown>>(row.data, {});
+      if (row.type === 'association.created' && typeof data.id === 'string' && shadowed.has(data.id)) continue;
+      const link = linkEvent(row.type, data, record.id, associationLabels);
+      const summary = summarise(data);
       items.push({
         object: 'timeline_item',
         id: row.id,
         kind: 'event',
         at: Number(row.created),
-        title: EVENT_TITLES[suffix] ?? humanise(row.type),
-        body: null,
-        icon: 'zap',
+        title: link?.title ?? titleForEvent(row.type, objectTypeNames),
+        // The readable sentence used to reach `data.summary` and stop there,
+        // so a card that said "Record archived" said nothing about what.
+        body: link?.body ?? (summary || null),
+        icon: link ? 'link' : 'zap',
         actor_id: row.actor_id,
         actor_type: row.actor_type,
         record_id: record.id,
         via: null,
-        data: { type: row.type, ...(data && typeof data === 'object' ? { summary: summarise(data) } : {}) },
+        data: { type: row.type, ...(link ? link.data : {}), summary },
       });
     }
   }
@@ -413,10 +444,12 @@ function foldWrite(
   const chosen = group.filter((e) => e.source !== 'system');
   const lead = (chosen.length ? chosen : group).slice().sort((a, b) => rank(a) - rank(b) || a.seq - b.seq)[0];
   const rest = group.filter((e) => e !== lead);
-  const render = (entry: HistoryEntry): string => {
-    const prop = crm.propertyOrNull(orgId, entry.object_type, entry.property);
-    return `${display(prop, entry.from_value) ?? 'empty'} → ${display(prop, entry.to_value) ?? 'empty'}`;
-  };
+  // Every value is printed through its property's type. The audit trail stores
+  // money in minor units, dates as ISO text, an enum as its machine value and
+  // an owner as a user id; a timeline that shows those raw tells an account
+  // manager their $80,000 deal moved from 8000000 to 8000001.
+  const render = (entry: HistoryEntry): string =>
+    `${entry.from_display ?? 'empty'} → ${entry.to_display ?? 'empty'}`;
   const shown = rest.slice(0, 4);
   const body = [render(lead), ...shown.map((e) => `${e.property_label} ${render(e)}`)].join(' · ')
     + (rest.length > shown.length ? ` · and ${rest.length - shown.length} more` : '');
@@ -434,10 +467,16 @@ function foldWrite(
     record_id: lead.record_id,
     via: lead.record_id === record.id ? null : { id: lead.record_id, object_type: lead.object_type, display_name: 'merged duplicate' },
     data: {
-      property: lead.property, from: lead.from_value, to: lead.to_value, source: lead.source,
-      write_id: lead.write_id, seq: lead.seq,
+      property: lead.property, from: lead.from_value, to: lead.to_value,
+      from_display: lead.from_display, to_display: lead.to_display,
+      source: lead.source, write_id: lead.write_id, seq: lead.seq,
       ...(rest.length ? {
-        also: rest.map((e) => ({ property: e.property, label: e.property_label, from: e.from_value, to: e.to_value, source: e.source })),
+        also: rest.map((e) => ({
+          property: e.property, label: e.property_label,
+          from: e.from_value, to: e.to_value,
+          from_display: e.from_display, to_display: e.to_display,
+          source: e.source,
+        })),
       } : {}),
     },
   };
@@ -556,6 +595,17 @@ function readEvents(
   );
 }
 
+/** Which of these events' association ids still exist as edges. */
+function liveAssociations(ctx: Ctx, orgId: string, payloads: Record<string, unknown>[]): Set<string> {
+  const ids = [...new Set(payloads.map((d) => d.id).filter((id): id is string => typeof id === 'string'))];
+  if (!ids.length) return new Set();
+  const rows = ctx.db.all<{ id: string }>(
+    `SELECT id FROM crm_associations WHERE org_id = ? AND id IN (${ids.map(() => '?').join(',')})`,
+    orgId, ...(ids as never[]),
+  );
+  return new Set(rows.map((r) => r.id));
+}
+
 /* ------------------------------- associations ----------------------------- */
 
 /**
@@ -600,16 +650,56 @@ function titleOf(lead: HistoryEntry): string {
   return `${lead.property_label} changed`;
 }
 
-function display(prop: PropertyDef | null, value: PropertyValue): string | null {
-  if (value === null || value === undefined || value === '') return null;
-  const text = Array.isArray(value) ? value.join(', ') : String(value);
-  // History stores dates as ISO text; a timeline reads better in words.
-  if (prop && (prop.type === 'date' || prop.type === 'datetime')) {
-    const ts = Date.parse(text);
-    if (Number.isFinite(ts)) return prop.type === 'date' ? formatDate(ts) : formatDateTime(ts);
-  }
-  if (!prop?.options?.length) return text;
-  return text.split(', ').map((part) => prop.options.find((o) => o.value === part)?.label ?? part).join(', ');
+/**
+ * `deal.archived` is a verb about this record; `association.deleted` and
+ * anything a module emits under its own namespace are not. Only a type whose
+ * prefix is a real object type may take a record title.
+ */
+function titleForEvent(type: string, objectTypes: Set<string>): string {
+  const dot = type.indexOf('.');
+  const prefix = dot < 0 ? '' : type.slice(0, dot);
+  const verb = dot < 0 ? type : type.slice(dot + 1);
+  if (objectTypes.has(prefix) && RECORD_EVENT_TITLES[verb]) return RECORD_EVENT_TITLES[verb];
+  return humanise(type);
+}
+
+/**
+ * An association event, rendered through the record on the other end of the
+ * link rather than through its own dot-segments. "Deleted" with an empty body
+ * is the removal of an account nobody can name afterwards, because the edge it
+ * described no longer exists to be looked up.
+ */
+function linkEvent(
+  type: string, data: Record<string, unknown>, subjectId: string,
+  labels: Map<string, { label: string; inverse_label: string }>,
+): { title: string; body: string | null; data: Record<string, unknown> } | null {
+  if (type !== 'association.created' && type !== 'association.deleted') return null;
+  const endpoint = (side: unknown): { id: string; object_type: string; display_name: string } | null => {
+    if (!side || typeof side !== 'object') return null;
+    const row = side as Record<string, unknown>;
+    return typeof row.id === 'string'
+      ? { id: row.id, object_type: String(row.object_type ?? ''), display_name: String(row.display_name ?? row.id) }
+      : null;
+  };
+  const from = endpoint(data.from);
+  const to = endpoint(data.to);
+  const outgoing = !from || from.id === subjectId;
+  const other = outgoing ? to : from;
+  if (!other) return null;
+  const associationType = typeof data.association_type === 'string' ? data.association_type : '';
+  const type_ = labels.get(associationType);
+  const relationship = (outgoing ? type_?.label : type_?.inverse_label) ?? associationType;
+  return {
+    title: type === 'association.created' ? `Linked to ${other.display_name}` : `Unlinked ${other.display_name}`,
+    body: relationship || null,
+    data: {
+      association_type: associationType,
+      relationship,
+      record_id: other.id,
+      object_type: other.object_type,
+      display_name: other.display_name,
+    },
+  };
 }
 
 const humanise = (type: string): string => {

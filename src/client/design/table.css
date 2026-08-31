@@ -109,6 +109,11 @@
 }
 .ain-table__count { font-variant-numeric: tabular-nums; }
 .ain-table__colmenu { padding: var(--space-3); max-height: 320px; overflow: auto; min-width: 220px; }
+/* One scroller here too: on a short window the list keeps its 320px and the
+   popover body scrolls as well, so Tab moves a checkbox the body has already
+   clipped. Let the list take the height the popover actually has. */
+.ain-colpop .ain-popover__body { display: flex; flex-direction: column; }
+.ain-colpop .ain-table__colmenu { flex: 1 1 auto; min-height: 0; }
 .ain-table__colitem { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-3) var(--space-4); border-radius: var(--radius-sm); cursor: pointer; font-size: var(--text-md); }
 .ain-table__colitem:hover { background: var(--bg-hover); }
 
@@ -154,6 +159,17 @@
 .ain-filtered__ops .ain-select, .ain-filtered__ops .ain-segmented { width: 100%; }
 .ain-filtered__search { padding: 0 var(--space-5) var(--space-3); }
 .ain-filtered__list { max-height: 260px; overflow-y: auto; padding: 0 var(--space-3) var(--space-3); }
+/* One scroller, not two.
+   The value list has its own 260px scrollport, so on a short window the popover
+   body ended up scrolling as well — and the browser, moving focus down the list
+   with Tab, scrolls the checkbox just far enough to clear the *body's* edge and
+   parks the row it belongs to under the sticky Clear/Done bar. Letting the list
+   flex into whatever height the clamped popover leaves means the body never
+   scrolls, the footer is never over the list, and every option Tab reaches is
+   whole. */
+.ain-filterpop--set .ain-popover__body { display: flex; flex-direction: column; }
+.ain-filterpop--set .ain-filtered { flex: 1 1 auto; min-height: 0; }
+.ain-filterpop--set .ain-filtered__list { flex: 1 1 auto; }
 .ain-filtered__opt {
   display: flex; align-items: center; gap: var(--space-4); justify-content: space-between;
   padding: var(--space-3) var(--space-4); border-radius: var(--radius-sm);
