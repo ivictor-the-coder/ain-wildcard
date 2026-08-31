@@ -37,7 +37,7 @@ export interface EntityRef {
   sublabel: string | null;
   ownerId: string | null;
   updated: number;
-  source: 'crm' | 'user' | 'billing' | 'catalog';
+  source: 'crm' | 'user' | 'billing' | 'catalog' | 'metering';
 }
 
 export interface EntityIndex {
@@ -80,7 +80,14 @@ export interface InvoiceSource {
   table: string;
   amountColumn: string;
   paidColumn: string | null;
-  dateColumn: string;
+  /**
+   * When the money landed. Only a question about cash collected may filter on
+   * it: an unpaid invoice has no payment date, so a window on this column
+   * silently excludes every row a receivables question is about.
+   */
+  paidDateColumn: string | null;
+  /** When the bill was raised — the date every other invoice question means. */
+  issuedDateColumn: string;
   statusColumn: string | null;
   customerColumn: string | null;
   currencyColumn: string | null;
@@ -133,13 +140,17 @@ export function billingSources(db: Db): BillingSources {
   const invoices: InvoiceSource | null = invoiceTable
     ? (() => {
         const amountColumn = firstColumn(db, invoiceTable, ['total', 'amount_due', 'amount', 'subtotal', 'amount_total']);
-        const dateColumn = firstColumn(db, invoiceTable, ['paid_at', 'finalized_at', 'issued_at', 'period_end', 'due_at', 'created']);
-        if (!amountColumn || !dateColumn) return null;
+        // Two different dates, kept apart on purpose. One cached "invoice date"
+        // meant `paid_at` won for every question, and `paid_at IS NULL` on every
+        // open invoice — so "what are we owed" matched no rows in any window.
+        const issuedDateColumn = firstColumn(db, invoiceTable, ['finalized_at', 'issued_at', 'created', 'period_end', 'due_at']);
+        if (!amountColumn || !issuedDateColumn) return null;
         return {
           table: invoiceTable,
           amountColumn,
           paidColumn: firstColumn(db, invoiceTable, ['amount_paid', 'paid_amount']),
-          dateColumn,
+          paidDateColumn: firstColumn(db, invoiceTable, ['paid_at', 'paid_date', 'settled_at']),
+          issuedDateColumn,
           statusColumn: firstColumn(db, invoiceTable, ['status', 'state']),
           customerColumn: firstColumn(db, invoiceTable, ['customer_id', 'account_id', 'company_id', 'customer']),
           currencyColumn: firstColumn(db, invoiceTable, ['currency']),
@@ -170,6 +181,46 @@ export function billingSources(db: Db): BillingSources {
   const sources: BillingSources = { invoices, customers, subscriptions };
   billingCache.set(db, { stamp: schema.tables.size, sources });
   return sources;
+}
+
+export interface MeterSource {
+  table: string;
+  nameColumn: string;
+  /** The event name the meter reads — how a person says "telemetry events". */
+  eventColumn: string | null;
+  unitColumn: string | null;
+  statusColumn: string | null;
+}
+
+const meterCache = new WeakMap<Db, { stamp: number; source: MeterSource | null }>();
+
+/**
+ * The metering module's meters, discovered the same way as the ledger's tables.
+ *
+ * A workspace that meters usage names its meters, and a question about
+ * "telemetry events" is a question about one of them. Without them in the index
+ * that phrase resolves to nothing and the engine answers about bookings
+ * instead, which is a different question with a different number.
+ */
+export function meterSource(db: Db): MeterSource | null {
+  const schema = schemaOf(db);
+  const cached = meterCache.get(db);
+  if (cached && cached.stamp === schema.tables.size) return cached.source;
+  const table = [...schema.tables.keys()]
+    .filter((n) => /(^|_)meters$/.test(n) && schema.tables.get(n)?.has('org_id'))
+    .sort((a, b) => a.length - b.length)[0] ?? null;
+  const nameColumn = table ? firstColumn(db, table, ['name', 'display_name', 'label']) : null;
+  const source: MeterSource | null = table && nameColumn
+    ? {
+        table,
+        nameColumn,
+        eventColumn: firstColumn(db, table, ['event_name', 'event', 'key']),
+        unitColumn: firstColumn(db, table, ['unit_label', 'unit']),
+        statusColumn: firstColumn(db, table, ['status', 'state']),
+      }
+    : null;
+  meterCache.set(db, { stamp: schema.tables.size, source });
+  return source;
 }
 
 /* ----------------------------- workspace facts ---------------------------- */
@@ -211,7 +262,9 @@ function crmStamp(ctx: Ctx, orgId: string): string {
   const users = ctx.db.count(`SELECT COUNT(*) FROM memberships WHERE org_id = ?`, orgId);
   const billing = billingSources(ctx.db);
   const invoices = billing.invoices ? ctx.db.count(`SELECT COUNT(*) FROM ${billing.invoices.table} WHERE org_id = ?`, orgId) : 0;
-  return `${row?.n ?? 0}:${row?.u ?? 0}:${users}:${invoices}`;
+  const meters = meterSource(ctx.db);
+  const meterCount = meters ? ctx.db.count(`SELECT COUNT(*) FROM ${meters.table} WHERE org_id = ?`, orgId) : 0;
+  return `${row?.n ?? 0}:${row?.u ?? 0}:${users}:${invoices}:${meterCount}`;
 }
 
 /** Build (or reuse) the searchable index of everything nameable in the org. */
@@ -283,6 +336,26 @@ export function entityIndex(ctx: Ctx, orgId: string): EntityIndex {
       entities.push({
         id: row.id, type: 'invoice', label: row.num || row.id, aliases: [row.id],
         sublabel: 'Invoice', ownerId: null, updated: 0, source: 'billing',
+      });
+    }
+  }
+  const meters = meterSource(ctx.db);
+  if (meters) {
+    const { table, nameColumn, eventColumn, unitColumn } = meters;
+    for (const row of ctx.db.all<{ id: string; nm: string | null; ev: string | null; un: string | null }>(
+      `SELECT id, ${nameColumn} AS nm, ${eventColumn ?? 'NULL'} AS ev, ${unitColumn ?? 'NULL'} AS un
+       FROM ${table} WHERE org_id = ? LIMIT 200`, orgId)) {
+      if (!row.nm) continue;
+      entities.push({
+        id: row.id,
+        type: 'meter',
+        label: row.nm,
+        // "telemetry_events" is how the API says it and how people type it.
+        aliases: [row.ev, row.ev?.replace(/_/g, ' ')].filter((a): a is string => !!a),
+        sublabel: row.un ? `Meter, in ${row.un}` : 'Meter',
+        ownerId: null,
+        updated: 0,
+        source: 'metering',
       });
     }
   }

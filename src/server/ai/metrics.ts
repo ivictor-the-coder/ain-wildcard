@@ -277,8 +277,19 @@ export function invoiceFacts(input: MetricInput, opts: { paidOnly?: boolean; out
   if (!invoices) return { available: false, total: 0, count: 0, ids: [], groups: [], label: 'no invoice table in this workspace' };
 
   const amountColumn = opts.paidOnly && invoices.paidColumn ? invoices.paidColumn : invoices.amountColumn;
-  const where: string[] = [`org_id = ?`, `${invoices.dateColumn} >= ?`, `${invoices.dateColumn} < ?`];
-  const params: unknown[] = [workspace.orgId, window.start, window.end];
+  // Cash collected is dated by when it was paid; everything else is dated by
+  // when the bill was raised. An unpaid invoice has no payment date, so dating
+  // the outstanding book on `paid_at` excludes every row it is asking about.
+  const dateColumn = opts.paidOnly && invoices.paidDateColumn ? invoices.paidDateColumn : invoices.issuedDateColumn;
+  // What is owed is owed today, whatever period the question named: an invoice
+  // raised last year and still open is money the business is still owed.
+  const windowed = !opts.outstanding;
+  const where: string[] = [`org_id = ?`];
+  const params: unknown[] = [workspace.orgId];
+  if (windowed) {
+    where.push(`${dateColumn} >= ?`, `${dateColumn} < ?`);
+    params.push(window.start, window.end);
+  }
 
   if (invoices.statusColumn) {
     if (opts.outstanding) { where.push(`${invoices.statusColumn} IN ('open', 'past_due', 'unpaid', 'uncollectible')`); }
@@ -296,13 +307,13 @@ export function invoiceFacts(input: MetricInput, opts: { paidOnly?: boolean; out
   const total = ctx.db.get<{ v: number | null; n: number }>(
     `SELECT SUM(${amountColumn}) AS v, COUNT(*) AS n FROM ${invoices.table} WHERE ${whereSql}`, ...(params as never[]));
   const ids = ctx.db.all<{ id: string }>(
-    `SELECT id FROM ${invoices.table} WHERE ${whereSql} ORDER BY ${invoices.dateColumn} DESC LIMIT 8`, ...(params as never[])).map((r) => r.id);
+    `SELECT id FROM ${invoices.table} WHERE ${whereSql} ORDER BY ${dateColumn} DESC LIMIT 8`, ...(params as never[])).map((r) => r.id);
 
   let groups: { key: string; value: number; count: number }[] = [];
   if (input.groupBy === 'time') {
     const format = bucketGrain(window) === 'day' ? '%Y-%m-%d' : bucketGrain(window) === 'year' ? '%Y' : '%Y-%m';
     groups = ctx.db.all<{ k: string; v: number | null; n: number }>(
-      `SELECT strftime('${format}', ${invoices.dateColumn} / 1000, 'unixepoch') AS k, SUM(${amountColumn}) AS v, COUNT(*) AS n
+      `SELECT strftime('${format}', ${dateColumn} / 1000, 'unixepoch') AS k, SUM(${amountColumn}) AS v, COUNT(*) AS n
        FROM ${invoices.table} WHERE ${whereSql} GROUP BY k ORDER BY k`, ...(params as never[]),
     ).map((r) => ({ key: r.k, value: Number(r.v ?? 0), count: r.n }));
   } else if (input.groupBy === 'account' && invoices.customerColumn) {
@@ -427,7 +438,11 @@ function recurringRevenue(input: MetricInput, months: 1 | 12): MetricResult {
 
 /* ------------------------------- definitions ------------------------------ */
 
-function moneyIn(input: MetricInput, opts: { paidOnly?: boolean; outstanding?: boolean }, def: Pick<MetricDefinition, 'id' | 'label' | 'unit'>): MetricResult {
+function moneyIn(
+  input: MetricInput,
+  opts: { paidOnly?: boolean; outstanding?: boolean },
+  def: Pick<MetricDefinition, 'id' | 'label' | 'unit'> & { snapshot?: boolean },
+): MetricResult {
   const invoices = invoiceFacts(input, opts);
   if (invoices.available) {
     const labeller = input.groupBy === 'time'
@@ -441,6 +456,9 @@ function moneyIn(input: MetricInput, opts: { paidOnly?: boolean; outstanding?: b
       source: invoices.label,
       sourceKind: 'invoices',
       ids: invoices.ids,
+      note: def.snapshot
+        ? 'Outstanding balance is what is owed right now — every invoice still open, whenever it was raised — so it ignores the reporting period.'
+        : null,
       groups: invoices.groups.map((g) => ({
         key: g.key,
         label: labeller(g.key),
@@ -451,6 +469,8 @@ function moneyIn(input: MetricInput, opts: { paidOnly?: boolean; outstanding?: b
     });
   }
   // No billing tables: closed-won deals are the honest stand-in, and we say so.
+  // That stand-in is a period figure whatever the metric normally is, so the
+  // snapshot claim is dropped with the source it belonged to.
   const scope = subjectScope(input);
   const conditions: Condition[] = [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).won }];
   const agg = aggregate(input.ctx, input.workspace.orgId, {
@@ -465,7 +485,7 @@ function moneyIn(input: MetricInput, opts: { paidOnly?: boolean; outstanding?: b
   const groups = input.groupBy === 'owner'
     ? groupByOwner(input.ctx, input.workspace.orgId, 'deal', conditions, { property: 'close_date', start: input.window.start, end: input.window.end }, { property: 'amount', fn: 'sum' }, input.workspace, 'money', scope.associatedTo)
     : groupsFrom(agg, 'money', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined);
-  return result(input, def, {
+  return result(input, { ...def, snapshot: false }, {
     value: agg.value,
     count: agg.count,
     source: `${agg.count} closed-won ${agg.count === 1 ? 'deal' : 'deals'}`,
@@ -496,10 +516,10 @@ const DEFS: MetricDefinition[] = [
     compute: (input) => moneyIn(input, {}, { id: 'invoiced', label: 'Invoiced', unit: 'money' }),
   },
   {
-    id: 'outstanding', label: 'Outstanding balance', unit: 'money', supportsSubject: true,
-    patterns: [/\b(outstanding|unpaid|past\s+due|overdue|owed?|receivables?|ar\s+balance)\b/i],
+    id: 'outstanding', label: 'Outstanding balance', unit: 'money', supportsSubject: true, snapshot: true,
+    patterns: [/\b(outstanding|unpaid|past\s+due|overdue|owed?|owes?|owing|receivables?|ar\s+balance)\b/i],
     keywords: ['outstanding', 'overdue', 'unpaid'],
-    compute: (input) => moneyIn(input, { outstanding: true }, { id: 'outstanding', label: 'Outstanding balance', unit: 'money' }),
+    compute: (input) => moneyIn(input, { outstanding: true }, { id: 'outstanding', label: 'Outstanding balance', unit: 'money', snapshot: true }),
   },
   {
     id: 'pipeline', label: 'Open pipeline', unit: 'money', supportsSubject: true, snapshot: true,

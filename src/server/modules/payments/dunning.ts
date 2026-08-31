@@ -53,7 +53,12 @@ export const DEFAULT_POLICY: DunningPolicy = {
   hard_decline_multiplier: 2,
   collection_hour: 9,
   jitter_hours: 4,
-  give_up_codes: ['expired_card', 'account_closed', 'no_account'],
+  // Every code here refuses for a reason no amount of waiting changes. The two
+  // that are easy to get wrong are the last two: `authentication_required` is
+  // refused by construction on every off-session attempt, and `incorrect_cvc`
+  // re-sends the same wrong digits each time. Retrying either spends the whole
+  // schedule on an outcome that was never going to move.
+  give_up_codes: ['expired_card', 'account_closed', 'no_account', 'authentication_required', 'incorrect_cvc'],
 };
 
 export interface DunningListFilter {
@@ -257,15 +262,20 @@ export class DunningEngine {
       return { action: campaign.resolution ?? 'Recovery was stopped by hand.', needsHuman: false };
     }
     if (campaign.status === 'exhausted') {
-      const why = campaign.last_failure_code ? `${DECLINES[campaign.last_failure_code].advice} ` : '';
-      return {
-        action: `${campaign.resolution ?? 'Recovery ended.'} ${why}${amount} is still owed — collect it by hand once there is something that works to charge, or write it off with a credit note.`,
-        needsHuman: true,
-      };
+      const code = campaign.last_failure_code;
+      const why = code ? `${DECLINES[code].advice} ` : '';
+      // The one ending where the card on file is not the problem: the bank
+      // wanted the cardholder, and nothing about the account is wrong. Telling
+      // an operator to chase new details here loses a customer who is one
+      // confirmation away from paying.
+      const close = code === 'authentication_required'
+        ? `${amount} is still owed on a card that works — do not write this account off over one confirmation.`
+        : `${amount} is still owed — collect it by hand once there is something that works to charge, or write it off with a credit note.`;
+      return { action: `${campaign.resolution ?? 'Recovery ended.'} ${why}${close}`, needsHuman: true };
     }
     if (!hasMethod) {
       return {
-        action: `No usable payment method on file. ${amount} cannot be charged until ${customerName} adds one — send them a payment link today rather than waiting for the schedule.`,
+        action: `No usable payment method on file. ${amount} cannot be charged until ${customerName} gives you one — take the card details and attach them with POST /v1/payment_methods, then present the bill with POST /v1/invoices/${campaign.invoice}/retry rather than waiting for a schedule that has nothing to present.`,
         needsHuman: true,
       };
     }
@@ -277,7 +287,7 @@ export class DunningEngine {
     const profile = DECLINES[code];
     if (profile.severity === 'final') {
       return {
-        action: `${profile.advice} Ask ${customerName} for new details and retry ${amount} by hand once they are in.`,
+        action: `${profile.advice} ${amount} stays owed until then, so this one is on ${customerName} and a person here, not on the schedule.`,
         needsHuman: true,
       };
     }

@@ -28,6 +28,8 @@ interface Workspace {
   card(customerId: string, behavior?: SimulatedBehavior, over?: Record<string, unknown>): Promise<PaymentMethod>;
   /** A subscription whose first invoice has already been through collection. */
   subscribe(customerId: string, price?: string): Promise<{ sub: Subscription; invoice: Invoice }>;
+  /** A finalised bill nothing has been presented against: no card was on file. */
+  bill(customerId: string): Promise<{ sub: Subscription; invoice: Invoice }>;
   invoice(id: string): Promise<Invoice>;
   invoicesFor(subscriptionId: string): Promise<Invoice[]>;
   dunning(customerId: string): Promise<DunningView[]>;
@@ -75,6 +77,16 @@ async function workspace(at = MONDAY): Promise<Workspace> {
       const invoices = await ws.invoicesFor(sub.id);
       assert.ok(invoices.length === 1, `expected one invoice for ${sub.id}, got ${invoices.length}`);
       return { sub: await ws.ok('GET', `/v1/subscriptions/${sub.id}`), invoice: invoices[0] };
+    },
+    async bill(customerId) {
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customerId, items: [{ price: 'growth_monthly' }],
+      });
+      await ws.tick();
+      const invoices = await ws.invoicesFor(sub.id);
+      assert.equal(invoices.length, 1, `expected one invoice for ${sub.id}, got ${invoices.length}`);
+      assert.equal(invoices[0].status, 'open', 'no method was on file, so nothing was presented');
+      return { sub, invoice: invoices[0] };
     },
     invoice: (id) => ws.ok('GET', `/v1/invoices/${id}`),
     async invoicesFor(subscriptionId) {
@@ -313,6 +325,283 @@ describe('collecting an invoice', () => {
 });
 
 /* ========================================================================== *
+ * 2b. Cash taken and cash recorded are the same number
+ *
+ * A payments system is judged on its worst outcome. The worst one available to
+ * this module is taking a card twice for one bill and accounting for it once,
+ * so every path that could do it is nailed down here — at the confirm, where
+ * it is refused, and at the ledger, where anything that arrives anyway becomes
+ * credit on the customer's account instead of a rounding artefact.
+ * ========================================================================== */
+
+describe('a bill is never collected twice in silence', () => {
+  /** Every unit that left the customer's account, against the bill it hit. */
+  const cashTaken = async (ws: Workspace, invoiceId: string): Promise<number> => {
+    const page = await ws.ok('GET', `/v1/charges?invoice=${invoiceId}&status=all&limit=100`);
+    return (page.data as Charge[]).filter((c) => c.status === 'succeeded').reduce((total, c) => total + c.amount, 0);
+  };
+
+  /** What the platform says it did with that cash: on the bill, or on the account. */
+  const accountedFor = async (ws: Workspace, invoiceId: string, customerId: string): Promise<number> => {
+    const invoice = await ws.invoice(invoiceId);
+    const ledger = await ws.ok('GET', `/v1/customers/${customerId}/balance_transactions?limit=200`);
+    const credited = (ledger.data as { type: string; amount: number; invoice: string | null }[])
+      .filter((row) => row.type === 'invoice_overpayment' && row.invoice === invoiceId)
+      .reduce((total, row) => total - row.amount, 0);
+    return invoice.amount_paid + credited;
+  };
+
+  test('a second intent on a settled bill is refused before the card is touched', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Loxley Handling');
+      const { invoice } = await ws.bill(customer.id);
+      const method = await ws.card(customer.id, 'succeeds');
+
+      // Two intents, both quoting the full bill — a pay page opened in two tabs.
+      const first: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: method.id,
+      });
+      const second: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: method.id,
+      });
+      assert.equal(first.amount, invoice.total);
+      assert.equal(second.amount, invoice.total);
+
+      const paid: PaymentIntent = await ws.ok('POST', `/v1/payment_intents/${first.id}/confirm`, {});
+      assert.equal(paid.status, 'succeeded');
+
+      const error = await ws.fail('POST', `/v1/payment_intents/${second.id}/confirm`, {}, 409, 'invoice_already_paid');
+      assert.match(error.message, /nothing left to collect/);
+
+      const untouched: PaymentIntent = await ws.ok('GET', `/v1/payment_intents/${second.id}`);
+      assert.equal(untouched.status, 'requires_confirmation', 'a refused confirm does not report the money as collected');
+      assert.equal(untouched.latest_charge, null);
+      assert.equal(untouched.succeeded_at, null);
+      assert.equal(untouched.attempt_count, 0, 'the card was never presented, so nothing was attempted');
+
+      assert.equal(await cashTaken(ws, invoice.id), invoice.total, 'the customer was charged once');
+      assert.equal(await accountedFor(ws, invoice.id, customer.id), invoice.total);
+      assert.equal((await ws.ok('GET', `/v1/refunds?invoice=${invoice.id}`)).data.length, 0, 'nothing had to be given back');
+    } finally { ws.close(); }
+  });
+
+  test('a credit note between the quote and the charge takes the intent down with the bill', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Brackley Hydraulics');
+      const { invoice } = await ws.bill(customer.id);
+      const method = await ws.card(customer.id, 'succeeds');
+
+      const quoted: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: method.id,
+      });
+      assert.equal(quoted.amount, invoice.total, 'the intent freezes what was owed when it was made');
+
+      const half = invoice.total / 2;
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: half, reason: 'order_change' });
+      const credited = await ws.invoice(invoice.id);
+      assert.equal(credited.pre_payment_credit_notes_amount, half);
+      assert.equal(credited.amount_due, half);
+
+      const confirmed: PaymentIntent = await ws.ok('POST', `/v1/payment_intents/${quoted.id}/confirm`, {});
+      assert.equal(confirmed.status, 'succeeded');
+      assert.equal(confirmed.amount, half, 'the charge follows the bill down instead of collecting the difference');
+
+      const charge: Charge = await ws.ok('GET', `/v1/charges/${confirmed.latest_charge}`);
+      assert.equal(charge.amount, half);
+
+      const settled = await ws.invoice(invoice.id);
+      assert.equal(settled.status, 'paid');
+      assert.equal(settled.amount_paid, half);
+      assert.equal(await cashTaken(ws, invoice.id), half);
+      assert.equal(await accountedFor(ws, invoice.id, customer.id), half);
+
+      const events = await ws.ok('GET', `/v1/events?type=payment_intent.amount_updated&limit=20`);
+      const repriced = (events.data as any[]).find((e) => e.data?.payment_intent === quoted.id);
+      assert.ok(repriced, 'the re-pricing is on the event stream, not silent');
+      assert.equal(repriced.data.previous_amount, invoice.total);
+      assert.equal(repriced.data.amount, half);
+    } finally { ws.close(); }
+  });
+
+  test('a part payment stays the part payment that was authorised', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Ilkeston Gears');
+      const { invoice } = await ws.bill(customer.id);
+      const method = await ws.card(customer.id, 'succeeds');
+
+      const deposit: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: method.id, amount: 10_000, confirm: true,
+      });
+      assert.equal(deposit.status, 'succeeded');
+      assert.equal(deposit.amount, 10_000, 'an amount smaller than the bill is never raised to meet it');
+
+      const partly = await ws.invoice(invoice.id);
+      assert.equal(partly.status, 'open');
+      assert.equal(partly.amount_paid, 10_000);
+      assert.equal(partly.amount_due, invoice.total - 10_000);
+
+      const rest: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: method.id, confirm: true,
+      });
+      assert.equal(rest.amount, invoice.total - 10_000, 'the second intent quotes what is left, not the whole bill');
+      const settled = await ws.invoice(invoice.id);
+      assert.equal(settled.status, 'paid');
+      assert.equal(await cashTaken(ws, invoice.id), invoice.total);
+      assert.equal(await accountedFor(ws, invoice.id, customer.id), invoice.total);
+    } finally { ws.close(); }
+  });
+
+  test('a withdrawn bill cannot be charged by an intent that was made before it was withdrawn', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Merton Castings');
+      const { invoice } = await ws.bill(customer.id);
+      const method = await ws.card(customer.id, 'succeeds');
+      const intent: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: method.id,
+      });
+
+      await ws.ok('POST', `/v1/invoices/${invoice.id}/void`, {});
+      const error = await ws.fail('POST', `/v1/payment_intents/${intent.id}/confirm`, {}, 409, 'invoice_void');
+      assert.match(error.message, /no longer exists/);
+      assert.equal(await cashTaken(ws, invoice.id), 0);
+    } finally { ws.close(); }
+  });
+
+  test('a debit that settles after the bill shrank credits the difference to the customer', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Sandwell Conveyors');
+      const { invoice } = await ws.bill(customer.id);
+      const method: PaymentMethod = await ws.ok('POST', '/v1/payment_methods', {
+        type: 'bank_debit', customer: customer.id, bank_name: 'Midland Union Bank',
+        account_type: 'checking', simulated_behavior: 'succeeds',
+      });
+
+      // The instruction is with the bank: this money is already committed and
+      // no confirm-time check can call it back.
+      const presented: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: method.id, confirm: true, off_session: true,
+      });
+      assert.equal(presented.status, 'processing');
+      assert.equal(presented.amount, invoice.total);
+
+      const half = invoice.total / 2;
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: half, reason: 'order_change' });
+
+      const travelled = await ws.travel(5 * DAY);
+      assert.equal(travelled.failed, 0);
+
+      const settled = await ws.invoice(invoice.id);
+      assert.equal(settled.status, 'paid');
+      assert.equal(settled.amount_paid, half, 'the bill records only what the bill was owed');
+      assert.equal(await cashTaken(ws, invoice.id), invoice.total, 'the bank took the whole instruction');
+      assert.equal(
+        await accountedFor(ws, invoice.id, customer.id), invoice.total,
+        'every unit the bank took is either on the bill or on the account',
+      );
+
+      const ledger = await ws.ok('GET', `/v1/customers/${customer.id}/balance_transactions`);
+      const overpayment = (ledger.data as any[]).find((row) => row.type === 'invoice_overpayment');
+      assert.ok(overpayment, 'the difference is a ledger row, not a rounding artefact');
+      assert.equal(overpayment.amount, -half, 'a credit is negative, the Stripe convention');
+      assert.equal(overpayment.invoice, invoice.id);
+      assert.ok(overpayment.description.includes(settled.number), 'the row says which bill it came off');
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, -half);
+
+      const events = await ws.ok('GET', '/v1/events?type=invoice.overpaid&limit=20');
+      const overpaid = (events.data as any[]).find((e) => e.data?.invoice === invoice.id);
+      assert.ok(overpaid, 'invoice.overpaid is emitted, so a webhook sees it too');
+      assert.equal(overpaid.data.amount_overpaid, half);
+      assert.equal(overpaid.data.customer_balance, -half);
+    } finally { ws.close(); }
+  });
+
+  test('a dispute won on a bill that has since been credited puts the money on the account', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Ravensworth Tooling');
+      await ws.card(customer.id, 'succeeds');
+      const { invoice } = await ws.subscribe(customer.id);
+      assert.equal(invoice.status, 'paid');
+
+      const charges = await ws.ok('GET', `/v1/charges?invoice=${invoice.id}`);
+      const dispute: Dispute = await ws.ok('POST', '/v1/disputes', {
+        charge: (charges.data[0] as Charge).id, reason: 'fraudulent',
+      });
+      const withdrawn = await ws.invoice(invoice.id);
+      assert.equal(withdrawn.status, 'open', 'the network took the money the day it was disputed');
+      assert.equal(withdrawn.amount_due, invoice.total);
+
+      const held = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(held.cash_collected, invoice.total);
+      assert.equal(held.amount_disputed, invoice.total, 'the network is holding it while the case is open');
+      assert.equal(held.amount_paid, 0);
+
+      // Support credits the bill in full while the case is open.
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: withdrawn.amount_due, reason: 'order_change' });
+      const credited = await ws.invoice(invoice.id);
+      assert.equal(credited.amount_due, 0);
+
+      await ws.ok('POST', `/v1/disputes/${dispute.id}/evidence`, {
+        product_description: 'Fleet telemetry seats, delivered and in use since 1 June.',
+      });
+      await ws.ok('POST', `/v1/disputes/${dispute.id}/close`, { status: 'won' });
+
+      const after = await ws.invoice(invoice.id);
+      assert.equal(after.amount_paid, 0, 'the bill was credited to nothing, so it takes none of it back');
+      const ledger = await ws.ok('GET', `/v1/customers/${customer.id}/balance_transactions`);
+      const overpayment = (ledger.data as any[]).find((row) => row.type === 'invoice_overpayment');
+      assert.ok(overpayment, 'the returned money is the customer’s, and it is on their account');
+      assert.equal(overpayment.amount, -invoice.total);
+      assert.equal(await accountedFor(ws, invoice.id, customer.id), invoice.total);
+    } finally { ws.close(); }
+  });
+
+  test('one bill’s money reads back as one story, cash in and cash accounted for', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Hetherington Drives');
+      const { invoice } = await ws.bill(customer.id);
+      const method: PaymentMethod = await ws.ok('POST', '/v1/payment_methods', {
+        type: 'bank_debit', customer: customer.id, bank_name: 'Midland Union Bank',
+        account_type: 'checking', simulated_behavior: 'succeeds',
+      });
+
+      const before = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(before.cash_collected, 0);
+      assert.equal(before.amount_overpaid, 0);
+      assert.equal(before.collectable, true);
+      assert.match(before.summary, /Nothing has been collected/);
+
+      await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: method.id, confirm: true, off_session: true,
+      });
+      const half = invoice.total / 2;
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: half, reason: 'order_change' });
+      assert.equal((await ws.travel(5 * DAY)).failed, 0);
+
+      const after = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(after.cash_collected, invoice.total, 'what the bank took');
+      assert.equal(after.amount_paid, half, 'what the bill absorbed');
+      assert.equal(after.amount_overpaid, half, 'and what went past it, on the account rather than nowhere');
+      assert.equal(after.amount_paid + after.amount_overpaid, after.cash_collected);
+      assert.equal(after.amount_refunded, 0);
+      assert.equal(after.collectable, false);
+      assert.equal(after.charges.length, 1);
+      assert.equal(after.payment_intents.length, 1);
+      assert.match(after.summary, /went past it/);
+
+      const blocked = await ws.fail('POST', `/v1/invoices/${invoice.id}/retry`, {}, 409, 'invoice_not_collectable');
+      assert.match(blocked.message, /already paid/, 'a settled bill is not presented again');
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
  * 3. Smart dunning — the recovery schedule
  * ========================================================================== */
 
@@ -404,6 +693,94 @@ describe('smart dunning', () => {
       assert.equal(travelled.failed, 0);
       const stillOne = await ws.dunning(customer.id);
       assert.equal(stillOne[0].attempt_count, 1, 'no further attempts were made against a dead card');
+    } finally { ws.close(); }
+  });
+
+  test('a decline the schedule cannot answer ends it on attempt one and names who can', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const customer = await ws.customer('Ashcombe Automation');
+      await ws.card(customer.id, 'authentication_required');
+      const { invoice } = await ws.subscribe(customer.id);
+
+      const [campaign] = await ws.dunning(customer.id);
+      assert.equal(campaign.status, 'exhausted', 'an off-session retry can never satisfy an issuer asking for the cardholder');
+      assert.equal(campaign.attempt_count, 1);
+      assert.equal(campaign.attempts_remaining, 3, 'three retries were dropped rather than spent on an impossible outcome');
+      assert.equal(campaign.next_attempt_at, null);
+      assert.equal(campaign.last_failure_code, 'authentication_required');
+      assert.equal(campaign.needs_human, true);
+      assert.match(campaign.recommended_action, /off_session=false/, 'the advice names a call that exists');
+      assert.match(campaign.recommended_action, /card that works/, 'and does not tell anyone to chase new details');
+
+      const action = await ws.ok('GET', '/v1/events?type=invoice.payment_action_required&limit=20');
+      const notice = (action.data as any[]).find((e) => e.data?.invoice === invoice.id);
+      assert.ok(notice, 'the bank wanting the cardholder is its own event, not just another failure');
+      assert.equal(notice.data.reason, 'authentication_required');
+      assert.match(notice.data.resolution, new RegExp(`/v1/invoices/${invoice.id}/retry`));
+
+      // Nothing further is queued: this schedule was abandoned, not paused.
+      assert.equal(
+        ws.app.ctx.db.count(
+          `SELECT COUNT(*) FROM jobs WHERE type = 'payments.dunning_retry' AND status = 'pending' AND idem_key = ?`,
+          `payments.dunning_retry:${campaign.id}`,
+        ),
+        0,
+      );
+      assert.equal((await ws.travel(60 * DAY)).failed, 0);
+      assert.equal((await ws.dunning(customer.id))[0].attempt_count, 1, 'sixty days later it still has not been retried');
+    } finally { ws.close(); }
+  });
+
+  test('an on-session retry gets the cardholder to confirm and collects the bill', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const customer = await ws.customer('Ashcombe Automation');
+      await ws.card(customer.id, 'authentication_required');
+      const { sub, invoice } = await ws.subscribe(customer.id);
+      assert.equal(invoice.status, 'open');
+
+      // The operator has the customer on the phone, so the issuer has someone
+      // to ask. This is the call the recommended action names.
+      const attempt = await ws.ok('POST', `/v1/invoices/${invoice.id}/retry`, { off_session: false });
+      assert.equal(attempt.collected, false, 'nothing is charged until the cardholder says yes');
+      assert.equal(attempt.payment_intent.status, 'requires_action');
+      assert.equal(attempt.next_action.type, 'authenticate');
+      assert.match(attempt.summary, /Nothing has been charged yet/);
+      assert.equal(attempt.charge, null);
+
+      const approved: PaymentIntent = await ws.ok('POST', attempt.next_action.authenticate_url, { result: 'approve' });
+      assert.equal(approved.status, 'succeeded');
+
+      const settled = await ws.invoice(invoice.id);
+      assert.equal(settled.status, 'paid');
+      assert.equal(settled.amount_paid, settled.total);
+      assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'active', 'the customer was never lost');
+
+      const money = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(money.cash_collected, settled.total);
+      assert.equal(money.amount_overpaid, 0);
+    } finally { ws.close(); }
+  });
+
+  test('a wrong security code is not retried — the second attempt sends the same wrong code', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const customer = await ws.customer('Norbury Fabrication');
+      await ws.card(customer.id, 'incorrect_cvc');
+      await ws.subscribe(customer.id);
+
+      const [campaign] = await ws.dunning(customer.id);
+      assert.equal(campaign.status, 'exhausted');
+      assert.equal(campaign.attempt_count, 1);
+      assert.match(campaign.attempts[0].decision, /dropped/);
+      assert.match(campaign.recommended_action, /re-enter the card/i);
+
+      const settings = await ws.ok('GET', '/v1/payments/settings');
+      const rows = settings.decline_codes as { code: string; retried: boolean }[];
+      assert.equal(rows.find((row) => row.code === 'incorrect_cvc')?.retried, false);
+      assert.equal(rows.find((row) => row.code === 'authentication_required')?.retried, false);
+      assert.equal(rows.find((row) => row.code === 'insufficient_funds')?.retried, true, 'the declines worth retrying still are');
     } finally { ws.close(); }
   });
 
@@ -676,6 +1053,15 @@ describe('refunds', () => {
     assert.equal(charge.amount_refunded, invoice.total);
     assert.equal(charge.refunded, true);
 
+    // Cash in, cash back out, and nothing left unexplained on the bill.
+    const money = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+    assert.equal(money.cash_collected, invoice.total);
+    assert.equal(money.amount_refunded, invoice.total);
+    assert.equal(money.amount_overpaid, 0);
+    assert.equal(money.amount_paid, 0);
+    assert.equal(money.refunds.length, 2);
+    assert.match(money.summary, /gone back to the customer/);
+
     await ws.fail('POST', '/v1/refunds', { invoice: invoice.id, amount: 100 }, 400, 'refund_exceeds_charge');
   });
 
@@ -898,6 +1284,40 @@ describe('the seeded workspace', () => {
         `${row.number}: collected + credited + due does not add up to the bill`,
       );
     }
+    // The identity above is satisfied by an invoice that took more than it was
+    // owed and threw the difference away, so it cannot be the only sweep. This
+    // one compares what left the customer's account with what the platform
+    // says it did with it, and there is nowhere for a unit to hide between them.
+    const taken = ws.app.ctx.db.all<{ invoice_id: string; cash: number }>(
+      `SELECT invoice_id, SUM(amount) AS cash FROM payments_charges
+        WHERE org_id = ? AND status = 'succeeded' AND invoice_id IS NOT NULL
+        GROUP BY invoice_id`, ORG,
+    );
+    assert.ok(taken.length > 50, `expected a body of collected invoices to sweep, got ${taken.length}`);
+    let swept = 0;
+    for (const row of taken) {
+      // Refunds and disputes move money back out; those are their own tests.
+      const reversed = ws.app.ctx.db.count(
+        `SELECT (SELECT COUNT(*) FROM payments_refunds WHERE org_id = ? AND invoice_id = ?)
+              + (SELECT COUNT(*) FROM payments_disputes WHERE org_id = ? AND invoice_id = ?)`,
+        ORG, row.invoice_id, ORG, row.invoice_id,
+      );
+      if (reversed > 0) continue;
+      const bill = ws.app.ctx.db.get<{ number: string; amount_paid: number }>(
+        `SELECT number, amount_paid FROM billing_invoices WHERE org_id = ? AND id = ?`, ORG, row.invoice_id,
+      );
+      const credited = ws.app.ctx.db.count(
+        `SELECT COALESCE(-SUM(amount), 0) FROM billing_balance_transactions
+          WHERE org_id = ? AND invoice_id = ? AND type = 'invoice_overpayment'`, ORG, row.invoice_id,
+      );
+      assert.equal(
+        Number(row.cash), Number(bill?.amount_paid ?? 0) + credited,
+        `${bill?.number}: ${row.cash} was taken from the customer, but the platform accounts for ${bill?.amount_paid} on the bill and ${credited} on the account`,
+      );
+      swept += 1;
+    }
+    assert.ok(swept > 50, `expected the sweep to cover the workspace, it covered ${swept}`);
+
     const summary = await ws.ok('GET', '/v1/dunning/summary');
     assert.ok(summary.attempts.total > 0);
     assert.equal(summary.attempts.total, summary.attempts.succeeded + summary.attempts.failed + summary.attempts.skipped);

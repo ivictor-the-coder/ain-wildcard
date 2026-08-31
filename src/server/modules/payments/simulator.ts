@@ -84,12 +84,15 @@ export const DECLINES: Record<DeclineCode, DeclineProfile> = {
   },
   incorrect_cvc: {
     code: 'incorrect_cvc',
-    severity: 'hard',
+    // Final, not hard: the stored security code does not change between
+    // attempts, so the second presentation sends the same wrong digits as the
+    // first. Only a corrected card fixes it, which is what `final` means.
+    severity: 'final',
     outcome_type: 'invalid',
     network_status: 'declined_by_network',
     message: 'The security code is incorrect.',
     seller_message: 'The bank rejected the card’s security code.',
-    advice: 'The stored details are wrong. Retrying sends the same wrong code — ask the customer to re-enter the card.',
+    advice: 'The stored details are wrong and every retry sends the same wrong code. Ask the customer to re-enter the card, then present the bill again by hand.',
   },
   processing_error: {
     code: 'processing_error',
@@ -102,12 +105,17 @@ export const DECLINES: Record<DeclineCode, DeclineProfile> = {
   },
   authentication_required: {
     code: 'authentication_required',
-    severity: 'soft',
+    // The one severity that reads oddly and is nonetheless right. Waiting
+    // cannot fix this — an off-session attempt is refused by construction, so
+    // a retry schedule spends every attempt on an outcome it could never have
+    // changed. What fixes it is the cardholder, and that is a person's job,
+    // which is exactly the line `final` draws.
+    severity: 'final',
     outcome_type: 'issuer_declined',
     network_status: 'declined_by_network',
     message: 'The card requires the cardholder to authenticate before it can be charged.',
     seller_message: 'The bank wants the cardholder to confirm this payment before it will go through.',
-    advice: 'An off-session charge can never satisfy this. Send the customer a link so they can authenticate once; the bank then remembers the mandate.',
+    advice: 'No off-session charge can ever satisfy this, however often it is retried. Present the bill again with the customer there — POST /v1/invoices/:id/retry with off_session=false — and approve it at the next_action that comes back. The issuer remembers the mandate afterwards, so later renewals collect on their own.',
   },
   account_closed: {
     code: 'account_closed',

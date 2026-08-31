@@ -93,6 +93,9 @@ export class Facts {
 
 const bullet = (line: string) => `• ${line}`;
 
+/** "Brightline Foods'" — a name that already ends in s does not take another. */
+const possessive = (name: string): string => (/s$/i.test(name) ? `${name}'` : `${name}'s`);
+
 /**
  * A database id, in the place a name belongs.
  *
@@ -209,10 +212,38 @@ function headline(metric: MetricToolResult, who: string, period: string, hasSubj
     case 'arr': return `${who} has ${value} in annual recurring revenue`;
     case 'csat': return `Customer satisfaction in ${period} averaged ${value} out of 5`;
     case 'resolution_time': return `${who} took ${value} on average to resolve a ticket in ${period}`;
+    // A count needs a noun that agrees with it. "1 open tickets" is the kind of
+    // sentence that makes a reader distrust the number in front of it.
+    case 'open_tickets': return `${who} has ${countOf(metric.value, 'open ticket')} right now`;
+    case 'deal_count': return `${who} has ${countOf(metric.value, 'open deal')} right now`;
+    case 'customers': return `${who} has ${countOf(metric.value, 'customer')} on the books`;
+    case 'new_customers': return `${who} added ${countOf(metric.value, 'new customer')} in ${period}`;
+    case 'tickets_created': return `${who} logged ${countOf(metric.value, 'ticket')} in ${period}`;
+    case 'connected_assets': return `${who} has ${countOf(metric.value, 'connected asset')} reporting telemetry`;
+    case 'activities': return `${who} logged ${countOf(metric.value, 'activity', 'activities')} in ${period}`;
+    case 'meetings': return `${who} held ${countOf(metric.value, 'meeting')} in ${period}`;
     default:
       return metric.snapshot
         ? `${who} has ${value} ${metric.label.toLowerCase()} right now`
         : `${who} has ${value} ${metric.label.toLowerCase()} in ${period}`;
+  }
+}
+
+/**
+ * A movement, in the unit the metric is actually in.
+ *
+ * A win rate that moved from 78.6% to 75% moved 3.6 percentage points; printing
+ * the raw 3.571 next to two correctly formatted percentages is a number with no
+ * unit sitting where a unit belongs, and the reader cannot tell what it is.
+ */
+function unitDelta(magnitude: number, unit: MetricToolResult['unit'], facts: Facts, locale: string): string {
+  switch (unit) {
+    case 'money': return facts.money(magnitude);
+    case 'percent': return `${Number(magnitude.toFixed(1))} ${Number(magnitude.toFixed(1)) === 1 ? 'point' : 'points'}`;
+    case 'days': return `${Number(magnitude.toFixed(1))} ${Number(magnitude.toFixed(1)) === 1 ? 'day' : 'days'}`;
+    case 'hours': return `${Number(magnitude.toFixed(1))} ${Number(magnitude.toFixed(1)) === 1 ? 'hour' : 'hours'}`;
+    case 'score': return magnitude.toFixed(2);
+    default: return Math.round(magnitude).toLocaleString(locale);
   }
 }
 
@@ -222,7 +253,11 @@ function metricSentence(metric: MetricToolResult, input: SynthesisInput, facts: 
   const period = metric.window.label || describeWindow(input.window, input.workspace.locale);
 
   if (metric.count === 0 && metric.value === 0) {
-    lines.push(`${who} has no ${metric.label.toLowerCase()} recorded for ${period} — the query matched no rows, so the honest answer is zero rather than a number.`);
+    lines.push(metric.snapshot
+      // A snapshot was never measured over the period, so blaming the period
+      // for the zero is a second wrong statement on top of the first.
+      ? `${who} has no ${metric.label.toLowerCase()} right now — the query matched no rows, so the honest answer is zero rather than a number.`
+      : `${who} has no ${metric.label.toLowerCase()} recorded for ${period} — the query matched no rows, so the honest answer is zero rather than a number.`);
   } else {
     // The supporting-row clause is dropped when it would just repeat the number.
     const redundant = metric.unit === 'count' && Math.round(metric.value) === metric.count;
@@ -231,7 +266,7 @@ function metricSentence(metric: MetricToolResult, input: SynthesisInput, facts: 
 
   if (metric.change && metric.count > 0) {
     const direction = metric.change.delta > 0 ? 'up' : metric.change.delta < 0 ? 'down' : 'flat';
-    const deltaText = metric.unit === 'money' ? facts.money(Math.abs(metric.change.delta)) : Math.abs(metric.change.delta).toLocaleString(input.workspace.locale);
+    const deltaText = unitDelta(Math.abs(metric.change.delta), metric.unit, facts, input.workspace.locale);
     lines.push(direction === 'flat'
       ? `That is level with the preceding period (${metric.change.previous_formatted}).`
       : `That is ${direction} ${deltaText}${metric.change.percent !== null ? ` (${formatSignedPercent(metric.change.percent)})` : ''} against ${metric.change.previous_formatted} in the period before.`);
@@ -469,6 +504,192 @@ const isInvoiceExplanation = (v: unknown): boolean =>
 const isUpcomingInvoice = (v: unknown): boolean =>
   arrayField(v, 'lines') && field(v, 'total_display') && field(v, 'due') && !field(v, 'number');
 
+/* ------------------- meters, entitlements, credits, catalog ---------------- */
+
+/**
+ * The rest of the revenue half answers in its own shapes too.
+ *
+ * Same rule as the billing renderers above: matched structurally, on the fields
+ * a payload carries rather than on the name of the tool that produced it, so a
+ * module that returns the same shape under another name still gets a sentence
+ * instead of having its payload printed with its own column names.
+ */
+interface MeterRow {
+  object: 'meter';
+  id: string;
+  name: string;
+  event_name: string;
+  aggregation: string;
+  unit_label?: string | null;
+  status?: string;
+  description?: string | null;
+}
+
+interface MeterUsage {
+  object: 'meter_usage';
+  meter_name: string;
+  event_name: string;
+  aggregation: string;
+  unit_label: string | null;
+  period_start: number;
+  period_end: number;
+  value: number;
+  billable_quantity: number;
+  event_count: number;
+  pending: boolean;
+}
+
+interface EntitlementRow {
+  feature_name: string;
+  unit_label: string | null;
+  value: number | null;
+  unlimited: boolean;
+  usage: { used: number; remaining?: number | null; unit_label?: string | null } | null;
+}
+interface EntitlementSetPayload {
+  object: 'entitlement_set';
+  entitlements: EntitlementRow[];
+  sources: { status: string; products: string[] }[];
+}
+
+interface CreditBalancePayload {
+  object: 'credit_balance';
+  totals_by_currency: { currency: string; monetary_available: number; unit_pots: number; next_expiry: number | null }[];
+  burn_order: string[];
+}
+
+interface CatalogProduct {
+  id: string;
+  name: string;
+  tagline?: string | null;
+  category?: string;
+  unit_label?: string | null;
+  prices: { summary?: string; nickname?: string | null; lookup_key?: string | null }[];
+}
+
+interface PriceQuote {
+  price: string;
+  product: string | null;
+  quantity: number;
+  amount_display: string;
+  effective_unit_display?: string;
+  warning?: string | null;
+  breakdown: string[];
+}
+
+const isMeterList = (v: unknown): boolean =>
+  Array.isArray(v) && v.length > 0 && v.every((row) => !!row && typeof row === 'object' && (row as { object?: unknown }).object === 'meter');
+const isMeterUsage = (v: unknown): boolean =>
+  !!v && typeof v === 'object' && (v as { object?: unknown }).object === 'meter_usage';
+const isEntitlementSet = (v: unknown): boolean =>
+  !!v && typeof v === 'object' && (v as { object?: unknown }).object === 'entitlement_set';
+const isCreditBalance = (v: unknown): boolean =>
+  !!v && typeof v === 'object' && (v as { object?: unknown }).object === 'credit_balance';
+const isProductList = (v: unknown): boolean =>
+  Array.isArray(v) && v.length > 0 && v.every((row) => !!row && typeof row === 'object'
+    && typeof (row as { name?: unknown }).name === 'string' && Array.isArray((row as { prices?: unknown }).prices));
+const isPriceQuote = (v: unknown): boolean =>
+  !!v && typeof v === 'object' && field(v, 'amount_display') && field(v, 'quantity') && arrayField(v, 'breakdown');
+
+const isRevenueShape = (v: unknown): boolean =>
+  isMeterList(v) || isMeterUsage(v) || isEntitlementSet(v) || isCreditBalance(v) || isProductList(v) || isPriceQuote(v);
+
+function meterBlocks(meters: MeterRow[], workspace: WorkspaceProfile): string[] {
+  const live = meters.filter((m) => !m.status || m.status === 'active');
+  const shown = (live.length ? live : meters).slice(0, 12);
+  return [
+    `${countOf(shown.length, 'meter')} in ${workspace.name}${live.length && live.length < meters.length ? `, and ${meters.length - live.length} not active` : ''}:`,
+    shown.map((m) => bullet(
+      `${m.name} — ${m.aggregation} of \`${m.event_name}\`${m.unit_label ? `, in ${m.unit_label}s` : ''}${m.description ? ` · ${m.description}` : ''}`,
+    )).join('\n'),
+  ];
+}
+
+function usageBlocks(usage: MeterUsage, facts: Facts, workspace: WorkspaceProfile, who: string | null): string[] {
+  const unit = usage.unit_label ? `${usage.unit_label}${usage.value === 1 ? '' : 's'}` : 'units';
+  const period = `${facts.day(usage.period_start)} – ${facts.day(usage.period_end - 1)}`;
+  return [
+    `${who ? `${who} used ` : ''}${usage.value.toLocaleString(workspace.locale)} ${unit}`
+    + ` on ${usage.meter_name} over ${period}`
+    // "3 events" next to "139,134 events" reads as a contradiction: one is the
+    // metered total, the other is how many ingested records it was built from.
+    + `, aggregated (${usage.aggregation}) from ${countOf(usage.event_count, 'ingested record')} on \`${usage.event_name}\`.`
+    + (usage.pending ? ' The period is still open, so the total can still move.' : ''),
+    usage.billable_quantity !== usage.value
+      ? `${usage.billable_quantity.toLocaleString(workspace.locale)} ${unit} is what the price book bills, rounded once from the exact total.`
+      : '',
+  ].filter(Boolean);
+}
+
+function entitlementBlocks(set: EntitlementSetPayload, workspace: WorkspaceProfile, who: string | null): string[] {
+  const account = who ?? 'That account';
+  if (!set.entitlements.length) {
+    return [`${account} has no entitlements — nothing it is subscribed to grants a feature.`];
+  }
+  const line = (row: EntitlementRow): string => {
+    const unit = row.unit_label ? ` ${row.unit_label}${row.value === 1 ? '' : 's'}` : '';
+    const allowance = row.unlimited ? 'unlimited' : row.value === null ? 'included' : `${row.value.toLocaleString(workspace.locale)}${unit}`;
+    if (!row.usage) return `${row.feature_name} — ${allowance}`;
+    const used = row.usage.used.toLocaleString(workspace.locale);
+    const left = row.usage.remaining === null || row.usage.remaining === undefined
+      ? ''
+      : `, ${row.usage.remaining.toLocaleString(workspace.locale)} left`;
+    return `${row.feature_name} — ${used} of ${allowance} used${left}`;
+  };
+  return [
+    `${countOf(set.entitlements.length, 'entitlement')} on ${who ?? 'that account'}:`,
+    set.entitlements.slice(0, 10).map((row) => bullet(line(row))).join('\n'),
+  ];
+}
+
+function creditBlocks(balance: CreditBalancePayload, facts: Facts, workspace: WorkspaceProfile, who: string | null): string[] {
+  const pots = balance.totals_by_currency.filter((t) => t.monetary_available > 0 || t.unit_pots > 0);
+  if (!pots.length) return [`${who ?? 'That account'} holds no credit — every grant is spent, expired or not yet started.`];
+  return [
+    pots.map((t) => bullet(
+      `${formatMoney({ amount: t.monetary_available, currency: t.currency }, { locale: workspace.locale })} available`
+      + `${t.unit_pots ? ` and ${countOf(t.unit_pots, 'unit pot')}` : ''}`
+      + `${t.next_expiry ? `, the next expiry ${facts.day(t.next_expiry)}` : ''}`,
+    )).join('\n'),
+    balance.burn_order.length ? `Credit is drawn down ${listPhrase(balance.burn_order.map((step) => step.replace(/_/g, ' ')))}, in that order.` : '',
+  ].filter(Boolean);
+}
+
+function productBlocks(products: CatalogProduct[]): string[] {
+  return [
+    `${countOf(products.length, 'product')} in the catalogue:`,
+    products.slice(0, 10).map((product) => {
+      const prices = product.prices.map((p) => p.summary).filter(Boolean).slice(0, 3);
+      return bullet(`${product.name}${product.tagline ? ` — ${product.tagline}` : ''}${prices.length ? ` (${prices.join('; ')})` : ''}`);
+    }).join('\n'),
+  ];
+}
+
+function quoteBlocks(quote: PriceQuote, workspace: WorkspaceProfile): string[] {
+  const blocks = [
+    `${quote.quantity.toLocaleString(workspace.locale)}${quote.product ? ` of ${quote.product}` : ''} costs ${quote.amount_display}`
+    + `${quote.effective_unit_display ? `, an effective ${quote.effective_unit_display} a unit` : ''}.`,
+  ];
+  if (quote.breakdown.length) blocks.push(quote.breakdown.slice(0, 8).map((row) => bullet(row)).join('\n'));
+  if (quote.warning) blocks.push(quote.warning);
+  return blocks;
+}
+
+function revenueAnswer(steps: StepResult[], facts: Facts, workspace: WorkspaceProfile, who: string | null): string[] {
+  const blocks: string[] = [];
+  for (const step of steps) {
+    if (!ok(step)) continue;
+    const value = step.result;
+    if (isMeterList(value)) blocks.push(...meterBlocks(value as MeterRow[], workspace));
+    else if (isMeterUsage(value)) blocks.push(...usageBlocks(value as MeterUsage, facts, workspace, who));
+    else if (isEntitlementSet(value)) blocks.push(...entitlementBlocks(value as EntitlementSetPayload, workspace, who));
+    else if (isCreditBalance(value)) blocks.push(...creditBlocks(value as CreditBalancePayload, facts, workspace, who));
+    else if (isPriceQuote(value)) blocks.push(...quoteBlocks(value as PriceQuote, workspace));
+    else if (isProductList(value)) blocks.push(...productBlocks(value as CatalogProduct[]));
+  }
+  return blocks;
+}
+
 interface BillingFound {
   subscriptions: { list: BillingSubscriptionList; args: Record<string, unknown> }[];
   invoices: { list: BillingInvoiceList; args: Record<string, unknown> }[];
@@ -520,8 +741,13 @@ function subscriptionBlocks(entry: { list: BillingSubscriptionList; args: Record
   if (!list.total || !shown.length) {
     return [`No subscription in ${workspace.name} is ${subscriptionScope(args)}${args.customer ? ' for that account' : ''}.`];
   }
+  // Same rule as the invoice list: a count scoped to one account has to say so,
+  // or it reads as a statement about the whole book.
+  const names = new Set(shown.map((row) => row.customer_name).filter((name): name is string => !!name));
+  const account = args.customer && names.size === 1 ? [...names][0] : null;
   const blocks = [
     `${countOf(list.total, 'subscription')} ${list.total === 1 ? 'is' : 'are'} ${subscriptionScope(args)}`
+    + `${account ? ` on ${possessive(account)} account` : ''}`
     + `${shown.length < list.total ? `. ${shown.length} of them:` : ':'}`,
   ];
   blocks.push(shown.map((row) => {
@@ -542,10 +768,14 @@ function invoiceBlocks(entry: { list: BillingInvoiceList; args: Record<string, u
   const { list, args } = entry;
   const shown = list.invoices;
   const status = typeof args.status === 'string' ? args.status : null;
+  // "2 invoices are in the book" is a claim about the whole ledger. When the
+  // rows are one account's, the sentence has to say whose.
+  const names = new Set(shown.map((row) => row.customer_name).filter((name): name is string => !!name));
+  const account = args.customer && names.size === 1 ? [...names][0] : null;
   const scope = args.due_before ? `past ${list.total === 1 ? 'its' : 'their'} due date`
     : status === 'open_like' ? 'still open'
     : status && status !== 'all' ? `at status ${humanise(status).toLowerCase()}`
-    : 'in the book';
+    : account ? `on ${possessive(account)} account` : 'in the book';
   if (!list.total || !shown.length) {
     return [`No invoice in ${workspace.name} is ${scope}${args.customer ? ' for that account' : ''}.`];
   }
@@ -667,6 +897,7 @@ function rowsReturned(steps: StepResult[]): number {
     if (isAggregate(value)) { rows += (value as RecordAggregateResult).matched_records; continue; }
     if (isTimeline(value)) { rows += (value as { items: TimelineItem[] }).items.length; continue; }
     if (isMetric(value) || isProfile(value)) continue;
+    if (isMeterUsage(value) || isEntitlementSet(value) || isCreditBalance(value) || isPriceQuote(value)) { rows += 1; continue; }
     if (Array.isArray(value)) { rows += value.length; continue; }
     if (value && typeof value === 'object') {
       for (const inner of Object.values(value as Record<string, unknown>)) {
@@ -677,10 +908,21 @@ function rowsReturned(steps: StepResult[]): number {
   return rows;
 }
 
+/** Fields that name a thing to a person, in the order a person would read them. */
+const DISPLAY_FIELDS = ['name', 'label', 'title', 'subject', 'display_name', 'summary', 'description', 'headline'];
+/** Fields worth putting after the name. `*_display` is money already formatted. */
+const DETAIL_FIELD = /(_display|_name|_label|status|state|reason|note|category|type|quantity|count)$/;
+
 /**
- * A tool succeeded, nothing above knows how to read its shape, and the run
- * would otherwise answer "I found nothing". Saying what came back is worth more
- * than a template, and it is still only facts the tool returned.
+ * A tool succeeded and nothing above knows how to read its shape.
+ *
+ * What this may never do is print the payload. A run that answered "`\`catalog_list_products\`
+ * returned: • Id prod_nw_starter · Name Telemetry Cloud Starter" put an internal
+ * tool name, primary keys and schema column labels in front of a reader — which
+ * is a worse answer than admitting there is no rendering for the result. So the
+ * rows are rebuilt out of display fields only, ids and raw keys are dropped, and
+ * when nothing readable is left the answer says so and the payload stays in the
+ * trace where a developer can see it.
  */
 function otherResults(steps: StepResult[]): string[] {
   const blocks: string[] = [];
@@ -689,37 +931,45 @@ function otherResults(steps: StepResult[]): string[] {
     const value = step.result;
     if (isRecordList(value) || isSearch(value) || isAggregate(value) || isMetric(value) || isProfile(value) || isTimeline(value)) continue;
     if (isSubscriptionList(value) || isInvoiceList(value) || isCustomerSummary(value) || isInvoiceExplanation(value) || isUpcomingInvoice(value)) continue;
+    if (isRevenueShape(value)) continue;
     const lines: string[] = [];
     const describe = (entry: unknown): string | null => {
       if (entry === null || entry === undefined) return null;
-      if (typeof entry !== 'object') return String(entry);
+      if (typeof entry !== 'object') return looksLikeId(String(entry)) ? null : String(entry);
       const row = entry as Record<string, unknown>;
+      const named = DISPLAY_FIELDS.map((key) => row[key]).find((v) => typeof v === 'string' && v.trim() && !looksLikeId(v));
+      if (!named) return null;
       const parts: string[] = [];
       for (const [key, item] of Object.entries(row)) {
-        if (parts.length >= 4 || item === null || item === undefined || typeof item === 'object') continue;
-        parts.push(`${humanise(key)} ${item}`);
+        if (parts.length >= 3) break;
+        if (item === null || item === undefined || typeof item === 'object') continue;
+        if (DISPLAY_FIELDS.includes(key) || !DETAIL_FIELD.test(key)) continue;
+        if (typeof item === 'string' && looksLikeId(item)) continue;
+        parts.push(String(item));
       }
-      return parts.length ? parts.join(' · ') : null;
+      return parts.length ? `${String(named)} — ${parts.join(' · ')}` : String(named);
     };
     if (Array.isArray(value)) {
       if (!value.length) continue;
-      for (const entry of value.slice(0, 5)) {
+      for (const entry of value.slice(0, 6)) {
         const line = describe(entry);
         if (line) lines.push(bullet(line));
       }
     } else if (value && typeof value === 'object') {
       const line = describe(value);
       if (line) lines.push(bullet(line));
-      for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+      for (const inner of Object.values(value as Record<string, unknown>)) {
         if (!Array.isArray(inner) || !inner.length || lines.length > 5) continue;
         for (const entry of inner.slice(0, 4)) {
           const row = describe(entry);
-          if (row) lines.push(bullet(`${humanise(key)}: ${row}`));
+          if (row) lines.push(bullet(row));
         }
       }
     }
-    if (!lines.length) continue;
-    blocks.push(`\`${step.tool}\` returned:`);
+    if (!lines.length) {
+      blocks.push(`${humanise(step.tool.replace(/^[a-z]+[._]/, '')).toLowerCase()} returned a result I have no way to write out — it carries no field I can name to you. The full payload is on the run's trace.`);
+      continue;
+    }
     blocks.push(lines.join('\n'));
   }
   return blocks;
@@ -805,10 +1055,16 @@ interface Gathered {
   searches: WorkspaceSearchResult[];
 }
 
-/** The general answer: lead with the number, then name the records behind it. */
-function overview(input: SynthesisInput, facts: Facts, found: Gathered): string[] {
+/**
+ * The general answer: lead with the number, then name the records behind it.
+ *
+ * `metricStated` is set when the branch above already wrote the headline. It
+ * used to be a fall-through, so a lookup that resolved a metric and no profile
+ * printed the same three paragraphs twice, back to back.
+ */
+function overview(input: SynthesisInput, facts: Facts, found: Gathered, metricStated = false): string[] {
   const blocks: string[] = [];
-  if (found.metrics.length) {
+  if (found.metrics.length && !metricStated) {
     blocks.push(...metricSentence(found.metrics[0], input, facts));
     blocks.push(...metricBreakdown(found.metrics[0]));
   }
@@ -869,6 +1125,7 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
   const aggregates = input.steps.filter((s) => ok(s) && isAggregate(s.result)).map((s) => s.result as RecordAggregateResult);
   const billing = gatherBilling(input.steps);
   const billingBlocks = billingAnswer(billing, facts, input.workspace);
+  const revenueBlocks = revenueAnswer(input.steps, facts, input.workspace, input.subject ? namedOrNull(input.subject.label) : null);
   // Every row every list-returning tool came back with. "Nothing matched" is a
   // claim about the whole run, not about one CRM search inside it.
   const rows = rowsReturned(input.steps);
@@ -912,9 +1169,7 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
         const delta = a.value - b.value;
         const percent = b.value === 0 ? null : (delta / Math.abs(b.value)) * 100;
         const who = a.subject ? a.subject.label : input.workspace.name;
-        const deltaText = a.unit === 'money'
-          ? facts.money(Math.abs(delta))
-          : Math.abs(Number(delta.toFixed(a.unit === 'percent' ? 1 : 0))).toLocaleString(input.workspace.locale);
+        const deltaText = unitDelta(Math.abs(delta), a.unit, facts, input.workspace.locale);
         const direction = delta > 0 ? 'up' : delta < 0 ? 'down' : 'level';
         blocks.push(delta === 0
           ? `${who} ${verb(a)} the same ${a.label.toLowerCase()} in both periods: ${a.formatted} in ${a.window.label} and in ${b.window.label}.`
@@ -951,7 +1206,7 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
         const leader = a.value >= b.value ? a : b;
         const trailer = a.value >= b.value ? b : a;
         const gap = Math.abs(a.value - b.value);
-        const gapText = a.unit === 'money' ? facts.money(gap) : gap.toLocaleString(input.workspace.locale);
+        const gapText = unitDelta(gap, a.unit, facts, input.workspace.locale);
         const percent = trailer.value !== 0 ? `, ${((gap / Math.abs(trailer.value)) * 100).toFixed(0)}% ahead` : '';
         const scope = a.snapshot ? 'right now' : `in ${a.window.label}`;
         blocks.push(gap === 0
@@ -1025,7 +1280,8 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
     case 'lookup': {
       // A lookup can still have a number in it — "what does X pay us each
       // month" is answered by the metric, then by the record it is about.
-      if (metrics.length && input.metric) blocks.push(...metricSentence(metrics[0], input, facts));
+      const metricStated = metrics.length > 0 && !!input.metric;
+      if (metricStated) blocks.push(...metricSentence(metrics[0], input, facts));
       if (profiles.length) {
         blocks.push(...profileParagraph(profiles[0], facts, input.workspace));
         const profile = profiles[0];
@@ -1070,7 +1326,7 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
           blocks.push(...recordLines(list, facts, input.workspace, 5));
         }
       } else {
-        blocks.push(...overview(input, facts, { metrics, profiles, lists, aggregates, searches }));
+        blocks.push(...overview(input, facts, { metrics, profiles, lists, aggregates, searches }, metricStated));
       }
       break;
     }
@@ -1183,9 +1439,9 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
 
   // Rows the ledger returned belong in the answer whatever the classifier
   // called the sentence they arrived in.
-  if (billingBlocks.length && input.intent.intent !== 'act') blocks.push(...billingBlocks);
+  if (input.intent.intent !== 'act') blocks.push(...billingBlocks, ...revenueBlocks);
   if (!blocks.length) blocks.push(...overview(input, facts, { metrics, profiles, lists, aggregates, searches }));
-  if (!blocks.length && rows > 0) blocks.push(...otherResults(input.steps));
+  if (!blocks.length) blocks.push(...otherResults(input.steps));
   if (!blocks.length && input.scopedTools) {
     blocks.push(input.scopedTools.length
       ? `This run was scoped to ${listPhrase(input.scopedTools.map((t) => `\`${t}\``))}, and none of those can answer that. Nothing else ran — the allowlist is enforced on the plan, not just on what I was offered.`
@@ -1201,7 +1457,12 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
       : `That question named no account, so I stayed on ${input.carriedSubject.label} from earlier in this conversation.`);
   }
   for (const step of input.skippedTools ?? []) {
-    blocks.push(`I did not run \`${step.tool}\`: it needs ${listPhrase(step.missing.map((m) => `a ${m.replace(/_/g, ' ')}`))} and nothing in the question or the records it resolved to gives me one. Say it explicitly and I will run it.`);
+    const one = step.missing.length === 1;
+    blocks.push([
+      `I did not run \`${step.tool}\`: it needs ${listPhrase(step.missing.map((m) => `\`${m}\``))},`,
+      `and nothing in the question or the records it resolved to gives me ${one ? 'one' : 'them'}.`,
+      `Name ${one ? 'it' : 'them'} and I will run it.`,
+    ].join(' '));
   }
 
   if (input.pendingApprovals.length && input.intent.intent !== 'act') {

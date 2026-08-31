@@ -13,6 +13,7 @@ import { entityIndex, workspaceProfile } from '../src/server/ai/grounding';
 import { resolveEntities } from '../src/server/ai/resolve';
 import { estimateTokens, accountUsage } from '../src/server/ai/usage';
 import { stageSets } from '../src/server/ai/metrics';
+import { businessMetric } from '../src/server/ai/functions';
 import { anthropicProvider, toWire, toWireTools } from '../src/server/ai/anthropic';
 import { formatMoney } from '../src/shared/money';
 import v from '../src/shared/validate';
@@ -2126,5 +2127,343 @@ describe('the read-only, allowlist and approval gates cover every tool, register
     const execution = await aiRuntime(app.ctx).execute('private_read', { id: 42 }, callContext(), privateRead);
     assert.equal(execution.error?.code, 'invalid_arguments');
     assert.equal(ran, 0);
+  });
+});
+
+/* --------------- what the business is owed, and when it is owed ----------- */
+
+describe('the receivables question is answered with the receivables number', () => {
+  const overview = () => expectOk('GET', '/v1/subscriptions/overview');
+
+  /** Every open invoice in the ledger, straight from SQL, as the arbiter. */
+  const openInvoices = () => app.ctx.db.get<{ n: number; total: number }>(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(total), 0) AS total FROM billing_invoices
+     WHERE org_id = ? AND status IN ('open', 'past_due', 'unpaid', 'uncollectible')`, ORG)!;
+
+  test('the outstanding metric equals the billing overview, to the cent', async () => {
+    const owed = (await overview()).invoices.outstanding;
+    const rows = openInvoices();
+    assert.ok(rows.n > 0 && owed > 0, 'the demo workspace carries an unpaid book to measure');
+    assert.equal(rows.total, owed, 'SQL and the billing overview agree before the engine is asked');
+
+    const metric = businessMetric(app.ctx, ORG, {
+      metric: 'outstanding', start: 0, end: app.ctx.now(), window_label: 'all time',
+    });
+    assert.ok(!('error' in metric));
+    assert.equal(metric.value, owed, `the copilot must not contradict its own billing screen`);
+    assert.equal(metric.count, rows.n);
+  });
+
+  test('every open invoice is unpaid, so a payment-dated window would match none of them', () => {
+    const dated = app.ctx.db.count(
+      `SELECT COUNT(*) FROM billing_invoices WHERE org_id = ? AND status = 'open' AND paid_at IS NOT NULL`, ORG);
+    assert.equal(dated, 0,
+      'this is the shape of the bug: filtering the outstanding book on paid_at can only ever return zero');
+  });
+
+  test('"what are we owed" answers the real number, in words', async () => {
+    const owed = (await overview()).invoices.outstanding;
+    const answer = await ask('What is our outstanding balance all time?');
+    assert.ok(answer.content.includes(money(owed)),
+      `expected ${money(owed)} in:\n${answer.content.slice(0, 300)}`);
+    assert.ok(!/no outstanding balance/i.test(answer.content),
+      `the answer must not report zero against a book that is not zero:\n${answer.content.slice(0, 300)}`);
+  });
+
+  test('outstanding is a snapshot: the period in the question does not move it', async () => {
+    const allTime = await ask('What is our outstanding balance all time?');
+    const quarter = await ask('What is our outstanding balance this quarter?');
+    const owed = (await overview()).invoices.outstanding;
+    for (const answer of [allTime, quarter]) {
+      assert.ok(answer.content.includes(money(owed)), `both windows report the same book:\n${answer.content.slice(0, 200)}`);
+    }
+    assert.equal(quarter.analysis.metric.id, 'outstanding');
+    assert.match(quarter.content, /ignores the reporting period/,
+      'and the answer says why the period was not applied');
+  });
+
+  test('an account with a past-due invoice is told what it owes', async () => {
+    const row = app.ctx.db.get<{ name: string; total: number }>(
+      `SELECT c.name AS name, SUM(i.total) AS total FROM billing_invoices i
+       JOIN billing_customers c ON c.id = i.customer_id AND c.org_id = i.org_id
+       WHERE i.org_id = ? AND i.status = 'open' GROUP BY c.id ORDER BY total DESC LIMIT 1`, ORG)!;
+    const answer = await ask(`How much does ${row.name} owe us?`);
+    assert.ok(answer.content.includes(money(row.total)),
+      `expected ${row.name} to owe ${money(row.total)}:\n${answer.content.slice(0, 300)}`);
+  });
+
+  test('cash collected is still dated by when it was paid, not by when it was raised', async () => {
+    const start = Date.UTC(2026, 0, 1);
+    const end = Date.UTC(2026, 3, 1);
+    const paid = app.ctx.db.get<{ n: number; total: number }>(
+      `SELECT COUNT(*) AS n, COALESCE(SUM(amount_paid), 0) AS total FROM billing_invoices
+       WHERE org_id = ? AND status = 'paid' AND paid_at >= ? AND paid_at < ?`, ORG, start, end)!;
+    assert.ok(paid.n > 0, 'the workspace collected money in Q1 2026');
+    const metric = businessMetric(app.ctx, ORG, { metric: 'revenue', start, end, window_label: 'Q1 2026' });
+    assert.ok(!('error' in metric));
+    assert.equal(metric.value, paid.total, 'revenue is what landed in the window, on the payment date');
+    assert.equal(metric.count, paid.n);
+  });
+});
+
+/* ------------------- one answer says each thing exactly once -------------- */
+
+describe('an answer never states the same finding twice', () => {
+  test('a metric lookup prints its headline paragraph once', async () => {
+    for (const question of ['closed won in 2026', 'outstanding balance', 'What is our outstanding balance all time?']) {
+      const answer = await ask(question);
+      const paragraphs = answer.content.split('\n\n').map((p: string) => p.trim());
+      const counts = new Map<string, number>();
+      for (const paragraph of paragraphs) counts.set(paragraph, (counts.get(paragraph) ?? 0) + 1);
+      const repeated = [...counts.entries()].filter(([, n]) => n > 1);
+      assert.equal(repeated.length, 0,
+        `"${question}" repeated ${repeated.map(([p]) => `"${p.slice(0, 70)}…"`).join(', ')}`);
+    }
+  });
+});
+
+/* --------------------- periods and units read as written ------------------ */
+
+describe('a period label and a delta carry their own units, once', () => {
+  test('a month window is labelled once, not with the year twice', () => {
+    const now = Date.UTC(2026, 7, 31);
+    const last = resolveWindow('bookings last month', now)!;
+    assert.equal(last.label, 'Jul 2026');
+    assert.equal(resolveWindow('bookings this month', now)!.label, 'Aug 2026 to date');
+    assert.equal(resolveWindow('bookings in March 2025', now)!.label, 'March 2025');
+  });
+
+  test('no answer prints a year twice in a row', async () => {
+    for (const question of ['bookings last month', 'bookings this month vs last month', 'bookings in July 2026']) {
+      const answer = await ask(question);
+      assert.ok(!/\b(19|20)\d{2}\s+(19|20)\d{2}\b/.test(answer.content),
+        `"${question}" doubled a year:\n${answer.content.slice(0, 200)}`);
+    }
+  });
+
+  test('a percentage metric reports its movement in points, never as a bare decimal', async () => {
+    const answer = await ask('win rate in Q2 2026');
+    assert.match(answer.content, /\d+(\.\d)? points? \([-+]/,
+      `a percentage delta needs a unit:\n${answer.content}`);
+    assert.ok(!/\b\d+\.\d{3}\b/.test(answer.content),
+      `no three-decimal number belongs in an answer:\n${answer.content}`);
+  });
+});
+
+/* ------------ a period the lexer can read but not resolve is refused ------- */
+
+describe('every period-shaped phrase is either measured or refused', () => {
+  const now = Date.UTC(2026, 7, 31);
+
+  test('the lexer sees the phrases the parser cannot resolve', () => {
+    for (const phrase of ['bookings in the month before last', 'bookings 3 months ago', 'bookings in early 2027', 'bookings the first week of 2026']) {
+      assert.ok(unresolvedPeriods(phrase, now).length > 0, `"${phrase}" must not pass as no period at all`);
+    }
+  });
+
+  test('a phrase the parser cannot resolve is refused, not swapped for the default', async () => {
+    for (const question of ['bookings in the month before last', 'bookings between 9999-12-31 and 0001-01-01']) {
+      const answer = await ask(question);
+      assert.equal(answer.analysis.refusal.code, 'period_unresolved', `"${question}" was answered anyway`);
+      assert.equal(answer.trace.filter((s: { kind: string }) => s.kind === 'tool').length, 0,
+        `"${question}" measured something`);
+      assert.ok(!/\$[\d,]/.test(answer.content), `"${question}" produced a number:\n${answer.content.slice(0, 200)}`);
+    }
+  });
+
+  test('the periods the parser does resolve are still answered', async () => {
+    for (const question of ['bookings last month', 'bookings in Q2 2026', 'bookings in 2026', 'bookings in the last 30 days']) {
+      const answer = await ask(question);
+      assert.equal(answer.analysis.refusal, null, `"${question}" should resolve:\n${answer.content.slice(0, 200)}`);
+    }
+  });
+});
+
+/* ------------- the revenue half is reachable from plain English ----------- */
+
+describe('a question about the ledger reaches the ledger, for one account', () => {
+  const brightline = () => app.ctx.db.get<{ id: string; name: string }>(
+    `SELECT id, name FROM billing_customers WHERE org_id = ? AND name LIKE 'Brightline%'`, ORG)!;
+
+  test('"show me <account> invoices" returns that account\'s invoices', async () => {
+    const customer = brightline();
+    const rows = app.ctx.db.count(`SELECT COUNT(*) FROM billing_invoices WHERE org_id = ? AND customer_id = ?`, ORG, customer.id);
+    assert.ok(rows > 0, 'the account has invoices to find');
+    const answer = await ask(`Show me ${customer.name} invoices`);
+    const step = answer.trace.find((s: { name: string }) => s.name === 'billing_list_invoices');
+    assert.ok(step, `the invoice tool never ran; plan was ${answer.trace.map((s: { name: string }) => s.name).join(', ')}`);
+    assert.equal(step.args.customer, customer.id, 'and it was scoped to the billing customer, not the CRM company');
+    assert.match(answer.content, /NR-\d+/, `the answer names invoices:\n${answer.content.slice(0, 400)}`);
+  });
+
+  test('"what is <account> subscribed to" reads the subscription ledger', async () => {
+    const customer = brightline();
+    const answer = await ask(`What is ${customer.name} subscribed to?`);
+    const step = answer.trace.find((s: { name: string }) => s.name === 'billing_list_subscriptions');
+    assert.ok(step, `plan was ${answer.trace.map((s: { name: string }) => s.name).join(', ')}`);
+    assert.equal(step.args.customer, customer.id);
+    assert.match(answer.content, /a month/, `the answer names what they are on:\n${answer.content.slice(0, 300)}`);
+  });
+
+  test('"what meters do we have" lists the meters, by name', async () => {
+    const meters = app.ctx.db.all<{ name: string }>(`SELECT name FROM meters WHERE org_id = ? AND status = 'active'`, ORG);
+    assert.ok(meters.length > 0);
+    const answer = await ask('What meters do we have?');
+    assert.ok(answer.trace.some((s: { name: string }) => s.name === 'metering.list_meters'),
+      `plan was ${answer.trace.map((s: { name: string }) => s.name).join(', ')}`);
+    for (const meter of meters) {
+      assert.ok(answer.content.includes(meter.name), `"${meter.name}" is missing from:\n${answer.content.slice(0, 500)}`);
+    }
+    assert.ok(!/`metering\.list_meters` returned/.test(answer.content), 'the tool name is not part of the answer');
+  });
+
+  test('an entitlement question reads the entitlement set, not the company card', async () => {
+    const customer = app.ctx.db.get<{ id: string; name: string }>(
+      `SELECT c.id, c.name FROM billing_customers c
+       JOIN entitlement_active e ON e.customer_id = c.id AND e.org_id = c.org_id
+       WHERE c.org_id = ? LIMIT 1`, ORG)!;
+    const answer = await ask(`Is ${customer.name} at its seat limit?`);
+    assert.ok(answer.trace.some((s: { name: string }) => s.name === 'entitlements.for_customer'),
+      `plan was ${answer.trace.map((s: { name: string }) => s.name).join(', ')}`);
+    assert.match(answer.content, /entitlements? on /, `the answer states the allowance:\n${answer.content.slice(0, 400)}`);
+  });
+
+  test('an invoice named by its number is explained, like one named by its id', async () => {
+    const invoice = app.ctx.db.get<{ number: string }>(
+      `SELECT number FROM billing_invoices WHERE org_id = ? AND number IS NOT NULL AND status = 'open' LIMIT 1`, ORG)!;
+    const answer = await ask(`Explain invoice ${invoice.number}`);
+    assert.ok(answer.trace.some((s: { name: string }) => s.name === 'billing_explain_invoice'),
+      `plan was ${answer.trace.map((s: { name: string }) => s.name).join(', ')}`);
+    assert.ok(answer.content.startsWith(`Invoice ${invoice.number}`),
+      `the answer is about the invoice that was named:\n${answer.content.slice(0, 200)}`);
+  });
+});
+
+/* ------------- a usage question is a usage question, or a refusal --------- */
+
+describe('a question about usage is never answered with a sales number', () => {
+  test('metered usage is read from the meter, for the account and the period', async () => {
+    const customer = app.ctx.db.get<{ id: string; name: string; crm: string | null }>(
+      `SELECT c.id, c.name, c.crm_record_id AS crm FROM billing_customers c
+       WHERE c.org_id = ? AND EXISTS (
+         SELECT 1 FROM meter_events e WHERE e.org_id = c.org_id AND e.customer_id = c.id) LIMIT 1`, ORG)!;
+    const answer = await ask(`How many telemetry events did ${customer.name} use last month?`);
+    const step = answer.trace.find((s: { name: string }) => s.name === 'metering.usage_for_period');
+    assert.ok(step, `plan was ${answer.trace.map((s: { name: string }) => s.name).join(', ')}`);
+    assert.equal(step.args.customer, customer.id);
+    assert.ok(!/closed-won|bookings/i.test(answer.content),
+      `a usage question must not be answered with bookings:\n${answer.content.slice(0, 300)}`);
+    assert.match(answer.content, /Telemetry events/);
+  });
+
+  test('a number question that names no measure is refused, even when it names an account', async () => {
+    const answer = await ask('How much is Brightline Foods worth?');
+    assert.equal(answer.analysis.refusal.code, 'no_measure');
+    assert.equal(answer.trace.filter((s: { kind: string }) => s.kind === 'tool').length, 0);
+    assert.match(answer.content, /an account tells me who to measure, not what/);
+  });
+
+  test('a number question that does name a measure is still answered', async () => {
+    for (const question of ['How many deals are open?', 'How much did we book in Q2 2026?', 'How many open tickets are there?']) {
+      const answer = await ask(question);
+      assert.equal(answer.analysis.refusal, null, `"${question}" was refused:\n${answer.content.slice(0, 200)}`);
+    }
+  });
+});
+
+/* --------- no answer prints a tool name, a field name or a raw id --------- */
+
+describe('a tool result reaches the reader as prose, never as its payload', () => {
+  const PROBES = [
+    'Quote the price for 5 million telemetry events',
+    'What meters do we have?',
+    'Show me Brightline Foods invoices',
+    'What is Brightline Foods subscribed to?',
+    'How much credit does Brightline Foods have?',
+    'What is our outstanding balance all time?',
+  ];
+
+  test('no answer contains a tool name in backticks or a bare primary key', async () => {
+    for (const question of PROBES) {
+      const answer = await ask(question);
+      assert.ok(!/`[a-z_]+[._][a-z_]+` returned/.test(answer.content),
+        `"${question}" printed a tool payload:\n${answer.content.slice(0, 300)}`);
+      const ids = answer.content.match(/\b(?:prod|cus|sub|in|mtr|price|usr|rec)_[A-Za-z0-9]{6,}\b/g) ?? [];
+      assert.deepEqual(ids, [], `"${question}" printed database ids ${ids.join(', ')}`);
+      assert.ok(!/• Id /.test(answer.content), `"${question}" printed schema field labels:\n${answer.content.slice(0, 300)}`);
+    }
+  });
+});
+
+/* ------- a conversation still knows what it is about on the fifth turn ---- */
+
+describe('a thread keeps hold of its account past the third turn', () => {
+  const account = () => app.ctx.db.get<{ id: string; display_name: string }>(
+    `SELECT id, display_name FROM crm_records WHERE org_id = ? AND object_type = 'company' AND display_name LIKE 'Rheinwerk%'`,
+    ORG)!;
+
+  test('turns four and five still answer about the account turn one named', async () => {
+    const target = account();
+    const thread = await expectOk('POST', '/v1/ai/threads', { message: `Where does ${target.display_name} stand?` });
+    const asked = [
+      'How much have they spent?',
+      'What are their open tickets?',
+      'And their invoices?',
+      'How much do they owe us?',
+    ];
+    for (const [index, question] of asked.entries()) {
+      const reply = await expectOk('POST', `/v1/ai/threads/${thread.id}/messages`, { content: question });
+      assert.ok(!/I do not know what "the(?:y|ir)" refers to/.test(reply.message.content),
+        `turn ${index + 2} lost the account:\n${reply.message.content.slice(0, 300)}`);
+      assert.ok(reply.message.content.includes(target.display_name),
+        `turn ${index + 2} did not name ${target.display_name}:\n${reply.message.content.slice(0, 300)}`);
+    }
+  });
+
+  test('the question is stored once, not twice, in the transcript the engine reads', async () => {
+    const thread = await expectOk('POST', '/v1/ai/threads', { message: 'Where does Rheinwerk Antriebstechnik stand?' });
+    await expectOk('POST', `/v1/ai/threads/${thread.id}/messages`, { content: 'How much have they spent?' });
+    const messages = await expectOk('GET', `/v1/ai/threads/${thread.id}/messages`);
+    const userTurns = messages.data.filter((m: { role: string }) => m.role === 'user').map((m: { content: string }) => m.content);
+    assert.deepEqual(userTurns, ['Where does Rheinwerk Antriebstechnik stand?', 'How much have they spent?']);
+  });
+
+  test('a later turn that names a different account moves to it', async () => {
+    const first = account();
+    const second = app.ctx.db.get<{ display_name: string }>(
+      `SELECT display_name FROM crm_records WHERE org_id = ? AND object_type = 'company' AND display_name LIKE 'Brightline%'`,
+      ORG)!;
+    const thread = await expectOk('POST', '/v1/ai/threads', { message: `Where does ${first.display_name} stand?` });
+    await expectOk('POST', `/v1/ai/threads/${thread.id}/messages`, { content: `And where does ${second.display_name} stand?` });
+    const reply = await expectOk('POST', `/v1/ai/threads/${thread.id}/messages`, { content: 'Who owns it?' });
+    assert.ok(reply.message.content.includes(second.display_name),
+      `"it" means the account the last naming turn established:\n${reply.message.content.slice(0, 300)}`);
+  });
+});
+
+/* ---------- the gates still hold over the ledger the planner reaches ------ */
+
+describe('the ledger steps obey the same gates as everything else', () => {
+  test('a run scoped to no tools plans nothing, ledger question or not', async () => {
+    const answer = await ask('Show me Brightline Foods invoices', { tools: [] });
+    assert.deepEqual(answer.analysis.scoped_tools, []);
+    assert.equal(answer.trace.filter((s: { kind: string }) => s.kind === 'tool').length, 0);
+    assert.match(answer.content, /scoped to no tools/);
+  });
+
+  test('a run scoped to one ledger tool runs only that one', async () => {
+    const answer = await ask('Show me Brightline Foods invoices', { tools: ['billing_list_invoices'] });
+    const ran = answer.trace.filter((s: { kind: string }) => s.kind === 'tool').map((s: { name: string }) => s.name);
+    assert.deepEqual([...new Set(ran)], ['billing_list_invoices']);
+  });
+
+  test('no ledger step is ever a write', async () => {
+    for (const question of ['Show me Brightline Foods invoices', 'What meters do we have?', 'How much credit does Brightline Foods have?']) {
+      const answer = await ask(question);
+      for (const step of answer.trace.filter((s: { kind: string }) => s.kind === 'tool')) {
+        const tool = aiRuntime(app.ctx).tool(step.name);
+        assert.equal(tool?.readOnly ?? true, true, `"${question}" planned a write: ${step.name}`);
+      }
+    }
   });
 });

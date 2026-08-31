@@ -1,0 +1,14 @@
+import { ws } from './lib';
+const log = (...a: any[]) => console.log(...a);
+const w = await ws();
+const show = (r: any) => `${r.status} ${r.body.error?.code ?? JSON.stringify({ id: r.body.id, status: r.body.status, amount: r.body.amount, cus: r.body.customer })}`;
+const c1 = await w.ok('POST', '/v1/customers', { name: 'Idem A', email: 'ia@x.example', currency: 'usd' });
+const c2 = await w.ok('POST', '/v1/customers', { name: 'Idem B', email: 'ib@x.example', currency: 'usd' });
+const p1 = await w.ok('POST', '/v1/payment_methods', { type: 'card', customer: c1.id, brand: 'visa', exp_month: 4, exp_year: 2031 });
+const p2 = await w.ok('POST', '/v1/payment_methods', { type: 'card', customer: c2.id, brand: 'visa', exp_month: 4, exp_year: 2031 });
+log('A 100 key=K ->', show(await w.call('POST', '/v1/payment_intents', { customer: c1.id, amount: 100, currency: 'usd', payment_method: p1.id, idempotency_key: 'K', confirm: true })));
+log('A 999 key=K ->', show(await w.call('POST', '/v1/payment_intents', { customer: c1.id, amount: 99900, currency: 'usd', payment_method: p1.id, idempotency_key: 'K', confirm: true })));
+log('B 500 key=K ->', show(await w.call('POST', '/v1/payment_intents', { customer: c2.id, amount: 50000, currency: 'usd', payment_method: p2.id, idempotency_key: 'K', confirm: true })));
+const chs = await w.ok('GET', '/v1/charges?limit=100');
+log('charges:', JSON.stringify(chs.data.filter((c: any) => [c1.id, c2.id].includes(c.customer)).map((c: any) => [c.customer === c1.id ? 'A' : 'B', c.status, c.amount])));
+w.close();

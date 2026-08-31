@@ -203,16 +203,32 @@ export function refusalFor(input: RefusalInput): Refusal | null {
     };
   }
 
+  // A question that wants a number and names no measure is refused — even when
+  // it names an account. Resolving "Whitcombe Aerospace" says who to measure,
+  // never what to measure, and the substitution that filled that gap answered
+  // "how many telemetry events did they use" with closed-won bookings.
   const wantsNumber = intent.intent === 'aggregate' || intent.intent === 'compare';
-  if (wantsNumber && !input.metric && !usable.length && !input.countableTypes.length) {
+  if (wantsNumber && !input.metric && !input.countableTypes.length) {
     const unknown = read.unknown.length ? ` I do not hold anything called ${quoteList(read.unknown.slice(0, 3))}.` : '';
+    // Only the accounts, and each of them once. A company and its billing
+    // customer are two rows with one name, and a deal that merely starts with
+    // that name is not the account — naming either in an apology for not
+    // understanding the question reads as a second failure.
+    const accounts = [...new Set(input.entities
+      .filter((e) => e.score >= 0.7 && ['company', 'customer', 'contact'].includes(e.entity.type))
+      .map((e) => e.entity.label))].slice(0, 3);
+    const named = accounts.length
+      ? ` I did resolve ${listPhrase(accounts)}, but an account tells me who to measure, not what.`
+      : '';
     return {
       code: 'no_measure',
-      why: `No metric matched "${truncate(input.question, 60)}" and no object type was named.`,
+      why: `No metric matched "${truncate(input.question, 60)}" and no countable object type was named.`,
       content: [
-        `I could not tell which measure you want, so I have not guessed one.${unknown}`,
+        `I could not tell which measure you want, so I have not guessed one.${unknown}${named}`,
         `I can compute ${metricMenu(input.metrics)} — over any period, for the workspace or for one account.`,
-        `Name one of those (or an object type such as deals, tickets or companies) and I will run it.`,
+        accounts.length
+          ? `Name one and I will run it for ${listPhrase(accounts)} — for example "${intent.intent === 'compare' ? 'compare ' : ''}closed-won bookings for ${listPhrase(accounts)}".`
+          : `Name one of those (or an object type such as deals, tickets or companies) and I will run it.`,
       ].join(' '),
     };
   }

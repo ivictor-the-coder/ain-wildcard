@@ -157,7 +157,10 @@ export function mergeRecords(
   const filled: string[] = [];
 
   for (const [name, prop] of index) {
-    if (prop.calculated) continue;
+    // Derived values are recomputed from the survivor's own associations after
+    // the merge, so copying them across would both fail the read-only check and
+    // stamp the loser's stale aggregate onto the winner.
+    if (prop.calculated || prop.rollup) continue;
     const loserValue = loser.properties[name];
     if (isEmptyValue(loserValue)) continue;
     const winnerValue = winner.properties[name];

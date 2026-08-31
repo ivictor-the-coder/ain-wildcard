@@ -23,6 +23,8 @@ export interface TimeWindow {
   partial: boolean;
 }
 
+const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
 const MONTHS = [
   'january', 'february', 'march', 'april', 'may', 'june',
   'july', 'august', 'september', 'october', 'november', 'december',
@@ -47,7 +49,14 @@ export function startOfWeek(ts: number): number {
 }
 
 const quarterLabel = (ts: number): string => `Q${quarterIndex(ts) + 1} ${new Date(ts).getUTCFullYear()}`;
-const monthLabel = (ts: number): string => formatDate(ts, { timeZone: 'UTC' }).replace(/\s\d+,/, '');
+/**
+ * "Aug 2026" — month and year, which is the whole label. Every call site used
+ * to append the year again, so every month period read "Aug 2026 2026".
+ */
+const monthLabel = (ts: number): string => {
+  const d = new Date(ts);
+  return `${SHORT_MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+};
 
 function makeWindow(start: number, end: number, label: string, grain: WindowGrain, matched: string, now: number): TimeWindow {
   // A window is partial when the clock is inside it. A wholly future period —
@@ -73,7 +82,7 @@ export function previousWindow(w: TimeWindow): TimeWindow {
     }
     case 'month': {
       const start = addInterval(w.start, interval('month', -1), 1);
-      return { start, end: w.start, label: `${monthLabel(start)} ${new Date(start).getUTCFullYear()}`, grain: 'month', matched: `${w.matched} (prior)`, partial: false };
+      return { start, end: w.start, label: monthLabel(start), grain: 'month', matched: `${w.matched} (prior)`, partial: false };
     }
     case 'year': {
       const start = Date.UTC(new Date(w.start).getUTCFullYear() - 1, 0, 1);
@@ -119,7 +128,7 @@ const RULES: Rule[] = [
       }
       if (key === 'month' || key === 'mtd') {
         const start = startOfMonth(now);
-        return makeWindow(start, addInterval(start, interval('month', 1), 1), `${monthLabel(start)} ${new Date(start).getUTCFullYear()} to date`, 'month', m[0], now);
+        return makeWindow(start, addInterval(start, interval('month', 1), 1), `${monthLabel(start)} to date`, 'month', m[0], now);
       }
       if (key === 'week' || key === 'wtd') {
         const start = startOfWeek(now);
@@ -139,7 +148,7 @@ const RULES: Rule[] = [
       }
       if (key === 'month') {
         const start = addInterval(startOfMonth(now), interval('month', -1), 1);
-        return makeWindow(start, startOfMonth(now), `${monthLabel(start)} ${new Date(start).getUTCFullYear()}`, 'month', m[0], now);
+        return makeWindow(start, startOfMonth(now), monthLabel(start), 'month', m[0], now);
       }
       if (key === 'week') {
         const start = startOfWeek(now) - 7 * DAY;
@@ -200,7 +209,7 @@ const RULES: Rule[] = [
       }
       if (key === 'month') {
         const start = addInterval(startOfMonth(now), interval('month', 1), 1);
-        return makeWindow(start, addInterval(start, interval('month', 1), 1), `${monthLabel(start)} ${new Date(start).getUTCFullYear()}`, 'month', m[0], now);
+        return makeWindow(start, addInterval(start, interval('month', 1), 1), monthLabel(start), 'month', m[0], now);
       }
       if (key === 'week') {
         const start = startOfWeek(now) + 7 * DAY;
@@ -339,10 +348,19 @@ const PERIOD_MENTIONS: RegExp[] = [
   /\b(?:first|second|third|fourth)\s+(?:quarter|half)(?:\s+of\s+(?:19|20)\d{2})?/gi,
   /\bfy\s*'?\d{2,4}\b/gi,
   /\b(?:last|past|previous|prior|trailing|this|current|next|coming)\s+(?:\d{1,3}\s*)?(?:day|week|fortnight|month|quarter|half|year|semester)s?\b/gi,
+  // Period shapes this engine cannot turn into a range. They are listed here
+  // precisely because they do not parse: a phrase that lexes as a period and
+  // resolves to nothing has to be refused, not quietly replaced by the default.
+  /\b(?:the\s+)?(?:day|week|fortnight|month|quarter|half|year)\s+before\s+(?:last|this|that)\b/gi,
+  /\b\d{1,3}\s+(?:days?|weeks?|fortnights?|months?|quarters?|years?)\s+ago\b/gi,
+  /\b(?:the\s+)?(?:first|second|third|fourth|fifth|last)\s+(?:day|week|month)\s+of\b/gi,
+  /\b(?:early|mid|late)[\s-]+(?:19|20)\d{2}\b/gi,
   new RegExp(`\\b(?:${MONTHS.join('|')})\\s*(?:(?:19|20)\\d{2})?\\b`, 'gi'),
   /\b(?:19|20)\d{2}\b/g,
   /\b(?:yesterday|today|tomorrow|ytd|mtd|qtd|wtd|year\s+to\s+date|month\s+to\s+date)\b/gi,
-  /\b(?:19|20)\d{2}-\d{2}-\d{2}\b/g,
+  // Any four-digit calendar date, not only the ones in a plausible century —
+  // "between 9999-12-31 and 0001-01-01" is period-shaped and parses to nothing.
+  /\b\d{4}-\d{2}-\d{2}\b/g,
   /\bweek\s+\d{1,2}\b/gi,
 ];
 
@@ -416,7 +434,7 @@ export function shiftWindowYears(w: TimeWindow, years: number): TimeWindow {
   const label = w.grain === 'quarter'
     ? quarterLabel(start)
     : w.grain === 'month'
-      ? `${monthLabel(start)} ${year}`
+      ? monthLabel(start)
       : w.grain === 'year'
         ? String(year)
         : `${formatDate(start, { timeZone: 'UTC' })} – ${formatDate(end - 1, { timeZone: 'UTC' })}`;
@@ -431,7 +449,7 @@ export const asksYearOverYear = (text: string): boolean =>
 export function defaultWindow(now: number, grain: 'quarter' | 'month' | 'year' = 'quarter'): TimeWindow {
   if (grain === 'month') {
     const start = startOfMonth(now);
-    return makeWindow(start, addInterval(start, interval('month', 1), 1), `${monthLabel(start)} ${new Date(start).getUTCFullYear()} to date`, 'month', '', now);
+    return makeWindow(start, addInterval(start, interval('month', 1), 1), `${monthLabel(start)} to date`, 'month', '', now);
   }
   if (grain === 'year') {
     const start = startOfYearUtc(now);
@@ -527,7 +545,7 @@ export function bucketKey(ts: number, grain: WindowGrain): string {
   if (grain === 'year') return String(d.getUTCFullYear());
   if (grain === 'quarter') return quarterLabel(ts);
   if (grain === 'day') return new Date(startOfDay(ts)).toISOString().slice(0, 10);
-  return `${monthLabel(ts)} ${d.getUTCFullYear()}`;
+  return monthLabel(ts);
 }
 
 /** How a window should be sliced on a chart: never more than ~24 buckets. */

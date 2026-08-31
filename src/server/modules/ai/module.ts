@@ -174,11 +174,24 @@ function assertKnownModel(model: string): void {
   );
 }
 
-const toMessages = (ctx: Ctx, orgId: string, history: AiMessage[], question: string): AiMessage[] => [
-  { role: 'system', content: SYSTEM_PROMPT(ctx, orgId) },
-  ...history,
-  { role: 'user', content: question },
-];
+/**
+ * The transcript the engine sees.
+ *
+ * `reply()` stores the user's turn before it asks, so the history it reads back
+ * already ends with this question. Appending it again put the same sentence in
+ * twice, and the second copy pushed the turn that named the account out of the
+ * window a pronoun is resolved against — which is why the fourth turn of every
+ * conversation forgot what it was about.
+ */
+const toMessages = (ctx: Ctx, orgId: string, history: AiMessage[], question: string): AiMessage[] => {
+  const last = history[history.length - 1];
+  const alreadyAsked = !!last && last.role === 'user' && last.content === question;
+  return [
+    { role: 'system', content: SYSTEM_PROMPT(ctx, orgId) },
+    ...history,
+    ...(alreadyAsked ? [] : [{ role: 'user' as const, content: question }]),
+  ];
+};
 
 /* --------------------------------- module -------------------------------- */
 
@@ -295,10 +308,13 @@ export default defineModule({
       },
 
       async ask(orgId, question, opts = {}) {
+        // Twelve messages is six turns of context. A pronoun in turn six still
+        // has to reach the account turn one named, and the engine resolves it
+        // out of this transcript — nothing else carries the subject forward.
         const history: AiMessage[] = opts.threadId
-          ? store.messages(orgId, opts.threadId, 12)
+          ? store.messages(orgId, opts.threadId, 16)
               .filter((m) => m.role === 'user' || m.role === 'assistant')
-              .slice(-8)
+              .slice(-12)
               .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }))
           : [];
         const completion = await service.complete(orgId, {

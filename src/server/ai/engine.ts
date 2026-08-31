@@ -18,13 +18,13 @@ import {
   resolveWindows, reversedRange, shiftWindowYears, unresolvedPeriods, type TimeWindow,
 } from './dates';
 import { entityIndex, workspaceProfile, type EntityIndex, type WorkspaceProfile } from './grounding';
-import { extractMentions, mentionedTypes, resolveEntities, type ResolvedEntity } from './resolve';
+import { CRM_OBJECT_TYPES, extractMentions, mentionedTypes, resolveEntities, type ResolvedEntity } from './resolve';
 import {
-  detectGrouping, detectMetric, isRankingQuestion, metricById, metricIds, stageSets,
+  detectGrouping, detectMetric, isRankingQuestion, linkedCustomerIds, metricById, metricIds, stageSets,
   type GroupBy, type MetricDetection, type MetricSubject,
 } from './metrics';
 import { comprehend, isUsableEntity, refusalFor, workspaceVocabulary, type Refusal } from './clarify';
-import { askedFor, planTools, planWrite, replan, isWriteBlocked, type BuiltinTool, type PlannedStep, type SkippedTool, type WindowPair, type WriteBlocked } from './plan';
+import { askedFor, ledgerToolFor, planTools, planWrite, replan, isWriteBlocked, type BuiltinTool, type PlannedStep, type SkippedTool, type WindowPair, type WriteBlocked } from './plan';
 import { propertyMap } from './query';
 import {
   accountProfile, businessMetric, recordAggregate, recordSearch, recordTimeline, workspaceSearch,
@@ -254,13 +254,26 @@ export function focusText(text: string): string {
   return [head, ...[...new Set(explicit)].slice(0, 40)].join('\n');
 }
 
-/** Earlier turns still name the account, so the whole thread feeds resolution. */
-const conversationContext = (req: AiCompletionRequest): string =>
-  req.messages.filter((m) => m.role === 'user').slice(-3).map((m) => focusText(m.content)).join('\n');
+/** How many earlier turns a pronoun may reach back through. */
+const CARRY_TURNS = 6;
 
-/** The turns before this one — what a pronoun in this one can point back at. */
-const priorContext = (req: AiCompletionRequest): string =>
-  req.messages.filter((m) => m.role === 'user').slice(-4, -1).map((m) => focusText(m.content)).join('\n');
+/**
+ * What a pronoun in this turn can point back at, newest turn first.
+ *
+ * Two things this must get right. It has to reach past the three-turn tail it
+ * used to read, because the account is named once — in turn one — and a thread
+ * that forgets it by turn four answers "and their invoices?" by refusing to
+ * know who "they" are. And it has to keep the turns apart rather than resolving
+ * one concatenated blob: when turn three names a second account, "their" in
+ * turn four means that one, so the most recent naming turn is listed first and
+ * the carry picks it.
+ */
+function priorEntities(req: AiCompletionRequest, index: EntityIndex, options: Parameters<typeof resolveEntities>[2]): ResolvedEntity[] {
+  const turns = req.messages.filter((m) => m.role === 'user').slice(0, -1).slice(-CARRY_TURNS).reverse();
+  const out: ResolvedEntity[] = [];
+  for (const turn of turns) out.push(...resolveEntities(focusText(turn.content), index, options));
+  return out;
+}
 
 /** The two periods a comparison will measure, and how they were chosen. */
 export function comparisonWindows(question: string, windows: TimeWindow[], now: number): WindowPair | null {
@@ -307,6 +320,9 @@ export function builtinEngine(): AiProvider {
       runtime?.note(call, 'plan', 'classify_intent', describeIntent(intent));
 
       /* 2. what period — every one the question names, in the order it names them */
+      // The metric is detected here rather than in step 3 because whether a
+      // period even applies depends on it: a snapshot metric has no window.
+      const metric = detectMetric(question);
       const windows = resolveWindows(question, workspace.now, 6);
       const mentions = periodMentions(question);
       const unresolved = unresolvedPeriods(question, workspace.now);
@@ -323,7 +339,11 @@ export function builtinEngine(): AiProvider {
       const comparison = intent.intent === 'compare' ? comparisonWindows(question, windows, workspace.now) : null;
       reasoning.push(explicit
         ? `Period${windows.length > 1 ? 's' : ''} ${windows.map((w) => `"${w.matched.trim()}" → ${w.label} (${describeWindow(w, workspace.locale)})`).join('; ')}.`
-        : `No period in the question; defaulting to ${window.label}.`);
+        // Saying a snapshot metric "defaulted" to this quarter describes a
+        // filter that will not be applied, which is worse than saying nothing.
+        : metric?.metric.snapshot
+          ? `No period in the question, and ${metric.metric.label} is measured as of now, so no reporting period applies.`
+          : `No period in the question; defaulting to ${window.label}.`);
       if (unresolved.length) {
         reasoning.push(`Period expressions found: ${mentions.map((m) => `"${m.text}"`).join(', ')}; ${mentions.length - unresolved.length} of ${mentions.length} resolved to a date range. Unparsed: ${unresolved.map((m) => `"${m.text}"`).join(', ')}.`);
       }
@@ -333,14 +353,13 @@ export function builtinEngine(): AiProvider {
 
       /* 3. which records — this turn's, and the ones the thread is already about */
       const types = mentionedTypes(question);
-      const metric = detectMetric(question);
       const prefer = metric?.metric.supportsSubject ? ['company', 'customer', 'contact'] : types;
       const index = entityIndex(ctx, orgId);
       const options = { prefer, limit: 6, dedupe: true };
       const deictic = deicticMention(question);
       const carriedFrom = carryConversation({
         turn: resolveEntities(question, index, options),
-        history: resolveEntities(priorContext(req), index, options),
+        history: priorEntities(req, index, options),
         pinned: pinnedSubject(call, index),
         deictic,
       });
@@ -365,7 +384,15 @@ export function builtinEngine(): AiProvider {
 
       /* 5. can this be answered at all, or must it be refused */
       const comprehension = comprehend(question, workspaceVocabulary(index));
-      const countableTypes = types.filter((t) => t !== 'activity' && t !== 'customer');
+      // A type is countable when something in this workspace can actually count
+      // it: the CRM for its own object types, and a registered ledger tool for
+      // the revenue half. Anything else names no measure, and a question that
+      // wants a number and names no measure is refused rather than answered
+      // with bookings under a different question's wording.
+      const countableTypes = types.filter((t) => t !== 'activity' && t !== 'customer' && (
+        CRM_OBJECT_TYPES.has(t)
+        || !!ledgerToolFor(req.tools ?? [], t, 'account')
+        || !!ledgerToolFor(req.tools ?? [], t, 'workspace')));
       // A pronoun with nothing behind it is not a question about the workspace.
       // Widening "how much have they spent" to every account in the book is how
       // a follow-up gets answered confidently about the wrong thing.
@@ -408,6 +435,9 @@ export function builtinEngine(): AiProvider {
         actorId: call.actorId ?? null,
         dealStages: [...propertyMap(ctx, orgId, 'deal').get('deal_stage')?.options ?? []],
         allowWrites: !!call.allowWrites,
+        // A CRM company and its billing customer are two rows with two ids, and
+        // every ledger tool takes the second one.
+        subjectCustomerIds: linkedCustomerIds(ctx, orgId, subject),
       };
       const attempted = intent.intent === 'act' ? planWrite(planInput) : null;
       const writeBlocked = isWriteBlocked(attempted) ? attempted : null;

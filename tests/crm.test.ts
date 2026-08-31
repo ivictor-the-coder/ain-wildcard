@@ -2515,3 +2515,34 @@ describe('a saved view cannot promise a column that does not exist', () => {
     assert.equal(patched.body.error.code, 'property_unknown');
   });
 });
+
+describe('merging a record while a max rollup is defined', () => {
+  test('a childless survivor can absorb a duplicate that has deals', async () => {
+    // "Recent deal close date" is a max rollup HubSpot ships on every Company by
+    // default. The survivor has no deals and the duplicate does, which is the
+    // normal dedupe direction — so the duplicate's rollup has a value and the
+    // merge's fill loop used to try to copy it onto a read-only property.
+    await expectOk('POST', '/v1/objects/company/properties', {
+      name: 'recent_deal_close',
+      label: 'Recent deal close date',
+      type: 'date',
+      rollup: { association: 'deal', aggregate: 'max', property: 'close_date' },
+    });
+
+    const survivor = await expectOk('POST', '/v1/records/company', { properties: { name: 'Vantage Freight (survivor)' } });
+    const duplicate = await expectOk('POST', '/v1/records/company', { properties: { name: 'Vantage Freight Ltd' } });
+
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Vantage telemetry rollout', amount: 4200000, close_date: '2026-11-30' },
+    });
+    await expectOk('POST', '/v1/associations', {
+      from_id: deal.id, to_id: duplicate.id, association_type: 'deal_to_company',
+    });
+
+    const withRollup = await expectOk('GET', `/v1/records/company/${duplicate.id}`);
+    assert.ok(withRollup.properties.recent_deal_close, 'the duplicate must actually carry a rollup value for this to be a real test');
+
+    const res = await call('POST', `/v1/records/company/${survivor.id}/merge`, { from_id: duplicate.id });
+    assert.ok(res.status < 400, `merge failed with ${res.status}: ${JSON.stringify(res.body)}`);
+  });
+});

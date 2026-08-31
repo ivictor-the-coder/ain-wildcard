@@ -9,7 +9,17 @@
  *     `reverseCollection`.** Both keep billing's own identity intact —
  *     `amount_paid + pre-payment credit notes + amount_due === total` — and
  *     both finish by calling billing's `assertBalanced`, so a mistake in this
- *     file takes the transaction down instead of reaching a customer.
+ *     file takes the transaction down instead of reaching a customer. That
+ *     identity is necessary and not sufficient: it can be satisfied by an
+ *     invoice that took more than it was owed and dropped the difference, so
+ *     the second rule below is what makes it mean something.
+ *  1a. **Nothing collected is ever discarded.** A payment is refused before the
+ *     card is touched when the bill has nothing left in it (`confirmIntent`
+ *     re-reads the invoice and prices against the live balance), and money
+ *     that was already committed when the bill moved — a debit settling days
+ *     later, a dispute won over a bill since credited — lands on the
+ *     customer's balance as an `invoice_overpayment` rather than being
+ *     truncated away.
  *  2. **A subscription's status is never written here.** Failure emits
  *     `invoice.payment_failed` and recovery emits `invoice.paid`, both of which
  *     billing already listens for and turns into a status change through its
@@ -17,7 +27,7 @@
  *     will not infer — giving up on an account — calls `transition()` directly.
  */
 import type { Ctx } from '../../kernel/context';
-import { badRequest, conflict, notFound } from '../../../shared/errors';
+import { badRequest, conflict, internal, notFound } from '../../../shared/errors';
 import { cursorOf, newId, parseCursor } from '../../../shared/ids';
 import { formatMoney, money } from '../../../shared/money';
 import { DAY } from '../../../shared/time';
@@ -296,6 +306,9 @@ export class Gateway {
       if (intent.status === 'processing') {
         throw conflict('payment_intent_processing', `Payment intent ${id} is with the bank and will settle in a few days. Confirming it again would present the debit twice.`);
       }
+      // The bill is re-read here, not trusted from when the intent was made.
+      // Everything below this line moves money.
+      if (intent.invoice) this.priceAgainstInvoice(orgId, intent, meta);
       const methodId = opts.payment_method ?? intent.payment_method;
       if (!methodId) {
         throw badRequest('payment_method_required', 'This payment intent has no payment method. Attach one before confirming.', 'payment_method');
@@ -313,6 +326,70 @@ export class Gateway {
         });
       }
       return this.runAttempt(orgId, this.requireIntent(orgId, id), method, { authenticated: false, meta });
+    });
+  }
+
+  /**
+   * Why charging this bill would take money nobody is owed, or null.
+   *
+   * Narrower than `uncollectableReason` on purpose, and the difference is
+   * `send_invoice`: net terms stop the *automatic* charge, they do not stop a
+   * customer paying their own bill by card. A hand-confirmed intent is exactly
+   * that, so the only things refused here are the states in which the bill has
+   * no money left in it.
+   */
+  private settledReason(invoice: Invoice): { code: string; message: string } | null {
+    if (invoice.status === 'draft') {
+      return { code: 'invoice_not_finalized', message: `Invoice ${invoice.number} has not been finalised, so nothing is owed on it yet.` };
+    }
+    if (invoice.status === 'void') {
+      return { code: 'invoice_void', message: `Invoice ${invoice.number} was voided. Charging it would take money against a bill that no longer exists.` };
+    }
+    if (invoice.status === 'uncollectible') {
+      return { code: 'invoice_uncollectible', message: `Invoice ${invoice.number} has been written off. Reopen it before collecting against it.` };
+    }
+    if (invoice.status === 'paid' || invoice.amount_due <= 0) {
+      return {
+        code: 'invoice_already_paid',
+        message: `Invoice ${invoice.number} has nothing left to collect — it was settled before this intent was confirmed. Refund the charge that settled it if this payment was meant to replace it.`,
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Re-price an invoice-bound intent against the bill as it stands right now.
+   *
+   * An intent is a quote for a balance that was true when it was made. Between
+   * the quote and the charge a credit note can land, a colleague can take the
+   * money over the phone, or the very same intent can be confirmed a second
+   * time — and every one of those ends with a card charged for money nobody is
+   * owed. So the live `amount_due` decides, not the frozen `amount`: if there
+   * is nothing left to collect the confirm is refused before the charge, and
+   * if the bill has shrunk the intent shrinks with it. It is never re-priced
+   * upwards; a part payment stays the part payment that was authorised.
+   */
+  private priceAgainstInvoice(orgId: string, intent: PaymentIntent, meta: WriteMeta): void {
+    const invoice = this.billing.invoices.require(orgId, intent.invoice as string);
+    const settled = this.settledReason(invoice);
+    if (settled) {
+      throw conflict(settled.code, settled.message, {
+        invoice: invoice.id, status: invoice.status,
+        amount_due: invoice.amount_due, amount_paid: invoice.amount_paid,
+      });
+    }
+    if (invoice.amount_due >= intent.amount) return;
+    const now = this.ctx.now();
+    const locale = this.locale(orgId);
+    this.ctx.db.patch('payments_intents', 'id', intent.id, { amount: invoice.amount_due, updated: now });
+    const after = this.requireIntent(orgId, intent.id);
+    this.ctx.emit(orgId, 'payment_intent.amount_updated', {
+      payment_intent: after.id, invoice: invoice.id, number: invoice.number, customer: invoice.customer,
+      amount: after.amount, previous_amount: intent.amount, currency: after.currency,
+      reason: `Invoice ${invoice.number} owed ${formatMoney(money(intent.amount, intent.currency), { locale })} when this intent was created and owes ${formatMoney(money(invoice.amount_due, invoice.currency), { locale })} now. The charge follows the bill down rather than collecting the difference.`,
+    }, {
+      objectId: after.id, objectType: 'payment_intent', previous: { amount: intent.amount },
+      actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
     });
   }
 
@@ -348,7 +425,11 @@ export class Gateway {
           },
         }, meta);
       }
-      return this.runAttempt(orgId, intent, method, { authenticated: true, meta });
+      // An intent can sit at `requires_action` for as long as it takes the
+      // cardholder to answer, and bills get settled in the meantime. The same
+      // re-read that guards the confirm guards the approval.
+      if (intent.invoice) this.priceAgainstInvoice(orgId, intent, meta);
+      return this.runAttempt(orgId, this.requireIntent(orgId, id), method, { authenticated: true, meta });
     });
   }
 
@@ -413,6 +494,9 @@ export class Gateway {
           authenticate_url: `/v1/payment_intents/${intent.id}/authenticate`,
           description: decision.description,
         },
+        // Whatever this method was refused for last time is superseded: the
+        // bank is asking for the cardholder now, not reporting a decline.
+        last_error_code: null, last_error_message: null, last_error_advice: null,
         updated: now,
       } as any);
       const after = this.requireIntent(orgId, intent.id);
@@ -517,13 +601,15 @@ export class Gateway {
     });
     if (after.invoice) {
       const invoice = this.applyCollection(orgId, after.invoice, charge.amount, {
-        note: `Collected by ${charge.id} on ${new Date(now).toISOString().slice(0, 10)}.`, at: now, meta,
+        note: `Collected by ${charge.id} on ${new Date(now).toISOString().slice(0, 10)}.`,
+        at: now, charge: charge.id, meta,
       });
       this.ctx.emit(orgId, 'invoice.payment_succeeded', {
         invoice: invoice.id, number: invoice.number, customer: invoice.customer,
         subscription: invoice.subscription, amount: charge.amount, currency: invoice.currency,
         charge: charge.id, payment_intent: after.id, payment_method: after.payment_method,
         amount_paid: invoice.amount_paid, amount_due: invoice.amount_due,
+        amount_overpaid: this.overpaidOn(orgId, invoice.id),
       }, {
         objectId: invoice.id, objectType: 'invoice',
         actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
@@ -579,6 +665,21 @@ export class Gateway {
       objectId: invoice.id, objectType: 'invoice',
       actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
     });
+    // Stripe's own distinction, and it is the right one: this is not a card
+    // that failed, it is a card the bank will not take without the cardholder.
+    // No retry schedule can produce a cardholder, so the event says who has to.
+    if (code === 'authentication_required' && after.off_session) {
+      this.ctx.emit(orgId, 'invoice.payment_action_required', {
+        invoice: invoice.id, number: invoice.number, customer: invoice.customer,
+        subscription: invoice.subscription, amount_due: invoice.amount_due, currency: invoice.currency,
+        charge: charge.id, payment_intent: after.id, payment_method: after.payment_method,
+        reason: code,
+        resolution: `Nobody was at the keyboard, so the issuer had no one to ask. Present ${invoice.number} again with ${this.customerName(orgId, invoice.customer)} there — POST /v1/invoices/${invoice.id}/retry with {"off_session": false} — and the intent comes back requires_action with the step to confirm at. The bank remembers the mandate afterwards, so the next off-session charge goes through.`,
+      }, {
+        objectId: invoice.id, objectType: 'invoice',
+        actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
+      });
+    }
     if (!this.drivenByDunning) {
       this.payments.dunning.onCollectionFailed(orgId, invoice, after, charge, { code, message, advice });
     }
@@ -636,7 +737,7 @@ export class Gateway {
    */
   collectInvoice(
     orgId: string, invoiceId: string,
-    opts: { source: PaymentIntentSource; methodId?: string | null; meta?: WriteMeta } ,
+    opts: { source: PaymentIntentSource; methodId?: string | null; offSession?: boolean; meta?: WriteMeta } ,
   ): CollectionResult {
     return this.ctx.atomic(() => {
       const invoice = this.billing.invoices.require(orgId, invoiceId);
@@ -660,6 +761,11 @@ export class Gateway {
       const sequence = this.ctx.db.count(
         `SELECT COUNT(*) FROM payments_intents WHERE org_id = ? AND invoice_id = ?`, orgId, invoice.id,
       );
+      // Off-session is the default because almost every collection here is one:
+      // a renewal, a scheduled retry, a job. Passing false is the one thing
+      // that can satisfy an `authentication_required` decline — the customer is
+      // present, so the issuer has someone to ask.
+      const offSession = opts.offSession ?? true;
       const intent = this.createIntent(orgId, {
         customer: customer.id,
         amount: invoice.amount_due,
@@ -667,12 +773,12 @@ export class Gateway {
         payment_method: method.id,
         invoice: invoice.id,
         description: `Invoice ${invoice.number} — ${customer.name}`,
-        off_session: true,
+        off_session: offSession,
         source: opts.source,
         idempotency_key: `collect:${invoice.id}:${sequence}`,
       }, meta);
       const confirmed = intent.status === 'requires_confirmation'
-        ? this.confirmIntent(orgId, intent.id, { off_session: true }, meta)
+        ? this.confirmIntent(orgId, intent.id, { off_session: offSession }, meta)
         : intent;
       const charge = confirmed.latest_charge ? this.charge(orgId, confirmed.latest_charge) : null;
       return {
@@ -719,29 +825,109 @@ export class Gateway {
    */
   applyCollection(
     orgId: string, invoiceId: string, amount: number,
-    opts: { note: string; at?: number; meta?: WriteMeta },
+    opts: { note: string; at?: number; charge?: string | null; meta?: WriteMeta },
   ): Invoice {
     const invoice = this.billing.invoices.require(orgId, invoiceId);
     if (amount <= 0) return invoice;
     const now = opts.at ?? this.ctx.now();
     const collectable = invoice.total - invoice.pre_payment_credit_notes_amount;
-    // Capped at what the bill could ever collect: a payment larger than that
-    // is not a bigger invoice, and recording it as one would put money on a
-    // document that never asked for it.
-    const paid = Math.min(invoice.amount_paid + amount, collectable);
-    if (paid >= collectable && invoice.status !== 'paid') {
-      return this.billing.invoices.pay(orgId, invoiceId, { note: opts.note, at: now }, opts.meta);
+    // What the bill can still absorb. A voided invoice absorbs nothing: it was
+    // withdrawn, so money arriving against it belongs to the customer, not to
+    // a document that has been struck out.
+    const room = invoice.status === 'void' ? 0 : Math.max(0, collectable - invoice.amount_paid);
+    // The split, and the whole point of this method: what the bill takes, and
+    // what it cannot. Clamping `amount` to `room` and stopping there is how a
+    // payments system takes a card payment and leaves no record of it — the
+    // invoice invariant stays green precisely *because* the difference was
+    // dropped. It is not dropped here; it is a value, and it goes somewhere.
+    const applied = Math.min(amount, room);
+    const excess = amount - applied;
+
+    let after = invoice;
+    if (applied > 0 && invoice.amount_paid + applied >= collectable) {
+      after = this.billing.invoices.pay(orgId, invoiceId, { note: opts.note, at: now }, opts.meta);
+    } else if (applied > 0) {
+      this.ctx.db.patch('billing_invoices', 'id', invoiceId, {
+        amount_paid: invoice.amount_paid + applied, amount_due: room - applied,
+        payment_note: opts.note, updated: now,
+      });
+      this.billing.invoices.assertBalanced(orgId, invoiceId);
+      after = this.billing.invoices.require(orgId, invoiceId);
+      this.ctx.emit(orgId, 'invoice.partially_paid', after, {
+        objectId: invoiceId, objectType: 'invoice', previous: { amount_paid: invoice.amount_paid, amount_due: invoice.amount_due },
+        actorId: opts.meta?.actorId, actorType: opts.meta?.actorType, requestId: opts.meta?.requestId,
+      });
     }
-    this.ctx.db.patch('billing_invoices', 'id', invoiceId, {
-      amount_paid: paid, amount_due: collectable - paid, payment_note: opts.note, updated: now,
+    if (excess > 0) {
+      after = this.recordOverpayment(orgId, after, excess, { at: now, charge: opts.charge ?? null, meta: opts.meta });
+    }
+    return after;
+  }
+
+  /**
+   * Money arrived that the bill could not absorb. It is the customer's.
+   *
+   * A payment that outruns its invoice is not a smaller payment. Stripe calls
+   * the difference `amount_overpaid` and lands it as a customer balance
+   * transaction, and that is the only honest place for it: the balance is a
+   * ledger, so the money keeps a row, a description and an ending figure, and
+   * billing's own `issue()` draws it down on the next bill without anyone
+   * having to remember it is there.
+   *
+   * Confirming an invoice-bound intent can no longer produce one of these —
+   * `priceAgainstInvoice` refuses first. What still can is a payment already
+   * committed before the bill moved: a direct debit that settles three days
+   * after a credit note landed, or a dispute won over a charge whose invoice
+   * has since been credited.
+   */
+  private recordOverpayment(
+    orgId: string, invoice: Invoice, excess: number,
+    opts: { at: number; charge: string | null; meta?: WriteMeta },
+  ): Invoice {
+    const customer = this.ctx.svc.billing.requireCustomer(orgId, invoice.customer);
+    if (customer.currency !== invoice.currency) {
+      // Billing fixes a customer's currency at their first bill, so this
+      // cannot happen — and if it ever does, taking the transaction down beats
+      // filing dollars in a euro ledger where nobody would find them again.
+      throw internal(
+        `Invoice ${invoice.number} is in ${invoice.currency.toUpperCase()} but ${customer.name}'s balance is kept in ${customer.currency.toUpperCase()}, so the ${excess} collected beyond the bill cannot be credited to the account.`,
+        { invoice: invoice.id, customer: customer.id, excess, invoice_currency: invoice.currency, customer_currency: customer.currency },
+      );
+    }
+    const locale = this.locale(orgId);
+    const shown = formatMoney(money(excess, invoice.currency), { locale });
+    const txn = this.billing.adjustBalance(orgId, customer.id, -excess, {
+      type: 'invoice_overpayment',
+      description: opts.charge
+        ? `${shown} more than invoice ${invoice.number} was owed arrived with ${opts.charge}. It is credit on the account and comes off the next bill.`
+        : `${shown} more than invoice ${invoice.number} was owed was collected against it. It is credit on the account and comes off the next bill.`,
+      subscription: invoice.subscription, invoice: invoice.id, createdAt: opts.at,
     });
-    this.billing.invoices.assertBalanced(orgId, invoiceId);
-    const after = this.billing.invoices.require(orgId, invoiceId);
-    this.ctx.emit(orgId, 'invoice.partially_paid', after, {
-      objectId: invoiceId, objectType: 'invoice', previous: { amount_paid: invoice.amount_paid, amount_due: invoice.amount_due },
+    this.ctx.emit(orgId, 'invoice.overpaid', {
+      invoice: invoice.id, number: invoice.number, customer: customer.id,
+      subscription: invoice.subscription,
+      amount_overpaid: excess, currency: invoice.currency,
+      charge: opts.charge, balance_transaction: txn.id, customer_balance: txn.ending_balance,
+      resolution: `${shown} was collected beyond what ${invoice.number} was owed and has been credited to ${customer.name}'s account balance. Refund it against ${opts.charge ?? 'the charge that collected it'} if the customer wants the money back rather than the credit.`,
+    }, {
+      objectId: invoice.id, objectType: 'invoice',
       actorId: opts.meta?.actorId, actorType: opts.meta?.actorType, requestId: opts.meta?.requestId,
     });
-    return after;
+    return this.billing.invoices.require(orgId, invoice.id);
+  }
+
+  /**
+   * What has been collected against this bill beyond what it was owed.
+   *
+   * Read back out of the balance ledger rather than kept in a column of its
+   * own, so the figure and the money that produced it can never disagree.
+   */
+  overpaidOn(orgId: string, invoiceId: string): number {
+    return this.ctx.db.count(
+      `SELECT COALESCE(-SUM(amount), 0) FROM billing_balance_transactions
+        WHERE org_id = ? AND invoice_id = ? AND type = 'invoice_overpayment'`,
+      orgId, invoiceId,
+    );
   }
 
   /**
@@ -977,7 +1163,7 @@ export class Gateway {
       if (dispute.invoice) {
         if (won) {
           this.applyCollection(orgId, dispute.invoice, dispute.amount, {
-            note: `${shown} returned after dispute ${id} was won.`, at: now, meta,
+            note: `${shown} returned after dispute ${id} was won.`, at: now, charge: charge.id, meta,
           });
         } else {
           // The money is gone and will not be collected: that is precisely what
@@ -1014,5 +1200,9 @@ export class Gateway {
   private locale(orgId: string): string {
     try { return this.ctx.svc.core.org(orgId).locale || 'en-US'; }
     catch { return 'en-US'; }
+  }
+
+  private customerName(orgId: string, customerId: string): string {
+    return this.ctx.svc.billing.customer(orgId, customerId)?.name ?? 'the customer';
   }
 }

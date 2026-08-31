@@ -16,6 +16,7 @@ import type { GroupBy, MetricDetection, MetricSubject, StageSets } from './metri
 import type { TimeWindow } from './dates';
 import { resolveDueDate } from './dates';
 import type { WorkspaceProfile } from './grounding';
+import { isLedgerType } from './resolve';
 import { capitalise, contentWords, normalise, stem, trigramSimilarity, truncate } from './text';
 
 export type BuiltinTool =
@@ -72,6 +73,14 @@ export interface PlanInput {
   allowWrites: boolean;
   /** True when the question asks who is biggest, not what the total is. */
   ranking: boolean;
+  /**
+   * The billing customers the resolved account maps to.
+   *
+   * A CRM company and its billing customer are two rows with two ids, and every
+   * ledger tool takes the second. Without this the planner reported "no value
+   * for customer" and answered an invoice question with the company card.
+   */
+  subjectCustomerIds: string[];
 }
 
 /**
@@ -152,6 +161,22 @@ export function inferConditions(question: string, objectType: string, stages: St
 
 const builtin = (tool: BuiltinTool, args: Record<string, unknown>, why: string, relevance = 1): PlannedStep =>
   ({ tool, args, why, builtin: tool, relevance });
+
+/**
+ * The ledger capability for an object type, armed from what already resolved.
+ *
+ * Returns `null` when the workspace registered no such tool, when this run is
+ * scoped away from it, or when its required arguments cannot be filled — the
+ * same rule as everywhere else, so a step that could only fail never runs.
+ */
+function ledgerStep(input: PlanInput, objectType: string, scope: 'account' | 'workspace', why: string, relevance = 0.95): PlannedStep | null {
+  const tool = ledgerToolFor(input.tools, objectType, scope);
+  if (!tool) return null;
+  if (input.allowedTools && !input.allowedTools.has(tool.name)) return null;
+  const filled = fillArguments(tool, fillContextOf(input));
+  if (filled.missing.length) return null;
+  return { tool: tool.name, args: filled.args, why, builtin: null, relevance };
+}
 
 /* ------------------------------- write plans ------------------------------ */
 
@@ -421,12 +446,30 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
   // workspace's quarter, listing its open deals and counting its tickets
   // answers a different question and buries the one that was asked, so a record
   // named by id is left to the tools that can actually read it.
-  const ledgerRecord = entities.find((e) => e.rule === 'id' && ['invoice', 'subscription', 'product'].includes(e.entity.type));
+  // An invoice number is an id people can actually type. "Explain invoice
+  // NR-000032" names one bill as precisely as "in_zWBua76XAnrENyoh" does, and
+  // measuring the workspace's quarter instead answers a different question.
+  // A product matched by name is not the same thing — a product name usually
+  // appears as context inside a question about something else — so only an
+  // exact hit on a ledger document counts.
+  const ledgerRecord = entities.find((e) =>
+    (e.rule === 'id' && ['invoice', 'subscription', 'product'].includes(e.entity.type))
+    || (['name_exact', 'alias_exact'].includes(e.rule) && e.score >= 0.85 && ['invoice', 'subscription'].includes(e.entity.type)));
 
   switch (intent) {
     case 'aggregate': {
       const namedType = input.types.find((t) => t !== 'activity' && t !== 'customer');
-      if (!metric && namedType) {
+      // "How many telemetry events did they use last month?" counts rows the
+      // CRM has never held. Measuring closed-won bookings instead answered a
+      // different question in the same confident register, with no hint to the
+      // reader that the question had been swapped.
+      const ledger = !metric && namedType && isLedgerType(namedType)
+        ? ledgerStep(input, namedType, subject ? 'account' : 'workspace',
+            `${namedType} is measured by the module that owns those rows, not by the CRM and not by a sales metric.`)
+        : null;
+      if (ledger) {
+        steps.push(ledger);
+      } else if (!metric && namedType && !isLedgerType(namedType)) {
         // "How many X" with no metric behind it is a count of X, not a guess.
         const conditions = inferConditions(input.question, namedType, input.stages);
         steps.push(builtin('record_aggregate', {
@@ -517,7 +560,14 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
         // "What are their open tickets?" names a type as well as an account.
         // The profile mentions the count; only the list answers the question.
         const scopedType = input.types.find((t) => t !== 'activity' && t !== 'customer' && t !== 'company');
-        if (scopedType) {
+        if (scopedType && isLedgerType(scopedType)) {
+          // Invoices, subscriptions, entitlements, credits and usage are not
+          // CRM rows. Searching `crm_records` for them returns zero every time,
+          // which is how an invoice question got answered with a company card.
+          const ledger = ledgerStep(input, scopedType, 'account',
+            `${scopedType} records for ${subject.label} live in the ledger, not in the CRM, so this reads them there.`);
+          if (ledger) steps.push(ledger);
+        } else if (scopedType) {
           const conditions = inferConditions(input.question, scopedType, input.stages);
           steps.push(builtin('record_search', {
             object_type: scopedType,
@@ -541,25 +591,11 @@ function canonicalPlan(input: PlanInput): PlannedStep[] {
         // "Which customers are past due?" is a question about the ledger's own
         // state, and the subscription rows carry both the status and the name.
         const ledgerType = named === 'customer' && BILLING_STATE.test(input.question) ? 'subscription' : named;
-        const candidate = ledgerListTool(input.tools, ledgerType);
-        const ledger = candidate && (!input.allowedTools || input.allowedTools.has(candidate.name)) ? candidate : undefined;
-        let fromLedger = false;
-        if (ledger) {
-          const filled = fillArguments(ledger, fillContextOf(input));
-          if (!filled.missing.length) {
-            steps.push({
-              tool: ledger.name,
-              args: filled.args,
-              why: `${ledgerType} records live in the ledger rather than in the CRM, so "${ledger.name}" is where the rows are.`,
-              builtin: null,
-              relevance: 0.95,
-            });
-            fromLedger = true;
-          }
-        }
+        const ledger = ledgerStep(input, ledgerType, 'workspace',
+          `${ledgerType} records live in the ledger rather than in the CRM, so that is where the rows are read from.`);
         // Searching `crm_records` for rows the ledger owns returns zero every
         // time, and a zero next to the real list is noise at best.
-        if (fromLedger) break;
+        if (ledger) { steps.push(ledger); break; }
         const conditions = inferConditions(input.question, objectType, input.stages);
         // "which deals are slipping this quarter" is about the deals due to
         // close in that quarter, not about every open deal on the book.
@@ -724,6 +760,8 @@ interface FillContext {
   types: string[];
   /** Read tools may fall back to the raw question; writes may never. */
   readOnly: boolean;
+  /** Billing customer ids for the account this question is about. */
+  customerIds: string[];
   /** Ids the first pass returned — how a second pass reaches a typed argument. */
   harvestedIds?: string[];
 }
@@ -802,11 +840,22 @@ function fillField(name: string, node: SchemaNode, context: FillContext): unknow
   if (ACCOUNT_FIELD.test(name)) {
     return idOfKind(context.question, 'cus')
       ?? context.entities.find((e) => e.entity.type === 'customer')?.entity.id
+      ?? context.customerIds[0]
       ?? context.harvestedIds?.find((id) => id.startsWith('cus_'));
   }
+  // "Meter id or event name" — the meter the question named, from the index.
+  if (name === 'meter' || name === 'meter_id') {
+    return context.entities.find((e) => e.entity.type === 'meter')?.entity.id;
+  }
+  if (name === 'feature' || name === 'feature_key') {
+    return context.entities.find((e) => e.entity.type === 'feature')?.entity.id;
+  }
+  // A parameter named after a record type takes that record, when the question
+  // resolved one. The id prefix is not derivable from the name — an invoice is
+  // `in_`, not `inv_` — so this only trusts what actually resolved.
   if (ENTITY_FIELD.test(name)) {
     return context.entities.find((e) => e.entity.type === name)?.entity.id
-      ?? context.harvestedIds?.find((id) => id.startsWith(`${name.slice(0, 3)}_`));
+      ?? (name === 'customer' ? context.customerIds[0] : undefined);
   }
   if (ID_FIELD.test(name)) {
     const wanted = name.replace(/_id$/, '');
@@ -856,6 +905,41 @@ export function ledgerListTool(tools: AiToolDef[], objectType: string): AiToolDe
   return tools.find((tool) => tool.readOnly && wanted.some((suffix) => tool.name.endsWith(suffix)));
 }
 
+/**
+ * The capability that answers a question about one object type, for one account.
+ *
+ * Same idea as `ledgerListTool` and the same rule: match on the catalogue's
+ * naming convention, never on a module's name, so the engine stays ignorant of
+ * which modules a workspace installed. The suffixes are the ones the platform's
+ * own tool-naming convention uses for "everything about this account's X".
+ */
+const ACCOUNT_LEDGER_SUFFIXES: Record<string, string[]> = {
+  invoice: ['list_invoices'],
+  subscription: ['list_subscriptions'],
+  entitlement: ['for_customer', 'entitlements'],
+  credit: ['balance', 'settlement_for_period'],
+  usage: ['usage_for_period'],
+  customer: ['customer_summary'],
+};
+
+/** Capabilities that answer the same question for the whole workspace. */
+const WORKSPACE_LEDGER_SUFFIXES: Record<string, string[]> = {
+  invoice: ['list_invoices'],
+  subscription: ['list_subscriptions'],
+  meter: ['list_meters'],
+  product: ['list_products'],
+  entitlement: ['at_limit'],
+};
+
+export function ledgerToolFor(tools: AiToolDef[], objectType: string, scope: 'account' | 'workspace'): AiToolDef | undefined {
+  const suffixes = (scope === 'account' ? ACCOUNT_LEDGER_SUFFIXES : WORKSPACE_LEDGER_SUFFIXES)[objectType] ?? [];
+  for (const suffix of suffixes) {
+    const found = tools.find((tool) => tool.readOnly && (tool.name === suffix || tool.name.endsWith(`_${suffix}`) || tool.name.endsWith(`.${suffix}`)));
+    if (found) return found;
+  }
+  return ledgerListTool(tools, objectType);
+}
+
 export const fillContextOf = (input: PlanInput): FillContext => ({
   question: input.question,
   window: input.window,
@@ -866,6 +950,7 @@ export const fillContextOf = (input: PlanInput): FillContext => ({
   groupBy: input.groupBy,
   types: input.types,
   readOnly: true,
+  customerIds: input.subjectCustomerIds,
 });
 
 export interface FilledArguments {
@@ -929,6 +1014,7 @@ export function planTools(input: PlanInput): PlanResult {
     groupBy: input.groupBy,
     types: input.types,
     readOnly: true,
+    customerIds: input.subjectCustomerIds,
   };
 
   const offIntent = (name: string) =>
@@ -1074,6 +1160,7 @@ export function replan(
       groupBy: input.groupBy,
       types: input.types,
       readOnly: true,
+      customerIds: input.subjectCustomerIds,
       harvestedIds: harvested,
     };
     for (const candidate of skipped) {

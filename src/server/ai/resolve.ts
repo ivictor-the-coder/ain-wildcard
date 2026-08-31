@@ -280,6 +280,16 @@ export function resolveEntities(message: string, index: EntityIndex, opts: Resol
 }
 
 /** Object types named in the question — "open deals", "tickets", "invoices". */
+/**
+ * Object types `crm_records` actually holds. Everything else a question can name
+ * — invoices, subscriptions, meters, entitlements, credits — lives in the ledger
+ * of the module that owns it, and searching the CRM for one returns zero rows
+ * every time.
+ */
+export const CRM_OBJECT_TYPES = new Set(['company', 'contact', 'deal', 'ticket', 'task', 'activity']);
+
+export const isLedgerType = (type: string): boolean => !CRM_OBJECT_TYPES.has(type);
+
 export function mentionedTypes(message: string): string[] {
   const text = normalise(message);
   const map: [RegExp, string][] = [
@@ -289,10 +299,17 @@ export function mentionedTypes(message: string): string[] {
     [/\b(tickets?|cases?|issues?|escalations?)\b/, 'ticket'],
     [/\b(tasks?|to ?dos?)\b/, 'task'],
     [/\b(meetings?|calls?|emails?|notes?|activit(?:y|ies)|touch(?:es|points?)?)\b/, 'activity'],
-    [/\b(invoices?|bills?)\b/, 'invoice'],
-    [/\b(subscriptions?|plans?)\b/, 'subscription'],
-    [/\b(products?|skus?|prices?)\b/, 'product'],
+    [/\b(invoices?|bills?|billing)\b/, 'invoice'],
+    [/\b(subscriptions?|subscribed|subscribes?|plans?)\b/, 'subscription'],
+    [/\b(products?|skus?|prices?|price\s+list|catalogue?)\b/, 'product'],
     [/\b(customers?|subscribers?)\b/, 'customer'],
+    // The revenue half of the platform has nouns too, and a question that uses
+    // one is a question about the module that owns it — not about a CRM object
+    // type nothing writes, and not about bookings.
+    [/\b(meters?|metering)\b/, 'meter'],
+    [/\b(usage|consumption|consumed|ingested|telemetry\s+events?|events?\s+(?:used|ingested|sent))\b/, 'usage'],
+    [/\b(entitlements?|allowances?|quotas?|seats?|feature\s+limits?|seat\s+limits?)\b/, 'entitlement'],
+    [/\b(credits?|credit\s+grants?|credit\s+balance)\b/, 'credit'],
   ];
   const out: string[] = [];
   for (const [re, type] of map) if (re.test(text)) out.push(type);

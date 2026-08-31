@@ -75,7 +75,8 @@ export type DeclineCode = Exclude<SimulatedBehavior, 'succeeds'>;
  * `soft` will plausibly clear on its own — payday arrives, the issuer's
  * gateway comes back. `hard` is the issuer refusing this card for this
  * merchant; retrying works occasionally but deserves a longer gap. `final`
- * cannot be fixed by waiting, only by a new payment method, and retrying it
+ * cannot be fixed by waiting at all — only by a person, whether that is new
+ * details, corrected ones, or the cardholder confirming once — and retrying it
  * burns goodwill and a retry fee for nothing.
  */
 export const DECLINE_SEVERITIES = ['soft', 'hard', 'final'] as const;

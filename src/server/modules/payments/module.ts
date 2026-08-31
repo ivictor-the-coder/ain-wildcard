@@ -33,7 +33,9 @@ export interface PaymentsService {
   methods(orgId: string, customerId: string): PaymentMethod[];
   defaultMethod(orgId: string, customerId: string): PaymentMethod | null;
   /** Charge a bill with the best method on file. Never throws on a decline. */
-  collectInvoice(orgId: string, invoiceId: string, opts?: { methodId?: string | null }): CollectionResult;
+  collectInvoice(orgId: string, invoiceId: string, opts?: { methodId?: string | null; offSession?: boolean }): CollectionResult;
+  /** Collected against this bill beyond what it was owed, as account credit. */
+  amountOverpaid(orgId: string, invoiceId: string): number;
   /** Every subscription in recovery, with the action a human should take. */
   recoveryQueue(orgId: string, filter?: DunningListFilter): DunningView[];
   recoverySummary(orgId: string): RecoverySummary;
@@ -147,6 +149,8 @@ const collectionResponse = (ctx: Ctx, orgId: string, result: CollectionResult) =
   const locale = localeOf(ctx, orgId);
   const store = paymentsStore(ctx);
   const campaign = store.dunning.forInvoice(orgId, result.invoice.id);
+  const show = (amount: number) => formatMoney(money(amount, result.invoice.currency), { locale });
+  const action = result.intent?.status === 'requires_action' ? result.intent.next_action : null;
   return {
     object: 'collection_attempt',
     collected: result.collected,
@@ -156,11 +160,15 @@ const collectionResponse = (ctx: Ctx, orgId: string, result: CollectionResult) =
     payment_method: result.method,
     failure: result.failure,
     skipped: result.skipped,
+    /** Set when the issuer wants the cardholder: nothing was charged, and this is where they say yes. */
+    next_action: action,
     dunning: campaign ? store.dunning.view(orgId, campaign) : null,
     summary: result.collected
-      ? `${formatMoney(money(result.charge?.amount ?? 0, result.invoice.currency), { locale })} collected against ${result.invoice.number}.`
-      : result.skipped
-        ?? `${result.invoice.number} was refused: ${result.failure?.message ?? 'the charge did not go through.'} ${result.failure?.advice ?? ''}`.trim(),
+      ? `${show(result.charge?.amount ?? 0)} collected against ${result.invoice.number}.`
+      : action
+        ? `The issuer wants the cardholder to confirm ${show(result.intent?.amount ?? result.invoice.amount_due)} against ${result.invoice.number}. Nothing has been charged yet — they approve it at POST ${action.authenticate_url}.`
+        : result.skipped
+          ?? `${result.invoice.number} was refused: ${result.failure?.message ?? 'the charge did not go through.'} ${result.failure?.advice ?? ''}`.trim(),
   };
 };
 
@@ -181,7 +189,10 @@ export default defineModule({
       methods: (orgId, customerId) => store.methods.forCustomer(orgId, customerId),
       defaultMethod: (orgId, customerId) => store.methods.defaultFor(orgId, customerId),
       collectInvoice: (orgId, invoiceId, opts) =>
-        store.gateway.collectInvoice(orgId, invoiceId, { source: 'api', methodId: opts?.methodId ?? null }),
+        store.gateway.collectInvoice(orgId, invoiceId, {
+          source: 'api', methodId: opts?.methodId ?? null, offSession: opts?.offSession ?? true,
+        }),
+      amountOverpaid: (orgId, invoiceId) => store.gateway.overpaidOn(orgId, invoiceId),
       recoveryQueue: (orgId, filter) => store.dunning.queue(orgId, filter).data,
       recoverySummary: (orgId) => store.dunning.summary(orgId),
       dunningForInvoice: (orgId, invoiceId) => store.dunning.forInvoice(orgId, invoiceId),
@@ -392,7 +403,7 @@ export default defineModule({
     router.post('/v1/payment_intents', (req: Req, c: Ctx) =>
       created(paymentsStore(c).gateway.createIntent(req.auth.orgId, req.body as any, writeMeta(req))), {
       summary: 'Create a payment intent', tags: ['payments'], roles: ['member'], idempotent: true,
-      description: 'Leave out amount and currency to charge exactly what an invoice still owes. Pass confirm=true to present it immediately; idempotency_key makes a replayed create return the first intent instead of charging twice.',
+      description: 'Leave out amount and currency to charge exactly what an invoice still owes. Pass confirm=true to present it immediately; idempotency_key makes a replayed create return the first intent instead of charging twice. An amount named here is a ceiling, not a promise: an invoice-bound intent is re-priced against the live balance at confirm time and refused outright once there is nothing left to collect, so two intents on one bill can never both take the money.',
       body: intentCreateBody,
     });
 
@@ -406,7 +417,7 @@ export default defineModule({
       return paymentsStore(c).gateway.confirmIntent(req.auth.orgId, req.params.id, body, writeMeta(req));
     }, {
       summary: 'Confirm and present a payment intent', tags: ['payments'], roles: ['member'],
-      description: 'off_session=true means nobody is at the keyboard, which is the difference between an authentication prompt and an authentication_required decline — exactly as it is with a real issuer.',
+      description: 'off_session=true means nobody is at the keyboard, which is the difference between an authentication prompt and an authentication_required decline — exactly as it is with a real issuer. An intent bound to an invoice is priced against that invoice as it stands at this moment, not as it stood when the intent was made: a bill with nothing left owed refuses with invoice_already_paid, invoice_void, invoice_uncollectible or invoice_not_finalized before the card is touched, and a bill that has shrunk since — a credit note landed, someone paid part of it — takes the intent down with it rather than collecting the difference.',
       body: v.object({
         payment_method: v.optional(v.id('pm')),
         off_session: v.optional(v.boolean()),
@@ -573,21 +584,88 @@ export default defineModule({
       body: v.object({ reason: v.optional(v.string({ max: 500 })) }),
     });
 
+    router.get('/v1/invoices/:id/payments', (req: Req, c: Ctx) => {
+      const orgId = req.auth.orgId;
+      const store = paymentsStore(c);
+      const invoice = billingStore(c).billing.invoices.require(orgId, req.params.id);
+      const locale = localeOf(c, orgId);
+      const show = (amount: number) => formatMoney(money(amount, invoice.currency), { locale });
+      const charges = store.gateway.listCharges(orgId, { invoice: invoice.id, status: 'all', limit: 100 }).data;
+      const taken = charges.filter((charge) => charge.status === 'succeeded').reduce((total, charge) => total + charge.amount, 0);
+      const refunds = store.gateway.listRefunds(orgId, { invoice: invoice.id, limit: 100 }).data;
+      const disputes = store.gateway.listDisputes(orgId, { invoice: invoice.id, status: 'all', limit: 100 }).data;
+      const campaign = store.dunning.forInvoice(orgId, invoice.id);
+      const overpaid = store.gateway.overpaidOn(orgId, invoice.id);
+      const blocked = store.gateway.uncollectableReason(invoice);
+      const refunded = refunds.reduce((total, refund) => total + refund.amount, 0);
+      const held = disputes
+        .filter((dispute) => dispute.status === 'needs_response' || dispute.status === 'under_review' || dispute.status === 'lost')
+        .reduce((total, dispute) => total + dispute.amount, 0);
+      const returned = refunded + held;
+      // Four different stories, and the wrong one is worse than none: a bill
+      // settled from account credit has never seen a card, and saying "nothing
+      // collected" about a paid invoice is how a support agent charges it twice.
+      const headline = taken > 0
+        ? overpaid > 0
+          ? `${show(taken)} has been taken against ${invoice.number}: ${show(invoice.amount_paid)} settled the bill and ${show(overpaid)} went past it, which is credit on the account and comes off the next invoice.`
+          : invoice.amount_due === 0
+            ? `${show(taken)} was collected against ${invoice.number} and settled it in full.`
+            : `${show(taken)} has been collected against ${invoice.number}, and ${show(invoice.amount_due)} is still owed.`
+        : invoice.amount_paid > 0
+          ? `No card or debit was ever presented against ${invoice.number}. The ${show(invoice.amount_paid)} on it was settled another way — account credit, a credit note, or recorded by hand.`
+          : `Nothing has been collected against ${invoice.number} yet. ${blocked ?? `${show(invoice.amount_due)} is owed and can be presented now.`}`;
+      return {
+        object: 'invoice_payments',
+        invoice: invoice.id,
+        number: invoice.number,
+        customer: invoice.customer,
+        currency: invoice.currency,
+        total: invoice.total,
+        amount_paid: invoice.amount_paid,
+        amount_due: invoice.amount_due,
+        /**
+         * Collected beyond what this bill was owed and credited to the account
+         * balance, where the next invoice draws it down. Stripe's field, and
+         * the reason a payment can never outrun its bill unnoticed here.
+         */
+        amount_overpaid: overpaid,
+        amount_refunded: refunded,
+        /** Withdrawn by the network and not yet returned — an open case, or one lost. */
+        amount_disputed: held,
+        cash_collected: taken,
+        collectable: blocked === null,
+        collectable_note: blocked,
+        payment_intents: store.gateway.listIntents(orgId, { invoice: invoice.id, status: 'all', limit: 100 }).data,
+        charges,
+        refunds,
+        disputes,
+        dunning: campaign ? store.dunning.view(orgId, campaign) : null,
+        summary: returned > 0 ? `${headline} ${show(returned)} of it has since gone back to the customer.` : headline,
+      };
+    }, {
+      summary: 'What happened to the money on one invoice', tags: ['payments'],
+      description: 'Every presentation, refund and dispute against one bill, with the recovery campaign chasing it and the two numbers that have to agree: what the customer’s account was actually charged, and what the platform did with it. amount_overpaid is anything collected past what the bill was owed — it is credit on the customer’s balance, never a difference that was dropped.',
+    });
+
     router.post('/v1/invoices/:id/retry', (req: Req, c: Ctx) => {
       const store = paymentsStore(c);
       const orgId = req.auth.orgId;
       const invoice = billingStore(c).billing.invoices.require(orgId, req.params.id);
       const blocked = store.gateway.uncollectableReason(invoice);
       if (blocked) throw conflict('invoice_not_collectable', blocked, { status: invoice.status, amount_due: invoice.amount_due });
-      const body = req.body as { payment_method?: string } | undefined;
+      const body = req.body as { payment_method?: string; off_session?: boolean } | undefined;
       const result = store.gateway.collectInvoice(orgId, invoice.id, {
-        source: 'manual_retry', methodId: body?.payment_method ?? null, meta: writeMeta(req),
+        source: 'manual_retry', methodId: body?.payment_method ?? null,
+        offSession: body?.off_session ?? true, meta: writeMeta(req),
       });
       return collectionResponse(c, orgId, result);
     }, {
       summary: 'Retry collection on an invoice now', tags: ['payments'], roles: ['member'], idempotent: true,
-      description: 'Presents the bill immediately instead of waiting for the next scheduled window. The attempt is recorded against the recovery campaign like any other, so the audit trail stays one story.',
-      body: v.object({ payment_method: v.optional(v.id('pm')) }),
+      description: 'Presents the bill immediately instead of waiting for the next scheduled window. The attempt is recorded against the recovery campaign like any other, so the audit trail stays one story. Pass off_session=false when the customer is with you: a card the issuer wants authenticated comes back requires_action with the step to approve at, instead of the authentication_required decline no retry schedule can ever satisfy.',
+      body: v.object({
+        payment_method: v.optional(v.id('pm')),
+        off_session: v.optional(v.boolean()),
+      }),
     });
 
     /* -------------------------------- settings ------------------------------ */
@@ -720,7 +798,7 @@ function explainSchedule(policy: DunningPolicy): string {
     ? ` and spread across the ${policy.jitter_hours} hour${policy.jitter_hours === 1 ? '' : 's'} after it so a thousand accounts do not present at once`
     : ' with no spread, so every account presents at the top of the window';
   const givingUp = policy.give_up_codes.length
-    ? ` ${policy.give_up_codes.join(', ')} stop the schedule immediately in favour of asking for a new payment method.`
+    ? ` ${policy.give_up_codes.join(', ')} stop the schedule immediately, because none of them clear by waiting — they need a person: new details, corrected ones, or the cardholder confirming once on-session.`
     : ' No decline ends the schedule early.';
   return `The first failure is attempt one. Retries follow after ${gaps}, each presented in the ${window} window${spread}${policy.skip_weekends ? ', never on a weekend' : ''}. A hard decline waits ${policy.hard_decline_multiplier}x longer;${givingUp} After ${policy.max_attempts} attempts ${end}.`;
 }

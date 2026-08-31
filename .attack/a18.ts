@@ -1,0 +1,44 @@
+import { ws } from './lib';
+const log = (...a: any[]) => console.log(...a);
+const DAY = 86400000;
+const w = await ws();
+// A) 3DS race: intent at requires_action, invoice settled elsewhere, then approve
+const cus = await w.ok('POST', '/v1/customers', { name: 'ThreeDS', email: 'tds@x.example', currency: 'usd' });
+const sca = await w.ok('POST', '/v1/payment_methods', { type: 'card', customer: cus.id, brand: 'visa', exp_month: 4, exp_year: 2031, simulated_behavior: 'authentication_required' });
+const good = await w.ok('POST', '/v1/payment_methods', { type: 'card', customer: cus.id, brand: 'amex', exp_month: 4, exp_year: 2031, simulated_behavior: 'succeeds' });
+const sub = await w.ok('POST', '/v1/subscriptions', { customer: cus.id, items: [{ price: 'price_nw_growth_monthly' }], default_payment_method: sca.id });
+await w.app.tick();
+const inv = (await w.ok('GET', `/v1/invoices?subscription=${sub.id}&limit=10`)).data[0];
+const A = await w.ok('POST', '/v1/payment_intents', { customer: cus.id, invoice: inv.id, payment_method: sca.id, confirm: true, off_session: false });
+log('A status', A.status, A.next_action?.type);
+const B = await w.ok('POST', '/v1/payment_intents', { customer: cus.id, invoice: inv.id, payment_method: good.id, confirm: true });
+log('B status', B.status, B.amount);
+const auth = await w.call('POST', `/v1/payment_intents/${A.id}/authenticate`, { result: 'approve' });
+log('approve after settled ->', auth.status, auth.body.error?.code ?? auth.body.status);
+const i = await w.ok('GET', `/v1/invoices/${inv.id}`);
+const c = await w.ok('GET', `/v1/customers/${cus.id}`);
+const chs = (await w.ok('GET', `/v1/charges?customer=${cus.id}&limit=20`)).data;
+log('invoice paid', i.amount_paid, 'due', i.amount_due, 'balance', c.balance, 'charges', JSON.stringify(chs.map((x: any) => [x.status, x.amount])));
+
+// B) retry while a bank debit is still processing
+log('\n-- retry during processing debit --');
+const cus2 = await w.ok('POST', '/v1/customers', { name: 'InFlight', email: 'if@x.example', currency: 'usd' });
+const debit = await w.ok('POST', '/v1/payment_methods', { type: 'bank_debit', customer: cus2.id, bank_name: 'B', account_type: 'checking', simulated_behavior: 'succeeds' });
+const sub2 = await w.ok('POST', '/v1/subscriptions', { customer: cus2.id, items: [{ price: 'price_nw_growth_monthly' }] });
+await w.app.tick();
+const inv2 = (await w.ok('GET', `/v1/invoices?subscription=${sub2.id}&limit=10`)).data[0];
+const ints = (await w.ok('GET', `/v1/payment_intents?customer=${cus2.id}&limit=10`)).data;
+log('in-flight intents', JSON.stringify(ints.map((x: any) => [x.status, x.amount])));
+const retry = await w.call('POST', `/v1/invoices/${inv2.id}/retry`, {});
+log('retry ->', retry.status, retry.body.error?.code ?? `collected=${retry.body.collected} intent=${retry.body.payment_intent?.status}`);
+const retry2 = await w.call('POST', `/v1/invoices/${inv2.id}/retry`, {});
+log('retry again ->', retry2.status, retry2.body.error?.code ?? `collected=${retry2.body.collected}`);
+await w.app.travel(8 * DAY);
+const i2 = await w.ok('GET', `/v1/invoices/${inv2.id}`);
+const c2 = await w.ok('GET', `/v1/customers/${cus2.id}`);
+const chs2 = (await w.ok('GET', `/v1/charges?customer=${cus2.id}&limit=20`)).data;
+log('after settle: invoice paid', i2.amount_paid, 'due', i2.amount_due, 'status', i2.status, 'balance', c2.balance);
+log('charges', JSON.stringify(chs2.map((x: any) => [x.status, x.amount])));
+const net = chs2.filter((x: any) => x.status === 'succeeded').reduce((s: number, x: any) => s + x.amount, 0);
+log('total debited', net, 'bill total', i2.total, 'overpaid', (await w.ok('GET', `/v1/invoices/${inv2.id}/payments`)).amount_overpaid);
+w.close();
