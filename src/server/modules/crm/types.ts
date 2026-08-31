@@ -340,6 +340,12 @@ export interface TimelineItem {
   id: string;
   kind: 'activity' | 'property_change' | 'event' | 'association';
   at: number;
+  /**
+   * This item's position in the merged order. Pass it back as `after` to
+   * resume from exactly here — `at` alone cannot address a row, because a
+   * bulk import stamps a whole cluster with the same millisecond.
+   */
+  cursor: string;
   title: string;
   body: string | null;
   icon: string;

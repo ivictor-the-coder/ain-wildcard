@@ -16,11 +16,11 @@ import {
   activeFilterCount, compareValues, dateExtent, decodeFilters, decodeTableState, describeFilter,
   encodeFilters, encodeTableState, extendSelection, filterRows, fold, isFilterEmpty, matchesFilter,
   rangeBetween, searchRows, selectionState, sortRows, splitSelection, sumColumn, toggleId,
-  toggleSort, uniqueValues, valueCounts, type FilterMap,
+  toggleSort, uniqueValues, valueCounts, type ColumnFilter, type FilterMap,
 } from '../src/client/design/table-core';
 import { contrastGrade, contrastRatio, parseColor, relativeLuminance } from '../src/client/design/color';
 import { readFileSync } from 'node:fs';
-import { computePosition } from '../src/client/design/position';
+import { computePosition, repositionFloating, type FloatingElement } from '../src/client/design/position';
 import {
   addDays, addMonths, monthMatrix, nextRange, RANGE_PRESETS, startOfMonthUtc, weekdayLabels,
 } from '../src/client/design/calendar-core';
@@ -92,6 +92,25 @@ describe('format', () => {
     assert.equal(formatDate(null), '—');
     assert.equal(formatRelative(ts - 3 * DAY, ts), '3 days ago');
     assert.match(formatDateRange(Date.UTC(2026, 0, 1), Date.UTC(2026, 2, 31), { timeZone: 'UTC' }), /Jan 1 – Mar 31, 2026/);
+  });
+
+  it('never throws on an instant a Date cannot hold', () => {
+    // `Intl` throws RangeError past +/-8.64e15. A throw inside a formatter
+    // unmounts whatever is rendering, so every date helper degrades instead.
+    const fmt = createFormatter({ locale: 'en-US', currency: 'usd', timeZone: 'UTC' }, () => Date.UTC(2026, 4, 14));
+    for (const bad of [1e17, -1e17, 8.64e15 + 1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.equal(formatDate(bad), '—', `formatDate(${bad})`);
+      assert.equal(fmt.date(bad), '—', `fmt.date(${bad})`);
+      assert.equal(fmt.dateTime(bad), '—');
+      assert.equal(fmt.time(bad), '—');
+      assert.equal(fmt.month(bad), '—');
+      assert.equal(fmt.relative(bad), '—');
+      assert.equal(fmt.when(bad), '—');
+      assert.equal(fmt.dateRange(bad, bad), '— – —');
+    }
+    // The edge itself is a real instant and still formats.
+    assert.equal(formatDate(8.64e15, { timeZone: 'UTC' }), 'Sep 13, 275760');
+    assert.equal(formatRelative(Date.UTC(2026, 4, 13), Date.UTC(2026, 4, 14)), 'yesterday');
   });
 
   it('exposes a bound formatter', () => {
@@ -356,6 +375,68 @@ describe('overlay positioning', () => {
     assert.equal(result.width, 120);
   });
 
+  /**
+   * A box that stands in for a real popover: it reports the height it would
+   * actually render at, which is its content clipped by whatever `max-height`
+   * the last placement pass wrote.
+   */
+  const fakeBox = (naturalHeight: number, width = 260): FloatingElement => {
+    let clamp: number | null = null;
+    return {
+      get clamp() { return clamp; },
+      set clamp(v: number | null) { clamp = v; },
+      get size() { return { width, height: clamp === null ? naturalHeight : Math.min(naturalHeight, clamp) }; },
+    };
+  };
+
+  describe('a filter popover on a chip near the bottom edge', () => {
+    // The exact geometry the critic measured: a 1512x950 window, a chip 120px
+    // from the bottom, and a Status editor that wants 286px.
+    const tall = { width: 1512, height: 950 };
+    const lowAnchor = { x: 300, y: tall.height - 120, width: 96, height: 24 };
+
+    it('flips above the anchor', () => {
+      const result = repositionFloating(fakeBox(286), lowAnchor, tall, { placement: 'bottom-start' });
+      assert.equal(result?.placement, 'top-start');
+      assert.ok(result && result.y + 286 <= lowAnchor.y, `${result?.y} should sit clear of the chip`);
+      // Room for the whole editor, not the 120px floor it used to be pinned to.
+      assert.ok(result && result.maxHeight >= 286, `maxHeight ${result?.maxHeight}`);
+    });
+
+    it('stays flipped on every later pass, because the clamp comes off before measuring', () => {
+      const box = fakeBox(286);
+      const first = repositionFloating(box, lowAnchor, tall, { placement: 'bottom-start' });
+      // The clamp the first pass wrote is now on the box — this is the state a
+      // scroll, a resize or a re-render used to measure and get wrong.
+      assert.equal(box.clamp, first?.maxHeight);
+      const second = repositionFloating(box, lowAnchor, tall, { placement: 'bottom-start' });
+      assert.equal(second?.placement, 'top-start');
+      assert.deepEqual(second, first, 'placement must be stable, not creep on every pass');
+    });
+
+    it('is what measuring a stale clamp, or an unattached box, got wrong', () => {
+      // Placed at the 120px it was clamped to and then allowed back to 286px,
+      // the editor runs 40px off the bottom of the screen.
+      const stale = computePosition(lowAnchor, { width: 260, height: 120 }, tall, { placement: 'bottom-start' });
+      assert.ok(stale.y + 286 > tall.height, `${stale.y} + 286 should overflow ${tall.height}`);
+      const honest = repositionFloating(fakeBox(286), lowAnchor, tall, { placement: 'bottom-start' });
+      assert.ok(honest && honest.y + 286 <= tall.height, `${honest?.y} + 286 should fit in ${tall.height}`);
+      // And a box still inside a detached portal host measures 0x0, which fits
+      // under the chip — so it never flipped at all.
+      assert.equal(computePosition(lowAnchor, { width: 0, height: 0 }, tall, { placement: 'bottom-start' }).placement, 'bottom-start');
+    });
+
+    it('refuses to place a box that has not been laid out yet', () => {
+      // A detached portal host measures 0x0, and 0x0 fits anywhere.
+      assert.equal(repositionFloating(fakeBox(0, 0), lowAnchor, tall), null);
+    });
+
+    it('still goes under the anchor when the anchor is near the top', () => {
+      const result = repositionFloating(fakeBox(286), { ...lowAnchor, y: 40 }, tall, { placement: 'bottom-start' });
+      assert.equal(result?.placement, 'bottom-start');
+    });
+  });
+
   it('ranks command matches by where the query hits', () => {
     const entries = [
       { id: '1', title: 'Create invoice', group: 'Create', onSelect: () => {} },
@@ -612,6 +693,42 @@ describe('shareable table state', () => {
   it('ignores junk in a hand-edited URL instead of throwing', () => {
     assert.deepEqual(decodeFilters('~~~;status~set~;;bogus'), {});
     assert.deepEqual(decodeFilters('amount~number~gte~notanumber,'), {});
+    // Finite, but past what a Date can hold — these used to decode cleanly and
+    // then throw `Invalid time value` inside the chip label, blanking the page.
+    assert.deepEqual(decodeFilters('issuedAt~date~between~-1e17,1e17'), {});
+    assert.deepEqual(decodeFilters('issuedAt~date~between~-99999999999999999,99999999999999999'), {});
+    assert.deepEqual(decodeFilters('issuedAt~date~after~1e400,'), {});
+    // The bound one millisecond inside the limit is still a real filter.
+    assert.deepEqual(
+      decodeFilters('issuedAt~date~before~,8640000000000000'),
+      { issuedAt: { kind: 'date', to: 8.64e15, op: 'before' } },
+    );
+    // A number filter is not a date filter: huge amounts stay legal.
+    assert.deepEqual(decodeFilters('amount~number~gte~1e17,'), { amount: { kind: 'number', min: 1e17, op: 'gte' } });
+  });
+
+  it('describes an unrepresentable date bound instead of throwing on it', () => {
+    const iso = (ts: number) => new Date(ts).toISOString().slice(0, 10);
+    const chip = (f: ColumnFilter) => describeFilter(f, { formatDate: iso });
+    assert.equal(chip({ kind: 'date', op: 'between', from: -1e17, to: 1e17 }), 'is any date');
+    assert.equal(chip({ kind: 'date', op: 'after', from: Number.POSITIVE_INFINITY }), 'is any date');
+    assert.equal(chip({ kind: 'date', op: 'before', to: Number.NaN }), 'is any date');
+    // One good bound out of two still says everything it honestly can.
+    assert.equal(chip({ kind: 'date', op: 'between', from: JUL_1, to: 1e17 }), 'is on or after 2026-07-01');
+    // A formatter that throws on a perfectly good day degrades the same way.
+    assert.equal(
+      describeFilter({ kind: 'date', op: 'is', from: JUL_1, to: JUL_1 }, { formatDate: () => { throw new RangeError('Invalid time value'); } }),
+      'is any date',
+    );
+  });
+
+  it('treats an unrepresentable date bound as no bound when filtering', () => {
+    const rows = [{ at: JUL_1 }, { at: JUL_1 + 30 * DAY_MS }];
+    const at = (row: { at: number }) => row.at;
+    // NaN comparisons are always false, so a bad bound used to match everything
+    // *and* look like an active filter. Now it simply is not a bound.
+    assert.equal(matchesFilter(JUL_1, { kind: 'date', from: 1e17 }), true);
+    assert.deepEqual(filterRows(rows, { at: { kind: 'date', from: 1e17, to: JUL_1 } }, at), [{ at: JUL_1 }]);
   });
 });
 

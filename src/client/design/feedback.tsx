@@ -1,5 +1,5 @@
 import { useState, type CSSProperties, type ReactNode } from 'react';
-import { cx } from './layout';
+import { cx } from './cx';
 import { AlertTriangleIcon, Icons } from './icons';
 import './feedback.css';
 

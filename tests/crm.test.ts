@@ -1275,3 +1275,281 @@ describe('AI tools', () => {
     assert.equal(history.data[0].to_value, 'Send the security questionnaire');
   });
 });
+
+/* ------------------------ the audit trail is a total order ---------------- */
+
+/**
+ * A millisecond clock cannot order an audit trail: two saves land in the same
+ * tick constantly on a fast machine. Everything here is a consequence of that
+ * one fact — what a timeline entry is folded on, what a page cursor addresses,
+ * and what stops one typo poisoning every total the workspace reports.
+ */
+describe('history is ordered by the write, not by the clock', () => {
+  test('a create and the stage change after it never fold into one entry', async () => {
+    // Folding on `${record}|${changed_at}|${actor}` passed roughly two runs in
+    // three, so the proof has to be repetition rather than a single sample.
+    const stages = (await expectOk('GET', '/v1/pipelines/deal/new_business')).stages as { name: string; probability: number }[];
+    const negotiation = stages.find((s) => s.name === 'negotiation')!.probability;
+    const forecastBeforeTheClose = String(Math.round(80_000_00 * negotiation / 100));
+
+    const titles = new Map<string, number>();
+    for (let i = 0; i < 25; i++) {
+      const deal = await expectOk('POST', '/v1/records/deal', {
+        properties: { name: `Fold probe ${i}`, amount: 80_000_00, deal_stage: 'negotiation' },
+      });
+      await expectOk('PATCH', `/v1/records/deal/${deal.id}`, { properties: { deal_stage: 'closed_won' } });
+
+      const timeline = await expectOk('GET', `/v1/records/deal/${deal.id}/timeline?kinds=property_change&limit=10`);
+      assert.equal(timeline.data.length, 1, 'the close is one line; the create is already told by the event');
+      const entry = timeline.data[0];
+      titles.set(entry.title, (titles.get(entry.title) ?? 0) + 1);
+
+      assert.equal(entry.data.property, 'deal_stage');
+      assert.equal(entry.data.from, 'negotiation');
+      assert.equal(entry.data.to, 'closed_won');
+
+      const also = (entry.data.also ?? []) as { property: string; from: string | null }[];
+      const touched = [entry.data.property as string, ...also.map((a) => a.property)];
+      assert.equal(new Set(touched).size, touched.length,
+        `one save changes a property once, but this entry lists ${touched.join(', ')}`);
+      const weighted = also.find((a) => a.property === 'weighted_amount');
+      assert.equal(weighted?.from, forecastBeforeTheClose,
+        `the forecast this save moved was already ${forecastBeforeTheClose} — a null before it means the create folded in`);
+    }
+    assert.deepEqual([...titles], [['Stage changed', 25]],
+      'the property a person actually changed titles the entry, every single time');
+  });
+
+  test('every row names the save it belongs to and carries a sequence that only rises', async () => {
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Sequence probe', amount: 40_000_00 },
+    });
+    await expectOk('PATCH', `/v1/records/deal/${deal.id}`, { properties: { deal_stage: 'proposal' } });
+
+    const rows = (await expectOk('GET', `/v1/records/deal/${deal.id}/history?limit=200&order=asc`)).data as
+      { id: string; seq: number; write_id: string }[];
+    assert.ok(rows.length > 6, `expected a real trail, got ${rows.length} rows`);
+    for (let i = 1; i < rows.length; i++) {
+      assert.ok(rows[i].seq > rows[i - 1].seq, `seq went ${rows[i - 1].seq} → ${rows[i].seq}`);
+    }
+
+    const writes = [...new Set(rows.map((r) => r.write_id))];
+    assert.equal(writes.length, 2, 'two saves, two write ids');
+    // Contiguity is what lets a cursor cut between two saves instead of
+    // through the middle of one and re-fold the remainder into a phantom.
+    for (const write of writes) {
+      const seqs = rows.filter((r) => r.write_id === write).map((r) => r.seq);
+      assert.equal(Math.max(...seqs) - Math.min(...seqs), seqs.length - 1, `the rows of ${write} are not contiguous`);
+    }
+  });
+
+  test('paging on the cursor walks the whole trail exactly once, in both directions', async () => {
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Paging probe', amount: 100_000_00, deal_stage: 'qualification' },
+    });
+    for (const stage of ['discovery', 'proposal', 'negotiation', 'closed_won']) {
+      await expectOk('PATCH', `/v1/records/deal/${deal.id}`, { properties: { deal_stage: stage } });
+    }
+    const url = `/v1/records/deal/${deal.id}/history`;
+    const total = (await expectOk('GET', `${url}?limit=500`)).data.length;
+    assert.ok(total > 20, `expected a trail worth paging, got ${total} rows`);
+
+    for (const order of ['desc', 'asc'] as const) {
+      const expected = (await expectOk('GET', `${url}?limit=500&order=${order}`))
+        .data.map((r: { id: string }) => r.id);
+      for (const limit of [1, 3, 7]) {
+        const walked: string[] = [];
+        let cursor: string | null = null;
+        let pages = 0;
+        do {
+          const page = await expectOk('GET', `${url}?order=${order}&limit=${limit}${cursor ? `&after=${encodeURIComponent(cursor)}` : ''}`);
+          walked.push(...page.data.map((r: { id: string }) => r.id));
+          cursor = page.next_cursor;
+          pages++;
+        } while (cursor && pages <= total + 2);
+        assert.deepEqual(walked, expected, `${order} paging at limit ${limit} skipped or repeated a row`);
+      }
+    }
+  });
+
+  test('has_more is read off a row past the page, so a full last page is honest', async () => {
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Boundary probe', amount: 20_000_00 },
+    });
+    await expectOk('PATCH', `/v1/records/deal/${deal.id}`, { properties: { deal_stage: 'proposal' } });
+    const url = `/v1/records/deal/${deal.id}/history`;
+    const total = (await expectOk('GET', `${url}?limit=500`)).data.length;
+
+    const exact = await expectOk('GET', `${url}?limit=${total}`);
+    assert.equal(exact.data.length, total);
+    assert.equal(exact.has_more, false, 'a page holding the last row must not claim another');
+    assert.equal(exact.next_cursor, null);
+    assert.equal(exact.next_page, null);
+
+    const short = await expectOk('GET', `${url}?limit=${total - 1}`);
+    assert.equal(short.has_more, true);
+    assert.equal(short.next_page, `${url}?after=${encodeURIComponent(short.next_cursor)}&limit=${total - 1}`);
+    const rest = await expectOk('GET', short.next_page);
+    assert.equal(rest.data.length, 1);
+    assert.equal(rest.has_more, false);
+  });
+
+  test('`before` accepts the numeric instant this endpoint prints', async () => {
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Instant probe', amount: 30_000_00, deal_stage: 'discovery' },
+    });
+    const url = `/v1/records/deal/${deal.id}/history`;
+    const first = await expectOk('GET', `${url}?limit=4`);
+    const at = first.data[first.data.length - 1].changed_at;
+    assert.equal(typeof at, 'number', 'the endpoint prints an instant as a number');
+
+    const numeric = await expectOk('GET', `${url}?limit=4&before=${at}`);
+    const iso = await expectOk('GET', `${url}?limit=4&before=${new Date(at).toISOString()}`);
+    assert.deepEqual(
+      numeric.data.map((r: { id: string }) => r.id),
+      iso.data.map((r: { id: string }) => r.id),
+      'the two spellings of one instant are one filter',
+    );
+  });
+
+  test('an instant is refused as a cursor rather than quietly dropping its tick', async () => {
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Cursor shape probe', amount: 10_000_00 },
+    });
+    const res = await call('GET', `/v1/records/deal/${deal.id}/history?after=1788130545105`);
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error.code, 'cursor_invalid');
+    assert.equal(res.body.error.param, 'after');
+    assert.match(res.body.error.message, /next_cursor/);
+  });
+});
+
+describe('the timeline pages on a position, not on a timestamp', () => {
+  const AT = Date.UTC(2026, 4, 29, 9, 0, 0);
+  let dealId = '';
+  let expected: string[] = [];
+
+  before(async () => {
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Backfill probe', amount: 60_000_00 },
+    });
+    dealId = deal.id;
+    // One sync backfilling a day of calls stamps every one of them with the
+    // same instant. `before=<that instant>` returns the first and loses eleven.
+    for (let i = 0; i < 12; i++) {
+      await expectOk('POST', `/v1/records/deal/${dealId}/activities`, {
+        type: 'call', subject: `Backfilled call ${i}`, occurred_at: AT,
+      });
+    }
+    expected = (await expectOk('GET', `/v1/records/deal/${dealId}/timeline?limit=200`))
+      .data.map((i: { id: string }) => i.id);
+  });
+
+  test('twelve items inside one millisecond still come back one page at a time', async () => {
+    const whole = await expectOk('GET', `/v1/records/deal/${dealId}/timeline?limit=200`);
+    assert.equal(whole.data.filter((i: { at: number }) => i.at === AT).length, 12);
+
+    for (const limit of [1, 2, 5]) {
+      const walked: string[] = [];
+      let cursor: string | null = null;
+      let pages = 0;
+      do {
+        const page = await expectOk('GET', `/v1/records/deal/${dealId}/timeline?limit=${limit}${cursor ? `&after=${encodeURIComponent(cursor)}` : ''}`);
+        walked.push(...page.data.map((i: { id: string }) => i.id));
+        cursor = page.next_cursor;
+        pages++;
+      } while (cursor && pages <= expected.length + 2);
+      assert.deepEqual(walked, expected, `paging at limit ${limit} lost or repeated an item`);
+    }
+  });
+
+  test('every item carries the cursor that resumes immediately after it', async () => {
+    const page = await expectOk('GET', `/v1/records/deal/${dealId}/timeline?limit=4`);
+    const third = page.data[2];
+    assert.ok(third.cursor, 'an item without a cursor cannot be resumed from');
+    const resumed = await expectOk('GET', `/v1/records/deal/${dealId}/timeline?limit=2&after=${encodeURIComponent(third.cursor)}`);
+    assert.equal(resumed.data[0].id, page.data[3].id);
+  });
+
+  test('the page that holds the last item says so, and the one before it links on', async () => {
+    const url = `/v1/records/deal/${dealId}/timeline`;
+    const exact = await expectOk('GET', `${url}?limit=${expected.length}`);
+    assert.equal(exact.data.length, expected.length);
+    assert.equal(exact.has_more, false, 'a page holding every item must not claim another');
+    assert.equal(exact.next_cursor, null);
+    assert.equal(exact.next_page, null);
+
+    const short = await expectOk('GET', `${url}?limit=${expected.length - 1}`);
+    assert.equal(short.has_more, true);
+    assert.equal(short.next_page, `${url}?after=${encodeURIComponent(short.next_cursor)}&limit=${expected.length - 1}`);
+    assert.equal((await expectOk('GET', short.next_page)).data.length, 1);
+  });
+
+  test('a raw instant is refused as a cursor, and the message says why', async () => {
+    const res = await call('GET', `/v1/records/deal/${dealId}/timeline?after=${AT}`);
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error.code, 'cursor_invalid');
+    assert.equal(res.body.error.param, 'after');
+    assert.match(res.body.error.message, /millisecond/);
+  });
+});
+
+describe('an amount has a ceiling, so no rollup can go non-finite', () => {
+  const assertFinite = (value: unknown, path: string): void => {
+    if (typeof value === 'number') {
+      assert.ok(Number.isFinite(value), `${path} is ${value}, which serialises to null and blanks the report`);
+      return;
+    }
+    if (Array.isArray(value)) { value.forEach((item, i) => assertFinite(item, `${path}[${i}]`)); return; }
+    if (value && typeof value === 'object') {
+      for (const [key, inner] of Object.entries(value)) assertFinite(inner, `${path}.${key}`);
+    }
+  };
+
+  test('an unbounded amount is refused at the door, naming the property', async () => {
+    const res = await call('POST', '/v1/records/deal', { properties: { name: 'Poison pill', amount: 1e308 } });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error.code, 'property_invalid');
+    assert.equal(res.body.error.param, 'properties.amount');
+    assert.match(res.body.error.message, /capped at 10,000,000,000,000 minor units/);
+    assert.equal(await countMatching('deal', { property: 'name', operator: 'eq', value: 'Poison pill' }), 0);
+
+    for (const amount of [Number.POSITIVE_INFINITY, -1e308, 10_000_000_000_001]) {
+      const rejected = await call('POST', '/v1/records/deal', { properties: { name: 'Poison pill', amount } });
+      assert.equal(rejected.status, 400, `${amount} was accepted`);
+      assert.equal(rejected.body.error.param, 'properties.amount');
+    }
+  });
+
+  test('the largest legal amount leaves every number in every rollup finite', async () => {
+    const pipeline = await expectOk('GET', '/v1/pipelines/deal/new_business');
+    const proposal = pipeline.stages.find((s: { name: string }) => s.name === 'proposal');
+    const deal = await expectOk('POST', '/v1/records/deal', {
+      properties: { name: 'Ceiling probe', amount: 10_000_000_000_000, deal_stage: 'proposal' },
+    });
+    assert.equal(deal.properties.weighted_amount, Math.round(10_000_000_000_000 * proposal.probability / 100),
+      'the record and the forecast agree at the ceiling');
+
+    for (const path of [
+      '/v1/crm/overview',
+      '/v1/pipelines/deal',
+      '/v1/pipelines/deal/new_business',
+      '/v1/pipelines/deal/new_business/velocity',
+      `/v1/records/deal/${deal.id}`,
+      `/v1/records/deal/${deal.id}/timeline?limit=50`,
+    ]) {
+      assertFinite(await expectOk('GET', path), path);
+    }
+
+    // The record and the rollup have to tell the same story: the headline is
+    // the sum of the rows a person can see, not a separately computed number.
+    const overview = await expectOk('GET', '/v1/crm/overview');
+    const open = overview.pipeline.filter((r: { is_closed: boolean }) => !r.is_closed);
+    assert.equal(overview.open_pipeline.amount, open.reduce((n: number, r: { amount: number }) => n + r.amount, 0));
+    assert.equal(overview.open_pipeline.weighted_amount,
+      open.reduce((n: number, r: { weighted_amount: number }) => n + r.weighted_amount, 0));
+    assert.ok(overview.open_pipeline.amount >= 10_000_000_000_000, 'the ceiling deal is counted, not dropped');
+
+    await expectOk('DELETE', `/v1/records/deal/${deal.id}?permanent=true`);
+  });
+});

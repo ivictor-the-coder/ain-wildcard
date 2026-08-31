@@ -1,13 +1,15 @@
 import {
   forwardRef, type CSSProperties, type ElementType, type HTMLAttributes, type ReactNode,
 } from 'react';
+import { ErrorBoundary } from './error-boundary';
+import { cx } from './cx';
 import './layout.css';
+
+export { cx } from './cx';
 
 export type Space = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14;
 const space = (n: Space | undefined): string | undefined => (n === undefined ? undefined : `var(--space-${n})`);
 
-export const cx = (...parts: unknown[]): string =>
-  parts.filter((p): p is string => typeof p === 'string' && p.length > 0).join(' ');
 
 /* -------------------------------- Page ----------------------------------- */
 
@@ -53,7 +55,19 @@ export function Page({
         </div>
         {tabs && <div className="ain-page__tabs">{tabs}</div>}
       </header>
-      <div className={cx('ain-page__body', flush && 'is-flush')}>{children}</div>
+      <div className={cx('ain-page__body', flush && 'is-flush')}>
+        {/* Every routed screen in the product is a Page, so this is the boundary
+            that decides whether a bug in one module costs the operator a panel
+            or the whole app. It costs a panel: the header, the nav and the
+            command palette stay live and they can navigate away. */}
+        <ErrorBoundary
+          title="This page stopped rendering"
+          message="Something in it threw while drawing. The rest of the app is unaffected — you can navigate away, or try again. If it keeps failing, quote the message below."
+          resetKeys={[title]}
+        >
+          {children}
+        </ErrorBoundary>
+      </div>
     </div>
   );
 }

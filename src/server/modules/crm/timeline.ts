@@ -1,7 +1,8 @@
 import type { Ctx } from '../../kernel/context';
 import { parseJson } from '../../kernel/db';
+import { badRequest } from '../../../shared/errors';
 import { formatDate, formatDateTime } from '../../../shared/time';
-import type { Crm } from './store';
+import { encodeHistoryCursor, type Crm } from './store';
 import type { CrmRecord, HistoryEntry, PropertyDef, PropertyValue, TimelineItem } from './types';
 
 /**
@@ -14,9 +15,46 @@ import type { CrmRecord, HistoryEntry, PropertyDef, PropertyValue, TimelineItem 
 
 export interface TimelineOptions {
   limit?: number;
+  /** A time filter a person can type: only what happened strictly before it. */
   before?: number;
+  /** The opaque cursor this module emits — a position, not an instant. */
+  after?: string;
   rollUp?: boolean;
   kinds?: TimelineItem['kind'][];
+}
+
+export interface TimelinePage {
+  items: TimelineItem[];
+  has_more: boolean;
+  next_cursor: string | null;
+}
+
+/** One past the page ceiling, because the pager reads a row it will not show. */
+const MAX_TIMELINE_LIMIT = 200;
+
+/**
+ * A timeline position: the instant, the tiebreak within it, and the item's id.
+ * A millisecond alone cannot address a row — six calls backfilled by one
+ * import share an instant, and `before=<that instant>` skips five of them —
+ * so the cursor carries the whole sort key and resumes on exactly one row.
+ */
+interface TimelineCursor { at: number; rank: number; id: string }
+
+const encodeCursor = (at: number, rank: number, id: string): string =>
+  Buffer.from(`t1.${at}.${rank}.${id}`).toString('base64url');
+
+function decodeCursor(cursor: string | undefined): TimelineCursor | null {
+  if (!cursor) return null;
+  const [tag, at, rank, ...rest] = Buffer.from(cursor, 'base64url').toString('utf8').split('.');
+  const id = rest.join('.');
+  if (tag !== 't1' || !id || !Number.isInteger(Number(at)) || !Number.isInteger(Number(rank))) {
+    throw badRequest(
+      'cursor_invalid',
+      'That is not a timeline cursor. Pass the previous page’s `next_cursor` back as `after`, or start again without it. `before` is a time filter and cannot page — items sharing a millisecond would fall through it.',
+      'after',
+    );
+  }
+  return { at: Number(at), rank: Number(rank), id };
 }
 
 const EVENT_TITLES: Record<string, string> = {
@@ -28,11 +66,15 @@ const EVENT_TITLES: Record<string, string> = {
 };
 
 export function buildTimeline(ctx: Ctx, crm: Crm, orgId: string, record: CrmRecord, options: TimelineOptions = {}): TimelineItem[] {
-  const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
-  const before = options.before ?? Number.MAX_SAFE_INTEGER;
+  const limit = Math.min(Math.max(options.limit ?? 50, 1), MAX_TIMELINE_LIMIT + 1);
+  const cursor = decodeCursor(options.after);
+  // Resuming from a cursor has to re-read the millisecond the last page ended
+  // in — everything else in that tick is still to come — and drop only what
+  // sits at or before the cursor's own position inside it.
+  const before = Math.min(options.before ?? Number.MAX_SAFE_INTEGER, cursor ? cursor.at + 1 : Number.MAX_SAFE_INTEGER);
   const wanted = new Set<TimelineItem['kind']>(options.kinds?.length ? options.kinds : ['activity', 'property_change', 'event', 'association']);
   const activityTypes = crm.activityTypes(orgId);
-  const items: TimelineItem[] = [];
+  const items: Omit<TimelineItem, 'cursor'>[] = [];
   // Two saves can share a millisecond, so the timeline needs a tiebreak that
   // is not the clock. Property changes carry the write sequence; everything
   // else falls back to its id, which is stable across requests either way.
@@ -56,6 +98,14 @@ export function buildTimeline(ctx: Ctx, crm: Crm, orgId: string, record: CrmReco
     const ids = anchors.slice(0, 250);
     const idPlaceholders = ids.map(() => '?').join(',');
     const typePlaceholders = activityTypes.map(() => '?').join(',');
+    // An import that backfills a day of calls stamps them all with the same
+    // instant, so the window this page reads has to be cut on the cursor
+    // itself, not on the tick it fell in — otherwise page two re-reads the
+    // same few rows the clock happens to hand back first and the rest of the
+    // cluster is never returned at all. `rank === 0` for every non-property
+    // item, so an id comparison is the whole tiebreak within the instant.
+    const withinTick = cursor && cursor.rank === 0
+      ? 'AND (COALESCE(v.value_date, r.created) < ? OR r.id > ?)' : '';
     const rows = ctx.db.all<any>(
       `SELECT r.id AS rid, r.object_type, r.display_name, r.properties, r.created, r.created_by, r.owner_id,
               COALESCE(v.value_date, r.created) AS at,
@@ -66,9 +116,12 @@ export function buildTimeline(ctx: Ctx, crm: Crm, orgId: string, record: CrmReco
         WHERE a.org_id = ? AND (a.from_id IN (${idPlaceholders}) OR a.to_id IN (${idPlaceholders}))
           AND r.object_type IN (${typePlaceholders}) AND r.archived = 0
           AND COALESCE(v.value_date, r.created) < ?
-        ORDER BY at DESC LIMIT ?`,
+          ${withinTick}
+        ORDER BY at DESC, rid ASC LIMIT ?`,
       ...(ids as never[]), ...(ids as never[]), orgId, ...(ids as never[]), ...(ids as never[]),
-      ...(activityTypes as never[]), before, limit * 3,
+      ...(activityTypes as never[]), before,
+      ...(withinTick ? [cursor!.at, cursor!.id] as never[] : []),
+      limit * 3,
     );
     // An activity linked to both a contact and its company arrives twice; keep
     // the row that names the contact so the account timeline reads "via Elena".
@@ -116,8 +169,20 @@ export function buildTimeline(ctx: Ctx, crm: Crm, orgId: string, record: CrmReco
     // whenever two landed in the same millisecond, which is most of the time
     // on a fast machine: a create and a stage change became one row titled
     // after whichever property happened to sort first.
+    //
+    // One save's rows are consecutive in the write sequence, so the group is
+    // addressed by its first `seq`: a cursor cut there lands between two saves
+    // and can never slice one in half and re-fold the remainder into a phantom
+    // second entry. A cursor on any other kind of item excludes the whole
+    // tick's changes, because a change never sorts after a plain item inside
+    // its own millisecond.
     const grouped = new Map<string, HistoryEntry[]>();
-    for (const entry of crm.history(orgId, record.id, { limit: limit * 4, before: before === Number.MAX_SAFE_INTEGER ? undefined : before })) {
+    const changesBefore = cursor && cursor.rank === 0 ? Math.min(before, cursor.at) : before;
+    for (const entry of crm.history(orgId, record.id, {
+      limit: limit * 4,
+      before: changesBefore === Number.MAX_SAFE_INTEGER ? undefined : changesBefore,
+      after: cursor && cursor.rank > 0 ? encodeHistoryCursor(cursor.at, cursor.rank) : undefined,
+    })) {
       const bucket = grouped.get(entry.write_id);
       if (bucket) bucket.push(entry); else grouped.set(entry.write_id, [entry]);
     }
@@ -148,7 +213,7 @@ export function buildTimeline(ctx: Ctx, crm: Crm, orgId: string, record: CrmReco
       const shown = rest.slice(0, 4);
       const body = [render(lead), ...shown.map((e) => `${e.property_label} ${render(e)}`)].join(' · ')
         + (rest.length > shown.length ? ` · and ${rest.length - shown.length} more` : '');
-      order.set(lead.id, lead.seq);
+      order.set(lead.id, group.reduce((low, e) => Math.min(low, e.seq), lead.seq));
       items.push({
         object: 'timeline_item',
         id: lead.id,
@@ -214,9 +279,44 @@ export function buildTimeline(ctx: Ctx, crm: Crm, orgId: string, record: CrmReco
     }
   }
 
+  // `(at, rank, id)` is a total order — no two items can tie — which is what
+  // makes the cursor exact and `has_more` a fact rather than a guess.
+  //
+  // The id tiebreak is a byte comparison, not `localeCompare`: ids are mixed
+  // case, SQLite orders them by code point, and a locale collation that reads
+  // "b" before "C" disagrees with the window the query returned — enough to
+  // hand back one item twice and never return another.
+  const rankOf = (item: Omit<TimelineItem, 'cursor'>): number => order.get(item.id) ?? 0;
+  const byId = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+  const beyondCursor = (item: Omit<TimelineItem, 'cursor'>): boolean => {
+    if (!cursor) return true;
+    if (item.at !== cursor.at) return item.at < cursor.at;
+    const rank = rankOf(item);
+    if (rank !== cursor.rank) return rank < cursor.rank;
+    return item.id > cursor.id;
+  };
   return items
-    .sort((a, b) => b.at - a.at || (order.get(b.id) ?? 0) - (order.get(a.id) ?? 0) || a.id.localeCompare(b.id))
-    .slice(0, limit);
+    .filter(beyondCursor)
+    .sort((a, b) => b.at - a.at || rankOf(b) - rankOf(a) || byId(a.id, b.id))
+    .slice(0, limit)
+    .map((item) => ({ ...item, cursor: encodeCursor(item.at, rankOf(item), item.id) }));
+}
+
+/**
+ * One page of the timeline and the cursor that resumes immediately after it.
+ * The page is measured by reading one item it will not show: `has_more` is
+ * then a fact, where `items.length === limit` lies every time a page lands
+ * exactly on the end of the record's history.
+ */
+export function buildTimelinePage(
+  ctx: Ctx, crm: Crm, orgId: string, record: CrmRecord, options: TimelineOptions = {},
+): TimelinePage {
+  const limit = Math.min(Math.max(options.limit ?? 50, 1), MAX_TIMELINE_LIMIT);
+  const rows = buildTimeline(ctx, crm, orgId, record, { ...options, limit: limit + 1 });
+  const has_more = rows.length > limit;
+  const items = has_more ? rows.slice(0, limit) : rows;
+  const last = items[items.length - 1];
+  return { items, has_more, next_cursor: has_more && last ? last.cursor : null };
 }
 
 /**

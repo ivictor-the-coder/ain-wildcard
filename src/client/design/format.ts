@@ -13,6 +13,7 @@ import {
   formatRelative as formatRelativeBase,
 } from '../../shared/time';
 import { useSession } from '../kernel/session';
+import { isTimestamp } from './calendar-core';
 
 export interface FormatLocale {
   locale: string;
@@ -143,8 +144,14 @@ export interface DateOptions {
   withYear?: boolean;
 }
 
+/**
+ * A throw inside a formatter takes down whatever is rendering, and timestamps
+ * arrive from query strings, saved views and API payloads — not all of them
+ * sane. Every date helper below treats an instant outside `MAX_TIMESTAMP` the
+ * same way it treats `null`: an em dash, never a `RangeError`.
+ */
 export function formatDate(ts: number | null | undefined, o: DateOptions = {}): string {
-  if (ts === null || ts === undefined || !Number.isFinite(ts)) return '—';
+  if (!isTimestamp(ts)) return '—';
   return formatDateBase(ts, {
     locale: o.locale || DEFAULT_LOCALE.locale,
     timeZone: o.timeZone || DEFAULT_LOCALE.timeZone,
@@ -158,31 +165,34 @@ export function formatDateTime(ts: number | null | undefined, o: DateOptions = {
 }
 
 export function formatTime(ts: number | null | undefined, o: DateOptions = {}): string {
-  if (ts === null || ts === undefined || !Number.isFinite(ts)) return '—';
+  if (!isTimestamp(ts)) return '—';
   return new Intl.DateTimeFormat(o.locale || DEFAULT_LOCALE.locale, {
     timeZone: o.timeZone || DEFAULT_LOCALE.timeZone, hour: 'numeric', minute: '2-digit',
   }).format(ts);
 }
 
 export function formatMonth(ts: number, o: DateOptions = {}): string {
+  if (!isTimestamp(ts)) return '—';
   return new Intl.DateTimeFormat(o.locale || DEFAULT_LOCALE.locale, {
     timeZone: o.timeZone || DEFAULT_LOCALE.timeZone, month: 'short', year: o.withYear === false ? undefined : 'numeric',
   }).format(ts);
 }
 
 export function formatRelative(ts: number | null | undefined, now: number, locale = DEFAULT_LOCALE.locale): string {
-  if (ts === null || ts === undefined || !Number.isFinite(ts)) return '—';
+  if (!isTimestamp(ts) || !isTimestamp(now)) return '—';
   return formatRelativeBase(ts, now, locale);
 }
 
 /** "3 days ago" under a week, an absolute date beyond it — how activity feeds read. */
 export function formatWhen(ts: number, now: number, o: DateOptions = {}): string {
+  if (!isTimestamp(ts) || !isTimestamp(now)) return '—';
   return Math.abs(now - ts) < 6 * DAY
     ? formatRelative(ts, now, o.locale)
     : formatDate(ts, { ...o, withYear: new Date(ts).getUTCFullYear() !== new Date(now).getUTCFullYear() });
 }
 
 export function formatDateRange(start: number, end: number, o: DateOptions = {}): string {
+  if (!isTimestamp(start) || !isTimestamp(end)) return `${formatDate(start, o)} – ${formatDate(end, o)}`;
   const locale = o.locale || DEFAULT_LOCALE.locale;
   const timeZone = o.timeZone || DEFAULT_LOCALE.timeZone;
   const sameYear = new Date(start).getUTCFullYear() === new Date(end).getUTCFullYear();

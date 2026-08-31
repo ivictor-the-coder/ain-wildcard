@@ -6,14 +6,15 @@ import { ChevronDownIcon, ChevronsUpDownIcon, FilterXIcon, Icons } from './icons
 import { Button, Checkbox, SegmentedControl } from './controls';
 import { Input, SearchInput, Select } from './fields';
 import { Calendar } from './datepicker';
-import { RANGE_PRESETS, startOfMonthUtc, type DateRange } from './calendar-core';
+import { RANGE_PRESETS, isTimestamp, startOfMonthUtc, type DateRange } from './calendar-core';
 import { Menu, MenuButton, Popover, type MenuSection } from './overlays';
 import { EmptyState, ErrorState, Skeleton } from './feedback';
+import { ErrorBoundary } from './error-boundary';
 import { formatNumber, humanize, useFormat } from './format';
 import { useDocumentDensity, useIsomorphicLayoutEffect, useVirtualRows } from './hooks';
 import { DAY, startOfDay } from '../../shared/time';
 import {
-  activeFilterCount, dateExtent, describeFilter, extendSelection, filterRows,
+  EMPTY_TABLE_STATE, activeFilterCount, dateExtent, describeFilter, extendSelection, filterRows,
   isFilterEmpty, rangeBetween, searchRows, selectionState, sortRows, splitSelection, sumColumn,
   toggleId, toggleSort, valueCounts,
   type CellValue, type ColumnFilter, type DateOperator, type FilterKind, type FilterMap,
@@ -129,7 +130,30 @@ const emptyFilterFor = (kind: FilterKind): ColumnFilter => {
   return { kind: 'date', op: 'between' };
 };
 
-export function DataTable<T>({
+/**
+ * Every list view in the product is a DataTable, and a DataTable renders code it
+ * does not own: `cell`, `total`, `filterOptionLabel`, `rowActions`, `bulkActions`.
+ * A throw in any of them used to unmount the whole app. Behind this boundary it
+ * costs the operator the grid, not the page — and the recovery clears the view
+ * state, which is where a bad value gets in from (a hand-edited share link).
+ */
+export function DataTable<T>(props: DataTableProps<T>) {
+  const { value, onChange } = props;
+  return (
+    <ErrorBoundary
+      className="ain-table-wrap ain-table-wrap--failed"
+      title="This table could not be drawn"
+      message="One of its columns threw while rendering. Resetting clears the search, sort and filters — including anything a shared link put there — and rebuilds the grid."
+      retryLabel="Reset this view"
+      resetKeys={[value?.query, value?.sort, value?.filters, props.rows, props.columns]}
+      onReset={() => onChange?.(EMPTY_TABLE_STATE)}
+    >
+      <DataTableGrid {...props} />
+    </ErrorBoundary>
+  );
+}
+
+function DataTableGrid<T>({
   rows, columns, getRowId, caption, loading, error, onRetry, empty, emptyFiltered,
   onRowClick, rowActions, rowTone, selectable, selected, onSelectionChange, bulkActions,
   toolbar, searchable = true, searchPlaceholder = 'Search this table…', initialSort = null,
@@ -913,13 +937,18 @@ function DateEditor<T>({
   const fmt = useFormat();
   const op = filter.op ?? 'between';
   const extent = useMemo(() => dateExtent(rows, column.id, accessor), [rows, column.id, accessor]);
-  const anchorDay = op === 'after' && filter.from !== undefined ? filter.from - DAY
-    : op === 'before' && filter.to !== undefined ? filter.to + DAY
-      : filter.from ?? filter.to ?? null;
+  // A bound the calendar cannot represent — a hand-edited link, a bad import —
+  // would make every `getUTC*` call NaN and render a month of blank cells.
+  const from = isTimestamp(filter.from) ? filter.from : undefined;
+  const to = isTimestamp(filter.to) ? filter.to : undefined;
+  const rawAnchor = op === 'after' && from !== undefined ? from - DAY
+    : op === 'before' && to !== undefined ? to + DAY
+      : from ?? to ?? null;
+  const anchorDay = isTimestamp(rawAnchor) ? rawAnchor : null;
   const [month, setMonth] = useState(() => startOfMonthUtc(anchorDay ?? extent?.max ?? fmt.now()));
   const [hover, setHover] = useState<number | null>(null);
 
-  const range: DateRange = { start: filter.from ?? null, end: filter.to ?? null };
+  const range: DateRange = { start: from ?? null, end: to ?? null };
 
   const setOp = (next: DateOperator) => {
     // Carry the day the operator was pointing at across the switch.
@@ -936,12 +965,12 @@ function DateEditor<T>({
     if (op === 'after') { onChange({ kind: 'date', op, from: day + DAY }); return; }
     if (op === 'before') { onChange({ kind: 'date', op, to: day - DAY }); return; }
     if (op === 'is') { onChange({ kind: 'date', op, from: day, to: day }); return; }
-    if (filter.from === undefined || filter.to !== undefined) {
+    if (from === undefined || to !== undefined) {
       onChange({ kind: 'date', op, from: day, to: undefined });
-    } else if (day < filter.from) {
-      onChange({ kind: 'date', op, from: day, to: filter.from });
+    } else if (day < from) {
+      onChange({ kind: 'date', op, from: day, to: from });
     } else {
-      onChange({ kind: 'date', op, from: filter.from, to: day });
+      onChange({ kind: 'date', op, from, to: day });
     }
   };
 
@@ -960,7 +989,7 @@ function DateEditor<T>({
         <div className="ain-filtered__presets">
           {RANGE_PRESETS.map((preset) => {
             const r = preset.range(fmt.now());
-            const active = filter.from === r.start && filter.to === r.end;
+            const active = from === r.start && to === r.end;
             return (
               <button
                 key={preset.id}

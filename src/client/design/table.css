@@ -4,6 +4,9 @@
   border-radius: var(--radius-lg); overflow: hidden;
 }
 .ain-table-wrap--plain { border: none; border-radius: 0; background: transparent; }
+/* The grid's error boundary keeps the card so the page's rhythm survives a
+   column that threw — the operator sees a panel with a way out, not a hole. */
+.ain-table-wrap--failed { align-items: center; justify-content: center; min-height: 260px; }
 
 /* ------------------------------- toolbar --------------------------------- */
 .ain-table__bar {

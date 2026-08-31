@@ -703,14 +703,22 @@ export class Crm {
     if (opts.property) { clauses.push('property = ?'); params.push(opts.property); }
     if (opts.before) { clauses.push('changed_at < ?'); params.push(opts.before); }
     if (opts.since) { clauses.push('changed_at >= ?'); params.push(opts.since); }
+    // A cursor means "the row after this position in the order you are reading
+    // in", so the comparison has to follow the sort. Fixed at `<` it paged the
+    // wrong way round under `order=asc`: every page walked back towards the
+    // oldest row, repeating what it had already returned and never reaching
+    // the rest of the trail.
+    const ascending = opts.order === 'asc';
+    const direction = ascending ? 'ASC' : 'DESC';
     const after = decodeHistoryCursor(opts.after);
     if (after) {
-      clauses.push('(changed_at < ? OR (changed_at = ? AND seq < ?))');
+      const beyond = ascending ? '>' : '<';
+      clauses.push(`(changed_at ${beyond} ? OR (changed_at = ? AND seq ${beyond} ?))`);
       params.push(after.changed_at, after.changed_at, after.seq);
     }
     const rows = this.ctx.db.all<HistoryRow>(
       `SELECT * FROM crm_property_history WHERE ${clauses.join(' AND ')}
-        ORDER BY changed_at ${opts.order === 'asc' ? 'ASC' : 'DESC'}, seq ${opts.order === 'asc' ? 'ASC' : 'DESC'} LIMIT ?`,
+        ORDER BY changed_at ${direction}, seq ${direction} LIMIT ?`,
       ...(params as never[]), Math.min(Math.max(opts.limit ?? 100, 1), 500),
     );
     return rows.map((row) => this.hydrateHistory(orgId, row));
@@ -1202,7 +1210,7 @@ function signatureOf(objectType: string, query: SearchQuery): string {
  * timestamp: `(changed_at, seq)` is a total order, so resuming from it lands on
  * the very next row even when a dozen changes share one millisecond.
  */
-function encodeHistoryCursor(changedAt: number, seq: number): string {
+export function encodeHistoryCursor(changedAt: number, seq: number): string {
   return Buffer.from(`h1.${changedAt}.${seq}`).toString('base64url');
 }
 

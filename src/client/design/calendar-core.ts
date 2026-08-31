@@ -12,6 +12,18 @@ export interface CalendarDay {
   weekday: number;
 }
 
+/**
+ * The widest instant a `Date` can hold. Past it `getUTCFullYear()` is NaN and
+ * every `Intl` formatter throws `RangeError: Invalid time value` — so anything
+ * that reaches a calendar or a formatter from a query string, a saved view or
+ * an API payload gets checked against this first.
+ */
+export const MAX_TIMESTAMP = 8.64e15;
+
+/** A number that names an instant a calendar and a formatter can both handle. */
+export const isTimestamp = (ts: number | null | undefined): ts is number =>
+  typeof ts === 'number' && Number.isFinite(ts) && Math.abs(ts) <= MAX_TIMESTAMP;
+
 export const utc = (year: number, month: number, day: number): number => Date.UTC(year, month, day);
 export const yearOf = (ts: number): number => new Date(ts).getUTCFullYear();
 export const monthOf = (ts: number): number => new Date(ts).getUTCMonth();

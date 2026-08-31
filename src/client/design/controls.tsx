@@ -2,7 +2,7 @@ import {
   forwardRef, useCallback, useEffect, useId, useRef, useState,
   type ButtonHTMLAttributes, type ChangeEvent, type InputHTMLAttributes, type ReactNode,
 } from 'react';
-import { cx } from './layout';
+import { cx } from './cx';
 import { Spinner } from './feedback';
 import './controls.css';
 

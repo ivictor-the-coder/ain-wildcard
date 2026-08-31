@@ -12,10 +12,10 @@ import { useSession } from '../../kernel/session';
 import { useRouter } from '../../kernel/router';
 import {
   Accordion, Avatar, AvatarGroup, Badge, Banner, BarChart, Breadcrumbs, Button, ButtonGroup,
-  ArrowLeftIcon, ArrowRightIcon, CheckCircleIcon, ChevronDownIcon, CreditCardIcon, FilterXIcon, XCircleIcon,
+  AlertTriangleIcon, ArrowLeftIcon, ArrowRightIcon, CheckCircleIcon, ChevronDownIcon, CreditCardIcon, FilterXIcon, XCircleIcon,
   Calendar, Card, Checkbox, CodeInput, Combobox, CommandList, ConfirmDialog, CopyField, DataTable,
   DatePicker, DateRangePicker, Delta, DescriptionList, Divider, DonutChart, Drawer, EmptyState,
-  ErrorState, Field, FunnelChart, Grid, Heatmap, Icons, IconButton, ICON_NAMES, Inline, Input,
+  ErrorBoundary, ErrorState, Field, FunnelChart, Grid, Heatmap, Icons, IconButton, ICON_NAMES, Inline, Input,
   Kbd, KeyValue, LineChart, Menu, MenuButton, Meter, MetricTile, Modal, MoneyInput, NumberInput,
   Pagination, Panel, Pill, PillGroup, Popover, ProgressBar, Radio, RadioGroup, ScrollArea,
   RANGE_PRESETS, SearchInput, Section, SegmentedControl, Select, Skeleton, SkeletonText, Slider, Sparkline,
@@ -426,7 +426,13 @@ function Doc({ id, title, description, imports, api, children }: {
         </div>
       </div>
       {imports && <CodeBlock label="Import" code={`import { ${imports} } from '@/client/design';`} />}
-      {children}
+      <ErrorBoundary
+        title={`The ${title.toLowerCase()} demos stopped rendering`}
+        message="Every other section on this page is still live — this one alone is isolated. Reset it to mount the demos again."
+        retryLabel="Reset this section"
+      >
+        {children}
+      </ErrorBoundary>
       {api && api.length > 0 && <PropsTable specs={api} />}
     </section>
   );
@@ -2049,7 +2055,7 @@ function FeedbackSection({ data }: { data: Derived }) {
       id="feedback"
       title="Feedback"
       description="Loading, empty and error states are designed first — they are what a user sees on their first day and on the worst day."
-      imports="Banner, DismissibleBanner, EmptyState, ErrorState, Skeleton, SkeletonText, Spinner"
+      imports="Banner, DismissibleBanner, EmptyState, ErrorBoundary, ErrorState, Skeleton, SkeletonText, Spinner"
       api={API.feedback}
     >
       <Demo title="Banners"
@@ -2214,7 +2220,65 @@ function NavigationSection() {
           </Collapsible>
         </Demo>
       </div>
+      <ResilienceDemo />
     </Doc>
+  );
+}
+
+/**
+ * A component that throws the way the real bug did: a timestamp no `Date` can
+ * hold, handed straight to a formatter. It is here so the boundary around it can
+ * be seen working, not described.
+ */
+function BrokenCell({ broken }: { broken: boolean }) {
+  const fmt = useFormat();
+  if (broken) {
+    // Exactly what `?filter=issuedAt~date~between~-1e17,1e17` used to reach.
+    return <span>{new Intl.DateTimeFormat(fmt.locale, { timeZone: 'UTC' }).format(1e17)}</span>;
+  }
+  return (
+    <Stack gap={2}>
+      <KeyValue label="Renews" value={fmt.date(fmt.now() + 21 * DAY)} />
+      <KeyValue label="Next invoice" value="Estimated from usage to date" />
+      <KeyValue label="Committed" value={fmt.money(4_800_00)} strong />
+    </Stack>
+  );
+}
+
+function ResilienceDemo() {
+  const [broken, setBroken] = useState(false);
+  return (
+    <Demo
+      title="Error boundary"
+      note="Break the panel, then recover it. The page around it never reloads."
+      code={"<ErrorBoundary\n  title=\"This section stopped rendering\"\n  message=\"The rest of the page is still live.\"\n  resetKeys={[recordId]}          // navigating away clears it on its own\n  onReset={() => setState(EMPTY_TABLE_STATE)}\n>\n  <RiskyThing />\n</ErrorBoundary>\n\n// Page and DataTable already wrap their children in one, so a module never\n// has to remember: a throw costs a panel, not the whole app."}
+    >
+      <Inline gap={4} wrap>
+        <Button
+          size="sm"
+          variant={broken ? 'secondary' : 'danger'}
+          iconLeft={<AlertTriangleIcon size={14} />}
+          onClick={() => setBroken((v) => !v)}
+        >
+          {broken ? 'Repair the panel' : 'Make the panel throw'}
+        </Button>
+        <span className="sg__demonote">
+          {broken
+            ? 'The panel below threw a RangeError while rendering. Everything else on this page still works — scroll it, open a menu, switch the theme.'
+            : 'The panel below formats a date. Break it and it is handed an instant no calendar can represent.'}
+        </span>
+      </Inline>
+      <Card title="Subscription" description="Fleet Enterprise, billed yearly">
+        <ErrorBoundary
+          title="This panel stopped rendering"
+          message="It was handed a value it could not draw. Nothing else on the page was affected — repair it above, or reset the panel here."
+          retryLabel="Reset the panel"
+          resetKeys={[broken]}
+        >
+          <BrokenCell broken={broken} />
+        </ErrorBoundary>
+      </Card>
+    </Demo>
   );
 }
 
@@ -2351,6 +2415,7 @@ function DesignSystemPage() {
     <ToastProvider>
       <div className="sg">
         <a className="sg__skip" href="#main">Skip to the components</a>
+
         <aside className="sg__side">
           <div className="sg__brand">
             <span className="sg__mark"><Icons.sparkles size={17} /></span>

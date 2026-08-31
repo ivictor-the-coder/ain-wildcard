@@ -5,7 +5,7 @@ import { ApiError, badRequest, isApiError, notFound } from '../../../shared/erro
 import v from '../../../shared/validate';
 import { CRM_MIGRATIONS } from './schema';
 import { Crm, type HistoryQuery } from './store';
-import { buildTimeline, type TimelineOptions } from './timeline';
+import { buildTimeline, buildTimelinePage, type TimelineOptions, type TimelinePage } from './timeline';
 import { findSimilar, mergeRecords, type MergeResult, type SimilarMatch } from './dedupe';
 import { installBuiltins, seedCrm } from './seed';
 import { EXPRESSION_FUNCTIONS } from './expr';
@@ -68,6 +68,8 @@ export interface CrmService {
 
   logActivity(orgId: string, input: LogActivityInput, opts?: WriteOptions): CrmRecord;
   timeline(orgId: string, objectType: string, id: string, opts?: TimelineOptions): TimelineItem[];
+  /** The same merge, paged on a cursor that cannot skip an item. */
+  timelinePage(orgId: string, objectType: string, id: string, opts?: TimelineOptions): TimelinePage;
   history(orgId: string, recordId: string, opts?: HistoryQuery): HistoryEntry[];
   /** The same trail, paged on a cursor that cannot skip a row. */
   historyPage(orgId: string, recordId: string, opts?: HistoryQuery): HistoryPage;
@@ -249,6 +251,7 @@ export default defineModule({
       },
 
       timeline: (orgId, objectType, id, opts) => buildTimeline(ctx, crm, orgId, crm.require(orgId, objectType, id), opts),
+      timelinePage: (orgId, objectType, id, opts) => buildTimelinePage(ctx, crm, orgId, crm.require(orgId, objectType, id), opts),
       history: (orgId, recordId, opts) => crm.history(orgId, recordId, opts),
       historyPage: (orgId, recordId, opts) => crm.historyPage(orgId, recordId, opts),
       stageHistory: (orgId, objectType, id) => stageHistory(ctx, crm, orgId, crm.require(orgId, objectType, id)),
@@ -992,23 +995,29 @@ export default defineModule({
       const record = crm.require(orgId, req.params.type, req.params.id);
       const q = req.query as Record<string, string | undefined>;
       const limit = q.limit ? Number(q.limit) : 50;
-      const items = buildTimeline(ctx, crm, orgId, record, {
+      const kinds = splitList(q.kinds);
+      const page = buildTimelinePage(ctx, crm, orgId, record, {
         limit,
         before: q.before ? instant().parse(q.before, 'before') : undefined,
+        after: q.after,
         rollUp: q.roll_up === undefined ? undefined : String(q.roll_up) === 'true',
-        kinds: splitList(q.kinds) as TimelineOptions['kinds'],
+        kinds: kinds as TimelineOptions['kinds'],
       });
-      const last = items[items.length - 1];
-      return list(items, {
-        hasMore: items.length === limit,
-        nextCursor: items.length === limit && last ? String(last.at) : null,
-      });
+      const carry = `${q.roll_up === undefined ? '' : `&roll_up=${String(q.roll_up) === 'true'}`}`
+        + `${kinds.length ? `&kinds=${encodeURIComponent(kinds.join(','))}` : ''}`;
+      return {
+        ...list(page.items, { hasMore: page.has_more, nextCursor: page.next_cursor }),
+        next_page: page.next_cursor
+          ? `/v1/records/${req.params.type}/${req.params.id}/timeline?after=${encodeURIComponent(page.next_cursor)}&limit=${limit}${carry}`
+          : null,
+      };
     }, {
       summary: 'The merged timeline: activities, property changes, events and associations', tags: ['crm'],
-      description: 'A company timeline rolls up the activity logged against its contacts, deals and tickets. Pass `roll_up=false` for only what is attached directly.',
+      description: 'A company timeline rolls up the activity logged against its contacts, deals and tickets. Pass `roll_up=false` for only what is attached directly. Every item carries the `cursor` that resumes right after it, and paging goes through `after` — never through `at`, because an import that backfills a day of calls stamps them all with one millisecond and a timestamp filter drops every item but the first. `has_more` is measured by reading an item the page does not show.',
       query: v.object({
         limit: v.optional(v.int({ min: 1, max: 200 })),
         before: v.optional(instant()),
+        after: v.optional(v.string({ max: 200 })),
         roll_up: v.optional(v.boolean()),
         kinds: v.optional(v.string({ max: 120 })),
       }, { strict: true }),

@@ -18,6 +18,7 @@ export * from './overlays';
 export * from './position';
 export * from './toast';
 export * from './feedback';
+export * from './error-boundary';
 export * from './nav';
 export * from './charts';
 export * from './chart-core';

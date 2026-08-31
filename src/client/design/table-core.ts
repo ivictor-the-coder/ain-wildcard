@@ -4,6 +4,7 @@
  * views that do not want the full table chrome.
  */
 import { DAY, startOfDay } from '../../shared/time';
+import { isTimestamp } from './calendar-core';
 
 export type SortDirection = 'asc' | 'desc';
 export interface SortState { columnId: string; direction: SortDirection }
@@ -131,13 +132,17 @@ export function matchesFilter(value: CellValue, filter: ColumnFilter): boolean {
     return (filter.op ?? 'any_of') === 'none_of' ? !present : present;
   }
   if (filter.kind === 'date') {
-    if (filter.from === undefined && filter.to === undefined) return true;
+    // An unrepresentable bound is treated as absent rather than as a comparison
+    // against NaN, which silently matches every row.
+    const from = isTimestamp(filter.from) ? startOfDay(filter.from) : null;
+    const to = isTimestamp(filter.to) ? startOfDay(filter.to) : null;
+    if (from === null && to === null) return true;
     const ts = toTimestamp(value);
     if (ts === null) return false;
     const day = startOfDay(ts);
-    if (filter.from !== undefined && day < startOfDay(filter.from)) return false;
+    if (from !== null && day < from) return false;
     // `to` is inclusive: the whole of that calendar day counts as inside.
-    if (filter.to !== undefined && day > startOfDay(filter.to)) return false;
+    if (to !== null && day > to) return false;
     return true;
   }
   const numeric = typeof value === 'number' ? value : Number(value);
@@ -194,19 +199,39 @@ export function describeFilter(filter: ColumnFilter, o: FilterLabelOptions = {})
     return `${filter.op === 'none_of' ? 'is none of' : 'is'} ${shown}`;
   }
   if (filter.kind === 'date') {
-    const op = filter.op ?? (filter.from !== undefined && filter.to !== undefined ? 'between'
-      : filter.from !== undefined ? 'after' : 'before');
+    // A chip label is the last place a bad bound surfaces, and it renders inside
+    // the table body: a throw here takes the whole page down. A bound outside
+    // what a Date can hold, or a caller-supplied formatter that throws on one,
+    // degrades the label to “any date” instead.
+    const day = (ts: number): string | null => {
+      if (!isTimestamp(ts)) return null;
+      try { return date(ts); } catch { return null; }
+    };
+    const from = isTimestamp(filter.from) ? filter.from : undefined;
+    const to = isTimestamp(filter.to) ? filter.to : undefined;
+    const op = filter.op ?? (from !== undefined && to !== undefined ? 'between'
+      : from !== undefined ? 'after' : 'before');
     // `after`/`before` store the first (or last) day that qualifies, so the
     // label reads back the day the operator actually picked.
-    if (op === 'after' && filter.from !== undefined && filter.to === undefined) return `is after ${date(filter.from - DAY)}`;
-    if (op === 'before' && filter.to !== undefined && filter.from === undefined) return `is before ${date(filter.to + DAY)}`;
-    if (filter.from !== undefined && filter.to !== undefined) {
-      return startOfDay(filter.from) === startOfDay(filter.to)
-        ? `is ${date(filter.from)}`
-        : `is ${date(filter.from)} – ${date(filter.to)}`;
+    if (op === 'after' && from !== undefined && to === undefined) {
+      const d = day(from - DAY);
+      if (d !== null) return `is after ${d}`;
+    } else if (op === 'before' && to !== undefined && from === undefined) {
+      const d = day(to + DAY);
+      if (d !== null) return `is before ${d}`;
+    } else if (from !== undefined && to !== undefined) {
+      const start = day(from);
+      const end = day(to);
+      if (start !== null && end !== null) {
+        return startOfDay(from) === startOfDay(to) ? `is ${start}` : `is ${start} – ${end}`;
+      }
+    } else if (from !== undefined) {
+      const d = day(from);
+      if (d !== null) return `is on or after ${d}`;
+    } else if (to !== undefined) {
+      const d = day(to);
+      if (d !== null) return `is on or before ${d}`;
     }
-    if (filter.from !== undefined) return `is on or after ${date(filter.from)}`;
-    if (filter.to !== undefined) return `is on or before ${date(filter.to)}`;
     return 'is any date';
   }
   if (filter.min !== undefined && filter.max !== undefined) {
@@ -256,6 +281,17 @@ const numOrUndef = (raw: string): number | undefined => {
 };
 
 /**
+ * The same rejection as `numOrUndef`, plus the range a calendar can actually
+ * draw. `?filter=issuedAt~date~between~-1e17,1e17` parses as two finite numbers
+ * but names an instant no `Date` can hold, and it used to travel from the query
+ * string all the way into `Intl.DateTimeFormat` before throwing.
+ */
+const dayOrUndef = (raw: string): number | undefined => {
+  const n = numOrUndef(raw);
+  return isTimestamp(n) ? n : undefined;
+};
+
+/**
  * `status~set~any_of~open,past_due;issuedAt~date~between~1719792000000,1727740800000`
  *
  * Readable enough to eyeball in a URL bar, short enough to paste into Slack,
@@ -290,8 +326,9 @@ export function decodeFilters(raw: string): FilterMap {
       if (values.length) out[columnId] = { kind: 'set', values, ...operator } as ColumnFilter;
     } else if (kind === 'number' || kind === 'date') {
       const [rawFrom, rawTo] = splitEscaped(payload, ',');
-      const from = numOrUndef(rawFrom ?? '');
-      const to = numOrUndef(rawTo ?? '');
+      const parse = kind === 'date' ? dayOrUndef : numOrUndef;
+      const from = parse(rawFrom ?? '');
+      const to = parse(rawTo ?? '');
       const bounds = kind === 'number'
         ? { ...(from !== undefined ? { min: from } : {}), ...(to !== undefined ? { max: to } : {}) }
         : { ...(from !== undefined ? { from } : {}), ...(to !== undefined ? { to } : {}) };

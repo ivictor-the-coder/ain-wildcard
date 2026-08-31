@@ -109,6 +109,63 @@ export function computePosition(
   };
 }
 
+/**
+ * The little a floating box has to expose for `repositionFloating` to place it:
+ * a `max-height` that can be read back and cleared, and a border-box size that
+ * honours it. Modelled as an interface so the placement pass — the part that
+ * actually got this wrong — is testable without a DOM.
+ */
+export interface FloatingElement {
+  /** Applied `max-height` in px, or `null` when the box is unclamped. */
+  clamp: number | null;
+  /** Border-box size *as currently clamped*. */
+  readonly size: Size;
+}
+
+/**
+ * One placement pass, in the only order that works.
+ *
+ * The clamp written by the previous pass must come off *before* measuring: a
+ * 286px box already clamped to 120px measures 120px, which fits under an anchor
+ * near the bottom edge, so the "not enough room below" branch never fires and
+ * the box stays pinned there — showing a title and nothing else while 800px of
+ * screen sits unused above it. Measure natural, choose the side, clamp after.
+ *
+ * Returns `null` when the box has not been laid out yet (detached, or
+ * `display: none`), because a 0×0 box fits anywhere and would place wrongly.
+ */
+export function repositionFloating(
+  el: FloatingElement,
+  anchor: Rect,
+  viewport: Size,
+  opts: PositionOptions = {},
+): PositionResult | null {
+  const previous = el.clamp;
+  el.clamp = null;
+  const natural = el.size;
+  if (natural.width === 0 && natural.height === 0) {
+    el.clamp = previous;
+    return null;
+  }
+  const result = computePosition(anchor, natural, viewport, opts);
+  el.clamp = result.maxHeight;
+  return result;
+}
+
+/** Wraps a real element as a `FloatingElement`, clamp read from inline style. */
+export const floatingElement = (el: HTMLElement): FloatingElement => ({
+  get clamp(): number | null {
+    const value = Number.parseFloat(el.style.maxHeight);
+    return Number.isFinite(value) ? value : null;
+  },
+  set clamp(value: number | null) {
+    el.style.maxHeight = value === null ? '' : `${value}px`;
+  },
+  get size(): Size {
+    return { width: el.offsetWidth, height: el.offsetHeight };
+  },
+});
+
 export const rectOf = (el: Element): Rect => {
   const r = el.getBoundingClientRect();
   return { x: r.left, y: r.top, width: r.width, height: r.height };

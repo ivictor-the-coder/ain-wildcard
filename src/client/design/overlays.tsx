@@ -6,8 +6,8 @@ import { createPortal } from 'react-dom';
 import { cx } from './layout';
 import { Button, IconButton, Kbd } from './controls';
 import { AlertTriangleIcon, ArrowRightIcon, ChevronDownIcon, ChevronRightIcon, Icons } from './icons';
-import { useClickOutside, useFocusTrap, useScrollLock } from './hooks';
-import { computePosition, rectOf, viewportSize, type Placement } from './position';
+import { useClickOutside, useFocusTrap, useIsomorphicLayoutEffect, useScrollLock } from './hooks';
+import { computePosition, floatingElement, rectOf, repositionFloating, viewportSize, type Placement } from './position';
 import { rankCommands } from './overlays-core';
 import './overlays.css';
 
@@ -15,7 +15,11 @@ import './overlays.css';
 
 export function Portal({ children }: { children: ReactNode }) {
   const [host] = useState(() => (typeof document === 'undefined' ? null : document.createElement('div')));
-  useEffect(() => {
+  // Attaching in a layout effect matters: child layout effects run before the
+  // parent's, so an overlay that measures itself on open sees a host that is
+  // already in the document. Attached in a passive effect, the first — and for
+  // a popover the only — measurement reads 0×0 off a detached node.
+  useIsomorphicLayoutEffect(() => {
     if (!host) return;
     host.setAttribute('data-ain-portal', '');
     document.body.appendChild(host);
@@ -305,13 +309,17 @@ export function Popover({
     const anchorEl = anchor.current;
     const el = ref.current;
     if (!anchorEl || !el) return;
-    const result = computePosition(
-      rectOf(anchorEl),
-      { width: el.offsetWidth, height: el.offsetHeight },
-      viewportSize(),
-      { placement, offset, matchWidth },
-    );
-    setPos({ x: result.x, y: result.y, maxHeight: result.maxHeight, width: result.width });
+    // `repositionFloating` strips the clamp before it measures. Reading
+    // `offsetHeight` with the previous pass's `max-height` still applied is what
+    // used to keep a 286px filter editor pinned under a chip near the bottom
+    // edge: clamped it measures 120px, 120px fits, so it never flipped up.
+    const result = repositionFloating(floatingElement(el), rectOf(anchorEl), viewportSize(), { placement, offset, matchWidth });
+    if (!result) return;
+    setPos((prev) => (
+      prev && prev.x === result.x && prev.y === result.y && prev.maxHeight === result.maxHeight && prev.width === result.width
+        ? prev
+        : { x: result.x, y: result.y, maxHeight: result.maxHeight, width: result.width }
+    ));
   }, [anchor, placement, offset, matchWidth]);
 
   useLayoutEffect(() => { if (open) reposition(); }, [open, reposition, children]);
@@ -325,6 +333,17 @@ export function Popover({
       window.removeEventListener('resize', handler);
       window.removeEventListener('scroll', handler, true);
     };
+  }, [open, reposition]);
+
+  // Content that grows after opening — switching the date operator from "is on"
+  // to "is between" adds the presets and a calendar — has to re-choose the side,
+  // otherwise the box grows downwards off the bottom of the screen.
+  useEffect(() => {
+    const el = ref.current;
+    if (!open || !el || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => reposition());
+    observer.observe(el);
+    return () => observer.disconnect();
   }, [open, reposition]);
 
   useEffect(() => {
@@ -583,12 +602,10 @@ export function Tooltip({ content, children, placement = 'top', delay = 400, sho
 
   useLayoutEffect(() => {
     if (!open || !anchor.current || !tip.current) return;
-    const result = computePosition(
-      rectOf(anchor.current),
-      { width: tip.current.offsetWidth, height: tip.current.offsetHeight },
-      viewportSize(),
-      { placement, offset: 8 },
-    );
+    const size = { width: tip.current.offsetWidth, height: tip.current.offsetHeight };
+    // A 0×0 box fits on every side, so it would place "above" and stay there.
+    if (size.width === 0 && size.height === 0) return;
+    const result = computePosition(rectOf(anchor.current), size, viewportSize(), { placement, offset: 8 });
     setPos({ x: result.x, y: result.y });
   }, [open, placement, content]);
 
