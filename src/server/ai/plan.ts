@@ -703,6 +703,8 @@ const END_FIELD = /^(end|to|until|end_at|end_date|before|period_end)$/;
 const TYPE_FIELD = /^(object_type|type|entity_type|record_type|resource)$/;
 /** A parameter that names an account rather than describing one. */
 const ACCOUNT_FIELD = /^(customer|customer_ref|account|client|subscriber)$/;
+/** A parameter named after the kind of record it takes. */
+const ENTITY_FIELD = /^(invoice|subscription|charge|deal|company|contact|ticket|product|record)$/;
 const DUE_FIELD = /^(due_before|overdue_before|due_by|before_date)$/;
 const OVERDUE = /\b(overdue|past\s+due|late|owed|owing|outstanding|unpaid|arrears|not\s+paid)\b/i;
 
@@ -767,6 +769,10 @@ function fillField(name: string, node: SchemaNode, context: FillContext): unknow
     return idOfKind(context.question, 'cus')
       ?? context.entities.find((e) => e.entity.type === 'customer')?.entity.id
       ?? context.harvestedIds?.find((id) => id.startsWith('cus_'));
+  }
+  if (ENTITY_FIELD.test(name)) {
+    return context.entities.find((e) => e.entity.type === name)?.entity.id
+      ?? context.harvestedIds?.find((id) => id.startsWith(`${name.slice(0, 3)}_`));
   }
   if (ID_FIELD.test(name)) {
     const wanted = name.replace(/_id$/, '');

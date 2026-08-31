@@ -24,7 +24,7 @@ import {
   type GroupBy, type MetricDetection, type MetricSubject,
 } from './metrics';
 import { comprehend, isUsableEntity, refusalFor, workspaceVocabulary, type Refusal } from './clarify';
-import { planTools, planWrite, replan, isWriteBlocked, type PlannedStep, type SkippedTool, type WindowPair, type WriteBlocked } from './plan';
+import { planTools, planWrite, replan, isWriteBlocked, type BuiltinTool, type PlannedStep, type SkippedTool, type WindowPair, type WriteBlocked } from './plan';
 import { propertyMap } from './query';
 import {
   accountProfile, businessMetric, recordAggregate, recordSearch, recordTimeline, workspaceSearch,
@@ -164,43 +164,44 @@ function callBuiltin(name: string, args: Record<string, unknown>, ctx: Ctx, orgI
   }
 }
 
+/**
+ * A capability nothing registered, wrapped so it runs behind the same gates.
+ *
+ * The engine implements these itself, which is why the copilot works in a
+ * workspace that installed no modules. It is not a reason to run them outside
+ * the caller's allowlist, step budget or rate limit: "scoped to no tools" has
+ * to mean no tools, including ours, or the scope is not a guarantee.
+ */
+function builtinDefinition(name: string, builtin: BuiltinTool): AiToolDef {
+  return {
+    name,
+    description: `Built-in capability ${builtin}, provided by the engine because no module registered it.`,
+    readOnly: true,
+    input: { parse: (value: unknown) => (value ?? {}) as Record<string, unknown>, describe: () => ({ type: 'object' }) },
+    run: (args: Record<string, unknown>, ctx: Ctx, meta: { orgId: string }) => callBuiltin(builtin, args, ctx, meta.orgId),
+  };
+}
+
 async function executeStep(
   call: AiCallContext,
   step: PlannedStep,
   tools: Map<string, AiToolDef>,
 ): Promise<StepResult> {
   const runtime = call.runtime;
-  const definition = tools.get(step.tool) ?? call.runtime?.tool(step.tool);
+  const registered = tools.get(step.tool) ?? call.runtime?.tool(step.tool);
+  const definition = registered ?? (step.builtin ? builtinDefinition(step.tool, step.builtin) : undefined);
   // Whether this step changes the workspace decides what the answer may claim.
   const write = definition ? !definition.readOnly : false;
-  // If nothing registered this capability, run our own implementation instead
-  // of asking the runtime for a tool that does not exist.
-  if (runtime && !definition && step.builtin) {
-    const started = process.hrtime.bigint();
-    try {
-      const result = callBuiltin(step.builtin, step.args, call.ctx, call.orgId);
-      runtime.note(call, 'tool', `${step.builtin} (built-in)`, summarise(result), Number((process.hrtime.bigint() - started) / 1_000_000n));
-      return { tool: step.tool, ok: true, why: step.why, args: step.args, result, write };
-    } catch (e) {
-      return { tool: step.tool, ok: false, why: step.why, args: step.args, write, error: { code: 'tool_failed', message: (e as Error).message } };
-    }
-  }
   if (runtime) {
+    if (!definition) {
+      return {
+        tool: step.tool, ok: false, why: step.why, args: step.args, write,
+        error: { code: 'tool_not_found', message: `No tool named "${step.tool}" is registered and the engine has no built-in for it.` },
+      };
+    }
     const execution = await runtime.execute(step.tool, step.args, call, definition);
     if (execution.ok) {
       return { tool: step.tool, ok: true, why: step.why, args: step.args, result: execution.result, write };
-    }
-    // A capability the workspace never registered still works: it is our own
-    // code, and the trace records it as a built-in rather than a tool call.
-    if (execution.error?.code === 'tool_not_found' && step.builtin) {
-      const started = process.hrtime.bigint();
-      try {
-        const result = callBuiltin(step.builtin, step.args, call.ctx, call.orgId);
-        runtime.note(call, 'tool', `${step.builtin} (built-in)`, summarise(result), Number((process.hrtime.bigint() - started) / 1_000_000n));
-        return { tool: step.tool, ok: true, why: step.why, args: step.args, result, write };
-      } catch (e) {
-        return { tool: step.tool, ok: false, why: step.why, args: step.args, write, error: { code: 'tool_failed', message: (e as Error).message } };
-      }
     }
     return {
       tool: step.tool, ok: false, why: step.why, args: step.args, write,

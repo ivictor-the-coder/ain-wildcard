@@ -1012,13 +1012,25 @@ describe('a comparison measures both periods the question names', () => {
         'each window is measured on its own, so the delta is between the two named periods');
     }
 
-    const delta = expectedSecond.total - expectedFirst.total;
-    const percent = Number((((delta) / Math.abs(expectedFirst.total)) * 100).toFixed(1));
+    // Derived from the rows, not from the engine's formula: the period the
+    // question named first is the subject, the second is what it is measured
+    // against, and a subject that booked less can only be down on it. Computing
+    // the expectation the way the code computes it is how a comparison shipped
+    // reporting an 81% collapse as 435% growth with a green suite.
+    const richer = expectedFirst.total >= expectedSecond.total ? first.label : second.label;
+    const direction = expectedFirst.total > expectedSecond.total ? 'up'
+      : expectedFirst.total < expectedSecond.total ? 'down' : 'level';
+    const delta = expectedFirst.total - expectedSecond.total;
+    const percent = Number(((delta / Math.abs(expectedSecond.total)) * 100).toFixed(1));
     const expectedLine =
       `Northwind Robotics booked ${money(expectedFirst.total)} in ${first.label} and ${money(expectedSecond.total)} in ${second.label}`
-      + ` — ${delta < 0 ? 'down' : 'up'} ${money(Math.abs(delta))} (${percent > 0 ? '+' : ''}${percent}%).`;
+      + ` — ${first.label} is ${direction} ${money(Math.abs(delta))} (${percent > 0 ? '+' : ''}${percent}%) on ${second.label}.`;
     assert.ok(answer.content.startsWith(expectedLine),
       `expected the answer to open with:\n${expectedLine}\ngot:\n${answer.content.slice(0, 300)}`);
+    assert.equal(richer === first.label, direction === 'up',
+      'the period that booked more is the one the answer calls the higher of the two');
+    assert.ok(!answer.content.includes(`${first.label} is ${direction === 'up' ? 'down' : 'up'}`),
+      `the direction is stated once, and it is not the opposite of the rows:\n${answer.content.slice(0, 300)}`);
     assert.match(answer.content, new RegExp(`${first.label}: \\${money(expectedFirst.total)} from ${expectedFirst.count} closed-won`));
     assert.match(answer.content, new RegExp(`${second.label}: \\${money(expectedSecond.total)} from ${expectedSecond.count} closed-won`));
     assert.ok(!answer.content.includes(before),

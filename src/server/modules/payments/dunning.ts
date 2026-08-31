@@ -91,6 +91,9 @@ export interface RecoverySummary {
   next_attempt_at: number | null;
 }
 
+/** Why a campaign stopped. It is on the event, so a report can chart the split. */
+type ExhaustionReason = 'attempts_exhausted' | 'decline_is_final' | 'nothing_to_present';
+
 const isWeekend = (ts: number): boolean => {
   const day = new Date(ts).getUTCDay();
   return day === 0 || day === 6;
@@ -569,7 +572,7 @@ export class DunningEngine {
    * out once every other subscriber has had its say.
    */
   private exhaust(
-    orgId: string, campaign: Dunning, reason: 'attempts_exhausted' | 'decline_is_final',
+    orgId: string, campaign: Dunning, reason: ExhaustionReason,
     failure: { code: DeclineCode; message: string; advice: string },
   ): void {
     const now = this.ctx.now();
@@ -577,7 +580,9 @@ export class DunningEngine {
     const shown = formatMoney(money(campaign.amount_at_risk, campaign.currency), { locale: org.locale });
     const resolution = reason === 'decline_is_final'
       ? `Gave up after attempt ${campaign.attempt_count}: ${failure.code} will not clear by waiting.`
-      : `All ${campaign.max_attempts} attempts were refused, the last with ${failure.code}.`;
+      : reason === 'nothing_to_present'
+        ? `The schedule ran out with nothing left to present: ${failure.advice}`
+        : `All ${campaign.max_attempts} attempts were refused, the last with ${failure.code}.`;
     this.ctx.db.patch('payments_dunning', 'id', campaign.id, {
       status: 'exhausted', next_attempt_at: null, resolved_at: now, resolution, updated: now,
     });
@@ -704,10 +709,10 @@ export class DunningEngine {
         });
         return;
       }
-      // Nothing was presented at all — no method on file, or the bank is still
-      // holding a debit from the last attempt. It still costs the campaign an
-      // attempt, because a recovery step that cannot run is a recovery step
-      // that failed, and pretending otherwise retries forever.
+      // Nothing was presented at all: there is no usable method on the account.
+      // It still costs the campaign an attempt, because a recovery step that
+      // cannot run is a recovery step that failed, and pretending otherwise
+      // would retry an account with no card on it forever.
       this.recordSkipped(orgId, campaign, attemptNumber, scheduledFor, invoice, result.skipped ?? 'Nothing could be presented.');
     });
   }
@@ -740,7 +745,7 @@ export class DunningEngine {
       return;
     }
     const last = campaign.last_failure_code ?? 'card_declined';
-    this.exhaust(orgId, this.require(orgId, campaign.id), 'attempts_exhausted', {
+    this.exhaust(orgId, this.require(orgId, campaign.id), 'nothing_to_present', {
       code: last, message: DECLINES[last].message, advice: why,
     });
   }

@@ -878,6 +878,7 @@ function TopSearch({ inputRef, sources, onPalette }: {
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const listId = useId();
+  const listRef = useRef<HTMLDivElement>(null);
   const rowId = (id: string) => `${listId}-${id}`;
 
   const search = useGlobalSearch(value, sources, { perSource: 4, limit: 24, delay: 140 });
@@ -895,6 +896,17 @@ function TopSearch({ inputRef, sources, onPalette }: {
 
   useEffect(() => { if (location.path !== '/search') setValue(''); }, [location.path]);
   useEffect(() => { setActive(0); }, [typed, shown]);
+
+  // ↓ past the visible rows has to bring the highlight with it.
+  useEffect(() => {
+    const list = listRef.current;
+    const row = list?.querySelector<HTMLElement>('[data-active="true"]');
+    if (!list || !row) return;
+    const top = row.offsetTop;
+    const bottom = top + row.offsetHeight;
+    if (top < list.scrollTop + 24) list.scrollTop = Math.max(0, top - 28);
+    else if (bottom > list.scrollTop + list.clientHeight) list.scrollTop = bottom - list.clientHeight + 6;
+  }, [at, shown]);
 
   const go = (target: TypeaheadTarget) => { setOpen(false); navigate(target.href); };
 
@@ -962,7 +974,7 @@ function TopSearch({ inputRef, sources, onPalette }: {
         aria-label="Search everything"
         role="combobox"
         aria-expanded={panelOpen}
-        aria-controls={listId}
+        aria-controls={panelOpen ? listId : undefined}
         aria-autocomplete="list"
         aria-activedescendant={panelOpen && highlighted ? rowId(highlighted.id) : undefined}
         autoComplete="off"
@@ -992,7 +1004,10 @@ function TopSearch({ inputRef, sources, onPalette }: {
             </div>
           )}
 
-          <div className="shell-search__list" id={listId} role="listbox" aria-label="Search results">
+          <div className="shell-search__box" id={listId} role="listbox" aria-label="Search results">
+            {/* Only the groups scroll. The row that opens the full page is
+                pinned, so the highlight is never parked out of sight. */}
+            <div className="shell-search__list" role="presentation" ref={listRef}>
             {search.groups.map((group) => (
               <div className="shell-search__group" key={group.source.id} role="group" aria-label={group.source.label}>
                 <div className="shell-search__grouphead" aria-hidden>
@@ -1008,6 +1023,7 @@ function TopSearch({ inputRef, sources, onPalette }: {
                       role="option"
                       aria-selected={i >= 0 && i === at}
                       aria-disabled={hit.href ? undefined : true}
+                      data-active={i >= 0 && i === at}
                       className={`shell-search__row${i >= 0 && i === at ? ' is-active' : ''}${hit.href ? '' : ' is-unopenable'}`}
                       onPointerEnter={() => { if (i >= 0) setActive(i); }}
                       onClick={() => { if (i >= 0) go(targets[i]); }}
@@ -1027,6 +1043,7 @@ function TopSearch({ inputRef, sources, onPalette }: {
                 })}
               </div>
             ))}
+            </div>
 
             {targets.length > 0 && (() => {
               const everything = targets[targets.length - 1];

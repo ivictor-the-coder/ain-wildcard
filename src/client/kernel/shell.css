@@ -357,6 +357,7 @@
 }
 .shell-search__note.is-alert { color: var(--text-danger); }
 .shell-search__note .u-mono { flex: 0 0 auto; font-size: var(--text-2xs); color: var(--text-tertiary); }
+.shell-search__box { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 .shell-search__list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: var(--space-3); }
 .shell-search__group + .shell-search__group { margin-top: var(--space-3); }
 .shell-search__grouphead {
@@ -389,7 +390,7 @@
 .shell-search__row.is-active { background: var(--bg-selected); }
 .shell-search__row.is-active .shell-search__title { color: var(--text-brand); }
 .shell-search__row.is-unopenable { cursor: default; color: var(--text-secondary); }
-.shell-search__row--all { margin-top: var(--space-2); border-top: 1px solid var(--border-subtle); border-radius: 0 0 var(--radius-md) var(--radius-md); }
+.shell-search__row--all { flex: 0 0 auto; border-top: 1px solid var(--border-subtle); border-radius: 0; }
 .shell-search__icon {
   display: grid;
   place-items: center;

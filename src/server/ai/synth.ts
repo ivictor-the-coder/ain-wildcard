@@ -578,8 +578,13 @@ function explanationBlocks(invoice: BillingInvoiceExplanation): string[] {
     `Invoice ${invoice.number}${invoice.customer_name ? ` for ${invoice.customer_name}` : ''} — ${humanise(invoice.status).toLowerCase()}, covering ${invoice.covers}.`,
   ];
   if (invoice.lines.length) {
-    blocks.push(invoice.lines.slice(0, 8).map((line) =>
-      bullet(`${line.description} — ${line.amount_display}${line.proration ? ' (proration)' : ''}${line.why ? `: ${line.why}` : ''}`)).join('\n'));
+    blocks.push(invoice.lines.slice(0, 8).map((line) => {
+      // The ledger repeats the description as the explanation on a line that
+      // needs no explaining; saying it twice reads as a bug, because it is one.
+      const bare = (text: string) => text.replace(/\s+/g, ' ').replace(/[.\s]+$/, '').toLowerCase();
+      const why = line.why && bare(line.why) !== bare(line.description) ? `: ${line.why}` : '';
+      return bullet(`${line.description} — ${line.amount_display}${line.proration ? ' (proration)' : ''}${why}`);
+    }).join('\n'));
   }
   const totals = [`subtotal ${invoice.subtotal_display}`];
   if (invoice.tax_display) totals.push(`tax ${invoice.tax_display}`);
