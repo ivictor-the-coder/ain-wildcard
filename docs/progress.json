@@ -1,11 +1,11 @@
 {
-  "updated": "2026-08-31T00:03:08.993751",
-  "headline": "Two waves now running side by side. Wave 1b is closing the gaps the first round of critics found; Wave 2a is building the revenue spine against Stripe Billing \u2014 proration to the cent, exactly-once metering, credit burn-down order, gapless invoice numbering and a dunning schedule you can reason about.",
+  "updated": "2026-08-31T04:34:53.682815",
+  "headline": "70,000 lines and 675 tests in, and every critic is still choosing the reference product. Round three is where they stop finding crashes and start finding the things that separate a real billing system from a convincing one: a graduated free tier that restarts on every settlement window, calculated properties evaluated without a dependency graph, an invoice that cannot be credited.",
   "stats": {
-    "server modules": 4,
-    "api routes": 28,
-    "tests passing": 317,
-    "lines of code": "40,181"
+    "server modules": 7,
+    "api routes": 44,
+    "tests passing": 675,
+    "lines of code": "70,252"
   },
   "waves": [
     {
@@ -73,57 +73,68 @@
           "id": "design-system",
           "title": "Design system",
           "status": "rework",
-          "rounds": 2,
+          "rounds": 4,
           "note": "The component kit: buttons, fields, tables, menus, overlays, charts \u2014 in both themes",
           "history": [
             "reference",
+            "reference",
+            "reference",
             "reference"
           ],
-          "verdict": "Filter popovers never flip upward \u2014 measured a 120px stub with 690px of unused space above the anchor. And one hand-edited date in a shared link white-screens the whole page."
+          "verdict": "Both original blockers are dead \u2014 verified at four viewports with numbers, not vibes. But the sweep stopped one level shallow: every dropdown menu is unusable by keyboard, because the key handler sits on a descendant of the element that actually receives focus."
         },
         {
           "id": "crm-core",
           "title": "Smart CRM data model",
           "status": "rework",
-          "rounds": 3,
+          "rounds": 5,
           "note": "Objects, custom properties, associations, records, timeline \u2014 the substrate",
           "history": [
             "reference",
             "reference",
+            "reference",
+            "reference",
             "reference"
           ],
-          "verdict": "Record history is keyed off a millisecond clock, so two saves in the same millisecond merge and a stage move gets titled \"Deal name changed\". Paging that history silently loses 8 of 23 rows."
+          "verdict": "The timeline pager is now excellent \u2014 500+ paged requests across same-millisecond clusters with exact set equality. But calculated properties are evaluated in index order with no dependency graph, so one built on another persists a save stale, and a dependency cycle is accepted and mutates the record on every no-op save."
         },
         {
           "id": "ai-engine",
           "title": "AI engine & tool runtime",
           "status": "rework",
-          "rounds": 2,
+          "rounds": 3,
           "note": "Grounded reasoning over real workspace data, tool calling, cost and trace capture",
           "history": [
             "reference",
+            "reference",
             "reference"
           ],
-          "verdict": "\"Compare Q1 and Q2\" answers with Q1 vs Q4 and reports -1.7% for a quarter that fell 77%. The tool allowlist is not enforced, and add_note writes the raw prompt into a customer record with no approval gate."
+          "verdict": "Comparison windows, the tool allowlist and the approval gate were rebuilt; the round-3 critic never got to run before the limit reset."
         },
         {
           "id": "catalog",
           "title": "Product catalog & pricing",
           "status": "rework",
-          "rounds": 2,
+          "rounds": 3,
           "note": "Flat, per-seat, tiered, volume, package, usage and hybrid prices in every currency",
           "history": [
             "reference",
+            "reference",
             "reference"
           ],
-          "verdict": "Every boolean query param compares a string to an already-coerced boolean, so ?active=true returns the archived price. Worse: the pricing summary says \"falling to\" on a ladder where the engine bills a jump."
+          "verdict": "Boolean query params and the misleading tier prose were fixed; the round-3 critic never got to run before the limit reset."
         },
         {
           "id": "app-shell",
           "title": "App shell & navigation",
-          "status": "building",
-          "rounds": 0,
-          "note": "Navigation, command palette, global search, the shortcut model, a real sign-in, and the time machine one click from the top bar"
+          "status": "rework",
+          "rounds": 2,
+          "note": "Navigation, command palette, global search, the shortcut model, a real sign-in, and the time machine one click from the top bar",
+          "history": [
+            "reference",
+            "reference"
+          ],
+          "verdict": "Shell, command palette, global search and the time-machine control landed; its critic hit the limit before reporting."
         }
       ]
     },
@@ -135,23 +146,37 @@
         {
           "id": "subscriptions",
           "title": "Customers, subscriptions & proration",
-          "status": "building",
-          "rounds": 0,
-          "note": "Anchor-day cycles, trials, schedules with phases, and one proration function shared by preview and charge"
+          "status": "rework",
+          "rounds": 4,
+          "note": "Anchor-day cycles, trials, schedules with phases, and one proration function shared by preview and charge",
+          "history": [
+            "reference",
+            "reference",
+            "reference",
+            "reference"
+          ],
+          "verdict": "A proration engine the critic could not make lose a cent in USD, JPY or BHD \u2014 746 invoices, every line summing to its total across 400 days. But the invoice it produces cannot be taxed and cannot be credited, and cancel_at in the past slips through the one entry point the last fix missed."
         },
         {
           "id": "metering-credits",
           "title": "Usage metering & prepaid credits",
-          "status": "building",
-          "rounds": 0,
-          "note": "Exactly-once ingestion, incremental hourly rollups, an append-only credit ledger and a documented burn-down order"
+          "status": "rework",
+          "rounds": 4,
+          "note": "Exactly-once ingestion, incremental hourly rollups, an append-only credit ledger and a documented burn-down order",
+          "history": [
+            "reference",
+            "reference",
+            "reference",
+            "reference"
+          ],
+          "verdict": "1.5M minor units of metered usage now reaches real invoice lines and 377 settlements reconcile perfectly \u2014 but the same engine prices 238,353 metered events at $0.00 through its own remediation route, because the graduated free tier restarts on every settlement window."
         },
         {
           "id": "invoicing-tax",
           "title": "Invoicing, credit notes & tax",
           "status": "queued",
           "rounds": 0,
-          "note": "Gapless numbering, an enforced lines-equal-total invariant, credit notes that cannot over-credit, and a printable document"
+          "note": "The tax engine and its migrations exist but are not yet applied at issuance \u2014 wiring them together, plus credit notes, is the next task"
         },
         {
           "id": "payments",
