@@ -103,14 +103,25 @@ export class JobQueue {
   }
 
   async runOne(job: JobRow, now: number): Promise<'ok' | 'retry' | 'failed' | 'skipped'> {
-    const handler = this.handlers.get(job.type);
     const attempts = job.attempts + 1;
+
+    // Claim the row before doing anything with it. `due()` and this call are not
+    // one transaction, so two drains racing the same batch would otherwise both
+    // run the same job — which for a renewal means two invoices for one period.
+    // The UPDATE ... WHERE status = 'pending' is the claim: exactly one caller
+    // can see `changes === 1`, and everyone else must leave the job alone.
+    const claimed = this.db.run(
+      `UPDATE jobs SET status = 'running', attempts = ?, updated = ? WHERE id = ? AND status = 'pending'`,
+      attempts, now, job.id,
+    ).changes;
+    if (claimed !== 1) return 'skipped';
+
+    const handler = this.handlers.get(job.type);
     if (!handler) {
-      this.db.patch('jobs', 'id', job.id, { status: 'failed', last_error: `No handler registered for job type "${job.type}"`, attempts, updated: now });
+      this.db.patch('jobs', 'id', job.id, { status: 'failed', last_error: `No handler registered for job type "${job.type}"`, updated: now });
       this.log.error('job.no_handler', { type: job.type, id: job.id });
       return 'failed';
     }
-    this.db.patch('jobs', 'id', job.id, { status: 'running', attempts, updated: now });
     try {
       await handler(job.payload, job);
       this.db.patch('jobs', 'id', job.id, { status: 'done', updated: now, last_error: null });
