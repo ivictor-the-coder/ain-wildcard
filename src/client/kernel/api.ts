@@ -96,8 +96,25 @@ export interface RateLimited {
   streak: number;
 }
 
+/**
+ * A request that never reached the server at all — the machine is offline, the
+ * connection was reset, DNS failed, or the API process died mid-response.
+ * `fetch` reports all of those by rejecting with a `TypeError`, which carries
+ * no status and no `{ error: … }` body, so it has to be turned into the one
+ * error shape the rest of the client is written against before it escapes.
+ */
+export interface NetworkFailure {
+  at: number;
+  message: string;
+  /** The address that did not answer, quoted in the banner. */
+  path: string;
+  /** Consecutive requests that failed to reach the server. */
+  streak: number;
+}
+
 let authLoss: AuthLoss | null = null;
 let rateLimited: RateLimited | null = null;
+let networkFailure: NetworkFailure | null = null;
 
 /** `/v1/health` answers signed out, so its 401 would never mean anything. */
 const PUBLIC_PATH = /\/v1\/health(\?|$)/;
@@ -106,12 +123,16 @@ const AUTH_PATH = /\/v1\/auth\//;
 
 export const currentAuthLoss = (): AuthLoss | null => authLoss;
 export const currentRateLimit = (): RateLimited | null => rateLimited;
+export const currentNetworkFailure = (): NetworkFailure | null => networkFailure;
 
 export function useAuthLoss(): AuthLoss | null {
   return useSyncExternalStore(subscribe, currentAuthLoss, () => null);
 }
 export function useRateLimit(): RateLimited | null {
   return useSyncExternalStore(subscribe, currentRateLimit, () => null);
+}
+export function useNetworkFailure(): NetworkFailure | null {
+  return useSyncExternalStore(subscribe, currentNetworkFailure, () => null);
 }
 
 /** Client backoff for a server that refuses without saying how long to wait. */
@@ -160,6 +181,46 @@ function noteFailure(url: string, status: number, body: ApiErrorBody, headers: H
     };
     notify();
   }
+}
+
+/** A cancelled request is a decision, not a failure — it must stay a cancel. */
+function isAbort(e: unknown): boolean {
+  return e instanceof Error && (e.name === 'AbortError' || e.name === 'TimeoutError');
+}
+
+const isOffline = (): boolean =>
+  typeof navigator !== 'undefined' && navigator !== null && navigator.onLine === false;
+
+/**
+ * Turn a transport failure into the error shape every panel already renders.
+ * Status 0 means "no server ever answered", which is why `useQuery` keeps the
+ * data it already had: stale numbers plus a banner beat a blank screen.
+ */
+function networkError(url: string): ApiClientError {
+  const at = Date.now();
+  const path = url.startsWith(BASE) ? url.slice(BASE.length) : url;
+  const message = isOffline()
+    ? 'You are offline, so this request never left the browser. It will work again as soon as the connection is back.'
+    : 'Could not reach the Ain API — the connection was refused or dropped before the server answered. Check that the API is running, then try again.';
+  const sameRound = !!networkFailure && at - networkFailure.at < 30_000;
+  networkFailure = { at, message, path, streak: sameRound ? networkFailure!.streak + 1 : 1 };
+  notify();
+  return new ApiClientError(0, {
+    type: 'connection_error',
+    code: isOffline() ? 'offline' : 'network_error',
+    message,
+    ...(lastId ? { request_id: lastId } : {}),
+  });
+}
+
+/**
+ * Any answer at all — a 500 included — proves the server is reachable, so the
+ * offline banner has to clear on a response, not only on a successful one.
+ */
+function noteReached(): void {
+  if (!networkFailure) return;
+  networkFailure = null;
+  notify();
 }
 
 /** One call getting through is the only proof that the workspace is back. */
@@ -211,30 +272,86 @@ export async function request<T = unknown>(path: string, opts: RequestOptions = 
  * second time would prefix `/api` onto a path that already carries it.
  */
 async function requestUrl<T>(url: string, opts: RequestOptions = {}): Promise<T> {
-  const res = await fetch(url, {
-    method: opts.method || 'GET',
-    credentials: 'same-origin',
-    headers: {
-      ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {}),
-      ...(opts.idempotencyKey ? { 'idempotency-key': opts.idempotencyKey } : {}),
-    },
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-    signal: opts.signal,
-  });
-  lastId = res.headers.get('request-id') || lastId;
-  const text = await res.text();
+  // `fetch` rejects with a bare TypeError when the request never reached the
+  // server — offline, connection reset, DNS failure, API process gone. Every
+  // caller below this line, and every panel above it, is written against
+  // ApiClientError; a TypeError escaping here is read as `error.body.message`
+  // on undefined and takes the whole route down with the error boundary.
+  // Reading the body can fail the same way on a connection that dies
+  // mid-response, so the two are caught together.
+  // Serialising the body is our own bug when it throws, not the network's, so
+  // it is diagnosed on its own rather than inside the catch below, which would
+  // tell the operator they were offline. It still leaves as an ApiClientError:
+  // apart from a deliberate abort, that is the only thing this may reject with.
+  let payload: string | undefined;
+  try { payload = opts.body !== undefined ? JSON.stringify(opts.body) : undefined; }
+  catch (e) { throw asApiError(e); }
+  let res: Response;
+  let text: string;
+  try {
+    res = await fetch(url, {
+      method: opts.method || 'GET',
+      credentials: 'same-origin',
+      headers: {
+        ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {}),
+        ...(opts.idempotencyKey ? { 'idempotency-key': opts.idempotencyKey } : {}),
+      },
+      body: payload,
+      signal: opts.signal,
+    });
+    lastId = res.headers.get('request-id') || lastId;
+    text = await res.text();
+  } catch (e) {
+    if (isAbort(e)) throw e;
+    throw networkError(url);
+  }
+  noteReached();
   const json = text ? safeParse(text) : null;
   if (!res.ok) {
-    const body: ApiErrorBody = (json as { error?: ApiErrorBody } | null)?.error
+    const body: ApiErrorBody = (json === UNPARSEABLE ? null : (json as { error?: ApiErrorBody } | null))?.error
       ?? { type: 'api_error', code: 'unknown', message: text || res.statusText };
     noteFailure(url, res.status, body, res.headers);
     throw new ApiClientError(res.status, body);
+  }
+  // "The server answered" is not the same as "the API answered". A proxy error
+  // page, a captive portal or a sign-in redirect all come back 200 with HTML,
+  // and handing that string to a panel that types it as an object is the same
+  // blank screen a raw TypeError used to cause — one layer further in, past
+  // every check above. Every route here answers JSON, `/v1/invoices/:id/render`
+  // included, so text that will not parse did not come from this API.
+  if (json === UNPARSEABLE) {
+    throw new ApiClientError(res.status, {
+      type: 'api_error',
+      code: 'invalid_response',
+      message: 'The server answered, but not with anything the Ain API produces. Something between this page and the API is intercepting requests — check that /api is being proxied to the running server.',
+      ...(lastId ? { request_id: lastId } : {}),
+    });
   }
   noteSuccess(url);
   return json as T;
 }
 
-const safeParse = (t: string) => { try { return JSON.parse(t); } catch { return t; } };
+/**
+ * Distinct from a body that parses to a string: `GET /v1/invoices/:id/render`
+ * legitimately answers with a JSON-encoded string, so "did not parse" has to be
+ * its own answer rather than "here is the text back".
+ */
+const UNPARSEABLE = Symbol('unparseable');
+const safeParse = (t: string): unknown => { try { return JSON.parse(t); } catch { return UNPARSEABLE; } };
+
+/**
+ * Nothing but an `ApiClientError` may reach a panel: `useQuery` and
+ * `useMutation` both hand their error straight to code that reads `.body`,
+ * `.status` and `.param` off it, so anything else there is a blank screen.
+ */
+export function asApiError(e: unknown): ApiClientError {
+  if (e instanceof ApiClientError) return e;
+  return new ApiClientError(0, {
+    type: 'api_error',
+    code: 'unexpected_error',
+    message: e instanceof Error ? e.message : String(e),
+  });
+}
 
 export const api = {
   get: <T>(path: string, query?: RequestOptions['query']) => request<T>(path, { query }),
@@ -296,9 +413,11 @@ export function useQuery<T = unknown>(
     validatingRef.current = !!existing;
     const promise = requestUrl(key)
       .then((data) => { cache.set(key, { data, error: null, at: Date.now() }); })
-      .catch((e: ApiClientError) => {
+      .catch((raw: unknown) => {
+        const e = asApiError(raw);
         // A stale answer is still the best thing to show while a refresh fails —
         // unless the failure was the credentials, in which case it is a lie.
+        // A connection that never answered (status 0) leaves the numbers alone.
         const keep = e.status === 401 || e.status === 403 ? undefined : existing?.data;
         cache.set(key, { data: keep, error: e, at: Date.now() });
       })
@@ -350,7 +469,7 @@ export function useMutation<A = void, T = unknown>(
       optsRef.current.onSuccess?.(result, args);
       return result;
     } catch (e) {
-      const err = e instanceof ApiClientError ? e : new ApiClientError(0, { type: 'api_error', code: 'network_error', message: (e as Error).message });
+      const err = asApiError(e);
       setError(err);
       optsRef.current.onError?.(err);
       throw err;

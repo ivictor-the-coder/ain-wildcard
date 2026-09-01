@@ -42,12 +42,16 @@ import { DAY, type Period } from '../../../shared/time';
 import type { TaxBehavior } from '../catalog/types';
 import type { BillableItem } from '../credits/types';
 import { longDate } from './cycle';
-import { hydrateInvoice, hydrateInvoiceLine, like, type InvoiceListFilter, type Page, type WriteMeta } from './records';
+import {
+  hydrateInvoice, hydrateInvoiceLine, like, rollUpLineTax,
+  type InvoiceListFilter, type Page, type WriteMeta,
+} from './records';
 import type { Billing } from './store';
-import { TaxRates, type ResolvedRate } from './tax';
+import { TaxRates, type ResolvedRate, type TaxSplit } from './tax';
 import type {
-  CollectionMethod, Customer, Invoice, InvoiceBillingReason, InvoiceLine, InvoiceLineKind, InvoiceLineSource,
-  InvoiceLineTax, InvoiceStatus, PauseBehavior, PendingInvoiceItem, RecurringLine, Subscription,
+  AutomaticTaxStatus, CollectionMethod, Customer, Invoice, InvoiceBillingReason, InvoiceLine, InvoiceLineKind,
+  InvoiceLineSource, InvoiceLineTax, InvoiceStatus, LineTaxAmount, PauseBehavior, PendingInvoiceItem,
+  RecurringLine, Subscription,
 } from './types';
 
 /** The one call this file makes into another module, named so it is obvious. */
@@ -80,7 +84,34 @@ export interface DraftLine {
  * `tax` is the snapshot that explains the rest.
  */
 export interface TaxedLine extends DraftLine {
+  /** One entry per rate that touched the line — see `InvoiceLine.taxes`. */
+  taxes: LineTaxAmount[];
+  /** Those entries rolled up, so a caller that wants one figure has one. */
   tax: InvoiceLineTax;
+}
+
+/** One currency's slice of the invoice book. */
+export interface InvoiceCurrencyTotals {
+  currency: string;
+  billed: number;
+  collected: number;
+  outstanding: number;
+  written_off: number;
+  count: number;
+}
+
+/**
+ * The invoice book at a glance. The money fields are every currency's minor
+ * units added together — read `by_currency` for figures that are amounts of
+ * something. The counts are counts, so they hold across the whole book.
+ */
+export interface InvoiceTotals extends Omit<InvoiceCurrencyTotals, 'currency'> {
+  untaxed: number;
+  missing_tax_location: number;
+  held_for_tax_location: number;
+  currencies: string[];
+  mixed_currency: boolean;
+  by_currency: InvoiceCurrencyTotals[];
 }
 
 export interface IssueInvoiceInput {
@@ -122,11 +153,34 @@ export class Invoices {
     ).map(hydrateInvoiceLine);
   }
 
+  /**
+   * Whether this workspace holds a bill back over a customer location it could
+   * not resolve.
+   *
+   * On by default, because a bill taxed at zero for want of an address is a
+   * liability the *supplier* carries, not the customer. A workspace that knows
+   * its book is not taxable anywhere turns it off, and the status is still
+   * computed, still counted on the overview and still findable with
+   * `?tax=missing` — only the hold goes away.
+   */
+  automaticTaxEnabled(orgId: string): boolean {
+    try {
+      return this.ctx.svc.core.setting<{ enabled?: boolean }>(orgId, 'billing.automatic_tax', {}).enabled !== false;
+    } catch { return true; }
+  }
+
+  /** Could the tax on a bill for this account be worked out at all? */
+  taxStatusFor(orgId: string, customer: Customer): AutomaticTaxStatus {
+    return new TaxRates(this.ctx, orgId).forCustomer(customer).location_known
+      ? 'complete'
+      : 'requires_location_inputs';
+  }
+
   invoice(orgId: string, id: string): Invoice | null {
     const row = this.ctx.db.get<Record<string, unknown>>(
       `SELECT * FROM billing_invoices WHERE org_id = ? AND id = ?`, orgId, id,
     );
-    return row ? hydrateInvoice(row, this.linesOf(orgId, id)) : null;
+    return row ? hydrateInvoice(row, this.linesOf(orgId, id), this.automaticTaxEnabled(orgId)) : null;
   }
 
   require(orgId: string, id: string): Invoice {
@@ -149,6 +203,12 @@ export class Invoices {
     if (filter.created_after !== undefined) { clauses.push('i.created >= ?'); params.push(filter.created_after); }
     if (filter.created_before !== undefined) { clauses.push('i.created <= ?'); params.push(filter.created_before); }
     if (filter.due_before !== undefined) { clauses.push('i.due_date IS NOT NULL AND i.due_date <= ?'); params.push(filter.due_before); }
+    // `missing` is not "no tax was charged": it is "no country could be
+    // resolved, so nothing could be worked out", which is the queue a finance
+    // team clears before those bills can go out.
+    if (filter.tax === 'missing') clauses.push(`i.automatic_tax_status = 'requires_location_inputs'`);
+    if (filter.tax === 'zero') clauses.push('i.tax = 0');
+    if (filter.tax === 'charged') clauses.push('i.tax != 0');
     if (filter.query) {
       clauses.push(
         `(i.number LIKE ? ESCAPE '\\' OR i.id = ? OR EXISTS (SELECT 1 FROM billing_customers c WHERE c.id = i.customer_id AND (c.name LIKE ? ESCAPE '\\' OR c.email LIKE ? ESCAPE '\\')))`,
@@ -173,7 +233,8 @@ export class Invoices {
       ...(paged as string[]), limit + 1,
     );
     const hasMore = rows.length > limit;
-    const data = rows.slice(0, limit).map((row) => hydrateInvoice(row, this.linesOf(orgId, String(row.id))));
+    const enabled = this.automaticTaxEnabled(orgId);
+    const data = rows.slice(0, limit).map((row) => hydrateInvoice(row, this.linesOf(orgId, String(row.id)), enabled));
     const last = data[data.length - 1];
     return { data, hasMore, nextCursor: hasMore && last ? cursorOf(last.created, last.id) : null, totalCount };
   }
@@ -205,10 +266,11 @@ export class Invoices {
 
   /** Everything still owed, for the customer summary and the dunning view. */
   openInvoices(orgId: string, customerId: string): Invoice[] {
+    const enabled = this.automaticTaxEnabled(orgId);
     return this.ctx.db.all<Record<string, unknown>>(
       `SELECT * FROM billing_invoices WHERE org_id = ? AND customer_id = ? AND status IN ('draft','open')
         ORDER BY created ASC`, orgId, customerId,
-    ).map((row) => hydrateInvoice(row, this.linesOf(orgId, String(row.id))));
+    ).map((row) => hydrateInvoice(row, this.linesOf(orgId, String(row.id)), enabled));
   }
 
   /**
@@ -225,23 +287,63 @@ export class Invoices {
     );
   }
 
-  /** What the workspace has collected, is still owed, and has written off. */
-  totals(orgId: string): { billed: number; collected: number; outstanding: number; written_off: number; count: number } {
-    const row = this.ctx.db.get<Record<string, number>>(
+  /**
+   * What the workspace has collected, is still owed, and has written off.
+   *
+   * Bucketed by the currency it was billed in, for the same reason the MRR on
+   * the overview is: minor units of different currencies are different things.
+   * Northwind bills in dollars, euros and pounds, and adding those three
+   * columns together produces `billed: 96,853,946` — a number that is not
+   * 968,539.46 of anything, and that moves by 98,000 when a ¥98,000 bill is
+   * raised. The flat figures are kept because they are what the shape has
+   * always published and because the counts beside them are currency-free, but
+   * `by_currency` is the one to read and the one to show.
+   */
+  totals(orgId: string): InvoiceTotals {
+    const rows = this.ctx.db.all<Record<string, number | string>>(
       `SELECT
+         currency,
          COALESCE(SUM(CASE WHEN status IN ('open','paid','uncollectible') THEN total ELSE 0 END), 0) AS billed,
          COALESCE(SUM(amount_paid), 0) AS collected,
          COALESCE(SUM(CASE WHEN status IN ('draft','open') THEN amount_due ELSE 0 END), 0) AS outstanding,
          COALESCE(SUM(CASE WHEN status = 'uncollectible' THEN total ELSE 0 END), 0) AS written_off,
-         COUNT(*) AS count
-       FROM billing_invoices WHERE org_id = ?`, orgId,
+         COUNT(*) AS count,
+         -- A bill that charged no tax at all. Most are right — an exempt
+         -- account, a reverse charge, a country nothing is registered in — and
+         -- the next two columns are how many of them are not.
+         COALESCE(SUM(CASE WHEN tax = 0 AND status != 'void' THEN 1 ELSE 0 END), 0) AS untaxed,
+         COALESCE(SUM(CASE WHEN automatic_tax_status = 'requires_location_inputs' AND status != 'void' THEN 1 ELSE 0 END), 0)
+           AS missing_tax_location,
+         COALESCE(SUM(CASE WHEN automatic_tax_status = 'requires_location_inputs' AND status = 'draft' THEN 1 ELSE 0 END), 0)
+           AS held_for_tax_location
+       FROM billing_invoices WHERE org_id = ?
+       GROUP BY currency ORDER BY currency ASC`, orgId,
     );
+    const byCurrency: InvoiceCurrencyTotals[] = rows.map((row) => ({
+      currency: String(row.currency),
+      billed: Number(row.billed ?? 0),
+      collected: Number(row.collected ?? 0),
+      outstanding: Number(row.outstanding ?? 0),
+      written_off: Number(row.written_off ?? 0),
+      count: Number(row.count ?? 0),
+    }));
+    // Summed here rather than by a second query, so the buckets and the total
+    // can never be two different readings of the same book.
+    const of = (key: keyof Omit<InvoiceCurrencyTotals, 'currency'>) =>
+      byCurrency.reduce((total, row) => total + row[key], 0);
+    const counted = (key: string) => rows.reduce((total, row) => total + Number(row[key] ?? 0), 0);
     return {
-      billed: Number(row?.billed ?? 0),
-      collected: Number(row?.collected ?? 0),
-      outstanding: Number(row?.outstanding ?? 0),
-      written_off: Number(row?.written_off ?? 0),
-      count: Number(row?.count ?? 0),
+      billed: of('billed'),
+      collected: of('collected'),
+      outstanding: of('outstanding'),
+      written_off: of('written_off'),
+      count: of('count'),
+      untaxed: counted('untaxed'),
+      missing_tax_location: counted('missing_tax_location'),
+      held_for_tax_location: counted('held_for_tax_location'),
+      currencies: byCurrency.map((row) => row.currency),
+      mixed_currency: byCurrency.length > 1,
+      by_currency: byCurrency,
     };
   }
 
@@ -353,22 +455,70 @@ export class Invoices {
     return drafts.map((draft) => {
       const behavior: TaxBehavior = draft.price ? book.find(draft.price)?.tax_behavior ?? 'unspecified' : 'unspecified';
       const split = rates.split(draft.amount, behavior, draft.currency, resolved);
-      return {
-        ...draft,
-        amount: split.base,
-        tax: {
-          amount: split.tax,
-          rate: split.rate?.id ?? null,
-          display_name: split.rate?.display_name ?? null,
-          jurisdiction: split.rate?.jurisdiction ?? null,
-          percentage: split.rate?.percentage ?? null,
-          tax_type: split.rate?.tax_type ?? null,
-          behavior: split.behavior,
-          reason: split.reason,
-          explanation: rates.explain(split, where),
-        },
-      };
+      const taxes = snapshotTax(rates, split, where);
+      return { ...draft, amount: split.base, taxes, tax: rollUpLineTax(taxes) };
     });
+  }
+
+  /**
+   * What a set of amounts is worth *on a bill*: the base they will be recorded
+   * at and the tax that will sit beside them.
+   *
+   * The projections — the change preview, the customer summary — have to state
+   * numbers the bill will state, and the only way to be sure of that is to run
+   * the bill's own call. It goes through `taxDrafts` rather than reaching for
+   * the rate engine itself, so there is exactly one implementation of "what
+   * does this line cost once tax is on it" and a preview cannot drift from the
+   * charge it predicts. An exclusive line comes back with `base` equal to the
+   * amount it went in as; an inclusive one comes back with the tax taken out of
+   * it, and `base + tax` is the listed price either way.
+   */
+  taxTotals(
+    orgId: string, customer: Customer, lines: { price: string | null; amount: number; currency: string }[],
+  ): { base: number; tax: number } {
+    if (!lines.length) return { base: 0, tax: 0 };
+    const taxed = this.taxDrafts(orgId, customer, lines.map((line) => ({
+      source: { type: 'subscription_item' as InvoiceLineSource, id: null },
+      subscription: null,
+      subscriptionItem: null,
+      price: line.price,
+      kind: 'recurring' as InvoiceLineKind,
+      proration: false,
+      description: '',
+      explanation: '',
+      quantity: 1,
+      amount: line.amount,
+      currency: line.currency,
+      period: { start: 0, end: 0 },
+      fraction: null,
+      breakdown: [],
+    })));
+    return {
+      base: taxed.reduce((total, line) => total + line.amount, 0),
+      tax: taxed.reduce((total, line) => total + line.tax.amount, 0),
+    };
+  }
+
+  /**
+   * The tax columns beside a line's entry list, so the two can never drift.
+   *
+   * The list is what the line's tax is; these are the same thing rolled into
+   * one figure, kept because a credit note, a total and plain SQL all read a
+   * line's tax as a single number.
+   */
+  private taxColumns(tax: InvoiceLineTax, taxes: LineTaxAmount[]): Record<string, unknown> {
+    return {
+      taxes,
+      tax_amount: tax.amount,
+      tax_rate: tax.rate,
+      tax_percentage: tax.percentage,
+      tax_display_name: tax.display_name,
+      tax_jurisdiction: tax.jurisdiction,
+      tax_type: tax.tax_type,
+      tax_behavior: tax.behavior,
+      tax_reason: tax.reason,
+      tax_explanation: tax.explanation,
+    };
   }
 
   /* --------------------------------- issuing ------------------------------- */
@@ -410,6 +560,7 @@ export class Invoices {
     if (!drafts.length) return null;
 
     const lines = this.taxDrafts(orgId, customer, drafts);
+    const taxStatus = this.taxStatusFor(orgId, customer);
     const subtotal = lines.reduce((total, line) => total + line.amount, 0);
     const tax = lines.reduce((total, line) => total + line.tax.amount, 0);
     const starting = customer.balance;
@@ -441,6 +592,7 @@ export class Invoices {
       arrears_period_end: input.arrearsPeriod?.end ?? null,
       subtotal,
       tax,
+      automatic_tax_status: taxStatus,
       balance_applied: balanceApplied,
       total,
       amount_paid: 0,
@@ -491,15 +643,7 @@ export class Invoices {
         proration_numerator: line.fraction?.numerator ?? null,
         proration_denominator: line.fraction?.denominator ?? null,
         breakdown: line.breakdown,
-        tax_amount: line.tax.amount,
-        tax_rate: line.tax.rate,
-        tax_percentage: line.tax.percentage,
-        tax_display_name: line.tax.display_name,
-        tax_jurisdiction: line.tax.jurisdiction,
-        tax_type: line.tax.tax_type,
-        tax_behavior: line.tax.behavior,
-        tax_reason: line.tax.reason,
-        tax_explanation: line.tax.explanation,
+        ...this.taxColumns(line.tax, line.taxes),
         released: 0,
         position,
         created: createdAt,
@@ -546,6 +690,17 @@ export class Invoices {
     // paused; that is the whole point of `pause_collection.behavior`.
     if (input.pauseBehavior === 'keep_as_draft') return draft;
     if (input.pauseBehavior === 'void') return this.voidInvoice(orgId, id, input.meta, createdAt);
+
+    // A bill Ain could not place is not sent. It stays a draft naming what is
+    // missing, because a zero-rated invoice raised out of ignorance is a
+    // liability the supplier carries and cannot see.
+    //
+    // Asked before `mark_uncollectible`, because writing a bill off finalises
+    // it: the paused behaviour would otherwise carry a held draft straight into
+    // `uncollectible`, where the book counts it as billed and then forgiven.
+    // Withdrawing one is still `void`, which is above and stays there.
+    if (taxStatus === 'requires_location_inputs' && draft.automatic_tax.enabled) return draft;
+
     if (input.pauseBehavior === 'mark_uncollectible') return this.markUncollectible(orgId, id, input.meta, createdAt);
 
     const open = this.finalize(orgId, id, input.meta, createdAt);
@@ -565,6 +720,14 @@ export class Invoices {
 
   /* ------------------------------ state changes ---------------------------- */
 
+  /**
+   * Turn a draft into a bill that is owed.
+   *
+   * The tax location is asked again here rather than trusted from the moment
+   * the draft was drawn: an address put on the account since is exactly what
+   * unblocks a held bill, and re-asking is what makes "add the country, then
+   * finalise" work without re-raising the invoice.
+   */
   finalize(orgId: string, id: string, meta: WriteMeta | undefined, at?: number): Invoice {
     const invoice = this.require(orgId, id);
     if (invoice.status !== 'draft') {
@@ -572,13 +735,111 @@ export class Invoices {
       throw conflict('invoice_not_draft', `Invoice ${invoice.number} is ${invoice.status}, so there is nothing left to finalise.`, { status: invoice.status });
     }
     const now = at ?? this.ctx.now();
+    const customer = this.billing.requireCustomer(orgId, invoice.customer);
+    const taxStatus = this.taxStatusFor(orgId, customer);
+    // A draft raised before the country was known was taxed at nothing, because
+    // there was nothing to tax it at. Letting it through now would turn "we did
+    // not know" into a bill that says 0% and means it — the same under-charge,
+    // one step further along and harder to see. So it is priced again.
+    if (taxStatus === 'complete' && invoice.automatic_tax.status === 'requires_location_inputs') {
+      this.retax(orgId, invoice, customer, now);
+    }
+    if (taxStatus !== invoice.automatic_tax.status) {
+      this.ctx.db.patch('billing_invoices', 'id', id, { automatic_tax_status: taxStatus, updated: now });
+    }
+    if (taxStatus === 'requires_location_inputs' && invoice.automatic_tax.enabled) {
+      throw badRequest(
+        'customer_tax_location_invalid',
+        `Invoice ${invoice.number} cannot be finalised: Ain has no country for ${customer.name}, so the tax on it was never worked out — a zero here would mean "we do not know", not "nothing is due". Put a country on the account (PATCH /v1/customers/${customer.id} with an address) and finalise again, or turn the hold off for the whole workspace with POST /v1/billing/automatic_tax.`,
+        'customer',
+        { invoice: id, customer: customer.id, automatic_tax_status: taxStatus },
+      );
+    }
     this.ctx.db.patch('billing_invoices', 'id', id, { status: 'open', finalized_at: now, updated: now });
+    this.assertBalanced(orgId, id);
     const after = this.require(orgId, id);
     this.ctx.emit(orgId, 'invoice.finalized', after, {
       objectId: id, objectType: 'invoice', previous: { status: invoice.status },
       actorId: meta?.actorId, actorType: meta?.actorType, requestId: meta?.requestId,
     });
     return after;
+  }
+
+  /**
+   * Price a held draft again, against the jurisdiction the account now has.
+   *
+   * Only ever a draft, and only one nobody has paid or credited: a draft is not
+   * a document yet, so redrawing it is honest, while re-pricing anything that
+   * money has moved against is not. Everything the invoice recorded moves with
+   * it — the base, every jurisdiction's tax, the total and the account balance
+   * it draws on — so the five identities still hold when it opens.
+   */
+  private retax(orgId: string, invoice: Invoice, customer: Customer, at: number): void {
+    if (invoice.amount_paid !== 0
+      || invoice.pre_payment_credit_notes_amount !== 0
+      || invoice.post_payment_credit_notes_amount !== 0) {
+      throw conflict(
+        'invoice_tax_stale',
+        `Invoice ${invoice.number} was drawn before ${customer.name} had a country on file, so its lines carry no tax — but money has already moved against it, so it cannot be priced again. Credit it and raise a new bill.`,
+        { invoice: invoice.id, customer: customer.id },
+      );
+    }
+    const rates = new TaxRates(this.ctx, orgId);
+    const resolved = rates.forCustomer(customer);
+    const book = this.billing.book(orgId);
+    const where = describeJurisdiction(customer, resolved);
+    const locale = this.billing.locale(orgId);
+
+    let subtotal = 0;
+    let tax = 0;
+    for (const line of invoice.lines) {
+      const behavior: TaxBehavior = line.price ? book.find(line.price)?.tax_behavior ?? 'unspecified' : 'unspecified';
+      // The held line's `amount` is still the pricing engine's own number: a
+      // line taxed at nothing had nothing taken out of it, whatever its
+      // behaviour, so this is the same base `issue()` started from.
+      const split = rates.split(line.amount, behavior, line.currency, resolved);
+      const taxes = snapshotTax(rates, split, where);
+      const rolled = rollUpLineTax(taxes);
+      this.ctx.db.patch('billing_invoice_lines', 'id', line.id, {
+        amount: split.base, ...this.taxColumns(rolled, taxes),
+      });
+      subtotal += split.base;
+      tax += rolled.amount;
+    }
+
+    // The credit this bill may draw is the credit the account holds *now*, not
+    // what it held on the day the draft was raised. Between the two, another
+    // held bill for the same account can have been released and spent it, and
+    // `starting_balance` is only a record of a moment that has passed. Pricing
+    // against that stale figure hands out credit that is no longer there: two
+    // held drafts against one 600.00 credit draw 546.21 and 141.00 between
+    // them, the account ends 87.21 in debt nobody agreed to, and each invoice
+    // states an `ending_balance` the account itself contradicts. So this bill's
+    // own draw is put back first, and taken again from where the account
+    // actually stands. A single held draft is untouched by this: nothing has
+    // moved, so `customer.balance + balance_applied` is exactly the
+    // `starting_balance` it was raised against.
+    const starting = customer.balance + invoice.balance_applied;
+    const total = Math.max(0, subtotal + tax + starting);
+    const balanceApplied = total - subtotal - tax;
+    const moved = balanceApplied - invoice.balance_applied;
+    if (moved !== 0) {
+      this.billing.adjustBalance(orgId, customer.id, -moved, {
+        type: 'applied_to_invoice',
+        description: `Invoice ${invoice.number} was priced again once ${customer.name} had a country on file, so what it draws from the account moved by ${formatMoney(money(Math.abs(moved), invoice.currency), { locale })}`,
+        subscription: invoice.subscription,
+        invoice: invoice.id,
+        createdAt: at,
+      });
+    }
+    this.ctx.db.patch('billing_invoices', 'id', invoice.id, {
+      subtotal, tax, balance_applied: balanceApplied, total, amount_due: total,
+      starting_balance: starting, ending_balance: starting - balanceApplied, updated: at,
+    });
+    this.ctx.emit(orgId, 'invoice.updated', this.require(orgId, invoice.id), {
+      objectId: invoice.id, objectType: 'invoice',
+      previous: { subtotal: invoice.subtotal, tax: invoice.tax, total: invoice.total },
+    });
   }
 
   /**
@@ -595,6 +856,20 @@ export class Invoices {
     if (invoice.status === 'paid') return invoice;
     if (invoice.status === 'void') {
       throw conflict('invoice_void', `Invoice ${invoice.number} was voided, so it cannot be paid. Raise a new one.`, { status: invoice.status });
+    }
+    // The sibling of `finalize`. A bill held back for want of a country was
+    // never sent, so nobody can have paid it — and recording cash here would
+    // walk it straight past the hold into `paid`, untaxed, which is the whole
+    // thing the hold exists to stop.
+    if (invoice.status === 'draft'
+      && invoice.automatic_tax.enabled
+      && invoice.automatic_tax.status === 'requires_location_inputs') {
+      throw badRequest(
+        'customer_tax_location_invalid',
+        `Invoice ${invoice.number} is still a draft: Ain has no country for this account, so the tax on it was never worked out and the bill was never sent. Put a country on the account and finalise it, then record the payment.`,
+        'customer',
+        { invoice: id, customer: invoice.customer, automatic_tax_status: invoice.automatic_tax.status },
+      );
     }
     const now = opts.at ?? this.ctx.now();
     const collected = invoice.total - invoice.pre_payment_credit_notes_amount;
@@ -646,6 +921,21 @@ export class Invoices {
     return after;
   }
 
+  /**
+   * Write a bill off. It was charged, and it is not going to be collected.
+   *
+   * The third door out of `draft`, and the same one `finalize` and `pay` hold
+   * shut. Writing a bill off finalises it — `finalized_at` is stamped below —
+   * and moves it into `uncollectible`, which the book counts as *billed* and
+   * then written off. A held draft going through here becomes revenue that was
+   * charged at a zero nobody decided on and then forgiven, and it leaves the
+   * queue of bills waiting for a country on its way, so the one screen that
+   * would have shown the mistake stops showing it.
+   *
+   * Only a draft is refused. An open bill was sent, whatever Ain knew about the
+   * address when it went; writing that one off is a decision about collection,
+   * not about tax.
+   */
   markUncollectible(orgId: string, id: string, meta?: WriteMeta, at?: number): Invoice {
     const invoice = this.require(orgId, id);
     if (invoice.status === 'uncollectible') return invoice;
@@ -654,6 +944,16 @@ export class Invoices {
         'invoice_not_collectible',
         `Invoice ${invoice.number} is ${invoice.status}, so it cannot be written off.`,
         { status: invoice.status },
+      );
+    }
+    if (invoice.status === 'draft'
+      && invoice.automatic_tax.enabled
+      && invoice.automatic_tax.status === 'requires_location_inputs') {
+      throw badRequest(
+        'customer_tax_location_invalid',
+        `Invoice ${invoice.number} is still a draft: Ain has no country for this account, so the tax on it was never worked out and the bill was never sent. There is nothing to write off — put a country on the account and finalise it first, or withdraw it with POST /v1/invoices/${id}/void.`,
+        'customer',
+        { invoice: id, customer: invoice.customer, automatic_tax_status: invoice.automatic_tax.status },
       );
     }
     const now = at ?? this.ctx.now();
@@ -690,6 +990,26 @@ export class Invoices {
       throw internal(
         `Invoice ${invoice.number}'s lines carry ${lineTax} of tax but its tax total says ${invoice.tax}.`,
         { invoice: id, lines: lineTax, tax: invoice.tax },
+      );
+    }
+    // Every jurisdiction on a line adds up to the line's tax, and every rate on
+    // the bill adds up to the bill's. Without the first, a stacked line can
+    // charge a number no jurisdiction asked for; without the second, the tax
+    // summary a customer reads is not the tax they were charged.
+    for (const line of invoice.lines) {
+      const entries = line.taxes.reduce((total, entry) => total + entry.amount, 0);
+      if (line.taxes.length && entries !== line.tax.amount) {
+        throw internal(
+          `Invoice ${invoice.number}: "${line.description}" is taxed ${line.tax.amount} but its ${line.taxes.length} jurisdictions add up to ${entries}.`,
+          { invoice: id, line: line.id, entries, tax: line.tax.amount },
+        );
+      }
+    }
+    const summarised = invoice.total_taxes.reduce((total, row) => total + row.amount, 0);
+    if (summarised !== invoice.tax) {
+      throw internal(
+        `Invoice ${invoice.number}'s tax summary adds up to ${summarised} but its tax total says ${invoice.tax}.`,
+        { invoice: id, summary: summarised, tax: invoice.tax },
       );
     }
     if (invoice.subtotal + invoice.tax + invoice.balance_applied !== invoice.total || invoice.total < 0) {
@@ -793,6 +1113,32 @@ export const describeWindow = (period: { start: number; end: number }, locale: s
  * there is no rate to name — "Iowa, US" rather than a bare country code, so
  * "why is there no tax on this?" is answered by the invoice.
  */
+/**
+ * One entry per rate that touched a line.
+ *
+ * A line that matched no rate still carries one entry, because "nothing is
+ * registered for this address" is an answer the invoice has to give and an
+ * empty list gives none.
+ */
+function snapshotTax(rates: TaxRates, split: TaxSplit, where: string | null): LineTaxAmount[] {
+  const slices = split.slices.length
+    ? split.slices
+    : [{ rate: null, reason: split.reason, amount: 0, behavior: split.behavior }];
+  return slices.map((slice) => ({
+    object: 'invoice_line_tax_amount',
+    amount: slice.amount,
+    taxable_amount: split.base,
+    rate: slice.rate?.id ?? null,
+    display_name: slice.rate?.display_name ?? null,
+    jurisdiction: slice.rate?.jurisdiction ?? null,
+    percentage: slice.rate?.percentage ?? null,
+    tax_type: slice.rate?.tax_type ?? null,
+    behavior: slice.behavior,
+    reason: slice.reason,
+    explanation: rates.explainSlice(slice, split.note, where),
+  }));
+}
+
 function describeJurisdiction(customer: Customer, resolved: ResolvedRate): string | null {
   if (resolved.rate) return resolved.rate.jurisdiction;
   if (!resolved.country) return null;

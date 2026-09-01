@@ -20,7 +20,7 @@ import type { Price, ProrationBehavior } from '../catalog/types';
 import { CreditNotes } from './credit-notes';
 import {
   hydrateBalanceTransaction, hydrateCustomer, hydrateItem, hydratePendingItem, hydratePeriod,
-  hydrateSubscription, like, normaliseAddress, taxSummaryOf,
+  describeAutomaticTax, hydrateSubscription, like, normaliseAddress, taxSummaryOf,
   type AddressInput, type CancelInput, type CustomerInput, type CustomerListFilter, type Page,
   type ResolvedItem, type SubscriptionCreateInput, type SubscriptionItemInput,
   type SubscriptionListFilter, type SubscriptionUpdateInput, type WriteMeta,
@@ -47,6 +47,19 @@ import {
   type SubscriptionStatus, type TaxId, type TaxIdVerification, type TrialEndBehavior,
 } from './types';
 
+/**
+ * How many waiting proration lines one bill sweeps up.
+ *
+ * A cap, because an invoice is bounded work; anything past it stays `pending`
+ * and rides the bill after. It is a constant rather than a literal because
+ * three different callers have to read the ledger to exactly this depth or
+ * they describe different bills: `claimPendingItems` decides what the invoice
+ * carries, `previewInvoice` predicts it, and the customer summary quotes it to
+ * a support agent. The summary read 200 of them while the bill claimed 500, so
+ * an account with 210 waiting lines was told $14.50 was outstanding on a bill
+ * that went out carrying $43.50 of it.
+ */
+export const PENDING_ITEMS_PER_INVOICE = 500;
 
 /* --------------------------------- the store ------------------------------ */
 
@@ -885,6 +898,10 @@ export class Billing {
       nextInvoiceDate: anchorReset ? nextPeriod.end : sub.current_period_end,
       intervalBefore: cadenceBefore,
       intervalAfter: cadenceAfter,
+      // The same call `issue()` makes, on the same customer. A preview that
+      // priced its lines any other way would be a second implementation that
+      // happens to agree today.
+      taxOf: (lines) => this.invoices.taxTotals(orgId, customer, lines),
     });
 
     return {
@@ -1608,7 +1625,7 @@ export class Billing {
     opts: { ids?: string[]; currency?: string } = {},
   ): PendingInvoiceItem[] {
     return this.ctx.atomic(() => {
-      const items = this.pendingItems(orgId, { customer: customerId, status: 'pending', limit: 500 })
+      const items = this.pendingItems(orgId, { customer: customerId, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE })
         .filter((item) => (opts.currency ? item.currency === opts.currency : true))
         .filter((item) => (opts.ids ? opts.ids.includes(item.id) : true));
       for (const item of items) {
@@ -1657,7 +1674,7 @@ export class Billing {
     const daysUntilDue = sub.days_until_due ?? customer.invoice_settings.days_until_due;
     // Read before the invoice claims them, so the event still says what this
     // cycle swept up rather than what is left afterwards, which is nothing.
-    const pending = this.pendingItems(orgId, { subscription: sub.id, status: 'pending', limit: 500 });
+    const pending = this.pendingItems(orgId, { subscription: sub.id, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE });
 
     const invoice = this.invoices.issue(orgId, {
       reason: opts.reason,
@@ -1854,7 +1871,7 @@ export class Billing {
     // Lines already waiting, plus the ones this change would add — including a
     // set that nets negative, which reaches the bill as credit lines and is
     // taxed there rather than being netted off in the balance.
-    const waiting = this.pendingItems(orgId, { customer: customer.id, status: 'pending', limit: 500 });
+    const waiting = this.pendingItems(orgId, { customer: customer.id, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE });
     const proposed = preview.lines;
     const drafts: DraftLine[] = [
       ...this.invoices.recurringDrafts(orgId, sub.id, upcoming),
@@ -1881,6 +1898,9 @@ export class Billing {
     // its lines differently from the invoice it predicts would not be a
     // preview of anything.
     const taxed = this.invoices.taxDrafts(orgId, customer, drafts);
+    const taxEnabled = this.invoices.automaticTaxEnabled(orgId);
+    const taxStatus = this.invoices.taxStatusFor(orgId, customer);
+    const automaticTax = { enabled: taxEnabled, status: taxStatus, detail: describeAutomaticTax(taxStatus, taxEnabled) };
     const subtotal = taxed.reduce((total, line) => total + line.amount, 0);
     const tax = taxed.reduce((total, line) => total + line.tax.amount, 0);
     const starting = customer.balance;
@@ -1905,6 +1925,7 @@ export class Billing {
       period: line.period,
       proration_fraction: line.fraction,
       breakdown: line.breakdown,
+      taxes: line.taxes,
       tax: line.tax,
       released: false,
     }));
@@ -1927,6 +1948,9 @@ export class Billing {
       balance_applied: balanceApplied,
       tax,
       total_taxes: taxSummaryOf(lines),
+      // A preview is the bill this account would be sent, and that includes
+      // whether it could be sent at all.
+      automatic_tax: automaticTax,
       total_excluding_tax: total - tax,
       pre_payment_credit_notes_amount: 0,
       post_payment_credit_notes_amount: 0,

@@ -254,9 +254,21 @@ export function createAiRuntime(config: Config): AinAiRuntime {
 
   const budgetFor = (call: AiCallContext): AiBudget => ({ ...DEFAULT_BUDGET, ...(call.budget ?? {}) });
 
+  /**
+   * `now` is the workspace's own clock, which an operator moves in both
+   * directions with `POST /v1/time/advance` and `POST /v1/time/reset`. A token
+   * bucket cannot survive time going backwards: the refill term goes negative
+   * by `elapsed × limit`, so returning a workspace to real time after a month
+   * of replay left it ~2.6M tokens in deficit against a 600/minute refill, and
+   * every tool call in that workspace answered `rate_limited` from then on —
+   * the copilot reporting that it could not reach any of the workspace's own
+   * data. Clamping `elapsed` at zero is the invariant: whatever the source of
+   * the number, a bucket may only ever be refilled by time passing, never
+   * emptied by it.
+   */
   function rateLimit(orgId: string, now: number, limit: number): boolean {
     const bucket = buckets.get(orgId) ?? { tokens: limit, last: now };
-    bucket.tokens = Math.min(limit, bucket.tokens + ((now - bucket.last) / 60_000) * limit);
+    bucket.tokens = Math.min(limit, bucket.tokens + (Math.max(0, now - bucket.last) / 60_000) * limit);
     bucket.last = now;
     if (bucket.tokens < 1) { buckets.set(orgId, bucket); return false; }
     bucket.tokens -= 1;

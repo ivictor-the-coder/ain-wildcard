@@ -15,7 +15,7 @@
 import type { Ctx } from '../../kernel/context';
 import { formatMoney, money } from '../../../shared/money';
 import { longDate } from './cycle';
-import { formatPercentage } from './tax';
+import { combinePercentages, formatPercentage } from './tax';
 import type { Billing } from './store';
 import type { CreditNote, Customer, Invoice, InvoiceLine } from './types';
 
@@ -273,8 +273,12 @@ function lineTable(
            </tbody>
          </table>`
       : '';
-    const taxCell = line.tax.percentage
-      ? `${esc(show(line.tax.amount))}<br><span class='muted'>${esc(line.tax.display_name ?? 'Tax')} ${esc(formatPercentage(line.tax.percentage))}%${line.tax.reason && line.tax.reason !== 'taxable' ? ` · ${esc(line.tax.reason.replace(/_/g, ' '))}` : ''}</span>`
+    // Every jurisdiction that taxed the line, named. One rate reads exactly as
+    // it always did; three read as the three a US customer expects to see.
+    const jurisdictions = line.taxes.filter((entry): entry is typeof entry & { percentage: string } => !!entry.percentage);
+    const taxCell = jurisdictions.length
+      ? `${esc(show(line.tax.amount))}<br>${jurisdictions.map((entry) =>
+        `<span class='muted'>${esc(entry.display_name ?? 'Tax')} ${esc(formatPercentage(entry.percentage))}%${entry.reason && entry.reason !== 'taxable' ? ` · ${esc(entry.reason.replace(/_/g, ' '))}` : ''}</span>`).join('<br>')}`
       : `<span class='muted'>—</span>`;
     return `
     <tr>
@@ -328,6 +332,31 @@ function taxSummary(
       <td class='num strong'>${esc(show(entry.amount))}</td>
     </tr>
     <tr class='note'><td colspan='4'>${esc(entry.explanation)}</td></tr>`;
+  // Where several jurisdictions taxed the same supply, the bill also states
+  // what they come to together. "8.875%" is the number a New York customer
+  // checks the total against; the rows above are what it is made of.
+  //
+  // A row is not a jurisdiction. The summary keys on how a rate was charged as
+  // well as on the rate, so one 19% VAT reaches this table twice the moment a
+  // bill carries an inclusive price beside an exclusive one — and adding those
+  // two rows up prints "Combined 38%", a rate no authority has ever charged, on
+  // a document the customer checks against their own return. So the combined
+  // line is built from the *distinct* rates, and only appears when there is
+  // more than one of them.
+  const identityOf = (entry: Invoice['total_taxes'][number]): string =>
+    entry.tax_rate ?? `${entry.display_name}@${entry.percentage}@${entry.jurisdiction}`;
+  const distinct = new Map<string, Invoice['total_taxes'][number]>();
+  for (const entry of charged) if (!distinct.has(identityOf(entry))) distinct.set(identityOf(entry), entry);
+  const rates = [...distinct.values()];
+  const combined = rates.length > 1
+    ? `
+    <tr>
+      <td class='strong'>Combined ${esc(combinePercentages(rates.map((entry) => entry.percentage)))}%</td>
+      <td>${esc([...new Set(rates.map((entry) => entry.jurisdiction))].join(', '))}</td>
+      <td class='num'></td>
+      <td class='num strong'>${esc(show(charged.reduce((total, entry) => total + entry.amount, 0)))}</td>
+    </tr>`
+    : '';
   return `
 <section>
   <h2>Tax summary</h2>
@@ -335,7 +364,7 @@ function taxSummary(
     <thead>
       <tr><th>Rate</th><th>Jurisdiction</th><th class='num'>Taxable amount</th><th class='num'>Tax</th></tr>
     </thead>
-    <tbody>${[...charged, ...zeroRated].map(row).join('')}</tbody>
+    <tbody>${[...charged, ...zeroRated].map(row).join('')}${combined}</tbody>
   </table>
 </section>`;
 }

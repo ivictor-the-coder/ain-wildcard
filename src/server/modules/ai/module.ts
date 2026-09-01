@@ -1,8 +1,8 @@
 import { defineModule } from '../../kernel/module';
 import type { Ctx } from '../../kernel/context';
 import type { AiCompletionRequest, AiMessage } from '../../kernel/ai';
-import { created, list, type Req } from '../../kernel/http';
-import { badRequest, notFound } from '../../../shared/errors';
+import { created, list, roleAtLeast, type Req } from '../../kernel/http';
+import { badRequest, forbidden, notFound } from '../../../shared/errors';
 import type { SchemaNode } from '../../../shared/validate';
 import v from '../../../shared/validate';
 import { DAY, dayKey, formatDate } from '../../../shared/time';
@@ -49,6 +49,58 @@ function describeStanding(standing: RecordStanding): string {
     case 'merged': return `${standing.name ?? standing.id} was merged into ${standing.mergedInto}`;
     default: return `${standing.name ?? standing.id} is unchanged`;
   }
+}
+
+/* --------------------------- the AI trust boundary ------------------------ */
+
+/**
+ * `allow_writes` and `approvals` are the AI surface's authority parameters:
+ * together they let a caller execute a write tool with nobody else in the loop,
+ * so the requester is also the approver. That is precisely the authority
+ * `POST /v1/ai/approvals/:id` carries, and that route is gated at `member` —
+ * so these two fields are gated at `member` too.
+ *
+ * The route itself stays open to every role, because reading the workspace
+ * through the copilot is what an analyst is for. Gating the whole endpoint
+ * would take the read surface away; gating only the fields closes the hole,
+ * which is that a readonly session refused `POST /v1/records/:id/activities`
+ * could write the identical note by asking the copilot for it.
+ */
+function assertMayAuthoriseWrites(req: Req): void {
+  const body = req.body as { allow_writes?: boolean; approvals?: string[] } | undefined;
+  const asking = body?.allow_writes === true || !!body?.approvals?.length;
+  if (!asking || roleAtLeast(req.auth.role, 'member')) return;
+  throw forbidden(
+    `Your role (${req.auth.role}) cannot let an agent write to this workspace. `
+    + 'Ask again without `allow_writes` to read, or have a teammate with the member role or higher run it from the approvals queue.',
+  );
+}
+
+const isMember = (ctx: Ctx, orgId: string, userId: string): boolean =>
+  !!ctx.db.get<{ user_id: string }>(
+    `SELECT user_id FROM memberships WHERE org_id = ? AND user_id = ?`, orgId, userId);
+
+/**
+ * Who an AI run acts as.
+ *
+ * A write tool hands its actor to the CRM as the owner of what it writes, and
+ * an API key id is not a person: `logActivity` puts the actor in `owner_id`,
+ * which rejects anything that is not a member of the workspace. Passing
+ * `auth.keyId` through is why every AI write tool answered `"ak_… is not a
+ * member of this workspace"` for exactly the callers who integrate with us,
+ * leaving the whole agent surface session-only.
+ *
+ * A key therefore acts as the teammate who created it. Anything that is not a
+ * live member of this org — a key created by someone who has since left, a
+ * session whose membership was revoked — resolves to null rather than to a
+ * stranger: an unattributed note is a small loss, a 400 on every write is not.
+ */
+function actorFor(ctx: Ctx, auth: Req['auth']): string | null {
+  if (auth.userId) return isMember(ctx, auth.orgId, auth.userId) ? auth.userId : null;
+  if (!auth.keyId) return null;
+  const key = ctx.db.get<{ created_by: string | null }>(
+    `SELECT created_by FROM api_keys WHERE id = ? AND org_id = ?`, auth.keyId, auth.orgId);
+  return key?.created_by && isMember(ctx, auth.orgId, key.created_by) ? key.created_by : null;
 }
 
 /* -------------------------------- service -------------------------------- */
@@ -429,6 +481,15 @@ export default defineModule({
 
     /* A scheduled follow-up is a durable job, so the time machine replays it. */
     ctx.jobs.handle('ai.followup', (payload: { recordId: string; note: string; assigneeId: string | null; runId: string | null }, job) => {
+      // The same rule the request path applies, at the other end of a job that
+      // may have been waiting a year: the note this writes carries its assignee
+      // as `owner_id`, which rejects anyone who is not a member. A teammate who
+      // has left since the follow-up was approved would otherwise turn it into a
+      // row that retries and then fails for good, and the note the operator
+      // approved never lands at all. Unassigned is the honest outcome.
+      const assignee = payload.assigneeId && isMember(ctx, job.org_id, payload.assigneeId)
+        ? payload.assigneeId
+        : null;
       const crm = ctx.svc.crm;
       if (crm) {
         crm.logActivity(job.org_id, {
@@ -437,10 +498,10 @@ export default defineModule({
           body: payload.note,
           occurredAt: ctx.now(),
           associateTo: [payload.recordId],
-        }, { actorId: payload.assigneeId, actorType: 'agent', source: 'agent' });
+        }, { actorId: assignee, actorType: 'agent', source: 'agent' });
       }
       ctx.emit(job.org_id, 'ai.followup.due', {
-        record_id: payload.recordId, note: payload.note, assignee_id: payload.assigneeId, run_id: payload.runId,
+        record_id: payload.recordId, note: payload.note, assignee_id: assignee, run_id: payload.runId,
       }, { objectId: payload.recordId, objectType: 'record', actorType: 'agent' });
     });
 
@@ -479,7 +540,7 @@ export default defineModule({
     const svc = () => ctx.svc.ai;
 
     const askOptions = (req: Req, extra: Partial<AskOptions> = {}): AskOptions => ({
-      actorId: req.auth.userId ?? req.auth.keyId ?? null,
+      actorId: actorFor(ctx, req.auth),
       actorType: req.auth.kind === 'session' ? 'user' : req.auth.kind === 'api_key' ? 'api_key' : 'system',
       ...extra,
     });
@@ -496,6 +557,7 @@ export default defineModule({
       if (!body.messages?.length && !body.prompt) {
         throw badRequest('missing_prompt', 'Send either `prompt` or a `messages` array.', 'prompt');
       }
+      assertMayAuthoriseWrites(req);
       const opts: AskOptions = askOptions(req, {
         threadId: body.thread_id ?? null,
         feature: body.feature ?? 'copilot',
@@ -573,14 +635,15 @@ export default defineModule({
     router.post('/v1/ai/threads', async (req: Req, c: Ctx) => {
       const body = req.body as { title?: string; message?: string; subject_id?: string; subject_type?: string };
       const title = body.title ?? (body.message ? truncate(body.message, 70) : 'New conversation');
+      const startedBy = actorFor(ctx, req.auth);
       const thread = store.createThread(req.auth.orgId, {
         title,
         subjectId: body.subject_id ?? null,
         subjectType: body.subject_type ?? null,
-        createdBy: req.auth.userId ?? null,
+        createdBy: startedBy,
       });
       c.emit(req.auth.orgId, 'ai.thread.created', { id: thread.id, title }, {
-        objectId: thread.id, objectType: 'ai_thread', actorId: req.auth.userId, actorType: 'user',
+        objectId: thread.id, objectType: 'ai_thread', actorId: startedBy, actorType: 'user',
       });
       if (!body.message) return created({ ...publicThread(thread), messages: [] });
       const answer = await svc().reply(req.auth.orgId, thread.id, body.message, askOptions(req));
@@ -639,6 +702,7 @@ export default defineModule({
     router.post('/v1/ai/threads/:id/messages', async (req: Req) => {
       const thread = store.thread(req.auth.orgId, req.params.id);
       if (!thread) throw notFound('ai thread', req.params.id);
+      assertMayAuthoriseWrites(req);
       const body = req.body as { content: string; allow_writes?: boolean; approvals?: string[]; tools?: string[] };
       const answer = await svc().reply(req.auth.orgId, thread.id, body.content, askOptions(req, {
         allowWrites: body.allow_writes,
@@ -751,14 +815,19 @@ export default defineModule({
     router.post('/v1/ai/approvals/:id', async (req: Req, c: Ctx) => {
       const approval = store.approval(req.auth.orgId, req.params.id);
       if (!approval) throw notFound('approval', req.params.id);
+      // The same resolution the ask routes use: a key acts as the teammate who
+      // created it, and a caller who is no longer a member acts as nobody. What
+      // this route executes hands its actor to the CRM as an owner, so an id
+      // that is not a live member fails the very write it was approving.
+      const decidedBy = actorFor(c, req.auth);
       if (approval.status !== 'pending') {
         throw badRequest('approval_decided', `This request was already ${approval.status}.`, 'id');
       }
       const body = req.body as { decision: 'approve' | 'decline'; note?: string };
       if (body.decision === 'decline') {
-        store.decideApproval(req.auth.orgId, approval.id, 'declined', req.auth.userId ?? null, body.note ?? 'Declined by an operator.');
+        store.decideApproval(req.auth.orgId, approval.id, 'declined', decidedBy, body.note ?? 'Declined by an operator.');
         c.emit(req.auth.orgId, 'ai.approval.declined', { id: approval.id, tool: approval.tool, run_id: approval.run_id }, {
-          objectId: approval.id, objectType: 'ai_approval', actorId: req.auth.userId, actorType: 'user',
+          objectId: approval.id, objectType: 'ai_approval', actorId: decidedBy, actorType: 'user',
         });
         return publicApproval(store.approval(req.auth.orgId, approval.id)!, recordNamer(c, req.auth.orgId));
       }
@@ -769,7 +838,7 @@ export default defineModule({
       const definition = runtime.tool(approval.tool);
       const args = JSON.parse(approval.args) as Record<string, unknown>;
       if (!definition) {
-        store.decideApproval(req.auth.orgId, approval.id, 'declined', req.auth.userId ?? null,
+        store.decideApproval(req.auth.orgId, approval.id, 'declined', decidedBy,
           `Blocked: no tool named "${approval.tool}" is registered any more.`);
         throw badRequest('tool_unavailable', `"${approval.tool}" is no longer registered, so this approval cannot be executed.`, 'id');
       }
@@ -777,10 +846,10 @@ export default defineModule({
         definition.input.parse(args);
       } catch (e) {
         const message = (e as Error).message;
-        store.decideApproval(req.auth.orgId, approval.id, 'declined', req.auth.userId ?? null, `Blocked: ${message}`);
+        store.decideApproval(req.auth.orgId, approval.id, 'declined', decidedBy, `Blocked: ${message}`);
         c.emit(req.auth.orgId, 'ai.approval.declined', {
           id: approval.id, tool: approval.tool, run_id: approval.run_id, reason: 'invalid_arguments',
-        }, { objectId: approval.id, objectType: 'ai_approval', actorId: req.auth.userId, actorType: 'user' });
+        }, { objectId: approval.id, objectType: 'ai_approval', actorId: decidedBy, actorType: 'user' });
         throw badRequest(
           'approval_arguments_invalid',
           `This approval cannot run: ${message} It has been declined rather than executed with bad arguments.`,
@@ -797,12 +866,12 @@ export default defineModule({
         .filter((standing) => standing.state !== 'live');
       if (moved.length) {
         const why = moved.map(describeStanding).join('; ');
-        store.decideApproval(req.auth.orgId, approval.id, 'declined', req.auth.userId ?? null,
+        store.decideApproval(req.auth.orgId, approval.id, 'declined', decidedBy,
           `Blocked: ${why}.`);
         c.emit(req.auth.orgId, 'ai.approval.declined', {
           id: approval.id, tool: approval.tool, run_id: approval.run_id, reason: 'target_changed',
           targets: moved.map((s) => ({ id: s.id, state: s.state })),
-        }, { objectId: approval.id, objectType: 'ai_approval', actorId: req.auth.userId, actorType: 'user' });
+        }, { objectId: approval.id, objectType: 'ai_approval', actorId: decidedBy, actorType: 'user' });
         throw badRequest(
           'approval_target_changed',
           `This approval cannot run: ${why}. It was prepared against ${moved.length === 1 ? 'a record' : 'records'} that changed while it waited, so it has been declined rather than written to ${moved.length === 1 ? 'the wrong place' : 'the wrong places'}. Ask again and I will prepare it against what is there now.`,
@@ -813,7 +882,7 @@ export default defineModule({
       const call: AiCallContext = {
         ctx: c,
         orgId: req.auth.orgId,
-        actorId: req.auth.userId ?? null,
+        actorId: decidedBy,
         actorType: 'user',
         runId: approval.run_id,
         threadId: approval.thread_id,
@@ -824,7 +893,7 @@ export default defineModule({
       };
       const execution = await runtime.execute(approval.tool, args, call, definition);
       store.decideApproval(
-        req.auth.orgId, approval.id, 'approved', req.auth.userId ?? null,
+        req.auth.orgId, approval.id, 'approved', decidedBy,
         execution.ok ? execution.span.summary : `Failed: ${execution.error?.message}`,
       );
       const stillWaiting = c.db.count(
@@ -835,9 +904,9 @@ export default defineModule({
       }
       c.emit(req.auth.orgId, 'ai.approval.granted', {
         id: approval.id, tool: approval.tool, run_id: approval.run_id, ok: execution.ok,
-      }, { objectId: approval.id, objectType: 'ai_approval', actorId: req.auth.userId, actorType: 'user' });
+      }, { objectId: approval.id, objectType: 'ai_approval', actorId: decidedBy, actorType: 'user' });
       c.audit({
-        orgId: req.auth.orgId, actorId: req.auth.userId, actorType: 'user', action: 'ai.approval.granted',
+        orgId: req.auth.orgId, actorId: decidedBy, actorType: 'user', action: 'ai.approval.granted',
         targetType: 'ai_approval', targetId: approval.id, summary: `Approved ${approval.tool} for run ${approval.run_id}`,
         after: execution.ok ? { result: execution.span.summary } : { error: execution.error?.message },
         requestId: req.requestId,
@@ -865,7 +934,7 @@ export default defineModule({
         contactId: body.contact_id,
         kind: body.kind,
         tone: body.tone,
-        actorId: req.auth.userId ?? null,
+        actorId: actorFor(ctx, req.auth),
       });
       return { object: 'ai_draft', ...draft };
     }, {

@@ -1,0 +1,3473 @@
+TAP version 13
+# (node:22369) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: the billing cycle anchor
+    # Subtest: a subscription anchored on the 31st bills the 28th in February and returns to the 31st
+    ok 1 - a subscription anchored on the 31st bills the 28th in February and returns to the 31st
+      ---
+      duration_ms: 2525.021601
+      type: 'test'
+      ...
+    # Subtest: a leap February takes the 29th
+    ok 2 - a leap February takes the 29th
+      ---
+      duration_ms: 5973.509939
+      type: 'test'
+      ...
+    # Subtest: a subscription that starts mid-cycle pays only for the rest of the month
+    ok 3 - a subscription that starts mid-cycle pays only for the rest of the month
+      ---
+      duration_ms: 21.896679
+      type: 'test'
+      ...
+    # Subtest: a renewal job that names a period the subscription has already left does nothing
+    ok 4 - a renewal job that names a period the subscription has already left does nothing
+      ---
+      duration_ms: 531.178466
+      type: 'test'
+      ...
+    1..4
+ok 1 - the billing cycle anchor
+  ---
+  duration_ms: 13984.27723
+  type: 'suite'
+  ...
+# Subtest: the anchor day
+    # Subtest: naming the day and naming the instant are two spellings of one cycle
+    ok 1 - naming the day and naming the instant are two spellings of one cycle
+      ---
+      duration_ms: 3979.008511
+      type: 'test'
+      ...
+    # Subtest: no period is ever longer than the interval it is a part of
+    ok 2 - no period is ever longer than the interval it is a part of
+      ---
+      duration_ms: 13636.725603
+      type: 'test'
+      ...
+    # Subtest: an anchor day that contradicts the anchor instant is refused, not silently picked between
+    ok 3 - an anchor day that contradicts the anchor instant is refused, not silently picked between
+      ---
+      duration_ms: 5627.525496
+      type: 'test'
+      ...
+    # Subtest: an anchor day means nothing on a weekly cycle, and says so
+    ok 4 - an anchor day means nothing on a weekly cycle, and says so
+      ---
+      duration_ms: 3291.894633
+      type: 'test'
+      ...
+    # Subtest: the first paid period after a trial covers only the days up to the billing day
+    ok 5 - the first paid period after a trial covers only the days up to the billing day
+      ---
+      duration_ms: 4478.220118
+      type: 'test'
+      ...
+    # Subtest: a change inside a part-period credits against the interval, never more than was charged
+    ok 6 - a change inside a part-period credits against the interval, never more than was charged
+      ---
+      duration_ms: 4023.988426
+      type: 'test'
+      ...
+    1..6
+ok 2 - the anchor day
+  ---
+  duration_ms: 35038.979438
+  type: 'suite'
+  ...
+# Subtest: proration
+    # Subtest: an upgrade at exactly half a period credits and charges symmetrically
+    ok 1 - an upgrade at exactly half a period credits and charges symmetrically
+      ---
+      duration_ms: 15.222667
+      type: 'test'
+      ...
+    # Subtest: a quantity change prorates only the difference in seats it is charged for
+    ok 2 - a quantity change prorates only the difference in seats it is charged for
+      ---
+      duration_ms: 9.662779
+      type: 'test'
+      ...
+    # Subtest: two changes in one cycle compose — the second prorates against the first
+    ok 3 - two changes in one cycle compose — the second prorates against the first
+      ---
+      duration_ms: 26.233775
+      type: 'test'
+      ...
+    # Subtest: the preview is the charge, line for line and to the cent
+    ok 4 - the preview is the charge, line for line and to the cent
+      ---
+      duration_ms: 26.433088
+      type: 'test'
+      ...
+    # Subtest: a downgrade is invoiced as a credit line, never collected and never routed around the bill
+    ok 5 - a downgrade is invoiced as a credit line, never collected and never routed around the bill
+      ---
+      duration_ms: 45.95101
+      type: 'test'
+      ...
+    # Subtest: proration never applies to a metered item
+    ok 6 - proration never applies to a metered item
+      ---
+      duration_ms: 16.059596
+      type: 'test'
+      ...
+    # Subtest: changes during a trial are free, and moving the anchor charges a whole new period
+    ok 7 - changes during a trial are free, and moving the anchor charges a whole new period
+      ---
+      duration_ms: 17.820389
+      type: 'test'
+      ...
+    # Subtest: proration_behavior=none moves the items and charges nothing
+    ok 8 - proration_behavior=none moves the items and charges nothing
+      ---
+      duration_ms: 15.13156
+      type: 'test'
+      ...
+    1..8
+ok 3 - proration
+  ---
+  duration_ms: 4645.470265
+  type: 'suite'
+  ...
+# Subtest: changing the billing cadence
+    # Subtest: "switch me to annual" moves the whole subscription onto the year
+    ok 1 - "switch me to annual" moves the whole subscription onto the year
+      ---
+      duration_ms: 17940.165506
+      type: 'test'
+      ...
+    # Subtest: a cadence change while the cycle is pinned is a contradiction, and names both cadences
+    ok 2 - a cadence change while the cycle is pinned is a contradiction, and names both cadences
+      ---
+      duration_ms: 7329.91358
+      type: 'test'
+      ...
+    # Subtest: switching cadence inside a trial moves the cycle, not the free time
+    ok 3 - switching cadence inside a trial moves the cycle, not the free time
+      ---
+      duration_ms: 4873.418552
+      type: 'test'
+      ...
+    # Subtest: a schedule phase on another cadence takes the subscription onto it
+    ok 4 - a schedule phase on another cadence takes the subscription onto it
+      ---
+      duration_ms: 7122.751917
+      type: 'test'
+      ...
+    1..4
+ok 4 - changing the billing cadence
+  ---
+  duration_ms: 37266.667965
+  type: 'suite'
+  ...
+# Subtest: the subscription lifecycle
+    # Subtest: cancel at period end fires exactly once, and nothing bills afterwards
+    ok 1 - cancel at period end fires exactly once, and nothing bills afterwards
+      ---
+      duration_ms: 4756.274456
+      type: 'test'
+      ...
+    # Subtest: a trial converts on its end date and starts the first paid period there
+    ok 2 - a trial converts on its end date and starts the first paid period there
+      ---
+      duration_ms: 348.599211
+      type: 'test'
+      ...
+    # Subtest: a trial with nothing to charge follows its end_behavior
+    ok 3 - a trial with nothing to charge follows its end_behavior
+      ---
+      duration_ms: 60.390617
+      type: 'test'
+      ...
+    # Subtest: pausing keeps the cycle running, and a resume date brings it back on its own
+    ok 4 - pausing keeps the cycle running, and a resume date brings it back on its own
+      ---
+      duration_ms: 462.368794
+      type: 'test'
+      ...
+    # Subtest: an immediate cancellation can hand back the unused remainder as credit
+    ok 5 - an immediate cancellation can hand back the unused remainder as credit
+      ---
+      duration_ms: 12.375771
+      type: 'test'
+      ...
+    # Subtest: an incomplete subscription expires if the first payment never arrives
+    ok 6 - an incomplete subscription expires if the first payment never arrives
+      ---
+      duration_ms: 39.556263
+      type: 'test'
+      ...
+    # Subtest: every renewal hands invoicing a complete brief
+    ok 7 - every renewal hands invoicing a complete brief
+      ---
+      duration_ms: 340.915611
+      type: 'test'
+      ...
+    # Subtest: over a year, what the ledger recognises is exactly what invoicing was asked for
+    ok 8 - over a year, what the ledger recognises is exactly what invoicing was asked for
+      ---
+      duration_ms: 18540.639785
+      type: 'test'
+      ...
+    # Subtest: resuming can restart the cycle from today instead of picking up the old one
+    ok 9 - resuming can restart the cycle from today instead of picking up the old one
+      ---
+      duration_ms: 12.345489
+      type: 'test'
+      ...
+    # Subtest: the status machine refuses moves that make no sense, and says what it would accept
+    ok 10 - the status machine refuses moves that make no sense, and says what it would accept
+      ---
+      duration_ms: 12.932634
+      type: 'test'
+      ...
+    1..10
+ok 5 - the subscription lifecycle
+  ---
+  duration_ms: 29712.732225
+  type: 'suite'
+  ...
+# Subtest: subscription schedules
+    # Subtest: a three-phase ramp advances in order across a year of the time machine
+    ok 1 - a three-phase ramp advances in order across a year of the time machine
+      ---
+      duration_ms: 3627.642814
+      type: 'test'
+      ...
+    # Subtest: a schedule that cancels at the end takes the subscription with it
+    ok 2 - a schedule that cancels at the end takes the subscription with it
+      ---
+      duration_ms: 575.657381
+      type: 'test'
+      ...
+    # Subtest: releasing a schedule leaves the subscription exactly as it is
+    ok 3 - releasing a schedule leaves the subscription exactly as it is
+      ---
+      duration_ms: 313.705373
+      type: 'test'
+      ...
+    # Subtest: a phase that cannot say how long it lasts is rejected before anything is written
+    ok 4 - a phase that cannot say how long it lasts is rejected before anything is written
+      ---
+      duration_ms: 1.069768
+      type: 'test'
+      ...
+    1..4
+ok 6 - subscription schedules
+  ---
+  duration_ms: 6492.72084
+  type: 'suite'
+  ...
+# Subtest: customers
+    # Subtest: currency is fixed once the account has been billed
+    ok 1 - currency is fixed once the account has been billed
+      ---
+      duration_ms: 5.273388
+      type: 'test'
+      ...
+    # Subtest: one CRM company has exactly one billing customer
+    ok 2 - one CRM company has exactly one billing customer
+      ---
+      duration_ms: 0.590812
+      type: 'test'
+      ...
+    # Subtest: the summary is one screen with everything a support agent needs
+    ok 3 - the summary is one screen with everything a support agent needs
+      ---
+      duration_ms: 7.115442
+      type: 'test'
+      ...
+    # Subtest: a customer with live subscriptions cannot be deleted out from under them
+    ok 4 - a customer with live subscriptions cannot be deleted out from under them
+      ---
+      duration_ms: 5.458108
+      type: 'test'
+      ...
+    # Subtest: search finds accounts by name, email and whether they still buy anything
+    ok 5 - search finds accounts by name, email and whether they still buy anything
+      ---
+      duration_ms: 5.289892
+      type: 'test'
+      ...
+    1..5
+ok 7 - customers
+  ---
+  duration_ms: 2068.337238
+  type: 'suite'
+  ...
+# Subtest: what billing refuses to do
+    # Subtest: every item on a subscription must share one billing interval
+    ok 1 - every item on a subscription must share one billing interval
+      ---
+      duration_ms: 6.569887
+      type: 'test'
+      ...
+    # Subtest: a flat plan fee has no quantity — the engine bills it the same at any number
+    ok 2 - a flat plan fee has no quantity — the engine bills it the same at any number
+      ---
+      duration_ms: 5.321084
+      type: 'test'
+      ...
+    # Subtest: dropping a per-unit line to zero credits exactly what it stops charging
+    ok 3 - dropping a per-unit line to zero credits exactly what it stops charging
+      ---
+      duration_ms: 5.942938
+      type: 'test'
+      ...
+    # Subtest: a one-time price belongs on an invoice, not a subscription
+    ok 4 - a one-time price belongs on an invoice, not a subscription
+      ---
+      duration_ms: 0.596424
+      type: 'test'
+      ...
+    # Subtest: the same price cannot appear twice
+    ok 5 - the same price cannot appear twice
+      ---
+      duration_ms: 0.620449
+      type: 'test'
+      ...
+    # Subtest: a negotiated price has to arrive with its negotiated number
+    ok 6 - a negotiated price has to arrive with its negotiated number
+      ---
+      duration_ms: 4.716392
+      type: 'test'
+      ...
+    # Subtest: a subscription cannot be emptied — that is a cancellation
+    ok 7 - a subscription cannot be emptied — that is a cancellation
+      ---
+      duration_ms: 3.584685
+      type: 'test'
+      ...
+    # Subtest: naming a price already on the subscription updates it instead of adding a second line
+    ok 8 - naming a price already on the subscription updates it instead of adding a second line
+      ---
+      duration_ms: 5.492447
+      type: 'test'
+      ...
+    # Subtest: a proration date outside the period is refused, not quietly clamped
+    ok 9 - a proration date outside the period is refused, not quietly clamped
+      ---
+      duration_ms: 3.330476
+      type: 'test'
+      ...
+    # Subtest: a trial cannot be bolted onto a subscription that is already running
+    ok 10 - a trial cannot be bolted onto a subscription that is already running
+      ---
+      duration_ms: 3.94832
+      type: 'test'
+      ...
+    # Subtest: a subscription cannot be backdated to a day that has not happened yet
+    ok 11 - a subscription cannot be backdated to a day that has not happened yet
+      ---
+      duration_ms: 4.896269
+      type: 'test'
+      ...
+    # Subtest: a cancellation cannot be scheduled for a date that has already passed
+    ok 12 - a cancellation cannot be scheduled for a date that has already passed
+      ---
+      duration_ms: 5.729326
+      type: 'test'
+      ...
+    # Subtest: an unknown price is a 404 that names what was asked for
+    ok 13 - an unknown price is a 404 that names what was asked for
+      ---
+      duration_ms: 0.741072
+      type: 'test'
+      ...
+    1..13
+ok 8 - what billing refuses to do
+  ---
+  duration_ms: 2539.307305
+  type: 'suite'
+  ...
+# Subtest: invoices
+    # Subtest: an invoice is raised for the period a subscription enters, and its lines add up
+    ok 1 - an invoice is raised for the period a subscription enters, and its lines add up
+      ---
+      duration_ms: 5.864321
+      type: 'test'
+      ...
+    # Subtest: the previewed invoice is the invoice, line for line
+    ok 2 - the previewed invoice is the invoice, line for line
+      ---
+      duration_ms: 847.845836
+      type: 'test'
+      ...
+    # Subtest: the stub period after a trial is previewed, and billed, as a stub
+    ok 3 - the stub period after a trial is previewed, and billed, as a stub
+      ---
+      duration_ms: 2688.227815
+      type: 'test'
+      ...
+    # Subtest: a downgrade rides the next invoice as a credit line, and nets against the new plan
+    ok 4 - a downgrade rides the next invoice as a credit line, and nets against the new plan
+      ---
+      duration_ms: 203.45314
+      type: 'test'
+      ...
+    # Subtest: an invoice a credit balance covers in full is settled at zero, not paid out
+    ok 5 - an invoice a credit balance covers in full is settled at zero, not paid out
+      ---
+      duration_ms: 6.448101
+      type: 'test'
+      ...
+    # Subtest: pausing collection decides what happens to the bills raised while it is paused
+    ok 6 - pausing collection decides what happens to the bills raised while it is paused
+      ---
+      duration_ms: 714.208284
+      type: 'test'
+      ...
+    # Subtest: voiding an invoice puts back everything it claimed
+    ok 7 - voiding an invoice puts back everything it claimed
+      ---
+      duration_ms: 286.636525
+      type: 'test'
+      ...
+    # Subtest: a paid invoice does not clear an account that still owes an older one
+    ok 8 - a paid invoice does not clear an account that still owes an older one
+      ---
+      duration_ms: 298.959111
+      type: 'test'
+      ...
+    # Subtest: a metered-only cycle raises no invoice, because nothing is billable in advance
+    ok 9 - a metered-only cycle raises no invoice, because nothing is billable in advance
+      ---
+      duration_ms: 291.469631
+      type: 'test'
+      ...
+    # Subtest: every invoice in the workspace reconciles, after a year of the time machine
+    ok 10 - every invoice in the workspace reconciles, after a year of the time machine
+      ---
+      duration_ms: 4586.358628
+      type: 'test'
+      ...
+    # Subtest: what a subscription was invoiced for its periods is what its ledger recognised
+    ok 11 - what a subscription was invoiced for its periods is what its ledger recognised
+      ---
+      duration_ms: 14.638347
+      type: 'test'
+      ...
+    # Subtest: what every account was asked to pay is what it was billed, less what it was credited
+    ok 12 - what every account was asked to pay is what it was billed, less what it was credited
+      ---
+      duration_ms: 13.448462
+      type: 'test'
+      ...
+    1..12
+ok 9 - invoices
+  ---
+  duration_ms: 12282.425688
+  type: 'suite'
+  ...
+# Subtest: Northwind's book of business
+    # Subtest: seeds a real subscription book across the whole ladder
+    ok 1 - seeds a real subscription book across the whole ladder
+      ---
+      duration_ms: 16.673215
+      type: 'test'
+      ...
+    # Subtest: every billing customer is one of the CRM companies
+    ok 2 - every billing customer is one of the CRM companies
+      ---
+      duration_ms: 10.422937
+      type: 'test'
+      ...
+    # Subtest: eighteen months of recognised revenue are on the books
+    ok 3 - eighteen months of recognised revenue are on the books
+      ---
+      duration_ms: 13.902741
+      type: 'test'
+      ...
+    # Subtest: two upgrades are already in the history, priced by the same proration function
+    ok 4 - two upgrades are already in the history, priced by the same proration function
+      ---
+      duration_ms: 0.64488
+      type: 'test'
+      ...
+    # Subtest: one schedule is mid-phase and survives a year of the time machine
+    ok 5 - one schedule is mid-phase and survives a year of the time machine
+      ---
+      duration_ms: 3640.233462
+      type: 'test'
+      ...
+    # Subtest: no subscription in the book ever ended before it began
+    ok 6 - no subscription in the book ever ended before it began
+      ---
+      duration_ms: 7.35289
+      type: 'test'
+      ...
+    # Subtest: the copilot can find an account, price a change and never guess
+    ok 7 - the copilot can find an account, price a change and never guess
+      ---
+      duration_ms: 10.685402
+      type: 'test'
+      ...
+    1..7
+ok 10 - Northwind's book of business
+  ---
+  duration_ms: 5655.592181
+  type: 'suite'
+  ...
+# Subtest: tax
+    # Subtest: the seeded workspace collects where it is registered, and nowhere else
+    ok 1 - the seeded workspace collects where it is registered, and nowhere else
+      ---
+      duration_ms: 1.755072
+      type: 'test'
+      ...
+    # Subtest: an exclusive price adds tax on top; an inclusive one has it taken out
+    ok 2 - an exclusive price adds tax on top; an inclusive one has it taken out
+      ---
+      duration_ms: 13.369173
+      type: 'test'
+      ...
+    # Subtest: the previewed invoice matches the issued one to the cent, tax included
+    ok 3 - the previewed invoice matches the issued one to the cent, tax included
+      ---
+      duration_ms: 937.791721
+      type: 'test'
+      ...
+    # Subtest: an EU business with a verified VAT number is reverse charged, and the invoice says so
+    ok 4 - an EU business with a verified VAT number is reverse charged, and the invoice says so
+      ---
+      duration_ms: 9.103068
+      type: 'test'
+      ...
+    # Subtest: an exempt account names the rate it would have paid and is charged nothing
+    ok 5 - an exempt account names the rate it would have paid and is charged nothing
+      ---
+      duration_ms: 6.263294
+      type: 'test'
+      ...
+    # Subtest: an address with no registered rate is charged nothing, and the line says why
+    ok 6 - an address with no registered rate is charged nothing, and the line says why
+      ---
+      duration_ms: 4.659449
+      type: 'test'
+      ...
+    # Subtest: an invoice keeps the rate it was raised under after that rate is retired
+    ok 7 - an invoice keeps the rate it was raised under after that rate is retired
+      ---
+      duration_ms: 5.899961
+      type: 'test'
+      ...
+    # Subtest: a mid-cycle downgrade credits the tax it charged, and the sign of the net changes nothing
+    ok 8 - a mid-cycle downgrade credits the tax it charged, and the sign of the net changes nothing
+      ---
+      duration_ms: 624.983701
+      type: 'test'
+      ...
+    # Subtest: a registration number that is not one is refused before it can zero-rate anything
+    ok 9 - a registration number that is not one is refused before it can zero-rate anything
+      ---
+      duration_ms: 4.299199
+      type: 'test'
+      ...
+    # Subtest: reverse charge needs a verified number and a border to cross
+    ok 10 - reverse charge needs a verified number and a border to cross
+      ---
+      duration_ms: 32.571053
+      type: 'test'
+      ...
+    # Subtest: a credit is taxed the way the charge it reverses was, whatever the currency does
+    ok 11 - a credit is taxed the way the charge it reverses was, whatever the currency does
+      ---
+      duration_ms: 13.982668
+      type: 'test'
+      ...
+    # Subtest: a percentage has to be an exact decimal, and a country has to be one we can match
+    ok 12 - a percentage has to be an exact decimal, and a country has to be one we can match
+      ---
+      duration_ms: 0.612286
+      type: 'test'
+      ...
+    1..12
+ok 11 - tax
+  ---
+  duration_ms: 3804.959485
+  type: 'suite'
+  ...
+# Subtest: credit notes
+    # Subtest: an open invoice is reduced, and the note carries the tax it reversed
+    ok 1 - an open invoice is reduced, and the note carries the tax it reversed
+      ---
+      duration_ms: 8.764935
+      type: 'test'
+      ...
+    # Subtest: a paid invoice is credited onto the account balance instead
+    ok 2 - a paid invoice is credited onto the account balance instead
+      ---
+      duration_ms: 6.827753
+      type: 'test'
+      ...
+    # Subtest: paying a bill a credit note already reduced collects the reduced amount, never the face value
+    ok 3 - paying a bill a credit note already reduced collects the reduced amount, never the face value
+      ---
+      duration_ms: 11.96637
+      type: 'test'
+      ...
+    # Subtest: a credit note is refused, never clamped, when it exceeds what is left
+    ok 4 - a credit note is refused, never clamped, when it exceeds what is left
+      ---
+      duration_ms: 9.121399
+      type: 'test'
+      ...
+    # Subtest: a line can only be credited for what it was billed, and only on its own invoice
+    ok 5 - a line can only be credited for what it was billed, and only on its own invoice
+      ---
+      duration_ms: 10.173182
+      type: 'test'
+      ...
+    # Subtest: voiding a note puts back exactly what it took
+    ok 6 - voiding a note puts back exactly what it took
+      ---
+      duration_ms: 7.271397
+      type: 'test'
+      ...
+    # Subtest: a draft or voided invoice cannot be credited at all
+    ok 7 - a draft or voided invoice cannot be credited at all
+      ---
+      duration_ms: 5.810231
+      type: 'test'
+      ...
+    # Subtest: every credit note is listed, retrievable and attached to its invoice
+    ok 8 - every credit note is listed, retrievable and attached to its invoice
+      ---
+      duration_ms: 7.012464
+      type: 'test'
+      ...
+    1..8
+ok 12 - credit notes
+  ---
+  duration_ms: 2671.086377
+  type: 'suite'
+  ...
+# Subtest: cancel_at in the past
+    # Subtest: creating a subscription with a cancel_at that has passed is refused
+    ok 1 - creating a subscription with a cancel_at that has passed is refused
+      ---
+      duration_ms: 2.201809
+      type: 'test'
+      ...
+    # Subtest: patching a subscription onto a past cancel_at is refused
+    ok 2 - patching a subscription onto a past cancel_at is refused
+      ---
+      duration_ms: 6.623857
+      type: 'test'
+      ...
+    # Subtest: scheduling a cancellation in the past through /cancel is refused
+    ok 3 - scheduling a cancellation in the past through /cancel is refused
+      ---
+      duration_ms: 6.557073
+      type: 'test'
+      ...
+    # Subtest: no cancellation in the whole seeded book predates the subscription it ends
+    ok 4 - no cancellation in the whole seeded book predates the subscription it ends
+      ---
+      duration_ms: 10.105181
+      type: 'test'
+      ...
+    1..4
+ok 13 - cancel_at in the past
+  ---
+  duration_ms: 2011.841819
+  type: 'suite'
+  ...
+# Subtest: the invoice document
+    # Subtest: renders a complete printable bill with the tax on it
+    ok 1 - renders a complete printable bill with the tax on it
+      ---
+      duration_ms: 7.403296
+      type: 'test'
+      ...
+    # Subtest: the document shows a credit note raised against the bill, and escapes what a customer typed
+    ok 2 - the document shows a credit note raised against the bill, and escapes what a customer typed
+      ---
+      duration_ms: 5.620586
+      type: 'test'
+      ...
+    # Subtest: a reverse-charged bill explains its zero on the page
+    ok 3 - a reverse-charged bill explains its zero on the page
+      ---
+      duration_ms: 4.380689
+      type: 'test'
+      ...
+    # Subtest: a bill that is worth money back says so, and says where the money went
+    ok 4 - a bill that is worth money back says so, and says where the money went
+      ---
+      duration_ms: 582.383233
+      type: 'test'
+      ...
+    # Subtest: an invoice that does not exist is a 404, not an empty page
+    ok 5 - an invoice that does not exist is a 404, not an empty page
+      ---
+      duration_ms: 0.317682
+      type: 'test'
+      ...
+    1..5
+ok 14 - the invoice document
+  ---
+  duration_ms: 2982.502209
+  type: 'suite'
+  ...
+# Subtest: an invoice Ain could not place
+    # Subtest: a zero nobody decided on is not the same answer as a zero somebody did
+    ok 1 - a zero nobody decided on is not the same answer as a zero somebody did
+      ---
+      duration_ms: 36.510881
+      type: 'test'
+      ...
+    # Subtest: a held bill priced again spends the account credit the new tax needs
+    ok 2 - a held bill priced again spends the account credit the new tax needs
+      ---
+      duration_ms: 6.01275
+      type: 'test'
+      ...
+    # Subtest: recording a payment does not walk a held bill past the hold
+    ok 3 - recording a payment does not walk a held bill past the hold
+      ---
+      duration_ms: 4.270305
+      type: 'test'
+      ...
+    # Subtest: a workspace that opts out is still told, it is just not held up
+    ok 4 - a workspace that opts out is still told, it is just not held up
+      ---
+      duration_ms: 8.933234
+      type: 'test'
+      ...
+    1..4
+ok 15 - an invoice Ain could not place
+  ---
+  duration_ms: 2229.245062
+  type: 'suite'
+  ...
+# Subtest: jurisdictions that stack
+    # Subtest: a New York bill charges the state, the city and the transit district, and names all three
+    ok 1 - a New York bill charges the state, the city and the transit district, and names all three
+      ---
+      duration_ms: 2321.934335
+      type: 'test'
+      ...
+    # Subtest: an inclusive price contains all three, and still adds back up to the listed price
+    ok 2 - an inclusive price contains all three, and still adds back up to the listed price
+      ---
+      duration_ms: 2156.043038
+      type: 'test'
+      ...
+    # Subtest: a country-wide rate stacks under a state one rather than losing to it
+    ok 3 - a country-wide rate stacks under a state one rather than losing to it
+      ---
+      duration_ms: 2336.745113
+      type: 'test'
+      ...
+    # Subtest: the same jurisdiction is still refused twice, and a different one is not
+    ok 4 - the same jurisdiction is still refused twice, and a different one is not
+      ---
+      duration_ms: 2227.178508
+      type: 'test'
+      ...
+    # Subtest: a credit and a credit note reverse every jurisdiction, not just the largest
+    ok 5 - a credit and a credit note reverse every jurisdiction, not just the largest
+      ---
+      duration_ms: 1932.259223
+      type: 'test'
+      ...
+    1..5
+ok 16 - jurisdictions that stack
+  ---
+  duration_ms: 10974.963057
+  type: 'suite'
+  ...
+# Subtest: the subscription overview
+    # Subtest: MRR is the whole book, not the first page of it
+    ok 1 - MRR is the whole book, not the first page of it
+      ---
+      duration_ms: 847.553599
+      type: 'test'
+      ...
+    # Subtest: a book in three currencies is never added up and labelled in one
+    ok 2 - a book in three currencies is never added up and labelled in one
+      ---
+      duration_ms: 27.45569
+      type: 'test'
+      ...
+    1..2
+ok 17 - the subscription overview
+  ---
+  duration_ms: 3379.016593
+  type: 'suite'
+  ...
+# Subtest: what billing refuses to accept
+    # Subtest: a subscription field billing does not read is refused, not answered 201
+    ok 1 - a subscription field billing does not read is refused, not answered 201
+      ---
+      duration_ms: 4.504878
+      type: 'test'
+      ...
+    # Subtest: the same rule holds on every billing write, nested keys included
+    ok 2 - the same rule holds on every billing write, nested keys included
+      ---
+      duration_ms: 4.919457
+      type: 'test'
+      ...
+    1..2
+ok 18 - what billing refuses to accept
+  ---
+  duration_ms: 2545.020112
+  type: 'suite'
+  ...
+# Subtest: one jurisdiction, charged two ways
+    # Subtest: the summary holds two rows for the one rate, and the document must not add them up
+    ok 1 - the summary holds two rows for the one rate, and the document must not add them up
+      ---
+      duration_ms: 2152.335425
+      type: 'test'
+      ...
+    # Subtest: a bill that really is in three jurisdictions still states what they come to
+    ok 2 - a bill that really is in three jurisdictions still states what they come to
+      ---
+      duration_ms: 2298.549611
+      type: 'test'
+      ...
+    1..2
+ok 19 - one jurisdiction, charged two ways
+  ---
+  duration_ms: 4451.558134
+  type: 'suite'
+  ...
+# Subtest: a held bill priced again once the country is known
+    # Subtest: the account credit it draws is the credit the account still holds
+    ok 1 - the account credit it draws is the credit the account still holds
+      ---
+      duration_ms: 2015.528347
+      type: 'test'
+      ...
+    1..1
+ok 20 - a held bill priced again once the country is known
+  ---
+  duration_ms: 2016.162556
+  type: 'suite'
+  ...
+# Subtest: the invoice money on the overview
+    # Subtest: is bucketed by the currency it was billed in
+    ok 1 - is bucketed by the currency it was billed in
+      ---
+      duration_ms: 2171.719591
+      type: 'test'
+      ...
+    1..1
+ok 21 - the invoice money on the overview
+  ---
+  duration_ms: 2172.777759
+  type: 'suite'
+  ...
+# Subtest: the next invoice on the customer summary
+    # Subtest: carries the tax the bill it predicts will charge
+    ok 1 - carries the tax the bill it predicts will charge
+      ---
+      duration_ms: 2172.498695
+      type: 'test'
+      ...
+    1..1
+ok 22 - the next invoice on the customer summary
+  ---
+  duration_ms: 2173.089504
+  type: 'suite'
+  ...
+# Subtest: writing off a bill Ain could not place
+    # Subtest: is refused for the same reason finalising and paying it are
+    ok 1 - is refused for the same reason finalising and paying it are
+      ---
+      duration_ms: 2229.118198
+      type: 'test'
+      ...
+    # Subtest: is allowed the moment the bill has actually been placed
+    ok 2 - is allowed the moment the bill has actually been placed
+      ---
+      duration_ms: 2104.830865
+      type: 'test'
+      ...
+    # Subtest: a workspace that opts out of the hold can still write the bill off
+    ok 3 - a workspace that opts out of the hold can still write the bill off
+      ---
+      duration_ms: 2065.601606
+      type: 'test'
+      ...
+    # Subtest: a paused subscription set to write its bills off holds them instead
+    ok 4 - a paused subscription set to write its bills off holds them instead
+      ---
+      duration_ms: 2708.831711
+      type: 'test'
+      ...
+    1..4
+ok 23 - writing off a bill Ain could not place
+  ---
+  duration_ms: 9109.593849
+  type: 'suite'
+  ...
+# Subtest: the outstanding figure the copilot reads out
+    # Subtest: names every currency rather than stamping one symbol on their sum
+    ok 1 - names every currency rather than stamping one symbol on their sum
+      ---
+      duration_ms: 2069.498824
+      type: 'test'
+      ...
+    # Subtest: still quotes one plain figure when only one currency is owed
+    ok 2 - still quotes one plain figure when only one currency is owed
+      ---
+      duration_ms: 1784.734661
+      type: 'test'
+      ...
+    1..2
+ok 24 - the outstanding figure the copilot reads out
+  ---
+  duration_ms: 3855.003687
+  type: 'suite'
+  ...
+# Subtest: the proration waiting on the overview
+    # Subtest: is bucketed by the currency it was priced in, like every other money on the payload
+    ok 1 - is bucketed by the currency it was priced in, like every other money on the payload
+      ---
+      duration_ms: 1790.272788
+      type: 'test'
+      ...
+    # Subtest: names every figure it added across currencies, average revenue included
+    ok 2 - names every figure it added across currencies, average revenue included
+      ---
+      duration_ms: 2063.935726
+      type: 'test'
+      ...
+    1..2
+ok 25 - the proration waiting on the overview
+  ---
+  duration_ms: 3854.810208
+  type: 'suite'
+  ...
+# (node:22370) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: Northwind’s price book
+    # Subtest: seeds a coherent ladder with components, an add-on, a service and credits
+    ok 1 - seeds a coherent ladder with components, an add-on, a service and credits
+      ---
+      duration_ms: 7.592167
+      type: 'test'
+      ...
+    # Subtest: every seeded price is priceable in all three currencies
+    ok 2 - every seeded price is priceable in all three currencies
+      ---
+      duration_ms: 40.65142
+      type: 'test'
+      ...
+    # Subtest: the annual option really is two months free
+    ok 3 - the annual option really is two months free
+      ---
+      duration_ms: 14.697611
+      type: 'test'
+      ...
+    1..3
+ok 26 - Northwind’s price book
+  ---
+  duration_ms: 3898.193491
+  type: 'suite'
+  ...
+# Subtest: tiering at the boundaries
+    # Subtest: graduated: 0 units → 500 (the first tier’s base charge applies even at zero)
+    ok 1 - graduated: 0 units → 500 (the first tier’s base charge applies even at zero)
+      ---
+      duration_ms: 0.709171
+      type: 'test'
+      ...
+    # Subtest: volume: 0 units → 500 (the first tier’s base charge applies even at zero)
+    ok 2 - volume: 0 units → 500 (the first tier’s base charge applies even at zero)
+      ---
+      duration_ms: 0.188485
+      type: 'test'
+      ...
+    # Subtest: graduated: 1 units → 600 (one unit inside tier one)
+    ok 3 - graduated: 1 units → 600 (one unit inside tier one)
+      ---
+      duration_ms: 0.377279
+      type: 'test'
+      ...
+    # Subtest: volume: 1 units → 600 (one unit inside tier one)
+    ok 4 - volume: 1 units → 600 (one unit inside tier one)
+      ---
+      duration_ms: 0.185606
+      type: 'test'
+      ...
+    # Subtest: graduated: 9 units → 1400 (just below the first boundary)
+    ok 5 - graduated: 9 units → 1400 (just below the first boundary)
+      ---
+      duration_ms: 0.169447
+      type: 'test'
+      ...
+    # Subtest: volume: 9 units → 1400 (just below the first boundary)
+    ok 6 - volume: 9 units → 1400 (just below the first boundary)
+      ---
+      duration_ms: 0.285334
+      type: 'test'
+      ...
+    # Subtest: graduated: 10 units → 1500 (exactly on the first boundary)
+    ok 7 - graduated: 10 units → 1500 (exactly on the first boundary)
+      ---
+      duration_ms: 0.176799
+      type: 'test'
+      ...
+    # Subtest: volume: 10 units → 1500 (exactly on the first boundary)
+    ok 8 - volume: 10 units → 1500 (exactly on the first boundary)
+      ---
+      duration_ms: 0.125228
+      type: 'test'
+      ...
+    # Subtest: graduated: 11 units → 1550 (volume reprices every unit at the new rate)
+    ok 9 - graduated: 11 units → 1550 (volume reprices every unit at the new rate)
+      ---
+      duration_ms: 0.172503
+      type: 'test'
+      ...
+    # Subtest: volume: 11 units → 550 (volume reprices every unit at the new rate)
+    ok 10 - volume: 11 units → 550 (volume reprices every unit at the new rate)
+      ---
+      duration_ms: 0.083715
+      type: 'test'
+      ...
+    # Subtest: graduated: 19 units → 1950 (inside tier two)
+    ok 11 - graduated: 19 units → 1950 (inside tier two)
+      ---
+      duration_ms: 0.080122
+      type: 'test'
+      ...
+    # Subtest: volume: 19 units → 950 (inside tier two)
+    ok 12 - volume: 19 units → 950 (inside tier two)
+      ---
+      duration_ms: 0.063548
+      type: 'test'
+      ...
+    # Subtest: graduated: 20 units → 2000 (exactly on the second boundary)
+    ok 13 - graduated: 20 units → 2000 (exactly on the second boundary)
+      ---
+      duration_ms: 0.124178
+      type: 'test'
+      ...
+    # Subtest: volume: 20 units → 1000 (exactly on the second boundary)
+    ok 14 - volume: 20 units → 1000 (exactly on the second boundary)
+      ---
+      duration_ms: 0.083321
+      type: 'test'
+      ...
+    # Subtest: graduated: 21 units → 2025 (first unit of the open-ended tier)
+    ok 15 - graduated: 21 units → 2025 (first unit of the open-ended tier)
+      ---
+      duration_ms: 0.084716
+      type: 'test'
+      ...
+    # Subtest: volume: 21 units → 525 (first unit of the open-ended tier)
+    ok 16 - volume: 21 units → 525 (first unit of the open-ended tier)
+      ---
+      duration_ms: 0.063141
+      type: 'test'
+      ...
+    # Subtest: graduated: 100 units → 4000 (well into the open-ended tier)
+    ok 17 - graduated: 100 units → 4000 (well into the open-ended tier)
+      ---
+      duration_ms: 0.082254
+      type: 'test'
+      ...
+    # Subtest: volume: 100 units → 2500 (well into the open-ended tier)
+    ok 18 - volume: 100 units → 2500 (well into the open-ended tier)
+      ---
+      duration_ms: 0.060409
+      type: 'test'
+      ...
+    # Subtest: graduated: 1000000 units → 25001500 (large quantities stay exact)
+    ok 19 - graduated: 1000000 units → 25001500 (large quantities stay exact)
+      ---
+      duration_ms: 0.093269
+      type: 'test'
+      ...
+    # Subtest: volume: 1000000 units → 25000000 (large quantities stay exact)
+    ok 20 - volume: 1000000 units → 25000000 (large quantities stay exact)
+      ---
+      duration_ms: 0.099375
+      type: 'test'
+      ...
+    # Subtest: graduated never charges less as quantity grows; volume may
+    ok 21 - graduated never charges less as quantity grows; volume may
+      ---
+      duration_ms: 12.402708
+      type: 'test'
+      ...
+    # Subtest: graduated tiers are explained tier by tier
+    ok 22 - graduated tiers are explained tier by tier
+      ---
+      duration_ms: 0.32277
+      type: 'test'
+      ...
+    # Subtest: volume picks exactly one tier and says which
+    ok 23 - volume picks exactly one tier and says which
+      ---
+      duration_ms: 0.115444
+      type: 'test'
+      ...
+    # Subtest: a free first tier reads as "included", not as a zero charge
+    ok 24 - a free first tier reads as "included", not as a zero charge
+      ---
+      duration_ms: 0.195939
+      type: 'test'
+      ...
+    1..24
+ok 27 - tiering at the boundaries
+  ---
+  duration_ms: 17.178293
+  type: 'suite'
+  ...
+# Subtest: package pricing
+    # Subtest: 0 GB → 0 rounding up, 0 rounding down
+    ok 1 - 0 GB → 0 rounding up, 0 rounding down
+      ---
+      duration_ms: 0.422672
+      type: 'test'
+      ...
+    # Subtest: 1 GB → 900 rounding up, 0 rounding down
+    ok 2 - 1 GB → 900 rounding up, 0 rounding down
+      ---
+      duration_ms: 0.130391
+      type: 'test'
+      ...
+    # Subtest: 9 GB → 900 rounding up, 0 rounding down
+    ok 3 - 9 GB → 900 rounding up, 0 rounding down
+      ---
+      duration_ms: 4.297285
+      type: 'test'
+      ...
+    # Subtest: 10 GB → 900 rounding up, 900 rounding down
+    ok 4 - 10 GB → 900 rounding up, 900 rounding down
+      ---
+      duration_ms: 0.254654
+      type: 'test'
+      ...
+    # Subtest: 11 GB → 1800 rounding up, 900 rounding down
+    ok 5 - 11 GB → 1800 rounding up, 900 rounding down
+      ---
+      duration_ms: 0.139812
+      type: 'test'
+      ...
+    # Subtest: 19 GB → 1800 rounding up, 900 rounding down
+    ok 6 - 19 GB → 1800 rounding up, 900 rounding down
+      ---
+      duration_ms: 0.08611
+      type: 'test'
+      ...
+    # Subtest: 20 GB → 1800 rounding up, 1800 rounding down
+    ok 7 - 20 GB → 1800 rounding up, 1800 rounding down
+      ---
+      duration_ms: 0.164742
+      type: 'test'
+      ...
+    # Subtest: 99 GB → 9000 rounding up, 8100 rounding down
+    ok 8 - 99 GB → 9000 rounding up, 8100 rounding down
+      ---
+      duration_ms: 0.260085
+      type: 'test'
+      ...
+    # Subtest: 100 GB → 9000 rounding up, 9000 rounding down
+    ok 9 - 100 GB → 9000 rounding up, 9000 rounding down
+      ---
+      duration_ms: 0.18598
+      type: 'test'
+      ...
+    # Subtest: 12345 GB → 1111500 rounding up, 1110600 rounding down
+    ok 10 - 12345 GB → 1111500 rounding up, 1110600 rounding down
+      ---
+      duration_ms: 0.105427
+      type: 'test'
+      ...
+    # Subtest: the quantity is bucketed before tiering, not after
+    ok 11 - the quantity is bucketed before tiering, not after
+      ---
+      duration_ms: 0.215278
+      type: 'test'
+      ...
+    # Subtest: the package label spells the arithmetic out
+    ok 12 - the package label spells the arithmetic out
+      ---
+      duration_ms: 0.121819
+      type: 'test'
+      ...
+    # Subtest: applyTransform is exact on awkward divisors
+    ok 13 - applyTransform is exact on awkward divisors
+      ---
+      duration_ms: 0.113913
+      type: 'test'
+      ...
+    1..13
+ok 28 - package pricing
+  ---
+  duration_ms: 7.151086
+  type: 'suite'
+  ...
+# Subtest: multi-currency
+    # Subtest: each currency uses its own amounts, not a conversion
+    ok 1 - each currency uses its own amounts, not a conversion
+      ---
+      duration_ms: 3.627701
+      type: 'test'
+      ...
+    # Subtest: currency options carry their own tiers
+    ok 2 - currency options carry their own tiers
+      ---
+      duration_ms: 0.858542
+      type: 'test'
+      ...
+    # Subtest: sub-cent metered rates differ per currency and stay exact
+    ok 3 - sub-cent metered rates differ per currency and stay exact
+      ---
+      duration_ms: 3.344353
+      type: 'test'
+      ...
+    # Subtest: an unsupported currency is refused by name, not silently converted
+    ok 4 - an unsupported currency is refused by name, not silently converted
+      ---
+      duration_ms: 0.938207
+      type: 'test'
+      ...
+    # Subtest: zero-decimal currencies format without a fraction
+    ok 5 - zero-decimal currencies format without a fraction
+      ---
+      duration_ms: 0.393503
+      type: 'test'
+      ...
+    # Subtest: the catalog can be re-priced into another currency wholesale
+    ok 6 - the catalog can be re-priced into another currency wholesale
+      ---
+      duration_ms: 7.705509
+      type: 'test'
+      ...
+    1..6
+ok 29 - multi-currency
+  ---
+  duration_ms: 17.31878
+  type: 'suite'
+  ...
+# Subtest: the engine never drifts by a cent
+    # Subtest: 10,000 randomised quantities match an independent exact computation
+    ok 1 - 10,000 randomised quantities match an independent exact computation
+      ---
+      duration_ms: 538.749054
+      type: 'test'
+      ...
+    # Subtest: exact tier boundaries are swept, not sampled
+    ok 2 - exact tier boundaries are swept, not sampled
+      ---
+      duration_ms: 0.748123
+      type: 'test'
+      ...
+    # Subtest: rounding happens once, at the end — not per unit
+    ok 3 - rounding happens once, at the end — not per unit
+      ---
+      duration_ms: 0.232507
+      type: 'test'
+      ...
+    # Subtest: proration multiplies the exact total, then rounds once
+    ok 4 - proration multiplies the exact total, then rounds once
+      ---
+      duration_ms: 0.260155
+      type: 'test'
+      ...
+    # Subtest: decimal parsing and rendering round-trip exactly
+    ok 5 - decimal parsing and rendering round-trip exactly
+      ---
+      duration_ms: 12.911346
+      type: 'test'
+      ...
+    1..5
+ok 30 - the engine never drifts by a cent
+  ---
+  duration_ms: 553.16477
+  type: 'suite'
+  ...
+# Subtest: metered usage aggregation
+    # Subtest: sum adds every reported quantity
+    ok 1 - sum adds every reported quantity
+      ---
+      duration_ms: 0.200361
+      type: 'test'
+      ...
+    # Subtest: max takes the peak
+    ok 2 - max takes the peak
+      ---
+      duration_ms: 0.099256
+      type: 'test'
+      ...
+    # Subtest: last_during_period takes the latest report
+    ok 3 - last_during_period takes the latest report
+      ---
+      duration_ms: 0.051421
+      type: 'test'
+      ...
+    # Subtest: last_ever takes the latest report of all time
+    ok 4 - last_ever takes the latest report of all time
+      ---
+      duration_ms: 0.044138
+      type: 'test'
+      ...
+    # Subtest: unique counts distinct subjects
+    ok 5 - unique counts distinct subjects
+      ---
+      duration_ms: 0.04934
+      type: 'test'
+      ...
+    # Subtest: an empty period bills nothing
+    ok 6 - an empty period bills nothing
+      ---
+      duration_ms: 0.042878
+      type: 'test'
+      ...
+    # Subtest: a preview can aggregate raw records the way the price will
+    ok 7 - a preview can aggregate raw records the way the price will
+      ---
+      duration_ms: 1.029905
+      type: 'test'
+      ...
+    1..7
+ok 31 - metered usage aggregation
+  ---
+  duration_ms: 1.750044
+  type: 'suite'
+  ...
+# Subtest: custom "contact us" prices
+    # Subtest: refuse to invent a number
+    ok 1 - refuse to invent a number
+      ---
+      duration_ms: 0.601977
+      type: 'test'
+      ...
+    # Subtest: enforce the negotiated floor and ceiling
+    ok 2 - enforce the negotiated floor and ceiling
+      ---
+      duration_ms: 0.538352
+      type: 'test'
+      ...
+    # Subtest: price the agreed amount once it is supplied
+    ok 3 - price the agreed amount once it is supplied
+      ---
+      duration_ms: 7.618828
+      type: 'test'
+      ...
+    # Subtest: carry their own floor in every currency
+    ok 4 - carry their own floor in every currency
+      ---
+      duration_ms: 0.827809
+      type: 'test'
+      ...
+    1..4
+ok 32 - custom "contact us" prices
+  ---
+  duration_ms: 9.781856
+  type: 'suite'
+  ...
+# Subtest: price previews for the pricing page
+    # Subtest: answers "what would 25,000 events cost?"
+    ok 1 - answers "what would 25,000 events cost?"
+      ---
+      duration_ms: 4.174816
+      type: 'test'
+      ...
+    # Subtest: samples every tier boundary so the steps land exactly
+    ok 2 - samples every tier boundary so the steps land exactly
+      ---
+      duration_ms: 1.573033
+      type: 'test'
+      ...
+    # Subtest: the marginal rate steps down exactly at each boundary
+    ok 3 - the marginal rate steps down exactly at each boundary
+      ---
+      duration_ms: 0.207836
+      type: 'test'
+      ...
+    # Subtest: the effective unit cost of a graduated price only ever falls
+    ok 4 - the effective unit cost of a graduated price only ever falls
+      ---
+      duration_ms: 2.27183
+      type: 'test'
+      ...
+    # Subtest: explicit quantities can be requested for a comparison table
+    ok 5 - explicit quantities can be requested for a comparison table
+      ---
+      duration_ms: 0.965454
+      type: 'test'
+      ...
+    1..5
+ok 33 - price previews for the pricing page
+  ---
+  duration_ms: 9.420754
+  type: 'suite'
+  ...
+# Subtest: the pricing calculator
+    # Subtest: prices a whole basket and rolls it up per interval
+    ok 1 - prices a whole basket and rolls it up per interval
+      ---
+      duration_ms: 1.641176
+      type: 'test'
+      ...
+    # Subtest: mixes intervals into one comparable monthly figure
+    ok 2 - mixes intervals into one comparable monthly figure
+      ---
+      duration_ms: 0.769924
+      type: 'test'
+      ...
+    # Subtest: an unknown price is named, not swallowed
+    ok 3 - an unknown price is named, not swallowed
+      ---
+      duration_ms: 0.395092
+      type: 'test'
+      ...
+    1..3
+ok 34 - the pricing calculator
+  ---
+  duration_ms: 2.972119
+  type: 'suite'
+  ...
+# Subtest: prices are immutable once they have billed
+    # Subtest: a brand new price can still be corrected
+    ok 1 - a brand new price can still be corrected
+      ---
+      duration_ms: 6.69554
+      type: 'test'
+      ...
+    # Subtest: once something bills against it, amounts freeze
+    ok 2 - once something bills against it, amounts freeze
+      ---
+      duration_ms: 6.199377
+      type: 'test'
+      ...
+    # Subtest: labels stay editable forever
+    ok 3 - labels stay editable forever
+      ---
+      duration_ms: 3.451519
+      type: 'test'
+      ...
+    # Subtest: a used price cannot be deleted, only deactivated
+    ok 4 - a used price cannot be deleted, only deactivated
+      ---
+      duration_ms: 6.127114
+      type: 'test'
+      ...
+    # Subtest: the replacement is a new price, and the old one still explains old invoices
+    ok 5 - the replacement is a new price, and the old one still explains old invoices
+      ---
+      duration_ms: 1.642055
+      type: 'test'
+      ...
+    # Subtest: a product with prices cannot be deleted either
+    ok 6 - a product with prices cannot be deleted either
+      ---
+      duration_ms: 0.609035
+      type: 'test'
+      ...
+    1..6
+ok 35 - prices are immutable once they have billed
+  ---
+  duration_ms: 25.028666
+  type: 'suite'
+  ...
+# Subtest: a price is the shape the payload asked for
+    # Subtest: the payload every Stripe integration sends is a per-unit price
+    ok 1 - the payload every Stripe integration sends is a per-unit price
+      ---
+      duration_ms: 8.100984
+      type: 'test'
+      ...
+    # Subtest: every model but "flat" follows from the fields, and "flat" has to be asked for
+    ok 2 - every model but "flat" follows from the fields, and "flat" has to be asked for
+      ---
+      duration_ms: 27.965857
+      type: 'test'
+      ...
+    # Subtest: a flat fee quoted at a quantity says what it just billed
+    ok 3 - a flat fee quoted at a quantity says what it just billed
+      ---
+      duration_ms: 8.154006
+      type: 'test'
+      ...
+    # Subtest: a mistyped parameter is refused, never dropped
+    ok 4 - a mistyped parameter is refused, never dropped
+      ---
+      duration_ms: 4.67334
+      type: 'test'
+      ...
+    # Subtest: a statement descriptor is checked on the way in and on every edit after
+    ok 5 - a statement descriptor is checked on the way in and on every edit after
+      ---
+      duration_ms: 6.028394
+      type: 'test'
+      ...
+    # Subtest: usage counts objects, not rows
+    ok 6 - usage counts objects, not rows
+      ---
+      duration_ms: 9.674674
+      type: 'test'
+      ...
+    1..6
+ok 36 - a price is the shape the payload asked for
+  ---
+  duration_ms: 64.997288
+  type: 'suite'
+  ...
+# Subtest: no price can be minted that bills negative money
+    # Subtest: the integer amount and the decimal amount refuse the same payload
+    ok 1 - the integer amount and the decimal amount refuse the same payload
+      ---
+      duration_ms: 4.86243
+      type: 'test'
+      ...
+    # Subtest: a tier rate cannot be negative, in either of its two decimal fields
+    ok 2 - a tier rate cannot be negative, in either of its two decimal fields
+      ---
+      duration_ms: 0.959117
+      type: 'test'
+      ...
+    # Subtest: a second currency cannot smuggle one in, flat or tiered
+    ok 3 - a second currency cannot smuggle one in, flat or tiered
+      ---
+      duration_ms: 1.046668
+      type: 'test'
+      ...
+    # Subtest: an edit cannot turn a good price bad, and leaves it as it was
+    ok 4 - an edit cannot turn a good price bad, and leaves it as it was
+      ---
+      duration_ms: 16.413298
+      type: 'test'
+      ...
+    # Subtest: a product created around a negative price is not created at all
+    ok 5 - a product created around a negative price is not created at all
+      ---
+      duration_ms: 9.816312
+      type: 'test'
+      ...
+    # Subtest: the floor is a floor, not a wall: zero and sub-cent rates still price
+    ok 6 - the floor is a floor, not a wall: zero and sub-cent rates still price
+      ---
+      duration_ms: 10.853317
+      type: 'test'
+      ...
+    # Subtest: the ceiling matches the integer field too
+    ok 7 - the ceiling matches the integer field too
+      ---
+      duration_ms: 3.733964
+      type: 'test'
+      ...
+    # Subtest: the parser itself stays sign-capable, because prorations need it
+    ok 8 - the parser itself stays sign-capable, because prorations need it
+      ---
+      duration_ms: 0.154678
+      type: 'test'
+      ...
+    # Subtest: nothing in the whole price book prices below zero, at any quantity
+    ok 9 - nothing in the whole price book prices below zero, at any quantity
+      ---
+      duration_ms: 4.246752
+      type: 'test'
+      ...
+    1..9
+ok 37 - no price can be minted that bills negative money
+  ---
+  duration_ms: 52.6343
+  type: 'suite'
+  ...
+# Subtest: the catalog API
+    # Subtest: rejects tiers that do not ascend, naming the offending tier
+    ok 1 - rejects tiers that do not ascend, naming the offending tier
+      ---
+      duration_ms: 5.017194
+      type: 'test'
+      ...
+    # Subtest: insists the last tier is open-ended so every quantity is priced
+    ok 2 - insists the last tier is open-ended so every quantity is priced
+      ---
+      duration_ms: 0.502789
+      type: 'test'
+      ...
+    # Subtest: refuses a tiered price that also carries a unit amount
+    ok 3 - refuses a tiered price that also carries a unit amount
+      ---
+      duration_ms: 0.396846
+      type: 'test'
+      ...
+    # Subtest: requires every extra currency to be fully priced
+    ok 4 - requires every extra currency to be fully priced
+      ---
+      duration_ms: 0.56934
+      type: 'test'
+      ...
+    # Subtest: will not let a one-time price recur
+    ok 5 - will not let a one-time price recur
+      ---
+      duration_ms: 0.349522
+      type: 'test'
+      ...
+    # Subtest: lookup keys are unique, and can be transferred deliberately
+    ok 6 - lookup keys are unique, and can be transferred deliberately
+      ---
+      duration_ms: 42.316201
+      type: 'test'
+      ...
+    # Subtest: the cut-over the refusal names is one atomic call on create
+    ok 7 - the cut-over the refusal names is one atomic call on create
+      ---
+      duration_ms: 34.614174
+      type: 'test'
+      ...
+    # Subtest: metadata merges rather than replacing wholesale
+    ok 8 - metadata merges rather than replacing wholesale
+      ---
+      duration_ms: 5.485863
+      type: 'test'
+      ...
+    # Subtest: statement descriptors are held to what a card statement can show
+    ok 9 - statement descriptors are held to what a card statement can show
+      ---
+      duration_ms: 0.294207
+      type: 'test'
+      ...
+    # Subtest: the default product list reads like the pricing page: plans, components, then the rest
+    ok 10 - the default product list reads like the pricing page: plans, components, then the rest
+      ---
+      duration_ms: 1.035857
+      type: 'test'
+      ...
+    # Subtest: product paging never repeats or drops a row
+    ok 11 - product paging never repeats or drops a row
+      ---
+      duration_ms: 7.216342
+      type: 'test'
+      ...
+    # Subtest: lists filter, paginate and expand
+    ok 12 - lists filter, paginate and expand
+      ---
+      duration_ms: 7.830791
+      type: 'test'
+      ...
+    # Subtest: a broken cursor is refused rather than silently ignored
+    ok 13 - a broken cursor is refused rather than silently ignored
+      ---
+      duration_ms: 0.427603
+      type: 'test'
+      ...
+    # Subtest: every mutation lands on the event stream
+    ok 14 - every mutation lands on the event stream
+      ---
+      duration_ms: 1.111451
+      type: 'test'
+      ...
+    # Subtest: a price cannot be read across workspace boundaries
+    ok 15 - a price cannot be read across workspace boundaries
+      ---
+      duration_ms: 0.281711
+      type: 'test'
+      ...
+    1..15
+ok 38 - the catalog API
+  ---
+  duration_ms: 108.06023
+  type: 'suite'
+  ...
+# Subtest: what the copilot can do with the catalog
+    # Subtest: quotes a tiered price with the arithmetic it used
+    ok 1 - quotes a tiered price with the arithmetic it used
+      ---
+      duration_ms: 4.632537
+      type: 'test'
+      ...
+    # Subtest: lists the ladder with prices a human would recognise
+    ok 2 - lists the ladder with prices a human would recognise
+      ---
+      duration_ms: 1.622101
+      type: 'test'
+      ...
+    # Subtest: shows where a metered rate steps down
+    ok 3 - shows where a metered rate steps down
+      ---
+      duration_ms: 1.308759
+      type: 'test'
+      ...
+    1..3
+ok 39 - what the copilot can do with the catalog
+  ---
+  duration_ms: 7.724521
+  type: 'suite'
+  ...
+# Subtest: the pricing copy says what the engine bills
+    # Subtest: a volume ladder of base charges is priced, never advertised as free
+    ok 1 - a volume ladder of base charges is priced, never advertised as free
+      ---
+      duration_ms: 4.655158
+      type: 'test'
+      ...
+    # Subtest: a graduated ladder of base charges quotes what each band really costs
+    ok 2 - a graduated ladder of base charges quotes what each band really costs
+      ---
+      duration_ms: 0.342723
+      type: 'test'
+      ...
+    # Subtest: an entry-tier base charge is folded into the headline and into "from"
+    ok 3 - an entry-tier base charge is folded into the headline and into "from"
+      ---
+      duration_ms: 0.319132
+      type: 'test'
+      ...
+    # Subtest: "from" is never cheaper than the cheapest line the engine will bill
+    ok 4 - "from" is never cheaper than the cheapest line the engine will bill
+      ---
+      duration_ms: 1.011669
+      type: 'test'
+      ...
+    # Subtest: a packaged tiered price quotes its rate and its boundaries per package
+    ok 5 - a packaged tiered price quotes its rate and its boundaries per package
+      ---
+      duration_ms: 0.408999
+      type: 'test'
+      ...
+    # Subtest: rounding part packages down moves the boundary to the last unit that still fits
+    ok 6 - rounding part packages down moves the boundary to the last unit that still fits
+      ---
+      duration_ms: 0.22129
+      type: 'test'
+      ...
+    # Subtest: only a price that charges nothing is called "included"
+    ok 7 - only a price that charges nothing is called "included"
+      ---
+      duration_ms: 0.156473
+      type: 'test'
+      ...
+    # Subtest: an included allowance is named before the rate that follows it
+    ok 8 - an included allowance is named before the rate that follows it
+      ---
+      duration_ms: 0.252812
+      type: 'test'
+      ...
+    # Subtest: a ladder that dips and then climbs quotes the band it ends on, not the cheapest one
+    ok 9 - a ladder that dips and then climbs quotes the band it ends on, not the cheapest one
+      ---
+      duration_ms: 0.368857
+      type: 'test'
+      ...
+    # Subtest: a rising ladder says how far it climbs, and stops on the rate that keeps applying
+    ok 10 - a rising ladder says how far it climbs, and stops on the rate that keeps applying
+      ---
+      duration_ms: 0.190802
+      type: 'test'
+      ...
+    # Subtest: a ladder that keeps turning counts the changes in the middle and spells out the last
+    ok 11 - a ladder that keeps turning counts the changes in the middle and spells out the last
+      ---
+      duration_ms: 4.92434
+      type: 'test'
+      ...
+    # Subtest: a band that drops the rate but adds a base charge quotes the base too
+    ok 12 - a band that drops the rate but adds a base charge quotes the base too
+      ---
+      duration_ms: 0.479974
+      type: 'test'
+      ...
+    # Subtest: the seeded metered price names its allowance, its rate and where it steps down
+    ok 13 - the seeded metered price names its allowance, its rate and where it steps down
+      ---
+      duration_ms: 0.596555
+      type: 'test'
+      ...
+    # Subtest: every price in the workspace agrees with the engine, in every currency it sells in
+    ok 14 - every price in the workspace agrees with the engine, in every currency it sells in
+      ---
+      duration_ms: 7.079862
+      type: 'test'
+      ...
+    1..14
+ok 40 - the pricing copy says what the engine bills
+  ---
+  duration_ms: 21.41736
+  type: 'suite'
+  ...
+# Subtest: a generated summary agrees with the engine on every number it prints
+    # Subtest: every threshold, figure and direction word survives being checked
+    ok 1 - every threshold, figure and direction word survives being checked
+      ---
+      duration_ms: 1192.359928
+      type: 'test'
+      ...
+    1..1
+ok 41 - a generated summary agrees with the engine on every number it prints
+  ---
+  duration_ms: 1192.487907
+  type: 'suite'
+  ...
+# Subtest: what GET /v1/catalog serves a pricing page
+    # Subtest: a tiered platform fee reaches the pricing page priced, and matches its own preview
+    ok 1 - a tiered platform fee reaches the pricing page priced, and matches its own preview
+      ---
+      duration_ms: 5.770878
+      type: 'test'
+      ...
+    1..1
+ok 42 - what GET /v1/catalog serves a pricing page
+  ---
+  duration_ms: 5.897309
+  type: 'suite'
+  ...
+# Subtest: a currency has to be a currency
+    # Subtest: a made-up code is refused on the price itself
+    ok 1 - a made-up code is refused on the price itself
+      ---
+      duration_ms: 0.396956
+      type: 'test'
+      ...
+    # Subtest: and inside currency_options, where it would end up on a pricing page
+    ok 2 - and inside currency_options, where it would end up on a pricing page
+      ---
+      duration_ms: 0.691403
+      type: 'test'
+      ...
+    # Subtest: and when a whole price book is asked for in one
+    ok 3 - and when a whole price book is asked for in one
+      ---
+      duration_ms: 0.27003
+      type: 'test'
+      ...
+    # Subtest: a real but unusual ISO-4217 code is accepted
+    ok 4 - a real but unusual ISO-4217 code is accepted
+      ---
+      duration_ms: 8.207791
+      type: 'test'
+      ...
+    # Subtest: the currency picker lists what the price book actually sells in
+    ok 5 - the currency picker lists what the price book actually sells in
+      ---
+      duration_ms: 1.471666
+      type: 'test'
+      ...
+    1..5
+ok 43 - a currency has to be a currency
+  ---
+  duration_ms: 15.454086
+  type: 'suite'
+  ...
+# (node:22376) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: the ledger is the balance
+    # Subtest: every entry carries the running total of the entries before it
+    ok 1 - every entry carries the running total of the entries before it
+      ---
+      duration_ms: 27.30891
+      type: 'test'
+      ...
+    # Subtest: there is no balance column anywhere in the schema
+    ok 2 - there is no balance column anywhere in the schema
+      ---
+      duration_ms: 0.337346
+      type: 'test'
+      ...
+    # Subtest: credit cannot be drawn below zero
+    ok 3 - credit cannot be drawn below zero
+      ---
+      duration_ms: 24.703474
+      type: 'test'
+      ...
+    1..3
+ok 44 - the ledger is the balance
+  ---
+  duration_ms: 4296.098688
+  type: 'suite'
+  ...
+# Subtest: burn-down order
+    # Subtest: the soonest-expiring grant drains first
+    ok 1 - the soonest-expiring grant drains first
+      ---
+      duration_ms: 26.425611
+      type: 'test'
+      ...
+    # Subtest: promotional credit is spent before paid credit of the same age
+    ok 2 - promotional credit is spent before paid credit of the same age
+      ---
+      duration_ms: 13.709711
+      type: 'test'
+      ...
+    # Subtest: explicit priority outranks the category
+    ok 3 - explicit priority outranks the category
+      ---
+      duration_ms: 26.378136
+      type: 'test'
+      ...
+    # Subtest: a grant that does not apply to the charge is not touched
+    ok 4 - a grant that does not apply to the charge is not touched
+      ---
+      duration_ms: 23.230552
+      type: 'test'
+      ...
+    # Subtest: a grant in another currency is never eligible
+    ok 5 - a grant in another currency is never eligible
+      ---
+      duration_ms: 13.156336
+      type: 'test'
+      ...
+    # Subtest: the settlement returns the order it used, and the draw follows every rung of it
+    ok 6 - the settlement returns the order it used, and the draw follows every rung of it
+      ---
+      duration_ms: 28.334302
+      type: 'test'
+      ...
+    # Subtest: the ordering is a pure, testable function
+    ok 7 - the ordering is a pure, testable function
+      ---
+      duration_ms: 0.405172
+      type: 'test'
+      ...
+    1..7
+ok 45 - burn-down order
+  ---
+  duration_ms: 132.634758
+  type: 'suite'
+  ...
+# Subtest: running out of credit mid-period
+    # Subtest: the covered and charged lines together equal the full usage
+    ok 1 - the covered and charged lines together equal the full usage
+      ---
+      duration_ms: 34.70406
+      type: 'test'
+      ...
+    # Subtest: credit is never spent on units the price gives away
+    ok 2 - credit is never spent on units the price gives away
+      ---
+      duration_ms: 9.248005
+      type: 'test'
+      ...
+    # Subtest: unit credit and monetary credit stack, and still add up
+    ok 3 - unit credit and monetary credit stack, and still add up
+      ---
+      duration_ms: 11.311775
+      type: 'test'
+      ...
+    # Subtest: when several grants pay for one period, their shares still sum to the credit applied
+    ok 4 - when several grants pay for one period, their shares still sum to the credit applied
+      ---
+      duration_ms: 17.914226
+      type: 'test'
+      ...
+    # Subtest: no credit at all still produces a charged line
+    ok 5 - no credit at all still produces a charged line
+      ---
+      duration_ms: 3.442798
+      type: 'test'
+      ...
+    # Subtest: settling the same period twice does not burn the balance twice
+    ok 6 - settling the same period twice does not burn the balance twice
+      ---
+      duration_ms: 16.813363
+      type: 'test'
+      ...
+    # Subtest: a retry whose period boundary moved by a millisecond is refused, not charged again
+    ok 7 - a retry whose period boundary moved by a millisecond is refused, not charged again
+      ---
+      duration_ms: 36.46699
+      type: 'test'
+      ...
+    # Subtest: the period that follows the settled one is not an overlap
+    ok 8 - the period that follows the settled one is not an overlap
+      ---
+      duration_ms: 16.658429
+      type: 'test'
+      ...
+    # Subtest: the metered path and the supplied-quantity path agree
+    ok 9 - the metered path and the supplied-quantity path agree
+      ---
+      duration_ms: 11.088769
+      type: 'test'
+      ...
+    1..9
+ok 46 - running out of credit mid-period
+  ---
+  duration_ms: 158.302109
+  type: 'suite'
+  ...
+# Subtest: top-ups
+    # Subtest: the invoice line and the grant are created together
+    ok 1 - the invoice line and the grant are created together
+      ---
+      duration_ms: 6.543966
+      type: 'test'
+      ...
+    # Subtest: a top-up against an unknown price writes neither half
+    ok 2 - a top-up against an unknown price writes neither half
+      ---
+      duration_ms: 0.683189
+      type: 'test'
+      ...
+    # Subtest: a pack whose size is unstated is refused rather than guessed
+    ok 3 - a pack whose size is unstated is refused rather than guessed
+      ---
+      duration_ms: 1.764323
+      type: 'test'
+      ...
+    # Subtest: unused paid credit can be refunded pro rata, with a matching line
+    ok 4 - unused paid credit can be refunded pro rata, with a matching line
+      ---
+      duration_ms: 22.919969
+      type: 'test'
+      ...
+    # Subtest: promotional credit is voided, not refunded
+    ok 5 - promotional credit is voided, not refunded
+      ---
+      duration_ms: 0.751928
+      type: 'test'
+      ...
+    1..5
+ok 47 - top-ups
+  ---
+  duration_ms: 33.062865
+  type: 'suite'
+  ...
+# Subtest: the balance a customer sees
+    # Subtest: is grouped per currency and per what it may be spent on
+    ok 1 - is grouped per currency and per what it may be spent on
+      ---
+      duration_ms: 13.136121
+      type: 'test'
+      ...
+    # Subtest: a targeted grant with no targets is refused
+    ok 2 - a targeted grant with no targets is refused
+      ---
+      duration_ms: 4.077272
+      type: 'test'
+      ...
+    # Subtest: a unit grant must name the meter whose units it holds
+    ok 3 - a unit grant must name the meter whose units it holds
+      ---
+      duration_ms: 0.685633
+      type: 'test'
+      ...
+    1..3
+ok 48 - the balance a customer sees
+  ---
+  duration_ms: 18.127553
+  type: 'suite'
+  ...
+# Subtest: expiry runs as a job on the day it is due
+    # Subtest: a grant expiring mid-period expires exactly once
+    ok 1 - a grant expiring mid-period expires exactly once
+      ---
+      duration_ms: 2624.371395
+      type: 'test'
+      ...
+    # Subtest: an expiry that has already been spent down writes nothing
+    ok 2 - an expiry that has already been spent down writes nothing
+      ---
+      duration_ms: 365.857524
+      type: 'test'
+      ...
+    # Subtest: rescheduling the expiry moves the job with it
+    ok 3 - rescheduling the expiry moves the job with it
+      ---
+      duration_ms: 764.152141
+      type: 'test'
+      ...
+    1..3
+ok 49 - expiry runs as a job on the day it is due
+  ---
+  duration_ms: 8147.238253
+  type: 'suite'
+  ...
+# Subtest: rollover at period end
+    # Subtest: none: the unused balance simply lapses
+    ok 1 - none: the unused balance simply lapses
+      ---
+      duration_ms: 1444.347489
+      type: 'test'
+      ...
+    # Subtest: capped: the cap rolls into a successor and the rest lapses
+    ok 2 - capped: the cap rolls into a successor and the rest lapses
+      ---
+      duration_ms: 107.11421
+      type: 'test'
+      ...
+    # Subtest: full: everything moves and nothing is written off
+    ok 3 - full: everything moves and nothing is written off
+      ---
+      duration_ms: 16.300726
+      type: 'test'
+      ...
+    # Subtest: a rollover policy without an expiry is refused
+    ok 4 - a rollover policy without an expiry is refused
+      ---
+      duration_ms: 0.64582
+      type: 'test'
+      ...
+    1..4
+ok 50 - rollover at period end
+  ---
+  duration_ms: 5720.911372
+  type: 'suite'
+  ...
+# Subtest: the invoice lines credits produce
+    # Subtest: are pending until billing claims them onto an invoice
+    ok 1 - are pending until billing claims them onto an invoice
+      ---
+      duration_ms: 20.910791
+      type: 'test'
+      ...
+    1..1
+ok 51 - the invoice lines credits produce
+  ---
+  duration_ms: 21.024785
+  type: 'suite'
+  ...
+# Subtest: a metered period bills itself when the cycle turns over
+    # Subtest: a month of usage becomes a settlement, a closed period and two invoice lines, unasked
+    ok 1 - a month of usage becomes a settlement, a closed period and two invoice lines, unasked
+      ---
+      duration_ms: 1623.343957
+      type: 'test'
+      ...
+    # Subtest: a period with no usage is settled and closed, but puts nothing on the invoice
+    ok 2 - a period with no usage is settled and closed, but puts nothing on the invoice
+      ---
+      duration_ms: 566.710356
+      type: 'test'
+      ...
+    # Subtest: a settlement whose usage is already billed under another window is reported, not retried forever
+    ok 3 - a settlement whose usage is already billed under another window is reported, not retried forever
+      ---
+      duration_ms: 555.159183
+      type: 'test'
+      ...
+    1..3
+ok 52 - a metered period bills itself when the cycle turns over
+  ---
+  duration_ms: 6658.642941
+  type: 'suite'
+  ...
+# Subtest: the outbox drains when an invoice is drawn
+    # Subtest: credit lines land on the invoice without anybody claiming them
+    ok 1 - credit lines land on the invoice without anybody claiming them
+      ---
+      duration_ms: 4.771448
+      type: 'test'
+      ...
+    # Subtest: an invoice for somebody else leaves the lines where they are
+    ok 2 - an invoice for somebody else leaves the lines where they are
+      ---
+      duration_ms: 3.766426
+      type: 'test'
+      ...
+    1..2
+ok 53 - the outbox drains when an invoice is drawn
+  ---
+  duration_ms: 8.801928
+  type: 'suite'
+  ...
+# Subtest: a settled period becomes something billable, on the event that fires
+    # Subtest: credits announce what they are holding when a cycle turns over
+    ok 1 - credits announce what they are holding when a cycle turns over
+      ---
+      duration_ms: 2215.874823
+      type: 'test'
+      ...
+    # Subtest: claiming is idempotent — a second invoice for the same customer takes nothing twice
+    ok 2 - claiming is idempotent — a second invoice for the same customer takes nothing twice
+      ---
+      duration_ms: 11.887004
+      type: 'test'
+      ...
+    1..2
+ok 54 - a settled period becomes something billable, on the event that fires
+  ---
+  duration_ms: 8308.106901
+  type: 'suite'
+  ...
+# Subtest: a refused period is a row, not a line in the log
+    # Subtest: the refusal names what superseded it and how much of the window that covers
+    ok 1 - the refusal names what superseded it and how much of the window that covers
+      ---
+      duration_ms: 1036.90262
+      type: 'test'
+      ...
+    # Subtest: a hole that outlives a billing cycle is billed, not just named
+    ok 2 - a hole that outlives a billing cycle is billed, not just named
+      ---
+      duration_ms: 955.129838
+      type: 'test'
+      ...
+    1..2
+ok 55 - a refused period is a row, not a line in the log
+  ---
+  duration_ms: 6203.818967
+  type: 'suite'
+  ...
+# Subtest: settling a metered period through the API freezes it
+    # Subtest: usage that lands after the period is billed is a true-up, not a silent number
+    ok 1 - usage that lands after the period is billed is a true-up, not a silent number
+      ---
+      duration_ms: 8.239029
+      type: 'test'
+      ...
+    # Subtest: `close_period: false` prices a window without claiming it was billed
+    ok 2 - `close_period: false` prices a window without claiming it was billed
+      ---
+      duration_ms: 4.299901
+      type: 'test'
+      ...
+    # Subtest: re-settling a period whose meter has moved is a 200 that names the drift
+    ok 3 - re-settling a period whose meter has moved is a 200 that names the drift
+      ---
+      duration_ms: 5.544269
+      type: 'test'
+      ...
+    # Subtest: usage withdrawn from a billed period reads as money owed back
+    ok 4 - usage withdrawn from a billed period reads as money owed back
+      ---
+      duration_ms: 3.684682
+      type: 'test'
+      ...
+    # Subtest: two prices on one meter share the window they both bill, and cannot half-share it
+    ok 5 - two prices on one meter share the window they both bill, and cannot half-share it
+      ---
+      duration_ms: 6.075768
+      type: 'test'
+      ...
+    # Subtest: a price with no meter behind it settles on the quantity given, and closes nothing
+    ok 6 - a price with no meter behind it settles on the quantity given, and closes nothing
+      ---
+      duration_ms: 1.925404
+      type: 'test'
+      ...
+    1..6
+ok 56 - settling a metered period through the API freezes it
+  ---
+  duration_ms: 30.08076
+  type: 'suite'
+  ...
+# Subtest: a true-up gives back the credit that paid for it
+    # Subtest: withdrawn usage returns credit pro rata, and never more than was drawn
+    ok 1 - withdrawn usage returns credit pro rata, and never more than was drawn
+      ---
+      duration_ms: 61.078561
+      type: 'test'
+      ...
+    # Subtest: a grant that has expired since cannot take it back, so the customer gets cash instead
+    ok 2 - a grant that has expired since cannot take it back, so the customer gets cash instead
+      ---
+      duration_ms: 1465.062542
+      type: 'test'
+      ...
+    # Subtest: a period paid for in units gives the units back, not cash it never took
+    ok 3 - a period paid for in units gives the units back, not cash it never took
+      ---
+      duration_ms: 15.219417
+      type: 'test'
+      ...
+    # Subtest: late usage meets the burn order like any other charge
+    ok 4 - late usage meets the burn order like any other charge
+      ---
+      duration_ms: 9.46527
+      type: 'test'
+      ...
+    1..4
+ok 57 - a true-up gives back the credit that paid for it
+  ---
+  duration_ms: 5553.565889
+  type: 'suite'
+  ...
+# Subtest: a balance that passes 2^53 micro-units
+    # Subtest: a $90m prepaid pool is granted, read back and spent
+    ok 1 - a $90m prepaid pool is granted, read back and spent
+      ---
+      duration_ms: 6.809841
+      type: 'test'
+      ...
+    # Subtest: an amount that could not be read back is a 400 naming the ceiling
+    ok 2 - an amount that could not be read back is a 400 naming the ceiling
+      ---
+      duration_ms: 0.684931
+      type: 'test'
+      ...
+    1..2
+ok 58 - a balance that passes 2^53 micro-units
+  ---
+  duration_ms: 7.645534
+  type: 'suite'
+  ...
+# Subtest: the Northwind workspace
+    # Subtest: the seeded settlement adds up and reads like an invoice
+    ok 1 - the seeded settlement adds up and reads like an invoice
+      ---
+      duration_ms: 4.860085
+      type: 'test'
+      ...
+    # Subtest: every seeded grant reconciles against its own ledger
+    ok 2 - every seeded grant reconciles against its own ledger
+      ---
+      duration_ms: 7.878528
+      type: 'test'
+      ...
+    # Subtest: the seeded workspace shows an invoice being corrected after it was sent
+    ok 3 - the seeded workspace shows an invoice being corrected after it was sent
+      ---
+      duration_ms: 6.090387
+      type: 'test'
+      ...
+    # Subtest: the overview names what is about to expire
+    ok 4 - the overview names what is about to expire
+      ---
+      duration_ms: 11.331017
+      type: 'test'
+      ...
+    # Subtest: a customer with no credit gets an empty, well-formed balance
+    ok 5 - a customer with no credit gets an empty, well-formed balance
+      ---
+      duration_ms: 0.852566
+      type: 'test'
+      ...
+    1..5
+ok 59 - the Northwind workspace
+  ---
+  duration_ms: 31.344738
+  type: 'suite'
+  ...
+# Subtest: the tier ladder belongs to the billing period, not to the window
+    # Subtest: a month settled in two halves costs exactly what the month costs
+    ok 1 - a month settled in two halves costs exactly what the month costs
+      ---
+      duration_ms: 16.160211
+      type: 'test'
+      ...
+    # Subtest: every partition of a period sums to the single-window total
+    ok 2 - every partition of a period sums to the single-window total
+      ---
+      duration_ms: 54.827626
+      type: 'test'
+      ...
+    # Subtest: windows settled out of order still sum to the whole
+    ok 3 - windows settled out of order still sum to the whole
+      ---
+      duration_ms: 11.068937
+      type: 'test'
+      ...
+    # Subtest: the next billing period starts the ladder again
+    ok 4 - the next billing period starts the ladder again
+      ---
+      duration_ms: 8.474179
+      type: 'test'
+      ...
+    # Subtest: the settlement explains the rung it was priced from
+    ok 5 - the settlement explains the rung it was priced from
+      ---
+      duration_ms: 7.61016
+      type: 'test'
+      ...
+    # Subtest: a caller can state the billing period, and a window outside it is refused
+    ok 6 - a caller can state the billing period, and a window outside it is refused
+      ---
+      duration_ms: 5.786277
+      type: 'test'
+      ...
+    # Subtest: the gap left by a refused settlement collects the money it is worth
+    ok 7 - the gap left by a refused settlement collects the money it is worth
+      ---
+      duration_ms: 3.725487
+      type: 'test'
+      ...
+    # Subtest: a window billed across the cycle boundary is still the rung the next one starts from
+    ok 8 - a window billed across the cycle boundary is still the rung the next one starts from
+      ---
+      duration_ms: 21.22115
+      type: 'test'
+      ...
+    # Subtest: credit still covers the marginal window, and the two lines sum to it
+    ok 9 - credit still covers the marginal window, and the two lines sum to it
+      ---
+      duration_ms: 36.500955
+      type: 'test'
+      ...
+    # Subtest: any ladder, any total: one window, two, five and one a day agree to the cent
+    ok 10 - any ladder, any total: one window, two, five and one a day agree to the cent
+      ---
+      duration_ms: 25860.140171
+      type: 'test'
+      ...
+    # Subtest: a late event on a split period trues up from the rung the invoice reached
+    ok 11 - a late event on a split period trues up from the rung the invoice reached
+      ---
+      duration_ms: 41.646479
+      type: 'test'
+      ...
+    1..11
+ok 60 - the tier ladder belongs to the billing period, not to the window
+  ---
+  duration_ms: 26067.901013
+  type: 'suite'
+  ...
+# Subtest: a subscription that restarts mid-cycle is still one billing period
+    # Subtest: cancelled and taken out again on the same anchor, the free tier is given once
+    ok 1 - cancelled and taken out again on the same anchor, the free tier is given once
+      ---
+      duration_ms: 2550.569162
+      type: 'test'
+      ...
+    # Subtest: a plan change that moves the anchor still bills the cycle it walked away from
+    ok 2 - a plan change that moves the anchor still bills the cycle it walked away from
+      ---
+      duration_ms: 1264.501318
+      type: 'test'
+      ...
+    1..2
+ok 61 - a subscription that restarts mid-cycle is still one billing period
+  ---
+  duration_ms: 10674.009013
+  type: 'suite'
+  ...
+# Subtest: a top-up charges first and grants second
+    # Subtest: the charge is raised in the same call, and the grant is live once it lands
+    ok 1 - the charge is raised in the same call, and the grant is live once it lands
+      ---
+      duration_ms: 7.2028
+      type: 'test'
+      ...
+    # Subtest: a purchase invoicing cannot take leaves unspendable credit and says why
+    ok 2 - a purchase invoicing cannot take leaves unspendable credit and says why
+      ---
+      duration_ms: 5.589565
+      type: 'test'
+      ...
+    # Subtest: the overview ages the unbilled purchase so it can be alerted on
+    ok 3 - the overview ages the unbilled purchase so it can be alerted on
+      ---
+      duration_ms: 4831.652606
+      type: 'test'
+      ...
+    # Subtest: the daily watch bills the purchase as soon as the account can be invoiced
+    ok 4 - the daily watch bills the purchase as soon as the account can be invoiced
+      ---
+      duration_ms: 7315.907887
+      type: 'test'
+      ...
+    1..4
+ok 62 - a top-up charges first and grants second
+  ---
+  duration_ms: 12160.865042
+  type: 'suite'
+  ...
+# (node:22402) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# entitlements.check over 49 seeded customers x 13 features
+#   cold   n=  637  mean=  107.4us  p50=   26.6us  p95=  246.1us  p99= 4123.6us  max=  5019.1us
+#   warm   n= 3185  mean=   62.7us  p50=   23.0us  p95=   55.5us  p99=  139.8us  max= 24207.9us
+# Subtest: the demo workspace arrives with its history intact
+    # Subtest: support has two temporary raises running, each with a reason and an expiry
+    ok 1 - support has two temporary raises running, each with a reason and an expiry
+      ---
+      duration_ms: 36.031871
+      type: 'test'
+      ...
+    1..1
+ok 63 - the demo workspace arrives with its history intact
+  ---
+  duration_ms: 4226.308528
+  type: 'suite'
+  ...
+# Subtest: the set is derived from the subscription, not from a copy of it
+    # Subtest: a plan change grants and revokes inside the transaction that changed the plan
+    ok 1 - a plan change grants and revokes inside the transaction that changed the plan
+      ---
+      duration_ms: 198.482521
+      type: 'test'
+      ...
+    # Subtest: a failed transaction takes the entitlements down with the subscription
+    ok 2 - a failed transaction takes the entitlements down with the subscription
+      ---
+      duration_ms: 63.919505
+      type: 'test'
+      ...
+    # Subtest: every entitlement names the product and price that granted it
+    ok 3 - every entitlement names the product and price that granted it
+      ---
+      duration_ms: 8.809516
+      type: 'test'
+      ...
+    # Subtest: cancelling ends the grant; the entitlements go with it
+    ok 4 - cancelling ends the grant; the entitlements go with it
+      ---
+      duration_ms: 9.816215
+      type: 'test'
+      ...
+    1..4
+ok 64 - the set is derived from the subscription, not from a copy of it
+  ---
+  duration_ms: 301.820924
+  type: 'suite'
+  ...
+# Subtest: cancel_at_period_end keeps its entitlements until the period ends
+    # Subtest: scheduled cancellation changes when access ends, not whether it exists
+    ok 1 - scheduled cancellation changes when access ends, not whether it exists
+      ---
+      duration_ms: 2408.492266
+      type: 'test'
+      ...
+    1..1
+ok 65 - cancel_at_period_end keeps its entitlements until the period ends
+  ---
+  duration_ms: 2409.270132
+  type: 'suite'
+  ...
+# Subtest: overrides: a temporary raise that takes itself away
+    # Subtest: a grant lifts the ceiling above the plan and names itself as the source
+    ok 1 - a grant lifts the ceiling above the plan and names itself as the source
+      ---
+      duration_ms: 13.161168
+      type: 'test'
+      ...
+    # Subtest: an override with an expiry ends itself under the time machine
+    ok 2 - an override with an expiry ends itself under the time machine
+      ---
+      duration_ms: 136.910571
+      type: 'test'
+      ...
+    # Subtest: a suspension removes the entitlement whatever the plan says, and revoking restores it
+    ok 3 - a suspension removes the entitlement whatever the plan says, and revoking restores it
+      ---
+      duration_ms: 29.263925
+      type: 'test'
+      ...
+    # Subtest: an override that grants less than the plan does not become the source
+    ok 4 - an override that grants less than the plan does not become the source
+      ---
+      duration_ms: 21.517076
+      type: 'test'
+      ...
+    # Subtest: an override without a reason is refused
+    ok 5 - an override without a reason is refused
+      ---
+      duration_ms: 23.18809
+      type: 'test'
+      ...
+    1..5
+ok 66 - overrides: a temporary raise that takes itself away
+  ---
+  duration_ms: 224.52027
+  type: 'suite'
+  ...
+# Subtest: metered limits are answered from the events, not from a counter
+    # Subtest: a check reflects events ingested a second earlier
+    ok 1 - a check reflects events ingested a second earlier
+      ---
+      duration_ms: 37.614187
+      type: 'test'
+      ...
+    # Subtest: prepaid credit in the meter’s own units raises the allowance
+    ok 2 - prepaid credit in the meter’s own units raises the allowance
+      ---
+      duration_ms: 18.807661
+      type: 'test'
+      ...
+    # Subtest: the warnings fire once per period, on consumption and never on a question
+    ok 3 - the warnings fire once per period, on consumption and never on a question
+      ---
+      duration_ms: 43.626382
+      type: 'test'
+      ...
+    # Subtest: a limit with no meter is a ceiling on a value, not a running total
+    ok 4 - a limit with no meter is a ceiling on a value, not a running total
+      ---
+      duration_ms: 22.172098
+      type: 'test'
+      ...
+    1..4
+ok 67 - metered limits are answered from the events, not from a counter
+  ---
+  duration_ms: 122.538952
+  type: 'suite'
+  ...
+# Subtest: a plan includes the same allowance each month on either term
+    # Subtest: the annual term refills monthly, on the same day and by the same amount
+    ok 1 - the annual term refills monthly, on the same day and by the same amount
+      ---
+      duration_ms: 35.161287
+      type: 'test'
+      ...
+    # Subtest: mid-term, the year is twelve consecutive windows anchored on the billing day
+    ok 2 - mid-term, the year is twelve consecutive windows anchored on the billing day
+      ---
+      duration_ms: 20.839515
+      type: 'test'
+      ...
+    # Subtest: no live account in the workspace is measured over a window longer than its allowance
+    ok 3 - no live account in the workspace is measured over a window longer than its allowance
+      ---
+      duration_ms: 3.158227
+      type: 'test'
+      ...
+    1..3
+ok 68 - a plan includes the same allowance each month on either term
+  ---
+  duration_ms: 63.49674
+  type: 'suite'
+  ...
+# Subtest: every refusal names the plan that would let them through
+    # Subtest: check returns a usable upgrade path for every capped feature in the seeded catalog
+    ok 1 - check returns a usable upgrade path for every capped feature in the seeded catalog
+      ---
+      duration_ms: 12.415547
+      type: 'test'
+      ...
+    # Subtest: the smallest sufficient rung wins, and the top of the ladder has none
+    ok 2 - the smallest sufficient rung wins, and the top of the ladder has none
+      ---
+      duration_ms: 10.531378
+      type: 'test'
+      ...
+    # Subtest: a plan listed in a second currency does not take the gate down for the first
+    ok 3 - a plan listed in a second currency does not take the gate down for the first
+      ---
+      duration_ms: 48.671691
+      type: 'test'
+      ...
+    1..3
+ok 69 - every refusal names the plan that would let them through
+  ---
+  duration_ms: 71.894539
+  type: 'suite'
+  ...
+# Subtest: features, and what each product includes of them
+    # Subtest: a feature key is immutable, checked, and never reused
+    ok 1 - a feature key is immutable, checked, and never reused
+      ---
+      duration_ms: 1.980812
+      type: 'test'
+      ...
+    # Subtest: a product declares how much of a feature it includes, and the value follows the seat count
+    ok 2 - a product declares how much of a feature it includes, and the value follows the seat count
+      ---
+      duration_ms: 42.124831
+      type: 'test'
+      ...
+    # Subtest: a feature default reaches accounts no product grants it to
+    ok 3 - a feature default reaches accounts no product grants it to
+      ---
+      duration_ms: 8.780699
+      type: 'test'
+      ...
+    # Subtest: deactivating a feature revokes it from everyone holding it
+    ok 4 - deactivating a feature revokes it from everyone holding it
+      ---
+      duration_ms: 118.140997
+      type: 'test'
+      ...
+    1..4
+ok 70 - features, and what each product includes of them
+  ---
+  duration_ms: 171.33294
+  type: 'suite'
+  ...
+# Subtest: the surface a product actually integrates against
+    # Subtest: a customer’s entitlements come back with sources, usage and the overrides shaping them
+    ok 1 - a customer’s entitlements come back with sources, usage and the overrides shaping them
+      ---
+      duration_ms: 32.456683
+      type: 'test'
+      ...
+    # Subtest: the overview lists adoption and the accounts pressing against a ceiling
+    ok 2 - the overview lists adoption and the accounts pressing against a ceiling
+      ---
+      duration_ms: 10.794775
+      type: 'test'
+      ...
+    # Subtest: one payload carries the whole set, delivered the moment it moves and readable on demand
+    ok 3 - one payload carries the whole set, delivered the moment it moves and readable on demand
+      ---
+      duration_ms: 14.19948
+      type: 'test'
+      ...
+    # Subtest: the copilot can ask the same questions the API answers
+    ok 4 - the copilot can ask the same questions the API answers
+      ---
+      duration_ms: 11.971282
+      type: 'test'
+      ...
+    1..4
+ok 71 - the surface a product actually integrates against
+  ---
+  duration_ms: 69.794292
+  type: 'suite'
+  ...
+# Subtest: fast enough to sit in front of the product
+    # Subtest: a check on the seeded workspace answers in well under a millisecond
+    ok 1 - a check on the seeded workspace answers in well under a millisecond
+      ---
+      duration_ms: 280.749772
+      type: 'test'
+      ...
+    1..1
+ok 72 - fast enough to sit in front of the product
+  ---
+  duration_ms: 287.629302
+  type: 'suite'
+  ...
+# Subtest: the seeded workspace tells one story
+    # Subtest: every plan in the price book declares what it includes
+    ok 1 - every plan in the price book declares what it includes
+      ---
+      duration_ms: 1.174142
+      type: 'test'
+      ...
+    # Subtest: every account with a live subscription has a derived, versioned set
+    ok 2 - every account with a live subscription has a derived, versioned set
+      ---
+      duration_ms: 89.283973
+      type: 'test'
+      ...
+    1..2
+ok 73 - the seeded workspace tells one story
+  ---
+  duration_ms: 90.632862
+  type: 'suite'
+  ...
+# Subtest: replaying the billing year leaves nothing out of step
+    # Subtest: after 180 days of renewals, cancellations and expiries every row still agrees with its source
+    ok 1 - after 180 days of renewals, cancellations and expiries every row still agrees with its source
+      ---
+      duration_ms: 3422.901094
+      type: 'test'
+      ...
+    1..1
+ok 74 - replaying the billing year leaves nothing out of step
+  ---
+  duration_ms: 3423.067559
+  type: 'suite'
+  ...
+# (node:22565) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: meter values are exact
+    # Subtest: decimal strings round-trip through micro-units without float drift
+    ok 1 - decimal strings round-trip through micro-units without float drift
+      ---
+      duration_ms: 0.864486
+      type: 'test'
+      ...
+    # Subtest: a seventh decimal place is refused rather than silently truncated
+    ok 2 - a seventh decimal place is refused rather than silently truncated
+      ---
+      duration_ms: 0.594807
+      type: 'test'
+      ...
+    # Subtest: billable quantity rounds half-up exactly once
+    ok 3 - billable quantity rounds half-up exactly once
+      ---
+      duration_ms: 0.233252
+      type: 'test'
+      ...
+    # Subtest: a sum wider than a double stays exact
+    ok 4 - a sum wider than a double stays exact
+      ---
+      duration_ms: 0.171848
+      type: 'test'
+      ...
+    1..4
+ok 75 - meter values are exact
+  ---
+  duration_ms: 4149.050111
+  type: 'suite'
+  ...
+# Subtest: ingestion is exactly once
+    # Subtest: 10,000 events with 30% duplicate identifiers produce exactly the unique count
+    ok 1 - 10,000 events with 30% duplicate identifiers produce exactly the unique count
+      ---
+      duration_ms: 843.814335
+      type: 'test'
+      ...
+    # Subtest: a replayed identifier returns the original event, not a new one
+    ok 2 - a replayed identifier returns the original event, not a new one
+      ---
+      duration_ms: 2.55483
+      type: 'test'
+      ...
+    # Subtest: an identifier is unique across the workspace, not per meter
+    ok 3 - an identifier is unique across the workspace, not per meter
+      ---
+      duration_ms: 1.440183
+      type: 'test'
+      ...
+    1..3
+ok 76 - ingestion is exactly once
+  ---
+  duration_ms: 848.168099
+  type: 'suite'
+  ...
+# Subtest: batch ingestion
+    # Subtest: one bad event does not reject the batch around it
+    ok 1 - one bad event does not reject the batch around it
+      ---
+      duration_ms: 8.397464
+      type: 'test'
+      ...
+    # Subtest: a batch over the limit is refused as a whole, with the limit in the message
+    ok 2 - a batch over the limit is refused as a whole, with the limit in the message
+      ---
+      duration_ms: 1.502002
+      type: 'test'
+      ...
+    1..2
+ok 77 - batch ingestion
+  ---
+  duration_ms: 10.266736
+  type: 'suite'
+  ...
+# Subtest: aggregations across period boundaries
+    # Subtest: max is the peak inside the period, not the peak overall
+    ok 1 - max is the peak inside the period, not the peak overall
+      ---
+      duration_ms: 2.912598
+      type: 'test'
+      ...
+    # Subtest: last is the closing reading of the period, whatever order events arrive in
+    ok 2 - last is the closing reading of the period, whatever order events arrive in
+      ---
+      duration_ms: 6.62857
+      type: 'test'
+      ...
+    # Subtest: unique counts distinct subjects per period, not events
+    ok 3 - unique counts distinct subjects per period, not events
+      ---
+      duration_ms: 8.739869
+      type: 'test'
+      ...
+    # Subtest: count ignores the value entirely
+    ok 4 - count ignores the value entirely
+      ---
+      duration_ms: 1.955721
+      type: 'test'
+      ...
+    1..4
+ok 78 - aggregations across period boundaries
+  ---
+  duration_ms: 20.524752
+  type: 'suite'
+  ...
+# Subtest: backdating
+    # Subtest: an event inside the acceptance window updates the pending total
+    ok 1 - an event inside the acceptance window updates the pending total
+      ---
+      duration_ms: 2.095394
+      type: 'test'
+      ...
+    # Subtest: an event outside the window is rejected with the window spelled out
+    ok 2 - an event outside the window is rejected with the window spelled out
+      ---
+      duration_ms: 1.058981
+      type: 'test'
+      ...
+    # Subtest: an event from the future is rejected too
+    ok 3 - an event from the future is rejected too
+      ---
+      duration_ms: 1.605797
+      type: 'test'
+      ...
+    1..3
+ok 79 - backdating
+  ---
+  duration_ms: 4.964721
+  type: 'suite'
+  ...
+# Subtest: closed periods
+    # Subtest: usage that lands after a period is billed is reported, not dropped
+    ok 1 - usage that lands after a period is billed is reported, not dropped
+      ---
+      duration_ms: 6.537323
+      type: 'test'
+      ...
+    # Subtest: closing a period twice returns the first closure
+    ok 2 - closing a period twice returns the first closure
+      ---
+      duration_ms: 2.270916
+      type: 'test'
+      ...
+    # Subtest: a close whose boundary has moved is a conflict, not a second closure
+    ok 3 - a close whose boundary has moved is a conflict, not a second closure
+      ---
+      duration_ms: 2.817393
+      type: 'test'
+      ...
+    1..3
+ok 80 - closed periods
+  ---
+  duration_ms: 11.818792
+  type: 'suite'
+  ...
+# Subtest: an event that should never have been recorded can be unsaid
+    # Subtest: a fat-fingered value leaves the total, and its identifier stays claimed
+    ok 1 - a fat-fingered value leaves the total, and its identifier stays claimed
+      ---
+      duration_ms: 5.227805
+      type: 'test'
+      ...
+    # Subtest: cancelling twice is the same as cancelling once
+    ok 2 - cancelling twice is the same as cancelling once
+      ---
+      duration_ms: 5.344284
+      type: 'test'
+      ...
+    # Subtest: max and last fall back to the readings that survive, not to arithmetic
+    ok 3 - max and last fall back to the readings that survive, not to arithmetic
+      ---
+      duration_ms: 8.631449
+      type: 'test'
+      ...
+    # Subtest: a distinct subject is only lost when no surviving event carries it
+    ok 4 - a distinct subject is only lost when no surviving event carries it
+      ---
+      duration_ms: 3.068646
+      type: 'test'
+      ...
+    # Subtest: a withdrawal inside a billed period files a negative true-up, it does not move the invoice
+    ok 5 - a withdrawal inside a billed period files a negative true-up, it does not move the invoice
+      ---
+      duration_ms: 2.622303
+      type: 'test'
+      ...
+    # Subtest: withdrawing a late arrival takes its own entry back out of the queue
+    ok 6 - withdrawing a late arrival takes its own entry back out of the queue
+      ---
+      duration_ms: 3.095347
+      type: 'test'
+      ...
+    # Subtest: an unknown identifier is a 404 and a mismatched event name a 400
+    ok 7 - an unknown identifier is a 404 and a mismatched event name a 400
+      ---
+      duration_ms: 1.774713
+      type: 'test'
+      ...
+    1..7
+ok 81 - an event that should never have been recorded can be unsaid
+  ---
+  duration_ms: 30.219662
+  type: 'suite'
+  ...
+# Subtest: a total that passes 2^53 stays readable
+    # Subtest: ten billion units in one hour ingest, read, close and read again
+    ok 1 - ten billion units in one hour ingest, read, close and read again
+      ---
+      duration_ms: 1087.56076
+      type: 'test'
+      ...
+    # Subtest: a value that could not be read back is refused rather than accepted
+    ok 2 - a value that could not be read back is refused rather than accepted
+      ---
+      duration_ms: 1712.832398
+      type: 'test'
+      ...
+    1..2
+ok 82 - a total that passes 2^53 stays readable
+  ---
+  duration_ms: 2800.577796
+  type: 'suite'
+  ...
+# Subtest: a period that ends settles itself
+    # Subtest: an invoice due with an arrears period enqueues one settlement per metered line
+    ok 1 - an invoice due with an arrears period enqueues one settlement per metered line
+      ---
+      duration_ms: 1.179799
+      type: 'test'
+      ...
+    # Subtest: a cancelled subscription still settles the part-period it used
+    ok 2 - a cancelled subscription still settles the part-period it used
+      ---
+      duration_ms: 13.049155
+      type: 'test'
+      ...
+    # Subtest: an event with nothing metered on it enqueues nothing
+    ok 3 - an event with nothing metered on it enqueues nothing
+      ---
+      duration_ms: 0.426152
+      type: 'test'
+      ...
+    1..3
+ok 83 - a period that ends settles itself
+  ---
+  duration_ms: 14.881447
+  type: 'suite'
+  ...
+# Subtest: pre-aggregated summaries
+    # Subtest: period totals read whole hours from the pre-aggregate and scan only the edges
+    ok 1 - period totals read whole hours from the pre-aggregate and scan only the edges
+      ---
+      duration_ms: 59.376404
+      type: 'test'
+      ...
+    # Subtest: a summary range that would read the whole table is refused
+    ok 2 - a summary range that would read the whole table is refused
+      ---
+      duration_ms: 0.908523
+      type: 'test'
+      ...
+    1..2
+ok 84 - pre-aggregated summaries
+  ---
+  duration_ms: 60.487989
+  type: 'suite'
+  ...
+# Subtest: meter definitions
+    # Subtest: a meter is reachable by id or by the event name it listens for
+    ok 1 - a meter is reachable by id or by the event name it listens for
+      ---
+      duration_ms: 1.066972
+      type: 'test'
+      ...
+    # Subtest: two live meters cannot claim the same event name
+    ok 2 - two live meters cannot claim the same event name
+      ---
+      duration_ms: 11.577636
+      type: 'test'
+      ...
+    # Subtest: the aggregation cannot be changed once summaries exist under it
+    ok 3 - the aggregation cannot be changed once summaries exist under it
+      ---
+      duration_ms: 1.43026
+      type: 'test'
+      ...
+    # Subtest: an inactive meter stops accepting events and says so
+    ok 4 - an inactive meter stops accepting events and says so
+      ---
+      duration_ms: 1.353312
+      type: 'test'
+      ...
+    1..4
+ok 85 - meter definitions
+  ---
+  duration_ms: 15.690998
+  type: 'suite'
+  ...
+# Subtest: the Northwind workspace
+    # Subtest: every seeded meter has real usage behind it
+    ok 1 - every seeded meter has real usage behind it
+      ---
+      duration_ms: 10.692393
+      type: 'test'
+      ...
+    # Subtest: the Sunday the export worker double-ran is on record as a withdrawal
+    ok 2 - the Sunday the export worker double-ran is on record as a withdrawal
+      ---
+      duration_ms: 1.649562
+      type: 'test'
+      ...
+    # Subtest: the telemetry meter carries a fleet-sized month for its biggest account
+    ok 3 - the telemetry meter carries a fleet-sized month for its biggest account
+      ---
+      duration_ms: 11.349274
+      type: 'test'
+      ...
+    1..3
+ok 86 - the Northwind workspace
+  ---
+  duration_ms: 23.890201
+  type: 'suite'
+  ...
+# Subtest: unitsWorthBurning never spends a credit that buys nothing
+    # Subtest: credits are not spent against a free tier
+    ok 1 - credits are not spent against a free tier
+      ---
+      duration_ms: 0.158736
+      type: 'test'
+      ...
+    # Subtest: when everything is chargeable, the whole balance is spent
+    ok 2 - when everything is chargeable, the whole balance is spent
+      ---
+      duration_ms: 0.080473
+      type: 'test'
+      ...
+    # Subtest: a balance bigger than the usage is capped by the usage
+    ok 3 - a balance bigger than the usage is capped by the usage
+      ---
+      duration_ms: 0.072301
+      type: 'test'
+      ...
+    # Subtest: no balance, no burn
+    ok 4 - no balance, no burn
+      ---
+      duration_ms: 0.129946
+      type: 'test'
+      ...
+    1..4
+ok 87 - unitsWorthBurning never spends a credit that buys nothing
+  ---
+  duration_ms: 0.630423
+  type: 'suite'
+  ...
+# Subtest: a billed period that drifts is settled in money, not in a word
+    # Subtest: withdrawing usage from an invoiced period produces a negative line for exactly what it was worth
+    ok 1 - withdrawing usage from an invoiced period produces a negative line for exactly what it was worth
+      ---
+      duration_ms: 42.581199
+      type: 'test'
+      ...
+    # Subtest: two true-ups on a graduated price sum to exactly one true-up of both
+    ok 2 - two true-ups on a graduated price sum to exactly one true-up of both
+      ---
+      duration_ms: 42.815923
+      type: 'test'
+      ...
+    # Subtest: a late reading below a peak moves nothing on a max meter, and says so
+    ok 3 - a late reading below a peak moves nothing on a max meter, and says so
+      ---
+      duration_ms: 18.09566
+      type: 'test'
+      ...
+    # Subtest: a period is trued up once, not once per event
+    ok 4 - a period is trued up once, not once per event
+      ---
+      duration_ms: 14.338235
+      type: 'test'
+      ...
+    # Subtest: resolving twice is a no-op, and changing a resolution that moved money is refused
+    ok 5 - resolving twice is a no-op, and changing a resolution that moved money is refused
+      ---
+      duration_ms: 9.376552
+      type: 'test'
+      ...
+    # Subtest: the wrong direction is refused before it becomes a line
+    ok 6 - the wrong direction is refused before it becomes a line
+      ---
+      duration_ms: 8.88242
+      type: 'test'
+      ...
+    # Subtest: a period billed through the settlement API is closed without being asked
+    ok 7 - a period billed through the settlement API is closed without being asked
+      ---
+      duration_ms: 16.233013
+      type: 'test'
+      ...
+    1..7
+ok 88 - a billed period that drifts is settled in money, not in a word
+  ---
+  duration_ms: 152.756608
+  type: 'suite'
+  ...
+# (node:22625) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: MRR and ARR
+    # Subtest: the headline figure is billing's own, to the cent — in each currency it is billed in
+    ok 1 - the headline figure is billing's own, to the cent — in each currency it is billed in
+      ---
+      duration_ms: 21.618784
+      type: 'test'
+      ...
+    # Subtest: an annual subscription normalises to the month, matching a hand calculation
+    ok 2 - an annual subscription normalises to the month, matching a hand calculation
+      ---
+      duration_ms: 29.748061
+      type: 'test'
+      ...
+    # Subtest: metered items are outside MRR, and the usage basis says how it was measured
+    ok 3 - metered items are outside MRR, and the usage basis says how it was measured
+      ---
+      duration_ms: 23.220103
+      type: 'test'
+      ...
+    # Subtest: the part of MRR that is gross of tax is named, not left to be discovered
+    ok 4 - the part of MRR that is gross of tax is named, not left to be discovered
+      ---
+      duration_ms: 19.543035
+      type: 'test'
+      ...
+    # Subtest: every endpoint carries a basis and the row counts it read
+    ok 5 - every endpoint carries a basis and the row counts it read
+      ---
+      duration_ms: 255.261271
+      type: 'test'
+      ...
+    # Subtest: every endpoint answers with both a series and totals
+    ok 6 - every endpoint answers with both a series and totals
+      ---
+      duration_ms: 255.547851
+      type: 'test'
+      ...
+    # Subtest: the summary reads the other six rather than recomputing them
+    ok 7 - the summary reads the other six rather than recomputing them
+      ---
+      duration_ms: 100.009934
+      type: 'test'
+      ...
+    # Subtest: a single-currency request needs no caveat
+    ok 8 - a single-currency request needs no caveat
+      ---
+      duration_ms: 17.882912
+      type: 'test'
+      ...
+    1..8
+ok 89 - MRR and ARR
+  ---
+  duration_ms: 7139.935215
+  type: 'suite'
+  ...
+# Subtest: MRR movement
+    # Subtest: every seeded month reconciles, and each month opens where the last one closed
+    ok 1 - every seeded month reconciles, and each month opens where the last one closed
+      ---
+      duration_ms: 16.284462
+      type: 'test'
+      ...
+    # Subtest: the closing MRR of the last month is the MRR the book reports today
+    ok 2 - the closing MRR of the last month is the MRR the book reports today
+      ---
+      duration_ms: 13.929789
+      type: 'test'
+      ...
+    # Subtest: an upgrade is expansion in its own month and in no other
+    ok 3 - an upgrade is expansion in its own month and in no other
+      ---
+      duration_ms: 2703.896016
+      type: 'test'
+      ...
+    # Subtest: a cancellation is churn exactly once
+    ok 4 - a cancellation is churn exactly once
+      ---
+      duration_ms: 2076.595387
+      type: 'test'
+      ...
+    # Subtest: churn and retention add up to one, and every rate shows its fraction
+    ok 5 - churn and retention add up to one, and every rate shows its fraction
+      ---
+      duration_ms: 3.897646
+      type: 'test'
+      ...
+    1..5
+ok 90 - MRR movement
+  ---
+  duration_ms: 8546.898437
+  type: 'suite'
+  ...
+# Subtest: reactivation
+    # Subtest: an account that comes back is reactivation, not new business
+    ok 1 - an account that comes back is reactivation, not new business
+      ---
+      duration_ms: 2859.527952
+      type: 'test'
+      ...
+    1..1
+ok 91 - reactivation
+  ---
+  duration_ms: 6522.745
+  type: 'suite'
+  ...
+# Subtest: cohorts
+    # Subtest: each cohort is measured against its own first month
+    ok 1 - each cohort is measured against its own first month
+      ---
+      duration_ms: 4.285861
+      type: 'test'
+      ...
+    # Subtest: an account with no revenue is counted as unassigned, not dropped
+    ok 2 - an account with no revenue is counted as unassigned, not dropped
+      ---
+      duration_ms: 11.758791
+      type: 'test'
+      ...
+    1..2
+ok 92 - cohorts
+  ---
+  duration_ms: 3960.297684
+  type: 'suite'
+  ...
+# Subtest: deferred revenue
+    # Subtest: a closed period is fully recognised: deferred plus recognised equals invoiced
+    ok 1 - a closed period is fully recognised: deferred plus recognised equals invoiced
+      ---
+      duration_ms: 2219.1346
+      type: 'test'
+      ...
+    # Subtest: the whole book reconciles, and every month states its balance
+    ok 2 - the whole book reconciles, and every month states its balance
+      ---
+      duration_ms: 102.767876
+      type: 'test'
+      ...
+    # Subtest: a voided invoice leaves the recognition schedule
+    ok 3 - a voided invoice leaves the recognition schedule
+      ---
+      duration_ms: 42.810129
+      type: 'test'
+      ...
+    1..3
+ok 93 - deferred revenue
+  ---
+  duration_ms: 8541.49256
+  type: 'suite'
+  ...
+# Subtest: collections
+    # Subtest: the ageing buckets add up to the receivable
+    ok 1 - the ageing buckets add up to the receivable
+      ---
+      duration_ms: 14.036011
+      type: 'test'
+      ...
+    # Subtest: DSO carries the two figures it was divided from
+    ok 2 - DSO carries the two figures it was divided from
+      ---
+      duration_ms: 12.657333
+      type: 'test'
+      ...
+    # Subtest: a bill that is paid leaves the ageing, and a month-end balance is a real balance
+    ok 3 - a bill that is paid leaves the ageing, and a month-end balance is a real balance
+      ---
+      duration_ms: 55.411537
+      type: 'test'
+      ...
+    # Subtest: failed payments are reported as exposure with the recovery behind them
+    ok 4 - failed payments are reported as exposure with the recovery behind them
+      ---
+      duration_ms: 8.377426
+      type: 'test'
+      ...
+    1..4
+ok 94 - collections
+  ---
+  duration_ms: 6854.190686
+  type: 'suite'
+  ...
+# Subtest: usage economics
+    # Subtest: metered value splits into what credit covered and what was charged
+    ok 1 - metered value splits into what credit covered and what was charged
+      ---
+      duration_ms: 82.218755
+      type: 'test'
+      ...
+    # Subtest: the invoiced mix is a partition of everything billed
+    ok 2 - the invoiced mix is a partition of everything billed
+      ---
+      duration_ms: 21.63145
+      type: 'test'
+      ...
+    # Subtest: credit is reported in the unit it was granted in
+    ok 3 - credit is reported in the unit it was granted in
+      ---
+      duration_ms: 7.021073
+      type: 'test'
+      ...
+    # Subtest: the credit ledger adds up, and every type in it is named
+    ok 4 - the credit ledger adds up, and every type in it is named
+      ---
+      duration_ms: 12.141979
+      type: 'test'
+      ...
+    1..4
+ok 95 - usage economics
+  ---
+  duration_ms: 6253.661576
+  type: 'suite'
+  ...
+# Subtest: a year through the time machine
+    # Subtest: every series still reconciles after 365 days of billing
+    ok 1 - every series still reconciles after 365 days of billing
+      ---
+      duration_ms: 7265.923664
+      type: 'test'
+      ...
+    1..1
+ok 96 - a year through the time machine
+  ---
+  duration_ms: 13739.580112
+  type: 'suite'
+  ...
+# Subtest: a book in more than one currency
+    # Subtest: no endpoint states a money figure that is true in no currency
+    ok 1 - no endpoint states a money figure that is true in no currency
+      ---
+      duration_ms: 151.00237
+      type: 'test'
+      ...
+    # Subtest: the by_currency block is exact, and asking for one currency brings the scalars back
+    ok 2 - the by_currency block is exact, and asking for one currency brings the scalars back
+      ---
+      duration_ms: 11.923835
+      type: 'test'
+      ...
+    # Subtest: a yen subscription is not a thousand dollars
+    ok 3 - a yen subscription is not a thousand dollars
+      ---
+      duration_ms: 18.66957
+      type: 'test'
+      ...
+    # Subtest: the copilot is handed no figure it could state wrongly
+    ok 4 - the copilot is handed no figure it could state wrongly
+      ---
+      duration_ms: 82.437159
+      type: 'test'
+      ...
+    1..4
+ok 97 - a book in more than one currency
+  ---
+  duration_ms: 5235.626196
+  type: 'suite'
+  ...
+# Subtest: a reporting window longer than the report draws
+    # Subtest: the months that survive are the recent ones, and the ones that went are named
+    ok 1 - the months that survive are the recent ones, and the ones that went are named
+      ---
+      duration_ms: 153.807531
+      type: 'test'
+      ...
+    # Subtest: a decade-wide request still finds its cohorts and its retention
+    ok 2 - a decade-wide request still finds its cohorts and its retention
+      ---
+      duration_ms: 12.041285
+      type: 'test'
+      ...
+    1..2
+ok 98 - a reporting window longer than the report draws
+  ---
+  duration_ms: 2970.36148
+  type: 'suite'
+  ...
+# Subtest: a collection pause
+    # Subtest: is dated where it happened, and stays there when the row is written again
+    ok 1 - is dated where it happened, and stays there when the row is written again
+      ---
+      duration_ms: 1591.60205
+      type: 'test'
+      ...
+    # Subtest: that is lifted is a hole in the history, not the end of it
+    ok 2 - that is lifted is a hole in the history, not the end of it
+      ---
+      duration_ms: 1255.591084
+      type: 'test'
+      ...
+    1..2
+ok 99 - a collection pause
+  ---
+  duration_ms: 5937.95027
+  type: 'suite'
+  ...
+# Subtest: the credit ledger behind usage
+    # Subtest: a rollover is not a grant, and a refund keeps the sign the ledger gave it
+    ok 1 - a rollover is not a grant, and a refund keeps the sign the ledger gave it
+      ---
+      duration_ms: 759.872899
+      type: 'test'
+      ...
+    # Subtest: every check the endpoint publishes actually passes
+    ok 2 - every check the endpoint publishes actually passes
+      ---
+      duration_ms: 3.639232
+      type: 'test'
+      ...
+    1..2
+ok 100 - the credit ledger behind usage
+  ---
+  duration_ms: 2917.927217
+  type: 'suite'
+  ...
+1..100
+# tests 458
+# suites 100
+# pass 458
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 208968.37575

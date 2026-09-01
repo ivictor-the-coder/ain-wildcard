@@ -267,6 +267,15 @@ export interface PreviewInput extends ProrateInput {
   intervalBefore: Cadence;
   /** The cadence it bills on afterwards — the new prices decide this, not the row. */
   intervalAfter: Cadence;
+  /**
+   * The rate engine, as the bill will run it on these exact lines: the base
+   * they will be recorded at and the tax beside it. `prorate()` is pure
+   * arithmetic on list prices and stays that way; everything this preview
+   * publishes as *money that moves* is priced through here instead, because a
+   * figure taken off the price list and shown to a human as "collected now" is
+   * short by the tax on every exclusive-priced account in the book.
+   */
+  taxOf(lines: { price: string | null; amount: number; currency: string }[]): { base: number; tax: number };
 }
 
 /**
@@ -283,11 +292,37 @@ export function previewChange(input: PreviewInput): ChangePreview {
   );
 
   // Every proration line goes onto a bill, whichever way the set nets, so the
-  // rate engine taxes a credit exactly as it taxed the charge it reverses. The
-  // customer balance is no longer part of this decision: it takes only what an
-  // invoice cannot carry, which is decided after tax, on the bill itself.
+  // rate engine taxes a credit exactly as it taxed the charge it reverses.
+  //
+  // `net` is the lines' own arithmetic and stays pre-tax — the notices say so,
+  // and it is what `credit_total` and `charge_total` are made of. What is
+  // *collected* is not that number: `always_invoice` raises a bill, and a bill
+  // is `base + tax + whatever the account balance settles`, floored at zero.
+  // Publishing the pre-tax net as "collected now" understated a $75.00 upgrade
+  // on a New York account by the $6.38 the card was actually charged, and the
+  // screen that reads this field prints it on the button that takes the money.
+  // So it is priced the way the invoice will price it, through the invoice's
+  // own call.
   const settles = input.behavior === 'always_invoice';
-  const amountDueNow = settles && set.net > 0 ? set.net : 0;
+  const dueNow = settles && set.net > 0
+    ? input.taxOf(set.lines.map((line) => ({ price: line.price, amount: line.amount, currency: line.currency })))
+    : null;
+  const taxDueNow = dueNow ? dueNow.tax : 0;
+  // A credit balance is drawn down by this bill and can never take it below
+  // zero, exactly as `Invoices.issue()` decides it — so an account holding
+  // more credit than the change is worth is collected from for nothing.
+  const amountDueNow = dueNow ? Math.max(0, dueNow.base + dueNow.tax + input.customerBalance) : 0;
+
+  // The recurring fee for the period after the change, on the basis the bill
+  // will record it: the taxable base, and the tax beside it. A tax-inclusive
+  // price already contains its tax, so quoting the list price here as
+  // `subtotal` states €250.00 for a bill whose subtotal will say €210.08 —
+  // the same mistake, one panel over, that `next_invoice` on the customer
+  // summary was carrying. `subtotal + tax` is the listed price either way.
+  const billable = lines.filter((line) => !line.metered && line.amount !== null);
+  const nextTaxed = input.taxOf(billable.map((line) => ({
+    price: line.price, amount: line.amount as number, currency: line.currency,
+  })));
 
   const notices = [...set.notices];
   if (!sameCadence(input.intervalBefore, input.intervalAfter)) {
@@ -326,11 +361,13 @@ export function previewChange(input: PreviewInput): ChangePreview {
     charge_total: set.chargeTotal,
     net: set.net,
     amount_due_now: amountDueNow,
+    tax_due_now: taxDueNow,
     customer_balance: input.customerBalance,
     next_invoice: {
       date: input.nextInvoiceDate,
       currency: input.currency,
-      subtotal: recurringSubtotal(lines),
+      subtotal: nextTaxed.base,
+      tax: nextTaxed.tax,
       lines,
     },
     items_after: input.itemsAfter.map((item) => {

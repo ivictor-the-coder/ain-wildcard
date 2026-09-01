@@ -392,4 +392,24 @@ ALTER TABLE billing_invoices ADD COLUMN pre_payment_credit_notes_amount INTEGER 
 ALTER TABLE billing_invoices ADD COLUMN post_payment_credit_notes_amount INTEGER NOT NULL DEFAULT 0;
 `,
   },
+  {
+    id: 'billing.0005_stacked_tax_and_tax_location',
+    sql: `
+-- Every jurisdiction's tax on a line, as a list. A US address is in the state,
+-- the city and a transit district at once and owes the sum of all three; the
+-- single snapshot beside this column holds their roll-up so that everything
+-- that reads a line's tax as one figure — the credit note, the totals, the
+-- ledger — still can. Rows written before this column hydrate from that
+-- snapshot, which is exactly one rate and always was.
+ALTER TABLE billing_invoice_lines ADD COLUMN taxes TEXT NOT NULL DEFAULT '[]';
+
+-- Whether the tax on this bill was worked out from a location Ain actually
+-- knows. 'requires_location_inputs' is not a zero: it is the absence of an
+-- answer, and it is the difference between a deliberately zero-rated supply
+-- and one nobody could place. Existing rows were raised before the question was
+-- asked, so they carry the answer that does not hold anything back.
+ALTER TABLE billing_invoices ADD COLUMN automatic_tax_status TEXT NOT NULL DEFAULT 'complete';
+CREATE INDEX idx_billing_invoices_tax_status ON billing_invoices(org_id, automatic_tax_status);
+`,
+  },
 ];

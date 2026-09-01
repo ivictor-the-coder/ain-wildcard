@@ -11,9 +11,11 @@
  *     of it and the base is what is left. That is the whole difference between
  *     the two behaviours, and it is why an inclusive price and an exclusive one
  *     must never produce the same invoice.
- *  2. **Rounding happens once per line**, on an exact rational, and the two
- *     halves are made to add up by subtraction rather than by rounding twice —
- *     an inclusive line's base is `amount - tax`, always, to the cent.
+ *  2. **Rounding happens once per rate**, on an exact rational, and the halves
+ *     are made to add up by subtraction rather than by rounding twice — an
+ *     inclusive line's base is `amount - tax`, always, to the cent. A line in
+ *     three jurisdictions rounds three times, once each, and never rounds one
+ *     jurisdiction's tax on top of another's.
  *  3. **Zero tax is still an answer.** A reverse-charged B2B supply into the EU
  *     is 0%, but the invoice says so, names the rate it would have been and
  *     says why. A bill that is silent about tax cannot be sent to a customer in
@@ -23,7 +25,7 @@
 import type { Ctx } from '../../kernel/context';
 import { badRequest, conflict, notFound } from '../../../shared/errors';
 import { newId } from '../../../shared/ids';
-import { rat, ratMul, ratToMoney, type Rational } from '../../../shared/money';
+import { rat, ratAdd, ratDiv, ratMul, ratToMoney, type Rational } from '../../../shared/money';
 import type { TaxBehavior } from '../catalog/types';
 import type { Customer, TaxId, TaxIdVerification } from './types';
 
@@ -131,6 +133,32 @@ export function percentToRat(percentage: string): Rational {
 export const formatPercentage = (percentage: string): string =>
   percentage.includes('.') ? percentage.replace(/0+$/, '').replace(/\.$/, '') : percentage;
 
+/**
+ * An exact percentage back to the decimal string it came from.
+ *
+ * `percentToRat` reduces, so 0.375% is held as 3/8 rather than 375/1000; the
+ * denominator still divides a million, because that is the most decimal places
+ * a percentage may have here, so this scaling is exact and never a float. It is
+ * what lets three stacked US rates print as the one combined "8.875%" a
+ * customer recognises.
+ */
+export function formatRationalPercentage(value: Rational): string {
+  const micro = (value.n * 1_000_000n) / value.d;
+  const whole = micro / 1_000_000n;
+  const fraction = (micro % 1_000_000n).toString().padStart(6, '0');
+  return formatPercentage(`${whole}.${fraction}`);
+}
+
+/** Add exact percentages: "4" + "4.5" + "0.375" is "8.875", to the last place. */
+export const combinePercentages = (percentages: string[]): string =>
+  formatRationalPercentage(percentages.reduce((total, one) => ratAdd(total, percentToRat(one)), rat(0n)));
+
+/** What to call a stack of rates that are all the same kind of tax. */
+export const TAX_TYPE_LABELS: Record<TaxType, string> = {
+  vat: 'VAT', gst: 'GST', sales_tax: 'Sales tax', hst: 'HST', pst: 'PST', qst: 'QST',
+  jct: 'JCT', igst: 'IGST', service_tax: 'Service tax', other: 'Tax',
+};
+
 /* ------------------------------- jurisdictions ---------------------------- */
 
 /**
@@ -149,10 +177,47 @@ const COUNTRY_CODES: Record<string, string> = {
   'united states': 'US', 'united states of america': 'US',
 };
 
+/**
+ * What people type that is not the code the register uses. `UK` is the one that
+ * matters: it is what a customer writes into an address field and `GB` is what
+ * the rate is registered under, and reading them as two different countries is
+ * how a British invoice quietly loses its VAT.
+ */
+const COUNTRY_ALIASES: Record<string, string> = { UK: 'GB', EL: 'GR' };
+
+/**
+ * Two letters that are a country, or two letters.
+ *
+ * ICU knows every ISO-3166-1 region and hands back the code itself when it does
+ * not recognise one, so `ZZ` and `QQ` are refused here rather than travelling on
+ * as a jurisdiction no rate can ever match and no invoice can ever explain.
+ * `ZZ` is named separately because CLDR calls it "Unknown Region" — a display
+ * name, which would otherwise read as a country that exists.
+ *
+ * A build shipped without region data would answer every code with itself;
+ * there is nothing to check against then, so the check stands down rather than
+ * refusing every address in the workspace.
+ */
+const REGION_NAMES: Intl.DisplayNames | null = (() => {
+  try {
+    const names = new Intl.DisplayNames(['en'], { type: 'region' });
+    return names.of('DE') === 'DE' || names.of('QQ') !== 'QQ' ? null : names;
+  } catch { return null; }
+})();
+
+export function isCountryCode(code: string): boolean {
+  if (!/^[A-Z]{2}$/.test(code) || code === 'ZZ') return false;
+  if (!REGION_NAMES) return true;
+  try { return REGION_NAMES.of(code) !== code; } catch { return false; }
+}
+
 export function countryCode(name: string | null | undefined): string | null {
   if (!name) return null;
   const trimmed = name.trim();
-  if (/^[A-Za-z]{2}$/.test(trimmed)) return trimmed.toUpperCase();
+  if (/^[A-Za-z]{2}$/.test(trimmed)) {
+    const canonical = COUNTRY_ALIASES[trimmed.toUpperCase()] ?? trimmed.toUpperCase();
+    if (isCountryCode(canonical)) return canonical;
+  }
   return COUNTRY_CODES[trimmed.toLowerCase()] ?? null;
 }
 
@@ -393,12 +458,39 @@ export const pendingVerification = (type: string): TaxIdVerification =>
 
 /* --------------------------------- the split ------------------------------ */
 
-/** The rate that applies to one customer, and why. */
+/** One rate that an address matched, and why it charged what it charged. */
+export interface ResolvedRateEntry {
+  rate: TaxRate;
+  /**
+   * Sibling rates can differ. A cross-border EU supply against a verified
+   * registration reverse charges the VAT while a city rate registered in the
+   * same country would still be charged, so the reason belongs to the rate.
+   */
+  reason: TaxReason;
+}
+
+/** The rates that apply to one customer, and why. */
 export interface ResolvedRate {
+  /**
+   * Every active rate the address matched, country-wide first and then the
+   * state's. A US supply is in as many jurisdictions as have registered a rate
+   * over it and owes the sum of them; taking the most specific one and calling
+   * it "the rate" undercharges by every other jurisdiction it is in.
+   */
+  entries: ResolvedRateEntry[];
+  /** The first of them — the single-rate reading most invoices still have. */
   rate: TaxRate | null;
+  /** The document's own answer, for a line with one rate or none. */
   reason: TaxReason;
   /** The country the decision was made against, for the explanation. */
   country: string | null;
+  /**
+   * False when no country could be resolved at all — no address, an address
+   * with no country, a country that is not one. It is the difference between
+   * "deliberately zero-rated" and "we never learned where this customer is",
+   * and it is what `automatic_tax.status` on the invoice is decided from.
+   */
+  location_known: boolean;
   /** Where the supplier is established, when the workspace has recorded it. */
   supplier_country: string | null;
   /**
@@ -409,11 +501,22 @@ export interface ResolvedRate {
   registration_note: string | null;
 }
 
+/** One rate's slice of a line's tax. */
+export interface TaxSlice {
+  rate: TaxRate | null;
+  reason: TaxReason;
+  /** Signed the same way the line is, so a credit line credits its tax. */
+  amount: number;
+  behavior: TaxBehavior;
+}
+
 /** One line's tax, and the base it was computed on. */
 export interface TaxSplit {
   /** The taxable base — what the line is worth before tax. */
   base: number;
-  /** The tax on it. Signed the same way the line is, so credits credit tax. */
+  /** One entry per rate that touched the line, charged or not. */
+  slices: TaxSlice[];
+  /** `slices` summed. Signed the same way the line is. */
   tax: number;
   behavior: TaxBehavior;
   reason: TaxReason;
@@ -473,15 +576,34 @@ export class TaxRates {
     }
     percentToRat(input.percentage);
     const state = input.state?.trim() || null;
-    const clash = this.ctx.db.get<{ id: string }>(
-      `SELECT id FROM billing_tax_rates WHERE org_id = ? AND country = ? AND active = 1
-        AND ((state IS NULL AND ? IS NULL) OR state = ?)`,
-      this.orgId, country, state, state,
+    // One active rate per *jurisdiction*, not per place. A US address is in
+    // several jurisdictions at once — the state, the city, a transit district —
+    // and every one of them registers its own rate over the same supply, so
+    // refusing the second would make a New York invoice impossible to write.
+    // What is still refused is the same jurisdiction registered twice, which is
+    // a duplicate rather than a stack and would double-charge it.
+    //
+    // The test is *overlap*, not sameness of place, and it is `ratesFor`'s own
+    // matching rule read backwards: two rates can both land on one address when
+    // either is registered country-wide or they name the same state. Keying the
+    // clash on the (country, state) tuple instead let New York be registered
+    // once country-wide and once under its state, and every New York bill was
+    // then charged New York twice — the exact double-charge this refusal
+    // exists to prevent, wearing the stack's clothes. Case is folded here for
+    // the same reason `ratesFor` folds it: "new york city" and "New York City"
+    // are one city, and a bill that charges both charges it twice.
+    const jurisdiction = input.jurisdiction.trim();
+    const named = jurisdiction.toLowerCase();
+    const scoped = state?.toLowerCase() ?? null;
+    const clash = this.list({ country, active: true, limit: 500 }).find(
+      (rate) => rate.jurisdiction.trim().toLowerCase() === named
+        && (rate.state === null || scoped === null || rate.state.trim().toLowerCase() === scoped),
     );
     if (clash) {
+      const where = clash.state ? `${country} / ${clash.state}` : `${country}, country-wide`;
       throw conflict(
         'tax_rate_exists',
-        `${country}${state ? ` / ${state}` : ''} already has an active rate (${clash.id}). Deactivate it before adding another, so an address can never match two.`,
+        `${jurisdiction} already has an active rate (${clash.id}, ${clash.display_name} ${formatPercentage(clash.percentage)}%) registered over ${where}, which covers ${state ? `${country} / ${state}` : `all of ${country}`}. Deactivate it before adding another, so one address can never be charged the same jurisdiction twice — a second, *different* jurisdiction over the same address is registered under its own name and stacks with this one.`,
         { tax_rate: clash.id },
       );
     }
@@ -491,7 +613,7 @@ export class TaxRates {
       org_id: this.orgId,
       display_name: input.display_name,
       description: input.description ?? null,
-      jurisdiction: input.jurisdiction,
+      jurisdiction,
       country,
       state,
       tax_type: input.tax_type ?? 'vat',
@@ -506,6 +628,14 @@ export class TaxRates {
     return this.require(id);
   }
 
+  /**
+   * Only ever called with `false` today, and the API exposes only that.
+   * Bringing a retired rate back is the one other way two active rates could
+   * come to name the same jurisdiction over one address, so whoever exposes it
+   * has to run `create`'s overlap check first — the refusal there is what keeps
+   * a New York bill from being charged New York twice, and a route that skips
+   * it hands the double-charge straight back.
+   */
   setActive(id: string, active: boolean, at: number): TaxRate {
     const rate = this.require(id);
     this.ctx.db.patch('billing_tax_rates', 'id', rate.id, { active: active ? 1 : 0, updated: at });
@@ -537,14 +667,24 @@ export class TaxRates {
     const country = countryCode(customer.address?.country)
       ?? customer.tax_ids.map(taxIdCountry).find((code): code is string => !!code)
       ?? null;
-    const rate = country ? this.rateFor(country, customer.address?.state ?? null) : null;
+    const rates = country ? this.ratesFor(country, customer.address?.state ?? null) : [];
     const supplier = this.supplierCountry();
-    const base = { rate, country, supplier_country: supplier, registration_note: null };
+    const base = {
+      rate: rates[0] ?? null,
+      country,
+      location_known: country !== null,
+      supplier_country: supplier,
+      registration_note: null,
+    };
+    const every = (reason: TaxReason): ResolvedRateEntry[] => rates.map((rate) => ({ rate, reason }));
 
-    if (customer.tax_exempt === 'exempt') return { ...base, reason: 'exempt' };
-    if (customer.tax_exempt === 'reverse') return { ...base, reason: 'reverse_charge' };
-    if (!rate) return { ...base, rate: null, reason: 'no_rate' };
-    if (!rate.reverse_charge) return { ...base, reason: 'taxable' };
+    if (customer.tax_exempt === 'exempt') return { ...base, entries: every('exempt'), reason: 'exempt' };
+    if (customer.tax_exempt === 'reverse') return { ...base, entries: every('reverse_charge'), reason: 'reverse_charge' };
+    if (!rates.length) return { ...base, rate: null, entries: [], reason: 'no_rate' };
+
+    const shiftable = rates.filter((rate) => rate.reverse_charge);
+    if (!shiftable.length) return { ...base, entries: every('taxable'), reason: 'taxable' };
+    const named = shiftable.map((rate) => rate.display_name).join(' and ');
 
     // Three things have to hold before the tax moves onto the customer, and
     // each of them has been a way to lose the money in some real billing
@@ -554,29 +694,37 @@ export class TaxRates {
     // charges its own domestic rate however good the customer's number is.
     // An account can hold more than one number in a country — an old one and
     // its replacement. The confirmed one decides, whichever order they are in.
-    const inCountry = customer.tax_ids.filter((taxId) => taxIdCountry(taxId) === rate.country);
+    const inCountry = customer.tax_ids.filter((taxId) => taxIdCountry(taxId) === country);
     const registration = inCountry.find((taxId) => taxId.verification.status === 'verified') ?? inCountry[0];
-    if (!registration) return { ...base, reason: 'taxable' };
-    if (supplier !== null && supplier === rate.country) {
+    if (!registration) return { ...base, entries: every('taxable'), reason: 'taxable' };
+    if (supplier !== null && supplier === country) {
       return {
         ...base,
+        entries: every('taxable'),
         reason: 'taxable',
-        registration_note: `${registration.value} is registered in ${rate.country}, but this is a domestic supply — the supplier is established in ${supplier} too — so ${rate.display_name} is charged rather than reverse charged.`,
+        registration_note: `${registration.value} is registered in ${country}, but this is a domestic supply — the supplier is established in ${supplier} too — so ${named} is charged rather than reverse charged.`,
       };
     }
     if (registration.verification.status !== 'verified') {
       return {
         ...base,
+        entries: every('taxable'),
         reason: 'taxable',
         registration_note: `${registration.value} is on file but ${describeVerification(registration.verification.status)}, so the tax has not been shifted onto the customer. Confirm it against the register with POST /v1/customers/${customer.id}/tax_ids/verify and the next invoice is reverse charged.`,
       };
     }
+    // Only the rates that say they shift do. A city rate stacked under a
+    // reverse-charged national one is still charged, and the line says both.
+    const entries: ResolvedRateEntry[] = rates.map((rate) => ({
+      rate, reason: rate.reverse_charge ? 'reverse_charge' : 'taxable',
+    }));
     return {
       ...base,
-      reason: 'reverse_charge',
+      entries,
+      reason: entries.every((entry) => entry.reason === 'reverse_charge') ? 'reverse_charge' : 'taxable',
       registration_note: supplier
-        ? `${registration.value} was confirmed against the ${rate.country} register, and this supply is made from ${supplier} into ${rate.country}.`
-        : `${registration.value} was confirmed against the ${rate.country} register.`,
+        ? `${registration.value} was confirmed against the ${country} register, and this supply is made from ${supplier} into ${country}.`
+        : `${registration.value} was confirmed against the ${country} register.`,
     };
   }
 
@@ -599,13 +747,21 @@ export class TaxRates {
     return recorded;
   }
 
-  /** The most specific active rate for an address: state first, then country. */
-  private rateFor(country: string, state: string | null): TaxRate | null {
-    const rows = this.list({ country, active: true });
-    if (!rows.length) return null;
+  /**
+   * Every active rate an address matches, country-wide first and then the
+   * state's — the order they belong in on a bill.
+   *
+   * This is a list because a supply is in every jurisdiction that has
+   * registered a rate over it at once. A New York invoice owes the state rate
+   * *and* the city rate *and* the transit district's, and the customer owes
+   * their sum. Returning only the most specific one undercharges by all the
+   * others and hides them from the document that has to name them.
+   */
+  private ratesFor(country: string, state: string | null): TaxRate[] {
     const normalised = state?.trim().toLowerCase();
-    const byState = normalised ? rows.find((r) => r.state && r.state.toLowerCase() === normalised) : undefined;
-    return byState ?? rows.find((r) => r.state === null) ?? null;
+    return this.list({ country, active: true, limit: 500 }).filter(
+      (rate) => rate.state === null || (!!normalised && rate.state.toLowerCase() === normalised),
+    );
   }
 
   /* --------------------------------- the maths --------------------------- */
@@ -621,42 +777,73 @@ export class TaxRates {
    * including the zero- and three-decimal ones.
    */
   split(amount: number, behavior: TaxBehavior, currency: string, resolved: ResolvedRate): TaxSplit {
-    const { rate, reason, registration_note: note } = resolved;
-    if (!rate || reason !== 'taxable') {
-      return { base: amount, tax: 0, behavior: rate ? behavior : 'unspecified', reason, rate, note };
+    const { entries, rate, reason, registration_note: note } = resolved;
+    // A line with no rate behind it has no behaviour to honour, which is what
+    // `unspecified` has always meant here.
+    const shape: TaxBehavior = entries.length ? behavior : 'unspecified';
+    const charging = new Set(
+      entries.filter((entry) => entry.reason === 'taxable' && percentToRat(entry.rate.percentage).n !== 0n),
+    );
+    if (!charging.size) {
+      const slices = entries.map((entry) => ({ rate: entry.rate, reason: entry.reason, amount: 0, behavior: shape }));
+      return { base: amount, slices, tax: 0, behavior: shape, reason, rate, note };
     }
-    const pct = percentToRat(rate.percentage);
-    if (pct.n === 0n) return { base: amount, tax: 0, behavior, reason, rate, note };
 
     if (behavior === 'inclusive') {
-      // base = gross x 100/(100 + pct), rounded once; the tax is the remainder,
-      // which is what makes an inclusive line add back up to its listed price.
-      const factor = rat(100n * pct.d, 100n * pct.d + pct.n);
-      const base = ratToMoney(ratMul(rat(BigInt(amount)), factor), currency).amount;
-      return { base, tax: amount - base, behavior, reason, rate, note };
+      // The listed price already contains every one of these taxes at once, so
+      // the divisor is their sum: this rate's share of the gross is
+      // gross x p / (100 + Σp), rounded once, and the base is what is left
+      // after all of them. base + Σtax is the listed price, to the cent.
+      const stacked = [...charging].reduce((total, entry) => ratAdd(total, percentToRat(entry.rate.percentage)), rat(0n));
+      const gross = ratAdd(rat(100n), stacked);
+      const slices = entries.map((entry) => ({
+        rate: entry.rate,
+        reason: entry.reason,
+        behavior,
+        amount: charging.has(entry)
+          ? ratToMoney(ratMul(rat(BigInt(amount)), ratDiv(percentToRat(entry.rate.percentage), gross)), currency).amount
+          : 0,
+      }));
+      const tax = slices.reduce((total, slice) => total + slice.amount, 0);
+      return { base: amount - tax, slices, tax, behavior, reason, rate, note };
     }
-    const tax = ratToMoney(ratMul(rat(BigInt(amount)), rat(pct.n, pct.d * 100n)), currency).amount;
-    return { base: amount, tax, behavior: 'exclusive', reason, rate, note };
+
+    // Exclusive: the line's amount is the base every jurisdiction taxes, and
+    // each of them rounds once against it. Nothing is rounded twice, and no
+    // rate is computed on another rate's tax.
+    const slices = entries.map((entry) => {
+      const pct = percentToRat(entry.rate.percentage);
+      return {
+        rate: entry.rate,
+        reason: entry.reason,
+        behavior: 'exclusive' as const,
+        amount: charging.has(entry)
+          ? ratToMoney(ratMul(rat(BigInt(amount)), rat(pct.n, pct.d * 100n)), currency).amount
+          : 0,
+      };
+    });
+    const tax = slices.reduce((total, slice) => total + slice.amount, 0);
+    return { base: amount, slices, tax, behavior: 'exclusive', reason, rate, note };
   }
 
   /**
-   * The sentence that goes on the line, so the figure explains itself.
+   * The sentence that goes on one rate's slice, so the figure explains itself.
    *
    * The *reason* leads, not the rate: an exempt account is exempt whether or
    * not a rate happens to be registered where it trades, and saying "no rate is
    * registered" about an account with a certificate on file would be the wrong
    * answer to the only question anyone asks about a zero.
    */
-  explain(split: TaxSplit, jurisdictionFallback: string | null): string | null {
-    const label = split.rate
-      ? `${split.rate.display_name} ${formatPercentage(split.rate.percentage)}% (${split.rate.jurisdiction})`
+  explainSlice(slice: TaxSlice, note: string | null, jurisdictionFallback: string | null): string | null {
+    const label = slice.rate
+      ? `${slice.rate.display_name} ${formatPercentage(slice.rate.percentage)}% (${slice.rate.jurisdiction})`
       : null;
-    switch (split.reason) {
+    switch (slice.reason) {
       case 'reverse_charge': {
         const head = label
           ? `${label} is reverse charged — the customer accounts for the tax, so nothing is charged here.`
           : 'This supply is reverse charged — the customer accounts for the tax, so nothing is charged here.';
-        return split.note ? `${head} ${split.note}` : head;
+        return note ? `${head} ${note}` : head;
       }
       case 'exempt':
         return label
@@ -669,12 +856,28 @@ export class TaxRates {
       case 'taxable':
       default: {
         if (!label) return null;
-        const how = split.behavior === 'inclusive'
+        const how = slice.behavior === 'inclusive'
           ? `${label} is included in the price, so it is taken out of the amount rather than added to it.`
           : `${label} is added on top of the amount.`;
-        return split.note ? `${how} ${split.note}` : how;
+        return note ? `${how} ${note}` : how;
       }
     }
+  }
+
+  /**
+   * The line's own sentence: every jurisdiction's, in the order they are
+   * charged. A line in one jurisdiction reads exactly as it always did.
+   */
+  explain(split: TaxSplit, jurisdictionFallback: string | null): string | null {
+    if (!split.slices.length) {
+      return this.explainSlice(
+        { rate: null, reason: split.reason, amount: 0, behavior: split.behavior }, split.note, jurisdictionFallback,
+      );
+    }
+    const said = split.slices
+      .map((slice) => this.explainSlice(slice, split.note, jurisdictionFallback))
+      .filter((sentence): sentence is string => !!sentence);
+    return said.length ? said.join(' ') : null;
   }
 }
 
@@ -695,20 +898,30 @@ export interface TaxSummaryRow {
   explanation: string;
 }
 
-/** Group taxed lines by the rate that produced them, for the invoice payload. */
+/**
+ * Group every line's tax entries by the rate that produced them.
+ *
+ * One row per rate across the whole document, which is what a US bill showing
+ * a state rate, a city rate and a transit district's needs and what the EU
+ * needs for a single reverse-charged VAT line. The key is the rate rather than
+ * the line, so a rate that touched six lines is one row summing all six.
+ */
 export function summariseTax(
-  lines: { tax_rate: string | null; tax_display_name: string | null; tax_jurisdiction: string | null;
+  entries: { tax_rate: string | null; tax_display_name: string | null; tax_jurisdiction: string | null;
     tax_percentage: string | null; tax_type: string | null; tax_reason: TaxReason | null;
-    tax_behavior: TaxBehavior | null; amount: number; tax_amount: number; currency: string }[],
+    tax_behavior: TaxBehavior | null; taxable_amount: number; tax_amount: number; currency: string }[],
 ): TaxSummaryRow[] {
   const groups = new Map<string, TaxSummaryRow>();
-  for (const line of lines) {
+  for (const line of entries) {
     if (!line.tax_rate && !line.tax_percentage) continue;
     const reason = line.tax_reason ?? 'taxable';
-    const key = `${line.tax_rate ?? 'none'}|${reason}|${line.tax_behavior === 'inclusive' ? 'i' : 'e'}`;
+    // A rate that was retired and re-registered, or one snapshotted before ids
+    // were carried, is still identified by what it charged and where.
+    const identity = line.tax_rate ?? `${line.tax_display_name ?? 'Tax'}@${line.tax_percentage}@${line.tax_jurisdiction ?? ''}`;
+    const key = `${identity}|${reason}|${line.tax_behavior === 'inclusive' ? 'i' : 'e'}`;
     const found = groups.get(key);
     if (found) {
-      found.taxable_amount += line.amount;
+      found.taxable_amount += line.taxable_amount;
       found.amount += line.tax_amount;
       continue;
     }
@@ -724,7 +937,7 @@ export function summariseTax(
       tax_type: (line.tax_type as TaxType | null) ?? null,
       reason,
       inclusive: line.tax_behavior === 'inclusive',
-      taxable_amount: line.amount,
+      taxable_amount: line.taxable_amount,
       amount: line.tax_amount,
       currency: line.currency,
       explanation: reason === 'reverse_charge'

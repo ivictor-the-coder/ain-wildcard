@@ -2467,3 +2467,165 @@ describe('the ledger steps obey the same gates as everything else', () => {
     }
   });
 });
+
+/* ---------------- the AI surface is not a way around a role --------------- */
+
+describe('the copilot carries no more authority than its caller', () => {
+  const READONLY: Auth = { kind: 'session', orgId: ORG, userId: 'usr_seed06', role: 'readonly', scopes: ['*'], livemode: true };
+  const ANALYST: Auth = { ...READONLY, role: 'analyst' };
+
+  const company = () => app.ctx.db.get<{ id: string; display_name: string }>(
+    `SELECT id, display_name FROM crm_records WHERE org_id = ? AND object_type = 'company' AND display_name LIKE 'Rheinwerk%'`,
+    ORG)!;
+  const noteCount = () => app.ctx.db.count(
+    `SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'note'`, ORG);
+
+  test('a role refused the write route cannot make the identical write through the copilot', async () => {
+    const target = company();
+    const direct = await call('POST', `/v1/records/company/${target.id}/activities`, {
+      type: 'note', subject: 'Escalation probe', body: 'Written straight at the CRM.',
+    }, READONLY);
+    assert.equal(direct.status, 403, 'the CRM route is the baseline: readonly cannot log an activity');
+
+    const before = noteCount();
+    const through = await call('POST', '/v1/ai/complete', {
+      prompt: `Add a note to ${target.display_name} saying "Written through the copilot."`,
+      allow_writes: true,
+      approvals: ['add_note'],
+    }, READONLY);
+
+    assert.equal(through.status, 403, `the copilot let a readonly session write: ${JSON.stringify(through.body).slice(0, 300)}`);
+    assert.equal(through.body.error.type, 'permission_error');
+    assert.equal(noteCount(), before, 'a note reached the CRM through the copilot');
+  });
+
+  test('the same two fields are gated on a thread turn, not only on /complete', async () => {
+    const thread = await expectOk('POST', '/v1/ai/threads', { title: 'Escalation probe' });
+    const before = noteCount();
+    const turn = await call('POST', `/v1/ai/threads/${thread.id}/messages`, {
+      content: `Add a note to ${company().display_name} saying "Written through a thread."`,
+      allow_writes: true,
+      approvals: ['add_note'],
+    }, READONLY);
+    assert.equal(turn.status, 403, `a thread turn let a readonly session write: ${JSON.stringify(turn.body).slice(0, 300)}`);
+    assert.equal(noteCount(), before);
+  });
+
+  test('an analyst is under the member bar too — the ladder, not one role', async () => {
+    const refused = await call('POST', '/v1/ai/complete', {
+      prompt: 'Add a note anywhere', allow_writes: true,
+    }, ANALYST);
+    assert.equal(refused.status, 403);
+    assert.match(refused.body.error.message, /analyst/);
+  });
+
+  test('reading through the copilot stays open to every role', async () => {
+    const answer = await expectOk('POST', '/v1/ai/complete', { prompt: 'What is our open pipeline by stage?' }, READONLY);
+    assert.equal(answer.object, 'ai_completion');
+    assert.ok(answer.content.length > 0, 'an analyst asking a question is the whole point of the surface');
+    const listed = await expectOk('GET', '/v1/ai/runs?limit=1', undefined, READONLY);
+    assert.equal(listed.object, 'list');
+  });
+
+  test('a member may still authorise a write, exactly as they may approve one', async () => {
+    const target = company();
+    const before = noteCount();
+    const answer = await expectOk('POST', '/v1/ai/complete', {
+      prompt: `Add a note to ${target.display_name} saying "A member asked for this."`,
+      allow_writes: true,
+      approvals: ['add_note'],
+    }, { ...READONLY, role: 'member' });
+    assert.equal(answer.trace.filter((s: { kind: string; name: string }) => s.kind === 'tool' && s.name === 'add_note').length, 1);
+    assert.equal(noteCount(), before + 1);
+  });
+});
+
+/* ------------- the agent surface works for the integration path ----------- */
+
+describe('an API key is a first-class caller of the agent surface', () => {
+  /* The demo workspace's own key, minted in the core module's seed. */
+  const KEY = `sk_test_${'ain_demo_workspace_key_0001'}`;
+  const withKey = (method: string, path: string, body?: unknown) =>
+    app.handle({ method, path, body, headers: { authorization: `Bearer ${KEY}` } });
+
+  test('a write tool called with an API key lands, attributed to whoever made the key', async () => {
+    const target = app.ctx.db.get<{ id: string; display_name: string }>(
+      `SELECT id, display_name FROM crm_records WHERE org_id = ? AND object_type = 'company' AND display_name LIKE 'Rheinwerk%'`,
+      ORG)!;
+    const before = app.ctx.db.count(`SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'note'`, ORG);
+
+    const res = await withKey('POST', '/v1/ai/complete', {
+      prompt: `Add a note to ${target.display_name} saying "Filed by the integration."`,
+      allow_writes: true,
+      approvals: ['add_note'],
+    });
+    assert.ok(res.status < 400, `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
+
+    const step = res.body.trace.find((s: { kind: string; name: string }) => s.kind === 'tool' && s.name === 'add_note');
+    assert.ok(step, `the plan never reached add_note: ${JSON.stringify(res.body.trace).slice(0, 400)}`);
+    assert.equal(step.ok, true, `the write failed for an API key: ${step.error?.message}`);
+    assert.equal(
+      app.ctx.db.count(`SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'note'`, ORG),
+      before + 1,
+      'the note never reached the CRM',
+    );
+
+    // `ak_seed_demo` was created by Dana, and an API key acts as the person who
+    // made it — an owner_id has to be a member of the workspace.
+    const note = app.ctx.db.get<{ display_name: string; owner_id: string | null; created_by: string | null }>(
+      `SELECT display_name, owner_id, created_by FROM crm_records WHERE org_id = ? AND object_type = 'note' ORDER BY created DESC LIMIT 1`, ORG)!;
+    assert.match(note.display_name, /Filed by the integration/);
+    assert.equal(note.owner_id, 'usr_seed01');
+    assert.equal(note.created_by, 'usr_seed01');
+  });
+
+  test('a follow-up whose assignee is no longer a member still lands, unassigned', async () => {
+    const runtime = aiRuntime(app.ctx);
+    const company = app.ctx.db.get<{ id: string }>(
+      `SELECT id FROM crm_records WHERE org_id = ? AND object_type = 'company' LIMIT 1`, ORG)!;
+    const runId = `run_departed_${app.ctx.now()}`;
+    app.ctx.db.insert('ai_runs', {
+      id: runId, org_id: ORG, thread_id: null, feature: 'test', provider: 'builtin', model: ENGINE_MODEL,
+      actor_id: 'usr_seed01', actor_type: 'user', status: 'running', question: 'departed', answer: '',
+      reasoning: '[]', citations: '[]', started: app.ctx.now(),
+    });
+
+    // The approval was prepared months ago for someone who has since left, so
+    // the id is well formed and simply is not a member of this workspace.
+    const execution = await runtime.execute('schedule_followup', {
+      record_id: company.id, in_days: 30, note: 'Reconfirm the acceptance window', assignee_id: 'usr_departed01',
+    }, callContext({ runId, allowWrites: true, approvals: ['schedule_followup'] }));
+    assert.equal(execution.ok, true, `scheduling failed: ${execution.error?.message}`);
+
+    const job = app.ctx.db.get<{ id: string; org_id: string; type: string; payload: string; run_at: number; attempts: number; max_attempts: number; status: string; last_error: string | null; idem_key: string | null; created: number; updated: number }>(
+      `SELECT * FROM jobs WHERE type = 'ai.followup' AND status = 'pending' ORDER BY created DESC LIMIT 1`)!;
+    assert.equal(JSON.parse(job.payload).assigneeId, 'usr_departed01');
+
+    const outcome = await app.ctx.jobs.runOne({ ...job, payload: JSON.parse(job.payload) } as never, app.ctx.now());
+    assert.equal(outcome, 'ok', `the follow-up failed instead of landing: ${app.ctx.db.pluck<string>(`SELECT last_error FROM jobs WHERE id = ?`, job.id)}`);
+
+    const note = app.ctx.db.get<{ owner_id: string | null }>(
+      `SELECT owner_id FROM crm_records WHERE org_id = ? AND object_type = 'note' AND display_name LIKE 'Follow-up: Reconfirm the acceptance window%' ORDER BY created DESC LIMIT 1`,
+      ORG);
+    assert.ok(note, 'the note the operator approved never reached the timeline');
+    assert.equal(note!.owner_id, null, 'an owner who is not a member is no owner at all');
+  });
+
+  test('no run started by a key is ever attributed to the key id', async () => {
+    await withKey('POST', '/v1/ai/complete', { prompt: 'What is our open pipeline by stage?' });
+    const keyed = app.ctx.db.count(
+      `SELECT COUNT(*) FROM ai_runs WHERE org_id = ? AND actor_id LIKE 'ak_%'`, ORG);
+    assert.equal(keyed, 0, 'an API key id is not a person and must never be stored as an actor');
+  });
+
+  test('a key-created thread and its draft resolve the same actor', async () => {
+    const thread = await withKey('POST', '/v1/ai/threads', { title: 'Integration thread' });
+    assert.ok(thread.status < 400, JSON.stringify(thread.body).slice(0, 200));
+    assert.equal(
+      app.ctx.db.pluck<string>(`SELECT created_by FROM ai_threads WHERE id = ?`, thread.body.id),
+      'usr_seed01',
+    );
+    const draft = await withKey('POST', '/v1/ai/draft', { instruction: 'Write a short check-in email' });
+    assert.ok(draft.status < 400, JSON.stringify(draft.body).slice(0, 200));
+  });
+});

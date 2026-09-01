@@ -10,15 +10,16 @@
 import { parseJson } from '../../kernel/db';
 import type { Price, ProrationBehavior, TaxBehavior } from '../catalog/types';
 import {
-  defaultVerificationNote, pendingVerification, summariseTax,
+  combinePercentages, defaultVerificationNote, pendingVerification, summariseTax, TAX_TYPE_LABELS,
   type TaxExemption, type TaxReason, type TaxSummaryRow, type TaxType,
 } from './tax';
 import type {
-  BalanceTransaction, BalanceTransactionType, BilledPeriod, CancellationReason, CollectionMethod,
+  AutomaticTax, AutomaticTaxStatus, BalanceTransaction, BalanceTransactionType, BilledPeriod,
+  CancellationReason, CollectionMethod,
   CreditNote, CreditNoteLine, CreditNoteReason, CreditNoteStatus,
   Customer, Invoice, InvoiceBillingReason, InvoiceLine, InvoiceLineKind, InvoiceLineSource,
-  InvoiceStatus, PaymentBehavior, PendingInvoiceItem, PendingItemStatus, PeriodStatus, Subscription,
-  SubscriptionItem, SubscriptionStatus, TaxId, TaxIdVerification, TrialEndBehavior,
+  InvoiceLineTax, InvoiceStatus, LineTaxAmount, PaymentBehavior, PendingInvoiceItem, PendingItemStatus,
+  PeriodStatus, Subscription, SubscriptionItem, SubscriptionStatus, TaxId, TaxIdVerification, TrialEndBehavior,
 } from './types';
 
 /* ---------------------------------- inputs -------------------------------- */
@@ -127,12 +128,23 @@ export interface CustomerListFilter {
   cursor?: string | null;
 }
 
+/**
+ * How an invoice's tax reads, as something to filter a list by.
+ *
+ * `missing` is the one that matters: it is not "no tax was charged" but "no
+ * country could be resolved, so nothing could be worked out" — the backlog a
+ * finance team has to clear before those bills can be sent.
+ */
+export const INVOICE_TAX_FILTERS = ['missing', 'zero', 'charged'] as const;
+export type InvoiceTaxFilter = (typeof INVOICE_TAX_FILTERS)[number];
+
 export interface InvoiceListFilter {
   customer?: string;
   subscription?: string;
   status?: InvoiceStatus | 'open_like' | 'all';
   billing_reason?: InvoiceBillingReason;
   collection_method?: CollectionMethod;
+  tax?: InvoiceTaxFilter;
   query?: string;
   created_after?: number;
   created_before?: number;
@@ -346,9 +358,103 @@ export function hydratePeriod(row: any): BilledPeriod {
   };
 }
 
+/** A line tax entry as it may sit in the column, from any version of the writer. */
+type StoredLineTax = Partial<Omit<LineTaxAmount, 'object'>>;
+
+/**
+ * Every rate that touched a line, however the row was written.
+ *
+ * Rows raised before tax stacked carry one rate in their own columns and no
+ * list; that rate *is* the list, so an old invoice hydrates into the new shape
+ * and still says exactly what it always said. A row with no tax information at
+ * all — nothing was ever resolved for it — has no entries rather than one empty
+ * one, so nothing summarises a rate that never existed.
+ */
+function hydrateLineTaxes(row: any, amount: number): LineTaxAmount[] {
+  const stored = parseJson<StoredLineTax[]>(row.taxes, []);
+  if (stored.length) {
+    return stored.map((entry) => ({
+      object: 'invoice_line_tax_amount',
+      amount: Number(entry.amount ?? 0),
+      taxable_amount: Number(entry.taxable_amount ?? amount),
+      rate: entry.rate ?? null,
+      display_name: entry.display_name ?? null,
+      jurisdiction: entry.jurisdiction ?? null,
+      percentage: entry.percentage ?? null,
+      tax_type: (entry.tax_type as TaxType | null) ?? null,
+      behavior: (entry.behavior as TaxBehavior | null) ?? null,
+      reason: (entry.reason as TaxReason | null) ?? null,
+      explanation: entry.explanation ?? null,
+    }));
+  }
+  const legacy = row.tax_reason ?? row.tax_rate ?? row.tax_percentage ?? row.tax_explanation;
+  if (legacy === null || legacy === undefined) return [];
+  return [{
+    object: 'invoice_line_tax_amount',
+    amount: Number(row.tax_amount ?? 0),
+    taxable_amount: amount,
+    rate: row.tax_rate ?? null,
+    display_name: row.tax_display_name ?? null,
+    jurisdiction: row.tax_jurisdiction ?? null,
+    percentage: row.tax_percentage ?? null,
+    tax_type: (row.tax_type as TaxType | null) ?? null,
+    behavior: (row.tax_behavior as TaxBehavior | null) ?? null,
+    reason: (row.tax_reason as TaxReason | null) ?? null,
+    explanation: row.tax_explanation ?? null,
+  }];
+}
+
+/**
+ * The line's tax as one figure, derived from the entries rather than stored
+ * beside them — two places holding the same number is how they come to disagree.
+ *
+ * One rate is reported exactly as it was resolved. Several are reported as what
+ * they are together: their amounts summed, their percentages combined into the
+ * one rate a US customer recognises ("8.875%"), and no `rate` id, because no
+ * single rate produced the figure and naming one of the three would be the same
+ * lie this list exists to stop telling.
+ */
+export function rollUpLineTax(taxes: LineTaxAmount[]): InvoiceLineTax {
+  const amount = taxes.reduce((total, entry) => total + entry.amount, 0);
+  if (taxes.length <= 1) {
+    const only = taxes[0];
+    return {
+      amount,
+      rate: only?.rate ?? null,
+      display_name: only?.display_name ?? null,
+      jurisdiction: only?.jurisdiction ?? null,
+      percentage: only?.percentage ?? null,
+      tax_type: only?.tax_type ?? null,
+      behavior: only?.behavior ?? null,
+      reason: only?.reason ?? null,
+      explanation: only?.explanation ?? null,
+    };
+  }
+  const one = <T>(values: (T | null)[]): T | null =>
+    values.every((value) => value === values[0]) ? values[0] : null;
+  const type = one(taxes.map((entry) => entry.tax_type));
+  const reason = one(taxes.map((entry) => entry.reason));
+  const percentages = taxes.map((entry) => entry.percentage).filter((pct): pct is string => !!pct);
+  return {
+    amount,
+    rate: null,
+    display_name: type ? TAX_TYPE_LABELS[type] : 'Tax',
+    jurisdiction: [...new Set(taxes.map((entry) => entry.jurisdiction).filter(Boolean))].join(' + ') || null,
+    percentage: percentages.length ? combinePercentages(percentages) : null,
+    tax_type: type,
+    // A line where one jurisdiction reverse charged and another did not was
+    // still taxed; the entries carry which was which.
+    reason: reason ?? 'taxable',
+    behavior: taxes[0].behavior,
+    explanation: taxes.map((entry) => entry.explanation).filter(Boolean).join(' ') || null,
+  };
+}
+
 export function hydrateInvoiceLine(row: any): InvoiceLine {
   const numerator = row.proration_numerator;
   const denominator = row.proration_denominator;
+  const amount = Number(row.amount);
+  const taxes = hydrateLineTaxes(row, amount);
   return {
     object: 'invoice_line_item',
     id: row.id,
@@ -362,24 +468,15 @@ export function hydrateInvoiceLine(row: any): InvoiceLine {
     description: row.description,
     explanation: row.explanation,
     quantity: Number(row.quantity),
-    amount: Number(row.amount),
+    amount,
     currency: row.currency,
     period: { start: Number(row.period_start), end: Number(row.period_end) },
     proration_fraction: numerator === null || numerator === undefined || denominator === null || denominator === undefined
       ? null
       : { numerator: Number(numerator), denominator: Number(denominator) },
     breakdown: parseJson<InvoiceLine['breakdown']>(row.breakdown, []),
-    tax: {
-      amount: Number(row.tax_amount ?? 0),
-      rate: row.tax_rate ?? null,
-      display_name: row.tax_display_name ?? null,
-      jurisdiction: row.tax_jurisdiction ?? null,
-      percentage: row.tax_percentage ?? null,
-      tax_type: (row.tax_type as TaxType | null) ?? null,
-      behavior: (row.tax_behavior as TaxBehavior | null) ?? null,
-      reason: (row.tax_reason as TaxReason | null) ?? null,
-      explanation: row.tax_explanation ?? null,
-    },
+    taxes,
+    tax: rollUpLineTax(taxes),
     released: asBool(row.released),
   };
 }
@@ -441,21 +538,44 @@ export function hydrateCreditNote(row: any, lines: CreditNoteLine[]): CreditNote
  * differently from the bill it is predicting.
  */
 export function taxSummaryOf(lines: InvoiceLine[]): TaxSummaryRow[] {
-  return summariseTax(lines.map((line) => ({
-    tax_rate: line.tax.rate,
-    tax_display_name: line.tax.display_name,
-    tax_jurisdiction: line.tax.jurisdiction,
-    tax_percentage: line.tax.percentage,
-    tax_type: line.tax.tax_type,
-    tax_reason: line.tax.reason,
-    tax_behavior: line.tax.behavior,
-    amount: line.amount,
-    tax_amount: line.tax.amount,
+  return summariseTax(lines.flatMap((line) => line.taxes.map((entry) => ({
+    tax_rate: entry.rate,
+    tax_display_name: entry.display_name,
+    tax_jurisdiction: entry.jurisdiction,
+    tax_percentage: entry.percentage,
+    tax_type: entry.tax_type,
+    tax_reason: entry.reason,
+    tax_behavior: entry.behavior,
+    taxable_amount: entry.taxable_amount,
+    tax_amount: entry.amount,
     currency: line.currency,
-  })));
+  }))));
 }
 
-export function hydrateInvoice(row: any, lines: InvoiceLine[]): Invoice {
+/**
+ * What the automatic-tax status means, in the words a screen will use.
+ *
+ * The sentence changes with the switch because the consequence does: with the
+ * hold on, a bill Ain could not place is a bill that cannot be sent; with it
+ * off, it is a bill that went out with no tax on it and no way to know whether
+ * that was right.
+ */
+export function describeAutomaticTax(status: AutomaticTaxStatus, enabled: boolean): string {
+  if (status === 'complete') {
+    return 'The tax on this bill was worked out from the country on the customer’s record.';
+  }
+  return enabled
+    ? 'No country could be resolved for this customer, so no tax could be worked out. Put a country on the account and this bill will finalise.'
+    : 'No country could be resolved for this customer, so no tax was worked out. Automatic tax is turned off for this workspace, so the bill was finalised anyway.';
+}
+
+export function hydrateInvoice(row: any, lines: InvoiceLine[], automaticTaxEnabled = true): Invoice {
+  const taxStatus = (row.automatic_tax_status as AutomaticTaxStatus | null) ?? 'complete';
+  const automaticTax: AutomaticTax = {
+    enabled: automaticTaxEnabled,
+    status: taxStatus,
+    detail: describeAutomaticTax(taxStatus, automaticTaxEnabled),
+  };
   return {
     object: 'invoice',
     id: row.id,
@@ -475,6 +595,7 @@ export function hydrateInvoice(row: any, lines: InvoiceLine[]): Invoice {
     subtotal: Number(row.subtotal),
     tax: Number(row.tax ?? 0),
     total_taxes: taxSummaryOf(lines),
+    automatic_tax: automaticTax,
     balance_applied: Number(row.balance_applied),
     total: Number(row.total),
     total_excluding_tax: Number(row.total) - Number(row.tax ?? 0),

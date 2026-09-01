@@ -450,10 +450,78 @@ export class DunningEngine {
   onCollectionSucceeded(orgId: string, invoice: Invoice, intent: PaymentIntent, charge: Charge): void {
     const campaign = this.forInvoice(orgId, invoice.id);
     if (!campaign || campaign.status !== 'recovering') return;
+    // Money arriving is not the same thing as the bill being recovered. A part
+    // payment — a customer paying over the phone what they can manage today, a
+    // debit presented for less than the balance because another was already with
+    // the bank — leaves the rest of the bill where it was, and closing the campaign
+    // here cancels the retry job with it. The difference is then never presented
+    // again by anything: the schedule is gone, the campaign reads "recovered",
+    // and the invoice sits open and owed for ever. Recovery is a fact about the
+    // bill, so the bill decides.
+    if (invoice.amount_due > 0) {
+      this.recordPartialCollection(orgId, campaign, invoice, charge);
+      return;
+    }
     this.recordRecovery(orgId, campaign, {
       attemptNumber: campaign.attempt_count + 1,
       scheduledFor: campaign.next_attempt_at ?? this.ctx.now(),
       intentId: intent.id, chargeId: charge.id, methodId: intent.payment_method, amount: charge.amount,
+    });
+  }
+
+  /**
+   * Part of the bill arrived. Keep chasing the rest.
+   *
+   * The campaign stays open and keeps its attempt count — a customer paying
+   * something must not spend one of the attempts left to collect the remainder —
+   * but two things do have to move: what is at risk, which is now only the
+   * balance, and the schedule itself. The schedule is put back on the queue
+   * rather than assumed to be on it, because the window this payment answers may
+   * already have been spent: `runScheduledAttempt` moves `next_attempt_at` to a
+   * debit's settlement date and deliberately leaves no job behind, on the
+   * understanding that the settlement schedules whatever comes next. This is
+   * that settlement.
+   */
+  private recordPartialCollection(orgId: string, campaign: Dunning, invoice: Invoice, charge: Charge): void {
+    const now = this.ctx.now();
+    const org = this.orgFormat(orgId);
+    const policy = this.policy(orgId);
+    const severity = severityOf(campaign.last_failure_code ?? 'card_declined');
+    const scheduled = campaign.next_attempt_at !== null && campaign.next_attempt_at > now
+      ? campaign.next_attempt_at
+      : this.nextAttemptAt(policy, {
+        invoiceId: campaign.invoice, failedAttempt: Math.max(1, campaign.attempt_count), from: now, severity, now,
+      });
+    // Only what is at risk moves, and it moves to the live balance — the same
+    // figure `open` keeps there. `recovered_amount` stays where it is on purpose:
+    // revenue reads open exposure as `amount_at_risk - recovered_amount`, so
+    // crediting the part payment here as well would subtract it twice and
+    // under-state what the workspace is still chasing by exactly the amount that
+    // came in.
+    this.ctx.db.patch('payments_dunning', 'id', campaign.id, {
+      amount_at_risk: invoice.amount_due,
+      next_attempt_at: scheduled,
+      updated: now,
+    });
+    this.ctx.enqueue(orgId, 'payments.dunning_retry', { dunning: campaign.id }, {
+      runAt: scheduled, idemKey: `payments.dunning_retry:${campaign.id}`,
+    });
+    const after = this.require(orgId, campaign.id);
+    const shown = (amount: number) => formatMoney(money(amount, campaign.currency), { locale: org.locale });
+    this.ctx.emit(orgId, 'dunning.partially_recovered', {
+      campaign: after,
+      invoice: invoice.id,
+      customer: campaign.customer,
+      subscription: campaign.subscription,
+      amount: charge.amount,
+      currency: campaign.currency,
+      charge: charge.id,
+      amount_at_risk: invoice.amount_due,
+      next_attempt_at: scheduled,
+      resolution: `${shown(charge.amount)} of ${shown(campaign.amount_at_risk)} came in against this bill, so ${shown(invoice.amount_due)} is still at risk. Recovery keeps running — attempt ${campaign.attempt_count + 1} of ${campaign.max_attempts} is scheduled for ${formatDate(scheduled, { ...org, withTime: true })} and will present the balance, not the original amount.`,
+    }, {
+      objectId: campaign.id, objectType: 'dunning',
+      previous: { amount_at_risk: campaign.amount_at_risk },
     });
   }
 
@@ -686,6 +754,36 @@ export class DunningEngine {
         this.stopFor(orgId, campaign.invoice, `${blocked} Recovery stopped.`);
         return;
       }
+      // The workspace has already decided this account is not being charged.
+      // `unpaid` and `paused` mean the same thing to this module — bills keep
+      // being raised and nobody presents a card for them — and the automatic
+      // charge when an invoice is finalised honours both. A schedule that was
+      // already running when the decision was made has to honour them too, or
+      // the pause is stood down by every path except the one engine whose whole
+      // job is to keep presenting: the card is charged days after collection was
+      // stopped, by the retry the stop was supposed to cancel.
+      const sub = campaign.subscription ? this.ctx.svc.billing.subscription(orgId, campaign.subscription) : null;
+      if (sub && (sub.status === 'unpaid' || sub.status === 'paused')) {
+        this.stopFor(
+          orgId, campaign.invoice,
+          sub.status === 'paused'
+            ? `Collection on this subscription is paused, so ${invoice.number} is not presented automatically. It stays owed; resume the subscription, or present it by hand with POST /v1/invoices/${invoice.id}/retry.`
+            : `The subscription was marked unpaid, so nothing is charged for it automatically. ${invoice.number} stays owed and is a manual collection from here.`,
+        );
+        return;
+      }
+      // A debit already with the bank is not a reason to present the bill
+      // again, and it is not a reason to give up on it either: it is a reason
+      // to wait. Spending this window would put a second instruction on the
+      // same money; the settlement below is the answer this window was for, and
+      // it schedules whatever comes next when the bank replies.
+      const inFlight = this.payments.gateway.inFlightOn(orgId, invoice.id);
+      if (inFlight.amount >= invoice.amount_due && inFlight.settlesAt) {
+        this.ctx.db.patch('payments_dunning', 'id', campaign.id, {
+          next_attempt_at: inFlight.settlesAt, updated: this.ctx.now(),
+        });
+        return;
+      }
 
       const attemptNumber = campaign.attempt_count + 1;
       const result = this.payments.gateway.collectForDunning(orgId, invoice.id);
@@ -703,6 +801,23 @@ export class DunningEngine {
       }
 
       if (result.collected && result.charge) {
+        // Authorised is not recovered. `onCollectionSucceeded` asks the bill
+        // rather than the charge for exactly this reason, and the scheduled
+        // path — which does its own bookkeeping and so never reaches that
+        // callback — has to ask it too. A window opened while a debit was
+        // already with the bank presents only the balance less what is in
+        // flight, so the card can be authorised in full and the bill still be
+        // owed; closing the campaign here would emit `dunning.recovered` over
+        // an open bill and cancel the retry that was to present the rest.
+        const settled = this.billing.invoices.require(orgId, invoice.id);
+        if (settled.amount_due > 0) {
+          this.recordPartialAttempt(orgId, campaign, settled, {
+            attemptNumber, scheduledFor,
+            intentId: result.intent?.id ?? null, chargeId: result.charge.id,
+            methodId: result.method?.id ?? null, amount: result.charge.amount,
+          });
+          return;
+        }
         this.recordRecovery(orgId, campaign, {
           attemptNumber, scheduledFor,
           intentId: result.intent?.id ?? null, chargeId: result.charge.id,
@@ -724,6 +839,72 @@ export class DunningEngine {
       // cannot run is a recovery step that failed, and pretending otherwise
       // would retry an account with no card on it forever.
       this.recordSkipped(orgId, campaign, attemptNumber, scheduledFor, invoice, result.skipped ?? 'Nothing could be presented.');
+    });
+  }
+
+  /**
+   * A scheduled attempt was authorised and the bill is still owed.
+   *
+   * The mirror of `recordPartialCollection` for money the schedule collected
+   * itself: the window was spent, so the attempt is written and the count moves
+   * on, but the campaign stays open because what decides that is the balance,
+   * not the authorisation. `amount_at_risk` follows the balance down;
+   * `recovered_amount` stays where it is, because the summary counts it only
+   * for a campaign that finished as recovered.
+   */
+  private recordPartialAttempt(
+    orgId: string, campaign: Dunning, invoice: Invoice,
+    input: {
+      attemptNumber: number; scheduledFor: number;
+      intentId: string | null; chargeId: string | null; methodId: string | null; amount: number;
+    },
+  ): void {
+    const now = this.ctx.now();
+    const policy = this.policy(orgId);
+    const org = this.orgFormat(orgId);
+    const shown = (amount: number) => formatMoney(money(amount, campaign.currency), { locale: org.locale });
+    const outOfAttempts = input.attemptNumber >= campaign.max_attempts;
+    const nextAt = outOfAttempts ? null : this.nextAttemptAt(policy, {
+      invoiceId: campaign.invoice, failedAttempt: input.attemptNumber, from: now, severity: 'soft', now,
+    });
+    const decision = nextAt
+      ? `${shown(input.amount)} of ${shown(campaign.amount_at_risk)} was authorised on attempt ${input.attemptNumber}, so ${shown(invoice.amount_due)} is still owed. Attempt ${input.attemptNumber + 1} of ${campaign.max_attempts} is scheduled for ${formatDate(nextAt, { ...org, withTime: true })} and will present the balance, not the original amount.`
+      : `${shown(input.amount)} was authorised on attempt ${input.attemptNumber}, but ${shown(invoice.amount_due)} of ${invoice.number} is still owed and that was the last scheduled window.`;
+    this.ctx.db.patch('payments_dunning', 'id', campaign.id, {
+      attempt_count: input.attemptNumber, last_attempt_at: now, next_attempt_at: nextAt,
+      amount_at_risk: invoice.amount_due, updated: now,
+    });
+    const attempt = this.writeAttempt(orgId, campaign, {
+      attemptNumber: input.attemptNumber, scheduledFor: input.scheduledFor, outcome: 'succeeded',
+      methodId: input.methodId, intentId: input.intentId, chargeId: input.chargeId,
+      amount: input.amount, failure: null, decision, nextAttemptAt: nextAt,
+    });
+    const after = this.require(orgId, campaign.id);
+    this.ctx.emit(orgId, 'dunning.partially_recovered', {
+      campaign: after, attempt,
+      invoice: invoice.id,
+      customer: campaign.customer,
+      subscription: campaign.subscription,
+      amount: input.amount,
+      currency: campaign.currency,
+      charge: input.chargeId,
+      amount_at_risk: invoice.amount_due,
+      next_attempt_at: nextAt,
+      resolution: decision,
+    }, {
+      objectId: campaign.id, objectType: 'dunning',
+      previous: { amount_at_risk: campaign.amount_at_risk },
+    });
+    if (nextAt !== null) {
+      this.ctx.enqueue(orgId, 'payments.dunning_retry', { dunning: campaign.id }, {
+        runAt: nextAt, idemKey: `payments.dunning_retry:${campaign.id}`,
+      });
+      return;
+    }
+    const last = campaign.last_failure_code ?? 'card_declined';
+    this.exhaust(orgId, this.require(orgId, campaign.id), 'attempts_exhausted', {
+      code: last, message: DECLINES[last].message,
+      advice: `${shown(invoice.amount_due)} of ${invoice.number} was never collected: the last window took only part of the bill.`,
     });
   }
 

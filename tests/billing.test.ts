@@ -385,13 +385,12 @@ describe('proration', () => {
   after(() => ws.close());
 
   async function subscribe(items: unknown[], over: Record<string, unknown> = {}): Promise<Subscription> {
-    const customer = await ws.customer('Proration Works', over.customer as Record<string, unknown> | undefined);
+    const customer = await ws.customer('Proration Works');
     return ws.ok('POST', '/v1/subscriptions', {
       customer: customer.id,
       items,
       billing_cycle_anchor: PERIOD_START,
       ...over,
-      customer_over: undefined,
     });
   }
 
@@ -2953,5 +2952,1194 @@ describe('the invoice document', () => {
   test('an invoice that does not exist is a 404, not an empty page', async () => {
     const res = await ws.call('GET', '/v1/invoices/in_doesnotexist000000/render');
     assert.equal(res.status, 404);
+  });
+});
+
+/* ========================================================================== *
+ * 12. A tax location Ain could not resolve
+ * ========================================================================== */
+
+describe('an invoice Ain could not place', () => {
+  let ws: Workspace;
+  let bench: string;
+
+  before(async () => {
+    ws = await workspace(UTC(2026, 9, 1));
+    const growth = await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly');
+    bench = (await ws.ok('POST', '/v1/prices', {
+      product: growth.data[0].product,
+      currency: 'eur',
+      model: 'flat',
+      unit_amount: 10_000,
+      nickname: 'Location bench — €100.00, tax exclusive',
+      lookup_key: 'location_bench',
+      recurring: { interval: 'month' },
+      tax_behavior: 'exclusive',
+    })).id as string;
+  });
+  after(() => ws.close());
+
+  /** The same €100.00 supply, so the only thing that moves is where they are. */
+  const billFor = async (over: Record<string, unknown>): Promise<{ customer: any; invoice: Invoice }> => {
+    const customer = await ws.customer('Location Check', { currency: 'eur', ...over });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: bench }],
+    });
+    const invoices = await allInvoices(ws, `&subscription=${sub.id}`);
+    assert.equal(invoices.length, 1);
+    return { customer, invoice: invoices[0] };
+  };
+
+  test('a zero nobody decided on is not the same answer as a zero somebody did', async () => {
+    await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+
+    const germany = await billFor({ address: { line1: 'Chausseestraße 1', city: 'Berlin', postal_code: '10115', country: 'Germany' } });
+    assert.equal(germany.invoice.tax, 1_900, '19% on a supply into Germany');
+    assert.equal(germany.invoice.total, 11_900);
+    assert.equal(germany.invoice.automatic_tax.enabled, true);
+    assert.equal(germany.invoice.automatic_tax.status, 'complete');
+    assert.equal(germany.invoice.status, 'open', 'a bill Ain could place goes out');
+
+    // A country that is registered nowhere is still a country: the zero is a
+    // decision, the invoice says so, and the bill is sent.
+    const newZealand = await billFor({ address: { line1: '12 Quay Street', city: 'Auckland', country: 'NZ' } });
+    assert.equal(newZealand.invoice.tax, 0);
+    assert.equal(newZealand.invoice.automatic_tax.status, 'complete',
+      'a resolved country with no registered rate is a complete answer');
+    assert.equal(newZealand.invoice.status, 'open');
+    assert.equal(newZealand.invoice.lines[0].tax.reason, 'no_rate');
+
+    // The three that are not an answer at all. Each used to bill at zero, go
+    // out, and look exactly like the New Zealand bill above.
+    const unplaceable = [
+      { label: 'no address at all', over: {} },
+      { label: 'an address with no country', over: { address: { line1: '1 Nowhere Street', city: 'Nowhere' } } },
+      { label: 'a country that is not a country', over: { address: { line1: '1 Nowhere Street', city: 'Nowhere', country: 'ZZ' } } },
+    ];
+    const held: { customer: any; invoice: Invoice }[] = [];
+    for (const { label, over } of unplaceable) {
+      const bill = await billFor(over);
+      held.push(bill);
+      assert.equal(bill.invoice.tax, 0, label);
+      assert.equal(bill.invoice.automatic_tax.status, 'requires_location_inputs', label);
+      assert.equal(bill.invoice.status, 'draft', `${label}: the bill is held, not sent`);
+      assert.match(bill.invoice.automatic_tax.detail, /country/i, label);
+      const error = await ws.fail('POST', `/v1/invoices/${bill.invoice.id}/finalize`, {}, 400, 'customer_tax_location_invalid');
+      assert.equal(error.param, 'customer', label);
+      assert.match(error.message, /no country/i, label);
+      const after: Invoice = await ws.ok('GET', `/v1/invoices/${bill.invoice.id}`);
+      assert.equal(after.status, 'draft', `${label}: a refused finalise leaves it a draft`);
+    }
+
+    // They are findable as a queue rather than as three bills someone has to
+    // notice, and the overview counts them.
+    const missing = await ws.ok('GET', '/v1/invoices?tax=missing&limit=200');
+    assert.deepEqual(
+      (missing.data as Invoice[]).map((invoice) => invoice.id).sort(),
+      held.map((bill) => bill.invoice.id).sort(),
+      'tax=missing is exactly the bills with no resolvable location',
+    );
+    const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+    assert.equal(overview.untaxed_invoices.missing_tax_location, 3);
+    assert.equal(overview.untaxed_invoices.held_in_draft, 3);
+    assert.ok(overview.untaxed_invoices.count >= 4, 'the New Zealand bill is untaxed too, and deliberately so');
+    assert.match(overview.untaxed_invoices.detail, /tax=missing/);
+
+    // And putting the country on the account releases the bill — but only by
+    // pricing it again. Letting the held draft through as it stood would swap
+    // "we do not know" for a bill that says 0% and means it, which is the same
+    // under-charge one step further along.
+    const first = held[0];
+    assert.equal(first.invoice.tax, 0);
+    await ws.ok('PATCH', `/v1/customers/${first.customer.id}`, {
+      address: { line1: 'Chausseestraße 1', city: 'Berlin', postal_code: '10115', country: 'Germany' },
+    });
+    const released: Invoice = await ws.ok('POST', `/v1/invoices/${first.invoice.id}/finalize`);
+    assert.equal(released.status, 'open');
+    assert.equal(released.automatic_tax.status, 'complete', 'the location is asked again, not trusted from the draft');
+    assert.equal(released.tax, 1_900, 'and the German VAT it never had is on it now');
+    assert.equal(released.subtotal, 10_000);
+    assert.equal(released.total, 11_900);
+    assert.equal(released.lines[0].tax.reason, 'taxable');
+    assert.equal(released.lines[0].tax.percentage, '19');
+    assert.equal(sumTax(released), released.tax);
+    assert.equal(released.total_taxes.reduce((total, row) => total + row.amount, 0), released.tax);
+    assert.equal((await ws.ok('GET', `/v1/customers/${first.customer.id}`)).balance, 0,
+      'nothing was routed around the invoice while it was priced again');
+    assert.equal((await ws.ok('GET', '/v1/invoices?tax=missing&limit=200')).data.length, 2);
+  });
+
+  test('a held bill priced again spends the account credit the new tax needs', async () => {
+    await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+    const customer = await ws.customer('Held With Credit', { currency: 'eur' });
+    // Enough to cover the €100.00 supply but not the VAT that is coming.
+    await ws.ok('POST', `/v1/customers/${customer.id}/balance_transactions`, {
+      amount: -10_500, description: 'Prepayment agreed with finance before the address was on file.',
+    });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: bench }],
+    });
+    const draft = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    assert.equal(draft.status, 'draft');
+    assert.equal(draft.balance_applied, -10_000, 'the credit covered the untaxed bill in full');
+    assert.equal(draft.total, 0);
+
+    await ws.ok('PATCH', `/v1/customers/${customer.id}`, {
+      address: { line1: 'Chausseestraße 1', city: 'Berlin', postal_code: '10115', country: 'Germany' },
+    });
+    const open: Invoice = await ws.ok('POST', `/v1/invoices/${draft.id}/finalize`);
+    assert.equal(open.subtotal, 10_000);
+    assert.equal(open.tax, 1_900);
+    assert.equal(open.balance_applied, -10_500, 'the whole of the credit is spent, VAT included');
+    assert.equal(open.total, 1_400, 'and the customer owes what the credit could not cover');
+    assert.equal(open.amount_due, 1_400);
+    assert.equal(open.subtotal + open.tax + open.balance_applied, open.total);
+    assert.equal(open.ending_balance, open.starting_balance - open.balance_applied);
+    assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0,
+      'the ledger moved by exactly what the re-pricing changed');
+  });
+
+  test('recording a payment does not walk a held bill past the hold', async () => {
+    await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+    const { invoice } = await billFor({});
+    assert.equal(invoice.status, 'draft');
+    // The sibling call. Refusing to finalise but agreeing to mark it paid
+    // would leave an untaxed bill settled, which is the same hole one door
+    // along.
+    const error = await ws.fail('POST', `/v1/invoices/${invoice.id}/pay`, {}, 400, 'customer_tax_location_invalid');
+    assert.match(error.message, /never sent/);
+    const after: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(after.status, 'draft');
+    assert.equal(after.amount_paid, 0);
+  });
+
+  test('a workspace that opts out is still told, it is just not held up', async () => {
+    const off = await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: false });
+    assert.equal(off.enabled, false);
+    assert.match(off.detail, /finalise with no tax/);
+
+    const bill = await billFor({});
+    assert.equal(bill.invoice.status, 'open', 'opted out, the bill goes out');
+    assert.equal(bill.invoice.automatic_tax.enabled, false);
+    assert.equal(bill.invoice.automatic_tax.status, 'requires_location_inputs',
+      'the status is still computed — turning the hold off does not turn the question off');
+    assert.match(bill.invoice.automatic_tax.detail, /turned off/);
+
+    const missing = await ws.ok('GET', '/v1/invoices?tax=missing&limit=200');
+    assert.ok((missing.data as Invoice[]).some((invoice) => invoice.id === bill.invoice.id),
+      'and it is still in the queue a finance team works down');
+
+    await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+    await ws.fail('POST', `/v1/invoices/${(await billFor({})).invoice.id}/finalize`, {}, 400, 'customer_tax_location_invalid');
+  });
+});
+
+/* ========================================================================== *
+ * 13. Jurisdictions that stack
+ * ========================================================================== */
+
+describe('jurisdictions that stack', () => {
+  /** A workspace with New York registered the way New York actually is. */
+  async function newYork(behavior: 'exclusive' | 'inclusive' = 'exclusive') {
+    const ws = await workspace(UTC(2026, 9, 1));
+    // The seed already holds NY State at 4%. A supply into Manhattan is also in
+    // the city and in the transit district, and owes all three.
+    await ws.ok('POST', '/v1/tax_rates', {
+      display_name: 'NYC sales tax', jurisdiction: 'New York City', country: 'US', state: 'New York',
+      tax_type: 'sales_tax', percentage: '4.5',
+    });
+    await ws.ok('POST', '/v1/tax_rates', {
+      display_name: 'MCTD surcharge', jurisdiction: 'MCTD', country: 'US', state: 'New York',
+      tax_type: 'sales_tax', percentage: '0.375',
+    });
+    const growth = await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly');
+    const price = (await ws.ok('POST', '/v1/prices', {
+      product: growth.data[0].product, currency: 'usd', model: 'flat', unit_amount: 10_000,
+      nickname: `Broadway bench — tax ${behavior}`, lookup_key: `broadway_${behavior}`,
+      recurring: { interval: 'month' }, tax_behavior: behavior,
+    })).id as string;
+    const customer = await ws.customer('Broadway Controls', {
+      address: { line1: '1 Broadway', city: 'New York', state: 'New York', postal_code: '10004', country: 'United States' },
+    });
+    return { ws, price, customer };
+  }
+
+  const billOnce = async (ws: Workspace, customerId: string, price: string): Promise<Invoice> => {
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: customerId, items: [{ price }] });
+    const invoices = await allInvoices(ws, `&subscription=${sub.id}`);
+    assert.equal(invoices.length, 1);
+    return invoices[0];
+  };
+
+  test('a New York bill charges the state, the city and the transit district, and names all three', async () => {
+    const { ws, price, customer } = await newYork();
+    try {
+      const invoice = await billOnce(ws, customer.id, price);
+
+      assert.equal(invoice.subtotal, 10_000);
+      // 4% + 4.5% + 0.375%. Most-specific-wins used to charge 400 and call the
+      // other two jurisdictions nothing.
+      assert.equal(invoice.tax, 888, '400 + 450 + 38, each rounded once against the same base');
+      assert.equal(invoice.total, 10_888);
+
+      const [line] = invoice.lines;
+      assert.equal(line.taxes.length, 3, 'one entry per jurisdiction, not one winner');
+      assert.deepEqual(
+        line.taxes.map((entry) => [entry.jurisdiction, entry.percentage, entry.amount]),
+        [['New York', '4', 400], ['New York City', '4.5', 450], ['MCTD', '0.375', 38]],
+      );
+      assert.ok(line.taxes.every((entry) => entry.taxable_amount === 10_000),
+        'every jurisdiction taxes the same base — none is charged on another one’s tax');
+      assert.equal(line.taxes.reduce((total, entry) => total + entry.amount, 0), line.tax.amount);
+
+      // The roll-up is honest about being a roll-up: no single rate produced
+      // it, and 8.875% is the combined rate a New Yorker recognises.
+      assert.equal(line.tax.amount, 888);
+      assert.equal(line.tax.rate, null, 'naming one of the three would be the lie the list exists to stop');
+      assert.equal(line.tax.percentage, '8.875');
+      assert.equal(line.tax.display_name, 'Sales tax');
+      assert.equal(line.tax.jurisdiction, 'New York + New York City + MCTD');
+
+      // And the document groups them by rate, one row each.
+      assert.equal(invoice.total_taxes.length, 3);
+      assert.deepEqual(
+        invoice.total_taxes.map((row) => [row.jurisdiction, row.percentage, row.taxable_amount, row.amount]),
+        [['New York', '4', 10_000, 400], ['New York City', '4.5', 10_000, 450], ['MCTD', '0.375', 10_000, 38]],
+      );
+      assert.equal(invoice.total_taxes.reduce((total, row) => total + row.amount, 0), invoice.tax);
+
+      const document = String(await ws.ok('GET', `/v1/invoices/${invoice.id}/render`));
+      for (const named of ['New York City', 'MCTD', '4.5%', '0.375%', 'Combined 8.875%']) {
+        assert.ok(document.includes(named), `the printed bill names ${named}`);
+      }
+    } finally {
+      ws.close();
+    }
+  });
+
+  test('an inclusive price contains all three, and still adds back up to the listed price', async () => {
+    const { ws, price, customer } = await newYork('inclusive');
+    try {
+      const invoice = await billOnce(ws, customer.id, price);
+      const [line] = invoice.lines;
+
+      // 10,000 x p / 108.875 for each rate, rounded once each; the base is what
+      // is left after all of them, so the customer pays exactly $100.00.
+      assert.deepEqual(line.taxes.map((entry) => entry.amount), [367, 413, 34]);
+      assert.equal(invoice.tax, 814);
+      assert.equal(invoice.subtotal, 9_186);
+      assert.equal(invoice.subtotal + invoice.tax, 10_000, 'base plus every jurisdiction is the listed price, to the cent');
+      assert.equal(invoice.total, 10_000, 'an inclusive price never changes what is charged');
+      assert.ok(line.taxes.every((entry) => entry.behavior === 'inclusive'));
+      assert.equal(invoice.total_taxes.length, 3);
+      assert.ok(invoice.total_taxes.every((row) => row.inclusive));
+    } finally {
+      ws.close();
+    }
+  });
+
+  test('a country-wide rate stacks under a state one rather than losing to it', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      // A federal levy registered over the whole country, and Ohio's own 5.75%
+      // from the seed. The address is in both jurisdictions and owes both.
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'US federal levy', jurisdiction: 'United States', country: 'US',
+        tax_type: 'sales_tax', percentage: '2',
+      });
+      const growth = await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly');
+      const price = (await ws.ok('POST', '/v1/prices', {
+        product: growth.data[0].product, currency: 'usd', model: 'flat', unit_amount: 10_000,
+        nickname: 'Cleveland bench', lookup_key: 'cleveland_bench', recurring: { interval: 'month' },
+        tax_behavior: 'exclusive',
+      })).id as string;
+      const customer = await ws.customer('Cuyahoga Automation', {
+        address: { line1: '1200 Superior Avenue East', city: 'Cleveland', state: 'Ohio', postal_code: '44114', country: 'United States' },
+      });
+      const invoice = await billOnce(ws, customer.id, price);
+
+      assert.equal(invoice.lines[0].taxes.length, 2);
+      assert.deepEqual(
+        invoice.lines[0].taxes.map((entry) => [entry.jurisdiction, entry.percentage, entry.amount]),
+        [['United States', '2', 200], ['Ohio', '5.75', 575]],
+      );
+      assert.equal(invoice.tax, 775, '2% + 5.75%, not whichever of the two is more specific');
+
+      // An address outside Ohio is still in the country-wide jurisdiction.
+      const elsewhere = await ws.customer('Boise Fabrication', {
+        address: { line1: '900 Main Street', city: 'Boise', state: 'Idaho', country: 'United States' },
+      });
+      const only = await billOnce(ws, elsewhere.id, price);
+      assert.equal(only.lines[0].taxes.length, 1);
+      assert.equal(only.tax, 200);
+      assert.equal(only.lines[0].tax.percentage, '2', 'one rate still reads as one rate');
+      assert.equal(only.lines[0].tax.rate, only.lines[0].taxes[0].rate);
+    } finally {
+      ws.close();
+    }
+  });
+
+  test('the same jurisdiction is still refused twice, and a different one is not', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'NYC sales tax', jurisdiction: 'New York City', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '4.5',
+      });
+      // A second New York City rate would charge the city twice.
+      await ws.fail('POST', '/v1/tax_rates', {
+        display_name: 'NYC sales tax (2027)', jurisdiction: 'New York City', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '4.75',
+      }, 409, 'tax_rate_exists');
+      // A different jurisdiction over the same address is a stack, not a clash.
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'MCTD surcharge', jurisdiction: 'MCTD', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '0.375',
+      });
+      const rates = await ws.ok('GET', '/v1/tax_rates?country=US&active=true&limit=500');
+      const newYork = (rates.data as { state: string | null; jurisdiction: string }[])
+        .filter((rate) => rate.state === 'New York');
+      assert.deepEqual(newYork.map((rate) => rate.jurisdiction).sort(), ['MCTD', 'New York', 'New York City']);
+    } finally {
+      ws.close();
+    }
+  });
+
+  test('a credit and a credit note reverse every jurisdiction, not just the largest', async () => {
+    const { ws, price, customer } = await newYork();
+    try {
+      const invoice = await billOnce(ws, customer.id, price);
+      assert.equal(invoice.tax, 888);
+
+      // The sign-flipped path: a mid-cycle downgrade credits back what it
+      // charged, jurisdiction by jurisdiction.
+      const sub: Subscription = (await ws.ok('GET', `/v1/subscriptions?customer=${customer.id}`)).data[0];
+      const cheaper = (await ws.ok('POST', '/v1/prices', {
+        product: (await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly')).data[0].product,
+        currency: 'usd', model: 'flat', unit_amount: 4_000, nickname: 'Broadway bench — smaller',
+        lookup_key: 'broadway_smaller', recurring: { interval: 'month' }, tax_behavior: 'exclusive',
+      })).id as string;
+      await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+        items: [{ id: sub.items[0].id, price: cheaper }], proration_date: midpointOf(sub),
+        proration_behavior: 'always_invoice',
+      });
+      const change = (await allInvoices(ws, `&subscription=${sub.id}`))
+        .find((bill) => bill.billing_reason === 'subscription_update');
+      assert.ok(change);
+      const unused = change.lines.find((line) => line.kind === 'unused_time');
+      assert.ok(unused);
+      assert.ok(unused.amount < 0);
+      assert.equal(unused.taxes.length, 3, 'a credit line is taxed by every jurisdiction that charged it');
+      assert.ok(unused.taxes.every((entry) => entry.amount <= 0), 'and every one of them is a credit');
+      assert.equal(unused.taxes.reduce((total, entry) => total + entry.amount, 0), unused.tax.amount);
+      assert.equal(sumTax(change), change.tax);
+      assert.equal(change.total_taxes.reduce((total, row) => total + row.amount, 0), change.tax);
+
+      // The sibling call: crediting the original bill in full reverses exactly
+      // the 888 it charged, and no more.
+      const note = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: invoice.total });
+      assert.equal(note.subtotal, invoice.subtotal);
+      assert.equal(note.tax, invoice.tax, 'every jurisdiction comes back, not the one the roll-up names');
+      assert.equal(note.total, invoice.total);
+      assert.equal(note.lines[0].tax_percentage, '8.875');
+    } finally {
+      ws.close();
+    }
+  });
+});
+
+/* ========================================================================== *
+ * 14. The overview reads the whole book
+ * ========================================================================== */
+
+describe('the subscription overview', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 9, 1)); });
+  after(() => ws.close());
+
+  /** Every subscription in the workspace, with the MRR the API puts on it. */
+  const everySubscription = async (): Promise<{ id: string; currency: string; mrr: number }[]> => {
+    const out: { id: string; currency: string; mrr: number }[] = [];
+    let cursor: string | null = null;
+    do {
+      const page = await ws.ok('GET', `/v1/subscriptions?status=all&limit=200${cursor ? `&cursor=${cursor}` : ''}`);
+      out.push(...(page.data as { id: string; currency: string; mrr: number }[]));
+      cursor = page.has_more ? (page.next_cursor as string) : null;
+    } while (cursor);
+    return out;
+  };
+
+  test('MRR is the whole book, not the first page of it', async () => {
+    const starter = await priceIdOf(ws, 'starter_monthly');
+    // Past 200, which is where a single page stopped and the number went on
+    // being reported as though it were the total.
+    const before = (await ws.ok('GET', '/v1/subscriptions?status=all&limit=1')).total_count as number;
+    for (let i = before; i < 215; i += 1) {
+      const customer = await ws.customer('Page Two Machining');
+      await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price: starter }] });
+    }
+
+    const all = await everySubscription();
+    assert.ok(all.length > 200, `the book has to reach past one page to prove anything, got ${all.length}`);
+    const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+    assert.equal(overview.subscriptions, all.length, 'the overview counted every subscription');
+    assert.equal(
+      overview.mrr, all.reduce((total, sub) => total + sub.mrr, 0),
+      'and its MRR is every subscription’s, not the first two hundred',
+    );
+    assert.equal(overview.arr, overview.mrr * 12);
+  });
+
+  test('a book in three currencies is never added up and labelled in one', async () => {
+    const growth = await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly');
+    const yen = (await ws.ok('POST', '/v1/prices', {
+      product: growth.data[0].product, currency: 'jpy', model: 'flat', unit_amount: 98_000,
+      nickname: 'Kanto plan — ¥98,000', lookup_key: 'kanto_monthly', recurring: { interval: 'month' },
+    })).id as string;
+
+      const dollarsBefore = ((await ws.ok('GET', '/v1/subscriptions/overview')).by_currency as { currency: string; mrr: number }[])
+      .find((row) => row.currency === 'usd');
+    assert.ok(dollarsBefore, 'the demo book bills in dollars');
+
+    const customer = await ws.customer('Kanto Seimitsu', { currency: 'jpy' });
+    await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price: yen }] });
+
+    const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+    const byCurrency = overview.by_currency as { currency: string; mrr: number; mrr_display: string; live: number }[];
+    const yenRow = byCurrency.find((row) => row.currency === 'jpy');
+    assert.ok(yenRow, 'the yen subscription has a bucket of its own');
+    assert.equal(yenRow.mrr, 98_000);
+    assert.equal(yenRow.mrr_display, '¥98,000');
+    assert.equal(
+      byCurrency.find((row) => row.currency === 'usd')?.mrr, dollarsBefore.mrr,
+      'and the dollar book did not move by ¥98,000',
+    );
+
+    assert.equal(overview.mixed_currency, true);
+    assert.equal(overview.mrr_display, null, 'a mixed sum never gets a currency symbol in front of it');
+    assert.ok(String(overview.mrr_note).includes('by_currency'), 'and it says where the real figures are');
+    assert.deepEqual([...overview.currencies].sort(), byCurrency.map((row) => row.currency).sort());
+    assert.equal(
+      byCurrency.reduce((total, row) => total + row.mrr, 0), overview.mrr,
+      'nothing is lost: the buckets are the same minor units the total holds',
+    );
+  });
+});
+
+/* ========================================================================== *
+ * 15. Request bodies that are not honoured
+ * ========================================================================== */
+
+describe('what billing refuses to accept', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 9, 1)); });
+  after(() => ws.close());
+
+  test('a subscription field billing does not read is refused, not answered 201', async () => {
+    const customer = await ws.customer('Strict Bodies');
+    // The two Stripe names this API does not use. Both used to be accepted,
+    // honoured by nothing, and the caller found out a month later.
+    const error = await ws.fail('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }],
+      start_date: UTC(2026, 8, 1),
+      trial_days: 14,
+    }, 400, 'parameter_invalid');
+    assert.equal(error.param, 'start_date');
+    assert.match(error.message, /unknown parameter/i);
+    assert.deepEqual(error.detail.unknown, ['start_date', 'trial_days'], 'every one of them is named, not just the first');
+
+    // And the names this API does read still work, so the refusal is a
+    // spelling correction rather than a wall.
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], trial_period_days: 14,
+    });
+    assert.equal(sub.status, 'trialing');
+    assert.equal(sub.trial_end, ws.now() + 14 * DAY);
+  });
+
+  test('the same rule holds on every billing write, nested keys included', async () => {
+    const customer = await ws.customer('Strict Everywhere');
+    await ws.fail('POST', '/v1/customers', { name: 'Typo Ltd', tax_id: 'DE811907980' }, 400, 'parameter_invalid');
+    const nested = await ws.fail('PATCH', `/v1/customers/${customer.id}`,
+      { address: { line1: '1 Somewhere', zip: '10115' } }, 400, 'parameter_invalid');
+    assert.equal(nested.param, 'address.zip', 'the path names the key that was not read');
+    await ws.fail('POST', '/v1/tax_rates', {
+      display_name: 'VAT', jurisdiction: 'Norway', country: 'NO', percentage: '25', inclusive: true,
+    }, 400, 'parameter_invalid');
+    await ws.fail('POST', `/v1/subscriptions/${(await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'starter_monthly' }],
+    })).id}/cancel`, { at_period_end: true, invoice_now: true }, 400, 'parameter_invalid');
+  });
+});
+
+/* ========================================================================== *
+ * 16. The blast radius of stacked tax: the document, the ledger and the book
+ * ========================================================================== */
+
+describe('one jurisdiction, charged two ways', () => {
+  /**
+   * A bill can carry the same rate twice — once taken out of an inclusive
+   * price, once added to an exclusive one — and the tax summary keys on the
+   * behaviour, so it holds two rows for one jurisdiction. Reading "two rows" as
+   * "two jurisdictions" is how a 4% state comes to be printed as 8%.
+   */
+  async function newYorkBill(): Promise<{ ws: Workspace; invoice: Invoice }> {
+    const ws = await workspace(UTC(2026, 9, 1));
+    const growth = await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly');
+    const product = growth.data[0].product as string;
+    const make = async (behavior: 'inclusive' | 'exclusive', amount: number) => (await ws.ok('POST', '/v1/prices', {
+      product, currency: 'usd', model: 'flat', unit_amount: amount,
+      nickname: `Hudson bench — tax ${behavior}`, lookup_key: `hudson_${behavior}`,
+      recurring: { interval: 'month' }, tax_behavior: behavior,
+    })).id as string;
+    const customer = await ws.customer('Hudson Yards Robotics', {
+      address: { line1: '20 Hudson Yards', city: 'New York', state: 'New York', postal_code: '10001', country: 'United States' },
+    });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: await make('exclusive', 10_000) }, { price: await make('inclusive', 10_400) }],
+    });
+    const invoices = await allInvoices(ws, `&subscription=${sub.id}`);
+    assert.equal(invoices.length, 1);
+    return { ws, invoice: invoices[0] };
+  }
+
+  test('the summary holds two rows for the one rate, and the document must not add them up', async () => {
+    const { ws, invoice } = await newYorkBill();
+    try {
+      // One jurisdiction, one rate id, two behaviours — so two summary rows.
+      assert.equal(invoice.total_taxes.length, 2, 'the summary splits a rate by how it was charged');
+      assert.equal(new Set(invoice.total_taxes.map((row) => row.tax_rate)).size, 1,
+        'both rows are the same registered rate');
+      assert.deepEqual(invoice.total_taxes.map((row) => row.percentage), ['4', '4']);
+
+      const document: string = await ws.ok('GET', `/v1/invoices/${invoice.id}/render`);
+      const combined = document.match(/Combined [^<%]*%/);
+      assert.equal(combined, null,
+        `New York charges 4%, so the bill may not state a combined rate at all — it printed "${combined?.[0]}"`);
+      assert.match(document, /4%/, 'the rate it does charge is still named');
+    } finally { ws.close(); }
+  });
+
+  test('a bill that really is in three jurisdictions still states what they come to', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'NYC sales tax', jurisdiction: 'New York City', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '4.5',
+      });
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'MCTD surcharge', jurisdiction: 'MCTD', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '0.375',
+      });
+      const customer = await ws.customer('Broadway Controls', {
+        address: { line1: '1 Broadway', city: 'New York', state: 'New York', postal_code: '10004', country: 'United States' },
+      });
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: await priceIdOf(ws, 'growth_monthly') }],
+      });
+      const [invoice] = await allInvoices(ws, `&subscription=${sub.id}`);
+      const document: string = await ws.ok('GET', `/v1/invoices/${invoice.id}/render`);
+      assert.match(document, /Combined 8\.875%/, 'three real jurisdictions still add up on the bill');
+    } finally { ws.close(); }
+  });
+});
+
+describe('a held bill priced again once the country is known', () => {
+  test('the account credit it draws is the credit the account still holds', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+      const growth = await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly');
+      const price = (await ws.ok('POST', '/v1/prices', {
+        product: growth.data[0].product, currency: 'usd', model: 'flat', unit_amount: 45_900,
+        nickname: 'Held bench', lookup_key: 'held_bench', recurring: { interval: 'month' }, tax_behavior: 'exclusive',
+      })).id as string;
+
+      // No address, so neither bill can be placed and both are held as drafts.
+      const customer = await ws.customer('Unplaced Automation');
+      await ws.ok('POST', `/v1/customers/${customer.id}/balance_transactions`, {
+        amount: -60_000, description: 'Goodwill credit agreed during the pilot',
+      });
+      await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price }] });
+      await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price }] });
+      const held = (await allInvoices(ws, `&customer=${customer.id}&status=draft`)).slice().reverse();
+      assert.equal(held.length, 2, 'both bills are held for want of a country');
+      assert.ok(held.every((invoice) => invoice.tax === 0));
+
+      await ws.ok('PATCH', `/v1/customers/${customer.id}`, {
+        address: { line1: '1 Broadway', city: 'New York', state: 'New York', postal_code: '10004', country: 'United States' },
+      });
+      for (const invoice of held) await ws.ok('POST', `/v1/invoices/${invoice.id}/finalize`, {});
+
+      const after = await allInvoices(ws, `&customer=${customer.id}&status=all`);
+      const account = await ws.ok('GET', `/v1/customers/${customer.id}`);
+      const applied = after.reduce((total, invoice) => total + invoice.balance_applied, 0);
+      assert.ok(applied >= -60_000,
+        `only 60,000 minor units of credit were ever granted, so the bills cannot draw ${-applied} of it`);
+
+      // Every bill states where it left the account. The last one to draw on it
+      // has to agree with the account itself, or the statement is fiction.
+      const drawnLast = after.filter((invoice) => invoice.balance_applied !== 0)
+        .sort((a, b) => a.created - b.created || a.sequence - b.sequence)
+        .pop() as Invoice;
+      assert.equal(account.balance, drawnLast.ending_balance,
+        'the bill that last drew on the account says where it left it');
+      assert.ok(account.balance <= 0, 'a credit that was never spent cannot become a debt');
+    } finally { ws.close(); }
+  });
+});
+
+describe('the invoice money on the overview', () => {
+  test('is bucketed by the currency it was billed in', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+      const invoices = overview.invoices as {
+        billed: number; collected: number; outstanding: number; written_off: number;
+        by_currency?: { currency: string; billed: number; collected: number; outstanding: number; written_off: number }[];
+      };
+      assert.ok(invoices.by_currency, 'a book billed in three currencies publishes three buckets, not one sum');
+      const buckets = invoices.by_currency as NonNullable<typeof invoices.by_currency>;
+      assert.deepEqual(buckets.map((row) => row.currency), ['eur', 'gbp', 'usd']);
+
+      for (const key of ['billed', 'collected', 'outstanding', 'written_off'] as const) {
+        assert.equal(
+          buckets.reduce((total, row) => total + row[key], 0), invoices[key],
+          `nothing is lost: the ${key} buckets are the same minor units the total holds`,
+        );
+      }
+
+      // And each bucket is the real figure for that currency, checked against
+      // the ledger rather than against itself.
+      const every = await allInvoices(ws, '&status=all');
+      for (const bucket of buckets) {
+        const mine = every.filter((invoice) => invoice.currency === bucket.currency);
+        assert.equal(
+          bucket.billed,
+          mine.filter((i) => ['open', 'paid', 'uncollectible'].includes(i.status)).reduce((t, i) => t + i.total, 0),
+          `${bucket.currency} billed`,
+        );
+        assert.equal(bucket.collected, mine.reduce((t, i) => t + i.amount_paid, 0), `${bucket.currency} collected`);
+      }
+    } finally { ws.close(); }
+  });
+});
+
+describe('the next invoice on the customer summary', () => {
+  test('carries the tax the bill it predicts will charge', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      const customer = await ws.customer('Hudson Yards Robotics', {
+        address: { line1: '20 Hudson Yards', city: 'New York', state: 'New York', postal_code: '10001', country: 'United States' },
+      });
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: await priceIdOf(ws, 'growth_monthly') }],
+      });
+
+      const predicted = await ws.ok('POST', '/v1/invoices/create_preview', { subscription: sub.id });
+      assert.equal(predicted.tax, 1_996, 'New York charges 4% on $499.00');
+      assert.equal(predicted.total, 51_896);
+
+      const summary = await ws.ok('GET', `/v1/customers/${customer.id}/summary`);
+      assert.equal(summary.next_invoice.tax, predicted.tax,
+        'the support screen and the document have to predict the same bill');
+      assert.equal(summary.next_invoice.estimated_total, predicted.total,
+        'an estimate that leaves the tax out is short by exactly the tax');
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 19. The third door out of a held draft
+ * ========================================================================== */
+
+describe('writing off a bill Ain could not place', () => {
+  /**
+   * `finalize` and `pay` both refuse a draft raised for an account with no
+   * resolvable country, because a zero there means "we never learned where
+   * they are" rather than "nothing is due". `mark_uncollectible` is the third
+   * way out of `draft`, and it *finalises* the bill on its way: it stamps
+   * `finalized_at`, moves it to `uncollectible` — which the book counts as
+   * billed, and then written off — and drops it out of the queue of bills
+   * waiting for a country. A bill that was never placed cannot be forgiven.
+   */
+  const heldDraft = async (): Promise<{ ws: Workspace; invoice: Invoice; customer: string }> => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+    const growth = await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly');
+    const price = (await ws.ok('POST', '/v1/prices', {
+      product: growth.data[0].product, currency: 'usd', model: 'flat', unit_amount: 10_000,
+      nickname: 'Unplaceable bench', lookup_key: 'unplaceable_bench',
+      recurring: { interval: 'month' }, tax_behavior: 'exclusive',
+    })).id as string;
+    // No address and no registration number, so there is no country to tax at.
+    const customer = await ws.customer('Nowhere Robotics');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price }],
+    });
+    const invoices = await allInvoices(ws, `&subscription=${sub.id}`);
+    assert.equal(invoices.length, 1);
+    assert.equal(invoices[0].status, 'draft');
+    assert.equal(invoices[0].automatic_tax.status, 'requires_location_inputs');
+    return { ws, invoice: invoices[0], customer: customer.id };
+  };
+
+  test('is refused for the same reason finalising and paying it are', async () => {
+    const { ws, invoice } = await heldDraft();
+    try {
+      const billedBefore = (await ws.ok('GET', '/v1/subscriptions/overview')).invoices.billed as number;
+
+      // The two doors that are already held shut, for contrast.
+      await ws.fail('POST', `/v1/invoices/${invoice.id}/finalize`, {}, 400, 'customer_tax_location_invalid');
+      await ws.fail('POST', `/v1/invoices/${invoice.id}/pay`, {}, 400, 'customer_tax_location_invalid');
+      // And the third.
+      await ws.fail('POST', `/v1/invoices/${invoice.id}/mark_uncollectible`, {}, 400, 'customer_tax_location_invalid');
+
+      const after: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+      assert.equal(after.status, 'draft', 'the bill is still a draft, not written off');
+      assert.equal(after.finalized_at, null, 'and writing it off did not finalise it behind the hold');
+
+      const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+      assert.equal(overview.invoices.billed, billedBefore,
+        'a bill that was never placed is not revenue that was billed and forgiven');
+      assert.equal(overview.invoices.written_off, 0);
+      assert.equal(overview.untaxed_invoices.held_in_draft, 1,
+        'and it is still in the queue of bills waiting for a country');
+
+      const queue = await ws.ok('GET', '/v1/invoices?tax=missing');
+      assert.equal(queue.data.length, 1);
+      assert.equal(queue.data[0].status, 'draft');
+    } finally { ws.close(); }
+  });
+
+  test('is allowed the moment the bill has actually been placed', async () => {
+    const { ws, invoice, customer } = await heldDraft();
+    try {
+      await ws.ok('PATCH', `/v1/customers/${customer}`, {
+        address: { line1: '1 Broadway', city: 'New York', state: 'New York', postal_code: '10004', country: 'United States' },
+      });
+      const open: Invoice = await ws.ok('POST', `/v1/invoices/${invoice.id}/finalize`);
+      assert.equal(open.status, 'open');
+      assert.equal(open.tax, 400, 'New York charges 4% on $100.00 once the address is on file');
+
+      const off: Invoice = await ws.ok('POST', `/v1/invoices/${invoice.id}/mark_uncollectible`);
+      assert.equal(off.status, 'uncollectible', 'a bill that was sent can still be written off');
+      assert.equal(off.total, 10_400);
+    } finally { ws.close(); }
+  });
+
+  test('a workspace that opts out of the hold can still write the bill off', async () => {
+    const { ws, invoice } = await heldDraft();
+    try {
+      await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: false });
+      const off: Invoice = await ws.ok('POST', `/v1/invoices/${invoice.id}/mark_uncollectible`);
+      assert.equal(off.status, 'uncollectible', 'the hold is the workspace’s decision, not a law of the module');
+      assert.equal(off.automatic_tax.status, 'requires_location_inputs', 'and the bill still says what was missing');
+    } finally { ws.close(); }
+  });
+
+  test('a paused subscription set to write its bills off holds them instead', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+      const customer = await ws.customer('Paused And Placeless');
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: 'starter_monthly' }],
+      });
+      await ws.ok('POST', `/v1/subscriptions/${sub.id}/pause`, { behavior: 'mark_uncollectible' });
+      await ws.travelTo(sub.current_period_end + 60_000);
+
+      const renewal = (await allInvoices(ws, `&subscription=${sub.id}`))
+        .find((invoice) => invoice.billing_reason === 'subscription_cycle');
+      assert.ok(renewal, 'the cycle still turned over');
+      assert.equal(renewal.status, 'draft',
+        'the hold outranks the pause behaviour — writing the bill off would have finalised it');
+      assert.equal(renewal.finalized_at, null);
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 20. What the copilot says is outstanding
+ * ========================================================================== */
+
+describe('the outstanding figure the copilot reads out', () => {
+  test('names every currency rather than stamping one symbol on their sum', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      const tools = ws.app.ctx.ai;
+      const answer = await tools.tool('billing_list_invoices')!.run(
+        { status: 'open_like', limit: 50 }, ws.app.ctx, { orgId: ORG },
+      ) as {
+        total: number;
+        outstanding_display: string;
+        outstanding_note: string | null;
+        outstanding_by_currency: { currency: string; amount: number; amount_display: string }[];
+      };
+
+      // What Northwind is actually owed, read straight off the invoice ledger.
+      const open = await allInvoices(ws, '&status=open_like');
+      const owed = new Map<string, number>();
+      for (const invoice of open) owed.set(invoice.currency, (owed.get(invoice.currency) ?? 0) + invoice.amount_due);
+      assert.ok(owed.size > 1, 'Northwind is owed money in more than one currency, or this proves nothing');
+
+      // The defect: every currency's minor units added up and handed back under
+      // the first invoice's symbol — $135,967.00 on a book owed $133,400.00,
+      // €1,007.00 and £1,560.00. This is the figure the copilot reads out.
+      const lumped = [...owed.values()].reduce((total, amount) => total + amount, 0);
+      assert.ok(!owed.has('usd') || lumped !== owed.get('usd'),
+        'the lump and the dollar book differ, or this proves nothing');
+      for (const [currency, amount] of owed) {
+        assert.notEqual(
+          answer.outstanding_display,
+          new Intl.NumberFormat('en-US', { style: 'currency', currency: currency.toUpperCase() }).format(lumped / 100),
+          `${lumped} may not be quoted as ${currency.toUpperCase()} — only ${amount} of it is`,
+        );
+      }
+
+      const buckets = answer.outstanding_by_currency;
+      assert.deepEqual(buckets.map((row) => row.currency), [...owed.keys()].sort());
+      for (const row of buckets) {
+        assert.equal(row.amount, owed.get(row.currency), `${row.currency} is owed what the ledger says`);
+        assert.ok(answer.outstanding_display.includes(row.amount_display),
+          `the answer names ${row.currency}'s ${row.amount_display}`);
+      }
+      assert.ok(String(answer.outstanding_note).includes('outstanding_by_currency'),
+        'and it says where the real figures are');
+    } finally { ws.close(); }
+  });
+
+  test('still quotes one plain figure when only one currency is owed', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      const customer = await ws.customer('Single Currency Only');
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: 'growth_monthly' }],
+      });
+      const answer = await ws.app.ctx.ai.tool('billing_list_invoices')!.run(
+        { customer: customer.id, status: 'open_like' }, ws.app.ctx, { orgId: ORG },
+      ) as { outstanding_display: string; outstanding_note: string | null; outstanding_by_currency: { currency: string }[] };
+      assert.equal(answer.outstanding_display, '$499.00');
+      assert.ok(Array.isArray(answer.outstanding_by_currency), 'one currency is still bucketed, so a reader never has to guess');
+      assert.equal(answer.outstanding_by_currency.length, 1);
+      assert.equal(answer.outstanding_note, null, 'one currency needs no caveat');
+      assert.ok(sub.id);
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 21. The last mixed figures on the overview
+ * ========================================================================== */
+
+describe('the proration waiting on the overview', () => {
+  test('is bucketed by the currency it was priced in, like every other money on the payload', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      const growth = await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly');
+      const product = growth.data[0].product as string;
+      const price = async (currency: string, amount: number, key: string) => (await ws.ok('POST', '/v1/prices', {
+        product, currency, model: 'flat', unit_amount: amount, nickname: key, lookup_key: key,
+        recurring: { interval: 'month' },
+      })).id as string;
+
+      // One account billed in dollars and one in euros, each upgraded halfway
+      // through its period, so a proration is waiting in each currency.
+      const waiting = new Map<string, number>();
+      for (const [currency, from, to] of [['usd', 20_000, 60_000], ['eur', 30_000, 50_000]] as const) {
+        const customer = await ws.customer(`Mid-cycle ${currency}`, { currency });
+        const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+          customer: customer.id, items: [{ price: await price(currency, from, `waiting_${currency}_from`) }],
+        });
+        await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+          items: [{ id: sub.items[0].id, price: await price(currency, to, `waiting_${currency}_to`) }],
+          proration_date: midpointOf(sub),
+        });
+        const items = await ws.ok('GET', `/v1/customers/${customer.id}/pending_items`);
+        assert.ok(items.data.length > 0, `${currency} has a proration waiting`);
+        waiting.set(currency, (items.data as { amount: number }[]).reduce((total, item) => total + item.amount, 0));
+      }
+      assert.ok(waiting.get('usd') !== waiting.get('eur'), 'the two currencies differ, or this proves nothing');
+
+      const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+      assert.ok(
+        Array.isArray(overview.uninvoiced_prorations_by_currency),
+        `uninvoiced_prorations is ${overview.uninvoiced_prorations}: euros and dollars added together, `
+        + 'with nothing beside it saying so and no figure that is an amount of anything',
+      );
+      const buckets = overview.uninvoiced_prorations_by_currency as
+        { currency: string; amount: number; amount_display: string }[];
+      assert.deepEqual(buckets.map((row) => row.currency), ['eur', 'usd']);
+      for (const row of buckets) {
+        assert.equal(row.amount, waiting.get(row.currency), `${row.currency}'s waiting proration is its own`);
+      }
+      assert.equal(
+        buckets.reduce((total, row) => total + row.amount, 0), overview.uninvoiced_prorations,
+        'nothing is lost: the buckets are the same minor units the flat figure holds',
+      );
+      assert.ok(String(overview.uninvoiced_prorations_note).includes('uninvoiced_prorations_by_currency'),
+        'and the flat figure says where the real ones are');
+    } finally { ws.close(); }
+  });
+
+  test('names every figure it added across currencies, average revenue included', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+      assert.equal(overview.mixed_currency, true, 'Northwind bills in three currencies');
+      // ARPA is mrr divided by a count, so it is the mixed sum too — and it was
+      // the one figure the caveat did not name.
+      assert.ok(String(overview.mrr_note).includes('average_revenue_per_account'),
+        'the caveat has to cover every figure derived from the mixed sum');
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 22. The mirror of the stack: one jurisdiction charged twice
+ * ========================================================================== */
+
+describe('a jurisdiction that could be registered twice over one address', () => {
+  /**
+   * Letting rates stack was the fix for an under-charge. Its mirror image is an
+   * over-charge, and the clash guard is the only thing standing in front of it:
+   * two active rates that name the *same* jurisdiction and can both land on one
+   * address charge that jurisdiction twice on every bill.
+   *
+   * The guard used to key on the (country, state) tuple, which is not the rule
+   * `ratesFor` matches by. Three registrations slipped past it.
+   */
+  const NEW_YORK = {
+    address: { line1: '1 Broadway', city: 'New York', state: 'New York', postal_code: '10004', country: 'United States' },
+  };
+
+  const benchPrice = async (ws: Workspace, key: string): Promise<string> => {
+    const product = (await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly')).data[0].product;
+    return (await ws.ok('POST', '/v1/prices', {
+      product, currency: 'usd', model: 'flat', unit_amount: 10_000, nickname: key,
+      lookup_key: key, recurring: { interval: 'month' }, tax_behavior: 'exclusive',
+    })).id as string;
+  };
+
+  test('the seeded state rate cannot be registered a second time country-wide', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      // The seed holds New York at 4%, scoped to the state. Registering the
+      // same jurisdiction with no state at all is a rate that covers every US
+      // address — New York's included — so a New York bill would be charged
+      // New York twice.
+      const error = await ws.fail('POST', '/v1/tax_rates', {
+        display_name: 'NY sales tax (again)', jurisdiction: 'New York', country: 'US',
+        tax_type: 'sales_tax', percentage: '4',
+      }, 409, 'tax_rate_exists');
+      assert.ok(String(error.message).includes('New York'), 'the refusal names the jurisdiction it is protecting');
+    } finally { ws.close(); }
+  });
+
+  test('a country-wide jurisdiction cannot then be registered again inside a state', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      // The reverse order, which is the same overlap read the other way round.
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'US federal levy', jurisdiction: 'United States', country: 'US',
+        tax_type: 'sales_tax', percentage: '2',
+      });
+      await ws.fail('POST', '/v1/tax_rates', {
+        display_name: 'US federal levy (Ohio office)', jurisdiction: 'United States', country: 'US',
+        state: 'Ohio', tax_type: 'sales_tax', percentage: '2',
+      }, 409, 'tax_rate_exists');
+    } finally { ws.close(); }
+  });
+
+  test('the same jurisdiction typed in another case is the same jurisdiction', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'NYC sales tax', jurisdiction: 'New York City', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '4.5',
+      });
+      // `ratesFor` matches a state case-insensitively, so both of these land on
+      // the same Manhattan address. The guard has to read case the same way.
+      await ws.fail('POST', '/v1/tax_rates', {
+        display_name: 'NYC sales tax (duplicate)', jurisdiction: 'new york city', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '4.5',
+      }, 409, 'tax_rate_exists');
+      await ws.fail('POST', '/v1/tax_rates', {
+        display_name: 'NYC sales tax (duplicate)', jurisdiction: 'New York City', country: 'US', state: 'new york',
+        tax_type: 'sales_tax', percentage: '4.5',
+      }, 409, 'tax_rate_exists');
+    } finally { ws.close(); }
+  });
+
+  test('a Manhattan bill is charged 8.875%, never twice that', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      // Everything a New York supply is really in, registered once each.
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'NYC sales tax', jurisdiction: 'New York City', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '4.5',
+      });
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'MCTD surcharge', jurisdiction: 'MCTD', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '0.375',
+      });
+      // And every way the same three could have been registered a second time.
+      for (const duplicate of [
+        { display_name: 'NY sales tax (again)', jurisdiction: 'New York', country: 'US', percentage: '4' },
+        { display_name: 'NYC again', jurisdiction: 'new york city', country: 'US', state: 'New York', percentage: '4.5' },
+        { display_name: 'MCTD again', jurisdiction: 'MCTD', country: 'US', state: 'new york', percentage: '0.375' },
+      ]) {
+        await ws.fail('POST', '/v1/tax_rates', { ...duplicate, tax_type: 'sales_tax' }, 409, 'tax_rate_exists');
+      }
+
+      const price = await benchPrice(ws, 'manhattan_bench');
+      const customer = await ws.customer('Broadway Controls', NEW_YORK);
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price }] });
+      const [invoice] = await allInvoices(ws, `&subscription=${sub.id}`);
+
+      assert.equal(invoice.tax, 888, '4% + 4.5% + 0.375% of $100.00 — 17.75% is the same three charged twice');
+      assert.equal(invoice.lines[0].taxes.length, 3, 'three jurisdictions, each once');
+      assert.equal(invoice.lines[0].tax.percentage, '8.875');
+      assert.deepEqual(
+        invoice.lines[0].taxes.map((entry) => entry.jurisdiction),
+        ['New York', 'New York City', 'MCTD'],
+        'no jurisdiction appears twice in the list the document prints',
+      );
+      const document = String(await ws.ok('GET', `/v1/invoices/${invoice.id}/render`));
+      assert.ok(document.includes('Combined 8.875%'), 'and the printed bill states the rate New York actually charges');
+    } finally { ws.close(); }
+  });
+
+  test('a genuinely different jurisdiction over the same address still stacks', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      // The refusal must not have been bought by refusing the stack itself.
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'US federal levy', jurisdiction: 'United States', country: 'US',
+        tax_type: 'sales_tax', percentage: '2',
+      });
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'NYC sales tax', jurisdiction: 'New York City', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '4.5',
+      });
+      const price = await benchPrice(ws, 'stacking_bench');
+      const customer = await ws.customer('Stacking Controls', NEW_YORK);
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price }] });
+      const [invoice] = await allInvoices(ws, `&subscription=${sub.id}`);
+      assert.equal(invoice.lines[0].taxes.length, 3, 'country-wide, state and city — three jurisdictions, three entries');
+      assert.equal(invoice.tax, 1_050, '2% + 4% + 4.5% of $100.00');
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 23. Predictions that add up
+ * ========================================================================== */
+
+describe('the next invoice, on a tax-inclusive price', () => {
+  const BERLIN = {
+    currency: 'eur',
+    address: { line1: '1 Hauptstrasse', city: 'Berlin', postal_code: '10115', country: 'Germany' },
+  };
+
+  const inclusivePrice = async (ws: Workspace, key: string, amount = 10_000): Promise<string> => {
+    const product = (await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly')).data[0].product;
+    return (await ws.ok('POST', '/v1/prices', {
+      product, currency: 'eur', model: 'flat', unit_amount: amount, nickname: `Berlin bench ${key}`,
+      lookup_key: key, recurring: { interval: 'month' }, tax_behavior: 'inclusive',
+    })).id as string;
+  };
+
+  test('publishes the subtotal the bill will record, not the list price beside its own tax', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      const price = await inclusivePrice(ws, 'berlin_inclusive');
+      const customer = await ws.customer('Spandau Fertigung', BERLIN);
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price }] });
+
+      // What the bill actually says: 19% German VAT taken out of €100.00.
+      const predicted = await ws.ok('POST', '/v1/invoices/create_preview', { subscription: sub.id });
+      assert.equal(predicted.tax, 1_597);
+      assert.equal(predicted.subtotal, 8_403);
+      assert.equal(predicted.total, 10_000, 'an inclusive price never changes what is charged');
+
+      const next = (await ws.ok('GET', `/v1/customers/${customer.id}/summary`)).next_invoice;
+      assert.equal(next.tax, predicted.tax);
+      assert.equal(next.estimated_total, predicted.total);
+      // The defect: `subtotal` came off the price list — €100.00 — while `tax`
+      // came out of the rate engine, so the panel added up to €118.14 for a
+      // bill that will say €100.00, over by exactly the VAT the customer was
+      // already paying.
+      assert.equal(next.subtotal, predicted.subtotal,
+        'the summary and the document have to state the same subtotal');
+      assert.equal(
+        next.subtotal + next.uninvoiced_total + next.tax + next.balance_applied,
+        next.estimated_total,
+        'every figure the panel publishes has to add up to the figure it predicts',
+      );
+    } finally { ws.close(); }
+  });
+
+  test('the waiting prorations are stated on the same basis', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      const price = await inclusivePrice(ws, 'kreuzberg_inclusive');
+      const dearer = await inclusivePrice(ws, 'kreuzberg_inclusive_plus', 25_000);
+      const customer = await ws.customer('Kreuzberg Fertigung', BERLIN);
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price }] });
+      // A mid-cycle upgrade leaves both halves of the proration waiting on the
+      // account, each of them an inclusive price with tax already inside it.
+      await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+        items: [{ id: sub.items[0].id, price: dearer }],
+        proration_date: midpointOf(sub), proration_behavior: 'create_prorations',
+      });
+      const next = (await ws.ok('GET', `/v1/customers/${customer.id}/summary`)).next_invoice;
+      assert.notEqual(next.uninvoiced_total, 0, 'there are prorations waiting, or this proves nothing');
+      assert.equal(
+        next.subtotal + next.uninvoiced_total + next.tax + next.balance_applied,
+        next.estimated_total,
+        'the waiting items are stated net of the tax counted beside them',
+      );
+    } finally { ws.close(); }
+  });
+});
+
+describe('the upcoming invoice the copilot reads out', () => {
+  test('names the tax rather than leaving a hole the size of it', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'NYC sales tax', jurisdiction: 'New York City', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '4.5',
+      });
+      const customer = await ws.customer('Chelsea Robotics', {
+        address: { line1: '9 Ninth Avenue', city: 'New York', state: 'New York', postal_code: '10011', country: 'United States' },
+      });
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: await priceIdOf(ws, 'growth_monthly') }],
+      });
+
+      const answer = await ws.app.ctx.ai.tool('billing_upcoming_invoice')!.run(
+        { subscription: sub.id }, ws.app.ctx, { orgId: ORG },
+      ) as {
+        subtotal_display: string; tax_display: string; taxes: string[];
+        balance_applied_display: string; total_display: string; adds_up: boolean;
+      };
+
+      // $499.00 of lines, 4% New York and 4.5% New York City on top. Without
+      // the tax the answer read "$499.00, nothing applied, total $541.42" and
+      // the copilot had to account for the $42.42 with something it invented.
+      assert.equal(answer.subtotal_display, '$499.00');
+      assert.equal(answer.balance_applied_display, '$0.00');
+      assert.equal(answer.total_display, '$541.42');
+      assert.equal(answer.tax_display, '$42.42', 'the gap is named, not left for the model to guess at');
+      assert.deepEqual(answer.taxes, [
+        'NY sales tax 4% (New York): $19.96',
+        'NYC sales tax 4.5% (New York City): $22.46',
+      ], 'every jurisdiction the bill will charge is named');
+      assert.equal(answer.adds_up, true);
+    } finally { ws.close(); }
   });
 });

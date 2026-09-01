@@ -63,6 +63,14 @@ export interface RequestCtx extends Ctx {
   requestId: string;
 }
 
+/**
+ * The per-request context also narrows the job queue to the caller's workspace.
+ * The clock is resolved per org, so draining has to be too: a handler reached
+ * through `c.jobs` — `POST /v1/time/advance`, `POST /v1/jobs/drain` — must not
+ * be able to run another tenant's renewals under this tenant's clock.
+ */
 export function withAuth(ctx: Ctx, auth: Auth, requestId: string): RequestCtx {
-  return Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx, { auth, requestId });
+  return Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx, {
+    auth, requestId, jobs: ctx.jobs.forOrg(auth.orgId),
+  });
 }

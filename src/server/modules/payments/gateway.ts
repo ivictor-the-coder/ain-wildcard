@@ -13,13 +13,19 @@
  *     identity is necessary and not sufficient: it can be satisfied by an
  *     invoice that took more than it was owed and dropped the difference, so
  *     the second rule below is what makes it mean something.
- *  1a. **Nothing collected is ever discarded.** A payment is refused before the
- *     card is touched when the bill has nothing left in it (`confirmIntent`
- *     re-reads the invoice and prices against the live balance), and money
- *     that was already committed when the bill moved — a debit settling days
- *     later, a dispute won over a bill since credited — lands on the
- *     customer's balance as an `invoice_overpayment` rather than being
- *     truncated away.
+ *  1a. **Nothing collected is ever discarded, and nothing returned is paid
+ *     twice.** A payment is refused before the card is touched when the bill
+ *     has nothing left in it or already has a debit in flight covering it
+ *     (`confirmIntent` re-reads the invoice and prices against the live
+ *     balance less what is with the bank), and money that was already
+ *     committed when the bill moved — a debit settling days later, a dispute
+ *     won over a bill since credited — lands on the customer's balance as an
+ *     `invoice_overpayment` rather than being truncated away. Reversal is the
+ *     same rule run backwards: a refund or a chargeback empties that credit
+ *     before it touches `amount_paid`, so the one identity this file exists to
+ *     keep — **net cash in === `amount_paid` + overpayment credit**, on every
+ *     bill, after any sequence of collect, reverse, refund, dispute and
+ *     overpay — survives money going out as well as money coming in.
  *  2. **A subscription's status is never written here.** Failure emits
  *     `invoice.payment_failed` and recovery emits `invoice.paid`, both of which
  *     billing already listens for and turns into a status change through its
@@ -110,6 +116,25 @@ export interface CollectionResult {
 
 /** How long we give the network before a silent dispute is treated as lost. */
 const DEFAULT_EVIDENCE_DAYS = 21;
+
+/**
+ * The parameters a replayed `idempotency_key` has to match.
+ *
+ * Recorded from the *request*, not recomputed from the intent it produced,
+ * because an invoice-bound intent is re-priced between the create and the
+ * replay — comparing against the stored `amount` would refuse the very replay
+ * idempotency exists to serve. Currency is normalised because `USD` and `usd`
+ * are the same request; everything else is an id or a literal amount.
+ */
+function intentFingerprint(input: IntentInput): string {
+  return [
+    input.customer,
+    input.invoice ?? '',
+    input.amount ?? '',
+    (input.currency ?? '').toLowerCase(),
+    input.payment_method ?? '',
+  ].join('|');
+}
 
 export class Gateway {
   /**
@@ -234,6 +259,7 @@ export class Gateway {
 
   createIntent(orgId: string, input: IntentInput, meta: WriteMeta = {}): PaymentIntent {
     return this.ctx.atomic(() => {
+      const fingerprint = intentFingerprint(input);
       if (input.idempotency_key) {
         const replay = this.ctx.db.get<any>(
           `SELECT * FROM payments_intents WHERE org_id = ? AND idempotency_key = ?`, orgId, input.idempotency_key,
@@ -241,7 +267,27 @@ export class Gateway {
         // The processor's own idempotency, under the platform's: a replayed
         // collection returns the intent it already made rather than a charge
         // the customer would see twice on their statement.
-        if (replay) return hydrateIntent(replay);
+        //
+        // Which is only true while the replay is the *same* request. A key is a
+        // caller's own string, and two callers — or one caller whose counter
+        // reset — can present the same one for different money. Handing back
+        // the first intent then answers 201 with someone else's customer,
+        // someone else's charge id and a `succeeded` status, while this
+        // customer is charged nothing at all: a payment reported and never
+        // made. The recorded request has to match before the replay is a
+        // replay. A row written before fingerprints existed has none, and
+        // keeps the old behaviour rather than being refused retroactively.
+        if (replay) {
+          const first = String(replay.idempotency_fingerprint ?? '');
+          if (first && first !== fingerprint) {
+            throw conflict(
+              'idempotency_key_in_use',
+              `Idempotency key "${input.idempotency_key}" was already used for a different payment (${replay.id}), so it cannot be reused for this one. A key only replays the request it was first sent with — send that request again, or use a new key.`,
+              { payment_intent: replay.id, first_request: first, this_request: fingerprint },
+            );
+          }
+          return hydrateIntent(replay);
+        }
       }
       const customer = this.ctx.svc.billing.requireCustomer(orgId, input.customer);
       const invoice = input.invoice ? this.billing.invoices.require(orgId, input.invoice) : null;
@@ -277,6 +323,7 @@ export class Gateway {
         last_error_code: null, last_error_message: null, last_error_advice: null,
         latest_charge_id: null, succeeded_at: null, canceled_at: null, cancellation_reason: null,
         idempotency_key: input.idempotency_key ?? null,
+        idempotency_fingerprint: input.idempotency_key ? fingerprint : null,
         source: input.source ?? 'api',
         metadata: input.metadata ?? {},
         created: now, updated: now,
@@ -338,7 +385,7 @@ export class Gateway {
    * that, so the only things refused here are the states in which the bill has
    * no money left in it.
    */
-  private settledReason(invoice: Invoice): { code: string; message: string } | null {
+  private settledReason(orgId: string, invoice: Invoice): { code: string; message: string } | null {
     if (invoice.status === 'draft') {
       return { code: 'invoice_not_finalized', message: `Invoice ${invoice.number} has not been finalised, so nothing is owed on it yet.` };
     }
@@ -352,6 +399,13 @@ export class Gateway {
       return {
         code: 'invoice_already_paid',
         message: `Invoice ${invoice.number} has nothing left to collect — it was settled before this intent was confirmed. Refund the charge that settled it if this payment was meant to replace it.`,
+      };
+    }
+    const presented = this.alreadyPresentedReason(orgId, invoice);
+    if (presented) {
+      return {
+        code: 'invoice_payment_in_flight',
+        message: `${presented} Wait for the bank's answer, then refund the debit if this payment was meant to replace it — a debit that has been presented cannot be recalled.`,
       };
     }
     return null;
@@ -371,22 +425,24 @@ export class Gateway {
    */
   private priceAgainstInvoice(orgId: string, intent: PaymentIntent, meta: WriteMeta): void {
     const invoice = this.billing.invoices.require(orgId, intent.invoice as string);
-    const settled = this.settledReason(invoice);
+    const settled = this.settledReason(orgId, invoice);
     if (settled) {
       throw conflict(settled.code, settled.message, {
         invoice: invoice.id, status: invoice.status,
         amount_due: invoice.amount_due, amount_paid: invoice.amount_paid,
+        amount_in_flight: this.inFlightOn(orgId, invoice.id).amount,
       });
     }
-    if (invoice.amount_due >= intent.amount) return;
+    const available = this.collectableNow(orgId, invoice);
+    if (available >= intent.amount) return;
     const now = this.ctx.now();
     const locale = this.locale(orgId);
-    this.ctx.db.patch('payments_intents', 'id', intent.id, { amount: invoice.amount_due, updated: now });
+    this.ctx.db.patch('payments_intents', 'id', intent.id, { amount: available, updated: now });
     const after = this.requireIntent(orgId, intent.id);
     this.ctx.emit(orgId, 'payment_intent.amount_updated', {
       payment_intent: after.id, invoice: invoice.id, number: invoice.number, customer: invoice.customer,
       amount: after.amount, previous_amount: intent.amount, currency: after.currency,
-      reason: `Invoice ${invoice.number} owed ${formatMoney(money(intent.amount, intent.currency), { locale })} when this intent was created and owes ${formatMoney(money(invoice.amount_due, invoice.currency), { locale })} now. The charge follows the bill down rather than collecting the difference.`,
+      reason: `Invoice ${invoice.number} owed ${formatMoney(money(intent.amount, intent.currency), { locale })} when this intent was created and has ${formatMoney(money(available, invoice.currency), { locale })} left to present now. The charge follows the bill down rather than collecting the difference.`,
     }, {
       objectId: after.id, objectType: 'payment_intent', previous: { amount: intent.amount },
       actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
@@ -439,6 +495,22 @@ export class Gateway {
       if (intent.status === 'canceled') return intent;
       if (intent.status === 'succeeded') {
         throw conflict('payment_intent_succeeded', `Payment intent ${id} has already been paid. Refund the charge instead.`, { charge: intent.latest_charge });
+      }
+      // The same rule that refuses a second confirm, from the other side: once
+      // the instruction is with the bank it cannot be taken back by writing a
+      // column here. Cancelling anyway would leave the charge pending for ever
+      // — the settlement job only answers a `processing` intent — and a charge
+      // that never settles is money `inFlightOn` counts against the bill for
+      // ever, so the invoice could never be presented again and the campaign
+      // chasing it would wait on an answer that was never coming.
+      if (intent.status === 'processing') {
+        const charge = intent.latest_charge ? this.charge(orgId, intent.latest_charge) : null;
+        const settlesAt = charge ? charge.created + BANK_DEBIT_SETTLEMENT_DAYS * DAY : null;
+        throw conflict(
+          'payment_intent_processing',
+          `Payment intent ${id} is with the bank and cannot be recalled${settlesAt ? ` — it is answered by ${new Date(settlesAt).toISOString().slice(0, 10)}` : ''}. Wait for the answer: a return unpaid reopens the bill on its own, and money that does arrive can be refunded.`,
+          { status: intent.status, charge: intent.latest_charge, settles_at: settlesAt },
+        );
       }
       const now = this.ctx.now();
       this.ctx.db.patch('payments_intents', 'id', id, {
@@ -654,6 +726,31 @@ export class Gateway {
     if (!after.invoice) return;
 
     const invoice = this.billing.invoices.require(orgId, after.invoice);
+    // A decline is a fact about the card. It is only a fact about the *bill*
+    // while the bill is still owed — and the answer to a presentation arrives
+    // long after the presentation on every path that matters: a direct debit is
+    // returned unpaid three days later, a cardholder closes the authentication
+    // page after a colleague has taken the money over the phone, a credit note
+    // cancels the whole invoice while the instruction is with the bank.
+    // `confirmIntent` re-reads the invoice before it charges for exactly this
+    // reason; nothing re-read it when the answer came back no. Reporting a
+    // failure against a settled bill puts `invoice.payment_failed` on it, which
+    // billing turns into a past-due — and then an unpaid — subscription, and
+    // opens a recovery campaign whose amount at risk is zero: service withdrawn
+    // over an invoice that owes nothing.
+    if (this.nothingLeftToCollect(invoice)) {
+      // And the campaign, if one is running, is chasing a bill that no longer
+      // owes anything. Standing it down is the same call the invoice's own
+      // settlement would have made; leaving it is how a schedule ends up with a
+      // window it has already spent and no job to run the next one.
+      if (!this.drivenByDunning) {
+        this.payments.dunning.stopFor(
+          orgId, invoice.id,
+          `${invoice.number} was settled before ${charge.id} was answered, so the ${code} it came back with is not a bill to chase.`,
+        );
+      }
+      return;
+    }
     // Billing listens for this and moves the subscription to `past_due` through
     // its own transition function. Payments never writes that column.
     this.ctx.emit(orgId, 'invoice.payment_failed', {
@@ -715,6 +812,21 @@ export class Gateway {
 
   /* ------------------------------- collection ----------------------------- */
 
+  /**
+   * Is there any money left in this bill at all?
+   *
+   * The question `settledReason` answers in words, without the parts of it that
+   * are about *this* presentation — a debit in flight is money on its way, not
+   * a bill that has been settled, and net terms are a reason not to charge a
+   * card rather than a reason nothing is owed. What is left is the states in
+   * which the invoice itself holds nothing: struck out, written off, paid, or
+   * credited down to zero.
+   */
+  private nothingLeftToCollect(invoice: Invoice): boolean {
+    return invoice.status === 'paid' || invoice.status === 'void'
+      || invoice.status === 'uncollectible' || invoice.amount_due <= 0;
+  }
+
   /** Why this bill cannot be charged right now, or null if it can. */
   uncollectableReason(invoice: Invoice): string | null {
     if (invoice.status === 'draft') return `Invoice ${invoice.number} has not been finalised yet, so nothing is owed on it.`;
@@ -726,6 +838,54 @@ export class Gateway {
       return `Invoice ${invoice.number} is on ${invoice.due_date ? 'net terms' : 'invoice terms'} — it is paid by bank transfer, not by card on file.`;
     }
     return null;
+  }
+
+  /**
+   * Cash already presented against this bill that the bank has not answered.
+   *
+   * `amount_due` is what a bill is owed. It is not what may be presented
+   * against it: a direct debit sits with the bank for days and the invoice
+   * stays open the whole time, so anything that prices a second presentation
+   * off `amount_due` presents money that is already on its way. Three "retry
+   * now" clicks in one afternoon become three debits against one bill, and the
+   * overpayment ledger dutifully records the two the customer never owed.
+   * `settlesAt` is when the last of them is answered — the first honest moment
+   * to try again, and a decline reopens the bill on its own before then.
+   */
+  inFlightOn(orgId: string, invoiceId: string): { amount: number; settlesAt: number | null } {
+    const row = this.ctx.db.get<{ amount: number | null; latest: number | null }>(
+      `SELECT COALESCE(SUM(amount), 0) AS amount, MAX(created) AS latest FROM payments_charges
+        WHERE org_id = ? AND invoice_id = ? AND status = 'pending'`,
+      orgId, invoiceId,
+    );
+    const amount = Number(row?.amount ?? 0);
+    if (amount <= 0 || !row?.latest) return { amount: Math.max(0, amount), settlesAt: null };
+    return { amount, settlesAt: Number(row.latest) + BANK_DEBIT_SETTLEMENT_DAYS * DAY };
+  }
+
+  /** What may be presented against this bill right now — the balance, less what is in flight. */
+  private collectableNow(orgId: string, invoice: Invoice): number {
+    return Math.max(0, invoice.amount_due - this.inFlightOn(orgId, invoice.id).amount);
+  }
+
+  /** Why presenting this bill again right now would take the same money twice, or null. */
+  private alreadyPresentedReason(orgId: string, invoice: Invoice): string | null {
+    const inFlight = this.inFlightOn(orgId, invoice.id);
+    if (inFlight.amount <= 0 || inFlight.amount < invoice.amount_due) return null;
+    const locale = this.locale(orgId);
+    const show = (amount: number) => formatMoney(money(amount, invoice.currency), { locale });
+    const settles = inFlight.settlesAt ? new Date(inFlight.settlesAt).toISOString().slice(0, 10) : 'in a few working days';
+    return `${show(inFlight.amount)} is already with the bank against ${invoice.number} and covers the ${show(invoice.amount_due)} still owed. Presenting it again would take the money twice — the debit is answered by ${settles}, and a return unpaid reopens the bill on its own.`;
+  }
+
+  /**
+   * Why this bill cannot be charged at this moment: its own state, or cash
+   * already committed against it. `uncollectableReason` answers the first
+   * question alone, and dunning wants only that one — a debit in flight is a
+   * reason to wait for the bank, never a reason to stop chasing the bill.
+   */
+  notCollectableNow(orgId: string, invoice: Invoice): string | null {
+    return this.uncollectableReason(invoice) ?? this.alreadyPresentedReason(orgId, invoice);
   }
 
   /**
@@ -742,8 +902,9 @@ export class Gateway {
     return this.ctx.atomic(() => {
       const invoice = this.billing.invoices.require(orgId, invoiceId);
       const meta = opts.meta ?? { actorType: 'system' as const };
-      const blocked = this.uncollectableReason(invoice);
+      const blocked = this.notCollectableNow(orgId, invoice);
       if (blocked) return { invoice, intent: null, charge: null, method: null, collected: false, skipped: blocked, failure: null };
+      const collectable = this.collectableNow(orgId, invoice);
 
       const customer = this.ctx.svc.billing.requireCustomer(orgId, invoice.customer);
       const subscription = invoice.subscription ? this.ctx.svc.billing.subscription(orgId, invoice.subscription) : null;
@@ -753,7 +914,7 @@ export class Gateway {
       if (!method) {
         return {
           invoice, intent: null, charge: null, method: null, collected: false,
-          skipped: `${customer.name} has no payment method on file, so ${formatMoney(money(invoice.amount_due, invoice.currency), { locale: this.locale(orgId) })} cannot be charged. Ask them for one.`,
+          skipped: `${customer.name} has no payment method on file, so ${formatMoney(money(collectable, invoice.currency), { locale: this.locale(orgId) })} cannot be charged. Ask them for one.`,
           failure: null,
         };
       }
@@ -768,7 +929,7 @@ export class Gateway {
       const offSession = opts.offSession ?? true;
       const intent = this.createIntent(orgId, {
         customer: customer.id,
-        amount: invoice.amount_due,
+        amount: collectable,
         currency: invoice.currency,
         payment_method: method.id,
         invoice: invoice.id,
@@ -933,8 +1094,9 @@ export class Gateway {
   /**
    * Take money back off a bill — a refund, or a dispute the network has pulled.
    *
-   * `amount_paid` falls by what left the account and `amount_due` rises by the
-   * same, which is the only way to keep billing's identity
+   * Cash that went past the bill is settled first, off the customer's balance,
+   * and only what is left comes off `amount_paid`, where `amount_due` rises by
+   * the same — the only way to keep billing's identity
    * `amount_paid + credited-before-payment + amount_due === total` true. If
    * that leaves anything owed, the invoice is open again, because a bill that
    * has had its money taken back is not a paid bill. What this deliberately
@@ -946,19 +1108,54 @@ export class Gateway {
     opts: { note: string; at?: number; meta?: WriteMeta },
   ): Invoice {
     const invoice = this.billing.invoices.require(orgId, invoiceId);
-    if (invoice.status === 'void') {
+    if (amount <= 0) return invoice;
+    const now = opts.at ?? this.ctx.now();
+    // What this bill took beyond what it was owed. It is on the customer's
+    // balance, not in `amount_paid`, and it is the first thing money leaving
+    // has to come out of. Taking it off the bill instead is how a refund pays
+    // a customer twice: the cash goes back, the credit that same cash created
+    // stays on the account, and the bill it never owed reopens for the
+    // difference. The mirror of `applyCollection`, which fills the bill first
+    // and puts only the excess on the account — so a reversal empties the
+    // account first and only then reaches into the bill.
+    const overpaid = this.overpaidOn(orgId, invoiceId);
+    // A withdrawn bill is refused only when it is genuinely holding nothing.
+    // Being void is not on its own a reason: `voidInvoice` leaves whatever was
+    // collected sitting in `amount_paid`, and a bill that was part paid before
+    // it was struck out still holds the customer's money. Refusing there is how
+    // a refund becomes impossible — the cash is recorded against a document
+    // nobody can act on, and neither a refund nor a chargeback can reach it.
+    if (invoice.status === 'void' && overpaid + invoice.amount_paid <= 0) {
       throw conflict('invoice_void', `Invoice ${invoice.number} was voided, so there is no payment on it to reverse.`);
     }
-    const moved = Math.min(amount, invoice.amount_paid);
-    if (moved <= 0) return invoice;
-    const now = opts.at ?? this.ctx.now();
-    const paid = invoice.amount_paid - moved;
-    const due = invoice.total - invoice.pre_payment_credit_notes_amount - paid;
-    const reopened = due > 0 && (invoice.status === 'paid');
+    const fromCredit = Math.min(amount, overpaid);
+    let current = invoice;
+    if (fromCredit > 0) {
+      current = this.reverseOverpayment(orgId, invoice, fromCredit, { at: now, note: opts.note, meta: opts.meta });
+    }
+    const moved = Math.min(amount - fromCredit, current.amount_paid);
+    if (fromCredit + moved !== amount) {
+      // Neither the bill nor the account held what is leaving, which means the
+      // cash taken against this invoice and the cash recorded against it had
+      // already drifted apart before this call. Taking the transaction down
+      // beats paying out money the platform has no record of collecting.
+      throw internal(
+        `Invoice ${current.number} cannot give back ${amount}: ${current.amount_paid} is recorded as collected on the bill and ${overpaid} as credit on the account, which is ${fromCredit + moved} in total.`,
+        { invoice: invoiceId, amount, amount_paid: current.amount_paid, amount_overpaid: overpaid },
+      );
+    }
+    if (moved <= 0) return current;
+    const paid = current.amount_paid - moved;
+    // A withdrawn bill is owed nothing and cannot become owed again: taking its
+    // cash back leaves it struck out and empty, not open for the difference.
+    // Every other status carries the rise on `amount_due`, which is what keeps
+    // billing's identity true.
+    const due = current.status === 'void' ? 0 : current.total - current.pre_payment_credit_notes_amount - paid;
+    const reopened = due > 0 && (current.status === 'paid');
     this.ctx.db.patch('billing_invoices', 'id', invoiceId, {
       amount_paid: paid, amount_due: due,
-      status: reopened ? 'open' : invoice.status,
-      paid_at: due > 0 ? null : invoice.paid_at,
+      status: reopened ? 'open' : current.status,
+      paid_at: due > 0 ? null : current.paid_at,
       payment_note: opts.note, updated: now,
     });
     this.billing.invoices.assertBalanced(orgId, invoiceId);
@@ -969,10 +1166,47 @@ export class Gateway {
       status: after.status, note: opts.note,
     }, {
       objectId: invoiceId, objectType: 'invoice',
-      previous: { amount_paid: invoice.amount_paid, amount_due: invoice.amount_due, status: invoice.status },
+      previous: { amount_paid: current.amount_paid, amount_due: current.amount_due, status: current.status },
       actorId: opts.meta?.actorId, actorType: opts.meta?.actorType, requestId: opts.meta?.requestId,
     });
     return after;
+  }
+
+  /**
+   * Take back credit this bill put on the account, because the cash that made
+   * it has gone back to the customer.
+   *
+   * The exact reverse of `recordOverpayment`, and it has to be, or the two
+   * halves of one refund disagree: a positive `invoice_overpayment` row against
+   * the same invoice, so `overpaidOn` and the customer's balance both fall by
+   * what left, in step with the money. Nothing on the invoice moves — the bill
+   * never held this cash.
+   */
+  private reverseOverpayment(
+    orgId: string, invoice: Invoice, amount: number,
+    opts: { at: number; note: string; meta?: WriteMeta },
+  ): Invoice {
+    const customer = this.ctx.svc.billing.requireCustomer(orgId, invoice.customer);
+    const locale = this.locale(orgId);
+    const shown = formatMoney(money(amount, invoice.currency), { locale });
+    const txn = this.billing.adjustBalance(orgId, customer.id, amount, {
+      type: 'invoice_overpayment',
+      description: `${shown} of the credit invoice ${invoice.number} put on this account went back with the money that made it. ${opts.note}`,
+      subscription: invoice.subscription, invoice: invoice.id, createdAt: opts.at,
+    });
+    this.ctx.emit(orgId, 'invoice.overpayment_reversed', {
+      invoice: invoice.id, number: invoice.number, customer: customer.id,
+      subscription: invoice.subscription,
+      amount, currency: invoice.currency,
+      amount_overpaid: this.overpaidOn(orgId, invoice.id),
+      balance_transaction: txn.id, customer_balance: txn.ending_balance,
+      note: opts.note,
+      resolution: `${shown} was collected past what ${invoice.number} was owed and credited to ${customer.name}'s account. That cash has now gone back to them, so the credit went with it — the bill itself is unchanged, because it never held this money.`,
+    }, {
+      objectId: invoice.id, objectType: 'invoice',
+      actorId: opts.meta?.actorId, actorType: opts.meta?.actorType, requestId: opts.meta?.requestId,
+    });
+    return this.billing.invoices.require(orgId, invoice.id);
   }
 
   /* --------------------------------- refunds ------------------------------ */
@@ -1169,8 +1403,16 @@ export class Gateway {
           // The money is gone and will not be collected: that is precisely what
           // "uncollectible" means. Billing hears this and moves the subscription
           // to `unpaid` through its own transition.
+          //
+          // Only for a bill that is actually still owed, though. A withdrawal
+          // does not always leave one: it comes off the customer's overpayment
+          // credit first, and a bill can also have been collected again while
+          // the case was open. Either way the invoice is settled, there is
+          // nothing to write off — and billing refuses to write off a paid bill,
+          // which took the whole close down with it and left the deadline job
+          // failing on every run, so the dispute could never be closed at all.
           const invoice = this.billing.invoices.require(orgId, dispute.invoice);
-          if (invoice.status !== 'uncollectible' && invoice.status !== 'void') {
+          if (invoice.status === 'open' && invoice.amount_due > 0) {
             this.billing.invoices.markUncollectible(orgId, dispute.invoice, meta, now);
           }
           this.payments.dunning.stopFor(orgId, dispute.invoice, `Dispute ${id} was lost, so there is nothing left to recover.`);

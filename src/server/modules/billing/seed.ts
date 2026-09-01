@@ -160,6 +160,17 @@ export function seedBilling(ctx: Ctx, orgId: string): void {
       'Payable by ACH, wire or card in the currency shown. Bank details are on your account under Billing \u2192 Payment methods. Quote the invoice number on the remittance advice, and send queries to ar@northwind.io.',
   });
 
+  // Northwind has not turned the tax-location hold on. Its own book is fully
+  // addressed — every account here came from a CRM company with a country on
+  // it — so the hold would never fire on this data; what it would catch is the
+  // accounts someone creates by hand while trying the product out, and refusing
+  // to bill those is not how a workspace should introduce itself. Nothing is
+  // hidden by leaving it off: every bill still carries `automatic_tax.status`,
+  // the overview still counts what could not be placed, and
+  // GET /v1/invoices?tax=missing still finds it. Turning it on is what a
+  // finance team does the day it starts selling somewhere it must not guess at.
+  ctx.svc.core.setSetting(orgId, 'billing.automatic_tax', { enabled: false });
+
   const priceOf = (lookupKey: string): string => {
     const price = ctx.svc.catalog.priceByLookupKey(orgId, lookupKey);
     if (!price) throw new Error(`Billing seed expects catalog price "${lookupKey}"`);

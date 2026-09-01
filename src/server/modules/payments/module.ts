@@ -62,6 +62,39 @@ const localeOf = (ctx: Ctx, orgId: string): string => {
   catch { return 'en-US'; }
 };
 
+/**
+ * Has the workspace decided this account is not to be presented automatically?
+ *
+ * `unpaid` and `paused` mean the same thing here — bills keep being raised and
+ * nobody presents a card for them — and every *automatic* door into
+ * `collectInvoice` has to ask the question at the moment it charges, not at the
+ * moment it decided to. A person makes this decision, and it lands whenever
+ * they make it: between the invoice being finalised and the collection job
+ * running it, or between one scheduled retry and the next. Reading it once and
+ * carrying the answer is how a pause is honoured by the code that queues the
+ * work and stood down by the code that does it.
+ *
+ * A human clicking "retry now", and the agent tool that needs a human's
+ * approval before it runs, deliberately do not ask: overriding the pause for
+ * one bill is exactly what those two are for.
+ */
+const collectionStoppedFor = (ctx: Ctx, orgId: string, subscriptionId: string | null): boolean => {
+  if (!subscriptionId) return false;
+  const sub = ctx.svc.billing.subscription(orgId, subscriptionId);
+  return !!sub && (sub.status === 'unpaid' || sub.status === 'paused');
+};
+
+/**
+ * The two statuses that mean an account is being collected normally again.
+ *
+ * `past_due` is deliberately not one of them. It is an arrears state whose
+ * whole schedule belongs to the recovery campaign that put it there, so
+ * treating it as "collection is back on" would present every other bill on the
+ * account in the same instant a retry was refused — a decline answered by three
+ * more presentations.
+ */
+const COLLECTED_AGAIN: readonly string[] = ['active', 'trialing'];
+
 /* ------------------------------- validators ------------------------------- */
 
 const methodCreateBody = v.object({
@@ -214,7 +247,15 @@ export default defineModule({
     ctx.jobs.handle('payments.collect_invoice', (payload: { invoice: string }, job) => {
       const invoice = billing.invoices.invoice(job.org_id, payload.invoice);
       if (!invoice) return;
-      if (store.gateway.uncollectableReason(invoice)) return;
+      if (store.gateway.notCollectableNow(job.org_id, invoice)) return;
+      // The pause was read when this job was queued. It has to be read again
+      // here, because the queue is not instant: the decision to stop charging
+      // an account is made by a person, and it lands in the window between the
+      // bill being finalised and the job running it. Trusting the earlier read
+      // is how a pause is honoured by the check that queued the work and stood
+      // down by the one that does it — the same mistake the retry schedule was
+      // making, one entry point along.
+      if (collectionStoppedFor(ctx, job.org_id, invoice.subscription)) return;
       store.gateway.collectInvoice(job.org_id, invoice.id, { source: 'invoice_collection', meta: { actorType: 'system' } });
     });
 
@@ -243,13 +284,11 @@ export default defineModule({
       const invoice = event.data as Invoice;
       if (!invoice?.id || invoice.status !== 'open') return;
       if (invoice.collection_method !== 'charge_automatically' || invoice.amount_due <= 0) return;
-      if (invoice.subscription) {
-        // `unpaid` and `paused` both mean the same thing to this module: bills
-        // keep being raised, and nobody is charging a card for them. Presenting
-        // anyway would make both settings meaningless.
-        const sub = ctx.svc.billing.subscription(event.org_id, invoice.subscription);
-        if (sub && (sub.status === 'unpaid' || sub.status === 'paused')) return;
-      }
+      // `unpaid` and `paused` both mean the same thing to this module: bills
+      // keep being raised, and nobody is charging a card for them. Presenting
+      // anyway would make both settings meaningless. Asked again by the job
+      // itself, because this answer goes stale the moment it is given.
+      if (collectionStoppedFor(ctx, event.org_id, invoice.subscription)) return;
       if (!store.methods.defaultFor(event.org_id, invoice.customer)) return;
       ctx.enqueue(event.org_id, 'payments.collect_invoice', { invoice: invoice.id }, {
         idemKey: `payments.collect_invoice:${invoice.id}`,
@@ -257,19 +296,67 @@ export default defineModule({
     }, 'payments');
 
     /**
-     * Settled by something other than a charge — a human marking it paid, a
-     * credit note covering it, account balance absorbing it. Whatever it was,
-     * there is no longer anything to recover.
+     * Collection is on again, so the bills the stop held back are presented.
+     *
+     * The mirror of `collectionStoppedFor`, and the module is wrong without it.
+     * That check stands the automatic charge down at the moment it would
+     * charge — which spends the queued job — and the retry schedule stands
+     * itself down the same way. Nothing puts either back: `invoice.finalized`
+     * fires once per bill and has already fired, and a campaign cancelled by
+     * the stop stays cancelled. So a pause honoured on every path is also a
+     * pause nothing ever ends — the account is resumed, the money is still
+     * owed, and no automatic path will ever ask for it again. Stopping
+     * collection means "not now"; only a credit note or a write-off means
+     * "not ever".
+     *
+     * `subscription.updated` is the one event every transition emits, so both
+     * ways back are covered by one rule: a pause lifted, and an account marked
+     * unpaid that has been revived. The subscription and its bills are read
+     * again rather than taken from the event, because the answer this acts on
+     * is the live one the collection job will ask for itself.
+     */
+    ctx.events.on('subscription.updated', (event) => {
+      const previous = event.previous as { status?: unknown } | null;
+      const was = previous?.status;
+      if (was !== 'paused' && was !== 'unpaid') return;
+      const subscriptionId = event.object_id;
+      if (!subscriptionId) return;
+      const sub = ctx.svc.billing.subscription(event.org_id, subscriptionId);
+      if (!sub || !COLLECTED_AGAIN.includes(sub.status)) return;
+      if (!store.methods.defaultFor(event.org_id, sub.customer)) return;
+      const held = billing.invoices.list(event.org_id, {
+        subscription: subscriptionId, status: 'open',
+        collection_method: 'charge_automatically', limit: 200,
+      }).data;
+      for (const invoice of held) {
+        if (invoice.amount_due <= 0) continue;
+        // A campaign still recovering owns its own next window. Presenting here
+        // would spend one of its attempts early and put a second instruction on
+        // money its schedule is already chasing; `runScheduledAttempt` asks the
+        // same question this handler does when that window comes round.
+        if (store.dunning.forInvoice(event.org_id, invoice.id)?.status === 'recovering') continue;
+        ctx.enqueue(event.org_id, 'payments.collect_invoice', { invoice: invoice.id }, {
+          idemKey: `payments.collect_invoice:${invoice.id}`,
+        });
+      }
+    }, 'payments');
+
+    /**
+     * The bill is settled, however it got there — a charge, a human marking it
+     * paid, a credit note covering it, account balance absorbing it. There is
+     * nothing left to recover, so nothing is left chasing it.
+     *
+     * This runs for a bill settled by a charge too, and has to: a campaign that
+     * has taken a part payment stays open to present the difference, so a credit
+     * note that clears that difference is the *only* thing that ends it. It is
+     * safe on the charge path because events dispatch after the transaction
+     * commits — by then `onCollectionSucceeded` has already closed the campaign
+     * as recovered, and `stopFor` touches nothing that is not still recovering.
      */
     ctx.events.on('invoice.paid', (event) => {
       const invoiceId = event.object_id;
       if (!invoiceId) return;
-      const byCharge = ctx.db.count(
-        `SELECT COUNT(*) FROM payments_charges WHERE org_id = ? AND invoice_id = ? AND status = 'succeeded'`,
-        event.org_id, invoiceId,
-      );
-      if (byCharge > 0) return;
-      store.dunning.stopFor(event.org_id, invoiceId, 'The invoice was settled outside the retry schedule, so recovery stopped.');
+      store.dunning.stopFor(event.org_id, invoiceId, 'The invoice was settled, so recovery stopped.');
     }, 'payments');
 
     ctx.events.on('invoice.voided', (event) => {
@@ -596,7 +683,7 @@ export default defineModule({
       const disputes = store.gateway.listDisputes(orgId, { invoice: invoice.id, status: 'all', limit: 100 }).data;
       const campaign = store.dunning.forInvoice(orgId, invoice.id);
       const overpaid = store.gateway.overpaidOn(orgId, invoice.id);
-      const blocked = store.gateway.uncollectableReason(invoice);
+      const blocked = store.gateway.notCollectableNow(orgId, invoice);
       const refunded = refunds.reduce((total, refund) => total + refund.amount, 0);
       const held = disputes
         .filter((dispute) => dispute.status === 'needs_response' || dispute.status === 'under_review' || dispute.status === 'lost')
@@ -651,7 +738,7 @@ export default defineModule({
       const store = paymentsStore(c);
       const orgId = req.auth.orgId;
       const invoice = billingStore(c).billing.invoices.require(orgId, req.params.id);
-      const blocked = store.gateway.uncollectableReason(invoice);
+      const blocked = store.gateway.notCollectableNow(orgId, invoice);
       if (blocked) throw conflict('invoice_not_collectable', blocked, { status: invoice.status, amount_due: invoice.amount_due });
       const body = req.body as { payment_method?: string; off_session?: boolean } | undefined;
       const result = store.gateway.collectInvoice(orgId, invoice.id, {
@@ -773,7 +860,7 @@ export default defineModule({
         run: (args: { invoice: string }, c: Ctx, meta) => {
           const store = paymentsStore(c);
           const invoice = billingStore(c).billing.invoices.require(meta.orgId, args.invoice);
-          const blocked = store.gateway.uncollectableReason(invoice);
+          const blocked = store.gateway.notCollectableNow(meta.orgId, invoice);
           if (blocked) return { object: 'collection_attempt', collected: false, summary: blocked };
           const result = store.gateway.collectInvoice(meta.orgId, invoice.id, {
             source: 'manual_retry', meta: { actorType: 'agent', actorId: meta.actorId ?? null },

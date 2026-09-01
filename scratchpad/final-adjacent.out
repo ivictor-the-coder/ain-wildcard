@@ -1,0 +1,890 @@
+TAP version 13
+# (node:25565) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: the billing cycle anchor
+    # Subtest: a subscription anchored on the 31st bills the 28th in February and returns to the 31st
+    ok 1 - a subscription anchored on the 31st bills the 28th in February and returns to the 31st
+      ---
+      duration_ms: 1718.343398
+      type: 'test'
+      ...
+    # Subtest: a leap February takes the 29th
+    ok 2 - a leap February takes the 29th
+      ---
+      duration_ms: 2533.2098
+      type: 'test'
+      ...
+    # Subtest: a subscription that starts mid-cycle pays only for the rest of the month
+    ok 3 - a subscription that starts mid-cycle pays only for the rest of the month
+      ---
+      duration_ms: 5.246897
+      type: 'test'
+      ...
+    # Subtest: a renewal job that names a period the subscription has already left does nothing
+    ok 4 - a renewal job that names a period the subscription has already left does nothing
+      ---
+      duration_ms: 263.724874
+      type: 'test'
+      ...
+    1..4
+ok 1 - the billing cycle anchor
+  ---
+  duration_ms: 7030.131173
+  type: 'suite'
+  ...
+# Subtest: the anchor day
+    # Subtest: naming the day and naming the instant are two spellings of one cycle
+    ok 1 - naming the day and naming the instant are two spellings of one cycle
+      ---
+      duration_ms: 2971.139117
+      type: 'test'
+      ...
+    # Subtest: no period is ever longer than the interval it is a part of
+    ok 2 - no period is ever longer than the interval it is a part of
+      ---
+      duration_ms: 8390.448303
+      type: 'test'
+      ...
+    # Subtest: an anchor day that contradicts the anchor instant is refused, not silently picked between
+    ok 3 - an anchor day that contradicts the anchor instant is refused, not silently picked between
+      ---
+      duration_ms: 2459.283133
+      type: 'test'
+      ...
+    # Subtest: an anchor day means nothing on a weekly cycle, and says so
+    ok 4 - an anchor day means nothing on a weekly cycle, and says so
+      ---
+      duration_ms: 2525.044559
+      type: 'test'
+      ...
+    # Subtest: the first paid period after a trial covers only the days up to the billing day
+    ok 5 - the first paid period after a trial covers only the days up to the billing day
+      ---
+      duration_ms: 3223.971328
+      type: 'test'
+      ...
+    # Subtest: a change inside a part-period credits against the interval, never more than was charged
+    ok 6 - a change inside a part-period credits against the interval, never more than was charged
+      ---
+      duration_ms: 2229.097757
+      type: 'test'
+      ...
+    1..6
+ok 2 - the anchor day
+  ---
+  duration_ms: 21799.988849
+  type: 'suite'
+  ...
+# Subtest: proration
+    # Subtest: an upgrade at exactly half a period credits and charges symmetrically
+    ok 1 - an upgrade at exactly half a period credits and charges symmetrically
+      ---
+      duration_ms: 7.155158
+      type: 'test'
+      ...
+    # Subtest: a quantity change prorates only the difference in seats it is charged for
+    ok 2 - a quantity change prorates only the difference in seats it is charged for
+      ---
+      duration_ms: 6.247149
+      type: 'test'
+      ...
+    # Subtest: two changes in one cycle compose — the second prorates against the first
+    ok 3 - two changes in one cycle compose — the second prorates against the first
+      ---
+      duration_ms: 13.217466
+      type: 'test'
+      ...
+    # Subtest: the preview is the charge, line for line and to the cent
+    ok 4 - the preview is the charge, line for line and to the cent
+      ---
+      duration_ms: 20.373483
+      type: 'test'
+      ...
+    # Subtest: a downgrade is invoiced as a credit line, never collected and never routed around the bill
+    ok 5 - a downgrade is invoiced as a credit line, never collected and never routed around the bill
+      ---
+      duration_ms: 27.006488
+      type: 'test'
+      ...
+    # Subtest: proration never applies to a metered item
+    ok 6 - proration never applies to a metered item
+      ---
+      duration_ms: 11.519714
+      type: 'test'
+      ...
+    # Subtest: changes during a trial are free, and moving the anchor charges a whole new period
+    ok 7 - changes during a trial are free, and moving the anchor charges a whole new period
+      ---
+      duration_ms: 9.11016
+      type: 'test'
+      ...
+    # Subtest: proration_behavior=none moves the items and charges nothing
+    ok 8 - proration_behavior=none moves the items and charges nothing
+      ---
+      duration_ms: 6.880103
+      type: 'test'
+      ...
+    1..8
+ok 3 - proration
+  ---
+  duration_ms: 2254.400491
+  type: 'suite'
+  ...
+# Subtest: changing the billing cadence
+    # Subtest: "switch me to annual" moves the whole subscription onto the year
+    ok 1 - "switch me to annual" moves the whole subscription onto the year
+      ---
+      duration_ms: 6170.999806
+      type: 'test'
+      ...
+    # Subtest: a cadence change while the cycle is pinned is a contradiction, and names both cadences
+    ok 2 - a cadence change while the cycle is pinned is a contradiction, and names both cadences
+      ---
+      duration_ms: 2510.579559
+      type: 'test'
+      ...
+    # Subtest: switching cadence inside a trial moves the cycle, not the free time
+    ok 3 - switching cadence inside a trial moves the cycle, not the free time
+      ---
+      duration_ms: 3639.983867
+      type: 'test'
+      ...
+    # Subtest: a schedule phase on another cadence takes the subscription onto it
+    ok 4 - a schedule phase on another cadence takes the subscription onto it
+      ---
+      duration_ms: 4379.507733
+      type: 'test'
+      ...
+    1..4
+ok 4 - changing the billing cadence
+  ---
+  duration_ms: 16701.538076
+  type: 'suite'
+  ...
+# Subtest: the subscription lifecycle
+    # Subtest: cancel at period end fires exactly once, and nothing bills afterwards
+    ok 1 - cancel at period end fires exactly once, and nothing bills afterwards
+      ---
+      duration_ms: 4906.071556
+      type: 'test'
+      ...
+    # Subtest: a trial converts on its end date and starts the first paid period there
+    ok 2 - a trial converts on its end date and starts the first paid period there
+      ---
+      duration_ms: 127.731014
+      type: 'test'
+      ...
+    # Subtest: a trial with nothing to charge follows its end_behavior
+    ok 3 - a trial with nothing to charge follows its end_behavior
+      ---
+      duration_ms: 84.501967
+      type: 'test'
+      ...
+    # Subtest: pausing keeps the cycle running, and a resume date brings it back on its own
+    ok 4 - pausing keeps the cycle running, and a resume date brings it back on its own
+      ---
+      duration_ms: 463.46103
+      type: 'test'
+      ...
+    # Subtest: an immediate cancellation can hand back the unused remainder as credit
+    ok 5 - an immediate cancellation can hand back the unused remainder as credit
+      ---
+      duration_ms: 10.935468
+      type: 'test'
+      ...
+    # Subtest: an incomplete subscription expires if the first payment never arrives
+    ok 6 - an incomplete subscription expires if the first payment never arrives
+      ---
+      duration_ms: 50.564125
+      type: 'test'
+      ...
+    # Subtest: every renewal hands invoicing a complete brief
+    ok 7 - every renewal hands invoicing a complete brief
+      ---
+      duration_ms: 346.786316
+      type: 'test'
+      ...
+    # Subtest: over a year, what the ledger recognises is exactly what invoicing was asked for
+    ok 8 - over a year, what the ledger recognises is exactly what invoicing was asked for
+      ---
+      duration_ms: 23815.743409
+      type: 'test'
+      ...
+    # Subtest: resuming can restart the cycle from today instead of picking up the old one
+    ok 9 - resuming can restart the cycle from today instead of picking up the old one
+      ---
+      duration_ms: 9.277806
+      type: 'test'
+      ...
+    # Subtest: the status machine refuses moves that make no sense, and says what it would accept
+    ok 10 - the status machine refuses moves that make no sense, and says what it would accept
+      ---
+      duration_ms: 9.003978
+      type: 'test'
+      ...
+    1..10
+ok 5 - the subscription lifecycle
+  ---
+  duration_ms: 32467.344838
+  type: 'suite'
+  ...
+# Subtest: subscription schedules
+    # Subtest: a three-phase ramp advances in order across a year of the time machine
+    ok 1 - a three-phase ramp advances in order across a year of the time machine
+      ---
+      duration_ms: 3587.754686
+      type: 'test'
+      ...
+    # Subtest: a schedule that cancels at the end takes the subscription with it
+    ok 2 - a schedule that cancels at the end takes the subscription with it
+      ---
+      duration_ms: 721.894035
+      type: 'test'
+      ...
+    # Subtest: releasing a schedule leaves the subscription exactly as it is
+    ok 3 - releasing a schedule leaves the subscription exactly as it is
+      ---
+      duration_ms: 327.601758
+      type: 'test'
+      ...
+    # Subtest: a phase that cannot say how long it lasts is rejected before anything is written
+    ok 4 - a phase that cannot say how long it lasts is rejected before anything is written
+      ---
+      duration_ms: 1.460106
+      type: 'test'
+      ...
+    1..4
+ok 6 - subscription schedules
+  ---
+  duration_ms: 6885.37135
+  type: 'suite'
+  ...
+# Subtest: customers
+    # Subtest: currency is fixed once the account has been billed
+    ok 1 - currency is fixed once the account has been billed
+      ---
+      duration_ms: 6.136137
+      type: 'test'
+      ...
+    # Subtest: one CRM company has exactly one billing customer
+    ok 2 - one CRM company has exactly one billing customer
+      ---
+      duration_ms: 0.764434
+      type: 'test'
+      ...
+    # Subtest: the summary is one screen with everything a support agent needs
+    ok 3 - the summary is one screen with everything a support agent needs
+      ---
+      duration_ms: 7.774123
+      type: 'test'
+      ...
+    # Subtest: a customer with live subscriptions cannot be deleted out from under them
+    ok 4 - a customer with live subscriptions cannot be deleted out from under them
+      ---
+      duration_ms: 6.435646
+      type: 'test'
+      ...
+    # Subtest: search finds accounts by name, email and whether they still buy anything
+    ok 5 - search finds accounts by name, email and whether they still buy anything
+      ---
+      duration_ms: 5.796901
+      type: 'test'
+      ...
+    1..5
+ok 7 - customers
+  ---
+  duration_ms: 2115.396657
+  type: 'suite'
+  ...
+# Subtest: what billing refuses to do
+    # Subtest: every item on a subscription must share one billing interval
+    ok 1 - every item on a subscription must share one billing interval
+      ---
+      duration_ms: 8.061107
+      type: 'test'
+      ...
+    # Subtest: a flat plan fee has no quantity — the engine bills it the same at any number
+    ok 2 - a flat plan fee has no quantity — the engine bills it the same at any number
+      ---
+      duration_ms: 6.317129
+      type: 'test'
+      ...
+    # Subtest: dropping a per-unit line to zero credits exactly what it stops charging
+    ok 3 - dropping a per-unit line to zero credits exactly what it stops charging
+      ---
+      duration_ms: 7.846141
+      type: 'test'
+      ...
+    # Subtest: a one-time price belongs on an invoice, not a subscription
+    ok 4 - a one-time price belongs on an invoice, not a subscription
+      ---
+      duration_ms: 0.825951
+      type: 'test'
+      ...
+    # Subtest: the same price cannot appear twice
+    ok 5 - the same price cannot appear twice
+      ---
+      duration_ms: 0.719524
+      type: 'test'
+      ...
+    # Subtest: a negotiated price has to arrive with its negotiated number
+    ok 6 - a negotiated price has to arrive with its negotiated number
+      ---
+      duration_ms: 6.347514
+      type: 'test'
+      ...
+    # Subtest: a subscription cannot be emptied — that is a cancellation
+    ok 7 - a subscription cannot be emptied — that is a cancellation
+      ---
+      duration_ms: 5.510456
+      type: 'test'
+      ...
+    # Subtest: naming a price already on the subscription updates it instead of adding a second line
+    ok 8 - naming a price already on the subscription updates it instead of adding a second line
+      ---
+      duration_ms: 8.128668
+      type: 'test'
+      ...
+    # Subtest: a proration date outside the period is refused, not quietly clamped
+    ok 9 - a proration date outside the period is refused, not quietly clamped
+      ---
+      duration_ms: 4.021492
+      type: 'test'
+      ...
+    # Subtest: a trial cannot be bolted onto a subscription that is already running
+    ok 10 - a trial cannot be bolted onto a subscription that is already running
+      ---
+      duration_ms: 4.696138
+      type: 'test'
+      ...
+    # Subtest: a subscription cannot be backdated to a day that has not happened yet
+    ok 11 - a subscription cannot be backdated to a day that has not happened yet
+      ---
+      duration_ms: 5.289036
+      type: 'test'
+      ...
+    # Subtest: a cancellation cannot be scheduled for a date that has already passed
+    ok 12 - a cancellation cannot be scheduled for a date that has already passed
+      ---
+      duration_ms: 6.940856
+      type: 'test'
+      ...
+    # Subtest: an unknown price is a 404 that names what was asked for
+    ok 13 - an unknown price is a 404 that names what was asked for
+      ---
+      duration_ms: 0.93442
+      type: 'test'
+      ...
+    1..13
+ok 8 - what billing refuses to do
+  ---
+  duration_ms: 2114.825835
+  type: 'suite'
+  ...
+# Subtest: invoices
+    # Subtest: an invoice is raised for the period a subscription enters, and its lines add up
+    ok 1 - an invoice is raised for the period a subscription enters, and its lines add up
+      ---
+      duration_ms: 5.613636
+      type: 'test'
+      ...
+    # Subtest: the previewed invoice is the invoice, line for line
+    ok 2 - the previewed invoice is the invoice, line for line
+      ---
+      duration_ms: 919.053063
+      type: 'test'
+      ...
+    # Subtest: the stub period after a trial is previewed, and billed, as a stub
+    ok 3 - the stub period after a trial is previewed, and billed, as a stub
+      ---
+      duration_ms: 2719.565935
+      type: 'test'
+      ...
+    # Subtest: a downgrade rides the next invoice as a credit line, and nets against the new plan
+    ok 4 - a downgrade rides the next invoice as a credit line, and nets against the new plan
+      ---
+      duration_ms: 234.055775
+      type: 'test'
+      ...
+    # Subtest: an invoice a credit balance covers in full is settled at zero, not paid out
+    ok 5 - an invoice a credit balance covers in full is settled at zero, not paid out
+      ---
+      duration_ms: 4.807158
+      type: 'test'
+      ...
+    # Subtest: pausing collection decides what happens to the bills raised while it is paused
+    ok 6 - pausing collection decides what happens to the bills raised while it is paused
+      ---
+      duration_ms: 659.79471
+      type: 'test'
+      ...
+    # Subtest: voiding an invoice puts back everything it claimed
+    ok 7 - voiding an invoice puts back everything it claimed
+      ---
+      duration_ms: 221.240592
+      type: 'test'
+      ...
+    # Subtest: a paid invoice does not clear an account that still owes an older one
+    ok 8 - a paid invoice does not clear an account that still owes an older one
+      ---
+      duration_ms: 238.485354
+      type: 'test'
+      ...
+    # Subtest: a metered-only cycle raises no invoice, because nothing is billable in advance
+    ok 9 - a metered-only cycle raises no invoice, because nothing is billable in advance
+      ---
+      duration_ms: 229.666867
+      type: 'test'
+      ...
+    # Subtest: every invoice in the workspace reconciles, after a year of the time machine
+    ok 10 - every invoice in the workspace reconciles, after a year of the time machine
+      ---
+      duration_ms: 4322.585492
+      type: 'test'
+      ...
+    # Subtest: what a subscription was invoiced for its periods is what its ledger recognised
+    ok 11 - what a subscription was invoiced for its periods is what its ledger recognised
+      ---
+      duration_ms: 18.553481
+      type: 'test'
+      ...
+    # Subtest: what every account was asked to pay is what it was billed, less what it was credited
+    ok 12 - what every account was asked to pay is what it was billed, less what it was credited
+      ---
+      duration_ms: 15.260078
+      type: 'test'
+      ...
+    1..12
+ok 9 - invoices
+  ---
+  duration_ms: 11716.16101
+  type: 'suite'
+  ...
+# Subtest: Northwind's book of business
+    # Subtest: seeds a real subscription book across the whole ladder
+    ok 1 - seeds a real subscription book across the whole ladder
+      ---
+      duration_ms: 21.258494
+      type: 'test'
+      ...
+    # Subtest: every billing customer is one of the CRM companies
+    ok 2 - every billing customer is one of the CRM companies
+      ---
+      duration_ms: 14.051649
+      type: 'test'
+      ...
+    # Subtest: eighteen months of recognised revenue are on the books
+    ok 3 - eighteen months of recognised revenue are on the books
+      ---
+      duration_ms: 20.999467
+      type: 'test'
+      ...
+    # Subtest: two upgrades are already in the history, priced by the same proration function
+    ok 4 - two upgrades are already in the history, priced by the same proration function
+      ---
+      duration_ms: 0.632966
+      type: 'test'
+      ...
+    # Subtest: one schedule is mid-phase and survives a year of the time machine
+    ok 5 - one schedule is mid-phase and survives a year of the time machine
+      ---
+      duration_ms: 4019.575709
+      type: 'test'
+      ...
+    # Subtest: no subscription in the book ever ended before it began
+    ok 6 - no subscription in the book ever ended before it began
+      ---
+      duration_ms: 6.999568
+      type: 'test'
+      ...
+    # Subtest: the copilot can find an account, price a change and never guess
+    ok 7 - the copilot can find an account, price a change and never guess
+      ---
+      duration_ms: 13.223943
+      type: 'test'
+      ...
+    1..7
+ok 10 - Northwind's book of business
+  ---
+  duration_ms: 6424.570646
+  type: 'suite'
+  ...
+# Subtest: tax
+    # Subtest: the seeded workspace collects where it is registered, and nowhere else
+    ok 1 - the seeded workspace collects where it is registered, and nowhere else
+      ---
+      duration_ms: 1.677438
+      type: 'test'
+      ...
+    # Subtest: an exclusive price adds tax on top; an inclusive one has it taken out
+    ok 2 - an exclusive price adds tax on top; an inclusive one has it taken out
+      ---
+      duration_ms: 13.089351
+      type: 'test'
+      ...
+    # Subtest: the previewed invoice matches the issued one to the cent, tax included
+    ok 3 - the previewed invoice matches the issued one to the cent, tax included
+      ---
+      duration_ms: 920.060583
+      type: 'test'
+      ...
+    # Subtest: an EU business with a verified VAT number is reverse charged, and the invoice says so
+    ok 4 - an EU business with a verified VAT number is reverse charged, and the invoice says so
+      ---
+      duration_ms: 10.282079
+      type: 'test'
+      ...
+    # Subtest: an exempt account names the rate it would have paid and is charged nothing
+    ok 5 - an exempt account names the rate it would have paid and is charged nothing
+      ---
+      duration_ms: 6.360981
+      type: 'test'
+      ...
+    # Subtest: an address with no registered rate is charged nothing, and the line says why
+    ok 6 - an address with no registered rate is charged nothing, and the line says why
+      ---
+      duration_ms: 5.077561
+      type: 'test'
+      ...
+    # Subtest: an invoice keeps the rate it was raised under after that rate is retired
+    ok 7 - an invoice keeps the rate it was raised under after that rate is retired
+      ---
+      duration_ms: 8.386493
+      type: 'test'
+      ...
+    # Subtest: a mid-cycle downgrade credits the tax it charged, and the sign of the net changes nothing
+    ok 8 - a mid-cycle downgrade credits the tax it charged, and the sign of the net changes nothing
+      ---
+      duration_ms: 557.494138
+      type: 'test'
+      ...
+    # Subtest: a registration number that is not one is refused before it can zero-rate anything
+    ok 9 - a registration number that is not one is refused before it can zero-rate anything
+      ---
+      duration_ms: 1.867608
+      type: 'test'
+      ...
+    # Subtest: reverse charge needs a verified number and a border to cross
+    ok 10 - reverse charge needs a verified number and a border to cross
+      ---
+      duration_ms: 21.409796
+      type: 'test'
+      ...
+    # Subtest: a credit is taxed the way the charge it reverses was, whatever the currency does
+    ok 11 - a credit is taxed the way the charge it reverses was, whatever the currency does
+      ---
+      duration_ms: 9.97309
+      type: 'test'
+      ...
+    # Subtest: a percentage has to be an exact decimal, and a country has to be one we can match
+    ok 12 - a percentage has to be an exact decimal, and a country has to be one we can match
+      ---
+      duration_ms: 0.425479
+      type: 'test'
+      ...
+    1..12
+ok 11 - tax
+  ---
+  duration_ms: 3796.644168
+  type: 'suite'
+  ...
+# Subtest: credit notes
+    # Subtest: an open invoice is reduced, and the note carries the tax it reversed
+    ok 1 - an open invoice is reduced, and the note carries the tax it reversed
+      ---
+      duration_ms: 8.173796
+      type: 'test'
+      ...
+    # Subtest: a paid invoice is credited onto the account balance instead
+    ok 2 - a paid invoice is credited onto the account balance instead
+      ---
+      duration_ms: 6.689897
+      type: 'test'
+      ...
+    # Subtest: paying a bill a credit note already reduced collects the reduced amount, never the face value
+    ok 3 - paying a bill a credit note already reduced collects the reduced amount, never the face value
+      ---
+      duration_ms: 11.146578
+      type: 'test'
+      ...
+    # Subtest: a credit note is refused, never clamped, when it exceeds what is left
+    ok 4 - a credit note is refused, never clamped, when it exceeds what is left
+      ---
+      duration_ms: 7.643823
+      type: 'test'
+      ...
+    # Subtest: a line can only be credited for what it was billed, and only on its own invoice
+    ok 5 - a line can only be credited for what it was billed, and only on its own invoice
+      ---
+      duration_ms: 9.581932
+      type: 'test'
+      ...
+    # Subtest: voiding a note puts back exactly what it took
+    ok 6 - voiding a note puts back exactly what it took
+      ---
+      duration_ms: 6.925477
+      type: 'test'
+      ...
+    # Subtest: a draft or voided invoice cannot be credited at all
+    ok 7 - a draft or voided invoice cannot be credited at all
+      ---
+      duration_ms: 5.558591
+      type: 'test'
+      ...
+    # Subtest: every credit note is listed, retrievable and attached to its invoice
+    ok 8 - every credit note is listed, retrievable and attached to its invoice
+      ---
+      duration_ms: 6.023808
+      type: 'test'
+      ...
+    1..8
+ok 12 - credit notes
+  ---
+  duration_ms: 1959.370932
+  type: 'suite'
+  ...
+# Subtest: cancel_at in the past
+    # Subtest: creating a subscription with a cancel_at that has passed is refused
+    ok 1 - creating a subscription with a cancel_at that has passed is refused
+      ---
+      duration_ms: 2.28903
+      type: 'test'
+      ...
+    # Subtest: patching a subscription onto a past cancel_at is refused
+    ok 2 - patching a subscription onto a past cancel_at is refused
+      ---
+      duration_ms: 5.322521
+      type: 'test'
+      ...
+    # Subtest: scheduling a cancellation in the past through /cancel is refused
+    ok 3 - scheduling a cancellation in the past through /cancel is refused
+      ---
+      duration_ms: 6.057137
+      type: 'test'
+      ...
+    # Subtest: no cancellation in the whole seeded book predates the subscription it ends
+    ok 4 - no cancellation in the whole seeded book predates the subscription it ends
+      ---
+      duration_ms: 10.7101
+      type: 'test'
+      ...
+    1..4
+ok 13 - cancel_at in the past
+  ---
+  duration_ms: 2315.915471
+  type: 'suite'
+  ...
+# Subtest: the invoice document
+    # Subtest: renders a complete printable bill with the tax on it
+    ok 1 - renders a complete printable bill with the tax on it
+      ---
+      duration_ms: 10.467287
+      type: 'test'
+      ...
+    # Subtest: the document shows a credit note raised against the bill, and escapes what a customer typed
+    ok 2 - the document shows a credit note raised against the bill, and escapes what a customer typed
+      ---
+      duration_ms: 7.801683
+      type: 'test'
+      ...
+    # Subtest: a reverse-charged bill explains its zero on the page
+    ok 3 - a reverse-charged bill explains its zero on the page
+      ---
+      duration_ms: 10.289518
+      type: 'test'
+      ...
+    # Subtest: a bill that is worth money back says so, and says where the money went
+    ok 4 - a bill that is worth money back says so, and says where the money went
+      ---
+      duration_ms: 632.002343
+      type: 'test'
+      ...
+    # Subtest: an invoice that does not exist is a 404, not an empty page
+    ok 5 - an invoice that does not exist is a 404, not an empty page
+      ---
+      duration_ms: 0.390055
+      type: 'test'
+      ...
+    1..5
+ok 14 - the invoice document
+  ---
+  duration_ms: 2962.021026
+  type: 'suite'
+  ...
+# Subtest: an invoice Ain could not place
+    # Subtest: a zero nobody decided on is not the same answer as a zero somebody did
+    ok 1 - a zero nobody decided on is not the same answer as a zero somebody did
+      ---
+      duration_ms: 29.57825
+      type: 'test'
+      ...
+    # Subtest: a held bill priced again spends the account credit the new tax needs
+    ok 2 - a held bill priced again spends the account credit the new tax needs
+      ---
+      duration_ms: 6.346986
+      type: 'test'
+      ...
+    # Subtest: recording a payment does not walk a held bill past the hold
+    ok 3 - recording a payment does not walk a held bill past the hold
+      ---
+      duration_ms: 6.518413
+      type: 'test'
+      ...
+    # Subtest: a workspace that opts out is still told, it is just not held up
+    ok 4 - a workspace that opts out is still told, it is just not held up
+      ---
+      duration_ms: 9.102017
+      type: 'test'
+      ...
+    1..4
+ok 15 - an invoice Ain could not place
+  ---
+  duration_ms: 1985.341801
+  type: 'suite'
+  ...
+# Subtest: jurisdictions that stack
+    # Subtest: a New York bill charges the state, the city and the transit district, and names all three
+    ok 1 - a New York bill charges the state, the city and the transit district, and names all three
+      ---
+      duration_ms: 1957.778642
+      type: 'test'
+      ...
+    # Subtest: an inclusive price contains all three, and still adds back up to the listed price
+    ok 2 - an inclusive price contains all three, and still adds back up to the listed price
+      ---
+      duration_ms: 2746.102906
+      type: 'test'
+      ...
+    # Subtest: a country-wide rate stacks under a state one rather than losing to it
+    ok 3 - a country-wide rate stacks under a state one rather than losing to it
+      ---
+      duration_ms: 2707.363639
+      type: 'test'
+      ...
+    # Subtest: the same jurisdiction is still refused twice, and a different one is not
+    ok 4 - the same jurisdiction is still refused twice, and a different one is not
+      ---
+      duration_ms: 2392.643932
+      type: 'test'
+      ...
+    # Subtest: a credit and a credit note reverse every jurisdiction, not just the largest
+    ok 5 - a credit and a credit note reverse every jurisdiction, not just the largest
+      ---
+      duration_ms: 2376.845224
+      type: 'test'
+      ...
+    1..5
+ok 16 - jurisdictions that stack
+  ---
+  duration_ms: 12181.600407
+  type: 'suite'
+  ...
+# Subtest: the subscription overview
+    # Subtest: MRR is the whole book, not the first page of it
+    ok 1 - MRR is the whole book, not the first page of it
+      ---
+      duration_ms: 590.473124
+      type: 'test'
+      ...
+    # Subtest: a book in three currencies is never added up and labelled in one
+    ok 2 - a book in three currencies is never added up and labelled in one
+      ---
+      duration_ms: 17.108572
+      type: 'test'
+      ...
+    1..2
+ok 17 - the subscription overview
+  ---
+  duration_ms: 3088.365773
+  type: 'suite'
+  ...
+# Subtest: what billing refuses to accept
+    # Subtest: a subscription field billing does not read is refused, not answered 201
+    ok 1 - a subscription field billing does not read is refused, not answered 201
+      ---
+      duration_ms: 5.337588
+      type: 'test'
+      ...
+    # Subtest: the same rule holds on every billing write, nested keys included
+    ok 2 - the same rule holds on every billing write, nested keys included
+      ---
+      duration_ms: 4.530995
+      type: 'test'
+      ...
+    1..2
+ok 18 - what billing refuses to accept
+  ---
+  duration_ms: 1898.749167
+  type: 'suite'
+  ...
+# Subtest: one jurisdiction, charged two ways
+    # Subtest: the summary holds two rows for the one rate, and the document must not add them up
+    ok 1 - the summary holds two rows for the one rate, and the document must not add them up
+      ---
+      duration_ms: 2264.573544
+      type: 'test'
+      ...
+    # Subtest: a bill that really is in three jurisdictions still states what they come to
+    ok 2 - a bill that really is in three jurisdictions still states what they come to
+      ---
+      duration_ms: 2087.88547
+      type: 'test'
+      ...
+    1..2
+ok 19 - one jurisdiction, charged two ways
+  ---
+  duration_ms: 4353.237346
+  type: 'suite'
+  ...
+# Subtest: a held bill priced again once the country is known
+    # Subtest: the account credit it draws is the credit the account still holds
+    ok 1 - the account credit it draws is the credit the account still holds
+      ---
+      duration_ms: 1971.391269
+      type: 'test'
+      ...
+    1..1
+ok 20 - a held bill priced again once the country is known
+  ---
+  duration_ms: 1971.926321
+  type: 'suite'
+  ...
+# Subtest: the invoice money on the overview
+    # Subtest: is bucketed by the currency it was billed in
+    ok 1 - is bucketed by the currency it was billed in
+      ---
+      duration_ms: 2415.561087
+      type: 'test'
+      ...
+    1..1
+ok 21 - the invoice money on the overview
+  ---
+  duration_ms: 2421.216401
+  type: 'suite'
+  ...
+# Subtest: the next invoice on the customer summary
+    # Subtest: carries the tax the bill it predicts will charge
+    ok 1 - carries the tax the bill it predicts will charge
+      ---
+      duration_ms: 2315.813832
+      type: 'test'
+      ...
+    1..1
+ok 22 - the next invoice on the customer summary
+  ---
+  duration_ms: 2316.422541
+  type: 'suite'
+  ...
+# Subtest: writing off a bill Ain could not place
+    # Subtest: is refused for the same reason finalising and paying it are
+    ok 1 - is refused for the same reason finalising and paying it are
+      ---
+      duration_ms: 2039.350531
+      type: 'test'
+      ...
+    # Subtest: is allowed the moment the bill has actually been placed
+    ok 2 - is allowed the moment the bill has actually been placed
+      ---
+      duration_ms: 2153.255918
+      type: 'test'
+      ...

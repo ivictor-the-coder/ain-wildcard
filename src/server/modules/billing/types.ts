@@ -395,18 +395,30 @@ export interface ChangePreview {
   charge_total: number;
   net: number;
   /**
-   * What would be collected immediately. A negative net is never collected and
-   * never paid out: its lines go onto a bill, where they are taxed exactly as
-   * the charges they reverse were taxed, and whatever that bill cannot absorb
-   * is what reaches the customer balance.
+   * What would be collected immediately — the `amount_due` of the bill
+   * `always_invoice` raises, tax and account balance included, never the
+   * pre-tax `net` above. A negative net is never collected and never paid out:
+   * its lines go onto a bill, where they are taxed exactly as the charges they
+   * reverse were taxed, and whatever that bill cannot absorb is what reaches
+   * the customer balance.
    */
   amount_due_now: number;
+  /** The tax inside `amount_due_now`, so the gap from `net` is named. */
+  tax_due_now: number;
   /** What the account holds today — credit is negative, Stripe's convention. */
   customer_balance: number;
   next_invoice: {
     date: number;
     currency: string;
+    /**
+     * The taxable base of the recurring lines — what the next bill will record
+     * as its subtotal, not what the price list says. On a tax-inclusive price
+     * the listed amount already contains `tax`, so the two differ; `subtotal +
+     * tax` is the listed price either way.
+     */
     subtotal: number;
+    /** The tax the next bill will charge on those lines. */
+    tax: number;
     lines: RecurringLine[];
   };
   items_after: { price: string; quantity: number; metered: boolean; description: string }[];
@@ -469,20 +481,40 @@ export interface InvoiceLine {
   /** The exact fraction of the interval behind a prorated line. */
   proration_fraction: { numerator: number; denominator: number } | null;
   breakdown: LineBreakdownRow[];
-  /** The tax on this line's base, snapshotted with the rate that produced it. */
+  /**
+   * Every jurisdiction's tax on this line's base, one entry per rate.
+   *
+   * A supply is in as many jurisdictions as have registered a rate over it. In
+   * most of the world that is one — a country's VAT — and this list has one
+   * entry; in the United States it is the state, the city and whatever transit
+   * district the address sits in, and the customer owes their sum. It is a list
+   * so that a New York bill can print "NY State 4%, NYC 4.5%, MCTD 0.375%"
+   * rather than one number that names only the largest of them.
+   */
+  taxes: LineTaxAmount[];
+  /**
+   * `taxes` rolled up: the amount is their sum, and the rate fields name the
+   * single rate when there is one. Where several jurisdictions taxed the line,
+   * `rate` is null because no one rate produced the figure and `percentage` is
+   * their combined rate — which is what a US invoice means by "8.875%".
+   */
   tax: InvoiceLineTax;
   /** True once the invoice was voided and the line let go of what it claimed. */
   released: boolean;
 }
 
 /**
- * A line's tax, frozen at the moment the invoice was raised. The rate is
- * copied rather than referenced because a rate can be changed or retired and an
- * invoice raised under the old one still has to add up and explain itself.
+ * One rate's tax on one line, frozen at the moment the invoice was raised. The
+ * rate is copied rather than referenced because a rate can be changed or
+ * retired and an invoice raised under the old one still has to add up and
+ * explain itself.
  */
-export interface InvoiceLineTax {
+export interface LineTaxAmount {
+  object: 'invoice_line_tax_amount';
   /** Signed like the line: a credit line credits its tax too. */
   amount: number;
+  /** The base this rate was applied to — the line's own amount. */
+  taxable_amount: number;
   rate: string | null;
   display_name: string | null;
   jurisdiction: string | null;
@@ -492,6 +524,51 @@ export interface InvoiceLineTax {
   behavior: TaxBehavior | null;
   reason: TaxReason | null;
   explanation: string | null;
+}
+
+/**
+ * A line's tax as one figure. Kept beside `taxes` because most bills have
+ * exactly one rate and every reader of an invoice — the credit note, the
+ * totals, the ledger — wants the line's tax, not a list to fold.
+ */
+export interface InvoiceLineTax {
+  /** Signed like the line: a credit line credits its tax too. */
+  amount: number;
+  rate: string | null;
+  display_name: string | null;
+  jurisdiction: string | null;
+  /** An exact decimal string — "19", "8.875". Combined where rates stack. */
+  percentage: string | null;
+  tax_type: TaxType | null;
+  behavior: TaxBehavior | null;
+  reason: TaxReason | null;
+  explanation: string | null;
+}
+
+/**
+ * Whether Ain worked the tax out for this bill, and whether it could.
+ *
+ * `complete` is a decision: a country was resolved and either a rate applied or
+ * none is registered there. `requires_location_inputs` is the absence of one —
+ * no address, an address with no country, a country that is not a country — and
+ * it is a different thing from a zero. A bill that says 0% because Ain never
+ * learned where the customer is has not been zero-rated; it has been guessed
+ * at, and the workspace is the one the authority comes to for the difference.
+ */
+export const AUTOMATIC_TAX_STATUSES = ['complete', 'requires_location_inputs'] as const;
+export type AutomaticTaxStatus = (typeof AUTOMATIC_TAX_STATUSES)[number];
+
+export interface AutomaticTax {
+  /**
+   * Whether the workspace holds bills back over a location it could not
+   * resolve. Off, the status is still computed and still reported — the
+   * overview counts it and `GET /v1/invoices?tax=missing` finds it — but a
+   * draft is allowed to finalise.
+   */
+  enabled: boolean;
+  status: AutomaticTaxStatus;
+  /** What the status means, in the words the screen will use. */
+  detail: string;
 }
 
 export interface Invoice {
@@ -517,6 +594,8 @@ export interface Invoice {
   tax: number;
   /** One row per rate that touched this bill. Stripe's `total_taxes`. */
   total_taxes: TaxSummaryRow[];
+  /** Whether the tax on this bill was worked out from a location Ain knows. */
+  automatic_tax: AutomaticTax;
   /** Signed. `subtotal + tax + balance_applied === total`, always. */
   balance_applied: number;
   total: number;

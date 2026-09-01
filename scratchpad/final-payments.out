@@ -1,0 +1,553 @@
+TAP version 13
+# (node:24227) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: the simulated processor
+    # Subtest: a card declared "insufficient_funds" declines with exactly that code, every time
+    ok 1 - a card declared "insufficient_funds" declines with exactly that code, every time
+      ---
+      duration_ms: 7.900044
+      type: 'test'
+      ...
+    # Subtest: a card declared "card_declined" declines with exactly that code, every time
+    ok 2 - a card declared "card_declined" declines with exactly that code, every time
+      ---
+      duration_ms: 4.235117
+      type: 'test'
+      ...
+    # Subtest: a card declared "expired_card" declines with exactly that code, every time
+    ok 3 - a card declared "expired_card" declines with exactly that code, every time
+      ---
+      duration_ms: 3.198062
+      type: 'test'
+      ...
+    # Subtest: a card declared "incorrect_cvc" declines with exactly that code, every time
+    ok 4 - a card declared "incorrect_cvc" declines with exactly that code, every time
+      ---
+      duration_ms: 2.782313
+      type: 'test'
+      ...
+    # Subtest: a card declared "processing_error" declines with exactly that code, every time
+    ok 5 - a card declared "processing_error" declines with exactly that code, every time
+      ---
+      duration_ms: 3.132562
+      type: 'test'
+      ...
+    # Subtest: a card that is declared to succeed is authorised, with an authorisation code
+    ok 6 - a card that is declared to succeed is authorised, with an authorisation code
+      ---
+      duration_ms: 5.071389
+      type: 'test'
+      ...
+    # Subtest: simulated_decline_count declines exactly that many attempts and then stops
+    ok 7 - simulated_decline_count declines exactly that many attempts and then stops
+      ---
+      duration_ms: 5.491938
+      type: 'test'
+      ...
+    # Subtest: authentication_required declines off-session and asks for the cardholder on-session
+    ok 8 - authentication_required declines off-session and asks for the cardholder on-session
+      ---
+      duration_ms: 4.133271
+      type: 'test'
+      ...
+    # Subtest: a direct debit is presented, not authorised — it settles days later
+    ok 9 - a direct debit is presented, not authorised — it settles days later
+      ---
+      duration_ms: 764.516278
+      type: 'test'
+      ...
+    # Subtest: a direct debit that comes back unpaid reports the bank’s reason, days after the fact
+    ok 10 - a direct debit that comes back unpaid reports the bank’s reason, days after the fact
+      ---
+      duration_ms: 33.585669
+      type: 'test'
+      ...
+    # Subtest: a card cannot be given a failure mode that belongs to a bank account
+    ok 11 - a card cannot be given a failure mode that belongs to a bank account
+      ---
+      duration_ms: 1.16625
+      type: 'test'
+      ...
+    # Subtest: a card number is refused outright — this platform never stores one
+    ok 12 - a card number is refused outright — this platform never stores one
+      ---
+      duration_ms: 0.729195
+      type: 'test'
+      ...
+    # Subtest: an expired card declines whatever its declared behaviour says
+    ok 13 - an expired card declines whatever its declared behaviour says
+      ---
+      duration_ms: 1.603483
+      type: 'test'
+      ...
+    # Subtest: an idempotency key makes a replayed create return the first intent, not a second charge
+    ok 14 - an idempotency key makes a replayed create return the first intent, not a second charge
+      ---
+      duration_ms: 2.409325
+      type: 'test'
+      ...
+    1..14
+ok 1 - the simulated processor
+  ---
+  duration_ms: 3185.242037
+  type: 'suite'
+  ...
+# Subtest: collecting an invoice
+    # Subtest: a finalised invoice is charged to the card on file
+    ok 1 - a finalised invoice is charged to the card on file
+      ---
+      duration_ms: 556.849275
+      type: 'test'
+      ...
+    # Subtest: an account with no payment method is left alone, not marked delinquent
+    ok 2 - an account with no payment method is left alone, not marked delinquent
+      ---
+      duration_ms: 6.669346
+      type: 'test'
+      ...
+    # Subtest: a bill on invoice terms is never presented to a card
+    ok 3 - a bill on invoice terms is never presented to a card
+      ---
+      duration_ms: 7.226211
+      type: 'test'
+      ...
+    1..3
+ok 2 - collecting an invoice
+  ---
+  duration_ms: 2995.175687
+  type: 'suite'
+  ...
+# Subtest: a bill is never collected twice in silence
+    # Subtest: a second intent on a settled bill is refused before the card is touched
+    ok 1 - a second intent on a settled bill is refused before the card is touched
+      ---
+      duration_ms: 2922.890235
+      type: 'test'
+      ...
+    # Subtest: a credit note between the quote and the charge takes the intent down with the bill
+    ok 2 - a credit note between the quote and the charge takes the intent down with the bill
+      ---
+      duration_ms: 2542.395678
+      type: 'test'
+      ...
+    # Subtest: a part payment stays the part payment that was authorised
+    ok 3 - a part payment stays the part payment that was authorised
+      ---
+      duration_ms: 2734.578997
+      type: 'test'
+      ...
+    # Subtest: a withdrawn bill cannot be charged by an intent that was made before it was withdrawn
+    ok 4 - a withdrawn bill cannot be charged by an intent that was made before it was withdrawn
+      ---
+      duration_ms: 2823.178688
+      type: 'test'
+      ...
+    # Subtest: a debit that settles after the bill shrank credits the difference to the customer
+    ok 5 - a debit that settles after the bill shrank credits the difference to the customer
+      ---
+      duration_ms: 3163.299975
+      type: 'test'
+      ...
+    # Subtest: a dispute won on a bill that has since been credited puts the money on the account
+    ok 6 - a dispute won on a bill that has since been credited puts the money on the account
+      ---
+      duration_ms: 2798.153277
+      type: 'test'
+      ...
+    # Subtest: one bill’s money reads back as one story, cash in and cash accounted for
+    ok 7 - one bill’s money reads back as one story, cash in and cash accounted for
+      ---
+      duration_ms: 2806.881678
+      type: 'test'
+      ...
+    1..7
+ok 3 - a bill is never collected twice in silence
+  ---
+  duration_ms: 19793.110658
+  type: 'suite'
+  ...
+# Subtest: money going back out is the mirror of money coming in
+    # Subtest: refunding an overpayment gives back the credit it made, and leaves the bill paid
+    ok 1 - refunding an overpayment gives back the credit it made, and leaves the bill paid
+      ---
+      duration_ms: 2489.386819
+      type: 'test'
+      ...
+    # Subtest: a refund bigger than the credit takes the credit first and only then the bill
+    ok 2 - a refund bigger than the credit takes the credit first and only then the bill
+      ---
+      duration_ms: 2929.596091
+      type: 'test'
+      ...
+    # Subtest: a chargeback over a bill holding credit takes the credit first, and a win puts it all back
+    ok 3 - a chargeback over a bill holding credit takes the credit first, and a win puts it all back
+      ---
+      duration_ms: 2713.338726
+      type: 'test'
+      ...
+    # Subtest: a debit that settles onto a withdrawn bill is all credit, and all of it can be refunded
+    ok 4 - a debit that settles onto a withdrawn bill is all credit, and all of it can be refunded
+      ---
+      duration_ms: 2311.434438
+      type: 'test'
+      ...
+    # Subtest: a direct debit with the bank is presented once, however many times collection is asked for
+    ok 5 - a direct debit with the bank is presented once, however many times collection is asked for
+      ---
+      duration_ms: 2625.844821
+      type: 'test'
+      ...
+    # Subtest: a card cannot be run against a bill whose debit is still with the bank
+    ok 6 - a card cannot be run against a bill whose debit is still with the bank
+      ---
+      duration_ms: 2994.147153
+      type: 'test'
+      ...
+    # Subtest: a debit covering only part of a bill still leaves the rest collectable
+    ok 7 - a debit covering only part of a bill still leaves the rest collectable
+      ---
+      duration_ms: 2365.211939
+      type: 'test'
+      ...
+    # Subtest: an idempotency key never answers with another customer’s payment
+    ok 8 - an idempotency key never answers with another customer’s payment
+      ---
+      duration_ms: 1999.039589
+      type: 'test'
+      ...
+    # Subtest: the same key for the same customer but a different amount is refused, not silently repriced
+    ok 9 - the same key for the same customer but a different amount is refused, not silently repriced
+      ---
+      duration_ms: 1943.203254
+      type: 'test'
+      ...
+    1..9
+ok 4 - money going back out is the mirror of money coming in
+  ---
+  duration_ms: 22373.034238
+  type: 'suite'
+  ...
+# Subtest: the reconciliation identity holds over random sequences
+    # Subtest: seed 5eed0001: collect / overpay / refund / dispute in any order still reconciles
+    ok 1 - seed 5eed0001: collect / overpay / refund / dispute in any order still reconciles
+      ---
+      duration_ms: 2936.428144
+      type: 'test'
+      ...
+    # Subtest: seed 5eed0002: collect / overpay / refund / dispute in any order still reconciles
+    ok 2 - seed 5eed0002: collect / overpay / refund / dispute in any order still reconciles
+      ---
+      duration_ms: 2978.059757
+      type: 'test'
+      ...
+    # Subtest: seed 5eed0007: collect / overpay / refund / dispute in any order still reconciles
+    ok 3 - seed 5eed0007: collect / overpay / refund / dispute in any order still reconciles
+      ---
+      duration_ms: 3124.56398
+      type: 'test'
+      ...
+    # Subtest: seed 5eed000d: collect / overpay / refund / dispute in any order still reconciles
+    ok 4 - seed 5eed000d: collect / overpay / refund / dispute in any order still reconciles
+      ---
+      duration_ms: 2961.687295
+      type: 'test'
+      ...
+    # Subtest: seed 5eed0010: collect / overpay / refund / dispute in any order still reconciles
+    ok 5 - seed 5eed0010: collect / overpay / refund / dispute in any order still reconciles
+      ---
+      duration_ms: 3074.954258
+      type: 'test'
+      ...
+    1..5
+ok 5 - the reconciliation identity holds over random sequences
+  ---
+  duration_ms: 15076.634109
+  type: 'suite'
+  ...
+# Subtest: what a reversal leaves the platform able to do
+    # Subtest: a chargeback taken out of the account’s credit can still be closed as lost
+    ok 1 - a chargeback taken out of the account’s credit can still be closed as lost
+      ---
+      duration_ms: 2685.742281
+      type: 'test'
+      ...
+    # Subtest: a chargeback on a bill collected again while it was open closes without a 409
+    ok 2 - a chargeback on a bill collected again while it was open closes without a 409
+      ---
+      duration_ms: 2266.789128
+      type: 'test'
+      ...
+    # Subtest: a deadline that passes on such a dispute does not leave a job failing for ever
+    ok 3 - a deadline that passes on such a dispute does not leave a job failing for ever
+      ---
+      duration_ms: 3032.549246
+      type: 'test'
+      ...
+    # Subtest: money left on a withdrawn bill can still be given back
+    ok 4 - money left on a withdrawn bill can still be given back
+      ---
+      duration_ms: 2480.675894
+      type: 'test'
+      ...
+    # Subtest: a debit with the bank cannot be cancelled out from under the bill it is against
+    ok 5 - a debit with the bank cannot be cancelled out from under the bill it is against
+      ---
+      duration_ms: 2566.934201
+      type: 'test'
+      ...
+    1..5
+ok 6 - what a reversal leaves the platform able to do
+  ---
+  duration_ms: 13033.649095
+  type: 'suite'
+  ...
+# Subtest: smart dunning
+    # Subtest: a card that declines three times and then clears recovers the invoice and the subscription
+    ok 1 - a card that declines three times and then clears recovers the invoice and the subscription
+      ---
+      duration_ms: 2507.349614
+      type: 'test'
+      ...
+    # Subtest: expired_card gives up immediately instead of burning the remaining retries
+    ok 2 - expired_card gives up immediately instead of burning the remaining retries
+      ---
+      duration_ms: 2435.66973
+      type: 'test'
+      ...
+    # Subtest: a decline the schedule cannot answer ends it on attempt one and names who can
+    ok 3 - a decline the schedule cannot answer ends it on attempt one and names who can
+      ---
+      duration_ms: 3188.422967
+      type: 'test'
+      ...
+    # Subtest: an on-session retry gets the cardholder to confirm and collects the bill
+    ok 4 - an on-session retry gets the cardholder to confirm and collects the bill
+      ---
+      duration_ms: 2743.78067
+      type: 'test'
+      ...
+    # Subtest: a wrong security code is not retried — the second attempt sends the same wrong code
+    ok 5 - a wrong security code is not retried — the second attempt sends the same wrong code
+      ---
+      duration_ms: 2757.033927
+      type: 'test'
+      ...
+    # Subtest: a hard decline waits longer than a soft one before the next attempt
+    ok 6 - a hard decline waits longer than a soft one before the next attempt
+      ---
+      duration_ms: 2809.222262
+      type: 'test'
+      ...
+    # Subtest: a retry that would land on a weekend moves to the Monday
+    ok 7 - a retry that would land on a weekend moves to the Monday
+      ---
+      duration_ms: 2892.990397
+      type: 'test'
+      ...
+    # Subtest: a manual retry is recorded against the same campaign and can recover it
+    ok 8 - a manual retry is recorded against the same campaign and can recover it
+      ---
+      duration_ms: 2570.704025
+      type: 'test'
+      ...
+    # Subtest: a direct debit in recovery is not counted as refused while the bank still has it
+    ok 9 - a direct debit in recovery is not counted as refused while the bank still has it
+      ---
+      duration_ms: 2859.500686
+      type: 'test'
+      ...
+    # Subtest: the recovery queue names the amount at risk, the next attempt and what to do
+    ok 10 - the recovery queue names the amount at risk, the next attempt and what to do
+      ---
+      duration_ms: 2832.437616
+      type: 'test'
+      ...
+    # Subtest: stopping a campaign by hand stands the schedule down and leaves the bill alone
+    ok 11 - stopping a campaign by hand stands the schedule down and leaves the bill alone
+      ---
+      duration_ms: 2650.538679
+      type: 'test'
+      ...
+    1..11
+ok 7 - smart dunning
+  ---
+  duration_ms: 30250.251332
+  type: 'suite'
+  ...
+# Subtest: the end of a recovery
+    # Subtest: “cancel” ends the subscription and says why
+    ok 1 - “cancel” ends the subscription and says why
+      ---
+      duration_ms: 2397.53556
+      type: 'test'
+      ...
+    # Subtest: “mark unpaid” stops collection but keeps the subscription
+    ok 2 - “mark unpaid” stops collection but keeps the subscription
+      ---
+      duration_ms: 2964.756767
+      type: 'test'
+      ...
+    # Subtest: “leave past due” hands the account to a human without changing anything
+    ok 3 - “leave past due” hands the account to a human without changing anything
+      ---
+      duration_ms: 2792.982513
+      type: 'test'
+      ...
+    # Subtest: the retry policy is validated, explained, and snapshotted onto running campaigns
+    ok 4 - the retry policy is validated, explained, and snapshotted onto running campaigns
+      ---
+      duration_ms: 2526.40736
+      type: 'test'
+      ...
+    1..4
+ok 8 - the end of a recovery
+  ---
+  duration_ms: 10683.065948
+  type: 'suite'
+  ...
+# Subtest: an answer that arrives after the bill has moved
+    # Subtest: a part payment does not close the campaign chasing the rest of the bill
+    ok 1 - a part payment does not close the campaign chasing the rest of the bill
+      ---
+      duration_ms: 2843.157744
+      type: 'test'
+      ...
+    # Subtest: a debit returned unpaid after the bill was credited away leaves the subscription alone
+    ok 2 - a debit returned unpaid after the bill was credited away leaves the subscription alone
+      ---
+      duration_ms: 2640.540521
+      type: 'test'
+      ...
+    # Subtest: a cardholder who abandons authentication after the bill was settled keeps their subscription
+    ok 3 - a cardholder who abandons authentication after the bill was settled keeps their subscription
+      ---
+      duration_ms: 2828.128445
+      type: 'test'
+      ...
+    # Subtest: a credit note that clears the balance of a part-paid bill ends the campaign chasing it
+    ok 4 - a credit note that clears the balance of a part-paid bill ends the campaign chasing it
+      ---
+      duration_ms: 2733.403765
+      type: 'test'
+      ...
+    # Subtest: pausing collection stands down the retry that was already scheduled
+    ok 5 - pausing collection stands down the retry that was already scheduled
+      ---
+      duration_ms: 2838.615936
+      type: 'test'
+      ...
+    1..5
+ok 9 - an answer that arrives after the bill has moved
+  ---
+  duration_ms: 13884.809215
+  type: 'suite'
+  ...
+# Subtest: refunds
+    # Subtest: a refund on a paid invoice moves amount_paid and leaves the bill owed again
+    ok 1 - a refund on a paid invoice moves amount_paid and leaves the bill owed again
+      ---
+      duration_ms: 575.005285
+      type: 'test'
+      ...
+    # Subtest: a refund never re-opens the retry schedule
+    ok 2 - a refund never re-opens the retry schedule
+      ---
+      duration_ms: 8.902473
+      type: 'test'
+      ...
+    1..2
+ok 10 - refunds
+  ---
+  duration_ms: 2544.026251
+  type: 'suite'
+  ...
+# Subtest: disputes
+    # Subtest: a lost dispute takes the money and marks the invoice uncollectible
+    ok 1 - a lost dispute takes the money and marks the invoice uncollectible
+      ---
+      duration_ms: 2279.371341
+      type: 'test'
+      ...
+    # Subtest: a dispute that is won gives the money back to the invoice
+    ok 2 - a dispute that is won gives the money back to the invoice
+      ---
+      duration_ms: 2304.748449
+      type: 'test'
+      ...
+    # Subtest: a dispute nobody answers is lost when the deadline passes
+    ok 3 - a dispute nobody answers is lost when the deadline passes
+      ---
+      duration_ms: 2489.322682
+      type: 'test'
+      ...
+    # Subtest: two disputes cannot be opened over the same charge
+    ok 4 - two disputes cannot be opened over the same charge
+      ---
+      duration_ms: 2477.737212
+      type: 'test'
+      ...
+    1..4
+ok 11 - disputes
+  ---
+  duration_ms: 9552.006493
+  type: 'suite'
+  ...
+# Subtest: payment methods
+    # Subtest: the first method attached becomes the default, and the default can be moved
+    ok 1 - the first method attached becomes the default, and the default can be moved
+      ---
+      duration_ms: 2.981921
+      type: 'test'
+      ...
+    # Subtest: detaching the default hands the account to the next method on file
+    ok 2 - detaching the default hands the account to the next method on file
+      ---
+      duration_ms: 550.533699
+      type: 'test'
+      ...
+    # Subtest: a subscription’s own default is charged ahead of the account default
+    ok 3 - a subscription’s own default is charged ahead of the account default
+      ---
+      duration_ms: 7.69948
+      type: 'test'
+      ...
+    # Subtest: a method named by a subscription but since deleted falls back rather than failing
+    ok 4 - a method named by a subscription but since deleted falls back rather than failing
+      ---
+      duration_ms: 7.398769
+      type: 'test'
+      ...
+    1..4
+ok 12 - payment methods
+  ---
+  duration_ms: 2831.989296
+  type: 'suite'
+  ...
+# Subtest: the seeded workspace
+    # Subtest: Northwind opens with a real recovery queue and a charge behind its paid bills
+    ok 1 - Northwind opens with a real recovery queue and a charge behind its paid bills
+      ---
+      duration_ms: 4.706217
+      type: 'test'
+      ...
+    # Subtest: every seeded invoice still accounts for itself after the payments module has touched it
+    ok 2 - every seeded invoice still accounts for itself after the payments module has touched it
+      ---
+      duration_ms: 1598.364493
+      type: 'test'
+      ...
+    1..2
+ok 13 - the seeded workspace
+  ---
+  duration_ms: 3605.591026
+  type: 'suite'
+  ...
+1..13
+# tests 75
+# suites 13
+# pass 75
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 150377.105168

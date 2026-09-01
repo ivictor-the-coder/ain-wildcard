@@ -8,6 +8,7 @@ import { PRORATION_BEHAVIORS, type ProrationBehavior } from '../catalog/types';
 import { BILLING_MIGRATIONS } from './schema';
 import { describeCadence, describeInterval, isMetered, longDate, Pricebook, recurringLines, recurringSubtotal, subscriptionMrr } from './cycle';
 import { Billing } from './store';
+import { INVOICE_TAX_FILTERS } from './records';
 import type {
   CustomerInput, CustomerListFilter, InvoiceListFilter, SubscriptionCreateInput, SubscriptionListFilter,
   SubscriptionUpdateInput,
@@ -126,15 +127,23 @@ const addressBody = v.object({
   state: v.optional(v.string({ max: 120 })),
   postal_code: v.optional(v.string({ max: 40 })),
   country: v.optional(v.string({ max: 80 })),
-});
+}, { strict: true });
 
 const invoiceSettingsBody = v.object({
   default_payment_method: v.optional(v.string({ max: 120 })),
   days_until_due: v.optional(v.int({ min: 0, max: 365 })),
   custom_fields: v.optional(v.array(v.object({ name: v.string({ min: 1, max: 40 }), value: v.string({ min: 1, max: 140 }) }), { max: 4 })),
   footer: v.optional(v.string({ max: 1000 })),
-});
+}, { strict: true });
 
+/**
+ * Every billing write body is strict, for the same reason the catalog's are: a
+ * key this module does not read is a request that did not happen. `POST
+ * /v1/subscriptions` used to take `start_date` and `trial_days`, answer 201 and
+ * honour neither — the caller believed they had backdated a subscription and
+ * given it a trial, and the bill said otherwise a month later. Unknown keys are
+ * named and refused, the way Stripe answers `Received unknown parameter`.
+ */
 const CUSTOMER_FIELDS = {
   email: v.optional(v.email()),
   description: v.optional(v.string({ max: 1000 })),
@@ -145,12 +154,12 @@ const CUSTOMER_FIELDS = {
     name: v.optional(v.string({ max: 160 })),
     phone: v.optional(v.string({ max: 40 })),
     address: v.optional(addressBody),
-  })),
+  }, { strict: true })),
   tax_ids: v.optional(v.array(v.object({
     type: v.string({ min: 2, max: 40, description: `The kind of registration. Checked against its authority's format for: ${TAX_ID_TYPES.join(', ')}.` }),
     value: v.string({ min: 2, max: 60, description: 'The number as the register writes it — DE811907980, GB123456789, 12-3456789. Spaces and dots are removed; a number that is not the shape its authority issues is refused.' }),
     country: v.optional(v.string({ max: 80 })),
-  }), { max: 10 })),
+  }, { strict: true }), { max: 10 })),
   tax_exempt: v.optional(v.enum(TAX_EXEMPTIONS)),
   invoice_settings: v.optional(invoiceSettingsBody),
   preferred_locales: v.optional(v.array(v.string({ max: 12 }), { max: 6 })),
@@ -158,8 +167,8 @@ const CUSTOMER_FIELDS = {
   crm_record_id: v.optional(v.string({ max: 80 })),
 };
 
-const customerCreateBody = v.object({ name: v.string({ min: 1, max: 200 }), ...CUSTOMER_FIELDS });
-const customerUpdateBody = v.object({ name: v.optional(v.string({ min: 1, max: 200 })), ...CUSTOMER_FIELDS });
+const customerCreateBody = v.object({ name: v.string({ min: 1, max: 200 }), ...CUSTOMER_FIELDS }, { strict: true });
+const customerUpdateBody = v.object({ name: v.optional(v.string({ min: 1, max: 200 })), ...CUSTOMER_FIELDS }, { strict: true });
 
 const itemBody = v.object({
   id: v.optional(v.id('si')),
@@ -168,7 +177,7 @@ const itemBody = v.object({
   custom_unit_amount: v.optional(v.int({ min: 0, description: 'The agreed amount, in minor units, for a negotiated price.' })),
   metadata: v.metadata(),
   deleted: v.optional(v.boolean()),
-});
+}, { strict: true });
 
 const subscriptionCreateBody = v.object({
   customer: v.id('cus'),
@@ -181,8 +190,8 @@ const subscriptionCreateBody = v.object({
   trial_end: v.optional(v.timestamp()),
   trial_from_plan: v.optional(v.boolean()),
   trial_settings: v.optional(v.object({
-    end_behavior: v.optional(v.object({ missing_payment_method: v.enum(TRIAL_END_BEHAVIORS) })),
-  })),
+    end_behavior: v.optional(v.object({ missing_payment_method: v.enum(TRIAL_END_BEHAVIORS) }, { strict: true })),
+  }, { strict: true })),
   collection_method: v.optional(v.enum(COLLECTION_METHODS)),
   days_until_due: v.optional(v.int({ min: 0, max: 365 })),
   default_payment_method: v.optional(v.string({ max: 120 })),
@@ -192,7 +201,7 @@ const subscriptionCreateBody = v.object({
   cancel_at: v.optional(v.timestamp()),
   description: v.optional(v.string({ max: 500 })),
   metadata: v.metadata(),
-});
+}, { strict: true });
 
 const CHANGE_FIELDS = {
   items: v.optional(v.array(itemBody, { max: 30 })),
@@ -211,9 +220,9 @@ const subscriptionUpdateBody = v.object({
   default_payment_method: v.optional(v.string({ max: 120 })),
   description: v.optional(v.string({ max: 500 })),
   metadata: v.metadata(),
-});
+}, { strict: true });
 
-const previewBody = v.object(CHANGE_FIELDS);
+const previewBody = v.object(CHANGE_FIELDS, { strict: true });
 
 const cancelBody = v.object({
   at_period_end: v.optional(v.boolean()),
@@ -221,17 +230,17 @@ const cancelBody = v.object({
   prorate: v.optional(v.boolean()),
   cancellation_reason: v.optional(v.enum(CANCELLATION_REASONS)),
   comment: v.optional(v.string({ max: 1000 })),
-});
+}, { strict: true });
 
 const pauseBody = v.object({
   behavior: v.default(v.enum(PAUSE_BEHAVIORS), 'keep_as_draft'),
   resumes_at: v.optional(v.timestamp()),
-});
+}, { strict: true });
 
 const resumeBody = v.object({
   billing_cycle_anchor: v.optional(v.enum(['now', 'unchanged'] as const)),
   proration_behavior: v.optional(v.enum(PRORATION_BEHAVIORS)),
-});
+}, { strict: true });
 
 const phaseBody = v.object({
   items: v.array(v.object({
@@ -239,7 +248,7 @@ const phaseBody = v.object({
     quantity: v.optional(v.int({ min: 0, max: 1_000_000 })),
     custom_unit_amount: v.optional(v.int({ min: 0 })),
     metadata: v.metadata(),
-  }), { min: 1, max: 30 }),
+  }, { strict: true }), { min: 1, max: 30 }),
   iterations: v.optional(v.int({ min: 1, max: 120 })),
   end_date: v.optional(v.timestamp()),
   start_date: v.optional(v.timestamp()),
@@ -250,7 +259,7 @@ const phaseBody = v.object({
   days_until_due: v.optional(v.int({ min: 0, max: 365 })),
   description: v.optional(v.string({ max: 300 })),
   metadata: v.metadata(),
-});
+}, { strict: true });
 
 const scheduleCreateBody = v.object({
   customer: v.optional(v.id('cus')),
@@ -259,13 +268,13 @@ const scheduleCreateBody = v.object({
   end_behavior: v.optional(v.enum(SCHEDULE_END_BEHAVIORS)),
   phases: v.array(phaseBody, { min: 1, max: 24 }),
   metadata: v.metadata(),
-});
+}, { strict: true });
 
 const scheduleUpdateBody = v.object({
   phases: v.optional(v.array(phaseBody, { min: 1, max: 24 })),
   end_behavior: v.optional(v.enum(SCHEDULE_END_BEHAVIORS)),
   metadata: v.metadata(),
-});
+}, { strict: true });
 
 const invoicePreviewBody = v.object({
   subscription: v.id('sub'),
@@ -273,7 +282,7 @@ const invoicePreviewBody = v.object({
   proration_behavior: v.optional(v.enum(PRORATION_BEHAVIORS)),
   proration_date: v.optional(v.timestamp()),
   billing_cycle_anchor: v.optional(v.enum(['now', 'unchanged'] as const)),
-});
+}, { strict: true });
 
 const taxRateBody = v.object({
   display_name: v.string({ min: 1, max: 60, description: 'What appears on the invoice: "VAT", "OH sales tax".' }),
@@ -286,7 +295,7 @@ const taxRateBody = v.object({
   reverse_charge: v.optional(v.boolean()),
   active: v.optional(v.boolean()),
   metadata: v.metadata(),
-});
+}, { strict: true });
 
 const creditNoteBody = v.object({
   invoice: v.id('in'),
@@ -295,18 +304,18 @@ const creditNoteBody = v.object({
     invoice_line_item: v.id('il'),
     amount: v.optional(v.int({ min: 1, max: 1_000_000_000, description: 'Gross, tax included. Left out, the line is credited in full.' })),
     quantity: v.optional(v.int({ min: 1, max: 1_000_000, description: 'Credit this many of the units billed, priced pro rata.' })),
-  }), { min: 1, max: 100 })),
+  }, { strict: true }), { min: 1, max: 100 })),
   reason: v.optional(v.enum(CREDIT_NOTE_REASONS)),
   memo: v.optional(v.string({ max: 600 })),
   metadata: v.metadata(),
-});
+}, { strict: true });
 
 const balanceBody = v.object({
   amount: v.int({ min: -100_000_000, max: 100_000_000, description: 'Signed minor units. Negative grants credit.' }),
   description: v.string({ min: 3, max: 300 }),
   type: v.default(v.enum(BALANCE_TRANSACTION_TYPES), 'adjustment'),
   subscription: v.optional(v.id('sub')),
-});
+}, { strict: true });
 
 /* --------------------------------- payloads ------------------------------- */
 
@@ -580,7 +589,7 @@ export default defineModule({
         verified_name: v.optional(v.string({ max: 200, description: 'The name the register holds, when it gave one back.' })),
         verified_address: v.optional(v.string({ max: 400 })),
         note: v.optional(v.string({ max: 400, description: 'Overrides the sentence the invoice prints about this registration.' })),
-      }),
+      }, { strict: true }),
       description:
         'A registration number is supplied by the customer; whether it is real is answered by the register that issued it. Only a `verified` number moves the tax onto the customer under the reverse charge — everything else is charged as normal, because the supplier is who the authority collects from. Point a VIES or HMRC connector at this route, or record a check a human made.',
     });
@@ -635,42 +644,137 @@ export default defineModule({
     router.get('/v1/subscriptions/overview', (req: Req, c: Ctx) => {
       const s = billingStore(c).billing;
       const orgId = req.auth.orgId;
-      const subs = s.listSubscriptions(orgId, { status: 'all', limit: 200 }).data;
+      const now = c.now();
       const book = new Pricebook(c, orgId);
+      const locale = localeOf(c, orgId);
+
+      // Every subscription, not the first page of them. Read one page deep,
+      // a book of 251 reported the MRR of 200 and said nothing about the rest —
+      // and said it as though it were the whole number.
+      const subs: Subscription[] = [];
+      let cursor: string | null = null;
+      do {
+        const page = s.listSubscriptions(orgId, { status: 'all', limit: 200, cursor });
+        subs.push(...page.data);
+        cursor = page.hasMore ? page.nextCursor : null;
+      } while (cursor);
+
+      // Money is bucketed by the currency it is billed in, because minor units
+      // of different currencies are different things. Adding a ¥98,000
+      // subscription to a dollar book moves the dollar figure by 98,000, and
+      // nothing in a single total can ever say that it did.
+      const buckets = new Map<string, {
+        currency: string; subscriptions: number; live: number; mrr: number; trial_mrr: number;
+        renewing_next_30_days: number; scheduled_to_cancel: number;
+      }>();
       const byStatus: Record<string, number> = {};
       let mrr = 0, trialMrr = 0;
       for (const sub of subs) {
         byStatus[sub.status] = (byStatus[sub.status] ?? 0) + 1;
-        if (countsAsRevenue(sub.status)) mrr += subscriptionMrr(sub, book);
-        else if (sub.status === 'trialing') trialMrr += subscriptionMrr(sub, book);
+        const bucket = buckets.get(sub.currency) ?? {
+          currency: sub.currency, subscriptions: 0, live: 0, mrr: 0, trial_mrr: 0,
+          renewing_next_30_days: 0, scheduled_to_cancel: 0,
+        };
+        bucket.subscriptions += 1;
+        if (!isTerminal(sub.status)) {
+          bucket.live += 1;
+          if (sub.current_period_end <= now + 30 * 86_400_000) bucket.renewing_next_30_days += 1;
+          if (sub.cancel_at_period_end || sub.cancel_at) bucket.scheduled_to_cancel += 1;
+        }
+        if (countsAsRevenue(sub.status)) {
+          const amount = subscriptionMrr(sub, book);
+          mrr += amount;
+          bucket.mrr += amount;
+        } else if (sub.status === 'trialing') {
+          const amount = subscriptionMrr(sub, book);
+          trialMrr += amount;
+          bucket.trial_mrr += amount;
+        }
+        buckets.set(sub.currency, bucket);
       }
+
+      const byCurrency = [...buckets.values()]
+        .sort((a, b) => a.currency.localeCompare(b.currency))
+        .map((row) => ({
+          ...row,
+          arr: row.mrr * 12,
+          average_revenue_per_account: row.live ? Math.round(row.mrr / row.live) : 0,
+          mrr_display: formatMoney(money(row.mrr, row.currency), { locale }),
+          arr_display: formatMoney(money(row.mrr * 12, row.currency), { locale }),
+          trial_mrr_display: formatMoney(money(row.trial_mrr, row.currency), { locale }),
+        }));
+      const currencies = byCurrency.map((row) => row.currency);
+      const mixed = currencies.length > 1;
       const currency = s.defaultCurrency(orgId);
-      const locale = localeOf(c, orgId);
       const live = subs.filter((sub) => !isTerminal(sub.status));
+      const invoices = s.invoices.totals(orgId);
+      const prorations = c.db.all<{ currency: string; amount: number | string }>(
+        `SELECT currency, COALESCE(SUM(amount), 0) AS amount FROM billing_pending_items
+          WHERE org_id = ? AND status = 'pending' GROUP BY currency ORDER BY currency ASC`, orgId,
+      ).map((row) => ({
+        currency: String(row.currency),
+        amount: Number(row.amount),
+        amount_display: formatMoney(money(Number(row.amount), String(row.currency)), { locale }),
+      }));
       return {
         object: 'billing_overview',
-        as_of: c.now(),
+        as_of: now,
+        /** The workspace's own currency. It is not a label for `mrr`. */
         currency,
+        currencies,
+        mixed_currency: mixed,
         subscriptions: subs.length,
         live: live.length,
         by_status: byStatus,
+        /** Minor units summed across every currency billed. Read `by_currency`. */
         mrr,
-        mrr_display: formatMoney(money(mrr, currency), { locale }),
+        // A mixed sum is never dressed up as one currency: a figure with a $ in
+        // front of it is a claim about dollars, and this one would not be true.
+        mrr_display: mixed ? null : formatMoney(money(mrr, currency), { locale }),
+        mrr_note: mixed
+          ? `This book bills in ${currencies.join(', ')}, so mrr, arr, trial_mrr and average_revenue_per_account are every currency's minor units added together — a figure in no currency at all. by_currency is the one to read, and to show.`
+          : null,
         arr: mrr * 12,
         trial_mrr: trialMrr,
         average_revenue_per_account: live.length ? Math.round(mrr / live.length) : 0,
+        by_currency: byCurrency,
         customers: c.db.count(`SELECT COUNT(*) FROM billing_customers WHERE org_id = ?`, orgId),
         delinquent_customers: c.db.count(`SELECT COUNT(*) FROM billing_customers WHERE org_id = ? AND delinquent = 1`, orgId),
-        renewing_next_30_days: live.filter((sub) => sub.current_period_end <= c.now() + 30 * 86_400_000).length,
+        renewing_next_30_days: live.filter((sub) => sub.current_period_end <= now + 30 * 86_400_000).length,
         scheduled_to_cancel: live.filter((sub) => sub.cancel_at_period_end || sub.cancel_at).length,
-        uninvoiced_prorations: c.db.count(
-          `SELECT COALESCE(SUM(amount), 0) FROM billing_pending_items WHERE org_id = ? AND status = 'pending'`, orgId,
-        ),
-        invoices: s.invoices.totals(orgId),
+        // The last money figure on this payload, and it was the last one still
+        // added up across every currency and published bare. A proration
+        // waiting on a euro subscription is not worth what its minor units say
+        // in dollars, so the flat figure is kept for the shape it has always
+        // had and the buckets beside it are the ones that are amounts of
+        // something — exactly what mrr and invoices above do.
+        uninvoiced_prorations: prorations.reduce((total, row) => total + row.amount, 0),
+        uninvoiced_prorations_by_currency: prorations,
+        uninvoiced_prorations_note: prorations.length > 1
+          ? `Prorations are waiting in ${prorations.map((row) => row.currency).join(', ')}, so uninvoiced_prorations is every currency's minor units added together — a figure in no currency at all. uninvoiced_prorations_by_currency is the one to read, and to show.`
+          : null,
+        invoices,
+        // The same rule the MRR above follows: a mixed book publishes no single
+        // money figure with a currency on it, and says where the real ones are.
+        invoices_note: invoices.mixed_currency
+          ? `Bills were raised in ${invoices.currencies.join(', ')}, so invoices.billed, collected, outstanding and written_off are every currency's minor units added together — a figure in no currency at all. invoices.by_currency is the one to read, and to show.`
+          : null,
+        // Bills that charged no tax, and how many of those are a zero nobody
+        // decided on. `missing_tax_location` is the backlog: an account with no
+        // country on it, billed at 0% because there was nothing to bill it at.
+        untaxed_invoices: {
+          count: invoices.untaxed,
+          missing_tax_location: invoices.missing_tax_location,
+          held_in_draft: invoices.held_for_tax_location,
+          detail: invoices.missing_tax_location === 0
+            ? 'Every bill on the book was taxed against a country Ain could resolve.'
+            : `${invoices.missing_tax_location} bill${invoices.missing_tax_location === 1 ? '' : 's'} were raised for accounts with no resolvable country, so the tax on them was never worked out. Find them with GET /v1/invoices?tax=missing.`,
+        },
       };
     }, {
       summary: 'The subscription book at a glance', tags: ['billing'],
-      description: 'Live count, MRR and ARR normalised across every interval, what renews in the next 30 days and what is set to cancel.',
+      description:
+        'Live count, MRR and ARR normalised across every interval, what renews in the next 30 days and what is set to cancel — over the whole book, not a page of it. Money is bucketed by the currency it is billed in; a mixed book publishes no single figure with a currency symbol on it.',
     });
 
     router.get('/v1/subscriptions', (req: Req, c: Ctx) => {
@@ -809,13 +913,15 @@ export default defineModule({
       });
     }, {
       summary: 'List invoices', tags: ['billing'],
-      description: 'status=open_like is everything still owed — drafts held back by a paused subscription and finalised bills alike. due_before finds what is overdue.',
+      description:
+        'status=open_like is everything still owed — drafts held back by a paused subscription and finalised bills alike. due_before finds what is overdue. tax=missing is the other queue: bills raised for an account with no resolvable country, where 0% means "we never learned where they are" rather than "nothing is due".',
       query: v.object({
         customer: v.optional(v.id('cus')),
         subscription: v.optional(v.id('sub')),
         status: v.optional(v.enum([...INVOICE_STATUSES, 'open_like', 'all'] as const)),
         billing_reason: v.optional(v.enum(INVOICE_BILLING_REASONS)),
         collection_method: v.optional(v.enum(COLLECTION_METHODS)),
+        tax: v.optional(v.enum(INVOICE_TAX_FILTERS)),
         query: v.optional(v.string({ max: 160 })),
         created_after: v.optional(v.timestamp()),
         created_before: v.optional(v.timestamp()),
@@ -835,7 +941,7 @@ export default defineModule({
       summary: 'Bill what this account already owes', tags: ['billing'], roles: ['member'], idempotent: true,
       description:
         'Sweeps up every proration waiting, the usage the credits module has settled and any credit packs bought, applies the balance and finalises the bill. The recurring fee is not billed again — that happened when the period opened — so this can never double-charge a cycle.',
-      body: v.object({ customer: v.id('cus'), subscription: v.optional(v.id('sub')) }),
+      body: v.object({ customer: v.id('cus'), subscription: v.optional(v.id('sub')) }, { strict: true }),
     });
 
     router.get('/v1/invoices/:id', (req: Req, c: Ctx) =>
@@ -859,7 +965,7 @@ export default defineModule({
         billingStore(c).billing.invoices.pay(req.auth.orgId, req.params.id, { note: body.note ?? null }, writeMeta(req))));
     }, {
       summary: 'Record payment of an invoice', tags: ['billing'], roles: ['member'], idempotent: true,
-      body: v.object({ note: v.optional(v.string({ max: 300, description: 'How it was collected — bank transfer, card, offset against a PO.' })) }),
+      body: v.object({ note: v.optional(v.string({ max: 300, description: 'How it was collected — bank transfer, card, offset against a PO.' })) }, { strict: true }),
       description: 'A subscription that was past due or unpaid comes back to active on the invoice that clears it.',
     });
 
@@ -943,6 +1049,27 @@ export default defineModule({
         summary: 'Withdraw a credit note', tags: ['billing'], roles: ['member'],
         description: 'Puts back exactly what the note took: the amount returns to amount_due, or comes back off the balance it was pushed onto, and an invoice the note had settled goes back to open.',
       });
+
+    /* ----------------------------- automatic tax -------------------------- */
+
+    router.get('/v1/billing/automatic_tax', (req: Req, c: Ctx) =>
+      automaticTaxPayload(c, req.auth.orgId),
+      {
+        summary: 'Whether bills are held back over a customer location Ain cannot resolve', tags: ['billing'],
+        description:
+          'On, an invoice for an account with no resolvable country is kept as a draft and POST /v1/invoices/:id/finalize answers customer_tax_location_invalid, because 0% there means "we do not know" and the supplier is who the authority collects from. Off, the bill finalises anyway — the status is still computed, still counted on the overview and still findable with GET /v1/invoices?tax=missing.',
+      });
+
+    router.post('/v1/billing/automatic_tax', (req: Req, c: Ctx) => {
+      const body = req.body as { enabled: boolean };
+      c.atomic(() => c.svc.core.setSetting(req.auth.orgId, 'billing.automatic_tax', { enabled: body.enabled }));
+      return automaticTaxPayload(c, req.auth.orgId);
+    }, {
+      summary: 'Turn the tax-location hold on or off', tags: ['billing'], roles: ['admin'],
+      body: v.object({ enabled: v.boolean() }, { strict: true }),
+      description:
+        'Turning it off does not turn tax off: every bill is still taxed from the address, and every bill that could not be is still marked. It only stops those bills being held as drafts.',
+    });
 
     /* -------------------------------- tax rates --------------------------- */
 
@@ -1045,7 +1172,7 @@ export default defineModule({
       schedulePayload(c, req.auth.orgId, billingStore(c).schedules.cancel(req.auth.orgId, req.params.id, req.body as { prorate?: boolean }, writeMeta(req))),
       {
         summary: 'Cancel the schedule and its subscription', tags: ['billing'], roles: ['member'],
-        body: v.object({ prorate: v.optional(v.boolean()) }),
+        body: v.object({ prorate: v.optional(v.boolean()) }, { strict: true }),
       });
 
   },
@@ -1147,12 +1274,32 @@ export default defineModule({
         run(args: { customer?: string; subscription?: string; status?: InvoiceStatus | 'open_like' | 'all'; due_before?: number; limit?: number }, c: Ctx, meta) {
           const s = billingStore(c).billing;
           const page = s.invoices.list(meta.orgId, { ...args, limit: args.limit ?? 20 });
+          // Bucketed by the currency each bill was raised in, for the reason the
+          // overview's mrr and invoices figures are. Adding the minor units up
+          // and stamping the first row's symbol on the answer is how "what is
+          // outstanding?" came back as $135,967.00 on a book owed $133,400.00,
+          // €1,007.00 and £1,560.00 — a dollar figure that is not dollars, read
+          // out loud to whoever asked. Every currency is named instead, so the
+          // sentence the copilot writes is true whatever the page holds.
+          const owed = new Map<string, number>();
+          for (const invoice of page.data) {
+            owed.set(invoice.currency, (owed.get(invoice.currency) ?? 0) + invoice.amount_due);
+          }
+          const outstanding = [...owed.entries()]
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([currency, amount]) => ({ currency, amount, amount_display: displayMoney(amount, currency) }));
+          const shown = outstanding.length
+            ? outstanding.map((row) => row.amount_display)
+            : [displayMoney(0, s.defaultCurrency(meta.orgId))];
           return {
             total: page.totalCount,
-            outstanding_display: displayMoney(
-              page.data.reduce((total, invoice) => total + invoice.amount_due, 0),
-              page.data[0]?.currency ?? s.defaultCurrency(meta.orgId),
-            ),
+            outstanding_by_currency: outstanding,
+            outstanding_display: shown.length === 1
+              ? shown[0]
+              : `${shown.slice(0, -1).join(', ')} and ${shown[shown.length - 1]}`,
+            outstanding_note: outstanding.length > 1
+              ? `These bills were raised in ${outstanding.map((row) => row.currency).join(', ')}. Minor units of different currencies are not the same thing, so there is no single figure to quote — read outstanding_by_currency, and name each currency.`
+              : null,
             invoices: page.data.map((invoice) => ({
               id: invoice.id,
               number: invoice.number,
@@ -1200,9 +1347,11 @@ export default defineModule({
             })),
             balance_applied_display: show(invoice.balance_applied),
             total_display: show(invoice.total),
-            adds_up: invoice.lines.reduce((total, line) => total + line.amount, 0) === invoice.subtotal
-              && invoice.lines.reduce((total, line) => total + line.tax.amount, 0) === invoice.tax
-              && invoice.subtotal + invoice.tax + invoice.balance_applied === invoice.total,
+            // The same predicate the payload publishes, not a second reading of
+            // it: an `adds_up: true` that checks fewer identities than
+            // `assertBalanced` is a copilot telling a customer a bill is sound
+            // on the strength of a question nobody asked it.
+            adds_up: invoiceAddsUp(invoice),
           };
         },
       },
@@ -1231,8 +1380,17 @@ export default defineModule({
             covers: `${longDate(invoice.period.start, locale())} to ${longDate(invoice.period.end, locale())}`,
             lines: invoice.lines.map((line) => `${line.description}: ${show(line.amount)}`),
             subtotal_display: show(invoice.subtotal),
+            // Without these the answer had a hole in it exactly the size of the
+            // tax: $100.00 of lines, no balance applied, and a $108.88 total the
+            // copilot had to explain with something it had made up. Every rate
+            // that will be charged is named, because "why is it 108.88?" is the
+            // question this tool exists to answer.
+            tax_display: show(invoice.tax),
+            taxes: invoice.total_taxes.map((row) =>
+              `${row.display_name} ${row.percentage}% (${row.jurisdiction}): ${show(row.amount)}`),
             balance_applied_display: show(invoice.balance_applied),
             total_display: show(invoice.total),
+            adds_up: invoice.subtotal + invoice.tax + invoice.balance_applied === invoice.total,
           };
         },
       },
@@ -1358,6 +1516,43 @@ export default defineModule({
   },
 });
 
+/** The workspace's tax-location hold, and what it means for the next bill. */
+function automaticTaxPayload(ctx: Ctx, orgId: string) {
+  const store = billingStore(ctx).billing;
+  const enabled = store.invoices.automaticTaxEnabled(orgId);
+  const totals = store.invoices.totals(orgId);
+  return {
+    object: 'automatic_tax_settings',
+    enabled,
+    invoices_missing_a_tax_location: totals.missing_tax_location,
+    invoices_held_in_draft: totals.held_for_tax_location,
+    detail: enabled
+      ? 'A bill for an account with no resolvable country is held as a draft until one is on file. Nothing goes out taxed at a zero nobody decided on.'
+      : 'Bills for accounts with no resolvable country finalise with no tax on them. They are still marked, still counted on the overview, and still findable with GET /v1/invoices?tax=missing.',
+  };
+}
+
+/**
+ * Does this bill account for itself?
+ *
+ * The same identities `Invoices.assertBalanced` refuses to commit without,
+ * asked as a question rather than thrown as a failure — so a screen and the
+ * copilot both report exactly what the writer enforced. Every reader of this
+ * must go through here: the two that had their own copy drifted the moment
+ * stacked jurisdictions arrived, and the shorter one went on answering "adds
+ * up" for a line whose jurisdictions did not.
+ */
+function invoiceAddsUp(invoice: Invoice): boolean {
+  return invoice.lines.reduce((total, line) => total + line.amount, 0) === invoice.subtotal
+    && invoice.lines.reduce((total, line) => total + line.tax.amount, 0) === invoice.tax
+    && invoice.lines.every((line) => !line.taxes.length
+      || line.taxes.reduce((total, entry) => total + entry.amount, 0) === line.tax.amount)
+    && invoice.total_taxes.reduce((total, row) => total + row.amount, 0) === invoice.tax
+    && invoice.subtotal + invoice.tax + invoice.balance_applied === invoice.total
+    && (invoice.status === 'void'
+      || invoice.amount_paid + invoice.pre_payment_credit_notes_amount + invoice.amount_due === invoice.total);
+}
+
 /**
  * An invoice with the two things a screen always needs on top of the row: the
  * money formatted in the workspace's locale, and the reconciliation stated out
@@ -1367,8 +1562,6 @@ export default defineModule({
 function invoicePayload(ctx: Ctx, orgId: string, invoice: Invoice) {
   const locale = localeOf(ctx, orgId);
   const display = (amount: number) => formatMoney(money(amount, invoice.currency), { locale });
-  const lineTotal = invoice.lines.reduce((total, line) => total + line.amount, 0);
-  const lineTax = invoice.lines.reduce((total, line) => total + line.tax.amount, 0);
   const store = billingStore(ctx).billing;
   return {
     ...invoice,
@@ -1383,16 +1576,14 @@ function invoicePayload(ctx: Ctx, orgId: string, invoice: Invoice) {
     lines: invoice.lines.map((line) => ({
       ...line,
       amount_display: display(line.amount),
+      taxes: line.taxes.map((entry) => ({ ...entry, amount_display: display(entry.amount) })),
       tax: { ...line.tax, amount_display: display(line.tax.amount) },
       amount_including_tax: line.amount + line.tax.amount,
     })),
     period_display: `${longDate(invoice.period.start, locale)} to ${longDate(invoice.period.end, locale)}`,
     status_detail: describeInvoiceStatus(invoice, locale),
     document_url: `/v1/invoices/${invoice.id}/render`,
-    reconciles: lineTotal === invoice.subtotal && lineTax === invoice.tax
-      && invoice.subtotal + invoice.tax + invoice.balance_applied === invoice.total
-      && (invoice.status === 'void'
-        || invoice.amount_paid + invoice.pre_payment_credit_notes_amount + invoice.amount_due === invoice.total),
+    reconciles: invoiceAddsUp(invoice),
   };
 }
 

@@ -78,12 +78,25 @@ export default defineModule({
       setSetting(orgId, key, value) {
         ctx.db.upsert('settings', { org_id: orgId, key, value: JSON.stringify(value), updated: ctx.now() }, ['org_id', 'key']);
       },
+      /**
+       * A sign-in is good for 30 *real* days — the one thing in the platform
+       * measured on the wall clock rather than `ctx.now()`.
+       *
+       * `ctx.now()` is the workspace's business time, which any admin moves a
+       * year with `POST /v1/time/advance`. Minting against it made the session
+       * cookie's own `Max-Age` (already real seconds) disagree with the row,
+       * and expiring against it meant the platform's headline feature signed
+       * out the operator who pressed it: advance 35 days and every following
+       * call is a 401. A credential's lifetime is a fact about the person who
+       * walked away from their desk, not about the ledger they were replaying.
+       */
       createSession(orgId, userId, meta = {}) {
         const token = randomId('sess', 32);
-        const expires = ctx.now() + 30 * DAY;
+        const at = Date.now();
+        const expires = at + 30 * DAY;
         ctx.db.insert('sessions', {
           id: newId('session'), org_id: orgId, user_id: userId, token_hash: sha(token),
-          expires, created: ctx.now(), ip: meta.ip ?? null, user_agent: meta.userAgent ?? null,
+          expires, created: at, ip: meta.ip ?? null, user_agent: meta.userAgent ?? null,
         });
         return { token, expires };
       },
@@ -93,12 +106,31 @@ export default defineModule({
     };
     ctx.provide('core', service);
 
-    ctx.jobs.handle('core.cleanup', () => {
+    /**
+     * Housekeeping for one workspace, on that workspace's clock.
+     *
+     * `ctx.now()` is per workspace and an operator moves it years at a time, so
+     * an unscoped sweep is a lever every tenant holds over every other: org_b
+     * advancing 60 days deleted org_a's live sessions, org_a's idempotency keys
+     * — so org_a's next retry of a charge executed a second time instead of
+     * replaying — and org_a's job history. The recurring job also re-enqueued
+     * itself against the *default* org rather than its own, so after one run by
+     * any other tenant the job emigrated: that tenant never cleaned up again,
+     * and the default workspace's next run was scheduled on a clock that was
+     * not its own.
+     *
+     * Sessions are the exception to `ctx.now()`: a sign-in is good for 30 real
+     * days (see `createSession`), so business time must not decide when one
+     * dies — otherwise the time machine's own advance button logs the operator
+     * who pressed it out of the workspace.
+     */
+    ctx.jobs.handle('core.cleanup', (_payload, job) => {
       const now = ctx.now();
-      ctx.db.run(`DELETE FROM sessions WHERE expires < ?`, now);
-      ctx.db.run(`DELETE FROM idempotency_keys WHERE expires < ?`, now);
-      ctx.db.run(`DELETE FROM jobs WHERE status IN ('done','cancelled') AND updated < ?`, now - 7 * DAY);
-      ctx.enqueue(ctx.config.defaultOrgId, 'core.cleanup', {}, { runAt: now + DAY, idemKey: 'core.cleanup' });
+      const orgId = job.org_id;
+      ctx.db.run(`DELETE FROM sessions WHERE org_id = ? AND expires < ?`, orgId, Date.now());
+      ctx.db.run(`DELETE FROM idempotency_keys WHERE org_id = ? AND expires < ?`, orgId, now);
+      ctx.db.run(`DELETE FROM jobs WHERE org_id = ? AND status IN ('done','cancelled') AND updated < ?`, orgId, now - 7 * DAY);
+      ctx.enqueue(orgId, 'core.cleanup', {}, { runAt: now + DAY, idemKey: 'core.cleanup' });
     });
   },
 
@@ -385,9 +417,11 @@ export default defineModule({
       if (c.clock.kind !== 'virtual') throw badRequest('clock_not_virtual', 'This workspace runs on the real clock.');
       const body = req.body as { days?: number; hours?: number; to?: number };
       const before = c.now();
-      if (body.to) c.clock.set(body.to);
-      else c.clock.advance((body.days ?? 0) * DAY + (body.hours ?? 0) * 3_600_000);
-      const worked = await drainUntil(c, c.now());
+      // The clock is moved *by* the replay, not before it. Jumping straight to
+      // the target and draining once ran every job that had been waiting with
+      // `ctx.now()` reading the far end of the jump — see `drainUntil`.
+      const target = body.to ? body.to : before + (body.days ?? 0) * DAY + (body.hours ?? 0) * 3_600_000;
+      const worked = await drainUntil(c, target);
       c.audit({ orgId: req.auth.orgId, actorId: req.auth.userId, actorType: 'user', action: 'time.advanced', summary: `Advanced the workspace clock to ${new Date(c.now()).toISOString()}`, before: { now: before }, after: { now: c.now() }, requestId: req.requestId });
       return { object: 'clock', now: c.now(), previous: before, offset_ms: c.clock.offset, jobs_run: worked.ran, jobs_failed: worked.failed };
     }, {
@@ -409,16 +443,52 @@ export default defineModule({
   },
 });
 
+/**
+ * Replay one workspace's queue up to `target`, the way it would have happened.
+ *
+ * Two things have to hold, and this is the only place the *product's* time
+ * machine can hold them — `app.travel` is the harness the tests drive, not the
+ * button an operator presses.
+ *
+ * 1. Every job runs at its own `run_at`, so the clock is stepped forward to
+ *    each due batch before that batch is drained. Setting the clock to the
+ *    target first and draining once made `ctx.now()` read the far end of the
+ *    jump for work that came due on day 1: a year of renewals, credit
+ *    settlements and usage rollups were priced and dated a year late, and every
+ *    job that books its own next attempt relative to `now` — a dunning retry, a
+ *    grant expiry — landed *past* the target and was left pending, so the
+ *    advance under-ran the work it reported having run.
+ * 2. The question "what is due next" is asked of the caller's own workspace.
+ *    `ctx.jobs` is already narrowed by `withAuth`; asking the whole `jobs`
+ *    table instead let another tenant's pending row decide where this
+ *    workspace's clock stopped next.
+ *
+ * A target in the past is still honoured — `to` may point backwards — but no
+ * step ever moves the clock backwards to get there: the loop only walks
+ * forward, and the final `set` lands exactly on the target.
+ */
 async function drainUntil(ctx: Ctx, target: number): Promise<{ ran: number; failed: number }> {
   let ran = 0, failed = 0, guard = 0;
   while (guard++ < 5000) {
-    const next = ctx.db.pluck<number>(`SELECT MIN(run_at) FROM jobs WHERE status = 'pending'`);
-    if (next === undefined || next === null || next > target) break;
+    const next = ctx.jobs.nextRunAt();
+    if (next === null || next > target) break;
+    // One read of the clock decides both the step and whether there was one:
+    // `ctx.now()` tracks wall time under the offset, so asking twice can answer
+    // twice and turn "no step" into a step of a millisecond.
+    const now = ctx.now();
+    const at = Math.max(next, now);
+    if (at > target) break;
+    const stepped = at > now;
+    if (stepped) ctx.clock.set(at);
     const r = await ctx.jobs.drain(() => ctx.now());
     ran += r.ran; failed += r.failed;
-    if (r.ran === 0 && r.failed === 0) break;
+    // Nothing ran and the clock did not move: the queue cannot make progress
+    // toward the target, so stop rather than spin to the guard.
+    if (!stepped && r.ran === 0 && r.failed === 0) break;
   }
-  return { ran, failed };
+  ctx.clock.set(target);
+  const r = await ctx.jobs.drain(() => ctx.now());
+  return { ran: ran + r.ran, failed: failed + r.failed };
 }
 
 const sessionCookie = (token: string, expires: number): Record<string, string> => ({

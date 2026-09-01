@@ -259,4 +259,18 @@ CREATE INDEX idx_payments_attempts_invoice ON payments_dunning_attempts(org_id, 
 ALTER TABLE payments_dunning ADD COLUMN end_behavior_applied TEXT;
 `,
   },
+  {
+    id: 'payments.0003_intent_idempotency_fingerprint',
+    sql: `
+-- The request an idempotency key was first used with. A key on its own only
+-- proves someone sent this string before; it does not prove they were asking
+-- for the same money, and returning the first intent to a second caller
+-- reports a payment that customer never made. The fingerprint is recorded from
+-- the request rather than derived from the intent, because an invoice-bound
+-- intent is re-priced after it is created and the request is what a replay has
+-- to match. Null on rows written before this column existed: those replay as
+-- they always did rather than being refused retroactively.
+ALTER TABLE payments_intents ADD COLUMN idempotency_fingerprint TEXT;
+`,
+  },
 ];

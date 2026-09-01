@@ -11,12 +11,22 @@
  */
 import { formatMoney, money } from '../../../shared/money';
 import { DAY, addInterval, formatRelative } from '../../../shared/time';
-import { describeInterval, intervalOf, isMetered, longDate, recurringLines, recurringSubtotal, subscriptionMrr } from './cycle';
+import { describeInterval, intervalOf, isMetered, longDate, recurringLines, subscriptionMrr } from './cycle';
 import { countsAsRevenue, describeStatus, isTerminal } from './status';
-import type { Billing } from './store';
+import { PENDING_ITEMS_PER_INVOICE, type Billing } from './store';
 import type {
   BalanceTransaction, Customer, PendingInvoiceItem, RecurringLine, Subscription, SubscriptionStatus,
 } from './types';
+
+/**
+ * How many subscription rows this screen paints. The counts and the MRR beside
+ * them are the whole account either way — this is the length of the list, not
+ * the depth the numbers are read to.
+ */
+const SUBSCRIPTION_ROWS = 100;
+
+/** How many per-subscription warnings are spelled out before they are counted. */
+const ATTENTION_NOTES = 20;
 
 /** One open invoice, as reported by whichever module owns invoicing. */
 export interface OpenInvoice {
@@ -65,9 +75,24 @@ export interface NextInvoicePreview {
   subscription: string;
   date: number;
   currency: string;
+  /** The price list's own view: what each item costs, tax included or not. */
   lines: RecurringLine[];
+  /**
+   * The taxable base of the recurring lines — what the bill will record as its
+   * subtotal, not what the price list says. On a tax-inclusive price the two
+   * differ by exactly the tax below, and adding the list price to that tax
+   * would charge it twice over.
+   */
   subtotal: number;
+  /** The waiting prorations, on the same basis. */
   uninvoiced_total: number;
+  /**
+   * The tax the bill this predicts will actually charge, worked out by the same
+   * call `issue()` makes. A next-invoice figure with the tax left out is short
+   * by exactly the tax — 19% on a German account — and it is the number a
+   * support agent reads out to the customer.
+   */
+  tax: number;
   balance_applied: number;
   estimated_total: number;
   note: string;
@@ -79,10 +104,14 @@ export interface CustomerSummary {
   customer: Customer;
   headline: string;
   subscriptions: {
+    /** Every subscription on the account, however many rows `data` carries. */
     total: number;
     live: number;
     by_status: Partial<Record<SubscriptionStatus, number>>;
+    /** A screenful of them, newest first. */
     data: SubscriptionSummaryRow[];
+    /** True when `data` is shorter than `total`. */
+    has_more: boolean;
   };
   mrr: number;
   arr: number;
@@ -109,7 +138,14 @@ export interface CustomerSummary {
     source: 'invoicing';
   };
   uninvoiced_items: {
+    /**
+     * The waiting proration lines the next bill will claim, read to the depth
+     * that bill claims to. Anything beyond it rides the invoice after, which is
+     * why this list and `next_invoice.uninvoiced_total` are read once and
+     * shared rather than being two readings of the same ledger.
+     */
     data: PendingInvoiceItem[];
+    /** What those lines are worth on the ledger, before tax is taken out. */
     total: number;
   };
   attention: string[];
@@ -121,12 +157,37 @@ export function buildCustomerSummary(
   const customer = billing.requireCustomer(orgId, customerId);
   const locale = billing.locale(orgId);
   const book = billing.book(orgId);
-  const subs = billing.listSubscriptions(orgId, { customer: customerId, status: 'all', limit: 100 }).data;
+  // Every subscription this account holds, not the first page of them.
+  //
+  // The overview learned this the expensive way — a book of 251 reported the
+  // MRR of 200 — and this screen was reading one page deeper into the same
+  // table. A holding company with 101 sites was told it had 100 subscriptions
+  // and $49,900.00 of MRR against a real $50,399.00, `by_status` counted a
+  // hundred of them, and `next_invoice` predicted the earliest renewal *of the
+  // page* rather than of the account, which is a different bill on a different
+  // date. There is no cap that makes those sentences true, so there is no cap.
+  const subs: Subscription[] = [];
+  let cursor: string | null = null;
+  do {
+    const page = billing.listSubscriptions(orgId, { customer: customerId, status: 'all', limit: 200, cursor });
+    subs.push(...page.data);
+    cursor = page.hasMore ? page.nextCursor : null;
+  } while (cursor);
 
   const byStatus: Partial<Record<SubscriptionStatus, number>> = {};
-  for (const sub of subs) byStatus[sub.status] = (byStatus[sub.status] ?? 0) + 1;
+  let mrr = 0;
+  for (const sub of subs) {
+    byStatus[sub.status] = (byStatus[sub.status] ?? 0) + 1;
+    if (countsAsRevenue(sub.status)) mrr += subscriptionMrr(sub, book);
+  }
+  const live = subs.filter((s) => !isTerminal(s.status));
 
-  const rows: SubscriptionSummaryRow[] = subs.map((sub) => {
+  // The counts and the money above are the whole account; the rows below are a
+  // screenful of it. Reading the book in full and then publishing every row of
+  // it would trade one unbounded answer for another, so what is capped is the
+  // list a human scrolls, and `has_more` says so rather than letting a short
+  // list read as the whole story.
+  const rows: SubscriptionSummaryRow[] = subs.slice(0, SUBSCRIPTION_ROWS).map((sub) => {
     const lines = recurringLines(sub.items, { start: sub.current_period_start, end: sub.current_period_end }, { book, currency: sub.currency, locale });
     return {
       id: sub.id,
@@ -154,9 +215,6 @@ export function buildCustomerSummary(
     };
   });
 
-  const live = subs.filter((s) => !isTerminal(s.status));
-  const mrr = rows.reduce((total, row) => total + row.mrr, 0);
-
   /* ------------------------------ lifetime value --------------------------- */
 
   const periods = billing.periods(orgId, { customer: customerId, to: now, limit: 2000 })
@@ -173,7 +231,14 @@ export function buildCustomerSummary(
     .filter((s) => s.status !== 'incomplete')
     .sort((a, b) => a.current_period_end - b.current_period_end)[0] ?? null;
 
-  const uninvoiced = billing.pendingItems(orgId, { customer: customerId, status: 'pending', limit: 200 });
+  // Read to exactly the depth the invoice claims to. This is the set the next
+  // bill sweeps up, so anything shallower describes a bill nobody will receive:
+  // at 200 of 210 waiting lines the panel said $14.50 was outstanding while the
+  // bill went out carrying $43.50 of it, and `create_preview` — which reads the
+  // ledger at the invoice's own depth — disagreed with the panel beside it.
+  const uninvoiced = billing.pendingItems(orgId, {
+    customer: customerId, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE,
+  });
   const uninvoicedTotal = uninvoiced.reduce((total, item) => total + item.amount, 0);
 
   let nextInvoice: NextInvoicePreview | null = null;
@@ -189,13 +254,37 @@ export function buildCustomerSummary(
     const lines = upcoming.cancel_at_period_end
       ? []
       : recurringLines(upcoming.items, period, { book, currency: upcoming.currency, locale });
-    const subtotal = recurringSubtotal(lines);
+    // The same rate engine the bill itself runs, on the same lines: a screen
+    // that predicts a total the invoice will not charge is not a prediction.
+    //
+    // Every money figure below comes back out of *this* call, including the two
+    // that look like they could be read straight off the price list. On a
+    // tax-inclusive price the listed 100.00 already contains the tax, so the
+    // bill's own subtotal is 91.86 and its tax is 8.14; publishing the list
+    // price as `subtotal` beside that `tax` made the panel add up to 108.14 for
+    // a bill that will say 100.00, and overstated it by exactly the tax the
+    // customer was already paying. The rule is the one `issue()` follows: a
+    // line's `amount` is the base, its tax is beside it, and the two are never
+    // read off different paths.
+    const recurring = billing.invoices.recurringDrafts(orgId, upcoming.id, lines);
+    const prorated = billing.invoices.prorationDrafts(uninvoiced);
+    const taxed = billing.invoices.taxDrafts(orgId, customer, [...recurring, ...prorated]);
+    const subtotal = taxed.slice(0, recurring.length).reduce((total, line) => total + line.amount, 0);
+    // What the waiting items will be worth *on the bill*. `uninvoiced_items`
+    // below still reports what the ledger holds; this is the same money after
+    // an inclusive price has had its tax taken out of it.
+    const uninvoicedOnBill = taxed.slice(recurring.length).reduce((total, line) => total + line.amount, 0);
+    const tax = taxed.reduce((total, line) => total + line.tax.amount, 0);
+    // What the lines are worth with their tax on them. For an exclusive price
+    // that is the amount plus the tax; for an inclusive one the tax came out of
+    // the amount, so the two halves add back up to the listed price either way.
+    const gross = subtotal + uninvoicedOnBill + tax;
     // A credit balance is drawn down by the invoice; it can never take a total
     // below zero, so what is left stays on the account for next time. The
     // waiting items can themselves be worth less than nothing — a downgrade is
     // a credit line now, not a balance movement — and a bill with nothing left
     // to pay draws nothing down.
-    const room = Math.max(0, subtotal + uninvoicedTotal);
+    const room = Math.max(0, gross);
     const balanceApplied = customer.balance < 0 ? Math.max(customer.balance, -room) : customer.balance;
     const metered = upcoming.items.filter((item) => isMetered(book.price(item.price)));
     nextInvoice = {
@@ -204,9 +293,10 @@ export function buildCustomerSummary(
       currency: upcoming.currency,
       lines,
       subtotal,
-      uninvoiced_total: uninvoicedTotal,
+      uninvoiced_total: uninvoicedOnBill,
+      tax,
       balance_applied: balanceApplied,
-      estimated_total: Math.max(0, subtotal + uninvoicedTotal + balanceApplied),
+      estimated_total: Math.max(0, gross + balanceApplied),
       note: upcoming.cancel_at_period_end
         ? `This subscription ends on ${longDate(upcoming.current_period_end, locale)}, so there is no renewal charge — only anything still outstanding.`
         : metered.length
@@ -230,16 +320,26 @@ export function buildCustomerSummary(
   if (customer.delinquent) {
     attention.push(`${customer.name} is delinquent — ${(byStatus.past_due ?? 0) + (byStatus.unpaid ?? 0)} subscription(s) are not being collected.`);
   }
+  // One sentence per subscription is a readable list for the accounts almost
+  // everybody has and a wall of text for a holding company with a thousand
+  // sites, now that the book above is read in full. So the sentences are
+  // written for a screenful and the rest are counted, which is the same bargain
+  // `subscriptions.data` and `has_more` strike one field over.
+  const perSubscription: string[] = [];
   for (const sub of live) {
     if (sub.status === 'trialing' && sub.trial_end !== null && sub.trial_end - now <= 7 * DAY) {
-      attention.push(`Trial on ${sub.id} ends ${formatRelative(sub.trial_end, now, locale)}; there is ${sub.default_payment_method ?? customer.invoice_settings.default_payment_method ? 'a payment method on file' : 'no payment method on file'}.`);
+      perSubscription.push(`Trial on ${sub.id} ends ${formatRelative(sub.trial_end, now, locale)}; there is ${sub.default_payment_method ?? customer.invoice_settings.default_payment_method ? 'a payment method on file' : 'no payment method on file'}.`);
     }
     if (sub.cancel_at_period_end) {
-      attention.push(`${sub.id} is set to cancel on ${longDate(sub.current_period_end, locale)}.`);
+      perSubscription.push(`${sub.id} is set to cancel on ${longDate(sub.current_period_end, locale)}.`);
     }
     if (sub.pause_collection) {
-      attention.push(`Collection on ${sub.id} is paused (${sub.pause_collection.behavior})${sub.pause_collection.resumes_at ? `, resuming ${formatRelative(sub.pause_collection.resumes_at, now, locale)}` : ''}.`);
+      perSubscription.push(`Collection on ${sub.id} is paused (${sub.pause_collection.behavior})${sub.pause_collection.resumes_at ? `, resuming ${formatRelative(sub.pause_collection.resumes_at, now, locale)}` : ''}.`);
     }
+  }
+  attention.push(...perSubscription.slice(0, ATTENTION_NOTES));
+  if (perSubscription.length > ATTENTION_NOTES) {
+    attention.push(`And ${perSubscription.length - ATTENTION_NOTES} more subscriptions on this account need attention — open the subscription list to work through them.`);
   }
   if (openInvoices.length) {
     const oldest = openInvoices[0];
@@ -263,7 +363,9 @@ export function buildCustomerSummary(
     as_of: now,
     customer,
     headline,
-    subscriptions: { total: subs.length, live: live.length, by_status: byStatus, data: rows },
+    subscriptions: {
+      total: subs.length, live: live.length, by_status: byStatus, data: rows, has_more: rows.length < subs.length,
+    },
     mrr,
     arr: mrr * 12,
     balance: {

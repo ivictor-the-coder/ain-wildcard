@@ -1,0 +1,12 @@
+import { chromium } from '@playwright/test';
+const URL='http://127.0.0.1:8854';
+const b=await chromium.launch();
+const c=await b.newContext({viewport:{width:1512,height:950}});
+const p=await c.newPage();
+await p.goto(URL,{waitUntil:'domcontentloaded'});
+await p.request.post(URL+'/api/v1/auth/demo');
+await p.goto(URL+'/deals',{waitUntil:'networkidle'}); await p.waitForTimeout(800);
+const opts=await p.getByLabel('Close date').locator('option').allInnerTexts();
+console.log('CLOSE DATE OPTIONS IN ORDER:',JSON.stringify(opts));
+console.log('selected:',await p.getByLabel('Close date').inputValue());
+await b.close();
