@@ -1,11 +1,12 @@
 {
-  "updated": "2026-09-01T01:52:18.964177",
-  "headline": "An independent audit called it: the backend is strong and the product barely existed. 228 API routes had four screens. That is the thing being fixed now \u2014 and the scoreboard has been replaced, because the old one could only ever print \"the reference product wins\".",
+  "updated": "2026-09-01T22:02:49.026630",
+  "headline": "The pivot worked. Seven client modules and 40 screens where there were four routes a day ago \u2014 and the revenue board answers the audit\u2019s worst finding by refusing to do the wrong thing: it will not convert or sum across currencies, it makes you pick a book.",
   "stats": {
     "server modules": 10,
     "api routes": 228,
+    "screens": 40,
     "tests passing": 1079,
-    "lines of code": "120,730"
+    "lines of code": "140,154"
   },
   "waves": [
     {
@@ -190,18 +191,18 @@
           "id": "billing-screens",
           "title": "Subscriptions, customers & invoices",
           "status": "critique",
-          "rounds": 1,
-          "operability": 0.75,
-          "debt": 6,
+          "rounds": 2,
+          "operability": 0.85,
+          "debt": 4,
           "note": "Live: 35 subscriptions with status pills, currency-bucketed totals and cancel-at-period-end badges. The proration preview is the centrepiece \u2014 the exact credit and charge lines before you commit."
         },
         {
           "id": "crm-screens",
           "title": "Contacts, companies & record pages",
           "status": "critique",
-          "rounds": 1,
-          "operability": 0.75,
-          "debt": 6,
+          "rounds": 2,
+          "operability": 0.85,
+          "debt": 4,
           "note": "Live: 148 contacts under saved views, the full filter builder, coloured lifecycle stages, owner avatars and CSV export."
         },
         {
@@ -216,9 +217,11 @@
         {
           "id": "revenue-screens",
           "title": "Revenue, usage, credits & dunning",
-          "status": "queued",
-          "rounds": 0,
-          "note": "The MRR waterfall, credit burn-down, and the recovery screen that makes money back. Lost to a container restart before it started."
+          "status": "critique",
+          "rounds": 1,
+          "note": "Per-currency books with an honest banner explaining that nothing is converted or added across them, an MRR movement waterfall carrying its reconciliation status, NRR, GRR, DSO, deferred balance, and a Who-moved panel naming the churned account.",
+          "operability": 0.8,
+          "debt": 4
         }
       ]
     },
