@@ -335,6 +335,9 @@ export interface PendingItem {
   amount: number;
   currency: string;
   period: { start: number; end: number };
+  /** The exact fraction of the period this line covers, as the engine holds it. */
+  proration: { numerator: number; denominator: number };
+  proration_date: number;
   status: string;
   invoice: string | null;
   created: number;
@@ -375,13 +378,50 @@ export interface SubscriptionSchedule {
   id: string;
   customer: string;
   subscription: string | null;
-  status: string;
+  status: ScheduleStatus;
   phases: SchedulePhase[];
   current_phase: number | null;
   end_behavior: 'release' | 'cancel';
   start_date: number;
   current_phase_ends: number | null;
   starts_in_days: number;
+  released_at: number | null;
+  canceled_at: number | null;
+  completed_at: number | null;
+  created: number;
+  updated: number;
+}
+
+export type ScheduleStatus = 'not_started' | 'active' | 'completed' | 'released' | 'canceled';
+
+/** Where this workspace is registered to collect, and at what rate. */
+export interface TaxRate {
+  object: 'tax_rate';
+  id: string;
+  display_name: string;
+  description: string | null;
+  jurisdiction: string;
+  country: string;
+  state: string | null;
+  tax_type: string;
+  /** An exact decimal string — never a float. "19", "8.875". */
+  percentage: string;
+  reverse_charge: boolean;
+  active: boolean;
+  metadata: Record<string, string>;
+  created: number;
+  updated: number;
+  percentage_display: string;
+  applies_to: string;
+  detail: string;
+}
+
+export interface AutomaticTaxSettings {
+  object: 'automatic_tax_settings';
+  enabled: boolean;
+  invoices_missing_a_tax_location: number;
+  invoices_held_in_draft: number;
+  detail: string;
 }
 
 export interface CustomerSummary {
@@ -740,6 +780,31 @@ export interface PaymentSettings {
   schedule_explained: string;
 }
 
+/**
+ * One presentation of money against a bill, in the state machine's own words.
+ *
+ * `processing` and `requires_action` are the two states a payments UI usually
+ * hides, and hiding them is how an operator is told a direct debit failed while
+ * the bank has simply not answered yet.
+ */
+export interface PaymentIntent {
+  object: 'payment_intent';
+  id: string;
+  customer: string;
+  payment_method: string | null;
+  invoice: string | null;
+  amount: number;
+  currency: string;
+  status: string;
+  description: string | null;
+  attempt_count: number;
+  next_action: { type: string; description?: string; authenticate_at?: string } | null;
+  last_payment_error: { code: string; message: string; advice: string | null } | null;
+  latest_charge: string | null;
+  succeeded_at: number | null;
+  created: number;
+}
+
 /** `GET /v1/invoices/:id/payments` — every attempt made against one bill. */
 export interface InvoicePayments {
   object: 'invoice_payments';
@@ -756,6 +821,7 @@ export interface InvoicePayments {
   cash_collected: number;
   collectable: boolean;
   collectable_note: string;
+  payment_intents: PaymentIntent[];
   charges: Charge[];
   refunds: Refund[];
   disputes: Dispute[];

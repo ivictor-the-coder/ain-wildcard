@@ -114,6 +114,16 @@ const money = (workspace: WorkspaceProfile, amount: number) =>
 const day = (workspace: WorkspaceProfile, ts: number) =>
   formatDate(ts, { locale: workspace.locale, timeZone: workspace.timezone });
 
+/**
+ * A date-only property — `close_date`, `renewal_date`.
+ *
+ * Stored as midnight UTC of the day a person picked, so it is read back in that
+ * same zone. Formatting it in the workspace's zone would put "your agreement
+ * renews on" a day before the renewal the record shows.
+ */
+const calendarDay = (workspace: WorkspaceProfile, ts: number) =>
+  formatDate(ts, { locale: workspace.locale, timeZone: 'UTC' });
+
 interface Facts {
   account: AccountProfileResult | null;
   contact: { id: string; name: string; email: string | null; title: string | null; role: string | null } | null;
@@ -121,6 +131,33 @@ interface Facts {
   topDeal: AccountProfileResult['open_deals'][number] | null;
   ticket: AccountProfileResult['open_tickets'][number] | null;
   used: string[];
+}
+
+/**
+ * A timeline entry this composer wrote earlier.
+ *
+ * Logging a draft puts it on the record as an email activity, so the *next*
+ * draft read it back as the last thing that happened and opened with
+ * "Following up on our Thornbury Logistics — multi-site rollout — following up
+ * (30 seconds ago)" — the message quoting its own predecessor's subject line.
+ * A draft nobody sent is not a touch on the customer, so the openers skip it and
+ * fall through to the agreed next step, which reads correctly.
+ *
+ * These are exactly the subject shapes the switch below composes.
+ */
+const COMPOSED_TAIL = [
+  ' — next step', ' — following up', ' — checking in', ' — call summary', ' — meeting notes',
+  ' — handover', ' — deal summary', ' — account summary', ' — recap and next steps',
+  ' — support update', ' — worth another look?', ' — quick introduction', ' — payment outstanding',
+];
+
+export function composedHere(title: string): boolean {
+  const t = title.trim().toLowerCase();
+  return COMPOSED_TAIL.some((tail) => t.endsWith(tail))
+    || /\s—\srenewal(\son\s.+)?$/.test(t)
+    || /\s—\stelemetry on your .+ lines$/.test(t)
+    || t.startsWith('recap — ')
+    || t.startsWith('update — ');
 }
 
 function gather(input: DraftInput): Facts {
@@ -133,7 +170,9 @@ function gather(input: DraftInput): Facts {
     ?? null;
   const topDeal = account?.open_deals?.[0] ?? null;
   const ticket = account?.open_tickets?.[0] ?? null;
-  const lastTouch = input.timeline.find((item) => item.kind !== 'property_change') ?? null;
+  const lastTouch = input.timeline.find(
+    (item) => item.kind !== 'property_change' && !composedHere(item.title),
+  ) ?? null;
   const used: string[] = [];
   if (account) used.push(`${account.name} — ${account.headline || account.object_type}`);
   if (contact) used.push(`${contact.name}${contact.title ? `, ${contact.title}` : ''}`);
@@ -163,7 +202,7 @@ export function composeDraft(input: DraftInput): DraftResult {
       if (facts.topDeal) {
         paragraphs.push(
           `We have ${facts.topDeal.name} sitting at ${facts.topDeal.stage.toLowerCase()} for ${facts.topDeal.amount_formatted}` +
-          `${facts.topDeal.close_date ? `, with a ${day(workspace, facts.topDeal.close_date)} close date on it` : ''}. ` +
+          `${facts.topDeal.close_date ? `, closing ${calendarDay(workspace, facts.topDeal.close_date)}` : ''}. ` +
           `${tone === 'consultative' ? 'Before we go further I want to be sure the business case holds up on your side.' : 'I want to make sure nothing is blocked on us.'}`,
         );
       }
@@ -195,14 +234,14 @@ export function composeDraft(input: DraftInput): DraftResult {
     }
     case 'renewal': {
       const renewal = account?.properties.renewal_date ? Number(account.properties.renewal_date) : null;
-      subject = `${name} — renewal${renewal ? ` on ${day(workspace, renewal)}` : ''}`;
+      subject = `${name} — renewal${renewal ? ` on ${calendarDay(workspace, renewal)}` : ''}`;
       const daysOut = renewal ? Math.round((renewal - workspace.now) / DAY) : null;
       paragraphs.push(renewal && daysOut !== null
         ? daysOut > 0
-          ? `Your agreement renews on ${day(workspace, renewal)}, which is ${daysOut} ${daysOut === 1 ? 'day' : 'days'} out.`
+          ? `Your agreement renews on ${calendarDay(workspace, renewal)}, which is ${daysOut} ${daysOut === 1 ? 'day' : 'days'} out.`
           : daysOut === 0
-            ? `Your agreement renews today, ${day(workspace, renewal)}.`
-            : `Your renewal date on file was ${day(workspace, renewal)}, ${Math.abs(daysOut)} days ago, so the paperwork is overdue on our side.`
+            ? `Your agreement renews today, ${calendarDay(workspace, renewal)}.`
+            : `Your renewal date on file was ${calendarDay(workspace, renewal)}, ${Math.abs(daysOut)} days ago, so the paperwork is overdue on our side.`
         : 'Your agreement is coming up for renewal.');
       if (account?.properties.connected_assets) {
         paragraphs.push(`You are currently running ${Number(account.properties.connected_assets).toLocaleString('en-US')} connected assets with us${account.totals.lifetime_won !== 0 ? `, ${account.totals.lifetime_won_formatted} of committed business to date` : ''}.`);
@@ -228,10 +267,10 @@ export function composeDraft(input: DraftInput): DraftResult {
       paragraphs.push(facts.lastTouch
         ? `Thanks for the time ${facts.lastTouch.when}. Here is what I took away.`
         : 'Thanks for the time today. Here is what I took away.');
-      const bullets = input.timeline.filter((i) => i.kind !== 'property_change').slice(0, 3)
+      const bullets = input.timeline.filter((i) => i.kind !== 'property_change' && !composedHere(i.title)).slice(0, 3)
         .map((i) => `• ${i.title}${i.body ? ` — ${truncate(i.body, 120)}` : ''}`);
       if (bullets.length) paragraphs.push(bullets.join('\n'));
-      if (facts.topDeal) paragraphs.push(`On commercials: ${facts.topDeal.name} is at ${facts.topDeal.amount_formatted}${facts.topDeal.close_date ? `, targeting ${day(workspace, facts.topDeal.close_date)}` : ''}.`);
+      if (facts.topDeal) paragraphs.push(`On commercials: ${facts.topDeal.name} is at ${facts.topDeal.amount_formatted}${facts.topDeal.close_date ? `, targeting ${calendarDay(workspace, facts.topDeal.close_date)}` : ''}.`);
       paragraphs.push('Shout if I have any of that wrong — otherwise I will pick up the actions on our side.');
       break;
     }
@@ -239,7 +278,7 @@ export function composeDraft(input: DraftInput): DraftResult {
     case 'meeting_notes': {
       subject = `${name} — ${kind === 'call_summary' ? 'call summary' : 'meeting notes'}`;
       const items = input.timeline.filter((i) => i.kind === (kind === 'call_summary' ? 'call' : 'meeting')).slice(0, 3);
-      const source = items.length ? items : input.timeline.slice(0, 3);
+      const source = items.length ? items : input.timeline.filter((i) => !composedHere(i.title)).slice(0, 3);
       paragraphs.push(source.length
         ? source.map((i) => `${day(workspace, i.at)} — ${i.title}${i.body ? `\n${truncate(i.body, 400)}` : ''}`).join('\n\n')
         : `No ${kind === 'call_summary' ? 'calls' : 'meetings'} are logged against ${name} yet, so there is nothing to summarise.`);
@@ -254,7 +293,7 @@ export function composeDraft(input: DraftInput): DraftResult {
         ? `${account.name}: ${account.headline}. Owned by ${account.owner ?? 'nobody — this account is unassigned'}.`
         : `${name}: no CRM record resolved, so this summary is thin by design.`);
       if (deal) {
-        paragraphs.push(`Live deal: ${deal.name} at ${deal.amount_formatted}, ${deal.stage.toLowerCase()}${deal.close_date ? `, close date ${day(workspace, deal.close_date)}` : ''}.`);
+        paragraphs.push(`Live deal: ${deal.name} at ${deal.amount_formatted}, ${deal.stage.toLowerCase()}${deal.close_date ? `, close date ${calendarDay(workspace, deal.close_date)}` : ''}.`);
       }
       if (account?.contacts.length) {
         paragraphs.push(`Buying committee: ${listPhrase(account.contacts.slice(0, 4).map((c) => `${c.name}${c.role ? ` (${c.role.toLowerCase()})` : ''}`))}.`);

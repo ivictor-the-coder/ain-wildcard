@@ -449,7 +449,31 @@ export class DunningEngine {
   /** A bill was collected outside a scheduled retry: close the campaign. */
   onCollectionSucceeded(orgId: string, invoice: Invoice, intent: PaymentIntent, charge: Charge): void {
     const campaign = this.forInvoice(orgId, invoice.id);
-    if (!campaign || campaign.status !== 'recovering') return;
+    if (!campaign) return;
+    // A schedule that ran out is not a bill that will never be paid, and the
+    // two are not allowed to disagree. `exhausted` is the one status the
+    // summary reads as money gone — `lost_amount` is the sum of what exhausted
+    // campaigns were chasing — so a bill collected after the last window, by
+    // the hand retry the queue itself tells an operator to make, is cash in
+    // that this workspace goes on reporting as lost, at a recovery rate that
+    // never moves, under an action line that still says the money is owed on a
+    // bill that has been paid. The window is spent and no schedule is
+    // restarted here: the campaign is simply told what happened to the bill it
+    // was chasing, which is the same thing `recordRecovery` is told on every
+    // other path. Only when the bill is actually settled — a part payment
+    // after the schedule ended leaves the rest owed, and that is still a
+    // recovery that did not happen.
+    if (campaign.status === 'exhausted') {
+      if (invoice.amount_due > 0) return;
+      this.recordRecovery(orgId, campaign, {
+        attemptNumber: campaign.attempt_count + 1,
+        scheduledFor: campaign.resolved_at ?? this.ctx.now(),
+        intentId: intent.id, chargeId: charge.id, methodId: intent.payment_method, amount: charge.amount,
+        resolution: `${formatMoney(money(charge.amount, campaign.currency), { locale: this.orgFormat(orgId).locale })} was collected against ${this.billing.invoices.invoice(orgId, invoice.id)?.number ?? invoice.id} after the ${campaign.max_attempts}-attempt schedule had run out, so this campaign recovered rather than losing what it was chasing.`,
+      });
+      return;
+    }
+    if (campaign.status !== 'recovering') return;
     // Money arriving is not the same thing as the bill being recovered. A part
     // payment — a customer paying over the phone what they can manage today, a
     // debit presented for less than the balance because another was already with
@@ -614,12 +638,18 @@ export class DunningEngine {
 
   private recordRecovery(
     orgId: string, campaign: Dunning,
-    input: { attemptNumber: number; scheduledFor: number; intentId: string | null; chargeId: string | null; methodId: string | null; amount: number },
+    input: {
+      attemptNumber: number; scheduledFor: number; intentId: string | null; chargeId: string | null;
+      methodId: string | null; amount: number;
+      /** Set where "attempt N of M" would not be the true story — a bill collected after the schedule ran out. */
+      resolution?: string;
+    },
   ): void {
     const now = this.ctx.now();
     const org = this.orgFormat(orgId);
     const shown = formatMoney(money(input.amount, campaign.currency), { locale: org.locale });
-    const resolution = `${shown} recovered on attempt ${input.attemptNumber} of ${campaign.max_attempts}, ${Math.max(1, Math.round((now - campaign.started_at) / DAY))} day(s) after the first failure.`;
+    const resolution = input.resolution
+      ?? `${shown} recovered on attempt ${input.attemptNumber} of ${campaign.max_attempts}, ${Math.max(1, Math.round((now - campaign.started_at) / DAY))} day(s) after the first failure.`;
     this.ctx.db.patch('payments_dunning', 'id', campaign.id, {
       status: 'recovered', attempt_count: input.attemptNumber, last_attempt_at: now,
       next_attempt_at: null, recovered_amount: input.amount, resolved_at: now, resolution, updated: now,

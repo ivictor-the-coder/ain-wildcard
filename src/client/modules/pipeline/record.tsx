@@ -7,22 +7,26 @@
  * The stage rail at the top is the primary control: clicking a stage is the
  * same move the board makes, with the same confirmation.
  */
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { api, invalidate, useMutation, useQuery, type ApiClientError, type ListEnvelope } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import { useSession } from '@/client/kernel/session';
 import {
   Avatar, Badge, Banner, Breadcrumbs, Button, Card, ChevronRightIcon, ConfirmDialog, DescriptionList,
   EmptyState, ErrorState, GitBranchIcon, humanize, iconByName, Icons, MenuButton, Page, Skeleton,
-  SkeletonText, Split, Timeline, useFormat, useToast,
+  SkeletonText, Split, Timeline, useToast,
   type DescriptionItem, type MenuSection, type TimelineEntry,
 } from '@/client/design';
 import {
   accountOf, contactsOf, dealAmount, dealCloseDate, dealEnteredStage, dealStage, dealWeighted,
-  num, recordHref, str, useDealProperties, usePipelines, useUserIndex, useUsers, useVelocity,
-  type DealRecord, type PipelineStage, type PropertyDef, type StageHistory, type TimelineItem,
+  num, recordHref, str, useDealFormat, useDealProperties, usePipelines, useUserIndex, useUsers,
+  useVelocity,
+  type CalendarFormat, type DealRecord, type PipelineStage, type PropertyDef, type StageHistory,
+  type TimelineItem,
 } from './api';
-import { EditDealDialog, LogActivityDialog, StageMoveDialog } from './dialogs';
+import { EditDealDialog, LogActivityDialog, PipelineMoveDialog, StageMoveDialog } from './dialogs';
+import { AccountCard, CommitteeCard } from './associations';
+import { DraftDialog } from '../copilot/draft';
 
 const DAY_MS = 86_400_000;
 
@@ -40,14 +44,15 @@ interface Subscription {
 /* ------------------------------- value copy ------------------------------- */
 
 /** Renders a stored property the way a person reads it, never in minor units. */
-function useValueRenderer(currency: string) {
-  const f = useFormat();
+function useValueRenderer(currency: string, f: CalendarFormat) {
   return (property: PropertyDef, value: unknown): string => {
     if (value === undefined || value === null || value === '') return '—';
     switch (property.type) {
       case 'currency': return f.money(num(value), { currency: (property.currency ?? currency) as never });
       case 'number': return f.number(num(value));
-      case 'date': return f.date(num(value));
+      // A `date` is a day the workspace picked, not an instant, so it is read
+      // back in the day it was stored as rather than shifted into a timezone.
+      case 'date': return f.calendarDate(num(value));
       case 'datetime': return f.dateTime(num(value));
       case 'bool':
       case 'boolean': return value ? 'Yes' : 'No';
@@ -69,7 +74,7 @@ const timelineTone = (kind: string): TimelineEntry['tone'] => {
 /* ================================== page ================================== */
 
 export function DealRecordPage({ id }: { id: string }) {
-  const f = useFormat();
+  const f = useDealFormat();
   const session = useSession();
   const toast = useToast();
   const { navigate } = useRouter();
@@ -81,7 +86,16 @@ export function DealRecordPage({ id }: { id: string }) {
   const users = useUsers();
   const userIndex = useUserIndex(users.data?.data);
 
-  const deal = record.data ?? null;
+  // A write here invalidates `/v1/records/deal`, and `invalidate` matches by
+  // prefix — so the detail key goes with the list key and `record.data` is
+  // briefly undefined. Falling back to the skeleton on that would unmount this
+  // whole subtree mid-interaction: the dialog that just saved would vanish, and
+  // every save would flash the page. The last deal read stays on screen while
+  // the next one is in flight. The route keys this component on the id, so a
+  // different deal remounts rather than inheriting the one before it.
+  const lastRead = useRef<DealDetail | null>(null);
+  if (record.data) lastRead.current = record.data;
+  const deal = record.data ?? lastRead.current;
   const pipeline = useMemo(
     () => (pipelines.data?.data ?? []).find((p) => p.name === str(deal?.properties.pipeline)),
     [pipelines.data, deal],
@@ -110,20 +124,38 @@ export function DealRecordPage({ id }: { id: string }) {
   const [logging, setLogging] = useState(false);
   const [move, setMove] = useState<PipelineStage | null>(null);
   const [archiving, setArchiving] = useState(false);
+  const [drafting, setDrafting] = useState(false);
+  const [repiping, setRepiping] = useState(false);
 
+  const restore = useMutation<void, DealRecord>(
+    () => api.post<DealRecord>(`/v1/records/deal/${encodeURIComponent(id)}/restore`),
+    {
+      invalidates: ['/v1/records/deal', '/v1/pipelines', '/v1/crm/overview'],
+      onSuccess: (deal) => {
+        toast.success('Deal restored', `${deal.display_name} is back on the board and counting towards the forecast.`);
+        navigate(recordHref('deal', id));
+      },
+      onError: (e) => toast.error('The deal was not restored', e.body.message),
+    },
+  );
+
+  // Archiving is reversible and the route leaves this page, so the way back has
+  // to travel with the notification rather than live on the screen being left.
   const archive = useMutation<void, void>(
     () => api.del(`/v1/records/deal/${encodeURIComponent(id)}`),
     {
       invalidates: ['/v1/records/deal', '/v1/pipelines', '/v1/crm/overview'],
       onSuccess: () => {
-        toast.success('Deal archived', 'It is off the board. Restore it from the record list if that was a mistake.');
+        toast.success('Deal archived', 'It is off the board and out of the forecast.', {
+          action: { label: 'Undo', onClick: () => { void restore.run().catch(() => undefined); } },
+        });
         navigate('/deals');
       },
       onError: (e) => toast.error('The deal was not archived', e.body.message),
     },
   );
 
-  const renderValue = useValueRenderer(session.currency);
+  const renderValue = useValueRenderer(session.currency, f);
   const props = useMemo(() => properties.data?.data ?? [], [properties.data]);
   const groups = useMemo(() => {
     const order = properties.data?.groups ?? [];
@@ -178,7 +210,6 @@ export function DealRecordPage({ id }: { id: string }) {
   const entered = dealEnteredStage(deal);
   const now = session.now();
   const daysInStage = entered ? Math.floor((now - entered) / DAY_MS) : null;
-  const daysToClose = close ? Math.round((close - now) / DAY_MS) : null;
   const owner = deal.owner_id ? userIndex.get(deal.owner_id) : undefined;
 
   const timeline: TimelineEntry[] = (deal.timeline ?? []).map((item) => ({
@@ -215,7 +246,19 @@ export function DealRecordPage({ id }: { id: string }) {
     {
       id: 'record',
       items: [
+        {
+          id: 'pipeline',
+          label: 'Move to another pipeline',
+          icon: <GitBranchIcon size={14} />,
+          onSelect: () => setRepiping(true),
+        },
         { id: 'log', label: 'Log activity', icon: <Icons.note size={14} />, onSelect: () => setLogging(true) },
+        {
+          id: 'draft',
+          label: 'Draft a follow-up',
+          icon: <Icons.edit size={14} />,
+          onSelect: () => setDrafting(true),
+        },
         { id: 'edit', label: 'Edit properties', icon: <Icons.edit size={14} />, onSelect: () => setEditing('') },
         {
           id: 'ask',
@@ -245,13 +288,27 @@ export function DealRecordPage({ id }: { id: string }) {
     },
     {
       label: 'Close date',
-      value: close ? f.date(close) : 'Not set',
-      hint: daysToClose === null ? undefined : daysToClose >= 0 ? `in ${f.plural(daysToClose, 'day')}` : `${f.plural(Math.abs(daysToClose), 'day')} overdue`,
+      value: close ? f.calendarDate(close) : 'Not set',
+      hint: close === null
+        ? undefined
+        : stage?.is_closed
+          ? `Booked ${f.calendarRelative(close)}`
+          : f.calendarDaysUntil(close) < 0
+            ? `${f.plural(-f.calendarDaysUntil(close), 'day')} overdue`
+            : f.calendarRelative(close),
     },
     {
       label: 'In this stage',
       value: daysInStage === null ? '—' : f.plural(daysInStage, 'day'),
-      hint: stageVelocity ? `Median here is ${f.plural(stageVelocity.median_days_in_stage, 'day')}` : undefined,
+      // A closed stage has no median because deals do not wait in one; saying
+      // that is more useful than an em dash where a number belongs.
+      hint: !stageVelocity
+        ? undefined
+        : stage?.is_closed
+          ? 'Deals do not wait here'
+          : stageVelocity.median_days_in_stage > 0
+            ? `Median here is ${f.plural(stageVelocity.median_days_in_stage, 'day')}`
+            : 'Nothing has sat here long enough to have a median',
     },
   ];
 
@@ -280,7 +337,23 @@ export function DealRecordPage({ id }: { id: string }) {
         </>
       }
     >
-      {stalled && stageVelocity && (
+      {deal.archived && (
+        <Banner
+          tone="neutral"
+          title="This deal is archived"
+          bar
+          actions={
+            <Button size="sm" variant="primary" loading={restore.loading} onClick={() => { void restore.run().catch(() => undefined); }}>
+              Restore it
+            </Button>
+          }
+        >
+          It is off the board and out of the forecast. Nothing has been deleted — restoring puts it back
+          in {stage?.label ?? 'its stage'} at {num(deal.properties.probability)}%.
+        </Banner>
+      )}
+
+      {!deal.archived && stalled && stageVelocity && (
         <Banner
           tone="warning"
           title="This deal has stopped moving"
@@ -322,49 +395,11 @@ export function DealRecordPage({ id }: { id: string }) {
         gap={6}
         aside={
           <>
-            <Card title="Account" description="Who this deal belongs to">
-              {account ? (
-                <button type="button" className="pl-assoc" onClick={() => navigate(recordHref('company', account.record_id))}>
-                  <Avatar name={account.display_name} seed={account.record_id} size={28} square />
-                  <span className="pl-assoc__text">
-                    <span className="pl-assoc__title u-truncate">{account.display_name}</span>
-                    <span className="pl-assoc__sub">{account.label}</span>
-                  </span>
-                  <ChevronRightIcon size={14} />
-                </button>
-              ) : (
-                <EmptyState
-                  size="sm"
-                  inline
-                  illustration={null}
-                  title="No account linked"
-                  body="Associate a company so the invoice, the tickets and this deal all agree on who the customer is."
-                />
-              )}
-            </Card>
+            <AccountCard deal={deal} account={account} onChanged={refresh} />
 
             <div style={{ height: 'var(--space-6)' }} />
 
-            <Card title="Buying committee" description={`${f.plural(committee.length, 'contact')} on this deal`}>
-              {committee.length === 0 && (
-                <EmptyState size="sm" inline illustration={null} title="Nobody named yet" body="Add the people who have to say yes." />
-              )}
-              {committee.map((contact) => (
-                <button
-                  key={contact.id}
-                  type="button"
-                  className="pl-assoc"
-                  onClick={() => navigate(recordHref('contact', contact.record_id))}
-                >
-                  <Avatar name={contact.display_name} seed={contact.record_id} size={26} />
-                  <span className="pl-assoc__text">
-                    <span className="pl-assoc__title u-truncate">{contact.display_name}</span>
-                    <span className="pl-assoc__sub">{contact.label}</span>
-                  </span>
-                  <ChevronRightIcon size={14} />
-                </button>
-              ))}
-            </Card>
+            <CommitteeCard deal={deal} contacts={committee} onChanged={refresh} />
 
             <div style={{ height: 'var(--space-6)' }} />
 
@@ -530,10 +565,24 @@ export function DealRecordPage({ id }: { id: string }) {
         onClose={() => setEditing(null)}
         onSaved={refresh}
       />
+      <PipelineMoveDialog
+        open={repiping}
+        deal={deal}
+        pipelines={pipelines.data?.data ?? []}
+        properties={props}
+        onClose={() => setRepiping(false)}
+        onMoved={refresh}
+      />
       <LogActivityDialog
         open={logging}
         deal={deal}
         onClose={() => setLogging(false)}
+        onLogged={refresh}
+      />
+      <DraftDialog
+        open={drafting}
+        subject={{ id: deal.id, objectType: 'deal', name: deal.display_name }}
+        onClose={() => setDrafting(false)}
         onLogged={refresh}
       />
       <ConfirmDialog

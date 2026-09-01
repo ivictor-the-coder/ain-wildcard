@@ -19,7 +19,10 @@ import {
 } from '../../design';
 import { CreditCardIcon, XCircleIcon } from '../../design';
 import { useSession } from '../../kernel/session';
-import { Loading, MoneyField, SectionError, StatusPill, idem, statusLabel, useAction, useBillingFormat } from './common';
+import {
+  DialogFields, Loading, MoneyField, SectionError, StatusPill, idem, statusLabel, useAction, useBillingFormat,
+  useDialogForm,
+} from './common';
 import type { CreditBalance, CreditGrant, Customer, PaymentMethod, TaxId } from './types';
 
 /* --------------------------------- shared -------------------------------- */
@@ -144,6 +147,8 @@ export function PaymentMethodDialog({ customer, open, onClose, method }: {
 
   const behaviors = type === 'card' ? CARD_BEHAVIORS : BANK_BEHAVIORS;
 
+  const form = useDialogForm(open, !(type === 'card' && last4.trim().length !== 4) && !action.busy, () => { void submit(); });
+
   return (
     <Modal
       open={open}
@@ -163,6 +168,7 @@ export function PaymentMethodDialog({ customer, open, onClose, method }: {
         </>
       }
     >
+      <DialogFields form={form}>
       <Stack gap={5}>
         {!editing && (
           <Field label="Instrument" hint="A card is charged automatically; a debit is collected against a mandate.">
@@ -264,6 +270,7 @@ export function PaymentMethodDialog({ customer, open, onClose, method }: {
           </Field>
         )}
       </Stack>
+      </DialogFields>
     </Modal>
   );
 }
@@ -436,6 +443,8 @@ export function CreditGrantDialog({ customer, open, onClose }: { customer: Custo
     if (result) onClose();
   };
 
+  const form = useDialogForm(open, !!value && value > 0 && !(kind === 'unit' && !meter) && !action.busy, () => { void submit(); });
+
   return (
     <Modal
       open={open}
@@ -452,6 +461,7 @@ export function CreditGrantDialog({ customer, open, onClose }: { customer: Custo
         </>
       }
     >
+      <DialogFields form={form}>
       <Stack gap={5}>
         <Field label="Name" optional hint="What this pot is called on the invoice that draws it down." error={action.errorFor('name')}>
           <Input value={name} maxLength={140} placeholder="Goodwill for the 6 March ingestion outage" onChange={(e) => setName(e.target.value)} />
@@ -513,6 +523,7 @@ export function CreditGrantDialog({ customer, open, onClose }: { customer: Custo
           <Textarea value={reason} maxLength={300} onChange={(e) => setReason(e.target.value)} placeholder="What the customer was promised, for whoever reads the ledger in a year." />
         </Field>
       </Stack>
+      </DialogFields>
     </Modal>
   );
 }
@@ -540,6 +551,8 @@ function GrantRefundDialog({ grant, open, onClose }: { grant: CreditGrant; open:
     if (result) onClose();
   };
 
+  const form = useDialogForm(open, !!amount && amount > 0 && !action.busy, () => { void submit(); });
+
   return (
     <Modal
       open={open}
@@ -555,6 +568,7 @@ function GrantRefundDialog({ grant, open, onClose }: { grant: CreditGrant; open:
         </>
       }
     >
+      <DialogFields form={form}>
       <Stack gap={5}>
         <Banner tone="info" compact>
           {grant.kind === 'monetary'
@@ -570,6 +584,7 @@ function GrantRefundDialog({ grant, open, onClose }: { grant: CreditGrant; open:
           <Input value={reason} maxLength={300} placeholder="Unused prepay returned on cancellation" onChange={(e) => setReason(e.target.value)} />
         </Field>
       </Stack>
+      </DialogFields>
     </Modal>
   );
 }
@@ -839,6 +854,8 @@ function TaxIdDialog({ customer, open, onClose }: { customer: Customer; open: bo
     onClose();
   };
 
+  const form = useDialogForm(open, value.trim().length >= 2 && !action.busy, () => { void submit(); });
+
   return (
     <Modal
       open={open}
@@ -854,6 +871,7 @@ function TaxIdDialog({ customer, open, onClose }: { customer: Customer; open: bo
         </>
       }
     >
+      <DialogFields form={form}>
       <Stack gap={5}>
         <Field label="Kind" hint={`Defaulted from the billing address${customer.address?.country ? ` — ${customer.address.country}` : ''}.`}>
           <Select
@@ -899,6 +917,7 @@ function TaxIdDialog({ customer, open, onClose }: { customer: Customer; open: bo
           />
         </Field>
       </Stack>
+      </DialogFields>
     </Modal>
   );
 }

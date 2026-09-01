@@ -38,6 +38,7 @@ import {
   type TaxIdVerificationStatus,
 } from './tax';
 import {
+  type AutomaticTax,
   type BalanceTransaction, type BalanceTransactionType, type BilledPeriod, type Cadence,
   type CancellationReason,
   type ChangePreview, type CollectionMethod, type Customer, type Invoice, type InvoiceBillingReason,
@@ -902,6 +903,7 @@ export class Billing {
       // priced its lines any other way would be a second implementation that
       // happens to agree today.
       taxOf: (lines) => this.invoices.taxTotals(orgId, customer, lines),
+      automaticTax: this.automaticTaxFor(orgId, customer),
     });
 
     return {
@@ -1898,9 +1900,7 @@ export class Billing {
     // its lines differently from the invoice it predicts would not be a
     // preview of anything.
     const taxed = this.invoices.taxDrafts(orgId, customer, drafts);
-    const taxEnabled = this.invoices.automaticTaxEnabled(orgId);
-    const taxStatus = this.invoices.taxStatusFor(orgId, customer);
-    const automaticTax = { enabled: taxEnabled, status: taxStatus, detail: describeAutomaticTax(taxStatus, taxEnabled) };
+    const automaticTax = this.automaticTaxFor(orgId, customer);
     const subtotal = taxed.reduce((total, line) => total + line.amount, 0);
     const tax = taxed.reduce((total, line) => total + line.tax.amount, 0);
     const starting = customer.balance;
@@ -2006,6 +2006,21 @@ export class Billing {
 
   mrr(orgId: string, sub: Subscription): number {
     return countsAsRevenue(sub.status) ? subscriptionMrr(sub, this.book(orgId)) : 0;
+  }
+
+  /**
+   * Whether a bill for this account can be placed, in the shape every payload
+   * that predicts one publishes it.
+   *
+   * One reader, because the question is one question: the bill itself, the
+   * upcoming-invoice preview and the change preview all have to give the same
+   * answer, and three copies of "enabled, status, sentence" is how two of them
+   * come to give a different one.
+   */
+  automaticTaxFor(orgId: string, customer: Customer): AutomaticTax {
+    const enabled = this.invoices.automaticTaxEnabled(orgId);
+    const status = this.invoices.taxStatusFor(orgId, customer);
+    return { enabled, status, detail: describeAutomaticTax(status, enabled) };
   }
 }
 

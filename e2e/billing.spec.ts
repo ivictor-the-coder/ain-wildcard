@@ -19,7 +19,23 @@ const signIn = async (page: Page) => {
   await page.waitForSelector('.ain-stat');
 };
 
-const json = async (page: Page, path: string) => (await page.request.get(`/api${path}`)).json();
+/**
+ * A read, retried once past a rate limit.
+ *
+ * The suite makes a few hundred API reads in one session and the platform's
+ * limiter answers 429 to the tail of them. A 429 is the right answer; a test
+ * that reads `undefined.data` off one is a flake, not a finding.
+ */
+const json = async (page: Page, path: string): Promise<any> => { // eslint-disable-line @typescript-eslint/no-explicit-any
+  for (let attempt = 0; ; attempt++) {
+    const res = await page.request.get(`/api${path}`);
+    if (res.ok() || attempt === 3) return res.json();
+    await new Promise((resolve) => setTimeout(resolve, 1200 * (attempt + 1)));
+  }
+};
+
+/** The "nothing was presented" option in the payment dialog, worded once. */
+const BY_HAND_LABEL = 'Recorded by hand — nothing is presented';
 
 /** The value of the stat tile whose label is exactly this — captions mention
  *  the same words, so a substring match picks up three tiles instead of one. */
@@ -30,7 +46,8 @@ const tile = (page: Page, label: string) => page
 
 interface InvoiceRow {
   id: string; number: string; status: string; currency: string;
-  total_display: string; amount_due_display: string; amount_due: number;
+  total_display: string; amount_due_display: string; amount_due: number; amount_paid: number;
+  customer: string;
   customer_name: string; due_date: number | null; created: number;
 }
 
@@ -43,6 +60,19 @@ async function notBeingChased(page: Page, rows: InvoiceRow[]): Promise<InvoiceRo
   const queue = await json(page, '/v1/dunning?status=recovering&limit=50');
   const chased = new Set(queue.data.map((row: { invoice: string }) => row.invoice));
   return rows.filter((row) => !chased.has(row.id));
+}
+
+/**
+ * The account field is a searching combobox, not a select: it asks the API
+ * rather than holding the whole book, so it is driven the way an operator
+ * drives it — type the name, take the first match.
+ */
+async function pickCustomer(page: Page, scope: ReturnType<Page['getByRole']>, name: string) {
+  const box = scope.getByRole('combobox').first();
+  await box.click();
+  await page.keyboard.type(name.slice(0, 18));
+  await expect(page.locator('[role=option]').first()).toBeVisible();
+  await page.keyboard.press('Enter');
 }
 
 test.beforeEach(async ({ page }) => { await signIn(page); });
@@ -117,11 +147,19 @@ test('a customer can be created, edited inline and credited, end to end', async 
   const credit = page.getByRole('dialog');
   await credit.getByLabel('Amount').fill('125.00');
   await credit.getByLabel('Why').fill('Goodwill credit for the ingestion outage, agreed in the e2e run.');
-  await credit.getByRole('button', { name: 'Apply the adjustment' }).click();
+  // The button carries the amount it is about to move, so the last thing read
+  // before committing is the figure itself.
+  const commit = credit.getByRole('button', { name: /^Credit / });
+  await expect(commit).toHaveText('Credit $125.00');
+  await commit.click();
 
   await expect.poll(async () => (await json(page, `/v1/customers/${id}`)).balance).toBe(-12500);
   await page.getByRole('tab', { name: /Balance ledger/ }).click();
-  await expect(page.getByText('Goodwill credit for the ingestion outage')).toBeVisible();
+  const entry = page.locator('tbody tr', { hasText: 'Goodwill credit for the ingestion outage' });
+  await expect(entry).toBeVisible();
+  // The ledger speaks the balance tile's language rather than printing a bare
+  // minus sign the tile then calls credit.
+  await expect(entry).toContainText('$125.00 credit');
 });
 
 test('the customer list joins MRR from the revenue book and filters delinquents', async ({ page }) => {
@@ -154,7 +192,9 @@ test('the proration preview shows the exact lines the change will bill, and appl
   const dialog = page.getByRole('dialog');
 
   const index = sub.items.indexOf(seat) + 1;
-  const quantity = dialog.getByLabel(`Quantity for item ${index}`);
+  // The steppers beside the field carry labels that contain the field's own,
+  // so the field is addressed by its role rather than by a substring.
+  const quantity = dialog.getByRole('spinbutton', { name: `Quantity for item ${index}` });
   await quantity.fill(String(target));
   await quantity.press('Enter');
 
@@ -226,10 +266,13 @@ test('an open invoice can be paid from its own screen, and the document renders'
   await expect(frame.locator('body')).toContainText(invoice.number);
 
   await page.getByRole('tab', { name: 'Lines and totals' }).click();
-  await page.getByRole('button', { name: 'Record payment' }).click();
+  await page.getByRole('button', { name: 'Take a payment' }).click();
   const dialog = page.getByRole('dialog');
+  // The amount defaults to the whole balance, and the primary action carries it.
+  await expect(dialog.getByRole('button', { name: new RegExp(`settles ${invoice.number}`) })).toBeEnabled();
+  await dialog.getByLabel('How it was taken').selectOption(BY_HAND_LABEL);
   await dialog.getByLabel('How it was collected').fill('Bank transfer, reference E2E-1');
-  await dialog.getByRole('button', { name: 'Record the payment' }).click();
+  await dialog.getByRole('button', { name: /^Record / }).click();
 
   await expect.poll(async () => (await json(page, `/v1/invoices/${invoice.id}`)).status).toBe('paid');
   await expect(page.locator('.ain-page__title')).toContainText(invoice.number);
@@ -448,8 +491,13 @@ test('the invoice grid narrows to one account without a lucky text search', asyn
   await expect(page).toHaveURL(new RegExp(`customer=${target.customer}`));
   const rows = page.locator('tbody tr');
   await expect(rows.first()).toBeVisible();
-  const server = await json(page, `/v1/invoices?customer=${target.customer}&status=all&limit=100`);
-  await expect.poll(async () => rows.count()).toBe(Math.min(server.data.length, 100));
+  // The book is re-read on every poll: other tests in this file raise invoices
+  // while this one runs, and a count taken once before the sweep settles is a
+  // race rather than an assertion about the grid.
+  await expect.poll(async () => {
+    const server = await json(page, `/v1/invoices?customer=${target.customer}&status=all&limit=1`);
+    return await rows.count() - Math.min(server.total_count, 200);
+  }, { timeout: 20_000 }).toBe(0);
 });
 
 /* ============================== record tabs =============================== */
@@ -540,9 +588,11 @@ test('billing an account shows what it would bill before it bills it', async ({ 
   await expect(page).toHaveURL(/\/billing\/invoices\/in_/);
 });
 
-test('a refused preview is shown as a refusal, not as a failed request', async ({ page }) => {
-  // "Quantity 1" is not the same thing as "a flat fee" — a per-unit price at one
-  // seat scales happily. The catalogue says which prices actually refuse.
+test('a flat fee is not given a quantity spinner it has no use for', async ({ page }) => {
+  // A flat price sells one of itself however many seats the plan is counted in.
+  // The engine refuses any other quantity, so the screen refuses to offer one:
+  // the control is locked at 1 and says why, rather than inviting an edit that
+  // can only come back as an error.
   const prices = await json(page, '/v1/prices?active=true&limit=200');
   const flatIds = new Set(prices.data
     .filter((row: { model: string }) => row.model === 'flat')
@@ -557,15 +607,12 @@ test('a refused preview is shown as a refusal, not as a failed request', async (
   await page.getByRole('button', { name: 'Change plan or quantity' }).click();
   const dialog = page.getByRole('dialog');
   const index = sub.items.indexOf(flat) + 1;
-  await dialog.getByLabel(`Quantity for item ${index}`).fill('4');
-  await dialog.getByLabel(`Quantity for item ${index}`).press('Enter');
 
-  // The server's sentence, with no "Try again" — retrying sends the same
-  // request and gets the same answer.
-  await expect(dialog.locator('.bl-refusal')).toBeVisible();
-  await expect(dialog.locator('.bl-refusal')).toContainText('flat fee');
-  await expect(dialog.getByRole('button', { name: 'Try again' })).toHaveCount(0);
-  await expect(dialog.getByRole('button', { name: /^Apply/ })).toBeDisabled();
+  await expect(dialog.getByRole('spinbutton', { name: `Quantity for item ${index}` })).toHaveCount(0);
+  const locked = dialog.locator('.bl-fixedqty').nth(index - 1);
+  await expect(locked).toBeVisible();
+  await expect(locked).toHaveText('1');
+  await expect(locked).toHaveAttribute('title', /flat fee/);
 });
 
 test('the subscription terms are editable where the API accepts a change', async ({ page }) => {
@@ -1014,4 +1061,794 @@ test('a failed list says so above the grid, and does not report zero rows', asyn
   // And the footer does not assert a count the request never established.
   await expect(page.locator('.bl-listfoot__count')).toContainText('could not be loaded');
   await expect(page.locator('.bl-listfoot__count')).not.toContainText('No invoices on this page');
+});
+
+/* =============================== schedules ================================ */
+
+test('a plan change can be booked for a future renewal, and released before it happens', async ({ page }) => {
+  const subs = await json(page, '/v1/subscriptions?status=active&limit=50');
+  // A per-seat line, because that is the one a phase can carry more of — a flat
+  // fee sells exactly one of itself and the engine refuses any other quantity.
+  const sub = subs.data.find((row: { schedule: string | null; items: { metered: boolean; quantity: number }[] }) =>
+    !row.schedule && row.items.some((item) => !item.metered && item.quantity > 1));
+  test.skip(!sub, 'no unscheduled subscription carries a per-seat item');
+  const seat = sub.items.find((item: { metered: boolean; quantity: number }) => !item.metered && item.quantity > 1);
+
+  await page.goto(`/billing/subscriptions/${sub.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'More actions' }).click();
+  await page.getByRole('menuitem', { name: /Schedule a change/ }).click();
+
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('What this phase is for').fill('Booked by the e2e run.');
+
+  // The future phase has to differ from the present one, which is the point of
+  // booking it: ten more seats from the renewal onwards.
+  const quantity = dialog.getByLabel(`Quantity for phase item ${sub.items.indexOf(seat) + 1}`);
+  await quantity.fill(String(seat.quantity + 10));
+  await quantity.press('Enter');
+
+  // The phase is priced before it is booked, by the same engine that bills it —
+  // and in the account's own currency, never in raw minor units.
+  const priced = dialog.locator('.bl-phasepreview__total');
+  await expect(priced).toBeVisible();
+  await expect(priced).not.toHaveText(/^\d+$/);
+
+  // The button names the boundary the server already published on the record.
+  await dialog.getByRole('button', { name: /^Schedule it for / }).click();
+  await expect(page.getByText('Change scheduled')).toBeVisible();
+
+  await expect.poll(async () => (await json(page, `/v1/subscriptions/${sub.id}`)).schedule).not.toBeNull();
+  const scheduleId = (await json(page, `/v1/subscriptions/${sub.id}`)).schedule as string;
+  const schedule = await json(page, `/v1/subscription-schedules/${scheduleId}`);
+  expect(schedule.phases.length).toBe(2);
+  // Phase one is the subscription as it stands; it hands over at the renewal
+  // the dialog quoted, not at a date this screen worked out for itself.
+  expect(schedule.phases[0].end_date).toBe(sub.current_period_end);
+  expect(schedule.phases[1].start_date).toBe(sub.current_period_end);
+  expect(schedule.phases[1].description).toBe('Booked by the e2e run.');
+  expect(schedule.phases[1].summary).not.toBe(schedule.phases[0].summary);
+
+  /* ---- and it can be undone from the tab that shows it ---- */
+  await page.getByRole('tab', { name: 'Schedule' }).click();
+  await expect(page.locator('.bl-phase__summary', { hasText: schedule.phases[1].summary })).toBeVisible();
+  await page.getByRole('button', { name: 'Release the subscription' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Release it' }).click();
+
+  await expect(page.getByText('Released from the schedule')).toBeVisible();
+  await expect.poll(async () => (await json(page, `/v1/subscriptions/${sub.id}`)).schedule).toBeNull();
+  await expect.poll(async () => (await json(page, `/v1/subscription-schedules/${scheduleId}`)).status).toBe('released');
+});
+
+test('a subscription already under a schedule says so before anyone changes it', async ({ page }) => {
+  const schedules = await json(page, '/v1/subscription-schedules?status=active&limit=10');
+  const schedule = schedules.data.find((row: { subscription: string | null }) => row.subscription);
+  test.skip(!schedule, 'no subscription in this workspace is under a schedule');
+
+  await page.goto(`/billing/subscriptions/${schedule.subscription}`, { waitUntil: 'networkidle' });
+  const upcoming = schedule.phases.find((phase: { state: string }) => phase.state === 'upcoming');
+  if (upcoming) {
+    await expect(page.getByText(`A change is already booked for`)).toBeVisible();
+    await expect(page.locator('.ain-banner__body')).toContainText(upcoming.summary);
+  }
+
+  // The phases carry the server's own windows, not dates this screen computed.
+  await page.getByRole('tab', { name: 'Schedule' }).click();
+  for (const phase of schedule.phases) {
+    await expect(page.locator('.bl-phase__desc', { hasText: phase.window })).toBeVisible();
+  }
+});
+
+/* ================================== tax =================================== */
+
+test('a tax rate can be registered and retired, and the invoice it taxed is untouched', async ({ page }) => {
+  const jurisdiction = `Playwright County ${Date.now()}`;
+  await page.goto('/billing/taxes', { waitUntil: 'networkidle' });
+
+  await page.getByRole('button', { name: 'Register a rate' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('What appears on the invoice').fill('PW sales tax');
+  await dialog.getByLabel('Jurisdiction').fill(jurisdiction);
+  await dialog.getByLabel('Country', { exact: true }).fill('US');
+  await dialog.getByLabel('State or region').fill(jurisdiction);
+  await dialog.getByLabel('Kind').selectOption('sales_tax');
+  await dialog.getByLabel('Percentage').fill('7.125');
+  await dialog.getByRole('button', { name: 'Register it' }).click();
+  await expect(page.getByText('PW sales tax registered')).toBeVisible();
+
+  const rates = await json(page, '/v1/tax_rates?limit=500');
+  const rate = rates.data.find((row: { jurisdiction: string }) => row.jurisdiction === jurisdiction);
+  expect(rate, 'the rate reached the server').toBeTruthy();
+  // The percentage is stored exactly as typed — a float would have rounded it.
+  expect(rate.percentage).toBe('7.125');
+  expect(rate.active).toBe(true);
+
+  const row = page.locator('tbody tr', { hasText: jurisdiction }).first();
+  await expect(row).toContainText('7.125%');
+  await row.getByRole('button', { name: 'Row actions' }).click();
+  await page.getByRole('menuitem', { name: /Retire this rate/ }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Retire it' }).click();
+
+  await expect(page.getByText('PW sales tax retired')).toBeVisible();
+  await expect.poll(async () => (await json(page, `/v1/tax_rates/${rate.id}`)).active).toBe(false);
+});
+
+test('a refused registration is explained under the field the server named', async ({ page }) => {
+  await page.goto('/billing/taxes', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Register a rate' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('What appears on the invoice').fill('VAT');
+  await dialog.getByLabel('Jurisdiction').fill('Germany');
+  // Germany already carries an active rate, and one address may never match two.
+  await dialog.getByLabel('Country', { exact: true }).fill('DE');
+  await dialog.getByLabel('Percentage').fill('19');
+  await dialog.getByRole('button', { name: 'Register it' }).click();
+
+  await expect(dialog.getByText(/already/i).first()).toBeVisible();
+  await expect(dialog).toBeVisible();
+});
+
+test('the hold on bills with no tax location can be turned on and off', async ({ page }) => {
+  const before = await json(page, '/v1/billing/automatic_tax');
+  await page.goto('/billing/taxes', { waitUntil: 'networkidle' });
+
+  const toggle = page.getByRole('switch', { name: /Hold them as drafts|Hold bills with no tax location/ });
+  await expect(toggle).toHaveAttribute('aria-checked', String(before.enabled));
+  await toggle.click();
+  await expect.poll(async () => (await json(page, '/v1/billing/automatic_tax')).enabled).toBe(!before.enabled);
+
+  await toggle.click();
+  await expect.poll(async () => (await json(page, '/v1/billing/automatic_tax')).enabled).toBe(before.enabled);
+});
+
+test('the invoice grid has a queue for bills nothing could place', async ({ page }) => {
+  const missing = await json(page, '/v1/invoices?tax=missing&limit=100');
+  await page.goto('/billing/invoices', { waitUntil: 'networkidle' });
+  await page.getByLabel('Tax', { exact: true }).selectOption('missing');
+  await expect(page).toHaveURL(/tax=missing/);
+
+  // The grid answers with exactly the queue the API defines — including when
+  // that queue is empty, which is a state and not a failure.
+  await expect.poll(async () => page.locator('tbody tr[data-index]').count()).toBe(missing.data.length);
+  if (missing.data.length === 0) {
+    await expect(page.getByText('No invoice matches this filter')).toBeVisible();
+  } else {
+    await expect(page.locator('tbody')).toContainText(missing.data[0].number);
+  }
+});
+
+/* ========================= the customer's own copy ======================== */
+
+test('a reference typed on the account is printed on the document the customer gets', async ({ page }) => {
+  const invoices = await json(page, '/v1/invoices?status=open&limit=20');
+  const invoice = invoices.data[0];
+  test.skip(!invoice, 'no invoice exists to print');
+  const reference = `PO-${Date.now()}`;
+
+  await page.goto(`/billing/customers/${invoice.customer}?tab=details`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Add a reference' }).click();
+  // Both halves before anything is written — a half-made reference would print
+  // on the customer's document the moment it existed.
+  await page.getByLabel('Reference name').fill('E2E purchase order');
+  await page.getByLabel('Reference value').fill(reference);
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Saved')).toBeVisible();
+
+  await expect.poll(async () => {
+    const customer = await json(page, `/v1/customers/${invoice.customer}`);
+    return customer.invoice_settings.custom_fields.some((field: { value: string }) => field.value === reference);
+  }).toBe(true);
+
+  // The server renders it into the bill-to block of the printable page.
+  await page.goto(`/billing/invoices/${invoice.id}?tab=document`, { waitUntil: 'networkidle' });
+  const frame = page.frameLocator(`iframe[title="Invoice ${invoice.number}"]`);
+  await expect(frame.locator('body')).toContainText(reference);
+
+  // And it can be taken off again.
+  await page.goto(`/billing/customers/${invoice.customer}?tab=details`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: /^Remove the reference / }).first().click();
+  await expect.poll(async () => {
+    const customer = await json(page, `/v1/customers/${invoice.customer}`);
+    return customer.invoice_settings.custom_fields.length;
+  }).toBe(0);
+});
+
+test('metadata can be added, re-valued and emptied on an account', async ({ page }) => {
+  const customers = await json(page, '/v1/customers?limit=5');
+  const customer = customers.data[0];
+  const value = `NW-${Date.now()}`;
+
+  await page.goto(`/billing/customers/${customer.id}?tab=details`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Add a key' }).click();
+  await page.getByLabel('Metadata key').fill('e2e_contract_id');
+  await page.getByLabel('Metadata value').fill(value);
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+
+  await expect.poll(async () => (await json(page, `/v1/customers/${customer.id}`)).metadata.e2e_contract_id).toBe(value);
+
+  await page.getByRole('button', { name: 'Edit Value of e2e_contract_id' }).click();
+  const field = page.getByRole('textbox', { name: 'Value of e2e_contract_id' });
+  await field.fill(`${value}-B`);
+  await field.press('Enter');
+  await expect.poll(async () => (await json(page, `/v1/customers/${customer.id}`)).metadata.e2e_contract_id).toBe(`${value}-B`);
+
+  // The API merges metadata and has no deletion, so the control empties the key
+  // rather than claiming to remove it — and the screen says exactly that.
+  await page.getByRole('button', { name: 'Clear the value of e2e_contract_id' }).click();
+  await expect.poll(async () => (await json(page, `/v1/customers/${customer.id}`)).metadata.e2e_contract_id).toBe('');
+});
+
+test('the new screens are operable from the keyboard alone', async ({ page }) => {
+  await page.goto('/billing/taxes', { waitUntil: 'networkidle' });
+
+  // Tab to the primary action rather than clicking it, and open it with Enter.
+  const register = page.getByRole('button', { name: 'Register a rate' });
+  await register.focus();
+  await expect(register).toBeFocused();
+  await page.keyboard.press('Enter');
+
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  // Focus is inside the dialog, not left behind on the page under it.
+  await expect(dialog.locator(':focus')).toHaveCount(1);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(register).toBeFocused();
+
+  // The status filter is a native select, so it is a keyboard control for free.
+  const filter = page.getByLabel('Which registrations');
+  await filter.focus();
+  await filter.selectOption('all');
+  await expect.poll(async () => page.locator('tbody tr[data-index]').count()).toBeGreaterThan(0);
+
+  // And the hold is a real switch: focusable, and toggled with the space bar.
+  const toggle = page.getByRole('switch', { name: /Hold them as drafts|Hold bills with no tax location/ });
+  const before = await toggle.getAttribute('aria-checked');
+  await toggle.focus();
+  await page.keyboard.press(' ');
+  await expect.poll(async () => toggle.getAttribute('aria-checked')).not.toBe(before);
+  await page.keyboard.press(' ');
+  await expect.poll(async () => toggle.getAttribute('aria-checked')).toBe(before);
+});
+
+/* ============================ the whole book ============================== */
+
+/**
+ * The single most important property of a receivables screen: the count under
+ * the grid is the count of the set the filter produced, and the totals beside
+ * it cover that same set. The old grid filtered the hundred rows it had
+ * fetched and printed the server's total over them, so "every invoice over
+ * $1,000" answered 44 of 172 and then said there were 344.
+ */
+test('an amount filter answers about the whole book, and the footer counts what it matched', async ({ page }) => {
+  const all: { currency: string; total: number; amount_due: number }[] = [];
+  for (let cursor: string | null = null; ;) {
+    const query = new URLSearchParams({ status: 'all', limit: '200' });
+    if (cursor) query.set('cursor', cursor);
+    const answer = await json(page, `/v1/invoices?${query}`);
+    all.push(...answer.data);
+    if (!answer.has_more || !answer.next_cursor) break;
+    cursor = answer.next_cursor as string;
+  }
+  expect(all.length).toBeGreaterThan(200); // more than one page, or this proves nothing
+
+  const me = await json(page, '/v1/me');
+  const currency: string = me.org.default_currency;
+  const floor = 100_000; // $1,000.00 in minor units
+  const matching = all.filter((row) => row.currency === currency && row.total >= floor);
+  test.skip(matching.length === 0, 'this book holds nothing over the threshold in its own currency');
+
+  await page.goto('/billing/invoices', { waitUntil: 'networkidle' });
+  // Unfiltered, the grid holds the book: its own row count is the book's size
+  // and the line beside it says the totals cover all of it.
+  await expect.poll(async () => page.locator('.ain-table__count').innerText())
+    .toContain(`${all.length} row`);
+  await expect(page.locator('.bl-listfoot__count')).toContainText('The whole book');
+
+  await page.getByRole('button', { name: /^Amount$/ }).click();
+  await page.getByLabel('Smallest amount').fill('1000');
+  await page.getByRole('button', { name: 'Apply' }).click();
+
+  // The chip names the figure, the amount and the currency it pinned.
+  await expect(page.getByRole('button', { name: /^Total ≥/ }))
+    .toContainText(currency.toUpperCase());
+
+  // The count is the count of the filtered set, over the whole book — and the
+  // line beside it says so, rather than quoting a server total over a page.
+  await expect.poll(async () => page.locator('.ain-table__count').innerText())
+    .toContain(`${matching.length} row`);
+  await expect(page.locator('.bl-listfoot__count'))
+    .toContainText(`${matching.length} of the ${all.length}`);
+
+  // And the totals row sums that same set — one figure, in one currency.
+  const owed = matching.reduce((sum, row) => sum + row.total, 0);
+  const expected = new Intl.NumberFormat(me.org.locale ?? 'en-US', { style: 'currency', currency: currency.toUpperCase() }).format(owed / 100);
+  await expect(page.locator('tfoot')).toContainText(expected);
+
+  // The filter is in the address bar, so the answer is a link someone can send.
+  expect(page.url()).toContain('amount=total');
+});
+
+test('the columns menu names columns, not the sentences they are explained with', async ({ page }) => {
+  await page.goto('/billing/invoices', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Columns' }).click();
+
+  const labels = await page.locator('.ain-table__colmenu .ain-check__label').allInnerTexts();
+  expect(labels).toContain('Total');
+  expect(labels).toContain('Amount due');
+  // No prose, and no permanently greyed filter-only rows pretending to be columns.
+  for (const label of labels) {
+    expect(label.length, label).toBeLessThan(24);
+    expect(label, label).not.toContain('.');
+  }
+  await expect(page.locator('.ain-table__colmenu input[disabled]')).toHaveCount(1); // the pinned first column
+});
+
+/* ========================= dialogs from the keyboard ====================== */
+
+test('a dialog opens on its first field and Enter creates the record', async ({ page }) => {
+  await page.goto('/billing/customers', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'New customer' }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+
+  // Focus is on the field, not on the Close button that would throw the work away.
+  const name = dialog.getByLabel('Name');
+  await expect(name).toBeFocused();
+
+  const label = `Keyboard Only Robotics ${Date.now().toString().slice(-6)}`;
+  await page.keyboard.type(label);
+  await expect(name).toHaveValue(label);
+
+  await page.keyboard.press('Enter');
+  await expect(dialog).toBeHidden();
+  await expect(page).toHaveURL(/\/billing\/customers\/cus_/);
+
+  const created = await json(page, `/v1/customers?query=${encodeURIComponent(label)}`);
+  expect(created.data).toHaveLength(1);
+  expect(created.data[0].name).toBe(label);
+
+  // A brand-new account has settled nothing, and does not claim it has.
+  await expect(page.getByText('No bill has been raised yet')).toBeVisible();
+
+  await page.request.delete(`/api/v1/customers/${created.data[0].id}`);
+});
+
+test('Enter does not submit a dialog whose primary action is disabled', async ({ page }) => {
+  const before = await json(page, '/v1/customers?limit=1');
+  await page.goto('/billing/customers', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'New customer' }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.getByRole('button', { name: 'Create customer' })).toBeDisabled();
+
+  await page.keyboard.press('Enter');
+  await expect(dialog).toBeVisible();       // it neither submitted nor closed
+  const after = await json(page, '/v1/customers?limit=1');
+  expect(after.total_count).toBe(before.total_count);
+});
+
+/* ============================== quantities =============================== */
+
+test('a typed quantity reaches the price and the stepper before anything is blurred', async ({ page }) => {
+  await page.goto('/billing/subscriptions', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'New subscription' }).click();
+  const dialog = page.getByRole('dialog');
+
+  const customers = await json(page, '/v1/customers?limit=1');
+  await pickCustomer(page, dialog, customers.data[0].name);
+
+  const prices = await json(page, '/v1/prices?active=true&limit=200');
+  const seat = prices.data.find((row: { model: string; type: string; recurring: { usage_type: string } | null }) =>
+    row.type === 'recurring' && row.model === 'per_unit' && row.recurring?.usage_type !== 'metered');
+  test.skip(!seat, 'the catalogue has no per-unit recurring price');
+  await dialog.getByLabel('Price 1').selectOption(seat.id);
+
+  const quantity = dialog.getByRole('spinbutton', { name: 'Quantity 1' });
+  await quantity.click();
+  await page.keyboard.press('ControlOrMeta+a');
+  await page.keyboard.type('7');
+
+  // No blur, no Tab, no click elsewhere: the price follows the field.
+  await expect(quantity).toHaveValue('7');
+  await expect.poll(async () => dialog.locator('.bl-lines').first().innerText(), { timeout: 6000 })
+    .toContain('7');
+
+  // And the stepper steps from what the field reads, not from the last value
+  // it happened to commit — typing 7 and pressing ArrowUp gives 8, never 2.
+  await quantity.click();
+  await page.keyboard.press('ControlOrMeta+a');
+  await page.keyboard.type('7');
+  await page.keyboard.press('ArrowUp');
+  await expect(quantity).toHaveValue('8');
+});
+
+/* ============================ dates and clocks =========================== */
+
+test('one invoice is dated on one calendar — the one the customer’s copy carries', async ({ page }) => {
+  const invoices = await json(page, '/v1/invoices?status=paid&limit=1');
+  const invoice = invoices.data[0];
+  test.skip(!invoice?.paid_at, 'no paid invoice to read');
+
+  const me = await json(page, '/v1/me');
+  const locale = me.org.locale ?? 'en-US';
+  // The document stamps itself on a UTC calendar. Every date on this screen
+  // that *names the invoice* has to be that one, or an AR agent quotes a day
+  // the customer cannot find on the bill in their hand.
+  const onDocument = new Intl.DateTimeFormat(locale, {
+    timeZone: 'UTC', month: 'short', day: 'numeric', year: 'numeric',
+  });
+  const paidOn = onDocument.format(invoice.paid_at);
+  const issuedOn = onDocument.format(invoice.created);
+
+  await page.goto(`/billing/invoices/${invoice.id}`, { waitUntil: 'networkidle' });
+
+  await expect(page.locator('.ain-page__subtitle')).toContainText(paidOn);
+  await expect(page.locator('.bl-headline__caption', { hasText: 'Settled' })).toHaveText(`Settled ${paidOn}`);
+
+  const issued = page.locator('.bl-fieldrow', { hasText: 'Issued' }).first();
+  // The row's own value, without the hint nested under it.
+  const issuedValue = await issued.locator('.bl-fieldrow__value').evaluate(
+    (node) => Array.from(node.childNodes)
+      .filter((child) => !(child instanceof HTMLElement && child.classList.contains('bl-fieldrow__hint')))
+      .map((child) => child.textContent ?? '')
+      .join('')
+      .trim(),
+  );
+  expect(issuedValue).toBe(issuedOn);
+
+  // The operator's own clock is not lost — it moves to the hint, named as
+  // their time rather than presented as the invoice's date.
+  await expect(issued.locator('.bl-fieldrow__hint')).toContainText('Recorded');
+  await expect(issued.locator('.bl-fieldrow__hint')).toContainText(me.org.timezone.replace(/_/g, ' '));
+
+  // And the document itself agrees with all of it.
+  await page.getByRole('tab', { name: 'Document' }).click();
+  const frame = page.frameLocator(`iframe[title="Invoice ${invoice.number}"]`);
+  await expect(frame.locator('body')).toContainText(issuedOn);
+});
+
+/* ============================= missing records =========================== */
+
+test('a record that does not exist offers the way back, not a doomed retry', async ({ page }) => {
+  await page.goto('/billing/invoices/in_doesnotexist000000', { waitUntil: 'networkidle' });
+  await expect(page.getByText('No such invoice', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Try again' })).toHaveCount(0);
+  await page.getByRole('link', { name: 'Back to invoices' }).click();
+  await expect(page).toHaveURL(/\/billing\/invoices$/);
+});
+
+/* ============================ one-off charges ============================ */
+
+/**
+ * This platform has no invoice-item route: a hand-written charge is carried on
+ * the account balance and drawn down by the next bill. What the screen owes an
+ * operator is a way to do it and an honest sentence about what it does — not a
+ * dead end that says "nothing is waiting on this account" and stops.
+ */
+test('a one-off amount can be charged to an account from the invoice screen', async ({ page }) => {
+  const customers = await json(page, '/v1/customers?limit=25');
+  const account = customers.data.find((row: { balance: number }) => row.balance === 0) ?? customers.data[0];
+  const before = account.balance;
+
+  await page.goto('/billing/invoices', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Bill an account' }).click();
+  const dialog = page.getByRole('dialog');
+  await pickCustomer(page, dialog, account.name);
+
+  await dialog.getByRole('button', { name: /one-off amount/ }).click();
+  const charge = page.getByRole('dialog', { name: 'Charge a one-off amount' });
+  await expect(charge).toBeVisible();
+  await expect(charge).toContainText('next invoice');
+
+  await charge.getByLabel('Amount').fill('250');
+  await charge.getByLabel('Why').fill('Onboarding and commissioning, 2 days on site');
+  await charge.getByRole('button', { name: /^Charge / }).click();
+
+  await expect.poll(async () => (await json(page, `/v1/customers/${account.id}`)).balance)
+    .toBe(before + 25_000);
+
+  // It is on the account's ledger, in the words the balance tile uses.
+  await page.goto(`/billing/customers/${account.id}?tab=ledger`, { waitUntil: 'networkidle' });
+  const row = page.locator('tbody tr', { hasText: 'Onboarding and commissioning' });
+  await expect(row).toBeVisible();
+  await expect(row).toContainText('owed');
+
+  await page.request.post(`/api/v1/customers/${account.id}/balance_transactions`, {
+    data: { amount: -25_000, description: 'Reversing the test charge', type: 'adjustment' },
+  });
+});
+
+test('a grid still loading does not report zero rows underneath its skeletons', async ({ page }) => {
+  // The critic's repro: a slow API left "0 rows / No invoices on this page"
+  // printed under eight skeleton rows — a count asserted about a read that had
+  // not answered.
+  await page.route('**/api/v1/invoices?**', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    await route.continue();
+  });
+  await page.goto('/billing/invoices', { waitUntil: 'domcontentloaded' });
+
+  await expect(page.locator('.bl-listfoot__count')).toContainText('Reading the invoices');
+  // The grid's own count is suppressed rather than left asserting zero.
+  await expect(page.locator('.ain-table__count')).toBeHidden();
+
+  await page.unroute('**/api/v1/invoices?**');
+  await expect.poll(async () => page.locator('.bl-listfoot__count').innerText(), { timeout: 20_000 })
+    .toContain('whole book');
+});
+
+/* ========================= partial payments ============================== */
+
+/**
+ * The defect this exists to keep fixed: an AR clerk received $40,000 against a
+ * $127,840 invoice, typed it into the only field the dialog had, and the bill
+ * was marked settled in full with the number sitting in a note.
+ *
+ * A part payment is a real thing here — the gateway takes an amount as a
+ * ceiling and never re-prices it upwards — so the screen has to be able to
+ * write one down, leave the bill open for the rest, and say what is still owed.
+ */
+test('a part payment is recorded for what actually arrived, and the bill stays open for the rest', async ({ page }) => {
+  const open = await json(page, '/v1/invoices?status=open&limit=20');
+  const candidates = (await notBeingChased(page, open.data)).filter((row) => row.amount_due >= 200);
+  const invoice = candidates[0];
+  test.skip(!invoice, 'nothing large enough is owed in this workspace');
+
+  // A presentation needs something to present against. Attaching one is a
+  // first-class flow on this dialog, so the test drives it the same way.
+  await page.goto(`/billing/invoices/${invoice.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Take a payment' }).click();
+  const dialog = page.getByRole('dialog', { name: /Take a payment on/ });
+  await expect(dialog).toBeVisible();
+
+  if (await dialog.getByLabel('How it was taken').locator('option').count() <= 1) {
+    await dialog.getByRole('button', { name: /Attach a card or bank account/ }).click();
+    const attach = page.getByRole('dialog', { name: /payment method/i });
+    await attach.getByRole('button', { name: /^Attach/ }).click();
+    await expect(attach).toBeHidden();
+  }
+
+  // Half of what is still owed, rounded to whole major units so the arithmetic
+  // is readable in the assertion.
+  const half = Math.floor(invoice.amount_due / 200) * 100;
+  const amountField = dialog.getByLabel('Amount received');
+  await amountField.fill(String(half / 100));
+  await expect(dialog.getByRole('button', { name: /still owed/ })).toBeVisible();
+
+  await dialog.getByRole('button', { name: /^Record / }).click();
+  await expect(dialog).toBeHidden();
+
+  await expect.poll(async () => (await json(page, `/v1/invoices/${invoice.id}`)).amount_due).toBeLessThan(invoice.amount_due);
+  const after = await json(page, `/v1/invoices/${invoice.id}`);
+  // Exactly what was typed came off the bill, and the rest is still owed.
+  expect(after.amount_paid - invoice.amount_paid).toBe(half);
+  expect(after.amount_due).toBe(invoice.amount_due - half);
+  expect(after.status).toBe('open');
+
+  // And the screen says so rather than calling a part payment a settlement.
+  await page.reload({ waitUntil: 'networkidle' });
+  await expect(page.locator('.bl-headline', { hasText: 'Collected' })).toContainText('Part paid');
+});
+
+/**
+ * The route that settles by hand takes no amount. Rather than let that be
+ * discovered after a bill is wrongly marked paid, the dialog refuses the
+ * combination and says which two things cannot both be true.
+ */
+test('settling by hand refuses a part amount instead of silently rounding it up', async ({ page }) => {
+  const open = await json(page, '/v1/invoices?status=open&limit=20');
+  const invoice = (await notBeingChased(page, open.data)).filter((row) => row.amount_due >= 200)[0];
+  test.skip(!invoice, 'nothing large enough is owed in this workspace');
+
+  await page.goto(`/billing/invoices/${invoice.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Take a payment' }).click();
+  const dialog = page.getByRole('dialog', { name: /Take a payment on/ });
+
+  await dialog.getByLabel('How it was taken').selectOption(BY_HAND_LABEL);
+  await dialog.getByLabel('Amount received').fill(String(Math.floor(invoice.amount_due / 200)));
+
+  await expect(dialog.getByText('A part payment has to be presented')).toBeVisible();
+  await expect(dialog.getByRole('button', { name: /^Record / })).toBeDisabled();
+
+  // Nothing was written.
+  const after = await json(page, `/v1/invoices/${invoice.id}`);
+  expect(after.status).toBe('open');
+  expect(after.amount_paid).toBe(invoice.amount_paid ?? 0);
+});
+
+test('a settled invoice says why its money button is closed rather than greying out in silence', async ({ page }) => {
+  const paid = await json(page, '/v1/invoices?status=paid&limit=1');
+  const invoice = paid.data[0];
+  test.skip(!invoice, 'nothing is settled in this workspace');
+
+  await page.goto(`/billing/invoices/${invoice.id}`, { waitUntil: 'networkidle' });
+  const button = page.getByRole('button', { name: 'Take a payment' });
+  await expect(button).toBeDisabled();
+  await expect(button).toHaveAttribute('title', /Nothing left to collect/);
+});
+
+/* ============================== export ================================== */
+
+/**
+ * Closing a month means handing finance the aged book. Without this the only
+ * route out of the product is retyping it.
+ */
+test('every book exports the rows on screen, formatted the way the screen formats them', async ({ page }) => {
+  for (const [route, name, header] of [
+    ['/billing/invoices', 'invoices', 'Number'],
+    ['/billing/subscriptions', 'subscriptions', 'Account'],
+    ['/billing/customers', 'customers', 'Account'],
+  ] as const) {
+    await page.goto(route, { waitUntil: 'networkidle' });
+    const button = page.getByRole('button', { name: 'Export' });
+    await expect(button).toBeEnabled({ timeout: 20_000 });
+    const [download] = await Promise.all([page.waitForEvent('download'), button.click()]);
+    expect(download.suggestedFilename()).toMatch(new RegExp(`^ain-${name}-\\d{4}-\\d{2}-\\d{2}\\.csv$`));
+
+    const stream = await download.createReadStream();
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) chunks.push(chunk as Buffer);
+    const csv = Buffer.concat(chunks).toString('utf8');
+    const lines = csv.replace(/^﻿/, '').trim().split('\r\n');
+    expect(lines[0]).toContain(header);
+    // One line per row on screen, plus the header.
+    const rows = Number((await page.locator('.ain-table__count').innerText()).replace(/\D+/g, ''));
+    expect(lines.length - 1).toBe(rows);
+    // Money is a decimal in the major unit, never the minor-unit integer.
+    expect(csv).not.toMatch(/,\d{7,},/);
+  }
+});
+
+/**
+ * The filtered export is the filtered file. A file that quietly holds more rows
+ * than the screen did is how a reconciliation goes wrong twice.
+ */
+test('the export follows the filter', async ({ page }) => {
+  await page.goto('/billing/invoices?status=open', { waitUntil: 'networkidle' });
+  const button = page.getByRole('button', { name: 'Export' });
+  await expect(button).toBeEnabled({ timeout: 20_000 });
+  const [download] = await Promise.all([page.waitForEvent('download'), button.click()]);
+  const stream = await download.createReadStream();
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(chunk as Buffer);
+  const lines = Buffer.concat(chunks).toString('utf8').replace(/^﻿/, '').trim().split('\r\n');
+
+  const open = await json(page, '/v1/invoices?status=open&limit=1');
+  expect(lines.length - 1).toBe(open.total_count);
+  for (const line of lines.slice(1)) expect(line).toContain('Open');
+});
+
+/* ========================= the caption tells the truth ==================== */
+
+/**
+ * The P0 from the last round: every server-narrowed list described itself as
+ * the whole book, directly under money totals that only covered the filtered
+ * part of it — including the subscriptions list's own default view.
+ */
+test('a narrowed list never calls itself the whole book', async ({ page }) => {
+  const whole = await json(page, '/v1/invoices?status=all&limit=1');
+  const openOnly = await json(page, '/v1/invoices?status=open&limit=1');
+  test.skip(openOnly.total_count === whole.total_count, 'every invoice in this workspace is open');
+
+  await page.goto('/billing/invoices?status=open', { waitUntil: 'networkidle' });
+  const caption = page.locator('.bl-listfoot__count');
+  await expect(caption).toContainText(`of the ${whole.total_count.toLocaleString('en-US')} invoices in the book match`);
+  await expect(caption).not.toContainText('The whole book');
+
+  // The default subscriptions view is already narrowed — "Everything live" is
+  // a filter — so it must not claim the book either.
+  const live = await json(page, '/v1/subscriptions?status=active_like&limit=1');
+  const all = await json(page, '/v1/subscriptions?status=all&limit=1');
+  if (live.total_count !== all.total_count) {
+    await page.goto('/billing/subscriptions', { waitUntil: 'networkidle' });
+    await expect(page.locator('.bl-listfoot__count')).toContainText(`of the ${all.total_count.toLocaleString('en-US')} subscriptions in the book match`);
+  }
+
+  // A filter that matches nothing says nothing matched, not "the whole book".
+  await page.goto('/billing/customers?standing=delinquent', { waitUntil: 'networkidle' });
+  const customers = await json(page, '/v1/customers?limit=1');
+  await expect(page.locator('.bl-listfoot__count'))
+    .toContainText(`of the ${customers.total_count.toLocaleString('en-US')} customers in the book`);
+});
+
+/* ====================== reconciling counts and money ===================== */
+
+test('a paused agreement never prints a bare $0.00 MRR beside its own fee', async ({ page }) => {
+  const subs = await json(page, '/v1/subscriptions?status=paused&limit=1');
+  const sub = subs.data[0];
+  test.skip(!sub, 'nothing is paused in this workspace');
+
+  await page.goto(`/billing/subscriptions/${sub.id}`, { waitUntil: 'networkidle' });
+  const tile = page.locator('.bl-headline', { hasText: 'MRR' }).first();
+  if (sub.mrr === 0 && sub.recurring_subtotal > 0) {
+    await expect(tile).toContainText('Excluded while collection is paused');
+  }
+});
+
+test('an account’s headline counts subscriptions the way the MRR beside it counts them', async ({ page }) => {
+  const subs = await json(page, '/v1/subscriptions?status=paused&limit=1');
+  const sub = subs.data[0];
+  test.skip(!sub, 'nothing is paused in this workspace');
+
+  await page.goto(`/billing/customers/${sub.customer}`, { waitUntil: 'networkidle' });
+  const subtitle = page.locator('.ain-page__subtitle');
+  await expect(subtitle).toContainText('paused');
+  await expect(subtitle).toContainText('excluded from MRR');
+});
+
+test('the receivables card does not count a draft nobody has sent as money owed', async ({ page }) => {
+  const drafts = await json(page, '/v1/invoices?status=draft&limit=50');
+  await page.goto('/billing', { waitUntil: 'networkidle' });
+  const card = page.locator('.ain-card', { hasText: 'Owed right now' });
+  await expect(card).toBeVisible();
+  for (const draft of drafts.data) await expect(card.getByText(draft.number, { exact: true })).toHaveCount(0);
+  if (drafts.data.length) await expect(card.getByText('Not counted above')).toBeVisible();
+});
+
+/* ============================ locked fields ============================== */
+
+test('billing a known account names it rather than printing its id', async ({ page }) => {
+  const customers = await json(page, '/v1/customers?limit=5');
+  const account = customers.data?.[0];
+  test.skip(!account, 'no account to bill');
+
+  await page.goto(`/billing/customers/${account.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Bill now' }).click();
+  const dialog = page.getByRole('dialog', { name: /Bill what this account owes/ });
+  await expect(dialog.getByText(account.name, { exact: true })).toBeVisible();
+  await expect(dialog.getByRole('textbox', { name: 'Customer' })).toHaveCount(0);
+});
+
+test('a 404 on a customer does not blame a void that cannot happen to one', async ({ page }) => {
+  await page.goto('/billing/customers/cus_doesnotexist00000', { waitUntil: 'networkidle' });
+  await expect(page.getByText('No such account', { exact: true })).toBeVisible();
+  await expect(page.getByText(/voided and removed/)).toHaveCount(0);
+  await expect(page.getByText(/may have been deleted/)).toBeVisible();
+});
+
+test('the amount filter’s fields can be reached by the words printed on them', async ({ page }) => {
+  await page.goto('/billing/invoices', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Amount', exact: true }).click();
+  await expect(page.getByLabel('From (smallest amount)')).toBeVisible();
+  await expect(page.getByLabel('To (largest amount)')).toBeVisible();
+});
+
+/**
+ * The upcoming invoice is the one surface that shows a line the customer will
+ * actually receive, and it was the one printing the raw ten-digit rational
+ * inline. The sentence stays; the fraction goes behind the disclosure every
+ * other surface already uses.
+ */
+test('an upcoming invoice line explains itself in words, with the arithmetic behind a disclosure', async ({ page }) => {
+  const subs = await json(page, '/v1/subscriptions?status=active&limit=20');
+  let disclosed = false;
+  for (const sub of subs.data.slice(0, 8)) {
+    await page.goto(`/billing/subscriptions/${sub.id}?tab=upcoming`, { waitUntil: 'networkidle' });
+    await expect(page.locator('.bl-lines').first()).toBeVisible();
+    // The invariant, on every one of them: no unreduced rational printed as
+    // invoice-line copy.
+    await expect(page.locator('.bl-lines__why', { hasText: /\d{6,}\s*\/\s*\d{6,}\s*ms/ })).toHaveCount(0);
+    const toggle = page.locator('.bl-lines .bl-lines__toggle').first();
+    if (!disclosed && await toggle.count()) {
+      disclosed = true;
+      await toggle.click();
+      await expect(page.locator('.bl-fraction').first()).toBeVisible();
+    }
+  }
+});
+
+test('the payment dialog is operable from the keyboard alone', async ({ page }) => {
+  const open = await json(page, '/v1/invoices?status=open&limit=20');
+  const invoice = (await notBeingChased(page, open.data))[0];
+  test.skip(!invoice, 'nothing is owed in this workspace');
+
+  await page.goto(`/billing/invoices/${invoice.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Take a payment' }).click();
+  const dialog = page.getByRole('dialog', { name: /Take a payment on/ });
+
+  // It opens on the field that decides the money.
+  await expect(dialog.getByLabel('Amount received')).toBeFocused();
+  // Escape closes it without writing anything.
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  expect((await json(page, `/v1/invoices/${invoice.id}`)).status).toBe('open');
 });

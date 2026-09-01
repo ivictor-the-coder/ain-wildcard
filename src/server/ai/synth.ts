@@ -86,7 +86,18 @@ export class Facts {
   money(amount: number): string {
     return formatMoney({ amount: Math.round(amount), currency: this.workspace.currency }, { locale: this.workspace.locale, trimZeroFraction: true });
   }
+  /** A genuine instant — `closed_at`, `created`, when something happened. */
   day(ts: number): string { return formatDate(ts, { locale: this.workspace.locale, timeZone: this.workspace.timezone }); }
+  /**
+   * A date-only property — `close_date`, `renewal_date`, `due_date`.
+   *
+   * A date picker writes midnight UTC for the day a person chose, so reading it
+   * back in the workspace's zone lands it on the previous evening everywhere
+   * west of Greenwich: the board says a deal closes Sep 1 and the answer says
+   * Aug 31. Calendar days are read back in the zone they were stored in, which
+   * is what `describeWrite` already does for `*_date` properties below.
+   */
+  calendarDay(ts: number): string { return formatDate(ts, { locale: this.workspace.locale, timeZone: 'UTC' }); }
   ago(ts: number): string { return formatRelative(ts, this.workspace.now, this.workspace.locale); }
   days(ts: number): number { return Math.round((this.workspace.now - ts) / DAY); }
 }
@@ -365,7 +376,7 @@ function profileParagraph(profile: AccountProfileResult, facts: Facts, workspace
     commercial.push(
       `${countOf(profile.open_deals.length, 'open deal')} worth ${profile.totals.open_pipeline_formatted}` +
       `, led by ${top.name} at ${top.amount_formatted} in ${top.stage.toLowerCase()}` +
-      `${top.close_date ? ` with a ${facts.day(top.close_date)} close date` : ''}`,
+      `${top.close_date ? `, closing ${facts.calendarDay(top.close_date)}` : ''}`,
     );
   } else if (profile.totals.lifetime_won) {
     commercial.push(`no open pipeline, ${profile.totals.lifetime_won_formatted} closed-won to date`);
@@ -409,7 +420,7 @@ function recordLines(list: RecordSearchResult, facts: Facts, workspace: Workspac
     const bits: string[] = [];
     if (props.amount !== undefined) bits.push(facts.money(Number(props.amount)));
     if (props.deal_stage) bits.push(humanise(String(props.deal_stage)));
-    if (props.close_date) bits.push(`closes ${facts.day(Number(props.close_date))}`);
+    if (props.close_date) bits.push(`closes ${facts.calendarDay(Number(props.close_date))}`);
     if (props.status) bits.push(humanise(String(props.status)));
     if (props.priority) bits.push(`${humanise(String(props.priority))} priority`);
     if (record.owner) bits.push(record.owner);
@@ -1293,7 +1304,7 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
           blocks.push(...recordLines(typed, facts, input.workspace, 6));
         } else if (profile.open_deals.length > 1) {
           blocks.push(...profile.open_deals.slice(0, 4).map((deal) =>
-            bullet(`${deal.name} — ${deal.amount_formatted}, ${deal.stage.toLowerCase()}${deal.close_date ? `, closes ${facts.day(deal.close_date)}` : ''}${deal.owner ? `, ${deal.owner}` : ''}`)));
+            bullet(`${deal.name} — ${deal.amount_formatted}, ${deal.stage.toLowerCase()}${deal.close_date ? `, closes ${facts.calendarDay(deal.close_date)}` : ''}${deal.owner ? `, ${deal.owner}` : ''}`)));
         }
       } else if (searches.length && searches[0].matches.length) {
         const search = searches[0];
@@ -1319,11 +1330,18 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
           }
           const args = input.steps.find((s) => s.result === list)?.args ?? {};
           const filtered = Array.isArray(args.conditions) || !!args.owner_id;
-          const order = args.order_by === 'amount' ? 'The largest:' : 'The most recent:';
+          // "7 tickets match. The most recent:" followed by five bullets told a
+          // reader about two rows it then gave them no way to reach. The list
+          // now runs long enough to hold a normal result whole, and when it
+          // genuinely cannot, the lead-in says which slice they are looking at.
+          const limit = 8;
+          const shown = Math.min(limit, list.records.length);
+          const ranked = args.order_by === 'amount' ? 'largest' : 'most recent';
+          const order = shown < list.total ? `The ${shown} ${ranked} of them:` : `The ${ranked}:`;
           blocks.push(filtered
             ? `${countOf(list.total, list.object_type)} ${list.total === 1 ? 'matches' : 'match'}. ${order}`
             : `${countOf(list.total, `${list.object_type} record`)} in the workspace. ${order}`);
-          blocks.push(...recordLines(list, facts, input.workspace, 5));
+          blocks.push(...recordLines(list, facts, input.workspace, limit));
         }
       } else {
         blocks.push(...overview(input, facts, { metrics, profiles, lists, aggregates, searches }, metricStated));
@@ -1360,7 +1378,7 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
         }
         if (profile.open_deals.length) {
           const deal = profile.open_deals[0];
-          actions.push(`Push ${deal.name} (${deal.amount_formatted}) out of ${deal.stage.toLowerCase()}${deal.close_date ? ` — the ${facts.day(deal.close_date)} close date is ${Math.round((deal.close_date - input.workspace.now) / DAY)} days away` : ''}.`);
+          actions.push(`Push ${deal.name} (${deal.amount_formatted}) out of ${deal.stage.toLowerCase()}${deal.close_date ? ` — the ${facts.calendarDay(deal.close_date)} close date is ${Math.round((deal.close_date - input.workspace.now) / DAY)} days away` : ''}.`);
         }
         if (profile.last_activity.days_ago !== null && profile.last_activity.days_ago !== undefined && profile.last_activity.days_ago > 21) {
           actions.push(`Re-engage: no activity for ${profile.last_activity.days_ago} days${profile.contacts[0] ? `, start with ${profile.contacts[0].name}` : ''}.`);
@@ -1412,9 +1430,12 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
         const pending = input.pendingApprovals[0];
         blocks.push(`I prepared ${pending.tool} and stopped there — it changes the workspace, so it needs your approval first. Nothing has been written.`);
         blocks.push(describeWrite(pending.tool, pending.args, nameOf).join('\n'));
+        // The decision is rendered directly under this answer, in the chat and
+        // on the run page both. Sending a reader to a different screen for a
+        // button that is two inches below the sentence is busywork.
         blocks.push(input.pendingApprovals.length > 1
-          ? `Approve or edit ${countOf(input.pendingApprovals.length, 'pending write')} from the approvals queue and I will finish the job.`
-          : 'Approve it from the approvals queue and I will write it; decline and nothing happens.');
+          ? `Approve or decline ${countOf(input.pendingApprovals.length, 'pending write')} below and I will finish the job.`
+          : 'Approve it below and I will write it; decline and nothing happens.');
       } else if (written.length) {
         // Only the leading word is lowercased. Lowercasing the whole phrase
         // turned "Rheinwerk Antriebstechnik" into "rheinwerk antriebstechnik".

@@ -19,16 +19,59 @@ import {
   type DataTableColumn, type MenuSection, type TableState,
 } from '../../design';
 import { AlertTriangleIcon, CheckCircleIcon, ChevronDownIcon, ChevronUpIcon, CreditCardIcon, XCircleIcon } from '../../design';
-import { ActionMenu, CustomerPicker, Headline } from './subscriptions';
+import { ActionMenu, CreditDialog, CustomerPicker, Headline } from './subscriptions';
+import { PaymentMethodDialog } from './payments';
 import {
-  EmptyList, FieldRow, ListFailure, ListFooter, LoadFailedEmpty, Loading, MoneyField, MoneyTotals, RecordLink,
-  SectionError, StatusPill, TableSearch, breakdownLabel, formatUnitRate, lineWhy, prorationCopy, statusLabel,
-  customerHref, idem, invoiceHref, moneyRank, subscriptionHref, totalsByCurrency, useAction, useBillingFormat,
-  useCursorList, useDebounced, useOpenOnQuery, useRecordTab, useTableView,
+  BookFooter, DialogFields, EmptyList, ExportCsvButton, FieldRow, ListFailure, ListFooter, LoadFailedEmpty, Loading, MoneyField,
+  MoneyRangeFilter,
+  MoneyTotals, RecordLink, RecordMissing, SectionError, StatusPill, TableSearch, breakdownLabel, decodeRange,
+  encodeRange,
+  formatUnitRate, invoiceStatusDetail, lineWhy, matchesRange, prorationCopy, rangeActive,
+  statusLabel, customerHref, idem,
+  invoiceClockNote, invoiceHref, moneyRank, subscriptionHref, totalsByCurrency, useAction, useBillingFormat, useBookList, useCurrencyChoices,
+  csvAmount, csvDay, csvInstant, useBookTotal,
+  useCursorList, useDebounced, useDialogForm, useOpenOnQuery, useRecord, useRecordTab, useTableView, visibleRows,
 } from './common';
+import type { CsvColumn } from './common';
 import type {
-  Charge, CreditNote, Invoice, InvoiceDunning, InvoiceLine, InvoicePayments, PaymentSettings, PendingItem,
+  Charge, CreditNote, Customer, Invoice, InvoiceDunning, InvoiceLine, InvoicePayments, PaymentIntent, PaymentMethod,
+  PaymentSettings, PendingItem,
 } from './types';
+
+/** Everything a payment moves, so one write refreshes every screen reading it. */
+const INVALIDATE_MONEY = ['/v1/invoices', '/v1/customers', '/v1/subscriptions', '/v1/revenue', '/v1/payment_intents', '/v1/charges'];
+
+/**
+ * The invoice book as a month-end file.
+ *
+ * Amounts are plain decimals in the major unit with the currency beside them,
+ * dates are the UTC calendar days the documents carry, and the ids are here so
+ * a reconciliation can be matched back rather than retyped.
+ */
+const INVOICE_CSV: CsvColumn<Invoice>[] = [
+  { header: 'Number', value: (row) => row.number },
+  { header: 'Account', value: (row) => row.customer_name ?? row.customer },
+  { header: 'Status', value: (row) => statusLabel(row.status) },
+  { header: 'Reason', value: (row) => humanize(row.billing_reason) },
+  { header: 'Collection', value: (row) => humanize(row.collection_method) },
+  { header: 'Currency', value: (row) => row.currency.toUpperCase() },
+  { header: 'Subtotal', value: (row) => csvAmount(row.subtotal, row.currency) },
+  { header: 'Tax', value: (row) => csvAmount(row.tax, row.currency) },
+  { header: 'Total', value: (row) => csvAmount(row.total, row.currency) },
+  { header: 'Amount paid', value: (row) => csvAmount(row.amount_paid, row.currency) },
+  { header: 'Amount due', value: (row) => csvAmount(row.amount_due, row.currency) },
+  { header: 'Issued', value: (row) => csvDay(row.created) },
+  { header: 'Due', value: (row) => csvDay(row.due_date) },
+  { header: 'Paid at', value: (row) => csvInstant(row.paid_at) },
+  { header: 'Period start', value: (row) => csvDay(row.period.start) },
+  { header: 'Period end', value: (row) => csvDay(row.period.end) },
+  { header: 'Customer id', value: (row) => row.customer },
+  { header: 'Subscription id', value: (row) => row.subscription ?? '' },
+  { header: 'Invoice id', value: (row) => row.id },
+];
+
+/** The "no method was presented" option, which is a real choice rather than an absence. */
+const BY_HAND = 'by_hand';
 
 /* ------------------------------- list columns ---------------------------- */
 
@@ -56,7 +99,7 @@ export function useInvoiceColumns(showCustomer = true): DataTableColumn<Invoice>
         width: 130,
         filter: 'set',
         accessor: (row) => row.status,
-        cell: (row) => <StatusPill status={row.status} title={row.status_detail} />,
+        cell: (row) => <StatusPill status={row.status} title={invoiceStatusDetail(row, f)} />,
       },
     ];
     if (showCustomer) {
@@ -86,34 +129,25 @@ export function useInvoiceColumns(showCustomer = true): DataTableColumn<Invoice>
       {
         id: 'total',
         header: 'Total',
+        // The Columns menu and the filter list both label a checkbox with this
+        // string, so it has to be the column's name. The reason the ranking is
+        // grouped by currency is stated once, under the grid, where it is read
+        // rather than hovered.
+        headerTitle: 'Total',
         align: 'right',
         width: 120,
         sortable: true,
-        headerTitle: 'Ranked inside each currency — nothing is converted.',
         accessor: (row) => moneyRank(row.total, row.currency),
         cell: (row) => row.total_display,
         total: (rows) => <MoneyTotals totals={totalsByCurrency(rows, (r) => r.total, (r) => r.currency)} />,
       },
       {
-        id: 'total_amount',
-        header: 'Total amount',
-        headerTitle: 'Total amount — a filter, not a column',
-        filterLabel: 'Total amount',
-        filter: 'number',
-        align: 'right',
-        width: 120,
-        defaultHidden: true,
-        hideable: false,
-        unsearchable: true,
-        accessor: (row) => row.total,
-      },
-      {
         id: 'amount_due',
         header: 'Amount due',
+        headerTitle: 'Amount due',
         align: 'right',
         width: 130,
         sortable: true,
-        headerTitle: 'Ranked inside each currency, and totalled one currency at a time.',
         accessor: (row) => moneyRank(row.amount_due, row.currency),
         cell: (row) => (
           row.amount_due > 0
@@ -124,19 +158,6 @@ export function useInvoiceColumns(showCustomer = true): DataTableColumn<Invoice>
         // need an exchange-rate table this platform does not have, and printing
         // "mixed currencies" left the AR screen unable to state any total.
         total: (rows) => <MoneyTotals totals={totalsByCurrency(rows, (r) => r.amount_due, (r) => r.currency)} />,
-      },
-      {
-        id: 'amount_due_amount',
-        header: 'Amount due value',
-        headerTitle: 'Amount due — a filter, not a column',
-        filterLabel: 'Amount due',
-        filter: 'number',
-        align: 'right',
-        width: 130,
-        defaultHidden: true,
-        hideable: false,
-        unsearchable: true,
-        accessor: (row) => row.amount_due,
       },
       {
         id: 'due_date',
@@ -158,7 +179,7 @@ export function useInvoiceColumns(showCustomer = true): DataTableColumn<Invoice>
         sortable: true,
         defaultHidden: true,
         accessor: (row) => row.created,
-        cell: (row) => f.day(row.created),
+        cell: (row) => f.date(row.created),
       },
     );
     return columns;
@@ -167,6 +188,8 @@ export function useInvoiceColumns(showCustomer = true): DataTableColumn<Invoice>
 
 /* ================================== list ================================== */
 
+const currencyOfRow = (row: { currency: string }): string => row.currency;
+
 export function InvoicesPage() {
   const f = useBillingFormat();
   const navigate = useNavigate();
@@ -174,20 +197,46 @@ export function InvoicesPage() {
   const [status, setStatus] = useSearchParam('status', 'all');
   const [reason, setReason] = useSearchParam('reason', '');
   const [customer, setCustomer] = useSearchParam('customer', '');
+  const [tax, setTax] = useSearchParam('tax', '');
   const [view, setView] = useTableView({ columnId: 'created', direction: 'desc' });
   const [selected, setSelected] = useState<string[]>([]);
   const [billing, setBilling] = useState(false);
   const [voiding, setVoiding] = useState<string[] | null>(null);
   useOpenOnQuery('new', useCallback(() => setBilling(true), []));
 
+  const [rangeParam, setRangeParam] = useSearchParam('amount', '');
+
   const search = useDebounced(view.query.trim(), 250);
-  const list = useCursorList<Invoice>('/v1/invoices', {
+  // The whole book, not its first page. Every figure this screen states —
+  // the count, the receivables total, what an amount range matches — is an
+  // answer about the filtered set, and it can only be one if the filtered set
+  // is what the browser is holding.
+  const book = useBookList<Invoice>('/v1/invoices', useMemo(() => ({
     status,
     ...(search ? { query: search } : {}),
     ...(customer ? { customer } : {}),
     ...(reason ? { billing_reason: reason } : {}),
-  }, 100);
+    ...(tax ? { tax } : {}),
+  }), [status, search, customer, reason, tax]));
   const columns = useInvoiceColumns(true);
+
+  const { currencies, preferred } = useCurrencyChoices(book.rows, currencyOfRow, f.currency);
+  const range = useMemo(() => decodeRange(rangeParam, preferred), [rangeParam, preferred]);
+
+  const rows = useMemo(() => (rangeActive(range)
+    ? book.rows.filter((row) => matchesRange(
+      range.field === 'amount_due' ? row.amount_due : row.total, row.currency, range,
+    ))
+    : book.rows), [book.rows, range]);
+  // The grid's own search and column filters, replayed so the footer can quote
+  // the number of rows on screen instead of the number the server holds.
+  // What the book holds with no filter at all. `book.total` is the count of the
+  // *filtered* set, so measuring narrowing against it made every server filter
+  // — status, reason, tax, account, the search box — describe itself as the
+  // whole book, under totals that only covered the filtered part of it.
+  const whole = useBookTotal('/v1/invoices', { status: 'all' });
+  const visible = useMemo(() => visibleRows(rows, columns, view), [rows, columns, view]);
+  const shown = visible.length;
 
   // Acts on the rows the bulk bar actually hands over, which is the selection
   // minus anything the current filter hides unless the operator opted those in.
@@ -196,7 +245,7 @@ export function InvoicesPage() {
     for (const id of ids) {
       try { await api.post(`/v1/invoices/${id}/${action}`, body ?? {}); ok++; } catch { /* reported below */ }
     }
-    list.retry();
+    book.retry();
     setSelected([]);
     if (ok === ids.length) toast.success(`${label} ${ok} ${ok === 1 ? 'invoice' : 'invoices'}`);
     else toast.warning(`${label} ${ok} of ${ids.length}`, 'The rest were refused — a paid bill cannot be voided, and a draft cannot be paid.', { duration: 0 });
@@ -205,8 +254,8 @@ export function InvoicesPage() {
   // What a bulk void would destroy, stated per currency because there is no
   // exchange-rate table here and one number across three books is not a number.
   const voidTargets = useMemo(
-    () => list.rows.filter((row) => voiding?.includes(row.id)),
-    [list.rows, voiding],
+    () => rows.filter((row) => voiding?.includes(row.id)),
+    [rows, voiding],
   );
 
   return (
@@ -220,15 +269,16 @@ export function InvoicesPage() {
         </Button>
       }
     >
-      {list.error && <ListFailure error={list.error} path="GET /v1/invoices" onRetry={list.retry} />}
+      {book.error && <ListFailure error={book.error} path="GET /v1/invoices" onRetry={book.retry} />}
+      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'}>
       <DataTable
-        rows={list.rows}
+        rows={rows}
         columns={columns}
         getRowId={(row) => row.id}
         caption="Invoices"
-        loading={list.loading}
+        loading={book.loading}
         error={null}
-        onRetry={list.retry}
+        onRetry={book.retry}
         value={view}
         onChange={setView}
         initialSort={{ columnId: 'created', direction: 'desc' }}
@@ -273,6 +323,20 @@ export function InvoicesPage() {
                 { value: 'manual', label: 'Manual' },
               ]}
             />
+            <Select
+              size="sm"
+              aria-label="Tax"
+              value={tax}
+              onChange={(value) => { setTax(value || undefined); setSelected([]); }}
+              options={[
+                { value: '', label: 'Any tax status' },
+                // 0% means two different things on a bill, and only one of them
+                // is fine. This is the queue for the other one.
+                { value: 'missing', label: 'No tax location' },
+                { value: 'charged', label: 'Tax charged' },
+                { value: 'zero', label: 'Nothing due' },
+              ]}
+            />
             <div className="bl-acctfilter">
               <CustomerPicker
                 value={customer}
@@ -283,6 +347,24 @@ export function InvoicesPage() {
                 label="Account"
               />
             </div>
+            <MoneyRangeFilter
+              value={range}
+              onChange={(next) => { setRangeParam(encodeRange(next) || undefined); setSelected([]); }}
+              fields={[
+                { value: 'total', label: 'Total' },
+                { value: 'amount_due', label: 'Amount due' },
+              ]}
+              currencies={currencies}
+              defaultCurrency={preferred}
+            />
+            <ExportCsvButton
+              rows={visible}
+              columns={INVOICE_CSV}
+              name="invoices"
+              noun="invoices"
+              disabled={!book.complete}
+              reason={book.complete ? undefined : 'Still reading the book — the file would hold fewer rows than the screen.'}
+            />
           </Inline>
         }
         bulkActions={(ids) => (
@@ -294,7 +376,7 @@ export function InvoicesPage() {
             <Button size="sm" variant="danger-ghost" onClick={() => setVoiding(ids)}>Void {ids.length}</Button>
           </Inline>
         )}
-        empty={list.error
+        empty={book.error
           ? <LoadFailedEmpty noun="invoices" />
           : (
             <EmptyList
@@ -303,8 +385,13 @@ export function InvoicesPage() {
               action={<Button variant="primary" iconLeft={<Icons.plus size={15} />} onClick={() => setBilling(true)}>Bill an account</Button>}
             />
           )}
-        footer={<ListFooter list={list} noun="invoices" />}
+        footer={<BookFooter book={book} noun="invoices" shown={shown} whole={whole} />}
       />
+      </div>
+      <p className="bl-gridnote">
+        Money columns are ranked and totalled inside each currency. There is no exchange-rate table in this
+        platform, so nothing here is converted and no figure is added across two books.
+      </p>
       <BillNowDialog open={billing} onClose={() => setBilling(false)} />
       <ConfirmDialog
         open={voiding !== null}
@@ -326,6 +413,37 @@ export function InvoicesPage() {
   );
 }
 
+/**
+ * A pending line's explanation: the sentence on the line, the exact rational
+ * behind the disclosure, exactly as the invoice's own lines print it.
+ */
+function PendingWhy({ item }: { item: PendingItem }) {
+  const [open, setOpen] = useState(false);
+  const why = prorationCopy(item.explanation ?? '', item.proration.denominator ? item.proration : null);
+  const sentence = lineWhy(item.description, why.sentence);
+  if (!sentence && !why.exact) return null;
+  return (
+    <>
+      {sentence && <div className="bl-lines__why">{sentence}</div>}
+      {why.exact && (
+        <>
+          <button type="button" className="bl-lines__toggle" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+            {open ? <ChevronUpIcon size={12} /> : <ChevronDownIcon size={12} />}
+            {open ? 'Hide the arithmetic' : 'Show the arithmetic'}
+          </button>
+          {open && (
+            <div className="bl-prorow__exact">
+              {`Exactly ${why.exact.numerator} / ${why.exact.denominator} of the period in milliseconds`}
+              {why.exact.reduced && ` — ${why.exact.reduced.numerator} / ${why.exact.reduced.denominator} in lowest terms`}
+              .
+            </div>
+          )}
+        </>
+      )}
+    </>
+  );
+}
+
 export function BillNowDialog({ open, onClose, customer }: { open: boolean; onClose: () => void; customer?: string }) {
   const f = useBillingFormat();
   const navigate = useNavigate();
@@ -342,10 +460,14 @@ export function BillNowDialog({ open, onClose, customer }: { open: boolean; onCl
     undefined,
     { enabled: open && !!customerId },
   );
+  // The account carries the currency, and the dialog needs it even when there
+  // is nothing pending to read one off.
+  const account = useQuery<Customer>(customerId ? `/v1/customers/${customerId}` : null, undefined, { enabled: open && !!customerId });
   const items = pending.data?.data ?? [];
-  const currency = items[0]?.currency ?? 'usd';
+  const currency = items[0]?.currency ?? account.data?.currency ?? 'usd';
   const total = items.reduce((sum, item) => sum + item.amount, 0);
   const nothing = !pending.loading && !pending.error && !!customerId && items.length === 0;
+  const [oneOff, setOneOff] = useState(false);
 
   const submit = async () => {
     const invoice = await action.run(
@@ -359,6 +481,8 @@ export function BillNowDialog({ open, onClose, customer }: { open: boolean; onCl
     );
     if (invoice) { onClose(); navigate(invoiceHref(invoice.id)); }
   };
+
+  const form = useDialogForm(open, !!customerId && !nothing && !action.busy, () => { void submit(); });
 
   return (
     <Modal
@@ -381,10 +505,24 @@ export function BillNowDialog({ open, onClose, customer }: { open: boolean; onCl
         </>
       }
     >
+      <DialogFields form={form}>
       <Stack gap={5}>
-        <Field label="Customer" required error={action.errorFor('customer')}>
+        <Field
+          label="Customer"
+          required
+          error={action.errorFor('customer')}
+          hint={account.data ? `Bills in ${account.data.currency.toUpperCase()}.` : undefined}
+        >
+          {/* Opened from an account, this field decides whose money is billed,
+              so it shows the name — the same locked-field pattern the
+              subscription dialog uses, rather than a raw `cus_…`. */}
           {customer
-            ? <Input value={customerId} readOnly aria-label="Customer" />
+            ? (
+              <div className="bl-lockedfield">
+                <span className="bl-lockedfield__name">{account.data?.name ?? 'Reading the account…'}</span>
+                <span className="bl-lockedfield__id u-mono">{customerId}</span>
+              </div>
+            )
             : <CustomerPicker value={customerId} onChange={setCustomerId} invalid={!!action.errorFor('customer')} />}
         </Field>
 
@@ -403,8 +541,29 @@ export function BillNowDialog({ open, onClose, customer }: { open: boolean; onCl
         )}
         {nothing && (
           <Banner tone="info" title="Nothing is waiting on this account">
-            No proration and no settled usage is unbilled here, so raising an invoice now would be refused.
-            The recurring fee is billed when the next period opens.
+            <div>
+              No proration and no settled usage is unbilled here, so raising an invoice now would be refused.
+              The recurring fee is billed when the next period opens.
+            </div>
+            {/* Where a hand-written charge went. Without this the dialog says
+                "nothing is waiting" straight after one was carried, and the
+                money looks lost. */}
+            {!!account.data && account.data.balance > 0 && (
+              <div style={{ marginTop: 'var(--space-3)' }}>
+                {`${f.money(account.data.balance, { currency: account.data.currency })} is carried on this account and comes off the next invoice raised for it — `}
+                <RecordLink to={`${customerHref(customerId)}?tab=ledger`}>see the balance ledger</RecordLink>
+                {'.'}
+              </div>
+            )}
+            {/* A refusal that names no next move is a dead end. This platform
+                bills a hand-written amount by carrying it on the account
+                balance, which the next invoice draws down — so that is offered
+                here, in the same dialog, rather than left to be found. */}
+            <Inline gap={3} style={{ marginTop: 'var(--space-4)' }}>
+              <Button size="sm" variant="secondary" iconLeft={<Icons.percent size={13} />} onClick={() => setOneOff(true)}>
+                Charge a one-off amount instead…
+              </Button>
+            </Inline>
           </Banner>
         )}
         {items.length > 0 && (
@@ -419,9 +578,13 @@ export function BillNowDialog({ open, onClose, customer }: { open: boolean; onCl
                     <tr key={item.id} className={item.amount < 0 ? 'bl-lines__row--credit' : undefined}>
                       <td>
                         <div>{item.description}</div>
-                        {lineWhy(item.description, item.explanation) && (
-                          <div className="bl-lines__why">{item.explanation}</div>
-                        )}
+                        {/* The server's explanation carries both halves — the
+                            sentence and the unreduced rational behind it. The
+                            sentence belongs on the line; a ten-digit fraction
+                            printed inline is how a bill starts reading like a
+                            stack trace, so it goes where the invoice lines put
+                            it, behind the same disclosure. */}
+                        <PendingWhy item={item} />
                       </td>
                       <td className="bl-nowrap">{f.dayRange(item.period.start, item.period.end)}</td>
                       <td className="bl-num">{f.money(item.amount, { currency: item.currency })}</td>
@@ -439,9 +602,28 @@ export function BillNowDialog({ open, onClose, customer }: { open: boolean; onCl
             <div className="bl-sub">
               Tax and the account balance are applied when the bill is raised, so the total on the invoice may differ from this subtotal.
             </div>
+            <Inline gap={3}>
+              <Button size="sm" variant="ghost" iconLeft={<Icons.percent size={13} />} onClick={() => setOneOff(true)}>
+                Add a one-off amount first…
+              </Button>
+            </Inline>
           </Stack>
         )}
       </Stack>
+      </DialogFields>
+      {customerId && (
+        <CreditDialog
+          customer={customerId}
+          currency={currency}
+          open={oneOff}
+          onClose={() => { setOneOff(false); pending.refetch(); account.refetch(); }}
+          initialDirection="debit"
+          title="Charge a one-off amount"
+          description={'This platform bills a hand-written amount by carrying it on the account balance: the next invoice '
+            + 'raised for this account draws it down, and the reason you type shows on the balance ledger. It does not '
+            + 'raise a document of its own.'}
+        />
+      )}
     </Modal>
   );
 }
@@ -457,11 +639,12 @@ export function InvoiceDetailPage() {
   const action = useAction();
   const platform = usePlatform(true);
   const [rawTab, setTab] = useRecordTab(INVOICE_TABS, 'lines');
+  const toast = useToast();
   const [dialog, setDialog] = useState<null | 'pay' | 'credit'>(null);
   const [destroy, setDestroy] = useState<null | 'void' | 'uncollectible'>(null);
   const [docOpen, setDocOpen] = useState(false);
 
-  const { data: invoice, error, loading, refetch } = useQuery<Invoice>(`/v1/invoices/${id}`);
+  const { data: invoice, error, loading, refetch } = useRecord<Invoice>(`/v1/invoices/${id}`);
   const notes = useQuery<ListEnvelope<CreditNote>>('/v1/credit_notes', { invoice: id, status: 'all', limit: 50 });
 
   if (loading) return <Page title="Invoice"><Loading label="Loading this invoice…" /></Page>;
@@ -469,10 +652,13 @@ export function InvoiceDetailPage() {
     return (
       <Page title="Invoice" eyebrow="Revenue">
         <Card>
-          <SectionError
-            error={error ?? ({ status: 404, body: { message: 'No invoice came back.' } } as ApiClientError)}
+          <RecordMissing
+            error={error ?? ({ status: 404, body: { message: `No invoice with the id ${id}.` } } as ApiClientError)}
             path={`GET /v1/invoices/${id}`}
             onRetry={refetch}
+            noun="invoice"
+            backTo="/billing/invoices"
+            backLabel="Back to invoices"
           />
         </Card>
       </Page>
@@ -482,6 +668,16 @@ export function InvoiceDetailPage() {
   const act = (path: string, copy: { success: string; description?: string; failure: string }) => {
     void action.run(api.post<Invoice>(path, {}), copy, ['/v1/invoices', '/v1/customers', '/v1/subscriptions']);
   };
+
+  // Why the money button is closed, in the house voice, so the disabled state
+  // is a closed door rather than a dead control.
+  const payBlocked = invoice.status === 'void'
+    ? `${invoice.number} was withdrawn, so there is nothing left to collect on it.`
+    : invoice.amount_due <= 0
+      ? invoice.paid_at
+        ? `Nothing left to collect — ${invoice.number} was settled ${f.day(invoice.paid_at, { withYear: true })}.`
+        : `Nothing is owed on ${invoice.number}, so there is nothing to record against it.`
+      : null;
 
   const hasPayments = platform.serves('GET', '/v1/invoices/:id/payments');
   const tab = rawTab === 'collection' && !hasPayments ? 'lines' : rawTab;
@@ -516,7 +712,17 @@ export function InvoiceDetailPage() {
       id: 'doc',
       label: 'Document',
       items: [
-        { id: 'preview', label: 'Open the printable document', icon: <Icons.print size={14} />, onSelect: () => setDocOpen(true) },
+        { id: 'preview', label: 'Open the printable document', icon: <Icons.receipt size={14} />, onSelect: () => setDocOpen(true) },
+        {
+          id: 'print',
+          label: 'Print or save as PDF',
+          icon: <Icons.print size={14} />,
+          onSelect: () => printDocument(invoice, () => toast.error(
+            'The document could not be opened',
+            'The browser blocked the new window. Allow pop-ups for this site, or open the document in a tab and print from there.',
+            { duration: 0 },
+          )),
+        },
         { id: 'tab', label: 'Open it in a new tab', icon: <Icons.external size={14} />, onSelect: () => window.open(`/api${invoice.document_url}`, '_blank', 'noopener') },
       ],
     },
@@ -555,8 +761,8 @@ export function InvoiceDetailPage() {
     <Page
       title={invoice.number}
       eyebrow="Invoice"
-      badge={<span style={{ marginLeft: 'var(--space-4)' }}><StatusPill status={invoice.status} title={invoice.status_detail} /></span>}
-      subtitle={invoice.status_detail}
+      badge={<span style={{ marginLeft: 'var(--space-4)' }}><StatusPill status={invoice.status} title={invoiceStatusDetail(invoice, f)} /></span>}
+      subtitle={invoiceStatusDetail(invoice, f)}
       breadcrumbs={
         <Inline gap={3}>
           <RecordLink to="/billing/invoices">Invoices</RecordLink>
@@ -566,6 +772,11 @@ export function InvoiceDetailPage() {
       }
       actions={
         <Inline gap={3}>
+          {/* The bulk bar exposes Finalise and Void as first-class buttons on
+              twenty invoices; hiding the same decision behind an icon-only
+              overflow on one is the surface contradicting itself. Whichever
+              status change applies to *this* bill stands in the open, and the
+              rest stay in the menu. */}
           {invoice.status === 'draft' && (
             <Button
               variant="secondary"
@@ -576,14 +787,22 @@ export function InvoiceDetailPage() {
               Finalise
             </Button>
           )}
+          {invoice.status === 'open' && (
+            <Button variant="danger-ghost" iconLeft={<XCircleIcon size={15} />} onClick={() => setDestroy('void')}>
+              Void…
+            </Button>
+          )}
           <Button variant="secondary" iconLeft={<Icons.print size={15} />} onClick={() => setDocOpen(true)}>Document</Button>
           <Button
             variant="primary"
             iconLeft={<CheckCircleIcon size={15} />}
-            disabled={invoice.amount_due <= 0 || invoice.status === 'void'}
+            disabled={!!payBlocked}
+            // Every other refusal on this surface explains itself in a
+            // sentence. A greyed button with no reason reads as broken.
+            title={payBlocked ?? undefined}
             onClick={() => setDialog('pay')}
           >
-            Record payment
+            Take a payment
           </Button>
           <ActionMenu sections={sections} label="More invoice actions" />
         </Inline>
@@ -611,11 +830,20 @@ export function InvoiceDetailPage() {
               value={invoice.amount_due_display}
               caption={
                 invoice.amount_due <= 0
-                  ? (invoice.paid_at ? `Settled ${f.date(invoice.paid_at, { withYear: true })}` : 'Nothing is owed on it')
+                  ? (invoice.paid_at ? `Settled ${f.day(invoice.paid_at, { withYear: true })}` : 'Nothing is owed on it')
                   : invoice.due_date ? `Due ${f.day(invoice.due_date)}` : 'Payable on receipt'
               }
             />
-            <Headline label="Paid" value={f.money(invoice.amount_paid, { currency: invoice.currency })} caption={invoice.paid_at ? f.date(invoice.paid_at) : 'Nothing collected yet'} />
+            <Headline
+              label="Collected"
+              value={f.money(invoice.amount_paid, { currency: invoice.currency })}
+              caption={invoice.paid_at
+                // The one figure on this card that is about the operator's day
+                // rather than the document's, so it is the one that carries a
+                // clock and names the zone.
+                ? `${f.dateTime(invoice.paid_at)} · ${f.timeZone.replace(/_/g, ' ')} time`
+                : invoice.amount_paid > 0 ? 'Part paid — the rest is still owed' : 'Nothing collected yet'}
+            />
             <Headline
               label="Account"
               value={<RecordLink to={customerHref(invoice.customer)}>{invoice.customer_name ?? invoice.customer}</RecordLink>}
@@ -629,7 +857,24 @@ export function InvoiceDetailPage() {
             Its lines no longer add up to its total. That is a bug worth reporting with the invoice id.
           </Banner>
         )}
-        {invoice.payment_note && <Banner tone="info" title="Payment note">{invoice.payment_note}</Banner>}
+        {/* The Collection tab tells this story in full, so the one-line
+            version stands down rather than repeating itself above it. */}
+        {invoice.payment_note && tab !== 'collection' && (
+          <Banner tone="info" compact title="How it was collected">
+            {invoice.payment_note}
+            {/* The gateway writes its own note and names the charge in it. The
+                place that explains a charge is the Collection tab, so the note
+                points at it rather than leaving an id to be searched for. */}
+            {/ch_[A-Za-z0-9]+/.test(invoice.payment_note) && hasPayments && (
+              <>
+                {' '}
+                <button type="button" className="bl-lines__toggle" onClick={() => setTab('collection')}>
+                  See every presentation
+                </button>
+              </>
+            )}
+          </Banner>
+        )}
 
         {tab === 'lines' && <LinesTab invoice={invoice} />}
         {tab === 'collection' && hasPayments && <CollectionTab invoice={invoice} onRetry={() => act(`/v1/invoices/${invoice.id}/retry`, {
@@ -757,6 +1002,17 @@ function CollectionTab({ invoice, onRetry, busy }: { invoice: Invoice; onRetry: 
           {data.charges.map((charge) => <ChargeRow key={charge.id} charge={charge} />)}
         </Card>
 
+        {data.payment_intents.length > 0 && (
+          <Card
+            title="Payments"
+            description="Each instruction raised against this bill and what state it is in — including the two that are usually hidden."
+          >
+            {data.payment_intents.map((intent) => (
+              <IntentRow key={intent.id} intent={intent} number={data.number} onChanged={refetch} />
+            ))}
+          </Card>
+        )}
+
         {data.disputes.length > 0 && (
           <Card title="Disputes" description="Money the customer has asked their bank to take back.">
             {data.disputes.map((dispute) => (
@@ -840,6 +1096,97 @@ function CollectionTab({ invoice, onRetry, busy }: { invoice: Invoice; onRetry: 
 }
 
 /**
+ * One payment instruction, with the step it is waiting on.
+ *
+ * `requires_action` is the state a payments UI usually drops: the issuer wants
+ * the cardholder, the money is authorised and not taken, and an operator with
+ * the customer on the phone has nowhere to say yes. It is a button here, and so
+ * is walking away from it — an intent left in that state holds a balance
+ * against the bill that nothing else can collect.
+ */
+function IntentRow({ intent, number, onChanged }: { intent: PaymentIntent; number: string; onChanged: () => void }) {
+  const f = useBillingFormat();
+  const action = useAction();
+  const money = f.money(intent.amount, { currency: intent.currency });
+
+  const run = (path: string, body: unknown, copy: { success: string; description?: string; failure: string }) => {
+    void action.run(api.post(path, body), copy, INVALIDATE_MONEY).then((result) => { if (result) onChanged(); });
+  };
+
+  return (
+    <div className="bl-row">
+      <div className="bl-row__main">
+        {/* The gateway names an invoice-bound intent after the invoice, which
+            on the invoice's own screen says nothing. Only a description the
+            operator wrote is worth repeating here. */}
+        <div className="bl-row__title">
+          {money}
+          {intent.description && intent.description !== `Invoice ${number}` ? ` · ${intent.description}` : ''}
+        </div>
+        <div className="bl-row__sub">
+          {intent.last_payment_error?.message
+            ?? intent.next_action?.description
+            ?? (intent.status === 'processing'
+              ? 'With the bank. A direct debit settles in a few days, and the bill stays owed until it does.'
+              : intent.status === 'succeeded'
+                ? `Taken ${f.dateTime(intent.succeeded_at ?? intent.created)}.`
+                : `Raised ${f.dateTime(intent.created)}.`)}
+        </div>
+        {(intent.status === 'requires_action' || intent.status === 'requires_confirmation' || intent.status === 'requires_payment_method') && (
+          <Inline gap={3} style={{ marginTop: 'var(--space-3)' }}>
+            {intent.status === 'requires_action' && (
+              <>
+                <Button
+                  size="sm"
+                  variant="primary"
+                  loading={action.busy}
+                  onClick={() => run(`/v1/payment_intents/${intent.id}/authenticate`, { result: 'approve' }, {
+                    success: `${money} authenticated`,
+                    description: 'The issuer accepted the cardholder, so the charge went through.',
+                    failure: 'The authentication step failed',
+                  })}
+                >
+                  The cardholder approved it
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  loading={action.busy}
+                  onClick={() => run(`/v1/payment_intents/${intent.id}/authenticate`, { result: 'abandon' }, {
+                    success: 'Abandoned',
+                    description: 'Nothing was taken. The bill is still owed and can be presented again.',
+                    failure: 'It could not be abandoned',
+                  })}
+                >
+                  They walked away
+                </Button>
+              </>
+            )}
+            {intent.status !== 'requires_action' && (
+              <Button
+                size="sm"
+                variant="ghost"
+                loading={action.busy}
+                onClick={() => run(`/v1/payment_intents/${intent.id}/cancel`, { cancellation_reason: 'abandoned' }, {
+                  success: 'Payment cancelled',
+                  description: 'Nothing was taken, and the bill is free to be presented again.',
+                  failure: 'It could not be cancelled',
+                })}
+              >
+                Cancel it
+              </Button>
+            )}
+          </Inline>
+        )}
+      </div>
+      <div className="bl-row__aside">
+        <div className="bl-sub"><StatusPill status={intent.status} /></div>
+      </div>
+    </div>
+  );
+}
+
+/**
  * The retry schedule, made operable.
  *
  * "Dunning is retrying it" is not a fact an AR clerk can act on. This is: when
@@ -871,6 +1218,8 @@ function RecoveryCard({ campaign, onChanged }: { campaign: InvoiceDunning; onCha
     );
     if (result) { setStopping(false); setReason(''); onChanged(); }
   };
+
+  const stopForm = useDialogForm(stopping, !action.busy, () => { void stop(); });
 
   return (
     <Card
@@ -981,14 +1330,16 @@ function RecoveryCard({ campaign, onChanged }: { campaign: InvoiceDunning; onCha
           </>
         }
       >
-        <Field label="Why" optional hint="Recorded on the campaign, for whoever reads the recovery queue next." error={action.errorFor('reason')}>
-          <Input
-            value={reason}
-            maxLength={500}
-            placeholder="Finance is collecting this one by bank transfer"
-            onChange={(e) => setReason(e.target.value)}
-          />
-        </Field>
+        <DialogFields form={stopForm}>
+          <Field label="Why" optional hint="Recorded on the campaign, for whoever reads the recovery queue next." error={action.errorFor('reason')}>
+            <Input
+              value={reason}
+              maxLength={500}
+              placeholder="Finance is collecting this one by bank transfer"
+              onChange={(e) => setReason(e.target.value)}
+            />
+          </Field>
+        </DialogFields>
       </Modal>
 
       <RetryScheduleDialog open={editing} onClose={() => setEditing(false)} />
@@ -1043,6 +1394,8 @@ function RetryScheduleDialog({ open, onClose }: { open: boolean; onClose: () => 
     if (result) onClose();
   };
 
+  const form = useDialogForm(open, valid && !!policy && !action.busy, () => { void submit(); });
+
   return (
     <Modal
       open={open}
@@ -1062,6 +1415,7 @@ function RetryScheduleDialog({ open, onClose }: { open: boolean; onClose: () => 
       {settings.error && <SectionError error={settings.error} path="GET /v1/payments/settings" onRetry={settings.refetch} />}
       {!settings.error && !policy && <Loading label="Reading the policy…" />}
       {policy && (
+        <DialogFields form={form}>
         <Stack gap={5}>
           <Banner tone="info" compact title="How it runs today">{settings.data?.schedule_explained}</Banner>
           <Field
@@ -1109,6 +1463,7 @@ function RetryScheduleDialog({ open, onClose }: { open: boolean; onClose: () => 
               + `${f.list(policy.give_up_codes.map(humanize))} stop the schedule outright — none of them clear by waiting.`}
           </div>
         </Stack>
+        </DialogFields>
       )}
     </Modal>
   );
@@ -1236,25 +1591,26 @@ function LinesTab({ invoice }: { invoice: Invoice }) {
               {f.dayRange(invoice.arrears_period.start, invoice.arrears_period.end)}
             </FieldRow>
           )}
-          {/* Two clocks, and saying which is which is the difference between a
-              record and a puzzle. Issued and finalised are the document's own
-              dates, which the engine sets on a UTC calendar and the printable
-              page prints the same way. Paid and voided are things that happened,
-              stamped on the operator's own clock. */}
-          <FieldRow label="Issued" hint="The date on the document, as the customer's copy prints it.">
+          {/* One calendar names this invoice, and it is the document's: every
+              date below is the UTC day the customer's copy carries, so the
+              header, the tiles and the printed bill can never disagree. The
+              operator's own clock is in the hint, labelled as their time. */}
+          <FieldRow label="Issued" hint={invoiceClockNote(invoice.created, f)}>
             {f.day(invoice.created, { withYear: true })}
           </FieldRow>
           {invoice.finalized_at && (
-            <FieldRow label="Finalised">{f.day(invoice.finalized_at, { withYear: true })}</FieldRow>
+            <FieldRow label="Finalised" hint={invoiceClockNote(invoice.finalized_at, f)}>
+              {f.day(invoice.finalized_at, { withYear: true })}
+            </FieldRow>
           )}
           {invoice.paid_at && (
-            <FieldRow label="Paid" hint={`Recorded at ${f.timeZone.replace(/_/g, ' ')} time.`}>
-              {f.dateTime(invoice.paid_at)}
+            <FieldRow label="Paid" hint={invoiceClockNote(invoice.paid_at, f)}>
+              {f.day(invoice.paid_at, { withYear: true })}
             </FieldRow>
           )}
           {invoice.voided_at && (
-            <FieldRow label="Voided" hint={`Recorded at ${f.timeZone.replace(/_/g, ' ')} time.`}>
-              {f.dateTime(invoice.voided_at)}
+            <FieldRow label="Voided" hint={invoiceClockNote(invoice.voided_at, f)}>
+              {f.day(invoice.voided_at, { withYear: true })}
             </FieldRow>
           )}
           <FieldRow label="Balance before">{f.money(invoice.starting_balance, { currency: invoice.currency })}</FieldRow>
@@ -1434,15 +1790,47 @@ function InvoiceDocument({ invoice, tall }: { invoice: Invoice; tall?: boolean }
   );
 }
 
+/**
+ * Print the customer's copy.
+ *
+ * There is no route in this platform that emails an invoice, and inventing a
+ * "Send" button that only pretends to would be the one lie on a screen whose
+ * whole job is to be the document. Printing is what a finance team actually
+ * does with it — to paper or to a PDF — so the same window the "open" link
+ * produces is asked to print itself once it has painted. The document is served
+ * from this origin, so the handle stays scriptable; a blocked pop-up is
+ * reported rather than silently doing nothing.
+ */
+function printDocument(invoice: Invoice, onBlocked: () => void): void {
+  const opened = window.open(`/api${invoice.document_url}`, '_blank', 'noopener=no');
+  if (!opened) { onBlocked(); return; }
+  opened.addEventListener('load', () => { opened.focus(); opened.print(); }, { once: true });
+}
+
 function DocumentCard({ invoice }: { invoice: Invoice }) {
+  const toast = useToast();
   return (
     <Card
       title="The printable document"
       description="One self-contained page — the issuer and bill-to blocks, every line with its window, the tax grouped by rate and how to pay."
       actions={
-        <Button size="sm" variant="secondary" iconLeft={<Icons.external size={13} />} href={`/api${invoice.document_url}`} target="_blank" rel="noopener">
-          Open in a new tab
-        </Button>
+        <Inline gap={3}>
+          <Button
+            size="sm"
+            variant="secondary"
+            iconLeft={<Icons.print size={13} />}
+            onClick={() => printDocument(invoice, () => toast.error(
+              'The document could not be opened',
+              'The browser blocked the new window. Allow pop-ups for this site, or use "Open in a new tab" and print from there.',
+              { duration: 0 },
+            ))}
+          >
+            Print or save as PDF
+          </Button>
+          <Button size="sm" variant="secondary" iconLeft={<Icons.external size={13} />} href={`/api${invoice.document_url}`} target="_blank" rel="noopener">
+            Open in a new tab
+          </Button>
+        </Inline>
       }
     >
       <InvoiceDocument invoice={invoice} />
@@ -1521,7 +1909,7 @@ function CreditNotesTab({ invoice, notes, loading, error, onRetry, onIssue }: {
           </div>
           <div className="bl-row__aside">
             <div>{note.total_display}</div>
-            <div className="bl-sub">{f.day(note.created)}</div>
+            <div className="bl-sub">{f.date(note.created)}</div>
           </div>
           <div className="bl-row__act">
             <Button
@@ -1553,47 +1941,272 @@ function CreditNotesTab({ invoice, notes, loading, error, onRetry, onIssue }: {
   );
 }
 
+/**
+ * Money arriving against one bill — all of it, or the part of it that landed.
+ *
+ * The version this replaces had one button, "Record payment of $127,840.00",
+ * and one free-text field. An AR clerk who received a $40,000 wire against it
+ * typed 40000 into the note, and the invoice was marked settled in full: the
+ * ledger said collected, the bank said otherwise, and nothing on the screen
+ * had refused. A receivables tool that cannot write down what actually arrived
+ * is not a ledger.
+ *
+ * There are two honest routes for money and this dialog offers both, priced
+ * before it commits:
+ *
+ *  - **Presented against a method on file** — `POST /v1/payment_intents` with
+ *    an `amount`, which the gateway takes as a ceiling and re-prices down (never
+ *    up) against the live balance at confirm time. A part payment stays a part
+ *    payment; `amount_paid` rises, `amount_due` falls, the bill stays open, and
+ *    the attempt appears on the Collection tab with the issuer's own words.
+ *  - **Settled by hand** — `POST /v1/invoices/:id/pay`, which takes a note and
+ *    no amount, so it can only ever settle in full. The dialog says so rather
+ *    than letting it be discovered afterwards, and refuses to run it for a
+ *    smaller figure.
+ */
 function RecordPaymentDialog({ invoice, open, onClose }: { invoice: Invoice; open: boolean; onClose: () => void }) {
+  const f = useBillingFormat();
   const action = useAction();
+  const toast = useToast();
+  const platform = usePlatform(true);
+  const canPresent = platform.serves('POST', '/v1/payment_intents');
+  const [amount, setAmount] = useState<number | null>(invoice.amount_due);
   const [note, setNote] = useState('');
-  useEffect(() => { if (open) { setNote(''); action.clear(); } }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [method, setMethod] = useState(BY_HAND);
+  const [attaching, setAttaching] = useState(false);
+
+  const methods = useQuery<ListEnvelope<PaymentMethod>>(
+    `/v1/customers/${invoice.customer}/payment_methods`,
+    undefined,
+    { enabled: open && canPresent },
+  );
+  const account = useQuery<Customer>(`/v1/customers/${invoice.customer}`, undefined, { enabled: open });
+  const attached = useMemo(
+    () => (methods.data?.data ?? []).filter((row) => row.status === 'attached'),
+    [methods.data],
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    setAmount(invoice.amount_due);
+    setNote('');
+    action.clear();
+  }, [open, invoice.amount_due]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Defaults to the account's default method once they are read, because that
+  // is the one an automatic charge would have used.
+  useEffect(() => {
+    if (!open || !canPresent) return;
+    setMethod(attached.find((row) => row.default_for_customer)?.id ?? attached[0]?.id ?? BY_HAND);
+  }, [open, canPresent, attached]);
+
+  const money = (value: number) => f.money(value, { currency: invoice.currency });
+  const due = invoice.amount_due;
+  const value = amount ?? 0;
+  const remaining = Math.max(0, due - value);
+  const byHand = method === BY_HAND;
+  const partial = value > 0 && value < due;
+  // The one combination the platform has no route for, said before it is tried
+  // rather than after: `POST /v1/invoices/:id/pay` has no `amount`.
+  const handBlocked = byHand && partial;
+  const tooMuch = value > due;
+  const invalid = value <= 0 ? 'Enter the amount that arrived.'
+    : tooMuch ? `${money(value)} is more than the ${money(due)} still owed on ${invoice.number}.`
+      : handBlocked ? 'Recorded by hand settles the whole bill.'
+        : null;
 
   const submit = async () => {
-    const result = await action.run(
-      api.post<Invoice>(`/v1/invoices/${invoice.id}/pay`, note.trim() ? { note: note.trim() } : {}, { idempotencyKey: idem() }),
+    if (invalid || amount === null) return;
+    if (byHand) {
+      const result = await action.run(
+        api.post<Invoice>(`/v1/invoices/${invoice.id}/pay`, note.trim() ? { note: note.trim() } : {}, { idempotencyKey: idem() }),
+        {
+          success: `${invoice.number} settled in full`,
+          description: invoice.subscription
+            ? 'A subscription that was past due comes back to active on the invoice that clears it.'
+            : 'Anything collected beyond what was owed stays on the account as credit.',
+          failure: 'The payment was not recorded',
+        },
+        INVALIDATE_MONEY,
+      );
+      if (result) onClose();
+      return;
+    }
+    const intent = await action.run(
+      api.post<PaymentIntent>('/v1/payment_intents', {
+        customer: invoice.customer,
+        invoice: invoice.id,
+        amount,
+        payment_method: method,
+        confirm: true,
+        off_session: false,
+        ...(note.trim() ? { description: note.trim().slice(0, 500) } : {}),
+      }, { idempotencyKey: idem() }),
       {
-        success: `${invoice.number} marked paid`,
-        description: invoice.subscription
-          ? 'A subscription that was past due comes back to active on the invoice that clears it.'
-          : 'Anything collected beyond what was owed stays on the account as credit.',
-        failure: 'The payment was not recorded',
+        success: `${money(amount)} presented against ${invoice.number}`,
+        description: remaining > 0
+          ? `${money(remaining)} is still owed on it.`
+          : 'It settles the bill.',
+        failure: 'The payment could not be presented',
       },
-      ['/v1/invoices', '/v1/customers', '/v1/subscriptions', '/v1/revenue'],
+      INVALIDATE_MONEY,
     );
-    if (result) onClose();
+    if (!intent) return;
+    // The intent came back; what it came back *as* is the thing worth saying.
+    // "Succeeded" over a `processing` debit is how a customer is told their
+    // money arrived three days before it does.
+    if (intent.status === 'processing') {
+      toast.info(
+        `${money(intent.amount)} is with the bank`,
+        `A direct debit settles in a few days. ${invoice.number} stays owed until it does, and the Collection tab tracks it.`,
+        { duration: 0 },
+      );
+    } else if (intent.status === 'requires_action') {
+      toast.warning(
+        'The issuer wants the cardholder',
+        `${money(intent.amount)} is authorised but not taken — open the Collection tab to complete the authentication step.`,
+        { duration: 0 },
+      );
+    } else if (intent.status !== 'succeeded') {
+      toast.error(
+        'The card was declined',
+        intent.last_payment_error?.message ?? 'Nothing was collected. The attempt is on the Collection tab with the issuer’s reason.',
+        { duration: 0 },
+      );
+    }
+    onClose();
   };
+
+  const form = useDialogForm(open, !invalid && !action.busy, () => { void submit(); });
+  const methodOptions = [
+    ...attached.map((row) => ({
+      value: row.id,
+      label: `${row.display_name}${row.default_for_customer ? ' · default' : ''}`,
+    })),
+    { value: BY_HAND, label: 'Recorded by hand — nothing is presented' },
+  ];
 
   return (
     <Modal
       open={open}
       onClose={onClose}
-      title={`Record payment of ${invoice.amount_due_display}`}
-      description="For money collected outside the platform — a transfer, a cheque, an offset against a purchase order."
+      size="md"
+      title={`Take a payment on ${invoice.number}`}
+      description={`${money(due)} is owed by ${invoice.customer_name ?? invoice.customer}. Record what arrived, not what was billed.`}
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
-          <Button variant="primary" loading={action.busy} onClick={() => { void submit(); }}>Record the payment</Button>
+          <Button variant="primary" loading={action.busy} disabled={!!invalid} onClick={() => { void submit(); }}>
+            {/* The button carries the money and its consequence, so the last
+                thing read before committing is the balance this leaves. */}
+            {value > 0 && !tooMuch
+              ? remaining > 0
+                ? `Record ${money(value)} · ${money(remaining)} still owed`
+                : `Record ${money(value)} · settles ${invoice.number}`
+              : 'Record the payment'}
+          </Button>
         </>
       }
     >
-      <Field label="How it was collected" optional error={action.errorFor('note')} counter={{ value: note.length, max: 300 }}>
-        <Input
-          value={note}
-          maxLength={300}
-          placeholder="Bank transfer, reference NW-4471"
-          onChange={(e) => setNote(e.target.value)}
+      <DialogFields form={form}>
+        <Stack gap={5}>
+          <Field
+            label="Amount received"
+            required
+            error={action.errorFor('amount') ?? invalid ?? undefined}
+            hint={partial && !handBlocked
+              ? `A part payment. ${invoice.number} stays open for the remaining ${money(remaining)}.`
+              : `Defaults to the whole balance. The most this bill can take is ${money(due)}.`}
+          >
+            <MoneyField
+              value={amount}
+              onChange={setAmount}
+              currency={invoice.currency}
+              min={0}
+              max={due}
+            />
+          </Field>
+
+          {canPresent && (
+            <Field
+              label="How it was taken"
+              required
+              error={action.errorFor('payment_method')}
+              hint={byHand
+                ? 'Nothing is presented — the bill is marked settled and the note below says how the money arrived.'
+                : 'Presented against this method now, and recorded on the Collection tab with the issuer’s answer.'}
+            >
+              <Stack gap={3}>
+                {/* No aria-label: the Field's own label already names it, and
+                    an aria-label would override the words on screen. */}
+                <Select value={method} onChange={setMethod} options={methodOptions} />
+                {account.data && (
+                  <Inline gap={3}>
+                    <Button size="sm" variant="ghost" iconLeft={<Icons.plus size={13} />} onClick={() => setAttaching(true)}>
+                      Attach a card or bank account…
+                    </Button>
+                  </Inline>
+                )}
+              </Stack>
+            </Field>
+          )}
+
+          {handBlocked && (
+            <Banner tone="warning" title="A part payment has to be presented">
+              <div>
+                {`Recording by hand marks ${invoice.number} settled in full — the platform has no route that writes down `}
+                {`part of a bill without presenting something against it. To record the ${money(value)} that actually `}
+                {'arrived, present it against a method on file, or attach the bank account the transfer came from.'}
+              </div>
+              <Inline gap={3} style={{ marginTop: 'var(--space-4)' }}>
+                {attached.length > 0 && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => setMethod(attached.find((row) => row.default_for_customer)?.id ?? attached[0].id)}
+                  >
+                    {`Present it against ${(attached.find((row) => row.default_for_customer) ?? attached[0]).display_name}`}
+                  </Button>
+                )}
+                {account.data && (
+                  <Button size="sm" variant={attached.length ? 'ghost' : 'secondary'} iconLeft={<Icons.plus size={13} />} onClick={() => setAttaching(true)}>
+                    Attach the account it came from…
+                  </Button>
+                )}
+              </Inline>
+            </Banner>
+          )}
+
+          <Field
+            label={byHand ? 'How it was collected' : 'What to call it'}
+            optional
+            error={action.errorFor('note')}
+            counter={{ value: note.length, max: 300 }}
+          >
+            <Input
+              value={note}
+              maxLength={300}
+              placeholder={byHand ? 'Bank transfer, reference NW-4471' : 'Part settlement of NW-4471'}
+              onChange={(e) => setNote(e.target.value)}
+            />
+          </Field>
+
+          {methods.error && canPresent && (
+            <SectionError
+              error={methods.error}
+              path={`GET /v1/customers/${invoice.customer}/payment_methods`}
+              onRetry={methods.refetch}
+            />
+          )}
+        </Stack>
+      </DialogFields>
+      {account.data && (
+        <PaymentMethodDialog
+          customer={account.data}
+          open={attaching}
+          onClose={() => { setAttaching(false); methods.refetch(); }}
         />
-      </Field>
+      )}
     </Modal>
   );
 }
@@ -1661,6 +2274,7 @@ export function CreditNoteDialog({ invoice, open, onClose }: { invoice: Invoice;
   };
 
   const creditable = preview?.remaining_creditable;
+  const form = useDialogForm(open, !!preview && !pending && !action.busy, () => { void submit(); });
 
   return (
     <Modal
@@ -1678,6 +2292,7 @@ export function CreditNoteDialog({ invoice, open, onClose }: { invoice: Invoice;
         </>
       }
     >
+      <DialogFields form={form}>
       <Stack gap={5}>
         <Field label="What to credit">
           <Select
@@ -1784,6 +2399,7 @@ export function CreditNoteDialog({ invoice, open, onClose }: { invoice: Invoice;
           </Stack>
         )}
       </Stack>
+      </DialogFields>
     </Modal>
   );
 }

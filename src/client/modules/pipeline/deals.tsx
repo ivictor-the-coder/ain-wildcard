@@ -18,42 +18,48 @@ import { useRouter } from '@/client/kernel/router';
 import { useSession } from '@/client/kernel/session';
 import {
   AlertTriangleIcon, ArrowRightIcon, Avatar, Badge, Banner, Button, Card, CheckCircleIcon,
-  DataTable, EmptyState, ErrorState, humanize, Icons, MenuButton, Page, SearchInput,
-  SegmentedControl, Select, Skeleton, SortDescIcon, Stat, Switch, useFormat, useToast, XCircleIcon,
-  type DataTableColumn, type MenuSection, type SelectOption
+  DataTable, EmptyState, ErrorState, GitBranchIcon, humanize, Icons, MenuButton, Page, SearchInput,
+  SegmentedControl, Select, Skeleton, SortDescIcon, Stat, Switch, useToast, XCircleIcon,
+  activeFilterCount, activeFilters, describeFilter, filterRows, searchRows,
+  type CellValue, type DataTableColumn, type MenuSection, type SelectOption,
+  type TableState,
 } from '@/client/design';
 import {
-  accountOf, dealAmount, dealCloseDate, dealEnteredStage, dealPipeline, dealStage, dealWeighted,
-  num, recordHref, str, totalsOf, useDealProperties, usePipelines, useUserIndex, useUsers, useVelocity,
-  type DealListEnvelope, type DealRecord, type Pipeline, type PipelineStage, type StageVelocity,
+  HORIZON_LABEL, SORTS, viewToState,
+  accountOf, civilDay, dealAmount, dealCloseDate, dealEnteredStage, dealPipeline, dealStage,
+  dealWeighted, num, recordHref, str, totalsOf, useDealFormat, useDealProperties, usePipelines,
+  useUserIndex, useUsers, useVelocity,
+  type BoardState, type CalendarFormat, type DealListEnvelope, type DealRecord, type DealView,
+  type Horizon, type Pipeline, type PipelineStage, type StageVelocity,
 } from './api';
+import { ViewBar } from './views';
 import { NewDealDialog, StageMoveDialog } from './dialogs';
+import { BulkOwnerDialog, BulkStageDialog } from './bulk';
 
 const DAY_MS = 86_400_000;
 const PAGE_SIZE = 200;
 
 type Display = 'board' | 'table';
-type Horizon = 'all' | 'overdue' | '30' | 'quarter';
-
-const HORIZON_LABEL: Record<Horizon, string> = {
-  all: 'Any close date',
-  overdue: 'Past its close date',
-  '30': 'Closing within 30 days',
-  quarter: 'Closing this quarter',
-};
-
-const SORTS: { value: string; label: string; sort: string; order: 'asc' | 'desc' }[] = [
-  { value: 'amount', label: 'Largest first', sort: 'amount', order: 'desc' },
-  { value: 'close', label: 'Closing soonest', sort: 'close_date', order: 'asc' },
-  { value: 'stage', label: 'Longest in stage', sort: 'stage_entered_at', order: 'asc' },
-  { value: 'updated', label: 'Recently updated', sort: 'updated', order: 'desc' },
-];
 
 const quarterEnd = (now: number): number => {
   const date = new Date(now);
   const month = date.getUTCMonth();
   return Date.UTC(date.getUTCFullYear(), month - (month % 3) + 3, 1);
 };
+
+/**
+ * A stat tile's label, badged when the figure under it is the filtered set
+ * rather than the whole pipeline — the two answer different questions and the
+ * screen has to say which one it is answering.
+ */
+function StatLabel({ filtered, children }: { filtered: boolean; children: React.ReactNode }) {
+  return (
+    <span className="pl-statlabel">
+      {children}
+      {filtered && <Badge size="sm" tone="warning">filtered</Badge>}
+    </span>
+  );
+}
 
 /* --------------------------------- card ---------------------------------- */
 
@@ -72,7 +78,7 @@ function DealCard({
   onDragStart: () => void;
   onDragEnd: () => void;
 }) {
-  const f = useFormat();
+  const f = useDealFormat();
   const session = useSession();
   const now = session.now();
   const account = accountOf(deal);
@@ -81,7 +87,9 @@ function DealCard({
   const stalledAfter = velocity?.stalled_after_days ?? null;
   const stalled = daysInStage !== null && stalledAfter !== null && daysInStage > stalledAfter;
   const close = dealCloseDate(deal);
-  const overdue = close !== null && close < now && !currentStage?.is_closed;
+  // A close date is a calendar day: "overdue" is measured against the day the
+  // workspace is on, not against this instant in UTC.
+  const overdue = close !== null && f.calendarDaysUntil(close) < 0 && !currentStage?.is_closed;
 
   const sections: MenuSection[] = [
     {
@@ -145,7 +153,7 @@ function DealCard({
         {ownerName && <Avatar name={ownerName} seed={deal.owner_id ?? deal.id} size={18} title={ownerName} />}
         {close !== null && (
           <span className={overdue ? 'pl-card__stalled' : undefined}>
-            <Icons.calendar size={11} /> {f.date(close, { withYear: false })}
+            <Icons.calendar size={11} /> {f.calendarDate(close, { withYear: false })}
           </span>
         )}
         {daysInStage !== null && (
@@ -177,7 +185,7 @@ function StageColumn({
   onDrop: (e: React.DragEvent) => void;
   onAdd: () => void;
 }) {
-  const f = useFormat();
+  const f = useDealFormat();
   const totals = totalsOf(deals);
   const share = ceiling > 0 ? Math.min(100, Math.round((totals.amount / ceiling) * 100)) : 0;
 
@@ -230,7 +238,7 @@ function StageColumn({
 
 export function DealsPage() {
   const session = useSession();
-  const f = useFormat();
+  const f = useDealFormat();
   const toast = useToast();
   const { location, navigate, setQuery } = useRouter();
 
@@ -285,6 +293,15 @@ export function DealsPage() {
   const [over, setOver] = useState<string | null>(null);
   const [pending, setPending] = useState<Record<string, string>>({});
   const [move, setMove] = useState<{ deal: DealRecord; stage: PipelineStage } | null>(null);
+  const [selection, setSelection] = useState<string[]>([]);
+  // Held here, not inside the grid: the tiles and the subtitle total the same
+  // set the table shows, so the page cannot narrow in one place and not another.
+  const [tableState, setTableState] = useState<TableState>(
+    () => ({ query: '', sort: { columnId: 'amount', direction: 'desc' }, filters: {} }),
+  );
+  const [bulkStage, setBulkStage] = useState<PipelineStage | null>(null);
+  const [bulkOwner, setBulkOwner] = useState(false);
+  const [refocus, setRefocus] = useState<string | null>(null);
 
   useEffect(() => { if (location.query.new === '1') setNewOpen(true); }, [location.query.new]);
 
@@ -326,6 +343,38 @@ export function DealsPage() {
     },
   );
 
+  /**
+   * Put the keyboard back on the card that was just acted on.
+   *
+   * A move remounts the card into another column, so whatever the menu or the
+   * dialog would have restored focus to is gone by the time it tries and the
+   * caret falls to `<body>` — which on a 22-card board means tabbing in from the
+   * sidebar again. The card is found by the id it carries in the DOM, after the
+   * column it landed in has rendered.
+   */
+  useEffect(() => {
+    if (!refocus) return;
+    let timer = 0;
+    let cancelled = false;
+    const until = Date.now() + 1400;
+    const land = () => {
+      if (cancelled) return;
+      // The card is remounted twice — once when the optimistic move drops it in
+      // its new column, again when the server's answer replaces it — and each
+      // remount drops whatever was focused inside it. So the caret is put back
+      // for as long as the move takes, and only ever when it has been lost:
+      // a person who has clicked somewhere else keeps their focus.
+      const lost = !document.activeElement || document.activeElement === document.body;
+      const card = document.querySelector<HTMLElement>(`.pl-card[data-deal="${CSS.escape(refocus)}"]`);
+      const target = card?.querySelector<HTMLElement>('.pl-card__menu') ?? card?.querySelector<HTMLElement>('.pl-card__name');
+      if (lost && target) target.focus();
+      if (Date.now() < until) timer = window.setTimeout(land, 60);
+      else setRefocus(null);
+    };
+    timer = window.setTimeout(land, 0);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [refocus]);
+
   const requestMove = useCallback((deal: DealRecord, stage: PipelineStage) => {
     if (dealStage(deal) === stage.name) return;
     const props = properties.data?.data ?? [];
@@ -334,6 +383,7 @@ export function DealsPage() {
         && (deal.properties[p.name] === undefined || deal.properties[p.name] === null || deal.properties[p.name] === ''));
     if (needs) { setMove({ deal, stage }); return; }
     setPending((prev) => ({ ...prev, [deal.id]: stage.name }));
+    setRefocus(deal.id);
     void moveNow.run({ deal, stage }).catch(() => {
       setPending((prev) => { const next = { ...prev }; delete next[deal.id]; return next; });
     });
@@ -344,18 +394,24 @@ export function DealsPage() {
   const stageOf = useCallback((deal: DealRecord): string => pending[deal.id] ?? dealStage(deal), [pending]);
 
   const now = session.now();
+  // Close dates are calendar days stored at midnight UTC, so every comparison
+  // against them is made against the workspace's own civil day rather than this
+  // instant — otherwise "overdue" flips for four hours every evening.
+  const today = civilDay(now, session.timeZone);
   const visible = useMemo(() => {
     const rows = (deals.data?.data ?? []).filter((deal) => !deal.archived && dealPipeline(deal) === board?.name);
-    const horizonEnd = horizon === '30' ? now + 30 * DAY_MS : horizon === 'quarter' ? quarterEnd(now) : null;
+    const lastDay = horizon === '30'
+      ? today + 30 * DAY_MS
+      : horizon === 'quarter' ? quarterEnd(today) - DAY_MS : null;
     return rows.filter((deal) => {
       if (forecast && str(deal.properties.forecast_category) !== forecast) return false;
       if (horizon === 'all') return true;
       const close = dealCloseDate(deal);
       if (close === null) return false;
-      if (horizon === 'overdue') return close < now;
-      return horizonEnd !== null && close <= horizonEnd;
+      if (horizon === 'overdue') return close < today;
+      return lastDay !== null && close <= lastDay;
     });
-  }, [deals.data, board?.name, forecast, horizon, now]);
+  }, [deals.data, board?.name, forecast, horizon, today]);
 
   const columns = useMemo(
     () => (board?.stages ?? []).filter((stage) => showClosed || !stage.is_closed),
@@ -385,9 +441,21 @@ export function DealsPage() {
     return top;
   }, [columns, byStage]);
 
-  const shown = useMemo(() => columns.reduce((n, stage) => n + (byStage.get(stage.name)?.length ?? 0), 0), [columns, byStage]);
-  const filtered = !!query || !!owner || !!forecast || horizon !== 'all';
+  const boardShown = useMemo(() => columns.reduce((n, stage) => n + (byStage.get(stage.name)?.length ?? 0), 0), [columns, byStage]);
+  const toolbarFiltered = !!query || !!owner || !!forecast || horizon !== 'all';
   const truncated = !!deals.data?.has_more;
+
+  const toolbarSummary = useMemo(() => [
+    query && `“${query}”`,
+    owner && (userIndex.get(owner)?.name ?? owner),
+    forecast && humanize(forecast),
+    horizon !== 'all' && HORIZON_LABEL[horizon].toLowerCase(),
+  ].filter(Boolean), [query, owner, forecast, horizon, userIndex]);
+
+  const stageByName = useMemo(
+    () => new Map((board?.stages ?? []).map((stage) => [stage.name, stage])),
+    [board],
+  );
 
   /* ------------------------------- toolbars ------------------------------- */
 
@@ -406,13 +474,64 @@ export function DealsPage() {
 
   const openDeal = useCallback((deal: DealRecord) => navigate(recordHref('deal', deal.id)), [navigate]);
 
+  /* -------------------------------- views -------------------------------- */
+
+  const activeView = location.query.view ?? '';
+
+  // The board as a saved view would hold it. The pipeline is the *effective*
+  // one, not the empty string that means "whichever is default": a view named
+  // after New business has to keep pointing at New business when the workspace
+  // makes another pipeline the default.
+  const boardState: BoardState = useMemo(() => ({
+    pipeline: board?.name ?? pipelineName,
+    owner,
+    forecast,
+    horizon,
+    sort: sortKey,
+    closed: showClosed,
+  }), [board?.name, pipelineName, owner, forecast, horizon, sortKey, showClosed]);
+
+  const applyView = useCallback((view: DealView | null) => {
+    if (!view) { setQuery({ view: undefined }); return; }
+    const { state, readable } = viewToState(view);
+    setQuery({
+      view: readable ? view.id : undefined,
+      pipeline: state.pipeline || undefined,
+      owner: state.owner || undefined,
+      forecast: state.forecast || undefined,
+      horizon: state.horizon === 'all' ? undefined : state.horizon,
+      sort: state.sort === 'amount' ? undefined : state.sort,
+      closed: state.closed ? '1' : undefined,
+    });
+    if (!readable) {
+      toast.info(
+        `“${view.name}” is only partly shown`,
+        'It also filters on conditions this board has no control for, so it is not marked as the view you are on. What it could take is on the board.',
+      );
+    }
+  }, [setQuery, toast]);
+
+  const pipelineLabel = useCallback(
+    (name: string) => (pipelines.data?.data ?? []).find((p) => p.name === name)?.label ?? name,
+    [pipelines.data],
+  );
+  const ownerName = useCallback(
+    (id: string) => userIndex.get(id)?.name ?? id,
+    [userIndex],
+  );
+  const forecastLabel = useCallback((value: string) => {
+    const property = (properties.data?.data ?? []).find((p) => p.name === 'forecast_category');
+    return property?.options?.find((option) => option.value === value)?.label ?? humanize(value);
+  }, [properties.data]);
+
   // Clearing has to reset the box as well as the address: the search text is
   // held here and written into the URL, so dropping only the parameter puts it
   // straight back on the next debounce.
   const clearFilters = useCallback(() => {
     setSearch('');
     setQueryText('');
-    setQuery({ q: undefined, owner: undefined, forecast: undefined, horizon: undefined });
+    setTableState((state) => ({ ...state, query: '', filters: {} }));
+    setQuery({ q: undefined, owner: undefined, forecast: undefined, horizon: undefined, view: undefined });
   }, [setQuery]);
 
   /* --------------------------------- table -------------------------------- */
@@ -444,6 +563,7 @@ export function DealsPage() {
     {
       id: 'stage',
       header: 'Stage',
+      width: 160,
       accessor: (row) => stageLabel(stageOf(row)),
       filter: 'set',
       cell: (row) => <Badge size="sm" tone="info">{stageLabel(stageOf(row))}</Badge>,
@@ -452,6 +572,7 @@ export function DealsPage() {
       id: 'amount',
       header: 'Amount',
       align: 'right',
+      width: 140,
       sortable: true,
       filter: 'number',
       accessor: (row) => dealAmount(row),
@@ -462,6 +583,7 @@ export function DealsPage() {
       id: 'probability',
       header: 'Probability',
       align: 'right',
+      width: 110,
       sortable: true,
       accessor: (row) => num(row.properties.probability),
       cell: (row) => `${num(row.properties.probability)}%`,
@@ -470,6 +592,7 @@ export function DealsPage() {
       id: 'weighted',
       header: 'Weighted',
       align: 'right',
+      width: 140,
       sortable: true,
       accessor: (row) => dealWeighted(row),
       cell: (row) => f.money(dealWeighted(row)),
@@ -478,17 +601,19 @@ export function DealsPage() {
     {
       id: 'close_date',
       header: 'Close date',
+      width: 130,
       sortable: true,
       filter: 'date',
       accessor: (row) => dealCloseDate(row) ?? 0,
       cell: (row) => {
         const close = dealCloseDate(row);
-        return close === null ? <span className="pl-muted">—</span> : f.date(close);
+        return close === null ? <span className="pl-muted">—</span> : f.calendarDate(close);
       },
     },
     {
       id: 'owner',
       header: 'Owner',
+      width: 150,
       filter: 'set',
       accessor: (row) => (row.owner_id ? userIndex.get(row.owner_id)?.name ?? row.owner_id : 'Unassigned'),
     },
@@ -496,6 +621,7 @@ export function DealsPage() {
       id: 'stage_age',
       header: 'In stage',
       align: 'right',
+      width: 100,
       sortable: true,
       accessor: (row) => {
         const entered = dealEnteredStage(row);
@@ -507,6 +633,95 @@ export function DealsPage() {
       },
     },
   ], [f, now, stageOf, stageLabel, userIndex]);
+
+  /**
+   * The table's own search box and column chips, lifted out of the grid.
+   *
+   * `DataTable` will filter itself perfectly well, but then only it knows what
+   * is on screen: the stat tiles above stayed on the pipeline-wide totals and
+   * the subtitle kept quoting 22 deals over a grid showing 2. The state lives
+   * here so the whole page answers one question — the same thing the board's
+   * own filters already do.
+   */
+  const tableSearchable = useMemo(
+    () => tableColumns.filter((column) => !column.unsearchable).map((column) => column.id),
+    [tableColumns],
+  );
+
+  const tableAccessor = useCallback((row: DealRecord, columnId: string): CellValue => {
+    const column = tableColumns.find((c) => c.id === columnId);
+    return column?.accessor ? column.accessor(row) : null;
+  }, [tableColumns]);
+
+  const tableNarrows = display === 'table'
+    && (!!tableState.query.trim() || activeFilterCount(tableState.filters) > 0);
+
+  const narrowed = useMemo(() => {
+    if (!tableNarrows) return visible;
+    const searched = tableState.query.trim()
+      ? searchRows(visible, tableState.query, tableSearchable, tableAccessor)
+      : visible;
+    return filterRows(searched, tableState.filters, tableAccessor);
+  }, [tableNarrows, visible, tableState.query, tableState.filters, tableSearchable, tableAccessor]);
+
+  // What the grid itself will show, once it has re-run the same narrowing over
+  // the rows it was handed. The subtitle counts these.
+  const gridRows = useMemo(() => {
+    if (!tableNarrows) return inView;
+    const names = new Set(columns.map((stage) => stage.name));
+    return narrowed.filter((deal) => names.has(stageOf(deal)));
+  }, [tableNarrows, inView, narrowed, columns, stageOf]);
+
+  const filtered = toolbarFiltered || tableNarrows;
+  const shown = display === 'table' ? gridRows.length : boardShown;
+  const onScreen = display === 'table' ? gridRows : inView;
+  // Whether there is anything for the surface to draw at all. The table keeps
+  // its own toolbar when its search matches nothing — replacing the grid with a
+  // page-level empty state would take away the box the text was typed into.
+  const populated = display === 'table' ? inView.length : boardShown;
+
+  const filterSummary = useMemo(() => {
+    const parts = [...toolbarSummary];
+    if (tableNarrows) {
+      if (tableState.query.trim()) parts.push(`“${tableState.query.trim()}”`);
+      for (const [columnId, filter] of activeFilters(tableState.filters)) {
+        const column = tableColumns.find((c) => c.id === columnId);
+        const label = typeof column?.header === 'string' ? column.header : columnId;
+        parts.push(`${label.toLowerCase()} ${describeFilter(filter, { formatDate: (ts) => f.calendarDate(ts) })}`);
+      }
+    }
+    return parts.join(' · ');
+  }, [toolbarSummary, tableNarrows, tableState.query, tableState.filters, tableColumns, f]);
+
+  /**
+   * The stat row, over the deals a filter has left on screen.
+   *
+   * `/v1/pipelines/deal` computes its totals over every deal on the pipeline,
+   * which is the right answer to "what is my pipeline" and the wrong answer to
+   * "what is Priya carrying". Filter the board — from the toolbar or from the
+   * table's own controls — and these tiles answer the second question, so the
+   * screen never shows two open-pipeline figures at once.
+   */
+  const filteredTotals = useMemo(() => {
+    let open = 0;
+    let weighted = 0;
+    let won = 0;
+    let stalled = 0;
+    let openDeals = 0;
+    let wonDeals = 0;
+    for (const deal of narrowed) {
+      const stage = stageByName.get(stageOf(deal));
+      if (stage?.is_won) { won += dealAmount(deal); wonDeals += 1; continue; }
+      if (stage?.is_closed) continue;
+      open += dealAmount(deal);
+      weighted += dealWeighted(deal);
+      openDeals += 1;
+      const entered = dealEnteredStage(deal);
+      const stallsAfter = velocityByStage.get(stage?.name ?? '')?.stalled_after_days ?? 0;
+      if (entered && stallsAfter > 0 && Math.floor((now - entered) / DAY_MS) > stallsAfter) stalled += 1;
+    }
+    return { open, weighted, won, stalled, openDeals, wonDeals, deals: narrowed.length };
+  }, [narrowed, stageByName, stageOf, velocityByStage, now]);
 
   const rowActions = useCallback((row: DealRecord): MenuSection[] => [
     { id: 'open', items: [{ id: 'open', label: 'Open deal', icon: <Icons.external size={14} />, onSelect: () => openDeal(row) }] },
@@ -529,17 +744,32 @@ export function DealsPage() {
   const error = deals.error ?? pipelines.error;
   const loading = deals.loading || pipelines.loading;
 
-  const headline = board
-    ? (() => {
-      const openRows = inView.filter((deal) => !board.stages.find((s) => s.name === stageOf(deal))?.is_closed);
-      const open = totalsOf(openRows);
-      return [
-        `${f.plural(shown, 'deal')} on ${board.label}${showClosed ? '' : ', open stages only'}`,
-        `${f.money(open.amount)} open`,
-        `${f.money(open.weighted)} weighted`,
-      ].join(' · ');
-    })()
-    : 'Deals, by stage';
+  // A sum over an array that has not arrived is not a measurement. While the
+  // board is loading or broken the subtitle says so rather than asserting
+  // "0 deals · $0.00 open" above a stat card reading several million.
+  // A filtered tile is a sum over the deals on screen, so it cannot be quoted
+  // until they have arrived. The unfiltered tiles come from `/v1/pipelines/deal`
+  // and stay true even when the deal list itself fails.
+  const unmeasured = filtered && (loading || !!deals.error);
+  const unmeasuredWhy = deals.error
+    ? 'The deal list did not answer, so this filter cannot be totalled'
+    : 'Counting the deals that match…';
+
+  const headline = error
+    ? 'The board could not be built'
+    : loading
+      ? `Reading ${board ? board.label : 'the pipeline'}…`
+      : board
+        ? (() => {
+          const openRows = onScreen.filter((deal) => !board.stages.find((s) => s.name === stageOf(deal))?.is_closed);
+          const open = totalsOf(openRows);
+          return [
+            `${f.plural(shown, 'deal')} on ${board.label}${showClosed ? '' : ', open stages only'}`,
+            `${f.money(open.amount)} open`,
+            `${f.money(open.weighted)} weighted`,
+          ].join(' · ');
+        })()
+        : 'Deals, by stage';
 
   return (
     <Page
@@ -567,40 +797,63 @@ export function DealsPage() {
         <div className="pl-summary">
           <Card padding="tight">
             <Stat
-              label="Open pipeline"
-              value={f.money(board.open_amount ?? 0)}
+              label={<StatLabel filtered={filtered}>Open pipeline</StatLabel>}
+              value={unmeasured ? '—' : f.money(filtered ? filteredTotals.open : board.open_amount ?? 0)}
               icon={<Icons.funnel size={15} />}
-              caption={`${f.plural(board.record_count, 'deal')} have passed through ${board.label}`}
+              caption={unmeasured
+                ? unmeasuredWhy
+                : filtered
+                  ? `${f.plural(filteredTotals.openDeals, 'open deal')} matching ${filterSummary}`
+                  : `${f.plural(board.record_count, 'deal')} have passed through ${board.label}`}
             />
           </Card>
           <Card padding="tight">
             <Stat
-              label="Weighted forecast"
-              value={f.money(board.weighted_amount ?? 0)}
+              label={<StatLabel filtered={filtered}>Weighted forecast</StatLabel>}
+              value={unmeasured ? '—' : f.money(filtered ? filteredTotals.weighted : board.weighted_amount ?? 0)}
               icon={<Icons.target size={15} />}
-              caption="Each open deal at its stage probability"
+              caption={unmeasured ? unmeasuredWhy : 'Each open deal at its stage probability'}
             />
           </Card>
           <Card padding="tight">
             <Stat
-              label="Closed won"
-              value={f.money(board.won_amount ?? 0)}
+              label={<StatLabel filtered={filtered}>Closed won</StatLabel>}
+              value={unmeasured ? '—' : f.money(filtered ? filteredTotals.won : board.won_amount ?? 0)}
               icon={<CheckCircleIcon size={15} />}
-              caption={velocity.data ? `Median ${f.plural(velocity.data.median_days_to_close, 'day')} to close` : 'Booked on this pipeline'}
+              caption={unmeasured
+                ? unmeasuredWhy
+                : filtered
+                  ? `${f.plural(filteredTotals.wonDeals, 'won deal')} in this filter`
+                  : velocity.data
+                    ? `Median ${f.plural(velocity.data.median_days_to_close, 'day')} to close`
+                    : 'Booked on this pipeline'}
             />
           </Card>
           <Card padding="tight">
             <Stat
-              label="Stalled"
-              value={velocity.data ? f.number(velocity.data.stalled_records) : '—'}
+              label={<StatLabel filtered={filtered}>Stalled</StatLabel>}
+              value={unmeasured
+                ? '—'
+                : filtered
+                  ? f.number(filteredTotals.stalled)
+                  : velocity.data ? f.number(velocity.data.stalled_records) : '—'}
               icon={<AlertTriangleIcon size={15} />}
-              caption="Sitting longer than twice their stage's median"
+              caption={unmeasured ? unmeasuredWhy : "Sitting longer than twice their stage's median"}
             />
           </Card>
         </div>
       )}
 
       <div className="pl-toolbar">
+        <ViewBar
+          state={boardState}
+          activeId={activeView}
+          onApply={applyView}
+          pipelineLabel={pipelineLabel}
+          ownerName={ownerName}
+          forecastLabel={forecastLabel}
+        />
+        <span className="pl-toolbar__rule" aria-hidden="true" />
         <Select
           value={board?.name ?? ''}
           onChange={(next) => setQuery({ pipeline: next })}
@@ -699,11 +952,11 @@ export function DealsPage() {
         />
       )}
 
-      {!error && !loading && board && shown === 0 && (
+      {!error && !loading && board && populated === 0 && (
         <EmptyState
           title={filtered ? 'No deal matches these filters' : `${board.label} has no deals yet`}
           body={filtered
-            ? `Nothing on ${board.label} matches ${[query && `“${query}”`, owner && userIndex.get(owner)?.name, forecast && humanize(forecast), horizon !== 'all' && HORIZON_LABEL[horizon].toLowerCase()].filter(Boolean).join(' · ')}.`
+            ? `Nothing on ${board.label} matches ${filterSummary}.`
             : `Open the first opportunity and it lands in ${board.stages[0]?.label ?? 'the first stage'} at ${board.stages[0]?.probability ?? 0}%.`}
           action={filtered
             ? <Button variant="primary" onClick={clearFilters}>Clear filters</Button>
@@ -712,7 +965,7 @@ export function DealsPage() {
         />
       )}
 
-      {!error && !loading && board && shown > 0 && display === 'board' && (
+      {!error && !loading && board && populated > 0 && display === 'board' && (
         <div className="pl-board">
           {columns.map((stage) => (
             <StageColumn
@@ -755,7 +1008,7 @@ export function DealsPage() {
         </div>
       )}
 
-      {!error && !loading && board && shown > 0 && display === 'table' && (
+      {!error && !loading && board && populated > 0 && display === 'table' && (
         <DataTable<DealRecord>
           rows={inView}
           columns={tableColumns}
@@ -763,13 +1016,62 @@ export function DealsPage() {
           caption={`Deals on ${board.label}`}
           onRowClick={openDeal}
           rowActions={rowActions}
+          selectable
+          selected={selection}
+          onSelectionChange={setSelection}
+          bulkActions={(ids) => {
+            const picked = inView.filter((row) => ids.includes(row.id));
+            const totals = totalsOf(picked);
+            return (
+              <>
+                <span className="ain-table__bulknote">
+                  {f.money(totals.amount)} · {f.money(totals.weighted)} weighted
+                </span>
+                <MenuButton
+                  size="sm"
+                  variant="secondary"
+                  label="Move the selected deals to a stage"
+                  icon={<GitBranchIcon size={13} />}
+                  sections={[{
+                    id: 'stages',
+                    label: 'Move to stage',
+                    // A deal already sitting in the destination is not moved, so
+                    // it is not quoted either: this preview is computed over the
+                    // same set the confirmation will commit.
+                    items: (board?.stages ?? []).map((stage) => {
+                      const moving = picked.filter((row) => stageOf(row) !== stage.name);
+                      const amount = moving.reduce((sum, row) => sum + dealAmount(row), 0);
+                      return {
+                        id: stage.name,
+                        label: stage.label,
+                        description: moving.length === 0
+                          ? 'All of them are here already'
+                          : `${f.plural(moving.length, 'deal')} · ${stage.probability}% · ${f.money(Math.round((amount * stage.probability) / 100))} weighted`,
+                        disabled: moving.length === 0,
+                        icon: stage.is_won
+                          ? <CheckCircleIcon size={14} />
+                          : stage.is_closed ? <XCircleIcon size={14} /> : <ArrowRightIcon size={14} />,
+                        onSelect: () => setBulkStage(stage),
+                      };
+                    }),
+                  }]}
+                >
+                  Move stage
+                </MenuButton>
+                <Button size="sm" variant="secondary" iconLeft={<Icons.user size={13} />} onClick={() => setBulkOwner(true)}>
+                  Reassign
+                </Button>
+              </>
+            );
+          }}
           searchable
           searchPlaceholder="Filter the deals on screen"
           stickyFooter
           showColumnToggle
           showFilters
-          initialSort={{ columnId: 'amount', direction: 'desc' }}
-          footer={<span className="pl-note">{f.plural(inView.length, 'deal')} on {board.label}{showClosed ? '' : ', open stages only'}</span>}
+          value={tableState}
+          onChange={setTableState}
+          footer={<span className="pl-note">{f.plural(gridRows.length, 'deal')} on {board.label}{showClosed ? '' : ', open stages only'}</span>}
         />
       )}
 
@@ -784,14 +1086,32 @@ export function DealsPage() {
         onCreated={(deal) => navigate(recordHref('deal', deal.id))}
       />
 
+      <BulkStageDialog
+        open={!!bulkStage}
+        deals={inView.filter((row) => selection.includes(row.id))}
+        stage={bulkStage}
+        stages={board?.stages ?? []}
+        properties={properties.data?.data ?? []}
+        onClose={() => setBulkStage(null)}
+        onDone={() => { setBulkStage(null); setSelection([]); }}
+      />
+
+      <BulkOwnerDialog
+        open={bulkOwner}
+        deals={inView.filter((row) => selection.includes(row.id))}
+        users={users.data?.data ?? []}
+        onClose={() => setBulkOwner(false)}
+        onDone={() => { setBulkOwner(false); setSelection([]); }}
+      />
+
       <StageMoveDialog
         open={!!move}
         deal={move?.deal ?? null}
         from={move ? board?.stages.find((s) => s.name === dealStage(move.deal)) : undefined}
         to={move?.stage ?? null}
         properties={properties.data?.data ?? []}
-        onClose={() => setMove(null)}
-        onMoved={() => setMove(null)}
+        onClose={() => { const id = move?.deal.id ?? null; setMove(null); setRefocus(id); }}
+        onMoved={() => { const id = move?.deal.id ?? null; setMove(null); setRefocus(id); }}
       />
     </Page>
   );

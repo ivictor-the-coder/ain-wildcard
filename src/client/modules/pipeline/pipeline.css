@@ -9,12 +9,26 @@
   flex-wrap: wrap;
 }
 .pl-toolbar__spacer { flex: 1 1 auto; min-width: var(--space-6); }
+/* The named view is a different kind of control from the filters beside it. */
+.pl-toolbar__rule {
+  width: 1px;
+  align-self: stretch;
+  min-height: var(--space-6);
+  background: var(--border-default);
+}
 .pl-toolbar__search { width: min(280px, 40vw); }
 
 .pl-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: var(--space-5);
+}
+
+.pl-statlabel {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
 }
 
 .pl-note {
@@ -277,6 +291,23 @@
 .pl-assoc__title { font-size: var(--text-sm); color: var(--text-primary); }
 .pl-assoc__sub { font-size: var(--text-2xs); color: var(--text-tertiary); }
 
+/* A committee row is the link plus the control that breaks it. The remove
+   button rests quiet rather than invisible: a control nobody can see until they
+   happen to hover the right row is a control most people never find, and it has
+   to be reachable by touch, where there is no hover at all. */
+.pl-assocrow { display: flex; align-items: center; gap: var(--space-2); }
+.pl-assocrow .pl-assoc { flex: 1 1 auto; min-width: 0; }
+.pl-assocrow__remove {
+  flex: 0 0 auto;
+  opacity: 0.45;
+  color: var(--text-tertiary);
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+.pl-assocrow:hover .pl-assocrow__remove,
+.pl-assocrow:focus-within .pl-assocrow__remove { opacity: 1; }
+.pl-assocrow__remove:hover { color: var(--text-danger); }
+@media (prefers-reduced-motion: reduce) { .pl-assocrow__remove { transition: none; } }
+
 .pl-proplist { display: grid; gap: var(--space-5); }
 .pl-propgroup__head {
   display: flex;
@@ -356,3 +387,8 @@
 }
 .pl-details[open] > summary::before { content: '▾'; }
 .pl-details > summary:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
+
+/* Per-row refusals from a batch write. The list is the whole point — a bulk
+   move that half-worked has to say which half, by name. */
+.pl-refusals { margin: var(--space-2) 0 0; padding-left: var(--space-5); display: grid; gap: var(--space-2); }
+.pl-refusals li { font-size: var(--text-xs); line-height: var(--leading-normal); }

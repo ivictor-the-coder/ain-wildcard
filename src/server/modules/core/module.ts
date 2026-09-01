@@ -1,7 +1,7 @@
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { defineModule } from '../../kernel/module';
 import type { Ctx } from '../../kernel/context';
-import { buildOpenApi, created, list, noContent, status as httpStatus, type Req, type Role } from '../../kernel/http';
+import { buildOpenApi, created, list, noContent, roleAtLeast, status as httpStatus, type Req, type Role } from '../../kernel/http';
 import { badRequest, forbidden, notFound, unauthorized } from '../../../shared/errors';
 import { newId, randomId } from '../../../shared/ids';
 import { parseJson } from '../../kernel/db';
@@ -23,6 +23,74 @@ export function verifyPassword(password: string, stored: string): boolean {
   return candidate.length === expected.length && timingSafeEqual(candidate, expected);
 }
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+
+/* ------------------------ who is behind a credential ---------------------- */
+
+/**
+ * The human this call is being made by, whichever door it came through.
+ *
+ * A session carries its user. An API key does not — and treating "no user id"
+ * as "no person" is what made a key an immortal credential: minting a key
+ * through a key dropped the author, and `authenticate` has nobody to ask about
+ * a key with no author, so the child outlived the removal of the human who
+ * created its parent. A key's principal is its author, transitively, because
+ * that is who is acting.
+ */
+function principalOf(c: Ctx, auth: Req['auth']): string | null {
+  if (auth.userId) return auth.userId;
+  if (!auth.keyId) return null;
+  return c.db.pluck<string>(`SELECT created_by FROM api_keys WHERE id = ? AND org_id = ?`, auth.keyId, auth.orgId) ?? null;
+}
+
+/* --------------------------- the authority ladder ------------------------- */
+
+/**
+ * Nobody hands out authority they do not hold.
+ *
+ * `boundedByAuthor` in `app.ts` states this for API keys — "a credential may
+ * never carry authority its author does not currently hold" — and the
+ * membership table is the *primary* grant path that mirror was written
+ * against. Only the mirror was guarded: `roles: ['admin']` let any admin PATCH
+ * themselves to `owner` and the owner down to `readonly`, in two calls, with
+ * no way back. A key minted by that admin is capped at `admin` by the bound;
+ * the seat the key hangs off was not capped at all.
+ */
+function assertMayGrant(req: Req, role: Role): void {
+  if (roleAtLeast(req.auth.role, role)) return;
+  throw forbidden(
+    `Your role (${req.auth.role}) cannot grant the ${role} role — nobody may hand out more authority than they hold. `
+    + `Ask ${role === 'owner' ? 'an owner' : 'someone with the ' + role + ' role or higher'} to make this change.`,
+  );
+}
+
+/** Memberships at `admin` or above that would survive this seat changing. */
+function adminsBesides(c: Ctx, orgId: string, userId: string): number {
+  return c.db.count(
+    `SELECT COUNT(*) FROM memberships WHERE org_id = ? AND user_id <> ? AND role IN ('owner', 'admin')`,
+    orgId, userId,
+  );
+}
+
+/**
+ * The floor under the ceiling: a workspace always keeps someone who can
+ * administer it.
+ *
+ * Now that every credential is resolved against a live membership, the last
+ * admin demoting or removing themselves is not a recoverable mistake — the
+ * session does not survive as `member`, the key they hold is bounded by the
+ * role they no longer have, and there is nobody left who can undo either.
+ */
+function assertKeepsAnAdmin(c: Ctx, orgId: string, userId: string, nextRole: Role | null): void {
+  const current = c.db.pluck<Role>(`SELECT role FROM memberships WHERE org_id = ? AND user_id = ?`, orgId, userId);
+  if (!current || !roleAtLeast(current, 'admin')) return;
+  if (nextRole && roleAtLeast(nextRole, 'admin')) return;
+  if (adminsBesides(c, orgId, userId)) return;
+  throw forbidden(
+    nextRole
+      ? `This is the workspace's last ${current}, so the role cannot be lowered to ${nextRole}. Promote another teammate to admin first, then come back.`
+      : `This is the workspace's last ${current}, so they cannot be removed. Promote another teammate to admin first, then come back.`,
+  );
+}
 
 /* -------------------------------- service -------------------------------- */
 
@@ -286,6 +354,7 @@ export default defineModule({
 
     router.post('/v1/users', (req: Req, c: Ctx) => {
       const body = req.body as { email: string; name: string; role: Role; title?: string };
+      assertMayGrant(req, body.role);
       const existing = c.db.get<UserRow>(`SELECT * FROM users WHERE email = ?`, body.email);
       const now = c.now();
       const userId = existing?.id ?? newId('user');
@@ -295,7 +364,7 @@ export default defineModule({
       const member = c.db.get<any>(`SELECT id FROM memberships WHERE org_id = ? AND user_id = ?`, req.auth.orgId, userId);
       if (member) throw badRequest('member_exists', `${body.email} is already a member of this workspace.`, 'email');
       c.db.insert('memberships', { id: newId('user'), org_id: req.auth.orgId, user_id: userId, role: body.role, teams: '[]', created: now });
-      c.audit({ orgId: req.auth.orgId, actorId: req.auth.userId, actorType: 'user', action: 'user.invited', targetType: 'user', targetId: userId, summary: `Invited ${body.email} as ${body.role}`, requestId: req.requestId });
+      c.audit({ orgId: req.auth.orgId, actorId: principalOf(c, req.auth), actorType: 'user', action: 'user.invited', targetType: 'user', targetId: userId, summary: `Invited ${body.email} as ${body.role}`, requestId: req.requestId });
       c.emit(req.auth.orgId, 'user.invited', { id: userId, email: body.email, role: body.role }, { objectId: userId, objectType: 'user' });
       return created({ ...publicUser(c.svc.core.user(userId)!), role: body.role });
     }, {
@@ -311,6 +380,16 @@ export default defineModule({
       const body = req.body as { role?: Role; name?: string; title?: string; teams?: string[] };
       const member = c.db.get<any>(`SELECT * FROM memberships WHERE org_id = ? AND user_id = ?`, req.auth.orgId, req.params.id);
       if (!member) throw notFound('user', req.params.id);
+      if (body.role) {
+        // The ceiling: an admin may not seat an owner, including themselves.
+        assertMayGrant(req, body.role);
+        // …and may not take a role away from someone above them either, which
+        // is the same rule read from the other end. Without it an admin could
+        // not promote themselves to owner but could still demote the owner to
+        // readonly and be the highest rung left.
+        assertMayGrant(req, member.role as Role);
+        assertKeepsAnAdmin(c, req.auth.orgId, req.params.id, body.role);
+      }
       if (body.role || body.teams) {
         c.db.patch('memberships', 'id', member.id, {
           ...(body.role ? { role: body.role } : {}),
@@ -318,6 +397,15 @@ export default defineModule({
         });
       }
       if (body.name || body.title) c.db.patch('users', 'id', req.params.id, { ...(body.name ? { name: body.name } : {}), ...(body.title ? { title: body.title } : {}), updated: c.now() });
+      if (body.role && body.role !== member.role) {
+        c.audit({
+          orgId: req.auth.orgId, actorId: principalOf(c, req.auth), actorType: 'user', action: 'user.role_changed',
+          targetType: 'user', targetId: req.params.id, summary: `Role changed from ${member.role} to ${body.role}`,
+          before: { role: member.role }, after: { role: body.role }, requestId: req.requestId,
+        });
+        c.emit(req.auth.orgId, 'user.role_changed', { id: req.params.id, role: body.role, previous: member.role },
+          { objectId: req.params.id, objectType: 'user' });
+      }
       return { ...publicUser(c.svc.core.user(req.params.id)!), role: body.role ?? member.role };
     }, {
       summary: 'Update a teammate', tags: ['settings'], roles: ['admin'],
@@ -329,29 +417,95 @@ export default defineModule({
       }),
     });
 
+    /**
+     * Removing a teammate ends every credential they hold. It is not a hold.
+     *
+     * The live-membership check in `authenticate` refuses both doors the
+     * moment the membership row goes, which reads exactly like revocation —
+     * until the seat comes back. A different admin re-inviting the same
+     * address as `readonly`, believing they are creating a fresh minimal seat,
+     * revived the departed employee's laptop cookie and their never-revoked
+     * `['*']` CI key against it, and promoting that seat later handed the key
+     * `admin` again with `revoked_at` still NULL. So the sessions are deleted
+     * and the keys are revoked here, and the door check goes back to being
+     * defence in depth rather than the only defence.
+     */
     router.del('/v1/users/:id', (req: Req, c: Ctx) => {
-      const changed = c.db.run(`DELETE FROM memberships WHERE org_id = ? AND user_id = ?`, req.auth.orgId, req.params.id).changes;
-      if (!changed) throw notFound('user', req.params.id);
-      c.audit({ orgId: req.auth.orgId, actorId: req.auth.userId, actorType: 'user', action: 'user.removed', targetType: 'user', targetId: req.params.id, summary: 'Removed from workspace', requestId: req.requestId });
+      const member = c.db.get<{ role: Role }>(`SELECT role FROM memberships WHERE org_id = ? AND user_id = ?`, req.auth.orgId, req.params.id);
+      if (!member) throw notFound('user', req.params.id);
+      // Removing yourself is instantly unrecoverable now that a session is only
+      // as live as its membership — and through a key it is not even obvious
+      // that is what you are doing, so the principal is resolved either way.
+      if (req.params.id === principalOf(c, req.auth)) {
+        throw forbidden('You cannot remove your own membership — you would be signed out of this workspace with no way back in. Ask another admin to remove you.');
+      }
+      assertMayGrant(req, member.role);
+      assertKeepsAnAdmin(c, req.auth.orgId, req.params.id, null);
+
+      c.atomic(() => {
+        c.db.run(`DELETE FROM memberships WHERE org_id = ? AND user_id = ?`, req.auth.orgId, req.params.id);
+        const sessions = c.db.run(`DELETE FROM sessions WHERE org_id = ? AND user_id = ?`, req.auth.orgId, req.params.id).changes;
+        const keys = c.db.run(
+          `UPDATE api_keys SET revoked_at = ? WHERE org_id = ? AND created_by = ? AND revoked_at IS NULL`,
+          c.now(), req.auth.orgId, req.params.id,
+        ).changes;
+        c.audit({
+          orgId: req.auth.orgId, actorId: principalOf(c, req.auth), actorType: 'user', action: 'user.removed',
+          targetType: 'user', targetId: req.params.id,
+          summary: `Removed from workspace — ${sessions} ${sessions === 1 ? 'session' : 'sessions'} ended, ${keys} API ${keys === 1 ? 'key' : 'keys'} revoked`,
+          before: { role: member.role }, after: { sessions_ended: sessions, api_keys_revoked: keys },
+          requestId: req.requestId,
+        });
+        c.emit(req.auth.orgId, 'user.removed', {
+          id: req.params.id, role: member.role, sessions_ended: sessions, api_keys_revoked: keys,
+        }, { objectId: req.params.id, objectType: 'user' });
+      });
       return noContent();
-    }, { summary: 'Remove a teammate', tags: ['settings'], roles: ['admin'] });
+    }, { summary: 'Remove a teammate, ending their sessions and revoking their API keys', tags: ['settings'], roles: ['admin'] });
 
     /* ------------------------------ API keys ----------------------------- */
     router.get('/v1/api-keys', (req: Req, c: Ctx) =>
       list(c.db.all<any>(`SELECT * FROM api_keys WHERE org_id = ? ORDER BY created DESC`, req.auth.orgId).map(publicKey)),
       { summary: 'List API keys', tags: ['developers'], roles: ['admin'] });
 
+    /**
+     * A key inherits the principal and the reach of whatever minted it.
+     *
+     * `created_by` used to be `auth.userId`, which an API key has not got, so
+     * one ordinary call — mint a key, then mint a key *with* it — produced an
+     * unattributed credential, and `authenticate` has no membership to ask
+     * about a key with no author. `DELETE /v1/users/:id` was one API call away
+     * from meaning nothing: the departing admin's grandchild key kept
+     * answering `role: admin`, moved the workspace clock and seated a new
+     * owner. Authorship is transitive because authority is: every key
+     * descended from a human dies with that human's membership, and only a key
+     * with genuinely no person behind it — one a migration or a fixture puts
+     * there — stays a workspace credential whose kill switch is `revoked_at`.
+     *
+     * The scopes are bounded the same way. `keyRole` reads the ladder off what
+     * a key asked for, so a key that could mint a wider child than itself
+     * would be a promotion by another name.
+     */
     router.post('/v1/api-keys', (req: Req, c: Ctx) => {
       const body = req.body as { name: string; livemode: boolean; scopes: string[] };
+      const minter = req.auth.keyId
+        ? parseJson<string[]>(c.db.pluck<string>(`SELECT scopes FROM api_keys WHERE id = ? AND org_id = ?`, req.auth.keyId, req.auth.orgId) ?? '["*"]', ['*'])
+        : null;
+      if (minter && !minter.includes('*')) {
+        const wider = body.scopes.filter((scope) => !minter.includes(scope));
+        if (wider.length) {
+          throw forbidden(`This API key holds ${minter.join(', ')}, so it cannot mint a key with ${wider.join(', ')}. A key may never issue more reach than it has.`);
+        }
+      }
       const prefix = body.livemode ? 'sk_live' : 'sk_test';
       const secret = `${prefix}_${randomBytes(24).toString('base64url')}`;
       const row = {
         id: newId('apikey'), org_id: req.auth.orgId, name: body.name, prefix,
         token_hash: sha(secret), last4: secret.slice(-4), scopes: JSON.stringify(body.scopes),
-        livemode: body.livemode ? 1 : 0, created_by: req.auth.userId ?? null, created: c.now(), last_used: null, revoked_at: null,
+        livemode: body.livemode ? 1 : 0, created_by: principalOf(c, req.auth), created: c.now(), last_used: null, revoked_at: null,
       };
       c.db.insert('api_keys', row);
-      c.audit({ orgId: req.auth.orgId, actorId: req.auth.userId, actorType: 'user', action: 'api_key.created', targetType: 'api_key', targetId: row.id, summary: `Created API key "${body.name}"`, requestId: req.requestId });
+      c.audit({ orgId: req.auth.orgId, actorId: row.created_by, actorType: 'user', action: 'api_key.created', targetType: 'api_key', targetId: row.id, summary: `Created API key "${body.name}"`, requestId: req.requestId });
       return created({ ...publicKey(row), secret });
     }, {
       summary: 'Create an API key (the secret is returned exactly once)', tags: ['developers'], roles: ['admin'],
@@ -365,7 +519,7 @@ export default defineModule({
     router.del('/v1/api-keys/:id', (req: Req, c: Ctx) => {
       const changed = c.db.run(`UPDATE api_keys SET revoked_at = ? WHERE org_id = ? AND id = ? AND revoked_at IS NULL`, c.now(), req.auth.orgId, req.params.id).changes;
       if (!changed) throw notFound('api key', req.params.id);
-      c.audit({ orgId: req.auth.orgId, actorId: req.auth.userId, actorType: 'user', action: 'api_key.revoked', targetType: 'api_key', targetId: req.params.id, summary: 'Revoked API key', requestId: req.requestId });
+      c.audit({ orgId: req.auth.orgId, actorId: principalOf(c, req.auth), actorType: 'user', action: 'api_key.revoked', targetType: 'api_key', targetId: req.params.id, summary: 'Revoked API key', requestId: req.requestId });
       return noContent();
     }, { summary: 'Revoke an API key', tags: ['developers'], roles: ['admin'] });
 

@@ -485,12 +485,29 @@ export interface ResolvedRate {
   /** The country the decision was made against, for the explanation. */
   country: string | null;
   /**
-   * False when no country could be resolved at all — no address, an address
-   * with no country, a country that is not one. It is the difference between
-   * "deliberately zero-rated" and "we never learned where this customer is",
-   * and it is what `automatic_tax.status` on the invoice is decided from.
+   * False when the address could not be placed at all. It is the difference
+   * between "deliberately zero-rated" and "we never learned where this customer
+   * is", and it is what `automatic_tax.status` on the invoice is decided from.
    */
   location_known: boolean;
+  /**
+   * Which part of the address is still missing, when it could not be placed.
+   *
+   * `country` is the obvious half — no address, an address with no country, a
+   * country that is not one. `state` is the other half, and it looks like an
+   * answer until you read the register: a country that registers tax state by
+   * state has nothing to match a country-only address against, so the bill goes
+   * out short *saying* it is complete — while eight state rates are registered
+   * and the supplier carries every one of them. "US, no state" is not a figure
+   * anybody decided on; it is the same absence as "no country", one field over.
+   *
+   * It is decided by what the country has registered, not by whether this
+   * address came back empty. A country-wide rate stacked over the same states
+   * matches a state-less address and makes the answer non-empty without making
+   * it complete — 2% charged against a 7.75% liability is the same gap as 0%
+   * against 5.75%, and reads even more like an answer.
+   */
+  missing_location: 'country' | 'state' | null;
   /** Where the supplier is established, when the workspace has recorded it. */
   supplier_country: string | null;
   /**
@@ -534,12 +551,23 @@ export interface TaxSplit {
  */
 export class TaxRates {
   private readonly resolved = new Map<string, ResolvedRate>();
+  private readonly byCountry = new Map<string, TaxRate[]>();
   private supplier: string | null | undefined;
 
   constructor(private readonly ctx: Ctx, private readonly orgId: string) {}
 
   /* ------------------------------- the store ----------------------------- */
 
+  /**
+   * One page of the register, for a client that is listing it.
+   *
+   * This is an API listing and nothing else. It is bounded, because a response
+   * body is, and the engine must never read the register through it: a US
+   * workspace crosses 500 active rates in one country routinely — Texas alone
+   * has some 1,600 local jurisdictions — and the rows past the bound are not
+   * "the rest of the page", they are jurisdictions that go uncharged and
+   * duplicates that go unrefused. `activeRatesIn` is the engine's read.
+   */
   list(filter: { country?: string; active?: boolean; limit?: number } = {}): TaxRate[] {
     const clauses = ['org_id = ?'];
     const params: unknown[] = [this.orgId];
@@ -550,6 +578,78 @@ export class TaxRates {
         ORDER BY country ASC, state IS NULL DESC, state ASC, created ASC LIMIT ?`,
       ...(params as string[]), Math.min(Math.max(filter.limit ?? 100, 1), 500),
     ).map(hydrateTaxRate);
+  }
+
+  /** How many rates that filter really matches, page or no page. */
+  count(filter: { country?: string; active?: boolean } = {}): number {
+    const clauses = ['org_id = ?'];
+    const params: unknown[] = [this.orgId];
+    if (filter.country) { clauses.push('country = ?'); params.push(filter.country.toUpperCase()); }
+    if (filter.active !== undefined) { clauses.push('active = ?'); params.push(filter.active ? 1 : 0); }
+    return this.ctx.db.count(
+      `SELECT COUNT(*) FROM billing_tax_rates WHERE ${clauses.join(' AND ')}`, ...(params as string[]),
+    );
+  }
+
+  /**
+   * Every active rate registered over a country, in the order a bill charges
+   * them: country-wide first, then each state's, oldest registration first.
+   *
+   * Unbounded on purpose. This is the read both halves of the register's
+   * contract are decided from — which jurisdictions an address is in, and
+   * whether a jurisdiction is already registered — and a bound on it is not a
+   * smaller answer, it is a wrong one. Memoised per instance because an invoice
+   * asks the same country once per line.
+   */
+  private activeRatesIn(country: string): TaxRate[] {
+    const key = country.toUpperCase();
+    const cached = this.byCountry.get(key);
+    if (cached) return cached;
+    const rows = this.ctx.db.all<Record<string, unknown>>(
+      `SELECT * FROM billing_tax_rates WHERE org_id = ? AND country = ? AND active = 1
+        ORDER BY state IS NULL DESC, state ASC, created ASC`,
+      this.orgId, key,
+    ).map(hydrateTaxRate);
+    this.byCountry.set(key, rows);
+    return rows;
+  }
+
+  /**
+   * Whether an address that this rate would land on already has one naming the
+   * same jurisdiction — `ratesFor`'s matching rule read backwards.
+   *
+   * Two rates land on one address when either is registered country-wide or
+   * they name the same state. Folding case here, and only here, keeps the
+   * question identical to the one the engine asks: SQL's `LOWER` is ASCII-only
+   * and would read "Zürich" and "ZÜRICH" as two cities, which is the same
+   * double-charge wearing an umlaut.
+   */
+  private overlapping(
+    country: string, state: string | null, jurisdiction: string, exceptId?: string,
+  ): TaxRate | null {
+    const named = jurisdiction.trim().toLowerCase();
+    const scoped = state?.trim().toLowerCase() || null;
+    return this.activeRatesIn(country).find(
+      (rate) => rate.id !== exceptId
+        && rate.jurisdiction.trim().toLowerCase() === named
+        && (rate.state === null || scoped === null || rate.state.trim().toLowerCase() === scoped),
+    ) ?? null;
+  }
+
+  private clash(country: string, state: string | null, jurisdiction: string, exceptId?: string): void {
+    const found = this.overlapping(country, state, jurisdiction, exceptId);
+    if (!found) return;
+    const where = found.state ? `${country} / ${found.state}` : `${country}, country-wide`;
+    throw conflict(
+      'tax_rate_exists',
+      `${jurisdiction.trim()} already has an active rate (${found.id}, ${found.display_name} ${formatPercentage(found.percentage)}%) registered over ${where}, which covers ${state ? `${country} / ${state}` : `all of ${country}`}. Deactivate it before adding another, so one address can never be charged the same jurisdiction twice — a second, *different* jurisdiction over the same address is registered under its own name and stacks with this one.`,
+      { tax_rate: found.id },
+    );
+  }
+
+  private forget(): void {
+    this.resolved.clear();
+    this.byCountry.clear();
   }
 
   get(id: string): TaxRate | null {
@@ -589,24 +689,15 @@ export class TaxRates {
     // clash on the (country, state) tuple instead let New York be registered
     // once country-wide and once under its state, and every New York bill was
     // then charged New York twice — the exact double-charge this refusal
-    // exists to prevent, wearing the stack's clothes. Case is folded here for
-    // the same reason `ratesFor` folds it: "new york city" and "New York City"
-    // are one city, and a bill that charges both charges it twice.
+    // exists to prevent, wearing the stack's clothes.
+    //
+    // It reads the register through `activeRatesIn`, not through `list`. Asking
+    // the listing for a 500-row page and searching that is a refusal that stops
+    // firing the moment a US workspace registers its districts, and the second
+    // Texas rate it then accepts is charged twice on every Austin bill from the
+    // day the book drops back under the bound.
     const jurisdiction = input.jurisdiction.trim();
-    const named = jurisdiction.toLowerCase();
-    const scoped = state?.toLowerCase() ?? null;
-    const clash = this.list({ country, active: true, limit: 500 }).find(
-      (rate) => rate.jurisdiction.trim().toLowerCase() === named
-        && (rate.state === null || scoped === null || rate.state.trim().toLowerCase() === scoped),
-    );
-    if (clash) {
-      const where = clash.state ? `${country} / ${clash.state}` : `${country}, country-wide`;
-      throw conflict(
-        'tax_rate_exists',
-        `${jurisdiction} already has an active rate (${clash.id}, ${clash.display_name} ${formatPercentage(clash.percentage)}%) registered over ${where}, which covers ${state ? `${country} / ${state}` : `all of ${country}`}. Deactivate it before adding another, so one address can never be charged the same jurisdiction twice — a second, *different* jurisdiction over the same address is registered under its own name and stacks with this one.`,
-        { tax_rate: clash.id },
-      );
-    }
+    this.clash(country, state, jurisdiction);
     const id = newId('taxrate');
     this.ctx.db.insert('billing_tax_rates', {
       id,
@@ -624,22 +715,25 @@ export class TaxRates {
       created: at,
       updated: at,
     });
-    this.resolved.clear();
+    this.forget();
     return this.require(id);
   }
 
   /**
-   * Only ever called with `false` today, and the API exposes only that.
-   * Bringing a retired rate back is the one other way two active rates could
-   * come to name the same jurisdiction over one address, so whoever exposes it
-   * has to run `create`'s overlap check first — the refusal there is what keeps
-   * a New York bill from being charged New York twice, and a route that skips
-   * it hands the double-charge straight back.
+   * Retire a rate, or bring one back.
+   *
+   * Bringing one back is the other way two active rates could come to name the
+   * same jurisdiction over one address — register it while a duplicate sits
+   * retired, then reactivate the retired one — so it runs the same overlap
+   * refusal `create` runs, against the register the same way. Leaving that to
+   * whoever eventually exposed the route is how the double-charge gets handed
+   * back; the rule belongs to the transition, not to the caller.
    */
   setActive(id: string, active: boolean, at: number): TaxRate {
     const rate = this.require(id);
+    if (active && !rate.active) this.clash(rate.country, rate.state, rate.jurisdiction, rate.id);
     this.ctx.db.patch('billing_tax_rates', 'id', rate.id, { active: active ? 1 : 0, updated: at });
-    this.resolved.clear();
+    this.forget();
     return this.require(id);
   }
 
@@ -669,10 +763,42 @@ export class TaxRates {
       ?? null;
     const rates = country ? this.ratesFor(country, customer.address?.state ?? null) : [];
     const supplier = this.supplierCountry();
+    // An address is placed when the register could answer *about* it, not when
+    // a country happens to be on it. A country-only address in a country
+    // registered state by state has nothing to say which state's rate it owes,
+    // and the answer it gets is indistinguishable from "we are not registered
+    // here" — which is why every US account someone typed a country into used
+    // to bill at 0% and report `complete`. It is only an answer when the
+    // country registers nothing sub-nationally at all: "we do not collect in
+    // New Zealand" is true wherever in New Zealand the customer is, and so is
+    // "Germany charges 19%".
+    //
+    // The question is the shape of the *register*, not whether this address
+    // came back empty. Anchoring it to an empty answer holds only while the
+    // country registers state rates and nothing else: register one country-wide
+    // rate over the same eight states and every state-less US address matches
+    // that one, comes back non-empty, and goes out at 2% of a 7.75% liability
+    // reporting `complete` — the same under-charge as the 0% one, quieter,
+    // and with the queue that would have shown it saying nothing. What is
+    // missing is the state, whether or not something else matched.
+    const registered = country ? this.activeRatesIn(country) : [];
+    const stateless = !customer.address?.state?.trim();
+    const missing: 'country' | 'state' | null = country === null
+      ? 'country'
+      : stateless && registered.some((rate) => rate.state !== null)
+        ? 'state'
+        : null;
+    // Why the figure on the bill may be short of the liability, in a sentence,
+    // for the line to carry. A workspace that has turned the hold off sends
+    // this bill, so the document has to say what it could not work out.
+    const stateGap = missing === 'state'
+      ? `${country} tax is registered state by state and this address names no state, so Ain could not tell which of its jurisdictions the supply is in.`
+      : null;
     const base = {
       rate: rates[0] ?? null,
       country,
-      location_known: country !== null,
+      location_known: missing === null,
+      missing_location: missing,
       supplier_country: supplier,
       registration_note: null,
     };
@@ -680,10 +806,27 @@ export class TaxRates {
 
     if (customer.tax_exempt === 'exempt') return { ...base, entries: every('exempt'), reason: 'exempt' };
     if (customer.tax_exempt === 'reverse') return { ...base, entries: every('reverse_charge'), reason: 'reverse_charge' };
-    if (!rates.length) return { ...base, rate: null, entries: [], reason: 'no_rate' };
+    if (!rates.length) {
+      // The line still has to explain its own zero, and "no tax rate is
+      // registered for US" is not what happened — eight of them are. What
+      // happened is that the address cannot say which. Not on the two branches
+      // above it, because an exempt or reverse-charged account has its answer
+      // whatever the register says, and a sentence about states would be beside
+      // the point on it.
+      return {
+        ...base,
+        rate: null,
+        entries: [],
+        reason: 'no_rate',
+        registration_note: stateGap,
+      };
+    }
 
     const shiftable = rates.filter((rate) => rate.reverse_charge);
-    if (!shiftable.length) return { ...base, entries: every('taxable'), reason: 'taxable' };
+    // A country-wide rate that matched while the state is still missing charges
+    // what it charges and says what it could not charge. Silence here is how a
+    // bill that carries 2% of a 7.75% liability reads as a finished answer.
+    if (!shiftable.length) return { ...base, entries: every('taxable'), reason: 'taxable', registration_note: stateGap };
     const named = shiftable.map((rate) => rate.display_name).join(' and ');
 
     // Three things have to hold before the tax moves onto the customer, and
@@ -756,11 +899,18 @@ export class TaxRates {
    * *and* the city rate *and* the transit district's, and the customer owes
    * their sum. Returning only the most specific one undercharges by all the
    * others and hides them from the document that has to name them.
+   *
+   * An address matches what it matches, so this reads the whole register for
+   * the country rather than a page of it. Filtering a bounded page by state
+   * applies the bound *before* the question: the rows are ordered by state, so
+   * 500 Californian districts push Texas off the end and an Austin bill goes
+   * out at 0% claiming no Texas rate is registered — while it is, and active,
+   * and the supplier carries the liability for every bill in the state.
    */
   private ratesFor(country: string, state: string | null): TaxRate[] {
     const normalised = state?.trim().toLowerCase();
-    return this.list({ country, active: true, limit: 500 }).filter(
-      (rate) => rate.state === null || (!!normalised && rate.state.toLowerCase() === normalised),
+    return this.activeRatesIn(country).filter(
+      (rate) => rate.state === null || (!!normalised && rate.state.trim().toLowerCase() === normalised),
     );
   }
 
@@ -849,10 +999,14 @@ export class TaxRates {
         return label
           ? `${label} would apply, but this account is registered as exempt.`
           : 'This account is registered as tax exempt, so nothing is charged.';
-      case 'no_rate':
+      case 'no_rate': {
+        // A zero for want of a *state* is not a zero for want of a rate, and
+        // the sentence that says so travels on the resolution's note.
+        if (note) return note;
         return jurisdictionFallback
           ? `No tax rate is registered for ${jurisdictionFallback}, so nothing is charged.`
           : 'No tax rate is registered for this address, so nothing is charged.';
+      }
       case 'taxable':
       default: {
         if (!label) return null;

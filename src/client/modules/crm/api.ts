@@ -462,6 +462,14 @@ export const createObjectType = (input: {
   name: string; label: string; plural_label: string; description?: string; icon?: string; color?: string; primary_property?: string;
 }) => api.post<ObjectTypeDef>('/v1/objects', input);
 
+export const updateObjectType = (name: string, patch: {
+  label?: string; plural_label?: string; description?: string; icon?: string; color?: string;
+  primary_property?: string; secondary_property?: string; searchable?: string[];
+}) => api.patch<ObjectTypeDef>(`/v1/objects/${name}`, patch);
+
+/** Refused by the server while any record of the type still exists. */
+export const deleteObjectType = (name: string) => api.del<void>(`/v1/objects/${name}`);
+
 export interface PropertyInput {
   name: string;
   label: string;

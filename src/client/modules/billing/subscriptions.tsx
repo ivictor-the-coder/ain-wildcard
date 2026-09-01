@@ -22,15 +22,43 @@ import {
 } from '../../design';
 import { AlertTriangleIcon, ArrowDownIcon, ArrowRightIcon, ArrowUpIcon, ArrowUpRightIcon, XCircleIcon } from '../../design';
 import {
-  Amount, EmptyList, FieldRow, InlineEdit, ListFailure, ListFooter, LoadFailedEmpty, Loading, MoneyField, MoneyTotals,
-  PreviewFailure, RecordLink, SectionError, StatusPill, TableSearch, customerHref, idem, invoiceHref, moneyRank,
-  breakdownLabel, prorationCopy, statusLabel, subscriptionHref, lineWhy, totalsByCurrency, useAction,
-  useBillingFormat, useCursorList, useDebounced, useOpenOnQuery, usePricedPreview, useRecordTab, useTableView,
+  Amount, BookFooter, DialogFields, EmptyList, ExportCsvButton, FieldRow, FixedQuantity, InlineEdit, ListFailure, ListFooter,
+  LoadFailedEmpty, Loading, MoneyField, MoneyRangeFilter, MoneyTotals, PreviewFailure, QuantityField, RecordLink,
+  RecordMissing, SectionError, StatusPill, TableSearch, breakdownLabel, customerHref, decodeRange, encodeRange, idem,
+  invoiceHref, lineWhy, matchesRange, moneyRank, prorationCopy, rangeActive, statusLabel, subscriptionHref,
+  csvAmount, csvDay, totalsByCurrency, useAction, useBillingFormat, useBookList, useBookTotal, useCurrencyChoices, useDebounced,
+  useDialogForm,
+  useOpenOnQuery, usePricedPreview, useRecord, useRecordTab, useTableView, visibleRows,
 } from './common';
+import type { CsvColumn } from './common';
 import type {
   BilledPeriod, CatalogEstimate, ChangePreview, Customer, CustomUnitAmount, EstimateLine, Invoice,
-  PauseBehavior, Price, ProrationLine, Subscription, SubscriptionSchedule,
+  InvoiceLine, PauseBehavior, Price, ProrationLine, Subscription, SubscriptionItem, SubscriptionSchedule,
 } from './types';
+import { ScheduleBanner, ScheduleChangeDialog, ScheduleTab } from './schedules';
+
+/**
+ * The recurring book as a file: what each agreement bills, on what cadence, and
+ * where its period sits. MRR excludes paused agreements exactly as the screen
+ * does, and the recurring fee is beside it so the two are never confused.
+ */
+const SUBSCRIPTION_CSV: CsvColumn<Subscription>[] = [
+  { header: 'Account', value: (row) => row.customer_detail?.name ?? row.customer },
+  { header: 'Status', value: (row) => statusLabel(row.status) },
+  { header: 'Currency', value: (row) => row.currency.toUpperCase() },
+  { header: 'MRR', value: (row) => csvAmount(row.mrr, row.currency) },
+  { header: 'Recurring fee', value: (row) => csvAmount(row.recurring_subtotal, row.currency) },
+  { header: 'Billed', value: (row) => row.interval_display },
+  { header: 'Items', value: (row) => row.items.length },
+  { header: 'Collection', value: (row) => humanize(row.collection_method) },
+  { header: 'Period start', value: (row) => csvDay(row.current_period_start) },
+  { header: 'Period end', value: (row) => csvDay(row.current_period_end) },
+  { header: 'Started', value: (row) => csvDay(row.start_date) },
+  { header: 'Trial ends', value: (row) => csvDay(row.trial_end) },
+  { header: 'Cancels at', value: (row) => csvDay(row.cancel_at) },
+  { header: 'Customer id', value: (row) => row.customer },
+  { header: 'Subscription id', value: (row) => row.id },
+];
 
 /* ------------------------------- shared data ----------------------------- */
 
@@ -38,6 +66,14 @@ export function useActivePrices(): { prices: Price[]; loading: boolean } {
   const { data, loading } = useQuery<ListEnvelope<Price>>('/v1/prices', { active: true, limit: 200 });
   return { prices: data?.data ?? [], loading };
 }
+
+/**
+ * A price with no per-unit component sells one of itself. Handing it a spinner
+ * invites an operator to buy two platform fees, which is not a thing, and the
+ * server refuses it after the fact rather than the screen refusing it before.
+ */
+const flatPrice = (price: Price | undefined): boolean =>
+  !!price && price.model === 'flat' && price.recurring?.usage_type !== 'metered';
 
 const priceLabel = (price: Price): string =>
   `${price.product_name}${price.nickname ? ` — ${price.nickname}` : ''}`;
@@ -253,6 +289,59 @@ function LineGroup({ title, lines, currency }: { title: string; lines: Proration
 }
 
 /**
+ * A line on the bill that has not been raised yet.
+ *
+ * Same rule as the invoice's own lines and the change preview's: the sentence
+ * that reconstructs the number stays on the line, and the unreduced rational it
+ * carries — `2591921671/2592000000 ms` — goes behind a disclosure. It was
+ * printing inline here alone, which is how the one surface that shows a real
+ * customer-facing line ended up reading like a stack trace.
+ */
+function UpcomingLineRow({ line }: { line: InvoiceLine }) {
+  const f = useBillingFormat();
+  const [open, setOpen] = useState(false);
+  const why = prorationCopy(line.explanation, line.proration_fraction);
+  return (
+    <>
+      <tr className={line.amount < 0 ? 'bl-lines__row--credit' : undefined}>
+        <td>
+          <div>{line.description}</div>
+          {lineWhy(line.description, why.sentence) && (
+            <div className="bl-lines__why">{why.sentence}</div>
+          )}
+          {why.exact && (
+            <button type="button" className="bl-lines__toggle" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+              {open ? <ArrowUpIcon size={12} /> : <ArrowDownIcon size={12} />}
+              {open ? 'Hide the arithmetic' : 'Show the arithmetic'}
+            </button>
+          )}
+        </td>
+        <td className="bl-nowrap">{f.dayRange(line.period.start, line.period.end)}</td>
+        <td>{f.number(line.quantity)}</td>
+        <td className="bl-num">{line.amount_display}</td>
+      </tr>
+      {open && why.exact && (
+        <tr>
+          <td colSpan={4}>
+            <div className="bl-lines__why">
+              {'Prorated by '}
+              <span className="bl-fraction">
+                {f.number(why.exact.numerator)} / {f.number(why.exact.denominator)} ms
+              </span>
+              {' of the interval'}
+              {why.exact.reduced
+                ? `, or ${f.number(why.exact.reduced.numerator)} / ${f.number(why.exact.reduced.denominator)} in lowest terms.`
+                : '.'}
+              {' That exact rational is multiplied into the price and rounded once — never a float.'}
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+/**
  * One priced credit or charge.
  *
  * The server's explanation carries both the human sentence and the exact
@@ -360,6 +449,7 @@ export function ChangeDialog({ sub, open, onClose }: { sub: Subscription; open: 
   const [pending, setPending] = useState(false);
   const [previewError, setPreviewError] = useState<ApiClientError | null>(null);
   const seq = useRef(0);
+  const priceById = useMemo(() => new Map(prices.map((price) => [price.id, price])), [prices]);
 
     // Keyed on the id, not the object: an invalidation elsewhere re-reads the
   // subscription, and resetting the operator's half-made change on that is how
@@ -417,6 +507,8 @@ export function ChangeDialog({ sub, open, onClose }: { sub: Subscription; open: 
     if (result) onClose();
   };
 
+  const form = useDialogForm(open, dirty && !!preview && !pending && !action.busy, () => { void apply(); });
+
   return (
     <Modal
       open={open}
@@ -440,6 +532,7 @@ export function ChangeDialog({ sub, open, onClose }: { sub: Subscription; open: 
         </>
       }
     >
+      <DialogFields form={form}>
       <Stack gap={6}>
         <Section title="Items" description="Swap a price to move plan; change a quantity to add or drop seats.">
           <div className="bl-items">
@@ -452,15 +545,24 @@ export function ChangeDialog({ sub, open, onClose }: { sub: Subscription; open: 
                   options={priceOptions.length ? priceOptions : [{ value: item.price, label: item.price }]}
                   onChange={(price) => setDraft((rows) => rows.map((row) => (row.key === item.key ? { ...row, price } : row)))}
                 />
-                <NumberInput
-                  aria-label={`Quantity for item ${index + 1}`}
-                  value={item.quantity}
-                  min={0}
-                  max={1000000}
-                  invalid={offending === item.key}
-                  disabled={item.deleted || item.metered}
-                  onChange={(quantity) => setDraft((rows) => rows.map((row) => (row.key === item.key ? { ...row, quantity: quantity ?? 0 } : row)))}
-                />
+                {item.metered || flatPrice(priceById.get(item.price))
+                  ? (
+                    <FixedQuantity
+                      label={`Quantity for item ${index + 1}`}
+                      why={item.metered
+                        ? 'Counted from recorded usage when the period closes.'
+                        : 'A flat fee sells one of itself, whatever the plan is counted in.'}
+                    />
+                  )
+                  : (
+                    <QuantityField
+                      label={`Quantity for item ${index + 1}`}
+                      value={item.quantity}
+                      min={0}
+                      disabled={item.deleted}
+                      onChange={(quantity) => setDraft((rows) => rows.map((row) => (row.key === item.key ? { ...row, quantity } : row)))}
+                    />
+                  )}
                 <Tooltip content={item.deleted ? 'Keep this item' : 'Remove this item'}>
                   <Button
                     variant="ghost"
@@ -549,6 +651,7 @@ export function ChangeDialog({ sub, open, onClose }: { sub: Subscription; open: 
           />
         )}
       </Stack>
+      </DialogFields>
     </Modal>
   );
 }
@@ -594,6 +697,8 @@ function CancelDialog({ sub, open, onClose }: { sub: Subscription; open: boolean
     if (result) onClose();
   };
 
+  const form = useDialogForm(open, !action.busy, () => { void submit(); });
+
   return (
     <Modal
       open={open}
@@ -610,6 +715,7 @@ function CancelDialog({ sub, open, onClose }: { sub: Subscription; open: boolean
         </>
       }
     >
+      <DialogFields form={form}>
       <Stack gap={5}>
         <Field label="When">
           <Select
@@ -648,6 +754,7 @@ function CancelDialog({ sub, open, onClose }: { sub: Subscription; open: boolean
           />
         </Field>
       </Stack>
+      </DialogFields>
     </Modal>
   );
 }
@@ -670,6 +777,8 @@ function PauseDialog({ sub, open, onClose }: { sub: Subscription; open: boolean;
     if (result) onClose();
   };
 
+  const form = useDialogForm(open, !action.busy, () => { void submit(); });
+
   return (
     <Modal
       open={open}
@@ -683,6 +792,7 @@ function PauseDialog({ sub, open, onClose }: { sub: Subscription; open: boolean;
         </>
       }
     >
+      <DialogFields form={form}>
       <Stack gap={5}>
         <Field label="What happens to invoices raised while paused">
           <Select
@@ -699,6 +809,7 @@ function PauseDialog({ sub, open, onClose }: { sub: Subscription; open: boolean;
           <DatePicker value={resumesAt} onChange={setResumesAt} min={session.now()} aria-label="Resume on" />
         </Field>
       </Stack>
+      </DialogFields>
     </Modal>
   );
 }
@@ -714,6 +825,8 @@ function ResumeDialog({ sub, open, onClose }: { sub: Subscription; open: boolean
     );
     if (result) onClose();
   };
+  const form = useDialogForm(open, !action.busy, () => { void submit(); });
+
   return (
     <Modal
       open={open}
@@ -726,16 +839,18 @@ function ResumeDialog({ sub, open, onClose }: { sub: Subscription; open: boolean
         </>
       }
     >
-      <Field label="Billing cycle">
-        <Select
-          value={anchor}
-          onChange={(value) => setAnchor(value as 'unchanged' | 'now')}
-          options={[
-            { value: 'unchanged', label: 'Pick the old cycle back up' },
-            { value: 'now', label: 'Restart the cycle from today' },
-          ]}
-        />
-      </Field>
+      <DialogFields form={form}>
+        <Field label="Billing cycle">
+          <Select
+            value={anchor}
+            onChange={(value) => setAnchor(value as 'unchanged' | 'now')}
+            options={[
+              { value: 'unchanged', label: 'Pick the old cycle back up' },
+              { value: 'now', label: 'Restart the cycle from today' },
+            ]}
+          />
+        </Field>
+      </DialogFields>
     </Modal>
   );
 }
@@ -749,16 +864,22 @@ function ResumeDialog({ sub, open, onClose }: { sub: Subscription; open: boolean
  * it, which opens the prepaid-credit dialog, a different mechanism whose own
  * copy takes pains to say it "is not a balance adjustment".
  */
-export function CreditDialog({ customer, currency, open, onClose, subscription }: {
+export function CreditDialog({ customer, currency, open, onClose, subscription, initialDirection = 'credit', title, description: intro }: {
   customer: string; currency: string; open: boolean; onClose: () => void; subscription?: string;
+  /** Opens on the charge side for the one-off billing flow. */
+  initialDirection?: 'credit' | 'debit';
+  title?: string;
+  description?: string;
 }) {
   const f = useBillingFormat();
   const action = useAction();
   const [amount, setAmount] = useState<number | null>(null);
-  const [direction, setDirection] = useState<'credit' | 'debit'>('credit');
+  const [direction, setDirection] = useState<'credit' | 'debit'>(initialDirection);
   const [description, setDescription] = useState('');
 
-  useEffect(() => { if (open) { setAmount(null); setDescription(''); action.clear(); } }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (open) { setAmount(null); setDescription(''); setDirection(initialDirection); action.clear(); }
+  }, [open, initialDirection]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const submit = async () => {
     const result = await action.run(
@@ -778,12 +899,15 @@ export function CreditDialog({ customer, currency, open, onClose, subscription }
     if (result) onClose();
   };
 
+  const form = useDialogForm(open, !!amount && description.trim().length >= 3 && !action.busy, () => { void submit(); });
+
   return (
     <Modal
       open={open}
       onClose={onClose}
-      title="Adjust the account balance"
-      description="This is how a discount is given here: the balance moves, and the next invoice draws it down. It is not prepaid credit — that is a pot bought up front, granted from Payment & credit."
+      title={title ?? 'Adjust the account balance'}
+      description={intro
+        ?? 'This is how a discount is given here: the balance moves, and the next invoice draws it down. It is not prepaid credit — that is a pot bought up front, granted from Payment & credit.'}
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
@@ -793,11 +917,16 @@ export function CreditDialog({ customer, currency, open, onClose, subscription }
             disabled={!amount || description.trim().length < 3}
             onClick={() => { void submit(); }}
           >
-            Apply the adjustment
+            {amount
+              ? direction === 'credit'
+                ? `Credit ${f.money(amount, { currency })}`
+                : `Charge ${f.money(amount, { currency })}`
+              : 'Apply the adjustment'}
           </Button>
         </>
       }
     >
+      <DialogFields form={form}>
       <Stack gap={5}>
         <Field label="Direction">
           <Select
@@ -827,6 +956,7 @@ export function CreditDialog({ customer, currency, open, onClose, subscription }
           />
         </Field>
       </Stack>
+      </DialogFields>
     </Modal>
   );
 }
@@ -1039,6 +1169,8 @@ export function SubscriptionCreateDialog({ open, onClose, customer }: {
     if (created) { onClose(); navigate(subscriptionHref(created.id)); }
   };
 
+  const form = useDialogForm(open, ready && !action.busy, () => { void submit(); });
+
   return (
     <Modal
       open={open}
@@ -1049,14 +1181,20 @@ export function SubscriptionCreateDialog({ open, onClose, customer }: {
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
+          {/* The label carries a price, so it must never carry a stale one:
+              while the basket is being re-priced it says so instead of quoting
+              the figure the last quantity produced. */}
           <Button variant="primary" loading={action.busy} disabled={!ready} onClick={() => { void submit(); }}>
-            {ready && recurring
-              ? `Create · ${f.money(perPeriod, { currency })}${cadenceWord ? ` per ${cadenceWord}` : ''}`
-              : 'Create subscription'}
+            {estimate.loading && basket.length > 0
+              ? 'Pricing…'
+              : ready && recurring
+                ? `Create · ${f.money(perPeriod, { currency })}${cadenceWord ? ` per ${cadenceWord}` : ''}`
+                : 'Create subscription'}
           </Button>
         </>
       }
     >
+      <DialogFields form={form}>
       <Stack gap={6}>
         <Field
           label="Customer"
@@ -1092,13 +1230,23 @@ export function SubscriptionCreateDialog({ open, onClose, customer }: {
                         ? { ...r, price: next, quantity: 1, custom: presetFor(priceById.get(next), currency) }
                         : r)))}
                     />
-                    <NumberInput
-                      aria-label={`Quantity ${index + 1}`}
-                      value={metered ? 1 : row.quantity}
-                      min={1}
-                      disabled={metered}
-                      onChange={(quantity) => setRows((all) => all.map((r) => (r.key === row.key ? { ...r, quantity: quantity ?? 1 } : r)))}
-                    />
+                    {metered || flatPrice(price)
+                      ? (
+                        <FixedQuantity
+                          label={`Quantity ${index + 1}`}
+                          why={metered
+                            ? 'Counted from recorded usage when the period closes.'
+                            : 'A flat fee sells one of itself, whatever the plan is counted in.'}
+                        />
+                      )
+                      : (
+                        <QuantityField
+                          label={`Quantity ${index + 1}`}
+                          value={row.quantity}
+                          min={1}
+                          onChange={(quantity) => setRows((all) => all.map((r) => (r.key === row.key ? { ...r, quantity } : r)))}
+                        />
+                      )}
                     <Button
                       variant="ghost"
                       size="sm"
@@ -1214,6 +1362,7 @@ export function SubscriptionCreateDialog({ open, onClose, customer }: {
         {customerId && !refusal && estimate.data && (
           <NewSubscriptionPrice
             estimate={estimate.data}
+            pending={estimate.loading}
             currency={currency}
             cadence={cadenceWord}
             trialDays={trialDays}
@@ -1222,6 +1371,7 @@ export function SubscriptionCreateDialog({ open, onClose, customer }: {
           />
         )}
       </Stack>
+      </DialogFields>
     </Modal>
   );
 }
@@ -1231,8 +1381,10 @@ export function SubscriptionCreateDialog({ open, onClose, customer }: {
  * period costs, what recurring revenue it adds, and — the question the old
  * dialog could not answer — what gets invoiced the moment Create is pressed.
  */
-function NewSubscriptionPrice({ estimate, currency, cadence, trialDays, anchorDay, account }: {
+function NewSubscriptionPrice({ estimate, pending, currency, cadence, trialDays, anchorDay, account }: {
   estimate: CatalogEstimate;
+  /** A newer basket is being priced; what is on screen is the previous answer. */
+  pending: boolean;
   currency: string;
   cadence: string;
   trialDays: number | null;
@@ -1244,7 +1396,8 @@ function NewSubscriptionPrice({ estimate, currency, cadence, trialDays, anchorDa
   const perPeriod = estimate.recurring.month + estimate.recurring.year + estimate.recurring.week + estimate.recurring.day;
 
   return (
-    <div className="bl-preview">
+    <div className={pending ? 'bl-preview is-pending' : 'bl-preview'} aria-busy={pending}>
+      {pending && <div className="bl-preview__pending" role="status">Re-pricing this basket…</div>}
       {estimate.warnings.map((warning) => (
         <Banner key={warning.price} tone="warning" compact>{warning.message}</Banner>
       ))}
@@ -1339,6 +1492,8 @@ const STATUS_FILTERS = [
   { value: 'canceled', label: 'Canceled' },
 ];
 
+const currencyOfRow = (row: { currency: string }): string => row.currency;
+
 export function SubscriptionsPage() {
   const f = useBillingFormat();
   const navigate = useNavigate();
@@ -1351,13 +1506,16 @@ export function SubscriptionsPage() {
   const [creating, setCreating] = useState(false);
   useOpenOnQuery('new', useCallback(() => setCreating(true), []));
 
+  const [rangeParam, setRangeParam] = useSearchParam('amount', '');
   const search = useDebounced(view.query.trim(), 250);
-  const list = useCursorList<Subscription>('/v1/subscriptions', {
+  const book = useBookList<Subscription>('/v1/subscriptions', useMemo(() => ({
     status,
     expand: 'customer',
     ...(search ? { query: search } : {}),
     ...(collection ? { collection_method: collection } : {}),
-  }, 100);
+  }), [status, search, collection]));
+  const { currencies, preferred } = useCurrencyChoices(book.rows, currencyOfRow, f.currency);
+  const range = useMemo(() => decodeRange(rangeParam, preferred), [rangeParam, preferred]);
 
   const columns: DataTableColumn<Subscription>[] = useMemo(() => [
     {
@@ -1413,23 +1571,10 @@ export function SubscriptionsPage() {
       // Ranked inside the currency it bills in. Comparing minor units across
       // three books converts at 1:1 and calls the result an order: GBP 2,285 is
       // roughly $2,900 and used to sit below $2,356 in this very column.
-      headerTitle: 'Ranked inside each currency — nothing is converted, because there is no exchange-rate table in this platform.',
+      headerTitle: 'MRR',
       accessor: (row) => moneyRank(row.mrr, row.currency),
       cell: (row) => <Amount value={row.mrr} display={f.money(row.mrr, { currency: row.currency })} tone="plain" />,
       total: (rows) => <MoneyTotals totals={totalsByCurrency(rows, (r) => r.mrr, (r) => r.currency)} />,
-    },
-    {
-      id: 'mrr_amount',
-      header: 'MRR amount',
-      headerTitle: 'MRR amount — a filter, not a column',
-      filterLabel: 'MRR amount',
-      filter: 'number',
-      align: 'right',
-      width: 120,
-      defaultHidden: true,
-      hideable: false,
-      unsearchable: true,
-      accessor: (row) => row.mrr,
     },
     {
       id: 'period',
@@ -1476,13 +1621,24 @@ export function SubscriptionsPage() {
     },
   ], [f]);
 
+  const rows = useMemo(() => (rangeActive(range)
+    ? book.rows.filter((row) => matchesRange(row.mrr, row.currency, range))
+    : book.rows), [book.rows, range]);
+  // The unnarrowed book. The default view is already narrowed — "Everything
+  // live" is `status=active_like` — so measuring against `book.total` had the
+  // list calling 36 of 41 subscriptions "the whole book" before anyone touched
+  // a filter.
+  const whole = useBookTotal('/v1/subscriptions', { status: 'all' });
+  const visible = useMemo(() => visibleRows(rows, columns, view), [rows, columns, view]);
+  const shown = visible.length;
+
   const bulk = async (label: string, path: (id: string) => string, body: unknown) => {
     const ids = [...selected];
     let ok = 0;
     for (const id of ids) {
       try { await api.post(path(id), body); ok++; } catch { /* counted below */ }
     }
-    list.retry();
+    book.retry();
     setSelected([]);
     if (ok === ids.length) toast.success(`${label} ${ok} ${ok === 1 ? 'subscription' : 'subscriptions'}`);
     else toast.warning(`${label} ${ok} of ${ids.length}`, 'The rest were refused — open them to see why.', { duration: 0 });
@@ -1504,15 +1660,16 @@ export function SubscriptionsPage() {
         </Inline>
       }
     >
-      {list.error && <ListFailure error={list.error} path="GET /v1/subscriptions" onRetry={list.retry} />}
+      {book.error && <ListFailure error={book.error} path="GET /v1/subscriptions" onRetry={book.retry} />}
+      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'}>
       <DataTable
-        rows={list.rows}
+        rows={rows}
         columns={columns}
         getRowId={(row) => row.id}
         caption="Subscriptions"
-        loading={list.loading}
+        loading={book.loading}
         error={null}
-        onRetry={list.retry}
+        onRetry={book.retry}
         value={view}
         onChange={setView}
         initialSort={{ columnId: 'mrr', direction: 'desc' }}
@@ -1546,6 +1703,21 @@ export function SubscriptionsPage() {
                 { value: 'send_invoice', label: 'Invoiced' },
               ]}
             />
+            <MoneyRangeFilter
+              value={range}
+              onChange={(next) => { setRangeParam(encodeRange(next) || undefined); setSelected([]); }}
+              fields={[{ value: 'mrr', label: 'MRR' }]}
+              currencies={currencies}
+              defaultCurrency={preferred}
+            />
+            <ExportCsvButton
+              rows={visible}
+              columns={SUBSCRIPTION_CSV}
+              name="subscriptions"
+              noun="subscriptions"
+              disabled={!book.complete}
+              reason={book.complete ? undefined : 'Still reading the book — the file would hold fewer rows than the screen.'}
+            />
           </Inline>
         }
         bulkActions={(ids) => (
@@ -1561,7 +1733,7 @@ export function SubscriptionsPage() {
             </Button>
           </Inline>
         )}
-        empty={list.error
+        empty={book.error
           ? <LoadFailedEmpty noun="subscriptions" />
           : (
             <EmptyList
@@ -1570,8 +1742,13 @@ export function SubscriptionsPage() {
               action={<Button variant="primary" iconLeft={<Icons.plus size={15} />} onClick={() => setCreating(true)}>New subscription</Button>}
             />
           )}
-        footer={<ListFooter list={list} noun="subscriptions" />}
+        footer={<BookFooter book={book} noun="subscriptions" shown={shown} whole={whole} />}
       />
+      </div>
+      <p className="bl-gridnote">
+        MRR is ranked and totalled inside each currency. There is no exchange-rate table in this platform, so
+        nothing here is converted and no figure is added across two books.
+      </p>
       <SubscriptionCreateDialog open={creating} onClose={() => setCreating(false)} />
     </Page>
   );
@@ -1625,19 +1802,22 @@ export function SubscriptionDetailPage() {
   const navigate = useNavigate();
   const action = useAction();
   const [rawTab, setTab] = useRecordTab(SUBSCRIPTION_TABS, 'overview');
-  const [dialog, setDialog] = useState<null | 'change' | 'cancel' | 'pause' | 'resume' | 'credit'>(null);
+  const [dialog, setDialog] = useState<null | 'change' | 'cancel' | 'pause' | 'resume' | 'credit' | 'schedule'>(null);
 
-  const { data: sub, error, loading, refetch } = useQuery<Subscription>(`/v1/subscriptions/${id}`, { expand: 'customer' });
+  const { data: sub, error, loading, refetch } = useRecord<Subscription>(`/v1/subscriptions/${id}`, { expand: 'customer' });
 
   if (loading) return <Page title="Subscription"><Loading label="Loading this subscription…" /></Page>;
   if (error || !sub) {
     return (
       <Page title="Subscription" eyebrow="Revenue">
         <Card>
-          <SectionError
-            error={error ?? ({ status: 404, body: { message: 'No subscription came back.' } } as ApiClientError)}
+          <RecordMissing
+            error={error ?? ({ status: 404, body: { message: `No subscription with the id ${id}.` } } as ApiClientError)}
             path={`GET /v1/subscriptions/${id}`}
             onRetry={refetch}
+            noun="subscription"
+            backTo="/billing/subscriptions"
+            backLabel="Back to subscriptions"
           />
         </Card>
       </Page>
@@ -1672,10 +1852,28 @@ export function SubscriptionDetailPage() {
       ],
     },
     {
+      id: 'schedule',
+      label: 'Agreement',
+      items: sub.schedule
+        ? [{
+          id: 'schedule-open',
+          label: 'Open the schedule',
+          icon: <Icons.calendar size={14} />,
+          onSelect: () => setTab('schedule'),
+        }]
+        : [{
+          id: 'schedule-new',
+          label: 'Schedule a change…',
+          icon: <Icons.calendar size={14} />,
+          disabled: sub.status === 'canceled',
+          onSelect: () => setDialog('schedule'),
+        }],
+    },
+    {
       id: 'money',
       label: 'Money',
       items: [
-        { id: 'credit', label: 'Adjust the account balance…', icon: <Icons.percent size={14} />, onSelect: () => setDialog('credit') },
+        { id: 'credit', label: 'Discount or credit the account…', icon: <Icons.percent size={14} />, onSelect: () => setDialog('credit') },
         {
           id: 'invoice',
           label: 'Bill what is owed now',
@@ -1733,8 +1931,22 @@ export function SubscriptionDetailPage() {
       <Stack gap={6}>
         <Card>
           <div className="bl-headline">
-            <Headline label="MRR" value={money(sub.mrr)} caption={`${money(sub.recurring_subtotal)} per ${sub.interval_display}`} />
-            <Headline label="Current period" value={f.dayRange(sub.current_period_start, sub.current_period_end)} caption={sub.status_detail} />
+            {/* MRR excludes a paused or cancelled agreement; the recurring fee
+                is unchanged. Both are true, and a tile that prints $0.00 over
+                $570.00 with no word between them reads as a contradiction —
+                so when they disagree, the caption says why. */}
+            <Headline
+              label="MRR"
+              value={money(sub.mrr)}
+              caption={sub.mrr === 0 && sub.recurring_subtotal > 0
+                ? `${sub.pause_collection ? 'Excluded while collection is paused' : 'Excluded — this agreement is no longer billing'} · the fee is still ${money(sub.recurring_subtotal)} per ${sub.interval_display}`
+                : `${money(sub.recurring_subtotal)} per ${sub.interval_display}`}
+            />
+            <Headline
+              label="Current period"
+              value={f.dayRange(sub.current_period_start, sub.current_period_end)}
+              caption={statusCaption(sub, f)}
+            />
             <Headline
               label={sub.cancel_at_period_end ? 'Ends' : 'Next invoice'}
               value={f.day(sub.current_period_end)}
@@ -1754,6 +1966,8 @@ export function SubscriptionDetailPage() {
             {sub.cancellation_comment ?? 'No note was recorded with the cancellation.'}
           </Banner>
         )}
+        {sub.schedule && <ScheduleBanner sub={sub} onOpen={() => setTab('schedule')} />}
+
         {sub.pause_collection && (
           <Banner tone="warning" title="Collection is paused">
             {`Invoices raised while paused are ${PAUSE_BEHAVIOR_COPY[sub.pause_collection.behavior]}. `}
@@ -1767,10 +1981,11 @@ export function SubscriptionDetailPage() {
         {tab === 'overview' && <OverviewTab sub={sub} onChange={() => setDialog('change')} onPatch={patch} />}
         {tab === 'upcoming' && <UpcomingTab sub={sub} />}
         {tab === 'periods' && <PeriodsTab sub={sub} />}
-        {tab === 'schedule' && sub.schedule && <ScheduleTab scheduleId={sub.schedule} />}
+        {tab === 'schedule' && sub.schedule && <ScheduleTab scheduleId={sub.schedule} subscription={sub} />}
       </Stack>
 
       <ChangeDialog sub={sub} open={dialog === 'change'} onClose={() => setDialog(null)} />
+      <ScheduleChangeDialog sub={sub} open={dialog === 'schedule'} onClose={() => setDialog(null)} />
       <CancelDialog sub={sub} open={dialog === 'cancel'} onClose={() => setDialog(null)} />
       <PauseDialog sub={sub} open={dialog === 'pause'} onClose={() => setDialog(null)} />
       <ResumeDialog sub={sub} open={dialog === 'resume'} onClose={() => setDialog(null)} />
@@ -1814,10 +2029,41 @@ export function ActionMenu({ sections, label = 'More actions' }: { sections: Men
   );
 }
 
+/**
+ * One naming scheme for a subscription's items.
+ *
+ * The server's `description` is written per line kind: a plan line reads
+ * "Telemetry Cloud Growth" and a seat line reads "5 × Growth operator seat —
+ * monthly", so the same table named one row after its product and the next
+ * after its nickname, and repeated in prose the quantity the Qty column
+ * already carries. The catalogue holds both halves, so both rows get the
+ * product on the first line and the price's nickname on the second.
+ */
+/**
+ * What a subscription's cycle is doing, in the same words as the tile beside
+ * it. The server's `status_detail` describes the *status* — a subscription set
+ * to cancel is still `active`, so it kept saying "Billing normally on its
+ * cycle" underneath a tile reading "Set to cancel at the period end".
+ */
+function statusCaption(sub: Subscription, f: ReturnType<typeof useBillingFormat>): string {
+  if (sub.cancel_at_period_end) return `The last period — it stops on ${f.day(sub.current_period_end)}.`;
+  if (sub.pause_collection) return 'The cycle runs; collection on it is paused.';
+  return sub.status_detail;
+}
+
+const stripQuantity = (description: string): string => description.replace(/^\s*[\d,.]+\s*[×x]\s*/u, '');
+
+function itemNaming(item: SubscriptionItem, price: Price | undefined): { name: string; detail: string | null } {
+  if (price) return { name: price.product_name, detail: price.nickname };
+  return { name: stripQuantity(item.description), detail: null };
+}
+
 function OverviewTab({ sub, onChange, onPatch }: {
   sub: Subscription; onChange: () => void; onPatch: (body: Record<string, unknown>) => Promise<unknown>;
 }) {
   const f = useBillingFormat();
+  const { prices } = useActivePrices();
+  const priceById = useMemo(() => new Map(prices.map((price) => [price.id, price])), [prices]);
   const money = (amount: number) => f.money(amount, { currency: sub.currency });
   return (
     <div className="bl-cols">
@@ -1831,16 +2077,20 @@ function OverviewTab({ sub, onChange, onPatch }: {
               <tr><th>Item</th><th>Qty</th><th className="bl-num">Amount per period</th></tr>
             </thead>
             <tbody>
-              {sub.items.map((item) => (
+              {sub.items.map((item) => {
+                const naming = itemNaming(item, priceById.get(item.price));
+                return (
                 <tr key={item.id}>
                   <td>
-                    <div>{item.description}</div>
+                    <div>{naming.name}</div>
+                    {naming.detail && <div className="bl-lines__why">{naming.detail}</div>}
                     <div className="bl-lines__why u-mono">{item.price}</div>
                   </td>
                   <td>{item.metered ? <Badge tone="info">metered</Badge> : f.number(item.quantity)}</td>
                   <td className="bl-num">{item.amount === null ? <span className="bl-muted">from usage</span> : money(item.amount)}</td>
                 </tr>
-              ))}
+                );
+              })}
               <tr>
                 <td className="bl-strong">Recurring subtotal</td>
                 <td />
@@ -1855,7 +2105,7 @@ function OverviewTab({ sub, onChange, onPatch }: {
 
       <Stack gap={6}>
       <Card title="Terms" description="Collection, net terms and the note below are editable here; the items and the money are changed through the priced dialog.">
-        <FieldRow label="Status">{sub.status_detail}</FieldRow>
+        <FieldRow label="Status">{statusCaption(sub, f)}</FieldRow>
         <FieldRow label="Cadence">{`Every ${cadencePhrase(sub.interval_count, sub.interval)}`}</FieldRow>
         <FieldRow label="Billing day" hint="The day of the month every future period lands on.">
           {sub.billing_cycle_anchor_day}
@@ -1871,7 +2121,12 @@ function OverviewTab({ sub, onChange, onPatch }: {
             onSave={(value) => onPatch({ collection_method: value })}
           />
         </FieldRow>
-        <FieldRow label="Net terms" hint="Days until an invoice raised on this subscription is due.">
+        <FieldRow
+          label="Net terms"
+          hint={sub.collection_method === 'charge_automatically'
+            ? 'Applies to invoices sent for payment. This subscription charges the card on file the moment a bill is raised, so nothing on it waits for a due date.'
+            : 'Days until an invoice raised on this subscription is due. Empty follows the account.'}
+        >
           <InlineEdit
             label="Net terms"
             value={String(sub.days_until_due ?? 0)}
@@ -1992,17 +2247,7 @@ function UpcomingTab({ sub }: { sub: Subscription }) {
           </thead>
           <tbody>
             {invoice.lines.map((line) => (
-              <tr key={line.id} className={line.amount < 0 ? 'bl-lines__row--credit' : undefined}>
-                <td>
-                  <div>{line.description}</div>
-                  {lineWhy(line.description, line.explanation) && (
-                    <div className="bl-lines__why">{line.explanation}</div>
-                  )}
-                </td>
-                <td className="bl-nowrap">{f.dayRange(line.period.start, line.period.end)}</td>
-                <td>{f.number(line.quantity)}</td>
-                <td className="bl-num">{line.amount_display}</td>
-              </tr>
+              <UpcomingLineRow key={line.id} line={line} />
             ))}
           </tbody>
         </table>
@@ -2071,30 +2316,3 @@ function PeriodsTab({ sub }: { sub: Subscription }) {
   );
 }
 
-function ScheduleTab({ scheduleId }: { scheduleId: string }) {
-  const f = useBillingFormat();
-  const { data, loading, error, refetch } = useQuery<SubscriptionSchedule>(`/v1/subscription-schedules/${scheduleId}`);
-  if (error) return <Card><SectionError error={error} path={`GET /v1/subscription-schedules/${scheduleId}`} onRetry={refetch} /></Card>;
-  if (loading || !data) return <Card><Loading label="Loading the schedule…" /></Card>;
-  return (
-    <Card
-      title="Schedule phases"
-      description={`${humanize(data.status)} · ends by ${data.end_behavior === 'cancel' ? 'cancelling' : 'releasing'} the subscription.`}
-    >
-      {data.phases.map((phase) => (
-        <div className="bl-phase" key={phase.id}>
-          <div>
-            <Badge tone={phase.state === 'current' ? 'success' : phase.state === 'complete' ? 'neutral' : 'info'}>
-              {humanize(phase.state)}
-            </Badge>
-            <div className="bl-phase__when" style={{ marginTop: 'var(--space-3)' }}>{f.day(phase.start_date)}</div>
-          </div>
-          <div>
-            <div className="bl-phase__summary">{phase.summary}</div>
-            <div className="bl-phase__desc">{phase.window}{phase.description ? ` — ${phase.description}` : ''}</div>
-          </div>
-        </div>
-      ))}
-    </Card>
-  );
-}

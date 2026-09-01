@@ -5,7 +5,8 @@
  * count, the confidence — is a field the engine wrote when the run happened.
  * Nothing here re-derives a number the server did not already publish.
  */
-import { useQuery, type ListEnvelope, type QueryResult } from '@/client/kernel/api';
+import { useMemo } from 'react';
+import { useQuery, type ApiClientError, type ListEnvelope, type QueryResult } from '@/client/kernel/api';
 
 export interface Citation { id: string; label: string; type: string }
 
@@ -165,6 +166,147 @@ export const useSuggestions = (): QueryResult<ListEnvelope<AiSuggestion>> =>
 
 export const useApprovals = (status = 'pending'): QueryResult<ListEnvelope<AiApproval>> =>
   useQuery<ListEnvelope<AiApproval>>('/v1/ai/approvals', { status });
+
+/**
+ * Every approval, whatever it was decided.
+ *
+ * `/v1/ai/approvals` answers one status at a time, and a conversation has to
+ * show what happened to a write after it was decided — not only the ones still
+ * waiting — so the three lists are read together and merged. Each is cached by
+ * the query layer, so re-reading them after a decision costs one round trip.
+ */
+export interface ApprovalIndex {
+  all: AiApproval[];
+  byRun: Map<string, AiApproval[]>;
+  loading: boolean;
+  error: ApiClientError | null;
+  refetch: () => void;
+}
+
+export function useAllApprovals(): ApprovalIndex {
+  const pending = useApprovals('pending');
+  const approved = useApprovals('approved');
+  const declined = useApprovals('declined');
+  return useMemo(() => {
+    const all = [
+      ...(pending.data?.data ?? []),
+      ...(approved.data?.data ?? []),
+      ...(declined.data?.data ?? []),
+    ].sort((a, b) => a.created - b.created);
+    const byRun = new Map<string, AiApproval[]>();
+    for (const approval of all) {
+      const list = byRun.get(approval.run_id) ?? [];
+      list.push(approval);
+      byRun.set(approval.run_id, list);
+    }
+    return {
+      all,
+      byRun,
+      loading: pending.loading || approved.loading || declined.loading,
+      error: pending.error ?? approved.error ?? declined.error,
+      refetch: () => { pending.refetch(); approved.refetch(); declined.refetch(); },
+    };
+  }, [pending, approved, declined]);
+}
+
+/**
+ * What a run really ended as.
+ *
+ * The engine writes `needs_approval` when it stops for a person and never
+ * revisits it, so a run whose write was declined an hour ago still reads as
+ * waiting — and the "Needs approval" filter, which is exactly the queue a person
+ * scans for work, never drains. The approvals themselves know the answer.
+ */
+export type RunOutcome = 'succeeded' | 'failed' | 'running' | 'needs_approval' | 'written' | 'declined';
+
+export const OUTCOME_LABEL: Record<RunOutcome, string> = {
+  succeeded: 'Succeeded',
+  failed: 'Failed',
+  running: 'Running',
+  needs_approval: 'Needs approval',
+  written: 'Approved and written',
+  declined: 'Declined',
+};
+
+export const OUTCOME_TONE: Record<RunOutcome, 'success' | 'danger' | 'warning' | 'info' | 'neutral'> = {
+  succeeded: 'success',
+  failed: 'danger',
+  running: 'info',
+  needs_approval: 'warning',
+  written: 'success',
+  declined: 'neutral',
+};
+
+export function runOutcome(run: { status: string }, approvals: AiApproval[] | undefined): RunOutcome {
+  const rows = approvals ?? [];
+  if (rows.some((a) => a.status === 'pending')) return 'needs_approval';
+  // The engine resolves a run to `succeeded` once an approved write executes,
+  // but leaves a declined one on `needs_approval` for ever. Either way the
+  // approvals are the record of what a person actually decided.
+  if (rows.some((a) => a.status === 'approved')) return run.status === 'failed' ? 'failed' : 'written';
+  if (rows.length && run.status === 'needs_approval') return 'declined';
+  return (['succeeded', 'failed', 'running', 'needs_approval'] as const).includes(run.status as never)
+    ? (run.status as RunOutcome)
+    : 'succeeded';
+}
+
+/* ------------------------- what a write actually did ---------------------- */
+
+const ID_PREFIX: Record<string, string> = { cmp: 'company', con: 'contact', deal: 'deal', tkt: 'ticket' };
+
+/** The records a queued write names, so the conversation can link to them. */
+export function writeTargets(args: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  const push = (value: unknown) => { if (typeof value === 'string' && value) out.push(value); };
+  for (const key of ['record_id', 'id', 'contact_id', 'company_id']) push(args[key]);
+  for (const key of ['record_ids', 'associate_to']) {
+    const value = args[key];
+    if (Array.isArray(value)) for (const entry of value) push(entry);
+  }
+  return [...new Set(out)].filter((id) => ID_PREFIX[id.split('_')[0]]);
+}
+
+export function recordLink(id: string): { type: string; href: string } | null {
+  const type = ID_PREFIX[id.split('_')[0]];
+  if (!type) return null;
+  return { type, href: citationHref({ id, label: id, type }) ?? `/records/${type}/${encodeURIComponent(id)}` };
+}
+
+/** `object=record id=note_x display_name=A note` → the pairs, or null for prose. */
+export function keyValues(text: string): Record<string, string> | null {
+  if (!/^[a-z_]+=/.test(text.trim())) return null;
+  const out: Record<string, string> = {};
+  for (const match of text.matchAll(/([a-z_]+)=(.*?)(?=\s+[a-z_]+=|$)/g)) out[match[1]] = match[2].trim();
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * The tool's return value, in the same English the approval card speaks.
+ *
+ * The engine hands back a wire line — `object=record id=note_… display_name=…` —
+ * which is the right thing for a debugger and the wrong thing for the sentence a
+ * person reads after pressing Approve. The wire line stays, under the trace.
+ */
+export function outcomeSummary(approval: AiApproval): { text: string; raw: string | null } {
+  const raw = approval.outcome;
+  if (!raw) {
+    return { text: approval.status === 'declined' ? 'Nothing was written.' : 'The write landed.', raw: null };
+  }
+  const fields = keyValues(raw);
+  if (!fields) return { text: raw, raw: null };
+  const headline = approval.preview[0] ?? `${humanTool(approval.tool)} ran`;
+  const name = fields.display_name;
+  const kind = fields.object_type ? fields.object_type.replace(/_/g, ' ') : 'record';
+  return {
+    text: name ? `${headline} — the ${kind} “${name}” is on the record.` : `${headline} — written.`,
+    raw,
+  };
+}
+
+export const humanTool = (tool: string): string => {
+  const words = tool.replace(/_/g, ' ');
+  return words.charAt(0).toUpperCase() + words.slice(1);
+};
 
 export const useAiStatus = (): QueryResult<AiStatus> => useQuery<AiStatus>('/v1/ai/status');
 

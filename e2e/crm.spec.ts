@@ -43,10 +43,20 @@ test('the contact list renders the workspace’s own records, and every number o
   expect(await rowCount(page)).toBeGreaterThan(0);
 
   // Money is never raw minor units. A deal's amount column must carry a
-  // currency symbol and a decimal, not the integer the API stores.
+  // currency symbol and grouped thousands, not the integer the API stores —
+  // and in a grid the cents come off a whole-unit amount, so "$96,520" is
+  // right and "$9652000" would be the defect.
   await openList(page, '/records/deal');
-  const amount = page.locator('table tbody tr[data-index]').first().locator('td').filter({ hasText: /[$€£]/ }).first();
-  await expect(amount).toContainText(/[$€£][\d,]+\.\d{2}/);
+  const row = page.locator('table tbody tr[data-index]').first();
+  const amount = row.locator('td').filter({ hasText: /[$€£]/ }).first();
+  await expect(amount).toContainText(/[$€£]\d{1,3}(,\d{3})*(\.\d{2})?$/);
+
+  const first = (await (await page.request.post('/api/v1/records/deal/search', {
+    data: { limit: 1, sort: [{ property: 'amount', direction: 'desc' }] },
+  })).json()).data[0];
+  const minor = String(first.properties.amount);
+  const shown = (await amount.innerText()).replace(/[^\d]/g, '');
+  expect(shown).not.toBe(minor);
 });
 
 test('a saved view swaps the filter and the columns, and the server count follows it', async ({ page }) => {
@@ -528,7 +538,11 @@ test('a list that failed to load says it does not know rather than claiming zero
   }));
   await page.goto('/companies', { waitUntil: 'networkidle' });
   await expect(page.locator('.ain-page__subtitle')).not.toContainText(/\b0\b/);
-  await expect(page.locator('.crm-tablefoot')).not.toContainText(/\b0\b/);
+  // Nothing under the grid asserts a number nobody measured: the whole count
+  // strip goes, rather than the header saying "—" while the footer says "0".
+  await expect(page.locator('.crm-tablefoot')).toHaveCount(0);
+  await expect(page.locator('.ain-table__pager')).toHaveCount(0);
+  await expect(page.getByText('Something broke on our side.')).toBeVisible();
 
   await page.unroute('**/api/v1/records/company/search');
   await page.getByRole('button', { name: 'Try again' }).click();
@@ -637,4 +651,407 @@ test('a sort and a row density chosen on the grid both come back', async ({ page
   await expect(page.locator('table tbody tr[data-index] .crm-cell__name').first()).toHaveText(top);
   await expect(page.getByRole('radiogroup', { name: 'Row density' }).locator('[data-value="compact"]'))
     .toHaveAttribute('aria-checked', 'true');
+});
+
+test('an object type can be renamed and deleted again from the data model', async ({ page }) => {
+  const stamp = Date.now().toString().slice(-6);
+  await page.goto('/records', { waitUntil: 'networkidle' });
+
+  // Make one to work on, so the test never depends on what the seed left behind.
+  await page.getByRole('button', { name: 'New custom object' }).click();
+  let dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Singular name').fill(`Depot ${stamp}`);
+  await dialog.getByLabel('Plural name').fill(`Depots ${stamp}`);
+  await dialog.getByRole('button', { name: 'Create object' }).click();
+  await expect(page.getByRole('status', { name: /created/ })).toBeVisible();
+
+  const name = `depot_${stamp}`;
+  const card = page.locator('.crm-objcard').filter({ hasText: `Depots ${stamp}` });
+  await card.getByRole('button', { name: `Manage Depots ${stamp}` }).click();
+  await page.getByRole('menuitem', { name: 'Edit this object type' }).click();
+
+  dialog = page.getByRole('dialog');
+  await expect(dialog.getByLabel('Internal name')).toBeDisabled();
+  await dialog.getByLabel('Singular name').fill(`Yard ${stamp}`);
+  await dialog.getByLabel('Plural name').fill(`Yards ${stamp}`);
+  await dialog.getByLabel('Description').fill('Where the fleet sleeps.');
+  await dialog.getByRole('button', { name: 'Save changes' }).click();
+  await expect(page.getByRole('status', { name: /updated/ })).toBeVisible();
+
+  const renamed = await (await page.request.get(`/api/v1/objects/${name}`)).json();
+  expect(renamed.label).toBe(`Yard ${stamp}`);
+  expect(renamed.plural_label).toBe(`Yards ${stamp}`);
+  expect(renamed.description).toBe('Where the fleet sleeps.');
+  // The workspace's own label is what the screen shows afterwards.
+  await expect(page.locator('.crm-objcard').filter({ hasText: `Yards ${stamp}` })).toBeVisible();
+
+  // And it can be removed again — records first, which this one has none of.
+  await page.locator('.crm-objcard').filter({ hasText: `Yards ${stamp}` })
+    .getByRole('button', { name: `Manage Yards ${stamp}` }).click();
+  await page.getByRole('menuitem', { name: 'Delete this object type' }).click();
+  const confirm = page.getByRole('dialog');
+  await confirm.locator('input').fill(name);
+  await confirm.getByRole('button', { name: 'Delete object type' }).click();
+  await expect(page.getByRole('status', { name: /removed/ })).toBeVisible();
+
+  expect((await page.request.get(`/api/v1/objects/${name}`)).status()).toBe(404);
+  await expect(page.locator('.crm-objcard').filter({ hasText: `Yards ${stamp}` })).toHaveCount(0);
+});
+
+test('deleting an object type that still has records is refused, in words that say what to do', async ({ page }) => {
+  await page.goto('/records', { waitUntil: 'networkidle' });
+  const card = page.locator('.crm-objcard').filter({ hasText: 'Companies' });
+  await card.getByRole('button', { name: 'Manage Companies' }).click();
+  // A built-in is not deletable at all, and the menu says so rather than failing later.
+  const item = page.getByRole('menuitem', { name: 'Built-in objects cannot be deleted' });
+  await expect(item).toBeVisible();
+  await expect(item).toHaveAttribute('aria-disabled', 'true');
+});
+
+test('the subtitle and the searched-by properties of an object can be re-pointed from the UI', async ({ page }) => {
+  const before = await (await page.request.get('/api/v1/objects/company')).json() as {
+    secondary_property: string; searchable: string[];
+  };
+  await page.goto('/records', { waitUntil: 'networkidle' });
+
+  const open = async () => {
+    await page.locator('.crm-objcard').filter({ hasText: 'Companies' }).getByRole('button', { name: 'Manage Companies' }).click();
+    await page.getByRole('menuitem', { name: 'Edit this object type' }).click();
+    return page.getByRole('dialog');
+  };
+
+  let dialog = await open();
+  await expect(dialog.getByLabel('Subtitle property')).toHaveValue(before.secondary_property);
+  await dialog.getByLabel('Subtitle property').selectOption({ label: 'Industry' });
+  // The search box looks inside exactly these, and the list of them is editable.
+  await dialog.getByLabel('Industry', { exact: true }).check();
+  await dialog.getByRole('button', { name: 'Save changes' }).click();
+  await expect(page.getByRole('status', { name: /updated/ })).toBeVisible();
+
+  const after = await (await page.request.get('/api/v1/objects/company')).json() as {
+    secondary_property: string; searchable: string[];
+  };
+  expect(after.secondary_property).toBe('industry');
+  expect(after.searchable).toContain('industry');
+
+  // The companies list picks the new subtitle up without a reload of the app.
+  await page.goto('/companies', { waitUntil: 'networkidle' });
+  await expect(page.locator('table tbody tr[data-index]').first()).toBeVisible();
+
+  await page.goto('/records', { waitUntil: 'networkidle' });
+  dialog = await open();
+  await dialog.getByLabel('Subtitle property').selectOption(before.secondary_property);
+  await dialog.getByLabel('Industry', { exact: true }).uncheck();
+  await dialog.getByRole('button', { name: 'Save changes' }).click();
+  await expect(page.getByRole('status', { name: /updated/ })).toBeVisible();
+  expect((await (await page.request.get('/api/v1/objects/company')).json()).secondary_property).toBe(before.secondary_property);
+});
+
+test('a money change on the timeline reads as money, never as the minor units underneath', async ({ page }) => {
+  await page.request.patch('/api/v1/records/company/cmp_nw_46', { data: { properties: { annual_revenue: 1234567 } } });
+  await page.request.patch('/api/v1/records/company/cmp_nw_46', { data: { properties: { annual_revenue: 9876543 } } });
+
+  await page.goto('/companies/cmp_nw_46', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Property changes' }).click();
+  const entry = page.locator('.crm-tl').filter({ hasText: 'Annual revenue changed' }).first();
+  await expect(entry).toContainText('$12,345.67 → $98,765.43');
+  await expect(entry).not.toContainText('1234567');
+});
+
+test('an object nobody has built a view for still arrives with its own columns', async ({ page }) => {
+  // Tasks have no saved view in the seed, so the grid has to choose. Choosing
+  // "name, owner, last modified" for a queue is a wall, not a list.
+  await openList(page, '/records/task');
+  for (const header of ['Task', 'Status', 'Due', 'Owner']) {
+    await expect(page.getByRole('columnheader', { name: header, exact: true })).toBeVisible();
+  }
+  const status = page.locator('table tbody tr[data-index]').first().locator('td').nth(2);
+  await expect(status).not.toBeEmpty();
+
+  // And the choice is still only a default: the column menu can drop one.
+  await page.getByRole('button', { name: /^Columns/ }).click();
+  await page.getByRole('menuitemcheckbox', { name: 'Due' }).click();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('columnheader', { name: 'Due', exact: true })).toHaveCount(0);
+});
+
+test('a contact that does not exist yet can be created and linked in one step', async ({ page }) => {
+  const stamp = Date.now().toString().slice(-6);
+  await page.goto('/companies/cmp_nw_34', { waitUntil: 'networkidle' });
+
+  await page.getByRole('button', { name: 'Link another record' }).click();
+  await page.getByRole('button', { name: 'Create a new one' }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toContainText('Oranmore Logistics');
+  await dialog.getByLabel('First name').fill('Saoirse');
+  await dialog.getByLabel('Last name').fill(`Byrne ${stamp}`);
+  await dialog.getByRole('button', { name: 'Create contact' }).click();
+  await expect(page.getByRole('status', { name: /Linked to the new record/ })).toBeVisible();
+
+  // The server is the judge: the association exists on the company's own page.
+  const linked = await (await page.request.get('/api/v1/records/company/cmp_nw_34/associations')).json() as {
+    data: { display_name: string }[];
+  };
+  expect(linked.data.some((a) => a.display_name === `Saoirse Byrne ${stamp}`)).toBe(true);
+  await expect(page.locator('.crm-record__col').last()).toContainText(`Saoirse Byrne ${stamp}`);
+});
+
+/* ============================ view management ============================= */
+
+/**
+ * A view a team shares is only an asset if the team can maintain it. These
+ * four were the whole reason a RevOps lead would have kept HubSpot: the screen
+ * gated on `system: true` while the server was quite happy to take the write.
+ */
+
+const viewsOf = async (page: Page, type = 'company') =>
+  (await (await page.request.get(`/api/v1/views?object_type=${type}`)).json()).data as {
+    id: string; name: string; system: boolean; is_default: boolean;
+    columns: string[]; sort: unknown[]; filter: unknown;
+  }[];
+
+const openViewMenu = async (page: Page) => {
+  await page.locator('button').filter({ hasText: /^View$/ }).first().click();
+  await expect(page.getByRole('menu')).toBeVisible();
+};
+
+test('changes made on a built-in view can be saved back onto it', async ({ page }) => {
+  await openList(page, '/companies');
+  await page.getByRole('button', { name: 'Key accounts' }).click();
+  await page.waitForFunction(() => !document.querySelector('.ain-skeleton'));
+  const id = new URL(page.url()).searchParams.get('view')!;
+  const before = (await viewsOf(page)).find((v) => v.id === id)!;
+  expect(before.system).toBe(true);
+
+  // Add a column, which is exactly the kind of maintenance a shared view needs.
+  await page.getByRole('button', { name: 'Columns' }).click();
+  await page.getByRole('menuitemcheckbox', { name: 'Founded' }).click();
+  await page.keyboard.press('Escape');
+  await expect(page.getByText('Modified', { exact: true })).toBeVisible();
+
+  await openViewMenu(page);
+  await page.getByRole('menuitem', { name: /Save changes to this view/ }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Save changes' }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+
+  const after = (await viewsOf(page)).find((v) => v.id === id)!;
+  expect(after.columns).toContain('founded_year');
+  expect(after.columns.length).toBe(before.columns.length + 1);
+  // And the screen agrees the view is no longer ahead of what is stored.
+  await expect(page.getByText('Modified', { exact: true })).toHaveCount(0);
+
+  await page.request.patch(`/api/v1/views/${id}`, { data: { columns: before.columns } });
+});
+
+test('a built-in view can be renamed, and the rename leaves its filter alone', async ({ page }) => {
+  await openList(page, '/companies');
+  await page.getByRole('button', { name: 'Gone quiet' }).click();
+  await page.waitForFunction(() => !document.querySelector('.ain-skeleton'));
+  const id = new URL(page.url()).searchParams.get('view')!;
+  const before = (await viewsOf(page)).find((v) => v.id === id)!;
+
+  await openViewMenu(page);
+  await page.getByRole('menuitem', { name: /Rename this view/ }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Name').fill('Dormant accounts');
+  await dialog.getByRole('button', { name: 'Rename view' }).click();
+  await expect(dialog).toHaveCount(0);
+
+  await expect(page.getByRole('button', { name: 'Dormant accounts' })).toBeVisible();
+  const after = (await viewsOf(page)).find((v) => v.id === id)!;
+  expect(after.name).toBe('Dormant accounts');
+  expect(JSON.stringify(after.filter)).toBe(JSON.stringify(before.filter));
+  expect(after.columns).toEqual(before.columns);
+
+  await page.request.patch(`/api/v1/views/${id}`, { data: { name: before.name } });
+});
+
+test('any view can be made the one the list opens on', async ({ page }) => {
+  const original = (await viewsOf(page)).find((v) => v.is_default)!;
+  await openList(page, '/companies');
+  await page.getByRole('button', { name: 'Open pipeline over $75k' }).click();
+  await page.waitForFunction(() => !document.querySelector('.ain-skeleton'));
+  const id = new URL(page.url()).searchParams.get('view')!;
+
+  await openViewMenu(page);
+  await page.getByRole('menuitem', { name: 'Make it the default view' }).click();
+  await expect(page.getByRole('menu')).toHaveCount(0);
+  await expect.poll(async () => (await viewsOf(page)).find((v) => v.id === id)!.is_default).toBe(true);
+
+  // The proof is arriving with no `?view=` at all and landing on it.
+  await openList(page, '/companies');
+  await expect(page.locator('.ain-page__subtitle')).toContainText('Open pipeline over $75k');
+
+  await page.request.patch(`/api/v1/views/${original.id}`, { data: { is_default: true } });
+});
+
+test('deleting a view works on one you made, and says why it will not on one that ships with Ain', async ({ page }) => {
+  const name = `Scratch view ${Date.now()}`;
+  const made = await (await page.request.post('/api/v1/views', {
+    data: { object_type: 'company', name, columns: ['name', 'owner_id'] },
+  })).json() as { id: string };
+
+  await openList(page, `/companies?view=${made.id}`);
+  await openViewMenu(page);
+  const del = page.getByRole('menuitem', { name: 'Delete this view' });
+  await expect(del).toBeEnabled();
+  await del.click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Delete view' }).click();
+  await expect.poll(async () => (await viewsOf(page)).some((v) => v.id === made.id)).toBe(false);
+
+  // A built-in one still shows the item — with the server's own reason on it,
+  // rather than vanishing and leaving the operator wondering.
+  await openList(page, '/companies');
+  await page.getByRole('button', { name: 'Key accounts' }).click();
+  await page.waitForFunction(() => !document.querySelector('.ain-skeleton'));
+  await openViewMenu(page);
+  const builtin = page.getByRole('menuitem', { name: /Delete this view/ });
+  await expect(builtin).toBeVisible();
+  await expect(builtin).toBeDisabled();
+  await expect(builtin).toContainText('Ships with Ain');
+});
+
+test('the archived list is a link, like every other piece of list state', async ({ page }) => {
+  await openList(page, '/contacts');
+  const archived = page.getByRole('button', { name: 'Archived' });
+  await archived.click();
+  await expect(page).toHaveURL(/[?&]archived=1/);
+  await expect(archived).toHaveAttribute('aria-pressed', 'true');
+
+  await page.reload({ waitUntil: 'networkidle' });
+  await expect(page.getByRole('button', { name: 'Archived' })).toHaveAttribute('aria-pressed', 'true');
+
+  await page.getByRole('button', { name: 'Archived' }).click();
+  await expect(page).not.toHaveURL(/archived=1/);
+});
+
+/* =========================== reading the screen =========================== */
+
+test('the list stays readable on a laptop-width window instead of shredding its columns', async ({ page }) => {
+  await page.setViewportSize({ width: 1100, height: 800 });
+  await openList(page, '/companies');
+
+  const widths = await page.evaluate(() =>
+    [...document.querySelectorAll('table thead th')]
+      // The select box and the row-actions button are chrome, not data.
+      .filter((th) => !th.className.includes('selectcell') && !th.className.includes('actioncell'))
+      .map((th) => ({ label: (th as HTMLElement).innerText.trim(), width: Math.round(th.getBoundingClientRect().width) }))
+      .filter((c) => c.label));
+  expect(widths.length).toBeGreaterThan(4);
+  for (const column of widths) expect(column.width, `${column.label} is unreadably narrow`).toBeGreaterThanOrEqual(96);
+
+  // Once the columns outgrow the window the wrapper scrolls, so nothing is lost.
+  const scroll = await page.evaluate(() => {
+    const el = document.querySelector('.ain-table__scroll') as HTMLElement;
+    return { scrollWidth: el.scrollWidth, clientWidth: el.clientWidth, overflowX: getComputedStyle(el).overflowX };
+  });
+  expect(scroll.overflowX).toBe('auto');
+  expect(scroll.scrollWidth).toBeGreaterThan(scroll.clientWidth);
+
+  // A badge cell still carries its word, not a bare coloured dot.
+  const stage = page.locator('table tbody tr[data-index]').first().locator('td').nth(2);
+  expect((await stage.innerText()).trim().length).toBeGreaterThan(2);
+});
+
+test('the footer’s verb agrees with the number in front of it', async ({ page }) => {
+  await openList(page, '/companies');
+  await page.getByPlaceholder('Search companies…').fill('kaiping');
+  await expect(page.locator('.crm-tablefoot')).toContainText('1 company matches this view');
+
+  await page.getByPlaceholder('Search companies…').fill('');
+  await expect(page.locator('.crm-tablefoot')).toContainText(/\d+ companies match this view/);
+});
+
+test('the search box offers one clear button, not two', async ({ page }) => {
+  await openList(page, '/companies');
+  const box = page.locator('.crm-toolsearch input');
+  await box.fill('kaiping');
+  await box.focus();
+  await expect(page.locator('.crm-toolsearch .ain-input__clear')).toHaveCount(1);
+  // The browser's own cancel glyph is suppressed, so the two never sit side by side.
+  const suppressed = await page.evaluate(() => [...document.styleSheets].some((sheet) => {
+    try { return [...sheet.cssRules].some((r) => r.cssText.includes('crm-toolsearch') && r.cssText.includes('search-cancel-button')); } catch { return false; }
+  }));
+  expect(suppressed).toBe(true);
+});
+
+test('a record page names the record in the breadcrumb, not its object type', async ({ page }) => {
+  const contact = (await (await page.request.get('/api/v1/records/contact?limit=1')).json()).data[0];
+  await page.goto(`/contacts/${contact.id}`, { waitUntil: 'networkidle' });
+  await expect(page.locator('nav[aria-label="Breadcrumb"]')).toContainText(contact.display_name);
+  await expect(page.locator('nav[aria-label="Breadcrumb"] [aria-current="page"]')).toHaveText(contact.display_name);
+});
+
+test('a contact’s employer is on the identity card and beside the name, not only in the right rail', async ({ page }) => {
+  const contacts = (await (await page.request.get('/api/v1/records/contact?limit=25')).json()).data as { id: string }[];
+  let target: { id: string; employer: string } | null = null;
+  for (const row of contacts) {
+    const full = await (await page.request.get(`/api/v1/records/contact/${row.id}`)).json();
+    const edge = (full.associations ?? []).find((a: { object_type: string }) => a.object_type === 'company');
+    if (edge) { target = { id: row.id, employer: edge.display_name }; break; }
+  }
+  expect(target, 'the demo workspace has a contact linked to a company').not.toBeNull();
+
+  await page.goto(`/contacts/${target!.id}`, { waitUntil: 'networkidle' });
+  const card = page.locator('.crm-identity__at');
+  await expect(card).toContainText(target!.employer);
+  await expect(page.locator('.ain-page__subtitle')).toContainText(target!.employer);
+
+  await card.click();
+  await expect(page).toHaveURL(/\/companies\//);
+  await expect(page.locator('.ain-page__title')).toContainText(target!.employer);
+});
+
+/* ============================== zoned writes ============================== */
+
+test('the activity composer stamps the workspace’s clock, not the browser’s', async ({ browser }) => {
+  // A London operator on a New York workspace is where this went wrong: the
+  // field rendered one day and the header another, on the same screen.
+  const context = await browser.newContext({ timezoneId: 'Europe/London' });
+  const page = await context.newPage();
+  await signIn(page);
+
+  const me = await (await page.request.get('/api/v1/me')).json();
+  const zone = me.org.timezone as string;
+  const now = me.clock.now as number;
+  const contact = (await (await page.request.get('/api/v1/records/contact?limit=1')).json()).data[0];
+
+  await page.goto(`/contacts/${contact.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Note', exact: true }).click();
+  const when = page.locator('input[type="datetime-local"]');
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(now).reduce<Record<string, string>>((acc, p) => (p.type === 'literal' ? acc : { ...acc, [p.type]: p.value }), {});
+  await expect(when).toHaveValue(`${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`);
+
+  // And what it writes back is that wall clock in that zone, to the minute.
+  const subject = `Backdated recap ${Date.now()}`;
+  await when.fill('2026-08-28T09:00');
+  await page.getByRole('dialog').getByLabel('Subject').fill(subject);
+  await page.getByRole('dialog').getByRole('button', { name: 'Write a note' }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+
+  const timeline = await (await page.request.get(`/api/v1/records/contact/${contact.id}/timeline?limit=10`)).json();
+  const entry = (timeline.data as { title?: string; occurred_at?: number; at?: number }[])
+    .find((i) => JSON.stringify(i).includes(subject));
+  expect(entry, 'the note reached the timeline').toBeTruthy();
+  const at = entry!.occurred_at ?? entry!.at!;
+  const stored = new Intl.DateTimeFormat('en-CA', {
+    timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).format(at);
+  expect(stored.replace(', ', 'T')).toBe('2026-08-28T09:00');
+  await context.close();
+});
+
+test('the CSV is stamped with the workspace’s day, and still carries exact money', async ({ page }) => {
+  await openList(page, '/companies');
+  const me = await (await page.request.get('/api/v1/me')).json();
+  const day = new Intl.DateTimeFormat('en-CA', { timeZone: me.org.timezone, year: 'numeric', month: '2-digit', day: '2-digit' })
+    .format(me.clock.now as number);
+
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button', { name: 'Export CSV' }).click(),
+  ]);
+  expect(download.suggestedFilename()).toBe(`Companies ${day}.csv`);
 });

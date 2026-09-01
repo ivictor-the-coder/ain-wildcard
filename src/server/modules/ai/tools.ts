@@ -6,6 +6,7 @@
  * run freely; the one write tool here is gated behind an approval, which is the
  * behaviour every tool that changes a customer's world should have.
  */
+import { createHash } from 'node:crypto';
 import type { AiToolDef } from '../../kernel/ai';
 import type { Ctx } from '../../kernel/context';
 import v from '../../../shared/validate';
@@ -174,7 +175,20 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
       }),
       run: (args: { record_id: string; in_days: number; note: string; assignee_id?: string }, _c, meta) => {
         const runAt = ctx.now() + args.in_days * DAY;
-        const idemKey = `ai.followup:${args.record_id}:${runAt}`;
+        // The key is the *write*, not the slot it lands in. Keyed on
+        // `(record, runAt)` alone, two follow-ups a person had separately
+        // approved — "send the renewal quote" and "chase the security
+        // questionnaire", both due in seven days on the same account — shared
+        // one key, and `JobQueue.enqueue` patches the payload of a row it
+        // already holds: the first note was overwritten rather than skipped,
+        // both calls answered `{ scheduled: true }`, both emitted
+        // `ai.followup.scheduled`, and one of the two silently never happened.
+        // The same identity `requestApproval` keys a card on, one file over:
+        // one approved write is one job, so two writes are two jobs. An
+        // identical repeat — a retried tool call — still collapses to one.
+        const idemKey = `ai.followup:${args.record_id}:${runAt}:${createHash('sha256')
+          .update(JSON.stringify({ n: args.note, a: args.assignee_id ?? meta.actorId ?? null }))
+          .digest('hex').slice(0, 16)}`;
         ctx.enqueue(meta.orgId, 'ai.followup', {
           recordId: args.record_id, note: args.note, assigneeId: args.assignee_id ?? meta.actorId ?? null, runId: meta.runId ?? null,
         }, { runAt, idemKey });

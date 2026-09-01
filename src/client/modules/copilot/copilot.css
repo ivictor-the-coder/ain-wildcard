@@ -8,11 +8,28 @@
   height: calc(100vh - 208px);
   min-height: 440px;
 }
+/* A short window used to push the composer off the bottom of the page: the
+   floor was taller than the space left under the header, so the page scrolled
+   instead of the transcript. Below that height the shell takes whatever room
+   there is and the stream — the only scroller in the column — absorbs it, which
+   keeps the box you type in on screen at any height. */
+@media (max-height: 760px) {
+  .cp-shell { min-height: 0; height: calc(100vh - 168px); }
+}
 @media (max-width: 1080px) {
-  .cp-shell { grid-template-columns: 1fr; height: auto; }
+  .cp-shell { grid-template-columns: 1fr; height: auto; min-height: 0; }
   .cp-rail { max-height: 280px; }
   .cp-stream { max-height: 60vh; }
 }
+
+/**
+ * The form layout the dialogs in this module use.
+ *
+ * `pl-form` is the pipeline module's class and the draft dialog borrowed it;
+ * defining it here too means the copilot's own dialogs lay out correctly even
+ * if this module is installed without that one.
+ */
+.pl-form { display: grid; gap: var(--space-5); }
 
 /* ------------------------------ thread rail ------------------------------- */
 
@@ -31,6 +48,31 @@
   scrollbar-width: thin;
   padding-right: var(--space-2);
 }
+/**
+ * A row is a target *and* a menu. The button fills the row so the whole thing is
+ * clickable; the menu sits over its right edge, hidden until the row is hovered
+ * or something inside it has focus — so it never appears out of reach of the
+ * keyboard, and never adds noise to a rail being read rather than tidied.
+ */
+.cp-threadrow {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
+.cp-threadrow__menu {
+  position: absolute;
+  top: var(--space-3);
+  right: var(--space-3);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+.cp-threadrow:hover .cp-threadrow__menu,
+.cp-threadrow:focus-within .cp-threadrow__menu,
+.cp-threadrow.is-active .cp-threadrow__menu { opacity: 1; }
+@media (hover: none) {
+  .cp-threadrow__menu { opacity: 1; }
+}
+
 .cp-thread {
   display: flex;
   flex-direction: column;
@@ -52,6 +94,7 @@
   border-color: var(--border-brand);
 }
 .cp-thread__title {
+  padding-right: var(--space-7);
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
   color: var(--text-primary);
@@ -87,6 +130,12 @@
   padding-right: var(--space-3);
   scrollbar-width: thin;
 }
+/* A short conversation belongs against the composer, not stranded at the top of
+   a tall empty column. `margin-top: auto` on the first message does that and
+   still scrolls correctly once the thread outgrows the box — which
+   `justify-content: flex-end` does not, because it pushes the overflow out of
+   reach above the scroll origin. The starter state keeps its own centring. */
+.cp-stream--messages > :first-child { margin-top: auto; }
 
 .cp-msg { display: flex; flex-direction: column; gap: var(--space-3); }
 .cp-msg--user { align-items: flex-end; }
@@ -263,6 +312,7 @@
 .cp-composer {
   display: flex;
   flex-direction: column;
+  flex: 0 0 auto;
   gap: var(--space-4);
   padding: var(--space-5);
   border: 1px solid var(--border-default);
@@ -372,3 +422,50 @@
 }
 .cp-details[open] > summary::before { content: '▾'; }
 .cp-details > summary:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
+
+/* --------------------------- approval aftermath --------------------------- */
+
+/* The prose above was composed before anyone decided. Dimming it is how the
+   turn says "this was true then" without deleting what the engine actually
+   said — the audit trail keeps its own words. */
+.cp-superseded { opacity: 0.62; }
+.cp-superseded__note {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-style: italic;
+}
+
+.cp-resolution {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--border-default);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-sunken);
+}
+.cp-resolution.is-written { border-left-color: var(--border-success); }
+.cp-resolution__head { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+.cp-resolution__line {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  line-height: var(--leading-normal);
+}
+
+.cp-divider {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-3) 0;
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  border: 1px dashed var(--border-default);
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-tertiary);
+}

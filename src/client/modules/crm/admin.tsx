@@ -9,15 +9,15 @@
  */
 import { useEffect, useMemo, useState } from 'react';
 import {
-  Badge, Banner, Button, Card, ConfirmDialog, DataTable, EmptyState, Field, Grid, Icons, IconButton,
-  Inline, Input, Modal, Page, SegmentedControl, Select, Skeleton, Switch, Textarea, Tooltip,
+  Badge, Banner, Button, Card, Checkbox, ConfirmDialog, DataTable, EmptyState, Field, Grid, Icons, IconButton,
+  Inline, Input, MenuButton, Modal, Page, SegmentedControl, Select, Skeleton, Switch, Textarea, Tooltip,
   humanize, iconByName, useFormat, useToast, type DataTableColumn, type MenuSection,
 } from '@/client/design';
 import { useRouter } from '@/client/kernel/router';
 import type { ApiClientError } from '@/client/kernel/api';
 import {
-  createAssociationType, createObjectType, createProperty, crmChanged, deleteProperty,
-  updateProperty, useAssociationTypes, useObjectTypes, useProperties, useSchema,
+  createAssociationType, createObjectType, createProperty, crmChanged, deleteObjectType, deleteProperty,
+  updateObjectType, updateProperty, useAssociationTypes, useObjectTypes, useProperties, useSchema,
   type AssociationTypeDef, type FilterNode, type ObjectTypeDef, type PropertyDef, type PropertyOption,
   type PropertyRollup, type PropertyType,
 } from './api';
@@ -67,7 +67,22 @@ export function DataModelPage() {
   const selected = list.find((t) => t.name === selectedName);
 
   const [creatingObject, setCreatingObject] = useState(false);
+  const [editingObject, setEditingObject] = useState<ObjectTypeDef | null>(null);
+  const [confirmDeleteObject, setConfirmDeleteObject] = useState<ObjectTypeDef | null>(null);
   const [creatingAssociation, setCreatingAssociation] = useState(false);
+  const toast = useToast();
+
+  const removeObjectType = async (type: ObjectTypeDef) => {
+    try {
+      await deleteObjectType(type.name);
+      crmChanged();
+      toast.success(`${type.plural_label} removed`, 'Its properties, views and API routes went with it.');
+      if (type.name === selectedName) setQuery({ type: undefined });
+    } catch (e) {
+      // The server refuses while records still exist, and says how many.
+      toast.error('Object type not deleted', (e as ApiClientError).body.message);
+    }
+  };
 
   return (
     <Page
@@ -126,9 +141,29 @@ export function DataModelPage() {
                 <div className="crm-objcard__foot">
                   <Badge tone={type.category === 'activity' ? 'neutral' : 'info'} size="sm">{humanize(type.category)}</Badge>
                   <span className="u-spacer" />
-                  {type.category === 'record' && (
-                    <Button size="sm" variant="ghost" onClick={() => navigate(listHref(type.name))}>Open list</Button>
-                  )}
+                  {/* An activity type has a list too — the calls, tasks and
+                      notes queues are the same screen as contacts. */}
+                  <Button size="sm" variant="ghost" onClick={() => navigate(listHref(type.name))}>Open list</Button>
+                  <MenuButton
+                    size="sm"
+                    label={`Manage ${type.plural_label}`}
+                    icon={<Icons.more size={14} />}
+                    sections={[{
+                      id: 'object',
+                      items: [
+                        { id: 'edit', label: 'Edit this object type', icon: <Icons.edit size={14} />, onSelect: () => setEditingObject(type) },
+                        { id: 'properties', label: 'Show its properties', icon: <Icons.layers size={14} />, onSelect: () => setQuery({ type: type.name }) },
+                        {
+                          id: 'delete',
+                          label: type.system ? 'Built-in objects cannot be deleted' : 'Delete this object type',
+                          icon: <Icons.trash size={14} />,
+                          danger: !type.system,
+                          disabled: type.system,
+                          onSelect: () => setConfirmDeleteObject(type),
+                        },
+                      ],
+                    }] satisfies MenuSection[]}
+                  />
                 </div>
               </Card>
             );
@@ -146,11 +181,30 @@ export function DataModelPage() {
         onCreate={() => setCreatingAssociation(true)}
       />
 
-      <ObjectDialog open={creatingObject} onClose={() => setCreatingObject(false)} onCreated={(type) => setQuery({ type: type.name })} />
+      <ObjectDialog
+        open={creatingObject || !!editingObject}
+        existing={editingObject}
+        onClose={() => { setCreatingObject(false); setEditingObject(null); }}
+        onCreated={(type) => setQuery({ type: type.name })}
+      />
       <AssociationDialog
         open={creatingAssociation}
         onClose={() => setCreatingAssociation(false)}
         objectTypes={list}
+      />
+
+      <ConfirmDialog
+        open={!!confirmDeleteObject}
+        onCancel={() => setConfirmDeleteObject(null)}
+        onConfirm={async () => {
+          const type = confirmDeleteObject;
+          setConfirmDeleteObject(null);
+          if (type) await removeObjectType(type);
+        }}
+        title={`Delete the ${confirmDeleteObject?.label ?? ''} object?`}
+        body="Its properties, its saved views and its API routes go with it. The workspace has to be empty of these records first — the server refuses while any still exist."
+        confirmLabel="Delete object type"
+        confirmPhrase={confirmDeleteObject?.name}
       />
     </Page>
   );
@@ -823,27 +877,66 @@ function AssociationDialog({ open, onClose, objectTypes }: {
 
 const OBJECT_ICONS = ['building', 'cpu', 'layers', 'briefcase', 'server', 'database', 'globe', 'tag', 'target', 'gauge', 'folder', 'grid'];
 
-function ObjectDialog({ open, onClose, onCreated }: {
-  open: boolean; onClose: () => void; onCreated: (type: ObjectTypeDef) => void;
+/** Text-ish properties are the ones worth putting behind the display name or the search box. */
+const LABELLABLE: PropertyType[] = ['string', 'text', 'email', 'url', 'phone', 'computed', 'enum', 'reference'];
+
+function ObjectDialog({ open, onClose, existing, onCreated }: {
+  open: boolean; onClose: () => void; existing?: ObjectTypeDef | null; onCreated: (type: ObjectTypeDef) => void;
 }) {
   const toast = useToast();
+  const editing = existing ?? null;
+  const props = useProperties(open && editing ? editing.name : null);
   const [label, setLabel] = useState('');
   const [pluralLabel, setPluralLabel] = useState('');
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [icon, setIcon] = useState('layers');
+  const [primary, setPrimary] = useState('');
+  const [secondary, setSecondary] = useState('');
+  const [searchable, setSearchable] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<ApiClientError | null>(null);
 
   useEffect(() => {
     if (!open) return;
-    setLabel(''); setPluralLabel(''); setName(''); setDescription(''); setIcon('layers'); setError(null);
-  }, [open]);
+    setError(null);
+    setLabel(editing?.label ?? '');
+    setPluralLabel(editing?.plural_label ?? '');
+    setName(editing?.name ?? '');
+    setDescription(editing?.description ?? '');
+    setIcon(editing?.icon ?? 'layers');
+    setPrimary(editing?.primary_property ?? '');
+    setSecondary(editing?.secondary_property ?? '');
+    setSearchable(editing?.searchable ?? []);
+  }, [open, editing]);
+
+  const candidates = useMemo(
+    () => (props.data?.data ?? []).filter((p) => !p.hidden && LABELLABLE.includes(p.type)),
+    [props.data],
+  );
+
+  const toggleSearchable = (property: string) =>
+    setSearchable((current) => (current.includes(property) ? current.filter((p) => p !== property) : [...current, property]));
 
   const submit = async () => {
     setBusy(true);
     setError(null);
     try {
+      if (editing) {
+        const saved = await updateObjectType(editing.name, {
+          label,
+          plural_label: pluralLabel || `${label}s`,
+          description,
+          icon,
+          ...(primary ? { primary_property: primary } : {}),
+          secondary_property: secondary,
+          searchable,
+        });
+        crmChanged();
+        toast.success(`${saved.plural_label} updated`, 'Every list, form and search box in the workspace uses it already.');
+        onClose();
+        return;
+      }
       const created = await createObjectType({
         name: name || slug(label),
         label,
@@ -861,7 +954,7 @@ function ObjectDialog({ open, onClose, onCreated }: {
     } catch (e) {
       const err = e as ApiClientError;
       setError(err);
-      toast.error('Object not created', err.body.message);
+      toast.error(editing ? 'Object not updated' : 'Object not created', err.body.message);
     } finally {
       setBusy(false);
     }
@@ -872,13 +965,15 @@ function ObjectDialog({ open, onClose, onCreated }: {
       open={open}
       onClose={onClose}
       size="md"
-      title="New custom object"
-      description="A first-class object: records, properties, associations, timelines, views, filters and API routes — the same machinery contacts and deals run on."
+      title={editing ? `Edit ${editing.plural_label}` : 'New custom object'}
+      description={editing
+        ? 'Names, icon and the properties this object is displayed and searched by. The internal name is fixed — it is the API path.'
+        : 'A first-class object: records, properties, associations, timelines, views, filters and API routes — the same machinery contacts and deals run on.'}
       footer={
         <>
           <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
           <Button variant="primary" loading={busy} disabled={!label.trim()} onClick={() => { void submit(); }}>
-            Create object
+            {editing ? 'Save changes' : 'Create object'}
           </Button>
         </>
       }
@@ -889,7 +984,7 @@ function ObjectDialog({ open, onClose, onCreated }: {
           <Field label="Singular name" required error={error?.body.param === 'label' ? error.body.message : undefined}>
             <Input
               value={label}
-              onChange={(e) => { setLabel(e.target.value); setName(slug(e.target.value)); if (!pluralLabel) setPluralLabel(''); }}
+              onChange={(e) => { setLabel(e.target.value); if (!editing) setName(slug(e.target.value)); if (!pluralLabel) setPluralLabel(''); }}
               placeholder="Installation"
               autoFocus
             />
@@ -898,8 +993,14 @@ function ObjectDialog({ open, onClose, onCreated }: {
             <Input value={pluralLabel} onChange={(e) => setPluralLabel(e.target.value)} placeholder="Installations" />
           </Field>
         </div>
-        <Field label="Internal name" hint="Lower case, letters, digits and underscores. This is the API path." error={error?.body.param === 'name' ? error.body.message : undefined}>
-          <Input value={name} onChange={(e) => setName(slug(e.target.value))} mono placeholder="installation" />
+        <Field
+          label="Internal name"
+          hint={editing
+            ? 'Fixed once the object exists — records, views and integrations address it by this name.'
+            : 'Lower case, letters, digits and underscores. This is the API path.'}
+          error={error?.body.param === 'name' ? error.body.message : undefined}
+        >
+          <Input value={name} onChange={(e) => setName(slug(e.target.value))} mono placeholder="installation" disabled={!!editing} />
         </Field>
         <Field label="Description" optional>
           <Textarea value={description} onChange={(e) => setDescription(e.target.value)} minRows={2} placeholder="A telemetry rollout at one customer site." />
@@ -924,6 +1025,52 @@ function ObjectDialog({ open, onClose, onCreated }: {
             })}
           </div>
         </Field>
+
+        {editing && (
+          <>
+            <div className="crm-form__grid">
+              <Field
+                label="Display property"
+                hint="Names a record everywhere it is shown."
+                error={error?.body.param === 'primary_property' ? error.body.message : undefined}
+              >
+                <Select
+                  value={primary}
+                  onChange={setPrimary}
+                  disabled={props.loading || !candidates.length}
+                  options={candidates.map((p) => ({ value: p.name, label: p.label }))}
+                />
+              </Field>
+              <Field label="Subtitle property" optional hint="Shown under the name in lists and pickers.">
+                <Select
+                  value={secondary}
+                  onChange={setSecondary}
+                  disabled={props.loading || !candidates.length}
+                  options={[{ value: '', label: 'No subtitle' }, ...candidates.filter((p) => p.name !== primary).map((p) => ({ value: p.name, label: p.label }))]}
+                />
+              </Field>
+            </div>
+            <Field
+              label="Searched by"
+              hint="What the search box and the list’s own search look inside. Everything else is still filterable."
+            >
+              {props.loading
+                ? <Skeleton height={64} />
+                : (
+                  <div className="crm-checkgrid">
+                    {candidates.map((p) => (
+                      <Checkbox
+                        key={p.name}
+                        checked={searchable.includes(p.name)}
+                        onChange={() => toggleSearchable(p.name)}
+                        label={p.label}
+                      />
+                    ))}
+                  </div>
+                )}
+            </Field>
+          </>
+        )}
       </div>
     </Modal>
   );

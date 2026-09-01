@@ -11,7 +11,7 @@ import type { ChargeListFilter, CollectionResult, IntentListFilter, RefundInput 
 import type { MethodInput, MethodListFilter, MethodUpdateInput } from './methods';
 import { PAYMENTS_MIGRATIONS } from './schema';
 import { seedPayments } from './seed';
-import { paymentsStore } from './store';
+import { paymentsStore, type Payments } from './store';
 import { DECLINES, DECLINE_CODES } from './simulator';
 import {
   BANK_ACCOUNT_TYPES, CARD_BRANDS, CARD_FUNDING, DISPUTE_REASONS, DUNNING_END_BEHAVIORS,
@@ -82,6 +82,27 @@ const collectionStoppedFor = (ctx: Ctx, orgId: string, subscriptionId: string | 
   if (!subscriptionId) return false;
   const sub = ctx.svc.billing.subscription(orgId, subscriptionId);
   return !!sub && (sub.status === 'unpaid' || sub.status === 'paused');
+};
+
+/**
+ * Put a bill back in front of the automatic charge, on exactly the terms
+ * `invoice.finalized` would present it on today.
+ *
+ * Used where something that had settled a bill is undone: the same four
+ * questions that decide whether a fresh bill is charged decide whether a
+ * revived one is, and a campaign that is still recovering owns its own next
+ * window and is left alone rather than made to present twice.
+ */
+const restartCollection = (ctx: Ctx, store: Payments, orgId: string, invoiceId: string): void => {
+  const invoice = billingStore(ctx).billing.invoices.invoice(orgId, invoiceId);
+  if (!invoice || invoice.status !== 'open' || invoice.amount_due <= 0) return;
+  if (invoice.collection_method !== 'charge_automatically') return;
+  if (collectionStoppedFor(ctx, orgId, invoice.subscription)) return;
+  if (!store.methods.defaultFor(orgId, invoice.customer)) return;
+  if (store.dunning.forInvoice(orgId, invoice.id)?.status === 'recovering') return;
+  ctx.enqueue(orgId, 'payments.collect_invoice', { invoice: invoice.id }, {
+    idemKey: `payments.collect_invoice:${invoice.id}`,
+  });
 };
 
 /**
@@ -256,6 +277,15 @@ export default defineModule({
       // down by the one that does it — the same mistake the retry schedule was
       // making, one entry point along.
       if (collectionStoppedFor(ctx, job.org_id, invoice.subscription)) return;
+      // And the same question about the schedule, for the same reason. Every
+      // door that queues one of these asks whether a campaign is already
+      // chasing this bill, because presenting alongside one spends a window it
+      // owns — but the answer can change between the queueing and the run, and
+      // does: a bill can be refused, and a campaign opened over it, by the
+      // very tick that is about to run this job. Read at the moment of
+      // charging, like the stop above, or the schedule is honoured by the code
+      // that queues the work and ignored by the code that does it.
+      if (store.dunning.forInvoice(job.org_id, invoice.id)?.status === 'recovering') return;
       store.gateway.collectInvoice(job.org_id, invoice.id, { source: 'invoice_collection', meta: { actorType: 'system' } });
     });
 
@@ -342,6 +372,54 @@ export default defineModule({
     }, 'payments');
 
     /**
+     * A card arrives after the bill did, so the bills that had nothing to
+     * present are presented.
+     *
+     * The third door into `collectInvoice` that closes and never reopens, and
+     * the module is wrong without this for exactly the reason it was wrong
+     * without the handler above. `invoice.finalized` refuses to queue a
+     * collection for an account with no method on file — rightly, there is
+     * nothing to charge — and then fires once per bill and never again. The
+     * resume handler asks the same question and stands down on the same
+     * answer. So an account billed before anyone put a card on it — a trial
+     * that converts on the day it is opened, a bill raised while the finance
+     * team is still finding the corporate card — is asked for that money
+     * exactly once, at the one moment nobody could pay it, and no automatic
+     * path ever asks again however many working cards arrive afterwards.
+     * Having nothing to charge means "not now"; only a credit note or a
+     * write-off means "not ever".
+     *
+     * Every other question is `restartCollection`'s, which is the same list
+     * `invoice.finalized` runs through — including the one that keeps this
+     * from being an over-correction: a campaign that is still recovering owns
+     * its own next window, so putting a fresh card on an account that is being
+     * chased does not spend one of its attempts early.
+     */
+    ctx.events.on('payment_method.attached', (event) => {
+      const method = event.data as PaymentMethod | null;
+      if (!method?.customer || method.status !== 'attached') return;
+      const held = billing.invoices.list(event.org_id, {
+        customer: method.customer, status: 'open',
+        collection_method: 'charge_automatically', limit: 200,
+      }).data;
+      for (const invoice of held) {
+        // Only the bills the automatic charge never reached, which is the
+        // whole of the defect and the whole of the fix. A recovery campaign —
+        // running, spent or stood down — means the queue owns this bill and
+        // says so in words, down to telling an operator to attach a card and
+        // present it by hand. And an open bill that has been presented before
+        // is open for a *reason* that a new card does not answer: a refund
+        // reopened it, or a chargeback did, and re-presenting a bill the
+        // cardholder is disputing is the mirror image of the money this fix
+        // exists to collect. `invoice.finalized` never sees either state; a
+        // handler that fires on any card, at any time, sees both.
+        if (store.dunning.forInvoice(event.org_id, invoice.id)) continue;
+        if (store.gateway.listIntents(event.org_id, { invoice: invoice.id, status: 'all', limit: 1 }).totalCount > 0) continue;
+        restartCollection(ctx, store, event.org_id, invoice.id);
+      }
+    }, 'payments');
+
+    /**
      * The bill is settled, however it got there — a charge, a human marking it
      * paid, a credit note covering it, account balance absorbing it. There is
      * nothing left to recover, so nothing is left chasing it.
@@ -362,6 +440,72 @@ export default defineModule({
     ctx.events.on('invoice.voided', (event) => {
       if (!event.object_id) return;
       store.dunning.stopFor(event.org_id, event.object_id, 'The invoice was withdrawn, so there is nothing left to chase.');
+    }, 'payments');
+
+    /**
+     * A bill has just shrunk, and it may have shrunk under money already on it.
+     *
+     * Billing routes a credit note to the customer's balance only when the
+     * invoice is `paid`, which reads "has the money arrived" as "has *all* of
+     * it arrived". A bill holding a part payment takes the whole note off what
+     * it was billed, and the slice of it covering cash already collected is
+     * left as a negative `amount_due` — money the customer paid, that the bill
+     * is no longer owed, and that nothing holds for them. It is the same
+     * shortfall `applyCollection` puts on the account when a debit settles
+     * after a credit note lands, arriving in the other order, so it goes to the
+     * same place. A note that lands on a bill nothing has been collected
+     * against changes nothing here.
+     */
+    ctx.events.on('credit_note.created', (event) => {
+      const note = event.data as { invoice?: string; number?: string } | null;
+      if (!note?.invoice) return;
+      store.gateway.settleCreditedExcess(event.org_id, note.invoice, {
+        note: `Credited by ${note.number ?? 'a credit note'}; what had been collected past the new balance went to the account.`,
+        meta: { actorType: 'system' },
+      });
+    }, 'payments');
+
+    /**
+     * A bill has grown back, and it may have grown back over cash this module
+     * moved off it.
+     *
+     * The mirror of the handler above, and the half that was missing: billing's
+     * `void` puts a note back as the note *recorded* itself, and a note that
+     * displaced a part payment recorded the whole of itself as pre-payment. So
+     * the whole amount lands back on `amount_due` while the slice this module
+     * had carried onto the account stays there — the bill is owed the full
+     * amount again with nothing recorded as collected, and the customer's own
+     * money is sitting as credit against that same invoice for the next
+     * presentation to collect a second time.
+     */
+    ctx.events.on('credit_note.voided', (event) => {
+      const note = event.data as { invoice?: string; number?: string; pre_payment_amount?: number } | null;
+      if (!note?.invoice) return;
+      // Read before the cash moves, because this is a question about the bill
+      // as the withdrawal found it: billing has already put the note's amount
+      // back on `amount_due`, so what the bill was owed a moment ago is what it
+      // is owed now less what the note was holding down. Nothing owed then
+      // means the note was the thing settling it.
+      const revived = billingStore(ctx).billing.invoices.invoice(event.org_id, note.invoice);
+      const noteHadSettledIt = !!revived && revived.amount_due - (note.pre_payment_amount ?? 0) <= 0;
+      store.gateway.restoreCreditedExcess(event.org_id, note.invoice, {
+        note: `${note.number ? `Credit note ${note.number}` : 'A credit note'} was withdrawn, so what had been collected against this bill is recorded against it again rather than left as credit on the account.`,
+        meta: { actorType: 'system' },
+      });
+      // And the half of the undo that is not money: a bill the note had settled
+      // has to be chased again, because settling it is what stopped the chase.
+      //
+      // `invoice.paid` went out when the note covered the balance, and this
+      // module answered it by cancelling the campaign and its retry job.
+      // Withdrawing the note puts the debt back and puts nothing back on the
+      // schedule: `invoice.finalized` fires once per bill and fired long ago,
+      // `subscription.updated` only speaks for a pause being lifted, and a
+      // cancelled campaign stays cancelled. So the bill sits open, owed, with a
+      // working card on file, and no automatic path ever presents it again —
+      // the same shape as reversing the cash and leaving the credit behind, one
+      // field along. A note that only reduced a balance settled nothing and
+      // stopped nothing, so nothing is restarted for it.
+      if (noteHadSettledIt) restartCollection(ctx, store, event.org_id, note.invoice);
     }, 'payments');
 
     ctx.events.on('invoice.marked_uncollectible', (event) => {

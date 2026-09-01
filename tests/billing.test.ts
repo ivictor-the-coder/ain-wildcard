@@ -4,6 +4,7 @@ import { createApp, frozenClock, type App } from '../src/server/app';
 import type { Auth } from '../src/server/kernel/http';
 import { DAY } from '../src/shared/time';
 import type { ChangePreview, Invoice, InvoiceLine, ProrationLine, Subscription } from '../src/server/modules/billing/types';
+import { TaxRates } from '../src/server/modules/billing/tax';
 
 const ORG = 'org_demo';
 const DANA: Auth = { kind: 'session', orgId: ORG, userId: 'usr_seed01', role: 'owner', scopes: ['*'], livemode: true };
@@ -3116,7 +3117,12 @@ describe('an invoice Ain could not place', () => {
   test('a workspace that opts out is still told, it is just not held up', async () => {
     const off = await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: false });
     assert.equal(off.enabled, false);
-    assert.match(off.detail, /finalise with no tax/);
+    // The opted-out sentence has to say two things: the bill goes out, and it
+    // is still findable. What it may not say is which field is missing — the
+    // hold reads the state as well as the country now.
+    assert.match(off.detail, /finalise/);
+    assert.match(off.detail, /tax=missing/);
+    assert.doesNotMatch(off.detail, /no resolvable country/i);
 
     const bill = await billFor({});
     assert.equal(bill.invoice.status, 'open', 'opted out, the bill goes out');
@@ -4140,6 +4146,1102 @@ describe('the upcoming invoice the copilot reads out', () => {
         'NYC sales tax 4.5% (New York City): $22.46',
       ], 'every jurisdiction the bill will charge is named');
       assert.equal(answer.adds_up, true);
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 29. A stack where one jurisdiction charges and another does not
+ * ========================================================================== */
+
+describe('a stack where one jurisdiction reverse charges and the other charges', () => {
+  /**
+   * Germany's VAT is reverse charged against a verified registration; a
+   * municipal levy registered over the same address is not, and is charged.
+   * `resolve()` says exactly that, one entry each — so the figure beside them
+   * has to name the rate that produced it and nothing else.
+   */
+  async function berlin() {
+    const ws = await workspace(UTC(2026, 9, 1));
+    await ws.ok('POST', '/v1/tax_rates', {
+      display_name: 'Berlin city levy', jurisdiction: 'Berlin', country: 'DE',
+      tax_type: 'other', percentage: '2',
+    });
+    const growth = await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly');
+    const price = (await ws.ok('POST', '/v1/prices', {
+      product: growth.data[0].product, currency: 'eur', model: 'flat', unit_amount: 10_000,
+      nickname: 'Berlin bench — €100.00, tax exclusive', lookup_key: 'berlin_bench',
+      recurring: { interval: 'month' }, tax_behavior: 'exclusive',
+    })).id as string;
+    const customer = await ws.customer('Berlin Werke', {
+      currency: 'eur',
+      address: { line1: 'Chausseestraße 1', city: 'Berlin', postal_code: '10115', country: 'Germany' },
+      tax_ids: [{ type: 'eu_vat', value: 'DE811907980' }],
+    });
+    await ws.ok('POST', `/v1/customers/${customer.id}/tax_ids/verify`, { value: 'DE811907980', status: 'verified' });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price }] });
+    const raised = await allInvoices(ws, `&subscription=${sub.id}`);
+    assert.equal(raised.length, 1);
+    return { ws, customer, invoice: raised[0] };
+  }
+
+  test('the line states the rate it was charged, not that rate plus the one that was not', async () => {
+    const { ws, invoice } = await berlin();
+    try {
+      assert.equal(invoice.subtotal, 10_000);
+      assert.equal(invoice.tax, 200, 'the levy is charged; the VAT is reverse charged');
+
+      const [line] = invoice.lines;
+      assert.deepEqual(
+        line.taxes.map((entry) => [entry.jurisdiction, entry.percentage, entry.reason, entry.amount]),
+        [['Germany', '19', 'reverse_charge', 0], ['Berlin', '2', 'taxable', 200]],
+        'both jurisdictions are on the line, and the line says which did what',
+      );
+
+      // The roll-up is the figure beside the list, so it has to be a rate that
+      // produced that figure. Summing every jurisdiction regardless of whether
+      // it charged printed "21%" against €2.00 — a rate no authority charged,
+      // on the document a customer checks against their own return.
+      assert.equal(line.tax.amount, 200);
+      assert.equal(line.tax.percentage, '2', 'only the jurisdictions that charged are combined');
+      assert.equal(line.tax.jurisdiction, 'Berlin');
+      assert.equal(
+        Math.round((line.tax.amount / line.amount) * 100 * 1000) / 1000,
+        Number(line.tax.percentage),
+        'the stated rate is the rate the amount was worked out at',
+      );
+
+      const document = String(await ws.ok('GET', `/v1/invoices/${invoice.id}/render`));
+      assert.ok(!document.includes('21%'), 'and no 21% anywhere on the printed bill');
+    } finally { ws.close(); }
+  });
+
+  test('the credit note that reverses it names the same rate', async () => {
+    const { ws, invoice } = await berlin();
+    try {
+      const note = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: invoice.total });
+      assert.equal(note.tax, 200, 'exactly the tax that was charged comes back');
+      assert.equal(note.lines[0].tax_percentage, '2');
+      assert.match(note.lines[0].explanation, /at 2%/);
+      assert.ok(!/21%/.test(note.lines[0].explanation), 'a credit note may not quote a rate nobody charged');
+    } finally { ws.close(); }
+  });
+
+  test('a stack that is uniform still reads exactly as it did', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      // Three jurisdictions, all charged: the combined rate is all three.
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'NYC sales tax', jurisdiction: 'New York City', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '4.5',
+      });
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'MCTD surcharge', jurisdiction: 'MCTD', country: 'US', state: 'New York',
+        tax_type: 'sales_tax', percentage: '0.375',
+      });
+      const manhattan = await ws.customer('Broadway Controls', {
+        address: { line1: '1 Broadway', city: 'New York', state: 'New York', country: 'United States' },
+      });
+      const price = await priceIdOf(ws, 'growth_monthly');
+      const one: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: manhattan.id, items: [{ price }] });
+      const [stacked] = await allInvoices(ws, `&subscription=${one.id}`);
+      assert.equal(stacked.lines[0].tax.percentage, '8.875');
+      assert.equal(stacked.lines[0].tax.jurisdiction, 'New York + New York City + MCTD');
+
+      // And a stack that is uniformly *not* charged still names the rate it
+      // would have been: a reverse-charged bill that stopped saying 19% would
+      // be unfileable in the other direction.
+      const berlinCo = await ws.customer('Hamburg Werke', {
+        currency: 'eur',
+        address: { line1: 'Chausseestraße 1', city: 'Berlin', country: 'Germany' },
+        tax_ids: [{ type: 'eu_vat', value: 'DE811907980' }],
+      });
+      await ws.ok('POST', `/v1/customers/${berlinCo.id}/tax_ids/verify`, { value: 'DE811907980', status: 'verified' });
+      const growth = await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly');
+      const euro = (await ws.ok('POST', '/v1/prices', {
+        product: growth.data[0].product, currency: 'eur', model: 'flat', unit_amount: 10_000,
+        nickname: 'Hamburg bench', lookup_key: 'hamburg_bench', recurring: { interval: 'month' },
+        tax_behavior: 'exclusive',
+      })).id as string;
+      const two: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: berlinCo.id, items: [{ price: euro }] });
+      const [shifted] = await allInvoices(ws, `&subscription=${two.id}`);
+      assert.equal(shifted.tax, 0);
+      assert.equal(shifted.lines[0].tax.reason, 'reverse_charge');
+      assert.equal(shifted.lines[0].tax.percentage, '19', 'the rate it would have been is still named');
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 30. The next bill a screen predicts says whether it can be sent
+ * ========================================================================== */
+
+describe('the next bill a screen predicts', () => {
+  /** An account with nothing to place it by, and one that is placed. */
+  async function accounts() {
+    const ws = await workspace(UTC(2026, 9, 1));
+    await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+    const price = await priceIdOf(ws, 'growth_monthly');
+    const nowhere = await ws.customer('Nowhere Robotics');
+    const placed = await ws.customer('Cleveland Robotics', {
+      address: { line1: '1200 Superior Avenue East', city: 'Cleveland', state: 'Ohio', country: 'United States' },
+    });
+    const held: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: nowhere.id, items: [{ price }] });
+    const sent: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: placed.id, items: [{ price }] });
+    return { ws, nowhere, placed, held, sent };
+  }
+
+  test('the customer summary says the bill it predicts will be held, not just that it is $0 of tax', async () => {
+    const { ws, nowhere, placed } = await accounts();
+    try {
+      const stuck = await ws.ok('GET', `/v1/customers/${nowhere.id}/summary`);
+      assert.ok(stuck.next_invoice, 'there is a next bill to predict');
+      assert.equal(stuck.next_invoice.tax, 0);
+      // The sibling of the upcoming-invoice preview, which already says this.
+      // Without it the panel predicts a bill at zero tax and never mentions
+      // that the workspace will refuse to send it.
+      assert.equal(stuck.next_invoice.automatic_tax.enabled, true);
+      assert.equal(stuck.next_invoice.automatic_tax.status, 'requires_location_inputs');
+      assert.match(stuck.next_invoice.automatic_tax.detail, /country/i);
+      assert.ok(
+        (stuck.attention as string[]).some((note) => /country/i.test(note)),
+        'and the account is flagged for the thing that is missing',
+      );
+
+      const fine = await ws.ok('GET', `/v1/customers/${placed.id}/summary`);
+      assert.equal(fine.next_invoice.automatic_tax.status, 'complete');
+      assert.ok(!(fine.attention as string[]).some((note) => /no country/i.test(note)));
+    } finally { ws.close(); }
+  });
+
+  test('the copilot says it too, rather than quoting a total nobody will be sent', async () => {
+    const { ws, held, sent } = await accounts();
+    try {
+      const tool = ws.app.ctx.ai.tool('billing_upcoming_invoice')!;
+      const stuck = await tool.run({ subscription: held.id }, ws.app.ctx, { orgId: ORG }) as {
+        automatic_tax: { enabled: boolean; status: string; detail: string };
+      };
+      assert.equal(stuck.automatic_tax.status, 'requires_location_inputs');
+      assert.match(stuck.automatic_tax.detail, /country/i);
+
+      const fine = await tool.run({ subscription: sent.id }, ws.app.ctx, { orgId: ORG }) as {
+        automatic_tax: { status: string };
+      };
+      assert.equal(fine.automatic_tax.status, 'complete');
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 31. The tax-rate reference describes the engine it documents
+ * ========================================================================== */
+
+describe('the tax-rate API reference', () => {
+  test('does not still promise the most-specific rate wins', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      const doc = await ws.ok('GET', '/openapi.json');
+      const list = doc.paths['/v1/tax_rates'].get.description as string;
+      const register = doc.paths['/v1/tax_rates'].post.description as string;
+
+      // The engine stacks every rate an address matches and charges their sum.
+      // The reference was written for the engine that picked one of them, and
+      // a customer reading it would price a New York bill at 4%.
+      assert.ok(!/most specific/i.test(list), `GET still documents most-specific-wins: ${list}`);
+      assert.ok(!/never match two|can never match two|one active rate per country and state/i.test(register),
+        `POST still documents one rate per address: ${register}`);
+      assert.match(list, /stack|every (active )?rate|all of them|sum/i);
+      assert.match(register, /stack|jurisdiction/i);
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 32. What a change collects, when the change is a credit
+ * ========================================================================== */
+
+describe('the amount a change collects now', () => {
+  test('is the bill it raises, whichever way the lines net', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      const customer = await ws.customer('Cuyahoga Automation', {
+        address: { line1: '1200 Superior Avenue East', city: 'Cleveland', state: 'Ohio', country: 'United States' },
+      });
+      const growth = await priceIdOf(ws, 'growth_monthly');
+      const starter = await priceIdOf(ws, 'starter_monthly');
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: growth }],
+      });
+      // The account is already carrying a charge forward — the invoice this
+      // change raises draws it down, so the change collects money even though
+      // its own lines are worth less than nothing.
+      await ws.ok('POST', `/v1/customers/${customer.id}/balance_transactions`, {
+        amount: 40_000, description: 'Carried forward from the July bill.',
+      });
+
+      const change = { items: [{ id: sub.items[0].id, price: starter }], proration_date: midpointOf(sub), proration_behavior: 'always_invoice' as const };
+      const preview: ChangePreview = await ws.ok('POST', `/v1/subscriptions/${sub.id}/preview`, change);
+      assert.equal(preview.credit_total, -24_950);
+      assert.equal(preview.charge_total, 4_950);
+      assert.equal(preview.net, -20_000);
+      assert.equal(preview.customer_balance, 40_000);
+
+      // `amount_due_now` is documented as the `amount_due` of the bill
+      // always_invoice raises, tax and balance included. Reading it only when
+      // the lines net positive answered $0.00 for a change that collects
+      // $188.50 — on the button that takes the money.
+      assert.equal(preview.tax_due_now, -1_150, '5.75% Ohio, credited on the credit and charged on the charge');
+      assert.equal(preview.amount_due_now, 18_850);
+
+      await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, change);
+      const raised = (await allInvoices(ws, `&subscription=${sub.id}`))
+        .find((invoice) => invoice.billing_reason === 'subscription_update');
+      assert.ok(raised, 'the change did raise a bill');
+      assert.equal(raised.subtotal, preview.net);
+      assert.equal(raised.tax, preview.tax_due_now, 'the tax previewed is the tax billed');
+      assert.equal(raised.amount_due, preview.amount_due_now, 'and the figure previewed is the figure collected');
+      assert.equal(raised.total, 18_850);
+    } finally { ws.close(); }
+  });
+
+  test('is still nothing when a credit has no balance to draw against', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      const customer = await ws.customer('Boise Fabrication', {
+        address: { line1: '900 Main Street', city: 'Boise', state: 'Idaho', country: 'United States' },
+      });
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: await priceIdOf(ws, 'growth_monthly') }],
+      });
+      const preview: ChangePreview = await ws.ok('POST', `/v1/subscriptions/${sub.id}/preview`, {
+        items: [{ id: sub.items[0].id, price: await priceIdOf(ws, 'starter_monthly') }],
+        proration_date: midpointOf(sub), proration_behavior: 'always_invoice',
+      });
+      assert.ok(preview.net < 0);
+      assert.equal(preview.amount_due_now, 0, 'a credit is never collected, and never paid out');
+    } finally { ws.close(); }
+  });
+
+  test('says whether the bill it would raise can be sent at all', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+      const customer = await ws.customer('Nowhere Robotics');
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: await priceIdOf(ws, 'starter_monthly') }],
+      });
+      const change = {
+        items: [{ id: sub.items[0].id, price: await priceIdOf(ws, 'growth_monthly') }],
+        proration_date: midpointOf(sub), proration_behavior: 'always_invoice' as const,
+      };
+      const preview: ChangePreview = await ws.ok('POST', `/v1/subscriptions/${sub.id}/preview`, change);
+      assert.ok(preview.amount_due_now > 0, 'the change is an upgrade, so it collects');
+      // The third reader of the same question, and the one with a figure on a
+      // button beside it: this bill will be held as a draft, so the amount is
+      // what it is worth, not what anyone is about to collect.
+      assert.equal(preview.automatic_tax.enabled, true);
+      assert.equal(preview.automatic_tax.status, 'requires_location_inputs');
+      assert.match(preview.automatic_tax.detail, /country/i);
+
+      await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, change);
+      const raised = (await allInvoices(ws, `&subscription=${sub.id}`))
+        .find((invoice) => invoice.billing_reason === 'subscription_update');
+      assert.ok(raised);
+      assert.equal(raised.status, 'draft', 'and it was indeed held rather than collected');
+      assert.equal(raised.amount_due, preview.amount_due_now);
+
+      // With a country on the account the same preview says so.
+      await ws.ok('PATCH', `/v1/customers/${customer.id}`, {
+        address: { line1: '1200 Superior Avenue East', city: 'Cleveland', state: 'Ohio', country: 'United States' },
+      });
+      const placed: ChangePreview = await ws.ok('POST', `/v1/subscriptions/${sub.id}/preview`, {
+        items: [{ id: sub.items[0].id, price: await priceIdOf(ws, 'starter_monthly') }],
+      });
+      assert.equal(placed.automatic_tax.status, 'complete');
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 33. What a draft invoice says it is
+ * ========================================================================== */
+
+describe('the sentence a draft invoice prints about itself', () => {
+  test('a bill held for want of a country does not blame a pause that is not there', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+      const customer = await ws.customer('Nowhere Robotics');
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: await priceIdOf(ws, 'growth_monthly') }],
+      });
+      const [held] = await allInvoices(ws, `&subscription=${sub.id}`);
+      assert.equal(held.status, 'draft');
+      assert.equal(held.automatic_tax.status, 'requires_location_inputs');
+      assert.equal(sub.pause_collection, null, 'nothing about this subscription is paused');
+
+      // `status_detail` is the sentence a screen prints under the status pill.
+      // A second reason for a draft arrived with the tax-location hold and this
+      // sentence was never told: it sent a support agent to look for a pause
+      // that does not exist while the account sat there without a country.
+      const detail = (await ws.ok('GET', `/v1/invoices/${held.id}`)).status_detail as string;
+      assert.ok(!/collection is paused/i.test(detail), `still blames a pause: ${detail}`);
+      assert.match(detail, /country/i);
+
+      // And the tool whose whole job is "why is this bill what it is?".
+      const explained = await ws.app.ctx.ai.tool('billing_explain_invoice')!.run(
+        { invoice: held.id }, ws.app.ctx, { orgId: ORG },
+      ) as { automatic_tax: { status: string; detail: string } };
+      assert.equal(explained.automatic_tax.status, 'requires_location_inputs');
+      assert.match(explained.automatic_tax.detail, /country/i);
+    } finally { ws.close(); }
+  });
+
+  test('and a bill held because collection really is paused still says so', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+      const customer = await ws.customer('Cuyahoga Automation', {
+        address: { line1: '1200 Superior Avenue East', city: 'Cleveland', state: 'Ohio', country: 'United States' },
+      });
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: await priceIdOf(ws, 'starter_monthly') }],
+      });
+      await ws.ok('POST', `/v1/subscriptions/${sub.id}/pause`, { behavior: 'keep_as_draft' });
+      await ws.travelTo(sub.current_period_end + 60_000);
+      const renewal = (await allInvoices(ws, `&subscription=${sub.id}`))
+        .find((invoice) => invoice.billing_reason === 'subscription_cycle');
+      assert.ok(renewal);
+      assert.equal(renewal.status, 'draft');
+      assert.equal(renewal.automatic_tax.status, 'complete');
+      const detail = (await ws.ok('GET', `/v1/invoices/${renewal.id}`)).status_detail as string;
+      assert.match(detail, /paused/i);
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 34. The register is not a page
+ * ========================================================================== */
+
+describe('a tax register bigger than one listing page', () => {
+  /**
+   * Both halves of the register's contract — which jurisdictions an address is
+   * in, and whether a jurisdiction is already registered — used to be decided
+   * from `list({ limit: 500 })`, a page of the listing API. The bound is
+   * applied by SQL before either question is asked, and the rows are ordered by
+   * state, so `California` pushes `Texas` off the end.
+   *
+   * A US sales-tax workspace crosses 500 active rates in one country as a
+   * matter of course: Texas alone has some 1,600 local taxing jurisdictions,
+   * and this module's own `POST /v1/tax_rates` invites exactly that stacking.
+   */
+  const AUSTIN = {
+    address: { line1: '1 Main', city: 'Austin', state: 'Texas', postal_code: '78701', country: 'United States' },
+  };
+
+  const registerCaliforniaDistricts = async (ws: Workspace, count = 500): Promise<void> => {
+    for (let i = 0; i < count; i += 1) {
+      await ws.ok('POST', '/v1/tax_rates', {
+        display_name: `CA district ${i}`, jurisdiction: `CA District ${i}`,
+        country: 'US', state: 'California', tax_type: 'sales_tax', percentage: '0.01',
+      });
+    }
+  };
+
+  const austinBill = async (ws: Workspace): Promise<Invoice> => {
+    const customer = await ws.customer('Austin Fabrication', AUSTIN);
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: await priceIdOf(ws, 'growth_monthly') }],
+    });
+    const [invoice] = await allInvoices(ws, `&subscription=${sub.id}`);
+    return invoice;
+  };
+
+  test('a state past the page is still charged the rate registered over it', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      await registerCaliforniaDistricts(ws);
+
+      const invoice = await austinBill(ws);
+      assert.equal(invoice.tax, 3_119, '6.25% of $499.00 — the seeded Texas rate is registered and active');
+      assert.equal(invoice.subtotal, GROWTH);
+      assert.equal(invoice.lines[0].tax.percentage, '6.25');
+      assert.equal(invoice.lines[0].tax.reason, 'taxable');
+      assert.deepEqual(
+        invoice.lines[0].taxes.map((entry) => entry.jurisdiction), ['Texas'],
+        'a Texas address is in Texas and in no Californian district',
+      );
+      assert.match(
+        String(invoice.lines[0].tax.explanation), /6\.25%/,
+        'the line states the rate that was charged, not that none is registered',
+      );
+
+      // Every net the hold put up misses this one, because the country did
+      // resolve: it is the rate that went missing, not the address.
+      assert.equal(invoice.automatic_tax.status, 'complete');
+      const queue = await ws.ok('GET', '/v1/invoices?tax=missing&status=all');
+      assert.equal(queue.total_count, 0, 'and there is nothing for it to have caught');
+    } finally { ws.close(); }
+  });
+
+  test('the listing says how big the register is, not how big its page is', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      await registerCaliforniaDistricts(ws);
+      const page = await ws.ok('GET', '/v1/tax_rates?country=US&active=true&limit=500');
+      assert.equal(page.data.length, 500, 'a response body is bounded, and this one is full');
+      assert.equal(page.total_count, 508, '500 Californian districts and the 8 seeded US state rates');
+      assert.equal(page.has_more, true, 'so the page never passes itself off as the whole book');
+    } finally { ws.close(); }
+  });
+
+  test('the same jurisdiction is still refused past the page, and charged once', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      await registerCaliforniaDistricts(ws);
+
+      // The mirror image, from the same root: a refusal that scans a page stops
+      // firing at row 501, and the duplicate it lets through is charged twice
+      // on every Austin bill the day the districts are retired.
+      await ws.fail('POST', '/v1/tax_rates', {
+        display_name: 'TX sales tax (2027)', jurisdiction: 'Texas', country: 'US', state: 'Texas',
+        tax_type: 'sales_tax', percentage: '6.25',
+      }, 409, 'tax_rate_exists');
+
+      const invoice = await austinBill(ws);
+      assert.equal(
+        invoice.lines[0].taxes.filter((entry) => entry.jurisdiction === 'Texas').length, 1,
+        'the refusal is worth having only if the bill shows Texas once',
+      );
+      assert.equal(invoice.tax, 3_119, 'not 6,238 — which is Texas charged twice');
+      assert.equal(invoice.lines[0].tax.percentage, '6.25', 'and not "12.5", a rate no authority has ever set');
+    } finally { ws.close(); }
+  });
+
+  test('bringing a retired rate back runs the refusal registering it runs', async () => {
+    const ws = await workspace(UTC(2026, 9, 1));
+    try {
+      // Every step here is legitimate on its own: register Columbus, retire it,
+      // register its replacement. Reactivating the retired one is what would
+      // leave two active rates naming Columbus over one Ohio address, so the
+      // rule belongs to the transition rather than to whoever calls it.
+      const first = await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'Columbus city tax', jurisdiction: 'Columbus', country: 'US', state: 'Ohio',
+        tax_type: 'sales_tax', percentage: '1.25',
+      });
+      await ws.ok('POST', `/v1/tax_rates/${first.id}/deactivate`, {});
+      const replacement = await ws.ok('POST', '/v1/tax_rates', {
+        display_name: 'Columbus city tax (2027)', jurisdiction: 'Columbus', country: 'US', state: 'Ohio',
+        tax_type: 'sales_tax', percentage: '1.5',
+      });
+
+      const register = new TaxRates(ws.app.ctx, ORG);
+      assert.throws(
+        () => ws.app.ctx.atomic(() => register.setActive(first.id, true, ws.now())),
+        /already has an active rate/,
+        'reactivating it would charge Columbus twice on every Cleveland-area bill',
+      );
+      assert.equal(register.get(first.id)?.active, false, 'and the refusal wrote nothing');
+
+      // And the refusal was not bought by banning reactivation: once the
+      // replacement is retired, the original may come back.
+      ws.app.ctx.atomic(() => register.setActive(replacement.id, false, ws.now()));
+      const revived = ws.app.ctx.atomic(() => register.setActive(first.id, true, ws.now()));
+      assert.equal(revived.active, true);
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 35. A country registered state by state, and an address with no state
+ * ========================================================================== */
+
+/**
+ * The hold that keeps an unplaceable bill off the wire was anchored to one
+ * field: `location_known` was `country !== null`. But the register a US address
+ * is matched against is kept *state by state* — Northwind has eight of them and
+ * nothing country-wide — so "US" with no state matches nothing at all, and the
+ * empty answer it gets back is the same empty answer New Zealand gets, where
+ * the workspace really is registered nowhere.
+ *
+ * So the bill went out at 0%, reported `automatic_tax.status: 'complete'`, said
+ * on its own face that no rate is registered for US, and stayed out of the one
+ * queue a finance team works down. Eight rates are registered, the supplier is
+ * the one the authority comes to, and nothing anywhere said so.
+ */
+describe('a country whose tax is registered state by state', () => {
+  const OHIO = { line1: '1200 Superior Avenue East', city: 'Cleveland', state: 'Ohio', country: 'US' };
+
+  const billFor = async (ws: Workspace, name: string, address?: Record<string, string>) => {
+    const customer = await ws.customer(name, address ? { address } : {});
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'starter_monthly' }],
+    });
+    const [invoice] = await allInvoices(ws, `&subscription=${sub.id}`);
+    return { customer, invoice };
+  };
+
+  test('an address with the country and no state is held, not billed at nothing', async () => {
+    const ws = await workspace(UTC(2026, 5, 3));
+    try {
+      await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+
+      // The control: the same country, with the state on it, is placed and charged.
+      const placed = await billFor(ws, 'Cuyahoga Automation', OHIO);
+      assert.equal(placed.invoice.automatic_tax.status, 'complete');
+      assert.equal(placed.invoice.status, 'open');
+      assert.equal(placed.invoice.tax, 569, 'Ohio charges 5.75% on $99.00');
+
+      // The same address with the one field missing. Ain is registered in eight
+      // US states; "US" cannot say which of them this supply is in.
+      const vague = await billFor(ws, 'Superior Fabricating', { line1: OHIO.line1, city: OHIO.city, country: 'US' });
+      assert.equal(vague.invoice.tax, 0);
+      assert.equal(
+        vague.invoice.automatic_tax.status, 'requires_location_inputs',
+        'a country whose register is kept state by state has not been answered by a country alone',
+      );
+      assert.equal(vague.invoice.status, 'draft', 'so the bill is held rather than sent at 0%');
+      assert.doesNotMatch(
+        vague.invoice.lines[0].tax.explanation ?? '', /No tax rate is registered/i,
+        'and the line does not claim nothing is registered in the US, because eight rates are',
+      );
+
+      // It is refused for the same reason, and the refusal names the field.
+      const error = await ws.fail(
+        'POST', `/v1/invoices/${vague.invoice.id}/finalize`, {}, 400, 'customer_tax_location_invalid',
+      );
+      assert.match(error.message, /no state/i);
+
+      // And it is in the queue, and counted, exactly like a bill with no country.
+      const missing = await ws.ok('GET', '/v1/invoices?tax=missing&limit=200');
+      assert.ok((missing.data as Invoice[]).some((invoice) => invoice.id === vague.invoice.id));
+      const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+      assert.equal(overview.untaxed_invoices.missing_tax_location, 1);
+      assert.equal(overview.untaxed_invoices.held_in_draft, 1);
+    } finally { ws.close(); }
+  });
+
+  test('the state arriving unblocks it, and it is priced at the rate it should always have carried', async () => {
+    const ws = await workspace(UTC(2026, 5, 3));
+    try {
+      await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+      const { customer, invoice } = await billFor(ws, 'Superior Fabricating', {
+        line1: OHIO.line1, city: OHIO.city, country: 'US',
+      });
+      assert.equal(invoice.status, 'draft');
+
+      await ws.ok('PATCH', `/v1/customers/${customer.id}`, { address: OHIO });
+      const open: Invoice = await ws.ok('POST', `/v1/invoices/${invoice.id}/finalize`);
+      assert.equal(open.status, 'open');
+      assert.equal(open.tax, 569, 'the held draft is priced again against the jurisdiction it now names');
+      assert.equal(open.total, 9_900 + 569);
+      assert.equal(open.automatic_tax.status, 'complete');
+    } finally { ws.close(); }
+  });
+
+  test('a country with nothing registered in it is still a complete answer', async () => {
+    const ws = await workspace(UTC(2026, 5, 3));
+    try {
+      await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+      // Nothing is registered in New Zealand, so "New Zealand" answers the
+      // question wherever in it the customer is. Holding this bill would be the
+      // mirror-image mistake: a refusal that never lifts, on an address that is
+      // as complete as it will ever be.
+      const { invoice } = await billFor(ws, 'Auckland Instruments', { line1: '12 Quay Street', city: 'Auckland', country: 'NZ' });
+      assert.equal(invoice.tax, 0);
+      assert.equal(invoice.automatic_tax.status, 'complete');
+      assert.equal(invoice.status, 'open');
+
+      // And a state that is spelled out but registered nowhere is also an
+      // answer: Ain knows where they are and does not collect there.
+      const nevada = await billFor(ws, 'Reno Controls', { line1: '1 Virginia Street', city: 'Reno', state: 'Nevada', country: 'US' });
+      assert.equal(nevada.invoice.tax, 0);
+      assert.equal(nevada.invoice.automatic_tax.status, 'complete');
+      assert.equal(nevada.invoice.status, 'open');
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 36. The balance draw a screen predicts, when the next bill is a credit
+ * ========================================================================== */
+
+/**
+ * `Invoices.issue()` settles a bill against the account balance with one
+ * formula — `total = max(0, subtotal + tax + balance)`, and what the bill drew
+ * is `total - subtotal - tax`. The customer summary carried its own: clamp the
+ * draw against `max(0, gross)` when the account holds credit, hand the balance
+ * straight through when it owes.
+ *
+ * The two agree on every bill worth more than nothing, which is why nobody
+ * looked. They disagree the moment one is not: a mid-cycle downgrade waiting to
+ * be swept up makes the next bill a net credit, the bill puts its whole value
+ * onto the account, and the panel said `balance_applied: 0`.
+ */
+describe('the balance draw the customer summary predicts', () => {
+  const OHIO = { line1: '1200 Superior Avenue East', city: 'Cleveland', state: 'Ohio', country: 'US' };
+
+  test('is the draw the bill makes, when the next bill is worth less than nothing', async () => {
+    const ws = await workspace(UTC(2026, 1, 2));
+    try {
+      const customer = await ws.customer('Cuyahoga Automation', { address: OHIO });
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: 'scale_monthly' }],
+      });
+      // A downgrade left waiting, worth far more than the fee it will sit beside.
+      await ws.travelTo(midpointOf(sub));
+      await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+        items: [{ id: sub.items[0].id, price: 'starter_monthly' }], proration_behavior: 'create_prorations',
+      });
+
+      const predicted = (await ws.ok('GET', `/v1/customers/${customer.id}/summary`)).next_invoice;
+      // The upcoming-invoice preview already reads the bill's own formula, so
+      // the two previews of one bill are checked against each other as well.
+      const upcoming: Invoice = await ws.ok('POST', '/v1/invoices/create_preview', { subscription: sub.id });
+      const gross = predicted.subtotal + predicted.uninvoiced_total + predicted.tax;
+      assert.ok(gross < 0, 'the next bill is a net credit');
+      assert.equal(predicted.estimated_total, 0, 'nothing is collectable on it');
+      assert.equal(
+        predicted.balance_applied, -gross,
+        'and everything it is worth goes onto the account, which is what the bill will record',
+      );
+      assert.equal(predicted.balance_applied, upcoming.balance_applied,
+        'the two previews of one bill agree');
+
+      // Then the bill itself, once it is raised.
+      await ws.travelTo(sub.current_period_end + 60_000);
+      const raised = (await allInvoices(ws, `&subscription=${sub.id}`))
+        .find((invoice) => invoice.subtotal < 0);
+      assert.ok(raised, 'the credit lines reached a bill');
+      assert.equal(raised.total, 0);
+      assert.equal(raised.balance_applied, predicted.balance_applied,
+        'the panel predicted the movement the bill made');
+      const after = await ws.ok('GET', `/v1/customers/${customer.id}`);
+      assert.equal(after.balance, -raised.balance_applied, 'and the account holds it');
+    } finally { ws.close(); }
+  });
+
+  test('is unchanged for every bill that is worth something', async () => {
+    const ws = await workspace(UTC(2026, 1, 2));
+    try {
+      const customer = await ws.customer('Halstead Precision', { address: OHIO });
+      await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price: 'growth_monthly' }] });
+
+      // Holding credit: the bill draws what it needs and no more.
+      await ws.ok('POST', `/v1/customers/${customer.id}/balance_transactions`, {
+        amount: -20_000, description: 'Goodwill credit',
+      });
+      let next = (await ws.ok('GET', `/v1/customers/${customer.id}/summary`)).next_invoice;
+      assert.equal(next.balance_applied, -20_000);
+      assert.equal(next.estimated_total, next.subtotal + next.tax - 20_000);
+
+      // Owing: the debit is carried onto the bill in full.
+      await ws.ok('POST', `/v1/customers/${customer.id}/balance_transactions`, {
+        amount: 50_000, description: 'Carried forward',
+      });
+      next = (await ws.ok('GET', `/v1/customers/${customer.id}/summary`)).next_invoice;
+      assert.equal(next.balance_applied, 30_000);
+      assert.equal(next.estimated_total, next.subtotal + next.tax + 30_000);
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 37. Withdrawing a bill that has already been corrected
+ * ========================================================================== */
+
+/**
+ * `voidInvoice` returned the balance the bill drew and released the rows it
+ * claimed, and stopped there. The credit notes raised against it stayed
+ * `issued`, worth what they were worth, pointing at a document that no longer
+ * exists.
+ *
+ * Nothing in this module noticed, because every reader here reaches the notes
+ * *through* the invoice. The reader that does not is the collections report,
+ * which sums `billing_credit_notes` on its own while excluding voided invoices
+ * from billings, ageing and DSO — so the month goes on reporting a credit
+ * against a bill it says was never raised.
+ *
+ * And the undo of the undo was worse: `CreditNotes.void()` recomputes
+ * `amount_due` from the invoice's `total` without asking whether the bill is
+ * still standing, so withdrawing the note put the full amount back as *due* on
+ * a bill that had been struck out — and `assertBalanced` exempts void invoices
+ * from the identity that would have caught it.
+ */
+describe('withdrawing a bill that has a credit note against it', () => {
+  const OHIO = { line1: '1200 Superior Avenue East', city: 'Cleveland', state: 'Ohio', country: 'US' };
+
+  const billed = async (ws: Workspace, name: string) => {
+    const customer = await ws.customer(name, { address: OHIO });
+    await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], collection_method: 'send_invoice',
+    });
+    const [invoice] = await allInvoices(ws, `&customer=${customer.id}`);
+    assert.equal(invoice.status, 'open');
+    return { customer, invoice };
+  };
+
+  test('is refused while the note stands, and the note keeps pointing at a bill that is', async () => {
+    const ws = await workspace(UTC(2026, 3, 6));
+    try {
+      const { invoice } = await billed(ws, 'Cuyahoga Automation');
+      const note = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 10_000 });
+
+      const error = await ws.fail('POST', `/v1/invoices/${invoice.id}/void`, {}, 409, 'invoice_has_credit_notes');
+      assert.match(error.message, new RegExp(note.number));
+
+      const after: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+      assert.equal(after.status, 'open', 'the refusal wrote nothing');
+      assert.equal(after.pre_payment_credit_notes_amount, 10_000);
+      assert.equal(after.amount_due, invoice.total - 10_000);
+    } finally { ws.close(); }
+  });
+
+  test('is refused on a bill already written off, which is the same bill one status over', async () => {
+    const ws = await workspace(UTC(2026, 3, 6));
+    try {
+      const { invoice } = await billed(ws, 'Superior Fabricating');
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 10_000 });
+      await ws.ok('POST', `/v1/invoices/${invoice.id}/mark_uncollectible`);
+      await ws.fail('POST', `/v1/invoices/${invoice.id}/void`, {}, 409, 'invoice_has_credit_notes');
+      assert.equal((await ws.ok('GET', `/v1/invoices/${invoice.id}`)).status, 'uncollectible');
+    } finally { ws.close(); }
+  });
+
+  test('a withdrawn bill is never owed anything, whichever order the two are undone in', async () => {
+    const ws = await workspace(UTC(2026, 3, 6));
+    try {
+      const { customer, invoice } = await billed(ws, 'Erie Handling');
+      const note = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 10_000 });
+
+      // The order that is allowed: withdraw the correction, then the bill.
+      await ws.ok('POST', `/v1/credit_notes/${note.id}/void`);
+      const reopened: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+      assert.equal(reopened.amount_due, invoice.total, 'the note going back makes the bill owed in full again');
+
+      const voided: Invoice = await ws.ok('POST', `/v1/invoices/${invoice.id}/void`);
+      assert.equal(voided.status, 'void');
+      assert.equal(voided.amount_due, 0, 'a withdrawn bill is owed nothing');
+      assert.equal(voided.pre_payment_credit_notes_amount, 0);
+
+      // Nothing is left standing against it in either book.
+      const notes = await ws.ok('GET', `/v1/credit_notes?invoice=${invoice.id}&status=all`);
+      assert.ok((notes.data as { status: string }[]).every((row) => row.status === 'void'),
+        'no correction stands against a bill that was withdrawn');
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0);
+    } finally { ws.close(); }
+  });
+});
+
+/**
+ * The refusal above closes the door; this closes the identity behind it.
+ *
+ * `CreditNotes.void()` puts `amount_due` back from `total` with no regard for
+ * whether the bill is still standing, and `assertBalanced` exempts void
+ * invoices from the clause that would have caught it — so the one state nobody
+ * checked was a withdrawn bill claiming its full value is owed. Reached here
+ * the only way it now can be, by writing the status underneath the module.
+ */
+test('a withdrawn bill that is put back as owed is refused, not committed', async () => {
+  const ws = await workspace(UTC(2026, 3, 6));
+  try {
+    const customer = await ws.customer('Ashtabula Conveyors', {
+      address: { line1: '1200 Superior Avenue East', city: 'Cleveland', state: 'Ohio', country: 'US' },
+    });
+    await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], collection_method: 'send_invoice',
+    });
+    const [invoice] = await allInvoices(ws, `&customer=${customer.id}`);
+    const note = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 10_000 });
+
+    // Struck out underneath the module, the way a bad migration or an older
+    // build would have left it.
+    ws.app.ctx.db.patch('billing_invoices', 'id', invoice.id, {
+      status: 'void', voided_at: ws.now(), amount_due: 0,
+    });
+
+    const res = await ws.call('POST', `/v1/credit_notes/${note.id}/void`, {});
+    assert.equal(res.status, 500, `withdrawing the note put ${res.status} back onto a void bill`);
+    const after: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(after.status, 'void');
+    assert.equal(after.amount_due, 0, 'a withdrawn bill is never owed anything');
+    assert.equal((await ws.ok('GET', `/v1/credit_notes/${note.id}`)).status, 'issued',
+      'and the refusal took the whole transaction with it');
+  } finally { ws.close(); }
+});
+
+/* ========================================================================== *
+ * 38. The register's shape, not the answer it happened to give
+ * ========================================================================== */
+
+/**
+ * The state hold reads "nothing matched, and this address names no state" as
+ * "the register here is kept state by state". That inference holds only while a
+ * country registers state rates and nothing else.
+ *
+ * Register one country-wide rate over the same eight states — the shape section
+ * 13 already bills, and the shape the original brief named — and every
+ * state-less US address matches that one, comes back non-empty and sails
+ * through: 2% charged against a 7.75% liability, `automatic_tax.status:
+ * 'complete'`, out of the queue, out of the count, and the line saying the
+ * federal levy "is added on top of the amount" as though that were the whole
+ * of it. It is the reported defect one register-shape over, and quieter,
+ * because the bill now carries a tax figure that looks like an answer.
+ *
+ * What is missing is the state. Whether something else matched is not the
+ * question.
+ */
+describe('a state-less address in a country that registers both a country-wide rate and state ones', () => {
+  const CLEVELAND = { line1: '1200 Superior Avenue East', city: 'Cleveland', country: 'US' };
+  const OHIO = { ...CLEVELAND, state: 'Ohio' };
+
+  /** Northwind's eight state rates, plus a levy registered over the whole US. */
+  const withFederalLevy = async (at: number): Promise<Workspace> => {
+    const ws = await workspace(at);
+    await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+    await ws.ok('POST', '/v1/tax_rates', {
+      display_name: 'US federal levy', jurisdiction: 'United States', country: 'US',
+      tax_type: 'sales_tax', percentage: '2',
+    });
+    return ws;
+  };
+
+  const billFor = async (ws: Workspace, name: string, address: Record<string, string>, price = 'starter_monthly') => {
+    const customer = await ws.customer(name, { address });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price }] });
+    const [invoice] = await allInvoices(ws, `&subscription=${sub.id}`);
+    return { customer, invoice };
+  };
+
+  test('is held, not billed at the country-wide rate alone', async () => {
+    const ws = await withFederalLevy(UTC(2026, 5, 3));
+    try {
+      // The control: the state is on the address, so both jurisdictions charge.
+      const placed = await billFor(ws, 'Cuyahoga Automation', OHIO);
+      assert.equal(placed.invoice.tax, 198 + 569, '2% + 5.75% of $99.00');
+      assert.equal(placed.invoice.status, 'open');
+      assert.equal(placed.invoice.automatic_tax.status, 'complete');
+
+      // The same address with the one field missing. The federal levy matches
+      // it and Ohio cannot, so the answer comes back non-empty — and short.
+      const vague = await billFor(ws, 'Superior Fabricating', CLEVELAND);
+      assert.equal(vague.invoice.tax, 198, 'the country-wide levy still charges what it charges');
+      assert.equal(
+        vague.invoice.automatic_tax.status, 'requires_location_inputs',
+        '2% of a 7.75% liability is not a finished answer just because it is not zero',
+      );
+      assert.equal(vague.invoice.status, 'draft', 'so the bill is held rather than sent short');
+      assert.match(
+        vague.invoice.lines[0].tax.explanation ?? '', /registered state by state/i,
+        'and the line says what it could not work out, for the workspace that has the hold off',
+      );
+
+      // The refusal names the field, and the bill is in the queue and counted.
+      const error = await ws.fail(
+        'POST', `/v1/invoices/${vague.invoice.id}/finalize`, {}, 400, 'customer_tax_location_invalid',
+      );
+      assert.match(error.message, /no state/i);
+      const missing = await ws.ok('GET', '/v1/invoices?tax=missing&limit=200');
+      assert.ok((missing.data as Invoice[]).some((invoice) => invoice.id === vague.invoice.id));
+      const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+      assert.equal(overview.untaxed_invoices.missing_tax_location, 1);
+      // Neither the count on the overview nor the screen that holds the bill
+      // may send a finance team to the one field that is already right.
+      assert.doesNotMatch(
+        overview.untaxed_invoices.detail, /no resolvable country/i,
+        'the overview names what is missing, and the country is not it',
+      );
+      const settings = await ws.ok('GET', '/v1/billing/automatic_tax');
+      assert.equal(settings.invoices_held_in_draft, 1);
+      assert.doesNotMatch(settings.detail, /no resolvable country/i);
+    } finally { ws.close(); }
+  });
+
+  test('withdrawing a held bill takes it off the queue the overview counts', async () => {
+    const ws = await withFederalLevy(UTC(2026, 5, 3));
+    try {
+      const { invoice } = await billFor(ws, 'Superior Fabricating', CLEVELAND);
+      assert.equal(invoice.status, 'draft');
+      assert.equal((await ws.ok('GET', '/v1/subscriptions/overview')).untaxed_invoices.missing_tax_location, 1);
+      assert.equal((await ws.ok('GET', '/v1/invoices?tax=missing&limit=200')).total_count, 1);
+
+      // Withdrawing it is the escape hatch the hold leaves open, and the count
+      // has always known a withdrawn bill is off the backlog. The query the
+      // overview's own sentence sends a finance team to has to agree with it.
+      await ws.ok('POST', `/v1/invoices/${invoice.id}/void`);
+      const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+      assert.equal(overview.untaxed_invoices.missing_tax_location, 0);
+      const queue = await ws.ok('GET', '/v1/invoices?tax=missing&limit=200');
+      assert.equal(
+        queue.total_count, 0,
+        'the queue the overview points at is the book the overview counted',
+      );
+      assert.deepEqual((queue.data as Invoice[]).map((row) => row.id), []);
+    } finally { ws.close(); }
+  });
+
+  test('the printed bill does not claim nothing is registered where eight rates are', async () => {
+    // Northwind ships with the hold *off*, so this bill goes out. The line
+    // explanations learned to say what happened; the Tax section of the
+    // document — the half a customer files — kept its own copy of the sentence
+    // the fix removed.
+    const ws = await workspace(UTC(2026, 5, 3));
+    try {
+      const { invoice } = await billFor(ws, 'Superior Fabricating', CLEVELAND);
+      assert.equal(invoice.status, 'open', 'the hold is off in this workspace, so it was sent');
+      assert.equal(invoice.tax, 0);
+      assert.equal(invoice.automatic_tax.status, 'requires_location_inputs');
+
+      const document = String(await ws.ok('GET', `/v1/invoices/${invoice.id}/render`));
+      const section = /<h2>Tax<\/h2>[\s\S]*?<\/section>/.exec(document)?.[0] ?? '';
+      assert.ok(section, 'the bill prints a tax section');
+      assert.doesNotMatch(
+        section, /No tax rate is registered for this address/,
+        'eight US rates are registered and active — the document may not tell a customer otherwise',
+      );
+      assert.match(section, /could not be placed/);
+
+      // The control: an address that *was* placed, in a country nothing is
+      // registered in, keeps the sentence that is true of it.
+      const nz = await billFor(ws, 'Auckland Instruments', { line1: '12 Quay Street', city: 'Auckland', country: 'NZ' });
+      assert.equal(nz.invoice.automatic_tax.status, 'complete');
+      const nzDocument = String(await ws.ok('GET', `/v1/invoices/${nz.invoice.id}/render`));
+      assert.match(nzDocument, /No tax rate is registered for this address/);
+    } finally { ws.close(); }
+  });
+
+  test('a country with only a country-wide rate is a complete answer, state or no state', async () => {
+    const ws = await withFederalLevy(UTC(2026, 5, 3));
+    try {
+      // Germany registers one rate over the whole country: "Germany charges
+      // 19%" is true wherever in Germany the customer is, so holding this bill
+      // would be the mirror-image mistake — a refusal nothing can lift.
+      const berlin = await billFor(ws, 'Rhein Steuerung', { line1: '1 Hauptstrasse', city: 'Berlin', country: 'DE' });
+      assert.equal(berlin.invoice.automatic_tax.status, 'complete');
+      assert.equal(berlin.invoice.status, 'open');
+      assert.equal(berlin.invoice.tax, 1_881, 'VAT 19%, charged in full');
+
+      // And a country nothing is registered in at all, still an answer.
+      const auckland = await billFor(ws, 'Auckland Instruments', { line1: '12 Quay Street', city: 'Auckland', country: 'NZ' });
+      assert.equal(auckland.invoice.automatic_tax.status, 'complete');
+      assert.equal(auckland.invoice.status, 'open');
+      assert.equal(auckland.invoice.tax, 0);
+    } finally { ws.close(); }
+  });
+
+  test('the state arriving prices a held inclusive line off the price it was quoted at, not the base', async () => {
+    const ws = await withFederalLevy(UTC(2026, 5, 3));
+    try {
+      // An inclusive price is where a held line stops being the pricing
+      // engine's own number: the 2% the levy charged came *out* of the $100.00,
+      // so the line's amount is $98.04. Re-splitting that as though it were the
+      // listed price bills $98.04 and taxes both jurisdictions on the shortfall.
+      const product = (await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly')).data[0].product;
+      const price = (await ws.ok('POST', '/v1/prices', {
+        product, currency: 'usd', model: 'flat', unit_amount: 10_000,
+        nickname: 'Cleveland bench, tax included', lookup_key: 'cleveland_inclusive',
+        recurring: { interval: 'month' }, tax_behavior: 'inclusive',
+      })).id as string;
+
+      const held = await billFor(ws, 'Superior Fabricating', CLEVELAND, price);
+      assert.equal(held.invoice.status, 'draft');
+      assert.equal(held.invoice.total, 10_000, 'an inclusive price is the price, held or not');
+      assert.equal(held.invoice.subtotal, 9_804, 'and the levy came out of it, so the base is less');
+
+      await ws.ok('PATCH', `/v1/customers/${held.customer.id}`, { address: OHIO });
+      const open: Invoice = await ws.ok('POST', `/v1/invoices/${held.invoice.id}/finalize`);
+
+      // The bill it should always have been: the same one the same price makes
+      // for an address that had the state all along.
+      const straight = await billFor(ws, 'Cuyahoga Automation', OHIO, price);
+      assert.equal(open.total, 10_000, 'the customer is billed the price they were quoted');
+      assert.equal(open.total, straight.invoice.total);
+      assert.equal(open.subtotal, straight.invoice.subtotal, 'and the base is the base that price makes');
+      assert.equal(open.tax, straight.invoice.tax, '2% + 5.75%, extracted from $100.00 once');
+      assert.deepEqual(
+        open.lines[0].taxes.map((entry) => [entry.jurisdiction, entry.amount]),
+        straight.invoice.lines[0].taxes.map((entry) => [entry.jurisdiction, entry.amount]),
+      );
+      assert.equal((await ws.ok('GET', `/v1/invoices/${open.id}`)).reconciles, true);
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 39. The reader of the identities, and the writer of them
+ * ========================================================================== */
+
+/**
+ * `assertBalanced` gained the identity a withdrawn bill was missing — void
+ * implies nothing is owed — so no path can commit one. `invoiceAddsUp` is the
+ * same identities asked as a question rather than thrown as a failure, and it
+ * is what `reconciles` on every invoice payload and `adds_up` in the copilot's
+ * readout are answered from. It did not gain it.
+ *
+ * Which leaves the one state the writer cannot reach: a row already in it. The
+ * writer refuses to make it, and the reader — the only thing that would ever
+ * tell anyone it existed — went on saying a struck-out bill claiming $527.69 is
+ * due adds up. A reader that checks fewer identities than the writer enforces
+ * is not a shorter answer, it is a wrong one.
+ */
+describe('what a bill says about whether it adds up', () => {
+  const OHIO = { line1: '1200 Superior Avenue East', city: 'Cleveland', state: 'Ohio', country: 'US' };
+
+  const billed = async (ws: Workspace, name: string) => {
+    const customer = await ws.customer(name, { address: OHIO });
+    await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], collection_method: 'send_invoice',
+    });
+    const [invoice] = await allInvoices(ws, `&customer=${customer.id}`);
+    return { customer, invoice };
+  };
+
+  test('a withdrawn bill that says money is due does not reconcile', async () => {
+    const ws = await workspace(UTC(2026, 3, 6));
+    try {
+      const { invoice } = await billed(ws, 'Ashtabula Conveyors');
+      assert.equal((await ws.ok('GET', `/v1/invoices/${invoice.id}`)).reconciles, true);
+
+      // The state `CreditNotes.void()` used to leave behind, and that the
+      // writer now refuses to commit — reached the only way it still can be,
+      // by writing the row underneath the module the way an older build left it.
+      ws.app.ctx.db.patch('billing_invoices', 'id', invoice.id, {
+        status: 'void', voided_at: ws.now(), amount_due: invoice.total,
+      });
+
+      const after = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+      assert.equal(after.status, 'void');
+      assert.equal(after.amount_due, invoice.total);
+      assert.equal(
+        after.reconciles, false,
+        'a withdrawn bill is owed nothing, and the reader has to say so as loudly as the writer does',
+      );
+
+      // The copilot answers from the same predicate, and must not disagree.
+      const tool = ws.app.ctx.ai.tool('billing_explain_invoice');
+      assert.ok(tool, 'the copilot reads invoices through this tool');
+      const readout = await tool.run({ invoice: invoice.id }, ws.app.ctx, { orgId: ORG }) as { adds_up: boolean };
+      assert.equal(readout.adds_up, false);
+    } finally { ws.close(); }
+  });
+
+  test('and voiding it properly still reconciles, which is what the clause is for', async () => {
+    const ws = await workspace(UTC(2026, 3, 6));
+    try {
+      const { invoice } = await billed(ws, 'Erie Handling');
+      const voided: Invoice = await ws.ok('POST', `/v1/invoices/${invoice.id}/void`);
+      assert.equal(voided.status, 'void');
+      assert.equal(voided.amount_due, 0);
+      assert.equal((await ws.ok('GET', `/v1/invoices/${invoice.id}`)).reconciles, true);
+
+      // And every other status keeps the identity it always had.
+      const { invoice: open } = await billed(ws, 'Lorain Tooling');
+      assert.equal((await ws.ok('GET', `/v1/invoices/${open.id}`)).reconciles, true);
+      await ws.ok('POST', '/v1/credit_notes', { invoice: open.id, amount: 10_000 });
+      assert.equal((await ws.ok('GET', `/v1/invoices/${open.id}`)).reconciles, true);
+      await ws.ok('POST', `/v1/invoices/${open.id}/pay`, {});
+      assert.equal((await ws.ok('GET', `/v1/invoices/${open.id}`)).reconciles, true);
     } finally { ws.close(); }
   });
 });

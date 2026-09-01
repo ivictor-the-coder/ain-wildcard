@@ -14,8 +14,9 @@ import {
   Select, Textarea, humanize, useFormat, useToast, type ComboOption, type SelectOption,
 } from '@/client/design';
 import {
-  emptyValue, num, stageRequirements, str,
-  type DealRecord, type Pipeline, type PipelineStage, type PropertyDef, type WorkspaceUser,
+  emptyValue, num, reasonOptions, stageRequirements, str, useDealFormat, useOutcomeSplit,
+  type DealRecord, type Pipeline, type PipelineStage, type PropertyDef, type PropertyOption,
+  type WorkspaceUser,
 } from './api';
 
 /* ------------------------------ value editors ----------------------------- */
@@ -24,7 +25,7 @@ export type Draft = Record<string, unknown>;
 
 /** The control a property's declared type asks for. */
 export function PropertyInput({
-  property, value, onChange, currency, autoFocus, invalid,
+  property, value, onChange, currency, autoFocus, invalid, options,
 }: {
   property: PropertyDef;
   value: unknown;
@@ -32,9 +33,12 @@ export function PropertyInput({
   currency: string;
   autoFocus?: boolean;
   invalid?: boolean;
+  /** Narrows an enum's choices — a closing stage only offers its own outcome's reasons. */
+  options?: PropertyOption[];
 }) {
   const session = useSession();
   const label = property.label;
+  const choices = options ?? property.options;
   switch (property.type) {
     case 'currency':
       return (
@@ -76,7 +80,7 @@ export function PropertyInput({
           invalid={invalid}
           options={[
             { value: '', label: `— no ${label.toLowerCase()} —` },
-            ...property.options.map<SelectOption>((option) => ({ value: option.value, label: option.label })),
+            ...choices.map<SelectOption>((option) => ({ value: option.value, label: option.label })),
           ]}
           aria-label={label}
         />
@@ -117,7 +121,7 @@ export function PropertyInput({
 }
 
 /** Errors the server raised, keyed by the `param` it named. */
-const errorFor = (error: ApiClientError | null, param: string): string | null => {
+export const errorFor = (error: ApiClientError | null, param: string): string | null => {
   if (!error) return null;
   const named = error.body.param;
   if (!named) return null;
@@ -125,7 +129,7 @@ const errorFor = (error: ApiClientError | null, param: string): string | null =>
 };
 
 /** The message that belongs nowhere in particular — shown above the form. */
-const unboundError = (error: ApiClientError | null, params: string[]): string | null => {
+export const unboundError = (error: ApiClientError | null, params: string[]): string | null => {
   if (!error) return null;
   const named = error.body.param?.replace(/^properties\./, '');
   if (named && params.includes(named)) return null;
@@ -354,15 +358,34 @@ export function StageMoveDialog({
 }) {
   const session = useSession();
   const toast = useToast();
-  const f = useFormat();
+  const f = useDealFormat();
   const [draft, setDraft] = useState<Draft>({});
+  const [closeDate, setCloseDate] = useState<number | null>(null);
 
   const requirements = useMemo(
     () => (to ? stageRequirements(deal, to, properties) : { required: [], optional: [] }),
     [deal, to, properties],
   );
 
-  useEffect(() => { if (open) setDraft({}); }, [open, deal?.id, to?.name]);
+  // The picklists are only narrowed for a closing move, so the split is only
+  // learned when one is on screen.
+  const split = useOutcomeSplit(properties, open && !!to?.is_closed);
+  const outcome = to?.is_won ? 'won' : 'lost';
+
+  // A deal that is already closed keeps the day it closed on; a fresh close gets
+  // the workspace's civil today, written explicitly so the server does not
+  // restamp it from a UTC midnight that can fall on the wrong side of a month.
+  const alreadyClosed = !emptyValue(deal?.properties.closed_at);
+  const stampsClose = !!to?.is_closed && !alreadyClosed;
+
+  // A number, not the formatter object, so the reset runs when the dialog opens
+  // rather than on every render that happens to make a new formatter.
+  const today = f.calendarToday();
+  useEffect(() => {
+    if (!open) return;
+    setDraft({});
+    setCloseDate(today);
+  }, [open, deal?.id, to?.name, today]);
 
   const missing = requirements.required.filter((property) => emptyValue(draft[property.name]));
 
@@ -370,6 +393,7 @@ export function StageMoveDialog({
     if (!deal || !to) throw new Error('no deal');
     const props: Draft = { deal_stage: to.name };
     for (const [key, value] of Object.entries(draft)) if (!emptyValue(value)) props[key] = value;
+    if (stampsClose && closeDate !== null) props.close_date = closeDate;
     return api.patch<DealRecord>(`/v1/records/deal/${encodeURIComponent(deal.id)}`, { properties: props });
   }, {
     invalidates: ['/v1/records/deal', '/v1/pipelines', '/v1/crm/overview'],
@@ -387,7 +411,7 @@ export function StageMoveDialog({
   if (!to) return null;
   const amount = deal ? num(deal.properties.amount) : 0;
   const params = [...requirements.required, ...requirements.optional].map((p) => p.name);
-  const banner = unboundError(move.error, [...params, 'deal_stage']);
+  const banner = unboundError(move.error, [...params, 'deal_stage', 'close_date']);
 
   return (
     <Modal
@@ -437,24 +461,221 @@ export function StageMoveDialog({
           </Banner>
         )}
 
-        {[...requirements.required, ...requirements.optional].map((property) => (
+        {[...requirements.required, ...requirements.optional].map((property) => {
+          const narrowed = to.is_closed && property.type === 'enum' && property.group.toLowerCase() === 'outcome'
+            ? reasonOptions(property, outcome, split)
+            : null;
+          return (
+            <Field
+              key={property.name}
+              label={property.label}
+              required={requirements.required.some((p) => p.name === property.name)}
+              optional={!requirements.required.some((p) => p.name === property.name)}
+              hint={narrowed
+                ? `Only the reasons ${outcome === 'won' ? 'a win' : 'a loss'} can carry${narrowed.learned ? `, learned from the ${f.plural(split.sampled, 'deal')} this workspace has already closed` : ''}.`
+                : property.description ?? undefined}
+              error={errorFor(move.error, property.name)}
+            >
+              <PropertyInput
+                property={property}
+                options={narrowed?.options}
+                value={draft[property.name] ?? deal?.properties[property.name]}
+                onChange={(value) => setDraft((prev) => ({ ...prev, [property.name]: value }))}
+                currency={session.currency}
+                invalid={!!errorFor(move.error, property.name)}
+              />
+            </Field>
+          );
+        })}
+
+        {stampsClose && (
           <Field
-            key={property.name}
-            label={property.label}
-            required={requirements.required.some((p) => p.name === property.name)}
-            optional={!requirements.required.some((p) => p.name === property.name)}
-            hint={property.description ?? undefined}
-            error={errorFor(move.error, property.name)}
+            label="Close date"
+            hint={`${to.is_won ? 'The day this deal books.' : 'The day it was lost.'} ${closeDate === null ? 'Leave it empty and the server stamps today.' : `${f.calendarDate(closeDate)} — ${f.calendarRelative(closeDate)}.`}`}
+            error={errorFor(move.error, 'close_date')}
           >
-            <PropertyInput
-              property={property}
-              value={draft[property.name] ?? deal?.properties[property.name]}
-              onChange={(value) => setDraft((prev) => ({ ...prev, [property.name]: value }))}
-              currency={session.currency}
-              invalid={!!errorFor(move.error, property.name)}
+            <DatePicker
+              value={closeDate}
+              onChange={setCloseDate}
+              invalid={!!errorFor(move.error, 'close_date')}
+              aria-label="Close date"
             />
           </Field>
-        ))}
+        )}
+
+        {to.is_closed && alreadyClosed && (
+          <p className="pl-note">
+            This deal already closed on {f.calendarDate(typeof deal?.properties.close_date === 'number' ? deal.properties.close_date : null)},
+            so that date stands. Edit it from the deal’s properties if it was wrong.
+          </p>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/* ---------------------------- pipeline movement --------------------------- */
+
+/**
+ * Move a deal onto a different pipeline.
+ *
+ * A deal opened as new business that turns out to be a renewal is a real thing
+ * that happens, and until now the only way to correct it was the API: the stage
+ * rail only walks the pipeline the deal is already on, and the edit form leaves
+ * both fields alone because changing one without the other is refused. Both are
+ * written in one PATCH, with the forecast restamp stated first.
+ */
+export function PipelineMoveDialog({
+  open, deal, pipelines, properties, onClose, onMoved,
+}: {
+  open: boolean;
+  deal: DealRecord | null;
+  pipelines: Pipeline[];
+  properties: PropertyDef[];
+  onClose: () => void;
+  onMoved: () => void;
+}) {
+  const session = useSession();
+  const toast = useToast();
+  const f = useFormat();
+  const [target, setTarget] = useState('');
+  const [stage, setStage] = useState('');
+  const [draft, setDraft] = useState<Draft>({});
+
+  const current = pipelines.find((p) => p.name === str(deal?.properties.pipeline));
+  const others = useMemo(() => pipelines.filter((p) => p.name !== current?.name), [pipelines, current]);
+  const chosen = others.find((p) => p.name === target) ?? others[0];
+  const openStages = useMemo(() => (chosen?.stages ?? []).filter((s) => !s.is_closed), [chosen]);
+  const chosenStage = openStages.find((s) => s.name === stage) ?? openStages[0];
+
+  useEffect(() => {
+    if (!open) return;
+    setTarget(others[0]?.name ?? '');
+    setStage('');
+    setDraft({});
+  }, [open, deal?.id, others]);
+
+  const requirements = useMemo(
+    () => (chosenStage ? stageRequirements(deal, chosenStage, properties) : { required: [], optional: [] }),
+    [deal, chosenStage, properties],
+  );
+  const missing = requirements.required.filter((property) => emptyValue(draft[property.name]));
+
+  const move = useMutation<void, DealRecord>(async () => {
+    if (!deal || !chosen || !chosenStage) throw new Error('no destination');
+    const props: Draft = { pipeline: chosen.name, deal_stage: chosenStage.name };
+    for (const [key, value] of Object.entries(draft)) if (!emptyValue(value)) props[key] = value;
+    return api.patch<DealRecord>(`/v1/records/deal/${encodeURIComponent(deal.id)}`, { properties: props });
+  }, {
+    invalidates: ['/v1/records/deal', '/v1/pipelines', '/v1/crm/overview'],
+    onSuccess: (updated) => {
+      toast.success(
+        `Moved to ${chosen?.label}`,
+        `${updated.display_name} is in ${chosenStage?.label} at ${num(updated.properties.probability)}%.`,
+      );
+      onMoved();
+      onClose();
+    },
+    onError: (e) => { if (!e.body.param) toast.error('The pipeline did not change', e.body.message); },
+  });
+
+  const amount = deal ? num(deal.properties.amount) : 0;
+  const from = current?.stages.find((s) => s.name === str(deal?.properties.deal_stage));
+  const banner = unboundError(move.error, ['pipeline', 'deal_stage', ...requirements.required.map((p) => p.name)]);
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="md"
+      title="Move to another pipeline"
+      description={deal?.display_name}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>Cancel</Button>
+          <Button
+            variant="primary"
+            loading={move.loading}
+            disabled={!chosen || !chosenStage || missing.length > 0}
+            onClick={() => { void move.run().catch(() => undefined); }}
+          >
+            {chosen ? `Move to ${chosen.label}` : 'Move'}
+          </Button>
+        </>
+      }
+    >
+      <div className="pl-form">
+        {banner && <Banner tone="danger" title="The pipeline did not change">{banner}</Banner>}
+
+        {others.length === 0 && (
+          <Banner tone="info" compact>
+            {current?.label ?? 'This pipeline'} is the only deal pipeline this workspace has, so there is nowhere else to move to.
+          </Banner>
+        )}
+
+        {others.length > 0 && (
+          <>
+            <div className="pl-form__row">
+              <Field label="Pipeline" required>
+                <Select
+                  value={chosen?.name ?? ''}
+                  onChange={(next) => { setTarget(next); setStage(''); }}
+                  options={others.map<SelectOption>((p) => ({ value: p.name, label: p.label }))}
+                  aria-label="Pipeline"
+                />
+              </Field>
+              <Field
+                label="Stage"
+                required
+                hint={chosenStage ? `Carries a ${chosenStage.probability}% probability` : undefined}
+              >
+                <Select
+                  value={chosenStage?.name ?? ''}
+                  onChange={setStage}
+                  options={openStages.map<SelectOption>((s) => ({ value: s.name, label: `${s.label} · ${s.probability}%` }))}
+                  aria-label="Stage"
+                />
+              </Field>
+            </div>
+
+            <div className="pl-movesummary">
+              <span>
+                Pipeline <strong>{current?.label ?? '—'}</strong> → <strong>{chosen?.label}</strong>
+              </span>
+              <span>
+                Probability <strong>{from ? `${from.probability}%` : '—'}</strong> → <strong>{chosenStage?.probability ?? 0}%</strong>
+              </span>
+              <span>
+                Weighted <strong>{f.money(Math.round((amount * (from?.probability ?? 0)) / 100))}</strong>
+                {' → '}
+                <strong>{f.money(Math.round((amount * (chosenStage?.probability ?? 0)) / 100))}</strong>
+              </span>
+            </div>
+
+            <p className="pl-note">
+              The stage history keeps every spell on the old pipeline; this starts a new one at{' '}
+              {chosenStage?.label ?? 'the first stage'}.
+            </p>
+
+            {requirements.required.map((property) => (
+              <Field
+                key={property.name}
+                label={property.label}
+                required
+                hint={property.description ?? undefined}
+                error={errorFor(move.error, property.name)}
+              >
+                <PropertyInput
+                  property={property}
+                  value={draft[property.name] ?? deal?.properties[property.name]}
+                  onChange={(value) => setDraft((prev) => ({ ...prev, [property.name]: value }))}
+                  currency={session.currency}
+                  invalid={!!errorFor(move.error, property.name)}
+                />
+              </Field>
+            ))}
+          </>
+        )}
       </div>
     </Modal>
   );

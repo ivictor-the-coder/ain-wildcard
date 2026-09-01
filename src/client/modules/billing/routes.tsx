@@ -7,7 +7,7 @@
  * request id support can grep for — never as a zero.
  */
 import { useMemo } from 'react';
-import type { CommandDef, NavItem, RouteDef, WidgetDef } from '../../kernel/registry-types';
+import type { CommandDef, NavItem, RouteDef, SettingsPage, WidgetDef } from '../../kernel/registry-types';
 import { useQuery, type ListEnvelope } from '../../kernel/api';
 import { useNavigate } from '../../kernel/router';
 import {
@@ -15,11 +15,13 @@ import {
   humanize,
 } from '../../design';
 import {
-  Loading, RecordLink, SectionError, StatusPill, customerHref, invoiceHref, statusLabel, useBillingFormat,
+  Loading, RecordLink, SectionError, StatusPill, calendarDay, customerHref, daysOverdue, invoiceHref,
+  invoiceStatusDetail, statusLabel, totalsByCurrency, useBillingFormat,
 } from './common';
 import { CustomersPage, CustomerDetailPage } from './customers';
 import { SubscriptionsPage, SubscriptionDetailPage } from './subscriptions';
 import { InvoicesPage, InvoiceDetailPage } from './invoices';
+import { TaxRatesPage } from './taxes';
 import type { BillingOverview, Invoice, RevenueAccount, Subscription } from './types';
 
 interface RevenueGroup { currency: string; accounts: number; mrr: number; arr: number; largest: string | null }
@@ -28,9 +30,14 @@ interface RevenueGroup { currency: string; accounts: number; mrr: number; arr: n
  * How late a bill is, in the unit an AR team ages a ledger in. `formatRelative`
  * says "2 months ago", which reads as a past event rather than a running debt.
  */
-const DAY_MS = 86_400_000;
-const daysLate = (invoice: Invoice, now: number): number =>
-  Math.max(0, Math.floor((now - (invoice.due_date ?? invoice.created)) / DAY_MS));
+const daysLate = (invoice: Invoice, now: number, timeZone: string): number => (
+  invoice.due_date !== null
+    // A due date is a UTC calendar boundary; "now" is an instant in the
+    // workspace's zone. Dividing the gap by 86,400,000 counts elapsed time
+    // rather than dates, and reads a day high all evening in New York.
+    ? daysOverdue(invoice.due_date, now, timeZone)
+    : Math.max(0, calendarDay(now, timeZone) - calendarDay(invoice.created, timeZone))
+);
 
 /* ================================ overview ================================ */
 
@@ -51,13 +58,25 @@ function BillingOverviewPage() {
   );
 
   const data = overview.data;
+  // `status=open_like` is drafts *and* open bills, and a draft the customer has
+  // never seen is not a receivable. The card that exists to size what is owed
+  // therefore lists only what has been sent; the drafts are counted under it,
+  // where they are a queue to finalise rather than money to chase.
   const owed = useMemo(() => {
-    const rows = receivables.data?.data ?? [];
+    const rows = (receivables.data?.data ?? []).filter((invoice) => invoice.status === 'open');
     // "Payable on receipt" has no due date; its issue date is when it became
     // owed, which is what slots it chronologically instead of floating it up.
     const dueAt = (invoice: Invoice) => invoice.due_date ?? invoice.created;
     return [...rows].sort((a, b) => dueAt(a) - dueAt(b));
   }, [receivables.data]);
+  const drafts = useMemo(
+    () => (receivables.data?.data ?? []).filter((invoice) => invoice.status === 'draft'),
+    [receivables.data],
+  );
+  const draftTotals = useMemo(
+    () => totalsByCurrency(drafts, (row) => row.amount_due, (row) => row.currency),
+    [drafts],
+  );
   const overdue = useMemo(
     () => owed.filter((invoice) => invoice.due_date !== null && invoice.due_date < f.now()),
     [owed, f],
@@ -66,6 +85,7 @@ function BillingOverviewPage() {
     () => Object.entries(data?.by_status ?? {}).sort((a, b) => b[1] - a[1]),
     [data],
   );
+  const paused = data?.by_status?.paused ?? 0;
 
   // One ranked column per currency. The API already sends the rows grouped and
   // sorted; this only splits them, so the card never ranks across books.
@@ -131,7 +151,16 @@ function BillingOverviewPage() {
                   </Card>
                 )}
               <Card padding="tight">
-                <Stat label="Live subscriptions" value={f.number(data.live)} caption={`${f.number(data.subscriptions)} ever created`} />
+                {/* MRR excludes a paused agreement and this count includes one,
+                    so whenever the workspace holds a paused subscription the
+                    caption says which part of the count the money covers. */}
+                <Stat
+                  label="Live subscriptions"
+                  value={f.number(data.live)}
+                  caption={paused > 0
+                    ? `${f.number(data.live - paused)} billing, ${f.number(paused)} paused and outside MRR`
+                    : `${f.number(data.subscriptions)} ever created`}
+                />
               </Card>
               <Card padding="tight">
                 <Stat label="Customers" value={f.number(data.customers)} caption={`${f.number(data.delinquent_customers)} delinquent`} />
@@ -180,20 +209,29 @@ function BillingOverviewPage() {
         <div className="bl-cols">
           <Card
             title="Owed right now"
-            description={overdue.length
-              ? `${f.plural(overdue.length, 'invoice')} past ${overdue.length === 1 ? 'its' : 'their'} due date, then the rest by how soon they fall due.`
-              : 'Everything still open, the soonest due first. Nothing is past its date.'}
+            description={receivables.error
+              // "Nothing is past its date" is a claim about receivables this
+              // request never established. The neutral line makes none.
+              ? 'Everything still open, the soonest due first.'
+              : overdue.length
+                ? `${f.plural(overdue.length, 'invoice')} past ${overdue.length === 1 ? 'its' : 'their'} due date, then the rest by how soon they fall due.`
+                : 'Everything still open, the soonest due first. Nothing is past its date.'}
             actions={<Button size="sm" variant="secondary" onClick={() => navigate('/billing/invoices?status=open_like')}>All open invoices</Button>}
           >
             {receivables.error && <SectionError error={receivables.error} path="GET /v1/invoices" onRetry={receivables.refetch} />}
             {!receivables.error && receivables.loading && <Loading label="Reading the receivables…" />}
-            {!receivables.error && !receivables.loading && (receivables.data?.data.length ?? 0) === 0 && (
+            {!receivables.error && !receivables.loading && owed.length === 0 && (
               <EmptyState
                 size="sm"
                 inline
                 illustration={null}
                 title="Nothing is outstanding"
-                body="Every invoice this workspace has raised has been settled, written off or withdrawn."
+                body={drafts.length
+                  ? `Every invoice that has been sent is settled. ${f.plural(drafts.length, 'draft')} still to finalise.`
+                  : 'Every invoice this workspace has raised has been settled, written off or withdrawn.'}
+                action={drafts.length
+                  ? <Button size="sm" variant="secondary" onClick={() => navigate('/billing/invoices?status=draft')}>See the drafts</Button>
+                  : undefined}
               />
             )}
             {owed.slice(0, 8).map((invoice) => {
@@ -206,7 +244,7 @@ function BillingOverviewPage() {
                       {' · '}
                       <RecordLink to={customerHref(invoice.customer)}>{invoice.customer_name ?? invoice.customer}</RecordLink>
                     </div>
-                    <div className="bl-row__sub">{invoice.status_detail}</div>
+                    <div className="bl-row__sub">{invoiceStatusDetail(invoice, f)}</div>
                   </div>
                   <div className="bl-row__aside">
                     <div>{invoice.amount_due_display}</div>
@@ -214,7 +252,7 @@ function BillingOverviewPage() {
                       {/* An invoice two months late and one raised yesterday are
                           both "Open" on the wire. Only one of them is a problem. */}
                       {late
-                        ? <Badge tone="danger" dot pill>{`${f.plural(daysLate(invoice, f.now()), 'day')} overdue`}</Badge>
+                        ? <Badge tone="danger" dot pill>{`${f.plural(daysLate(invoice, f.now(), f.timeZone), 'day')} overdue`}</Badge>
                         : <StatusPill status={invoice.status} />}
                     </div>
                   </div>
@@ -224,6 +262,18 @@ function BillingOverviewPage() {
             {owed.length > 8 && (
               <div className="bl-rank__rest">
                 {`${f.plural(owed.length - 8, 'more open invoice')} behind these.`}
+              </div>
+            )}
+            {drafts.length > 0 && (
+              <div style={{ marginTop: 'var(--space-4)' }}>
+                <Banner tone="info" compact title="Not counted above">
+                  {`${f.plural(drafts.length, 'invoice')} worth `}
+                  {f.list(draftTotals.map((total) => f.money(total.amount, { currency: total.currency })))}
+                  {' is held as a draft — collection is paused on those subscriptions, so nothing has been sent '
+                    + 'and nothing is owed yet. '}
+                  <RecordLink to="/billing/invoices?status=draft">Finalise them</RecordLink>
+                  {' to make them collectable.'}
+                </Banner>
               </div>
             )}
           </Card>
@@ -360,7 +410,7 @@ function ReceivablesWidget() {
                   <div className="bl-row__sub">
                     {invoice.customer_name ?? invoice.customer}
                     {invoice.due_date !== null && invoice.due_date < f.now()
-                      ? ` · ${f.plural(daysLate(invoice, f.now()), 'day')} overdue`
+                      ? ` · ${f.plural(daysLate(invoice, f.now(), f.timeZone), 'day')} overdue`
                       : invoice.due_date !== null ? ` · due ${f.day(invoice.due_date)}` : ' · payable on receipt'}
                   </div>
                 </div>
@@ -384,6 +434,7 @@ export const routes: RouteDef[] = [
   { path: '/billing/subscriptions/:id', element: SubscriptionDetailPage, title: 'Subscription' },
   { path: '/billing/invoices', element: InvoicesPage, title: 'Invoices' },
   { path: '/billing/invoices/:id', element: InvoiceDetailPage, title: 'Invoice' },
+  { path: '/billing/taxes', element: TaxRatesPage, title: 'Tax' },
 ];
 
 export const nav: NavItem[] = [
@@ -391,6 +442,7 @@ export const nav: NavItem[] = [
   { id: 'billing.customers.nav', label: 'Customers', to: '/billing/customers', group: 'revenue', order: 12, icon: 'wallet' },
   { id: 'billing.subscriptions.nav', label: 'Subscriptions', to: '/billing/subscriptions', group: 'revenue', order: 14, icon: 'repeat' },
   { id: 'billing.invoices.nav', label: 'Invoices', to: '/billing/invoices', group: 'revenue', order: 16, icon: 'invoice' },
+  { id: 'billing.taxes.nav', label: 'Tax', to: '/billing/taxes', group: 'revenue', order: 18, icon: 'percent' },
 ];
 
 export const commands: CommandDef[] = [
@@ -467,6 +519,24 @@ export const commands: CommandDef[] = [
     run: (nav) => nav('/billing/invoices?status=open_like'),
   },
   {
+    id: 'billing.taxes.open',
+    title: 'Tax registrations',
+    subtitle: 'Where this workspace collects, and what happens to a bill it cannot place',
+    group: 'Go to',
+    keywords: ['tax', 'vat', 'gst', 'sales tax', 'rate', 'jurisdiction'],
+    icon: 'percent',
+    run: (nav) => nav('/billing/taxes'),
+  },
+  {
+    id: 'billing.tax.missing',
+    title: 'Bills with no tax location',
+    subtitle: 'Invoices raised for an account whose country nothing could match',
+    group: 'Revenue',
+    keywords: ['tax missing', 'no country', 'untaxed', 'held'],
+    icon: 'alert-triangle',
+    run: (nav) => nav('/billing/invoices?tax=missing'),
+  },
+  {
     id: 'billing.open.past_due',
     title: 'Past-due subscriptions',
     subtitle: 'Accounts in arrears',
@@ -497,3 +567,15 @@ export const widgets: WidgetDef[] = [
 ];
 
 export { humanize as billingHumanize, statusLabel };
+
+export const settings: SettingsPage[] = [
+  {
+    id: 'billing.taxes',
+    label: 'Tax registrations',
+    group: 'Revenue',
+    order: 20,
+    path: '/billing/taxes',
+    element: TaxRatesPage,
+    description: 'The rates every invoice is taxed from, and the hold on bills with no location',
+  },
+];

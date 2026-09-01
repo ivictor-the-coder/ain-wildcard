@@ -185,6 +185,18 @@
   background: var(--bg-subtle);
 }
 
+.crm-checkgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--space-2) var(--space-4);
+  max-height: 168px;
+  overflow-y: auto;
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+}
+
 .crm-iconpick { display: flex; flex-wrap: wrap; gap: var(--space-2); }
 .crm-iconpick__btn {
   width: 34px; height: 34px;
@@ -256,6 +268,16 @@
 .crm-identity__text { min-width: 0; }
 .crm-identity__name { font-size: var(--text-md); font-weight: var(--weight-semibold); color: var(--text-primary); }
 .crm-identity__sub { font-size: var(--text-sm); color: var(--text-tertiary); }
+/* The employer, under the job title, the way the company card carries its domain. */
+.crm-identity__at {
+  display: inline-flex; align-items: center; gap: var(--space-2); max-width: 100%;
+  margin-top: var(--space-1); font-size: var(--text-sm); font-weight: var(--weight-medium);
+  color: var(--text-link); text-decoration: none; border-radius: var(--radius-xs);
+}
+.crm-identity__at:hover { text-decoration: underline; }
+.crm-identity__at:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
+.crm-identity__at svg { flex: 0 0 auto; color: var(--text-tertiary); }
+.crm-identity__at svg:last-child { color: var(--text-warning); }
 .crm-identity__owner {
   display: flex; flex-direction: column; gap: var(--space-2);
   margin-top: var(--space-4); padding-top: var(--space-4);
@@ -445,3 +467,8 @@ button.crm-prop__value:focus-visible .crm-prop__pencil { opacity: 1; }
 .crm-widgetrow__when { font-size: var(--text-xs); color: var(--text-tertiary); white-space: nowrap; }
 
 .crm-toolsearch { min-width: 220px; }
+/* The component paints its own circled clear button; Chromium paints a second
+   one inside a focused `type=search`, so the field grew two X glyphs side by
+   side the moment anyone typed in it. */
+.crm-toolsearch input[type='search']::-webkit-search-cancel-button,
+.crm-toolsearch input[type='search']::-webkit-search-decoration { -webkit-appearance: none; appearance: none; display: none; }

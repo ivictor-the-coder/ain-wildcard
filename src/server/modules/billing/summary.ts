@@ -15,7 +15,7 @@ import { describeInterval, intervalOf, isMetered, longDate, recurringLines, subs
 import { countsAsRevenue, describeStatus, isTerminal } from './status';
 import { PENDING_ITEMS_PER_INVOICE, type Billing } from './store';
 import type {
-  BalanceTransaction, Customer, PendingInvoiceItem, RecurringLine, Subscription, SubscriptionStatus,
+  AutomaticTax, BalanceTransaction, Customer, PendingInvoiceItem, RecurringLine, Subscription, SubscriptionStatus,
 } from './types';
 
 /**
@@ -93,6 +93,17 @@ export interface NextInvoicePreview {
    * support agent reads out to the customer.
    */
   tax: number;
+  /**
+   * Whether the bill this predicts can be sent at all.
+   *
+   * A prediction of "€100.00, no tax" for an account Ain cannot place
+   * is not a prediction of the bill that goes out — that bill is held as a
+   * draft — and a panel that says the first without the second is telling a
+   * support agent a number nobody will ever be asked to pay. The upcoming
+   * invoice already carries this; so does the bill itself; this is the third
+   * reader of the same question.
+   */
+  automatic_tax: AutomaticTax;
   balance_applied: number;
   estimated_total: number;
   note: string;
@@ -241,6 +252,11 @@ export function buildCustomerSummary(
   });
   const uninvoicedTotal = uninvoiced.reduce((total, item) => total + item.amount, 0);
 
+  // Asked once for the account, because both the prediction and the attention
+  // list below are about the same fact: whether a bill for this customer can be
+  // placed at all.
+  const automaticTax: AutomaticTax = billing.automaticTaxFor(orgId, customer);
+
   let nextInvoice: NextInvoicePreview | null = null;
   if (upcoming) {
     // Recurring charges are billed in advance, so the next invoice covers the
@@ -279,13 +295,21 @@ export function buildCustomerSummary(
     // that is the amount plus the tax; for an inclusive one the tax came out of
     // the amount, so the two halves add back up to the listed price either way.
     const gross = subtotal + uninvoicedOnBill + tax;
-    // A credit balance is drawn down by the invoice; it can never take a total
-    // below zero, so what is left stays on the account for next time. The
-    // waiting items can themselves be worth less than nothing — a downgrade is
-    // a credit line now, not a balance movement — and a bill with nothing left
-    // to pay draws nothing down.
-    const room = Math.max(0, gross);
-    const balanceApplied = customer.balance < 0 ? Math.max(customer.balance, -room) : customer.balance;
+    // `Invoices.issue()`'s own formula, not a second one that agrees on the
+    // easy cases. Both invariants fall out of it: the bill never goes below
+    // zero, and whatever the lines and the balance cannot settle between them
+    // stays on the account.
+    //
+    // The formula it replaced clamped the draw against `max(0, gross)` and
+    // handed a debit balance straight through, which is right for every bill
+    // worth more than nothing and wrong the moment one is not. A next bill made
+    // of credit lines — a mid-cycle downgrade waiting to be swept up — puts its
+    // whole value onto the account, and this panel reported `balance_applied:
+    // 0` for an $863.78 movement the bill itself records and `ending_balance`
+    // states. The total was right in both readings, which is exactly why the
+    // disagreement went unseen.
+    const estimatedTotal = Math.max(0, gross + customer.balance);
+    const balanceApplied = estimatedTotal - gross;
     const metered = upcoming.items.filter((item) => isMetered(book.price(item.price)));
     nextInvoice = {
       subscription: upcoming.id,
@@ -295,8 +319,9 @@ export function buildCustomerSummary(
       subtotal,
       uninvoiced_total: uninvoicedOnBill,
       tax,
+      automatic_tax: automaticTax,
       balance_applied: balanceApplied,
-      estimated_total: Math.max(0, gross + balanceApplied),
+      estimated_total: estimatedTotal,
       note: upcoming.cancel_at_period_end
         ? `This subscription ends on ${longDate(upcoming.current_period_end, locale)}, so there is no renewal charge — only anything still outstanding.`
         : metered.length
@@ -319,6 +344,15 @@ export function buildCustomerSummary(
   const attention: string[] = [];
   if (customer.delinquent) {
     attention.push(`${customer.name} is delinquent — ${(byStatus.past_due ?? 0) + (byStatus.unpaid ?? 0)} subscription(s) are not being collected.`);
+  }
+  // The one thing on this screen that stops a bill going out, so it is said
+  // before the things that only slow one down.
+  if (automaticTax.status === 'requires_location_inputs') {
+    attention.push(
+      automaticTax.enabled
+        ? `Ain could not place ${customer.name}’s address — it needs a country, and a state in a country whose tax is registered state by state — so the tax on their bills cannot be worked out and they are being held as drafts. Complete the address and finalise them.`
+        : `Ain could not place ${customer.name}’s address — it needs a country, and a state in a country whose tax is registered state by state — so their bills go out with no tax on them and nobody can tell whether that is right. Complete the address.`,
+    );
   }
   // One sentence per subscription is a readable list for the accounts almost
   // everybody has and a wall of text for a holding company with a thousand

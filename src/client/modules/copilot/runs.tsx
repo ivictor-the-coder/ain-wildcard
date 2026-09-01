@@ -6,7 +6,7 @@
  * arguments, how long each took, what it cost in tokens and credits, and how it
  * ended. HubSpot will tell you Breeze did something; this says why.
  */
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useQuery, type ListEnvelope } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import {
@@ -15,16 +15,10 @@ import {
   type DataTableColumn, type SelectOption,
 } from '@/client/design';
 import {
-  refusalOf, useApprovals, useRun, type AiRun, type RunDetail,
+  OUTCOME_LABEL, OUTCOME_TONE, refusalOf, runOutcome, useAllApprovals, useApprovals, useRun,
+  type AiRun, type RunDetail, type RunOutcome,
 } from './api';
 import { ApprovalQueue, CitationChips, ReasoningList, RunFacts, TraceSteps } from './trace';
-
-const STATUS_TONE: Record<string, 'success' | 'danger' | 'warning' | 'info' | 'neutral'> = {
-  succeeded: 'success',
-  failed: 'danger',
-  needs_approval: 'warning',
-  running: 'info',
-};
 
 /* ------------------------------- run list --------------------------------- */
 
@@ -35,14 +29,27 @@ export function RunsPage() {
   const feature = location.query.feature ?? '';
   const tab = location.query.tab === 'approvals' ? 'approvals' : 'runs';
 
+  // The outcome filter is applied here rather than by the server, because the
+  // server's `needs_approval` never resolves once a person decides: a run whose
+  // write was declined would sit in that filter for ever. The approvals say what
+  // really happened, so the filter is computed from the same answer the column
+  // shows.
   const runs = useQuery<ListEnvelope<AiRun>>('/v1/ai/runs', {
     limit: 100,
-    ...(status ? { status } : {}),
     ...(feature ? { feature } : {}),
   });
+  const decisions = useAllApprovals();
   const approvals = useApprovals(location.query.approvals ?? 'pending');
 
-  const rows = runs.data?.data ?? [];
+  const outcomeOf = useCallback(
+    (run: AiRun): RunOutcome => runOutcome(run, decisions.byRun.get(run.id)),
+    [decisions],
+  );
+
+  const rows = useMemo(
+    () => (runs.data?.data ?? []).filter((run) => !status || outcomeOf(run) === status),
+    [runs.data, status, outcomeOf],
+  );
 
   const features = useMemo(
     () => [...new Set(rows.map((run) => run.feature))].sort(),
@@ -90,9 +97,13 @@ export function RunsPage() {
     {
       id: 'status',
       header: 'Outcome',
+      width: 180,
       filter: 'set',
-      accessor: (row) => row.status,
-      cell: (row) => <Badge size="sm" tone={STATUS_TONE[row.status] ?? 'neutral'}>{humanize(row.status)}</Badge>,
+      accessor: (row) => OUTCOME_LABEL[outcomeOf(row)],
+      cell: (row) => {
+        const outcome = outcomeOf(row);
+        return <Badge size="sm" tone={OUTCOME_TONE[outcome]}>{OUTCOME_LABEL[outcome]}</Badge>;
+      },
     },
     {
       id: 'intent',
@@ -157,7 +168,7 @@ export function RunsPage() {
       accessor: (row) => row.model,
       defaultHidden: true,
     },
-  ], [f]);
+  ], [f, outcomeOf]);
 
   return (
     <Page
@@ -245,6 +256,8 @@ export function RunsPage() {
                 { value: '', label: 'Every outcome' },
                 { value: 'succeeded', label: 'Succeeded' },
                 { value: 'needs_approval', label: 'Needs approval' },
+                { value: 'written', label: 'Approved and written' },
+                { value: 'declined', label: 'Declined' },
                 { value: 'failed', label: 'Failed' },
                 { value: 'running', label: 'Running' },
               ] as SelectOption[]}
@@ -344,14 +357,19 @@ export function RunDetailPage({ id }: { id: string }) {
 
   const detail: RunDetail = run.data;
   const refusal = refusalOf(detail);
+  const outcome = runOutcome(detail, detail.approvals);
+  // The header and the panel below it are counting the same array. They used to
+  // read `span_count`, which is stamped when the run finishes and never sees the
+  // step a post-approval execution appends.
+  const steps = detail.trace.length;
 
   return (
     <Page
       width="wide"
       eyebrow={`${humanize(detail.feature)} run`}
       title={detail.question || 'Untitled run'}
-      badge={<Badge size="sm" tone={STATUS_TONE[detail.status] ?? 'neutral'}>{humanize(detail.status)}</Badge>}
-      subtitle={`${f.dateTime(detail.started)} · ${detail.model} · ${f.plural(detail.span_count, 'step')} · ${f.number(detail.duration_ms)} ms`}
+      badge={<Badge size="sm" tone={OUTCOME_TONE[outcome]}>{OUTCOME_LABEL[outcome]}</Badge>}
+      subtitle={`${f.dateTime(detail.started)} · ${detail.model} · ${f.plural(steps, 'step')} · ${f.number(detail.duration_ms)} ms`}
       actions={
         <>
           {detail.thread_id && (
@@ -378,13 +396,15 @@ export function RunDetailPage({ id }: { id: string }) {
       )}
 
       <Card title="What it cost and how it ended">
-        <RunFacts run={detail} toolMs={detail.timings.tool_ms} />
+        <RunFacts run={detail} toolMs={detail.timings.tool_ms} approvals={detail.approvals} steps={steps} />
       </Card>
 
 
       <Card
         title="Answer"
-        description="Exactly what was returned to the caller"
+        description={detail.approvals.some((a) => a.status !== 'pending')
+          ? 'Exactly what was returned to the caller when the run stopped — what happened after the decision is below'
+          : 'Exactly what was returned to the caller'}
         actions={
           <Button size="sm" variant="ghost" onClick={() => setShowAnswer((value) => !value)} aria-expanded={showAnswer}>
             {showAnswer ? 'Hide' : 'Show'}
@@ -404,9 +424,9 @@ export function RunDetailPage({ id }: { id: string }) {
 
       <Card
         title="Trace"
-        description={`${f.plural(detail.trace.length, 'step')} · ${f.number(detail.timings.tool_ms)} ms of it inside tools`}
+        description={`${f.plural(steps, 'step')} · ${f.number(detail.timings.tool_ms)} ms of it inside tools · in the order they ran`}
       >
-        <TraceSteps spans={detail.trace} />
+        <TraceSteps spans={detail.trace} decidedAfter={detail.finished} />
       </Card>
 
       {detail.approvals.length > 0 && (

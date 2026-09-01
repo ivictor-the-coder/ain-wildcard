@@ -101,6 +101,15 @@ export const commands: CommandDef[] = [
     run: (go) => go('/copilot?new=1'),
   },
   {
+    id: 'copilot.draft',
+    title: 'Draft with the copilot',
+    subtitle: 'Write a follow-up from a deal’s own facts, then log it',
+    group: 'Create',
+    keywords: ['ai', 'draft', 'email', 'write', 'follow up', 'compose'],
+    icon: 'edit',
+    run: (go) => go('/copilot?draft=1'),
+  },
+  {
     id: 'copilot.runs',
     title: 'Agent runs and traces',
     subtitle: 'Every run, its steps, timings and cost',

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createApp, frozenClock, type App } from '../src/server/app';
 import type { Auth } from '../src/server/kernel/http';
 import { DAY, dayKey } from '../src/shared/time';
-import type { Invoice, Subscription } from '../src/server/modules/billing/types';
+import type { CreditNote, Invoice, Subscription } from '../src/server/modules/billing/types';
 import type {
   Charge, Dispute, DunningAttempt, DunningView, PaymentIntent, PaymentMethod, Refund, SimulatedBehavior,
 } from '../src/server/modules/payments/types';
@@ -627,6 +627,14 @@ const netCashIn = (view: any): number => view.cash_collected - view.amount_refun
  * the customer's own balance ledger. Reading the credit back out of the ledger
  * is what catches an overpayment row filed against the wrong bill — the view
  * would agree with itself either way.
+ *
+ * The identity on its own is necessary and not sufficient, which is the whole
+ * reason `assertCashHeld` exists in the gateway and the reason the second loop
+ * below does: a bill that ends up holding more of a customer's cash than it
+ * could ever be owed satisfies `net cash in === amount_paid + credit` exactly,
+ * because the cash *is* on the bill — sitting against a negative `amount_due`
+ * that nobody can act on and no ledger records. So what the bill can hold is
+ * asserted here too, against what was written rather than what was computed.
  */
 async function assertReconciled(ws: Workspace, customerId: string, where: string): Promise<number> {
   const invoices = (await ws.ok('GET', `/v1/invoices?customer=${customerId}&status=all&limit=100`)).data as Invoice[];
@@ -650,6 +658,31 @@ async function assertReconciled(ws: Workspace, customerId: string, where: string
       netCashIn(view), view.amount_paid + view.amount_overpaid,
       `${where}: ${invoice.number} took ${netCashIn(view)} net and accounts for ${view.amount_paid} on the bill + ${view.amount_overpaid} on the account`,
     );
+    // A struck-out bill is the one document allowed to record cash it is not
+    // owed: voiding leaves whatever was collected in `amount_paid` so a refund
+    // can still reach it. Every other bill has to be able to hold what it says
+    // it holds.
+    if (invoice.status !== 'void') {
+      const collectable = invoice.total - invoice.pre_payment_credit_notes_amount;
+      assert.ok(
+        invoice.amount_paid >= 0 && invoice.amount_paid <= collectable,
+        `${where}: ${invoice.number} records ${invoice.amount_paid} collected but can only ever be owed ${collectable}, so ${invoice.amount_paid - collectable} of the customer's money is on a bill that cannot hold it and on nobody's account`,
+      );
+      assert.ok(
+        invoice.amount_due >= 0,
+        `${where}: ${invoice.number} is owed ${invoice.amount_due}, which is not a bill anybody can act on`,
+      );
+      // The half the identity is blindest to, because it balances perfectly
+      // while it is false: a bill that can still absorb money holding the
+      // customer's cash as credit against *itself*. `applyCollection` only
+      // lands the excess once the room is gone, so the two are never both
+      // positive — and the next presentation against a bill in that state
+      // collects money the customer has already paid on it.
+      assert.ok(
+        creditForBill === 0 || invoice.amount_paid >= collectable,
+        `${where}: ${invoice.number} can still absorb ${collectable - invoice.amount_paid} and is at the same time holding ${creditForBill} of the customer's cash as credit against itself, so presenting it again would collect money they have already paid on it`,
+      );
+    }
     cash += netCashIn(view);
     accounted += view.amount_paid;
   }
@@ -986,6 +1019,558 @@ describe('money going back out is the mirror of money coming in', () => {
   });
 });
 
+
+/* ========================================================================== *
+ * 2c-ii. The bill can shrink under the money as well as after it
+ *
+ * `applyCollection` handles one order: a debit settles days after a credit note
+ * landed, the room in the bill has gone, and the difference goes to the
+ * customer's account. This section is the other order, which is the same event
+ * and the same shortfall: the cash is already on the bill when the credit note
+ * arrives.
+ *
+ * Billing routes a note to the customer's balance only when the invoice is
+ * `paid` — reading "has the money arrived" as "has *all* of it arrived" — so a
+ * part-paid bill takes the whole note off what it was billed. Left alone that
+ * leaves `amount_paid` bigger than the bill can ever be owed and `amount_due`
+ * *negative*: the customer's cash on a document that is no longer owed it, and
+ * on nobody's account.
+ *
+ * The identity these tests do not rely on alone is the reason this section
+ * exists: net cash in still equals `amount_paid` + credit in that state,
+ * because the cash really is on the bill. What it is not is money anyone can
+ * reach.
+ * ========================================================================== */
+
+describe('a bill that shrinks under money already on it', () => {
+  /** $400.00 of a $499.00 bill collected by card, nothing credited yet. */
+  async function partPaid(ws: Workspace, name: string): Promise<{ customer: any; invoice: Invoice; charge: Charge }> {
+    const customer = await ws.customer(name);
+    const { invoice } = await ws.bill(customer.id);
+    assert.equal(invoice.total, 49_900, 'the growth plan is $499.00 a month');
+    const card = await ws.card(customer.id, 'succeeds');
+    const paid: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+      customer: customer.id, invoice: invoice.id, payment_method: card.id,
+      amount: 40_000, confirm: true, off_session: true,
+    });
+    assert.equal(paid.status, 'succeeded');
+    const part = await ws.invoice(invoice.id);
+    assert.equal(part.status, 'open');
+    assert.equal(part.amount_paid, 40_000);
+    assert.equal(part.amount_due, 9_900, '$99.00 of the bill is still owed');
+    await assertReconciled(ws, customer.id, 'after a part payment');
+    return { customer, invoice: part, charge: await ws.ok('GET', `/v1/charges/${paid.latest_charge}`) };
+  }
+
+  test('crediting the whole of a part-paid bill hands the cash back as credit, not as a negative balance', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice } = await partPaid(ws, 'Bewdley Castings');
+
+      // The whole bill is credited — an order cancelled after a deposit was
+      // taken. $400.00 of it is money that has already arrived.
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 49_900, reason: 'order_change' });
+
+      const after = await ws.invoice(invoice.id);
+      assert.equal(after.pre_payment_credit_notes_amount, 49_900);
+      assert.equal(
+        after.amount_due, 0,
+        'a bill credited to nothing is owed nothing — never minus the deposit that was taken against it',
+      );
+      assert.equal(after.amount_paid, 0, 'the bill charges nothing now, so it holds none of the cash');
+      assert.equal(after.status, 'paid', 'and it is settled: there is nothing left on it to collect');
+
+      const view = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(view.cash_collected, 40_000, 'the card was still charged $400.00');
+      assert.equal(view.amount_overpaid, 40_000, 'and all of it is the customer’s, on their account');
+      assert.equal(netCashIn(view), 40_000);
+      assert.equal(
+        (await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, -40_000,
+        'the customer holds the deposit they paid on an order that was cancelled',
+      );
+      await assertReconciled(ws, customer.id, 'after crediting a part-paid bill in full');
+
+      const ledger = (await ws.ok('GET', `/v1/customers/${customer.id}/balance_transactions?limit=50`)).data as any[];
+      const row = ledger.find((entry) => entry.type === 'invoice_overpayment');
+      assert.ok(row, 'the credit is a ledger row of its own, so the account reads as one story');
+      assert.equal(row.amount, -40_000);
+      assert.equal(row.invoice, invoice.id);
+      assert.match(row.description, /credited/);
+
+      const events = await ws.ok('GET', '/v1/events?type=invoice.overpaid&limit=20');
+      const overpaid = (events.data as any[]).find((e) => e.data?.invoice === invoice.id);
+      assert.ok(overpaid, 'money moving onto the account is on the event stream, not silent');
+      assert.equal(overpaid.data.amount_overpaid, 40_000);
+    } finally { ws.close(); }
+  });
+
+  test('crediting past the balance but not the whole bill moves only what the bill can no longer hold', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice } = await partPaid(ws, 'Ludlow Gearing');
+
+      // $200.00 credited against a bill that is owed $99.00: $99.00 of it comes
+      // off what is still due and the remaining $101.00 is cash already taken.
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 20_000, reason: 'order_change' });
+
+      const after = await ws.invoice(invoice.id);
+      assert.equal(after.amount_paid, 29_900, 'the bill charges $299.00 now, and holds exactly that');
+      assert.equal(after.amount_due, 0);
+      assert.equal(after.status, 'paid');
+      const view = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(view.amount_overpaid, 10_100, 'and $101.00 — no more — went to the account');
+      assert.equal(netCashIn(view), 40_000);
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, -10_100);
+      await assertReconciled(ws, customer.id, 'after crediting past the balance of a part-paid bill');
+    } finally { ws.close(); }
+  });
+
+  test('a credit note that only reaches the balance leaves the cash where it is', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice } = await partPaid(ws, 'Kidderminster Weave');
+
+      // Exactly the $99.00 still owed. Nothing has been collected past the new
+      // balance, so nothing moves to the account.
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 9_900, reason: 'order_change' });
+
+      const after = await ws.invoice(invoice.id);
+      assert.equal(after.amount_paid, 40_000, 'the bill still holds the $400.00 it was paid');
+      assert.equal(after.amount_due, 0);
+      assert.equal(after.status, 'paid');
+      const view = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(view.amount_overpaid, 0, 'and the account is handed nothing it is not owed');
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0);
+      await assertReconciled(ws, customer.id, 'after crediting exactly the balance');
+    } finally { ws.close(); }
+  });
+
+  test('the cash and the credit note arriving in either order leave the same account', async () => {
+    // The whole point: these are one event in two orders, and a customer's
+    // position cannot depend on which of them the clock happened to put first.
+    const cashFirst = await workspace();
+    const creditFirst = await workspace();
+    try {
+      const { customer: a, invoice: firstBill } = await partPaid(cashFirst, 'Order Alpha');
+      await cashFirst.ok('POST', '/v1/credit_notes', { invoice: firstBill.id, amount: 20_000, reason: 'order_change' });
+
+      // The mirror: the note lands while the debit is still with the bank, so
+      // the money arrives against a bill that has already shrunk.
+      const b = await creditFirst.customer('Order Beta');
+      const { invoice: secondBill } = await creditFirst.bill(b.id);
+      const debit: PaymentMethod = await creditFirst.ok('POST', '/v1/payment_methods', {
+        type: 'bank_debit', customer: b.id, bank_name: 'Midland Union Bank',
+        account_type: 'checking', simulated_behavior: 'succeeds',
+      });
+      await creditFirst.ok('POST', '/v1/payment_intents', {
+        customer: b.id, invoice: secondBill.id, payment_method: debit.id,
+        amount: 40_000, confirm: true, off_session: true,
+      });
+      await creditFirst.ok('POST', '/v1/credit_notes', { invoice: secondBill.id, amount: 20_000, reason: 'order_change' });
+      assert.equal((await creditFirst.travel(5 * DAY)).failed, 0);
+
+      const shape = async (ws: Workspace, customerId: string, invoiceId: string) => {
+        const invoice = await ws.invoice(invoiceId);
+        const view = await ws.ok('GET', `/v1/invoices/${invoiceId}/payments`);
+        return {
+          status: invoice.status,
+          amount_paid: invoice.amount_paid,
+          amount_due: invoice.amount_due,
+          amount_overpaid: view.amount_overpaid,
+          cash_collected: view.cash_collected,
+          balance: (await ws.ok('GET', `/v1/customers/${customerId}`)).balance,
+        };
+      };
+      const before = await shape(cashFirst, a.id, firstBill.id);
+      const later = await shape(creditFirst, b.id, secondBill.id);
+      assert.deepEqual(
+        before, later,
+        'a $200.00 credit note against a $499.00 bill with $400.00 collected leaves one position, whichever arrived first',
+      );
+      assert.deepEqual(before, {
+        status: 'paid', amount_paid: 29_900, amount_due: 0,
+        amount_overpaid: 10_100, cash_collected: 40_000, balance: -10_100,
+      });
+      await assertReconciled(cashFirst, a.id, 'cash before the credit note');
+      await assertReconciled(creditFirst, b.id, 'credit note before the cash');
+    } finally { cashFirst.close(); creditFirst.close(); }
+  });
+
+  test('the cash a credit note displaced can be refunded once, and the bill is not billed again', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice, charge } = await partPaid(ws, 'Wolverley Tooling');
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 49_900, reason: 'order_change' });
+
+      // The customer wants the deposit back rather than the credit — the
+      // module's documented remedy, run against the charge that took it.
+      const refund: Refund = await ws.ok('POST', '/v1/refunds', {
+        charge: charge.id, amount: 40_000, reason: 'requested_by_customer',
+      });
+      assert.equal(refund.amount, 40_000);
+
+      const after = await ws.invoice(invoice.id);
+      assert.equal(after.status, 'paid', 'a bill credited to nothing is not owed again by the refund of a deposit');
+      assert.equal(after.amount_due, 0, 'the customer is not shown owing a bill that charges nothing');
+      assert.equal(after.amount_paid, 0);
+      const view = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(view.amount_refunded, 40_000);
+      assert.equal(view.amount_overpaid, 0, 'the credit went back with the cash that made it');
+      assert.equal(netCashIn(view), 0, '$400.00 taken, $400.00 returned');
+      assert.equal(
+        (await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0,
+        'the customer was paid back once — not paid back and left holding the credit as well',
+      );
+      await assertReconciled(ws, customer.id, 'after refunding cash a credit note displaced');
+
+      await ws.fail('POST', '/v1/refunds', { charge: charge.id, amount: 1 }, 400, 'refund_exceeds_charge');
+    } finally { ws.close(); }
+  });
+
+  test('a chargeback over cash a credit note displaced takes the credit, not the settled bill', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice, charge } = await partPaid(ws, 'Stourport Anodising');
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 49_900, reason: 'order_change' });
+
+      const dispute: Dispute = await ws.ok('POST', '/v1/disputes', { charge: charge.id, reason: 'fraudulent' });
+      assert.equal(dispute.amount, 40_000);
+
+      const held = await ws.invoice(invoice.id);
+      assert.equal(held.status, 'paid', 'the bill charges nothing and stays settled — the network took the credit');
+      assert.equal(held.amount_due, 0);
+      const view = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(view.amount_overpaid, 0);
+      assert.equal(netCashIn(view), 0);
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0);
+      await assertReconciled(ws, customer.id, 'while a chargeback over displaced cash is open');
+
+      await ws.ok('POST', `/v1/disputes/${dispute.id}/evidence`, {
+        product_description: 'Deposit taken against a telemetry rollout the customer cancelled; credited in full the same week.',
+      });
+      await ws.ok('POST', `/v1/disputes/${dispute.id}/close`, { status: 'won' });
+
+      const back = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(back.amount_overpaid, 40_000, 'winning it puts the credit back on the account, to the penny');
+      assert.equal((await ws.invoice(invoice.id)).amount_paid, 0, 'and never onto a bill that charges nothing');
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, -40_000);
+      await assertReconciled(ws, customer.id, 'after winning a chargeback over displaced cash');
+    } finally { ws.close(); }
+  });
+
+  test('a bill withdrawn after a credit note keeps the cash reachable rather than moving it twice', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice, charge } = await partPaid(ws, 'Cleobury Bearings');
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 20_000, reason: 'order_change' });
+      const credited = await ws.invoice(invoice.id);
+      assert.equal(credited.amount_paid, 29_900);
+      assert.equal(credited.status, 'paid');
+
+      // A settled bill cannot be withdrawn, so the money stays reachable
+      // through the charge that took it. That is the point: the fix must not
+      // strand the cash somewhere neither a refund nor a chargeback can go.
+      await ws.fail('POST', `/v1/invoices/${invoice.id}/void`, {}, 409, 'invoice_paid');
+
+      await ws.ok('POST', '/v1/refunds', { charge: charge.id, reason: 'requested_by_customer' });
+      const view = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(view.amount_refunded, 40_000, 'every unit that was taken can still be given back');
+      assert.equal(netCashIn(view), 0);
+      assert.equal(view.amount_overpaid, 0);
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0);
+      const after = await ws.invoice(invoice.id);
+      assert.equal(after.amount_paid, 0);
+      assert.equal(after.amount_due, 29_900, 'and what the bill still charges is owed again');
+      assert.equal(after.status, 'open');
+      await assertReconciled(ws, customer.id, 'after refunding everything off a credited part-paid bill');
+    } finally { ws.close(); }
+  });
+
+  /* ------------------------------------------------------------------ *
+   * And the undo. A credit note can be withdrawn, and billing puts it back
+   * as the note *recorded* itself — the whole amount onto `amount_due`,
+   * because a note raised against a part-paid bill records the whole of
+   * itself as pre-payment. The slice payments had carried onto the account
+   * is not billing's to put back, so if nothing here does it the bill is
+   * owed the full amount again with nothing recorded as collected, and the
+   * customer's own money sits as credit against that same invoice for the
+   * next presentation to take a second time.
+   * ------------------------------------------------------------------ */
+
+  test('withdrawing the note that displaced the cash puts it back on the bill, not onto a second charge', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice } = await partPaid(ws, 'Highley Castings');
+      const note = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 49_900, reason: 'order_change' });
+      assert.equal((await ws.invoice(invoice.id)).amount_paid, 0, 'the deposit moved to the account');
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, -40_000);
+
+      // The note should not have been written — the order was not cancelled.
+      await ws.ok('POST', `/v1/credit_notes/${note.id}/void`, {});
+
+      const back = await ws.invoice(invoice.id);
+      assert.equal(back.status, 'open', 'the bill is owed again');
+      assert.equal(
+        back.amount_paid, 40_000,
+        'and it records the $400.00 that was collected against it — the deposit did not stop being a deposit when the note was withdrawn',
+      );
+      assert.equal(back.amount_due, 9_900, 'so what is owed is the $99.00 that was owed before the note, not the whole $499.00');
+      const view = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(view.amount_overpaid, 0, 'nothing is left filed as credit against a bill that can hold it');
+      assert.equal(netCashIn(view), 40_000);
+      assert.equal(
+        (await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0,
+        'the account holds nothing: the cash is on the bill it was paid against',
+      );
+      await assertReconciled(ws, customer.id, 'after withdrawing a note that had displaced a part payment');
+
+      // The whole point, in the only terms that matter: what the next
+      // presentation takes off the customer's card.
+      await ws.ok('POST', `/v1/invoices/${invoice.id}/retry`, {});
+      const settled = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(
+        settled.cash_collected, 49_900,
+        '$499.00 in total was ever taken from the card — not $899.00, which is what presenting the whole bill again over a $400.00 credit would have collected',
+      );
+      assert.equal((await ws.invoice(invoice.id)).status, 'paid');
+      assert.equal(settled.amount_overpaid, 0);
+      await assertReconciled(ws, customer.id, 'after settling the balance a withdrawn note left');
+    } finally { ws.close(); }
+  });
+
+  test('withdrawing a note that reached only part-way into the cash puts back exactly that part', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice } = await partPaid(ws, 'Alveley Pressings');
+      // $200.00 against a bill owed $99.00: $101.00 of it displaced cash.
+      const note = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 20_000, reason: 'order_change' });
+      assert.equal((await ws.invoice(invoice.id)).amount_paid, 29_900);
+      assert.equal((await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`)).amount_overpaid, 10_100);
+
+      await ws.ok('POST', `/v1/credit_notes/${note.id}/void`, {});
+
+      const back = await ws.invoice(invoice.id);
+      assert.deepEqual(
+        { status: back.status, amount_paid: back.amount_paid, amount_due: back.amount_due, pre: back.pre_payment_credit_notes_amount },
+        { status: 'open', amount_paid: 40_000, amount_due: 9_900, pre: 0 },
+        'the withdrawal leaves exactly the position the note found — no more and no less',
+      );
+      assert.equal((await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`)).amount_overpaid, 0);
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0);
+      await assertReconciled(ws, customer.id, 'after withdrawing a note that reached part-way into the cash');
+    } finally { ws.close(); }
+  });
+
+  test('credit the bill genuinely cannot absorb survives the withdrawal of a later note', async () => {
+    const ws = await workspace();
+    try {
+      // $499.00 taken by a debit against a bill credited to $199.00 while it
+      // flew: $300.00 of it is credit the bill can never hold, because it can
+      // never be owed more than the $199.00 it now charges.
+      const { customer, invoice } = await overpaidByCreditNote(ws, 'Quatt Hydraulics');
+      assert.equal((await ws.invoice(invoice.id)).amount_paid, 19_900);
+      assert.equal((await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`)).amount_overpaid, 30_000);
+
+      // A second note, on a bill that is now paid: it goes to the balance and
+      // takes nothing off `amount_paid`, so withdrawing it must put nothing
+      // back onto it — and must leave the $300.00 that was already there.
+      const later = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 10_000, reason: 'order_change' });
+      assert.equal(later.post_payment_amount, 10_000, 'a paid bill takes a note on the balance');
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, -40_000);
+
+      await ws.ok('POST', `/v1/credit_notes/${later.id}/void`, {});
+
+      const back = await ws.invoice(invoice.id);
+      assert.equal(back.amount_paid, 19_900, 'the bill still holds exactly what it could be owed');
+      assert.equal(back.status, 'paid');
+      assert.equal(back.amount_due, 0);
+      assert.equal(
+        (await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`)).amount_overpaid, 30_000,
+        'and the $300.00 the bill can never absorb is still the customer’s, untouched by a withdrawal that never displaced it',
+      );
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, -30_000);
+      await assertReconciled(ws, customer.id, 'after withdrawing a note off a bill holding credit it cannot absorb');
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 2c-ii. A bill somebody gave up on
+ *
+ * `pay()` is billing's word for "settled", and this module says it through
+ * `applyCollection`. A written-off bill is a decision a person made, so what
+ * that word may be said over is not a detail: `settleCreditedExcess` states the
+ * rule on the way out — "a bill written off stays written off" — and the two
+ * paths that put money *back* on a bill have to keep it, because neither of
+ * them is a collection. A chargeback we win back and the cash a withdrawn
+ * credit note puts back were both sitting on that bill before anyone gave up on
+ * it; returning them cannot be what collects it.
+ *
+ * The identity cannot see any of this — every figure below balances either way,
+ * because the cash never moves off the account. What moves is the bill's
+ * status, `invoice.paid` goes out over a bad debt, and billing turns that into
+ * a subscription put back into service on money nobody paid.
+ *
+ * And the mirror-image mistake this must not become is the last test: money
+ * that genuinely *arrives* on a written-off bill — a debit already with the
+ * bank when finance gave up — was collected after all, and still settles it.
+ * ========================================================================== */
+
+describe('a bill somebody gave up on', () => {
+  /**
+   * $400.00 collected, the $99.00 balance written off, and then credited away
+   * so the write-off is tidy: `uncollectible`, nothing owed, $400.00 on it.
+   */
+  async function writtenOff(ws: Workspace, name: string): Promise<{ customer: any; invoice: Invoice; charge: Charge }> {
+    const customer = await ws.customer(name);
+    const { invoice } = await ws.bill(customer.id);
+    const card = await ws.card(customer.id, 'succeeds');
+    const paid: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+      customer: customer.id, invoice: invoice.id, payment_method: card.id,
+      amount: 40_000, confirm: true, off_session: true,
+    });
+    await ws.ok('POST', `/v1/invoices/${invoice.id}/mark_uncollectible`, {});
+    await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 9_900, reason: 'order_change' });
+    const off = await ws.invoice(invoice.id);
+    assert.deepEqual(
+      { status: off.status, amount_paid: off.amount_paid, amount_due: off.amount_due },
+      { status: 'uncollectible', amount_paid: 40_000, amount_due: 0 },
+      'the deposit stays on the bill, the $99.00 nobody is going to pay is credited away, and the bill is written off',
+    );
+    await assertReconciled(ws, customer.id, 'after writing off the balance of a part-paid bill');
+    return { customer, invoice: off, charge: await ws.ok('GET', `/v1/charges/${paid.latest_charge}`) };
+  }
+
+  test('withdrawing a note off a written-off bill leaves the write-off where it found it', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice } = await writtenOff(ws, 'Wroxeter Tooling');
+
+      // A second note, raised against the wrong bill: $200.00 of the deposit is
+      // more than what is left owed, so payments carries it onto the account.
+      const wrong = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 20_000, reason: 'order_change' });
+      assert.equal((await ws.invoice(invoice.id)).amount_paid, 20_000);
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, -20_000);
+      assert.equal((await ws.invoice(invoice.id)).status, 'uncollectible', 'crediting a written-off bill does not un-write it off');
+
+      await ws.ok('POST', `/v1/credit_notes/${wrong.id}/void`, {});
+
+      const back = await ws.invoice(invoice.id);
+      assert.deepEqual(
+        {
+          status: back.status, amount_paid: back.amount_paid, amount_due: back.amount_due,
+          pre: back.pre_payment_credit_notes_amount,
+        },
+        { status: 'uncollectible', amount_paid: 40_000, amount_due: 0, pre: 9_900 },
+        'exactly the position the note found — including the write-off, which withdrawing a note nobody paid cannot undo',
+      );
+      assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0);
+      await assertReconciled(ws, customer.id, 'after withdrawing a note off a written-off bill');
+    } finally { ws.close(); }
+  });
+
+  test('a written-off bill does not settle itself and put the subscription back into service', async () => {
+    const ws = await workspace();
+    try {
+      // The card on file is refused, so the bill goes past due and the recovery
+      // schedule runs out: billing marks the subscription unpaid.
+      const customer = await ws.customer('Ludlow Conveyors');
+      await ws.card(customer.id, 'card_declined');
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: 'growth_monthly' }],
+      });
+      await ws.tick();
+      const invoice = (await ws.invoicesFor(sub.id))[0];
+      assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'past_due');
+
+      // $400.00 arrives on a card that works, and finance writes the rest off.
+      const good = await ws.card(customer.id, 'succeeds', { brand: 'mastercard' });
+      await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: good.id,
+        amount: 40_000, confirm: true, off_session: true,
+      });
+      await ws.ok('POST', `/v1/invoices/${invoice.id}/mark_uncollectible`, {});
+      assert.equal(
+        (await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'unpaid',
+        'writing the bill off stops the account being collected',
+      );
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 9_900, reason: 'order_change' });
+
+      const wrong = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 20_000, reason: 'order_change' });
+      await ws.ok('POST', `/v1/credit_notes/${wrong.id}/void`, {});
+
+      assert.equal(
+        (await ws.invoice(invoice.id)).status, 'uncollectible',
+        'the bad debt is still a bad debt: nothing was collected, a note was withdrawn',
+      );
+      assert.equal(
+        (await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'unpaid',
+        'so the account stays out of service — an invoice.paid over a written-off bill revives it on money nobody paid',
+      );
+      await assertReconciled(ws, customer.id, 'after withdrawing a note off a written-off bill of an unpaid account');
+    } finally { ws.close(); }
+  });
+
+  test('a chargeback won back onto a written-off bill does not settle it either', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice, charge } = await writtenOff(ws, 'Kinlet Gearing');
+
+      // The network takes the deposit while the case is argued. The bill is
+      // written off and owed $400.00 again — and it stays written off.
+      const dispute: Dispute = await ws.ok('POST', '/v1/disputes', { charge: charge.id, reason: 'fraudulent' });
+      const held = await ws.invoice(invoice.id);
+      assert.deepEqual(
+        { status: held.status, amount_paid: held.amount_paid, amount_due: held.amount_due },
+        { status: 'uncollectible', amount_paid: 0, amount_due: 40_000 },
+      );
+      await assertReconciled(ws, customer.id, 'while the network holds the deposit');
+
+      await ws.ok('POST', `/v1/disputes/${dispute.id}/close`, { status: 'won' });
+
+      const won = await ws.invoice(invoice.id);
+      assert.deepEqual(
+        { status: won.status, amount_paid: won.amount_paid, amount_due: won.amount_due },
+        { status: 'uncollectible', amount_paid: 40_000, amount_due: 0 },
+        'the money that came back is the money the bill was already holding when it was written off, so winning it back is not collecting it',
+      );
+      await assertReconciled(ws, customer.id, 'after winning back a chargeback on a written-off bill');
+    } finally { ws.close(); }
+  });
+
+  test('a debit that clears after the write-off did collect the bill, and settles it', async () => {
+    const ws = await workspace();
+    try {
+      // The mirror-image mistake this must not become. Everything above is
+      // about money going back where it already was; this is money genuinely
+      // arriving on a bill finance had given up on, and it was collected after
+      // all. Refusing to settle here would leave a bill the bank has paid in
+      // full sitting for ever as a bad debt.
+      const customer = await ws.customer('Bewdley Drives');
+      const { invoice } = await ws.bill(customer.id);
+      const debit: PaymentMethod = await ws.ok('POST', '/v1/payment_methods', {
+        type: 'bank_debit', customer: customer.id, bank_name: 'Midland Union Bank',
+        account_type: 'checking', simulated_behavior: 'succeeds',
+      });
+      const presented: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: debit.id, confirm: true, off_session: true,
+      });
+      assert.equal(presented.status, 'processing');
+      await ws.ok('POST', `/v1/invoices/${invoice.id}/mark_uncollectible`, {});
+
+      assert.equal((await ws.travel(5 * DAY)).failed, 0);
+
+      const settled = await ws.invoice(invoice.id);
+      assert.deepEqual(
+        { status: settled.status, amount_paid: settled.amount_paid, amount_due: settled.amount_due },
+        { status: 'paid', amount_paid: 49_900, amount_due: 0 },
+        'the bank paid it in full after the write-off, so it is paid — a write-off is not a state money cannot reach',
+      );
+      await assertReconciled(ws, customer.id, 'after a debit cleared onto a written-off bill');
+    } finally { ws.close(); }
+  });
+});
+
 /* ========================================================================== *
  * 2d. The identity, over sequences nobody wrote down
  *
@@ -1013,14 +1598,23 @@ describe('the reconciliation identity holds over random sequences', () => {
   const OPERATIONS = [
     'present', 'present_debit', 'present_debit', 'pay_card', 'credit_note',
     'settle', 'settle', 'refund', 'dispute', 'close_dispute',
+    // The half the shipped walk never reached. A note can be withdrawn, and
+    // withdrawing one that displaced cash is the one move that grows a bill
+    // back over money this module had already carried onto the account — the
+    // state in which presenting the bill again collects it a second time.
+    'withdraw_note',
   ] as const;
 
-  // Seeds chosen because each walk reaches the state that matters — a bill
-  // holding overpayment credit, then money leaving it that is larger than the
-  // bill itself recorded collecting. The three assertions at the end of the
-  // walk enforce that, so a seed that stops covering the case fails loudly
-  // instead of passing quietly.
-  for (const seed of [0x5eed_0001, 0x5eed_0002, 0x5eed_0007, 0x5eed_000d, 0x5eed_0010]) {
+  // Seeds chosen because each walk reaches every state that matters — a bill
+  // holding overpayment credit, money leaving it that is larger than the bill
+  // itself recorded collecting, a credit note reaching past the balance into
+  // cash that had already arrived, and the note that did it being withdrawn
+  // again afterwards. The five assertions at the end of the walk enforce that,
+  // so a seed that stops covering a case fails loudly instead of passing
+  // quietly — which is exactly what two of them did when the stop on this
+  // account was added below, and why they were re-picked rather than the
+  // assertions relaxed.
+  for (const seed of [0x5eed_007f, 0x5eed_00b1, 0x5eed_00f7, 0x5eed_0115, 0x5eed_011a, 0x5eed_0132]) {
     test(`seed ${seed.toString(16)}: collect / overpay / refund / dispute in any order still reconciles`, async () => {
       const ws = await workspace();
       const log: string[] = [];
@@ -1029,7 +1623,15 @@ describe('the reconciliation identity holds over random sequences', () => {
         const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length) % items.length];
 
         const customer = await ws.customer('Property Machining');
-        const { invoice } = await ws.bill(customer.id);
+        const { sub, invoice } = await ws.bill(customer.id);
+        // Automatic collection is stopped on this account, so the only thing
+        // that moves money here is the walk itself. Without it the bill is
+        // presented the moment a method is attached — which is correct, and is
+        // the whole point of the handler above — and every walk then starts
+        // from a bill that is already settled, which is the one state none of
+        // the cases below can be reached from. A human retry overrides the
+        // stop, so `present` still exercises the collection path.
+        await ws.ok('POST', `/v1/subscriptions/${sub.id}/pause`, { behavior: 'keep_as_draft' });
         const card = await ws.card(customer.id, 'succeeds');
         const debit: PaymentMethod = await ws.ok('POST', '/v1/payment_methods', {
           type: 'bank_debit', customer: customer.id, bank_name: 'Midland Union Bank',
@@ -1043,6 +1645,8 @@ describe('the reconciliation identity holds over random sequences', () => {
         let sawCredit = false;
         let sawReversalAgainstCredit = false;
         let sawReversalBeyondBill = false;
+        let sawCreditPastTheCash = false;
+        let sawNoteWithdrawn = false;
         const creditOnBill = async (): Promise<number> =>
           (await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`)).amount_overpaid as number;
 
@@ -1066,7 +1670,7 @@ describe('the reconciliation identity holds over random sequences', () => {
             .sort(byContent);
         };
 
-        for (let step = 0; step < 24; step++) {
+        for (let step = 0; step < 48; step++) {
           const op = pick(OPERATIONS);
           const bill = await ws.invoice(invoice.id);
           switch (op) {
@@ -1097,8 +1701,29 @@ describe('the reconciliation identity holds over random sequences', () => {
             }
             case 'credit_note': {
               const amount = Math.max(1, Math.ceil(invoice.total * (0.05 + random() * 0.5)));
-              log.push(`${step}: credit_note ${amount}`);
-              await attempt('POST', '/v1/credit_notes', { invoice: invoice.id, amount, reason: 'order_change' });
+              log.push(`${step}: credit_note ${amount} (${bill.amount_paid} on the bill, ${bill.amount_due} owed)`);
+              const written = await attempt('POST', '/v1/credit_notes', { invoice: invoice.id, amount, reason: 'order_change' });
+              // The bill shrinking under money already on it: the note reaches
+              // past what is still owed and into cash that has already arrived.
+              if (written && bill.status !== 'paid' && bill.amount_paid > 0 && amount > bill.amount_due) sawCreditPastTheCash = true;
+              break;
+            }
+            case 'withdraw_note': {
+              // Ordered by what the notes *are*, for the same reason the charges
+              // are: ids are random and several notes share a frozen `created`.
+              const issued = ((await ws.ok('GET', `/v1/credit_notes?invoice=${invoice.id}&status=issued&limit=50`))
+                .data as CreditNote[])
+                .slice()
+                .sort((a, b) => a.created - b.created || a.total - b.total || a.pre_payment_amount - b.pre_payment_amount);
+              if (!issued.length) { log.push(`${step}: withdraw (no note to withdraw)`); break; }
+              const note = pick(issued);
+              const credit = await creditOnBill();
+              log.push(`${step}: withdraw ${note.number} ${note.total} (pre ${note.pre_payment_amount}, ${credit} credit, ${bill.amount_paid} on the bill)`);
+              const done = await attempt('POST', `/v1/credit_notes/${note.id}/void`, {});
+              // Only a pre-payment note over a bill that is holding a customer's
+              // cash as credit grows the bill back over that cash. Anything else
+              // is a withdrawal this half was never in danger of getting wrong.
+              if (done && credit > 0 && note.pre_payment_amount > 0) sawNoteWithdrawn = true;
               break;
             }
             case 'settle': {
@@ -1167,6 +1792,25 @@ describe('the reconciliation identity holds over random sequences', () => {
         assert.ok(
           sawReversalBeyondBill,
           `seed ${seed}: the walk never reversed more than the bill recorded as collected, so the split between bill and credit was never load-bearing\n${log.join('\n')}`,
+        );
+        // The other order, and the one the identity alone cannot see: a credit
+        // note reaching past the balance into cash that has already arrived. It
+        // leaves `net cash in === amount_paid + credit` true and the bill
+        // holding money it can never be owed, so a walk that never gets there
+        // never tests the half of `assertReconciled` that checks what the bill
+        // can hold.
+        assert.ok(
+          sawCreditPastTheCash,
+          `seed ${seed}: the walk never credited a bill past the cash already on it, so the bill never shrank under money it was holding\n${log.join('\n')}`,
+        );
+        // And the undo of that: a note withdrawn off a bill whose cash it had
+        // displaced. The bill is owed the whole amount again while the account
+        // still holds the money, which every figure in the identity survives —
+        // it is the clause about what a bill can hold that does not, and the
+        // next presentation that collects the customer's money twice.
+        assert.ok(
+          sawNoteWithdrawn,
+          `seed ${seed}: the walk never withdrew a note that had displaced cash, so the half that puts it back was never exercised\n${log.join('\n')}`,
         );
       } finally { ws.close(); }
     });
@@ -1919,6 +2563,87 @@ describe('an answer that arrives after the bill has moved', () => {
     } finally { ws.close(); }
   });
 
+  /**
+   * The mirror of the test above, and the half of the undo that is not money.
+   *
+   * A credit note that clears a balance settles the bill, and `invoice.paid`
+   * cancels the campaign chasing it and the retry job with it. Withdrawing the
+   * note puts the money back on the bill — and has to put the chase back too,
+   * or the bill sits open, owed, with a working card on file, and no automatic
+   * path ever presents it again. `invoice.finalized` fires once per bill and
+   * fired long ago; a cancelled campaign stays cancelled.
+   */
+  test('withdrawing the credit note that settled a bill puts the chase back, not just the debt', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const customer = await ws.customer('Melverley Castings');
+      const method = await ws.card(customer.id, 'insufficient_funds');
+      const { invoice } = await ws.subscribe(customer.id);
+      const [opened] = await ws.dunning(customer.id);
+      assert.equal(opened.status, 'recovering');
+
+      const note: CreditNote = await ws.ok('POST', '/v1/credit_notes', {
+        invoice: invoice.id, amount: invoice.total, reason: 'order_change',
+      });
+      assert.equal((await ws.invoice(invoice.id)).status, 'paid', 'the note covered the whole bill');
+      assert.equal((await ws.dunning(customer.id))[0].status, 'canceled', 'so nothing is chasing it');
+
+      // The note should never have been written. Billing puts the debt back.
+      await ws.ok('POST', `/v1/credit_notes/${note.id}/void`, {});
+      const owed = await ws.invoice(invoice.id);
+      assert.equal(owed.status, 'open');
+      assert.equal(owed.amount_due, invoice.total, 'the whole bill is owed again');
+
+      // The card is good now, and a year is long enough for any schedule.
+      await ws.ok('PATCH', `/v1/payment_methods/${method.id}`, { simulated_behavior: 'succeeds' });
+      assert.equal((await ws.travel(400 * DAY)).failed, 0);
+
+      const settled = await ws.invoice(invoice.id);
+      assert.equal(
+        settled.status, 'paid',
+        'a bill whose credit note was withdrawn is presented again like any other owed bill',
+      );
+      assert.equal(settled.amount_paid, invoice.total);
+      const view = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(view.cash_collected, invoice.total, 'and the money actually arrived');
+      await assertReconciled(ws, customer.id, 'after the credit note that settled a bill was withdrawn');
+    } finally { ws.close(); }
+  });
+
+  /**
+   * The same undo with a card that still declines: the campaign the settlement
+   * closed is the one that takes the bill back, rather than a second campaign
+   * starting the schedule over from attempt one.
+   */
+  test('a bill revived by withdrawing its credit note goes back to the campaign that was chasing it', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const customer = await ws.customer('Alderbury Tooling');
+      await ws.card(customer.id, 'insufficient_funds');
+      const { invoice } = await ws.subscribe(customer.id);
+      const first = (await ws.dunning(customer.id))[0];
+      assert.equal(first.status, 'recovering');
+      assert.equal(first.attempt_count, 1);
+
+      const note: CreditNote = await ws.ok('POST', '/v1/credit_notes', {
+        invoice: invoice.id, amount: invoice.total, reason: 'order_change',
+      });
+      assert.equal((await ws.dunning(customer.id))[0].status, 'canceled');
+
+      await ws.ok('POST', `/v1/credit_notes/${note.id}/void`, {});
+      assert.equal((await ws.travel(2 * DAY)).failed, 0);
+
+      const campaigns = await ws.dunning(customer.id);
+      assert.equal(campaigns.length, 1, 'the same campaign, not a second one over the same bill');
+      assert.equal(campaigns[0].status, 'recovering', 'the debt is being chased again');
+      assert.ok(
+        campaigns[0].attempt_count > first.attempt_count,
+        `the card was presented again — attempts went ${first.attempt_count} → ${campaigns[0].attempt_count}`,
+      );
+      await assertReconciled(ws, customer.id, 'after a declined bill was revived by withdrawing its credit note');
+    } finally { ws.close(); }
+  });
+
   test('pausing collection stands down the retry that was already scheduled', async () => {
     const ws = await workspace(MONDAY);
     try {
@@ -2543,3 +3268,271 @@ describe('the bills a stop held back are presented when it is lifted', () => {
     } finally { ws.close(); }
   });
 });
+
+/* ========================================================================== *
+ * 8. The other two ways a bill stops being asked for
+ *
+ * The section above holds one half of a rule. These hold the rest of it, and
+ * both are the same mistake one condition along: `invoice.finalized` asks five
+ * questions before it queues the one automatic charge a bill is entitled to,
+ * and every "no" is a decision that can stop being true. A pause being lifted
+ * is answered above. Nothing answered the other one that lifts — an account
+ * with no method on file — so a bill raised the day before the card arrived is
+ * asked for once, at the one moment nobody could pay it, and never again.
+ *
+ * And the mirror of it at the far end of the schedule: a campaign that ran out
+ * of windows is the one status the recovery summary reads as money gone. A
+ * bill collected after that — by exactly the hand retry the queue tells an
+ * operator to make — left the campaign disagreeing with the bill it was
+ * chasing: cash in, reported as lost, under an action line still asking for it.
+ * ========================================================================== */
+
+describe('a card that arrives after the bill', () => {
+  test('a bill raised before there was a card on file is presented when one arrives', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Redgate Castings');
+      const { invoice } = await ws.bill(customer.id);
+      assert.equal(
+        ws.app.ctx.db.count(
+          `SELECT COUNT(*) FROM jobs WHERE org_id = ? AND idem_key = ?`,
+          ORG, `payments.collect_invoice:${invoice.id}`,
+        ),
+        0,
+        'nothing was queued, and rightly: an account with no method on file has nothing to present',
+      );
+      assert.equal((await ws.dunning(customer.id)).length, 0, 'and nothing was refused, so nothing is chasing it');
+
+      // The finance team finds the corporate card the next day. That is the
+      // answer to the only question that stopped this bill being charged.
+      await ws.travel(DAY);
+      await ws.card(customer.id, 'succeeds');
+      assert.equal((await ws.travel(2 * DAY)).failed, 0);
+
+      const after = await ws.invoice(invoice.id);
+      assert.equal(
+        after.status, 'paid',
+        `${after.number} is still owed ${after.amount_due} by an account with a working card on it: the one presentation the bill was entitled to was skipped because there was nothing to charge, and nothing ever queued another`,
+      );
+      assert.equal(after.amount_paid, invoice.amount_due, 'and it collected exactly what it was owed');
+      const charges = (await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all&limit=100`)).data as Charge[];
+      assert.equal(charges.length, 1, 'presented once, not once per method on the account');
+      await assertReconciled(ws, customer.id, 'after a card arrived for a bill that had none');
+    } finally { ws.close(); }
+  });
+
+  test('a stop lifted while there was nothing to charge is not the end of the bill either', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Fenwick Castings');
+      const { sub, invoice } = await ws.bill(customer.id);
+
+      // Both stops are on at once, and both come off — the pause first, while
+      // the account still has nothing on it to charge. Resuming reads the same
+      // "no method" answer `invoice.finalized` read and stands down on it, so
+      // the half above cannot be what puts this bill back.
+      await ws.ok('POST', `/v1/subscriptions/${sub.id}/pause`, { behavior: 'keep_as_draft' });
+      await ws.tick();
+      const resumed = await ws.ok('POST', `/v1/subscriptions/${sub.id}/resume`, {});
+      assert.equal(resumed.status, 'active');
+      assert.equal((await ws.travel(2 * DAY)).failed, 0);
+      assert.equal((await ws.invoice(invoice.id)).amount_paid, 0, 'there was still nothing to present');
+
+      await ws.card(customer.id, 'succeeds');
+      assert.equal((await ws.travel(2 * DAY)).failed, 0);
+      const after = await ws.invoice(invoice.id);
+      assert.equal(
+        after.status, 'paid',
+        `${after.number} was held back by a pause and then by an empty wallet, and neither stop ever ended: ${after.amount_due} is owed by an active account with a working card`,
+      );
+      await assertReconciled(ws, customer.id, 'after both stops came off');
+    } finally { ws.close(); }
+  });
+
+  test('a card put on an account already being chased leaves that schedule where it is', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const customer = await ws.customer('Pentridge Fabrication');
+      await ws.card(customer.id, 'insufficient_funds');
+      const { invoice } = await ws.subscribe(customer.id);
+      const [opened] = await ws.dunning(customer.id);
+      assert.equal(opened.status, 'recovering', 'the first presentation was refused');
+      const window = opened.next_attempt_at as number;
+      const presented = (await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all&limit=100`)).data.length;
+
+      // A second card lands on an account whose bill is already owned by a
+      // schedule. Presenting here would spend a window the campaign is holding
+      // and put a second instruction on money it is already chasing.
+      await ws.card(customer.id, 'succeeds', { set_default: true });
+      await ws.tick();
+      const campaign = (await ws.dunning(customer.id))[0];
+      assert.equal(campaign.status, 'recovering');
+      assert.equal(campaign.attempt_count, opened.attempt_count, 'attaching a card did not spend one of its attempts');
+      assert.equal(campaign.next_attempt_at, window, 'and its window is where it was');
+      assert.equal(
+        (await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all&limit=100`)).data.length, presented,
+        'nothing was presented: the schedule owns this bill until its window comes round',
+      );
+
+      // And the window it kept is what collects it, on the card that works.
+      assert.equal((await ws.travel(window - ws.now() + DAY)).failed, 0);
+      assert.equal((await ws.invoice(invoice.id)).status, 'paid', 'the window the campaign kept did the collecting');
+      await assertReconciled(ws, customer.id, 'after a second card on an account in recovery');
+    } finally { ws.close(); }
+  });
+
+  test('a queued presentation stands down if a schedule takes the bill before it runs', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const customer = await ws.customer('Selby Toolmakers');
+      const { invoice } = await ws.bill(customer.id);
+      await ws.card(customer.id, 'insufficient_funds');
+      assert.equal(
+        ws.app.ctx.db.count(
+          `SELECT COUNT(*) FROM jobs WHERE org_id = ? AND idem_key = ? AND status = 'pending'`,
+          ORG, `payments.collect_invoice:${invoice.id}`,
+        ),
+        1,
+        'the card queued the presentation this bill never had',
+      );
+
+      // A human gets there first, and the refusal opens the schedule that now
+      // owns this bill — in the window between the job being queued and run.
+      const refused = await ws.ok('POST', `/v1/invoices/${invoice.id}/retry`, {});
+      assert.equal(refused.collected, false);
+      const [opened] = await ws.dunning(customer.id);
+      assert.equal(opened.status, 'recovering');
+      assert.equal(opened.attempt_count, 1);
+      const window = opened.next_attempt_at as number;
+      const presented = (await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all&limit=100`)).data.length;
+
+      await ws.tick();
+
+      const after = (await ws.dunning(customer.id))[0];
+      assert.equal(
+        after.attempt_count, 1,
+        'the queued job spent a window the campaign now owns — the answer it was queued on went stale and nothing read it again',
+      );
+      assert.equal(after.next_attempt_at, window, 'and the schedule is where it was');
+      assert.equal(
+        (await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all&limit=100`)).data.length, presented,
+        'the card was presented twice in the same instant',
+      );
+      await assertReconciled(ws, customer.id, 'after a schedule took a bill a queued job was holding');
+    } finally { ws.close(); }
+  });
+
+  test('a card attached while a chargeback has reopened the bill presents nothing', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Ardleigh Pressings');
+      await ws.card(customer.id, 'succeeds');
+      const { invoice } = await ws.subscribe(customer.id);
+      assert.equal(invoice.status, 'paid', 'the first presentation collected it');
+      const charge = (await ws.ok('GET', `/v1/charges?invoice=${invoice.id}`)).data[0] as Charge;
+      await ws.ok('POST', '/v1/disputes', { charge: charge.id, reason: 'fraudulent' });
+
+      const reopened = await ws.invoice(invoice.id);
+      assert.equal(reopened.status, 'open', 'the network took the money, so the bill is owed again');
+      assert.ok(reopened.amount_due > 0);
+      assert.equal((await ws.dunning(customer.id)).length, 0, 'and nothing is chasing it — a chargeback is not a decline');
+      const presented = (await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all&limit=100`)).data.length;
+
+      // An open bill with no campaign against it is exactly the shape the
+      // handler above collects — and this one is open because the cardholder
+      // is disputing it. Presenting a second card for money that is with the
+      // network is the mirror image of the bill that never got asked for.
+      await ws.card(customer.id, 'succeeds', { set_default: true });
+      assert.equal((await ws.travel(2 * DAY)).failed, 0);
+
+      assert.equal(
+        (await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all&limit=100`)).data.length, presented,
+        'a bill that has been presented before is open for a reason a new card does not answer',
+      );
+      assert.equal((await ws.invoice(invoice.id)).status, 'open');
+      await assertReconciled(ws, customer.id, 'after a card arrived on an account with a live chargeback');
+    } finally { ws.close(); }
+  });
+});
+
+describe('a bill collected after the schedule ran out', () => {
+  /** A campaign that has spent every window, with the bill left open and owed. */
+  async function exhausted(ws: Workspace): Promise<{ customer: any; card: PaymentMethod; invoice: Invoice }> {
+    await ws.ok('PATCH', '/v1/payments/settings', {
+      dunning: { end_behavior: 'leave_past_due', max_attempts: 2, retry_days: [3] },
+    });
+    const customer = await ws.customer('Talbot Instruments');
+    const card = await ws.card(customer.id, 'insufficient_funds');
+    const { invoice } = await ws.subscribe(customer.id);
+    assert.equal((await ws.travel(20 * DAY)).failed, 0);
+    assert.equal((await ws.dunning(customer.id))[0].status, 'exhausted', 'the schedule ran out');
+    return { customer, card, invoice };
+  }
+
+  test('a bill collected by hand after the last window is not still reported as lost', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const { customer, card, invoice } = await exhausted(ws);
+      const before = await ws.ok('GET', '/v1/dunning/summary');
+      const usdBefore = (before.totals as any[]).find((t) => t.currency === 'usd');
+      assert.equal(usdBefore.lost_amount >= invoice.total, true, 'the bill is counted as lost while it is owed');
+
+      // The account rings in with a working card and someone presents the bill
+      // — which is precisely what the queue's own advice tells them to do.
+      await ws.ok('PATCH', `/v1/payment_methods/${card.id}`, { simulated_behavior: 'succeeds' });
+      const collected = await ws.ok('POST', `/v1/invoices/${invoice.id}/retry`, {});
+      assert.equal(collected.collected, true);
+      assert.equal((await ws.invoice(invoice.id)).status, 'paid');
+
+      const campaign = (await ws.dunning(customer.id))[0];
+      assert.equal(
+        campaign.status, 'recovered',
+        `the bill was collected in full and the campaign chasing it still reads ${campaign.status}`,
+      );
+      assert.equal(campaign.recovered_amount, invoice.total, 'and it records what came in');
+      assert.doesNotMatch(
+        campaign.recommended_action, /still owed/,
+        'the queue is telling an operator to chase or credit a bill that has been paid',
+      );
+
+      const after = await ws.ok('GET', '/v1/dunning/summary');
+      const usdAfter = (after.totals as any[]).find((t) => t.currency === 'usd');
+      assert.equal(
+        usdAfter.lost_amount, usdBefore.lost_amount - invoice.total,
+        `${invoice.total} came in and this workspace still reports it as revenue it lost`,
+      );
+      assert.equal(usdAfter.recovered_amount, usdBefore.recovered_amount + invoice.total);
+      assert.ok(usdAfter.recovery_rate_bps > usdBefore.recovery_rate_bps, 'and the recovery rate moved with it');
+      await assertReconciled(ws, customer.id, 'after a bill was collected past the end of its schedule');
+    } finally { ws.close(); }
+  });
+
+  test('a part payment after the last window is not a recovery', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const { customer, card, invoice } = await exhausted(ws);
+      const before = await ws.ok('GET', '/v1/dunning/summary');
+      const usdBefore = (before.totals as any[]).find((t) => t.currency === 'usd');
+
+      // Money arriving is not the same thing as the bill being recovered — the
+      // rule the live schedule already keeps, and the mirror image this fix
+      // would be if it closed a campaign the moment any cash showed up.
+      await ws.ok('PATCH', `/v1/payment_methods/${card.id}`, { simulated_behavior: 'succeeds' });
+      await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: card.id,
+        amount: Math.round(invoice.total / 4), confirm: true, off_session: true,
+      });
+      const part = await ws.invoice(invoice.id);
+      assert.equal(part.status, 'open');
+      assert.ok(part.amount_due > 0, 'the bill is still owed');
+
+      const campaign = (await ws.dunning(customer.id))[0];
+      assert.equal(campaign.status, 'exhausted', 'a quarter of the bill is not a recovered campaign');
+      const after = await ws.ok('GET', '/v1/dunning/summary');
+      const usdAfter = (after.totals as any[]).find((t) => t.currency === 'usd');
+      assert.equal(usdAfter.lost_amount, usdBefore.lost_amount, 'and nothing moved off the lost column');
+      await assertReconciled(ws, customer.id, 'after a part payment past the end of a schedule');
+    } finally { ws.close(); }
+  });
+});
+

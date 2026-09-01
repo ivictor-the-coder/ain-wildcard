@@ -209,6 +209,8 @@ export const commands: CommandDef[] = [
   { id: 'crm.companies', title: 'Companies', subtitle: 'Accounts, with their pipeline', group: 'Go to', keywords: ['accounts', 'crm'], icon: 'building', run: (go) => go('/companies') },
   { id: 'crm.deals', title: 'Deals', subtitle: 'Every opportunity, filterable', group: 'Go to', keywords: ['pipeline', 'opportunities'], icon: 'deals', run: (go) => go('/records/deal') },
   { id: 'crm.tickets', title: 'Tickets', subtitle: 'The support queue', group: 'Go to', keywords: ['support', 'queue'], icon: 'tickets', run: (go) => go('/records/ticket') },
+  { id: 'crm.tasks', title: 'Tasks', subtitle: 'Everything anyone still owes a customer', group: 'Go to', keywords: ['todo', 'follow up', 'queue'], icon: 'check-circle', run: (go) => go('/records/task') },
+  { id: 'crm.calls', title: 'Calls', subtitle: 'Every call logged, newest first', group: 'Go to', keywords: ['phone', 'dials', 'activity'], icon: 'phone', run: (go) => go('/records/call') },
   { id: 'crm.model', title: 'Data model', subtitle: 'Objects, properties and associations', group: 'Go to', keywords: ['schema', 'properties', 'custom object'], icon: 'layers', run: (go) => go('/records') },
   { id: 'crm.new-contact', title: 'New contact', subtitle: 'Add a person', group: 'Create', keywords: ['add', 'person', 'lead'], icon: 'plus', run: (go) => go('/contacts?new=1') },
   { id: 'crm.new-company', title: 'New company', subtitle: 'Add an account', group: 'Create', keywords: ['add', 'account'], icon: 'plus', run: (go) => go('/companies?new=1') },

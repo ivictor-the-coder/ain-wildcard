@@ -19,17 +19,22 @@ import {
 } from '../../design';
 import { ArrowUpRightIcon } from '../../design';
 import {
-  EmptyList, FieldRow, InlineEdit, ListFailure, ListFooter, LoadFailedEmpty, Loading, MoneyTotals, RecordLink,
-  SectionError, StatusPill, TableSearch, customerHref, idem, invoiceHref, moneyRank, subscriptionHref,
-  totalsByCurrency, useAction, useBillingFormat, useCursorList, useDebounced, useOpenOnQuery, useRecordTab,
-  useTableView,
+  BookFooter, DialogFields, EmptyList, FieldRow, InlineEdit, ListFailure, LoadFailedEmpty, Loading,
+  balanceWords, csvAmount, csvDay, ExportCsvButton, invoiceClockNote, useBookTotal,
+  MoneyRangeFilter, MoneyTotals, RecordLink, RecordMissing, SectionError, StatusPill, TableSearch, customerHref,
+  decodeRange, encodeRange, idem, invoiceHref, matchesRange, moneyRank, prorationCopy, rangeActive, subscriptionHref,
+  totalsByCurrency, useAction, useBillingFormat, useBookList, useCurrencyChoices, useDebounced, useDialogForm,
+  useOpenOnQuery, useRecord, useRecordTab, useTableView, visibleRows,
 } from './common';
 import { ActionMenu, CreditDialog, Headline, SubscriptionCreateDialog } from './subscriptions';
 import { BillNowDialog, CustomerInvoices } from './invoices';
 import { PaymentsTab, TaxRegistrationsCard } from './payments';
+import type { BillingFormatter, CsvColumn } from './common';
 import type { BalanceTransaction, Customer, CustomerSummary, Invoice, RevenueAccount } from './types';
 
 /* ================================== list ================================== */
+
+const currencyOfRow = (row: { currency: string }): string => row.currency;
 
 export function CustomersPage() {
   const f = useBillingFormat();
@@ -48,12 +53,12 @@ export function CustomersPage() {
   // The grid's own search filters the rows it holds; sending the same string to
   // the server first means it is searching the whole book rather than page one.
   const search = useDebounced(view.query.trim(), 250);
-  const list = useCursorList<Customer>('/v1/customers', {
+  const book = useBookList<Customer>('/v1/customers', useMemo(() => ({
     ...(search ? { query: search } : {}),
     ...(currency ? { currency } : {}),
     ...(standing === 'delinquent' ? { delinquent: true } : {}),
     ...(standing === 'subscribed' ? { has_subscription: true } : {}),
-  }, 100);
+  }), [search, currency, standing]));
 
   const hasRevenue = platform.serves('GET', '/v1/revenue/accounts');
   const accounts = useQuery<ListEnvelope<RevenueAccount>>('/v1/revenue/accounts', { limit: 500 }, { enabled: hasRevenue });
@@ -62,6 +67,10 @@ export function CustomersPage() {
     for (const row of accounts.data?.data ?? []) map.set(row.customer, row);
     return map;
   }, [accounts.data]);
+
+  const [rangeParam, setRangeParam] = useSearchParam('amount', '');
+  const { currencies, preferred } = useCurrencyChoices(book.rows, currencyOfRow, f.currency);
+  const range = useMemo(() => decodeRange(rangeParam, preferred), [rangeParam, preferred]);
 
   const columns = useMemo<DataTableColumn<Customer>[]>(() => {
     const cols: DataTableColumn<Customer>[] = [
@@ -103,7 +112,7 @@ export function CustomersPage() {
           align: 'right',
           width: 120,
           sortable: true,
-          headerTitle: 'Ranked inside each currency — there is no exchange-rate table in this platform, so nothing is converted.',
+          headerTitle: 'MRR',
           accessor: (row) => moneyRank(mrrByCustomer.get(row.id)?.mrr ?? 0, mrrByCustomer.get(row.id)?.currency ?? row.currency),
           cell: (row) => {
             const account = mrrByCustomer.get(row.id);
@@ -119,24 +128,6 @@ export function CustomersPage() {
               )}
             />
           ),
-        },
-        {
-          // A filter, not a column. The sort on MRR above ranks inside a
-          // currency, which a range filter cannot do, so this carries the raw
-          // figure and "MRR over 1,000" stays askable — but it can never be
-          // shown, because a second column printing the identical money beside
-          // the first is noise on an already wide grid.
-          id: 'mrr_amount',
-          header: 'MRR amount',
-          headerTitle: 'MRR amount — a filter, not a column',
-          filterLabel: 'MRR amount',
-          filter: 'number',
-          align: 'right',
-          width: 120,
-          defaultHidden: true,
-          hideable: false,
-          unsearchable: true,
-          accessor: (row) => mrrByCustomer.get(row.id)?.mrr ?? 0,
         },
         {
           id: 'subscriptions',
@@ -156,7 +147,7 @@ export function CustomersPage() {
         align: 'right',
         width: 140,
         sortable: true,
-        headerTitle: 'Ranked inside each currency; a negative balance is credit the account holds.',
+        headerTitle: 'Balance',
         accessor: (row) => moneyRank(row.balance, row.currency),
         cell: (row) => (
           row.balance === 0
@@ -165,19 +156,6 @@ export function CustomersPage() {
               ? <span className="bl-amount bl-amount--credit">{f.money(-row.balance, { currency: row.currency })} credit</span>
               : <span className="bl-amount">{f.money(row.balance, { currency: row.currency })} owed</span>
         ),
-      },
-      {
-        id: 'balance_amount',
-        header: 'Balance amount',
-        headerTitle: 'Balance amount — a filter, not a column',
-        filterLabel: 'Balance amount',
-        filter: 'number',
-        align: 'right',
-        width: 140,
-        defaultHidden: true,
-        hideable: false,
-        unsearchable: true,
-        accessor: (row) => row.balance,
       },
       {
         id: 'standing',
@@ -193,11 +171,46 @@ export function CustomersPage() {
         width: 150,
         sortable: true,
         accessor: (row) => row.created,
-        cell: (row) => f.day(row.created, { withYear: true }),
+        cell: (row) => f.date(row.created, { withYear: true }),
       },
     );
     return cols;
   }, [f, hasRevenue, mrrByCustomer]);
+
+  const rows = useMemo(() => (rangeActive(range)
+    ? book.rows.filter((row) => {
+      const account = mrrByCustomer.get(row.id);
+      return range.field === 'mrr'
+        ? !!account && matchesRange(account.mrr, account.currency, range)
+        : matchesRange(row.balance, row.currency, range);
+    })
+    : book.rows), [book.rows, range, mrrByCustomer]);
+  // The book with nothing asked of it. `book.total` counts only what the
+  // server returned for the filters in force, so "Delinquent only" used to
+  // print "0 rows · the whole book" over an empty grid.
+  const whole = useBookTotal('/v1/customers', {});
+  // Built here rather than at module scope because two of its columns are
+  // joined from the revenue book, and a file that silently drops MRR when that
+  // read failed would be worse than one that says the column is empty.
+  const customerCsv = useMemo<CsvColumn<Customer>[]>(() => [
+    { header: 'Account', value: (row) => row.name },
+    { header: 'Email', value: (row) => row.email ?? '' },
+    { header: 'Currency', value: (row) => row.currency.toUpperCase() },
+    { header: 'MRR', value: (row) => {
+      const account = mrrByCustomer.get(row.id);
+      return account ? csvAmount(account.mrr, account.currency) : '';
+    } },
+    { header: 'Subscriptions', value: (row) => mrrByCustomer.get(row.id)?.subscriptions ?? '' },
+    { header: 'Balance', value: (row) => csvAmount(row.balance, row.currency) },
+    { header: 'Balance means', value: (row) => (row.balance === 0 ? 'Settled' : row.balance < 0 ? 'Credit held' : 'Carried forward') },
+    { header: 'Standing', value: (row) => (row.delinquent ? 'Delinquent' : 'Good standing') },
+    { header: 'Tax exempt', value: (row) => humanize(row.tax_exempt) },
+    { header: 'Country', value: (row) => row.address?.country ?? '' },
+    { header: 'Created', value: (row) => csvDay(row.created) },
+    { header: 'Customer id', value: (row) => row.id },
+  ], [mrrByCustomer]);
+  const visible = useMemo(() => visibleRows(rows, columns, view), [rows, columns, view]);
+  const shown = visible.length;
 
   const billSelected = async () => {
     const ids = [...selected];
@@ -206,7 +219,7 @@ export function CustomersPage() {
       try { await api.post('/v1/invoices', { customer: id }); ok++; } catch { /* reported below */ }
     }
     setSelected([]);
-    list.retry();
+    book.retry();
     if (ok === ids.length) toast.success(`Raised ${ok} ${ok === 1 ? 'invoice' : 'invoices'}`);
     else toast.warning(`Raised ${ok} of ${ids.length}`, 'The rest had nothing waiting to bill.', { duration: 0 });
   };
@@ -238,7 +251,7 @@ export function CustomersPage() {
             api.del(`/v1/customers/${row.id}`),
             { success: `${row.name} deleted`, failure: 'The customer could not be deleted' },
             ['/v1/customers'],
-          ).then(() => list.retry());
+          ).then(() => book.retry());
         },
       },
     ],
@@ -266,7 +279,8 @@ export function CustomersPage() {
             {`${accounts.error.body.message} The accounts below are real; the MRR column is missing, not zero.`}
           </Banner>
         )}
-        {list.error && <ListFailure error={list.error} path="GET /v1/customers" onRetry={list.retry} />}
+        {book.error && <ListFailure error={book.error} path="GET /v1/customers" onRetry={book.retry} />}
+        <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'}>
         <DataTable
           /* The grid decides which columns start hidden once, on its first
              render. The revenue columns only exist after `/v1/system/map`
@@ -274,13 +288,13 @@ export function CustomersPage() {
              decision — which is how "MRR amount" and "Subs" ended up on screen
              despite both being defaultHidden. */
           key={hasRevenue ? 'with-revenue' : 'no-revenue'}
-          rows={list.rows}
+          rows={rows}
           columns={columns}
           getRowId={(row) => row.id}
           caption="Billing customers"
-          loading={list.loading}
+          loading={book.loading}
           error={null}
-          onRetry={list.retry}
+          onRetry={book.retry}
           value={view}
           onChange={setView}
           initialSort={{ columnId: 'name', direction: 'asc' }}
@@ -319,6 +333,26 @@ export function CustomersPage() {
                   { value: 'gbp', label: 'GBP' },
                 ]}
               />
+              <MoneyRangeFilter
+                value={range}
+                onChange={(next) => { setRangeParam(encodeRange(next) || undefined); setSelected([]); }}
+                // MRR is joined from the revenue book. When that read failed the
+                // column is missing rather than zero, so offering a filter over
+                // it would answer "nothing matches" about data nobody has.
+                fields={hasRevenue && !accounts.error
+                  ? [{ value: 'mrr', label: 'MRR' }, { value: 'balance', label: 'Balance' }]
+                  : [{ value: 'balance', label: 'Balance' }]}
+                currencies={currencies}
+                defaultCurrency={preferred}
+              />
+              <ExportCsvButton
+                rows={visible}
+                columns={customerCsv}
+                name="customers"
+                noun="customers"
+                disabled={!book.complete}
+                reason={book.complete ? undefined : 'Still reading the book — the file would hold fewer rows than the screen.'}
+              />
             </Inline>
           }
           bulkActions={(ids) => (
@@ -328,7 +362,7 @@ export function CustomersPage() {
               </Button>
             </Inline>
           )}
-          empty={list.error
+          empty={book.error
             ? <LoadFailedEmpty noun="customers" />
             : (
               <EmptyList
@@ -337,8 +371,14 @@ export function CustomersPage() {
                 action={<Button variant="primary" iconLeft={<Icons.plus size={15} />} onClick={() => setCreating(true)}>New customer</Button>}
               />
             )}
-          footer={<ListFooter list={list} noun="customers" />}
+          footer={<BookFooter book={book} noun="customers" shown={shown} whole={whole} />}
         />
+        </div>
+        <p className="bl-gridnote">
+          MRR and Balance are ranked and totalled inside each currency. There is no exchange-rate table in this
+          platform, so nothing here is converted and no figure is added across two books. A negative balance is
+          credit the account holds.
+        </p>
       </Stack>
 
       <CustomerCreateDialog open={creating} onClose={() => setCreating(false)} />
@@ -406,22 +446,26 @@ function CustomerCreateDialog({ open, onClose }: { open: boolean; onClose: () =>
     }
   };
 
+  const ready = name.trim().length > 0 && !action.busy;
+  const form = useDialogForm(open, ready, () => { void submit(); });
+
   return (
     <Modal
       open={open}
       onClose={onClose}
       size="lg"
       title="New customer"
-      description="The billing face of a company: it carries the currency, the tax address and the balance."
+      description="The billing face of a company: it carries the currency, the tax address and the balance. Enter creates it from any field."
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
-          <Button variant="primary" loading={action.busy} disabled={name.trim().length < 1} onClick={() => { void submit(); }}>
+          <Button variant="primary" loading={action.busy} disabled={!ready} onClick={() => { void submit(); }}>
             Create customer
           </Button>
         </>
       }
     >
+      <DialogFields form={form}>
       <Stack gap={5}>
         <Field label="Name" required error={action.errorFor('name')}>
           <Input value={name} maxLength={200} placeholder="Cobalt Line Automation" onChange={(e) => setName(e.target.value)} />
@@ -495,6 +539,7 @@ function CustomerCreateDialog({ open, onClose }: { open: boolean; onClose: () =>
           </Grid>
         </Section>
       </Stack>
+      </DialogFields>
     </Modal>
   );
 }
@@ -511,17 +556,20 @@ export function CustomerDetailPage() {
   const [tab, setTab] = useRecordTab(CUSTOMER_TABS, 'overview');
   const [dialog, setDialog] = useState<null | 'credit' | 'subscription' | 'bill'>(null);
 
-  const { data, error, loading, refetch } = useQuery<CustomerSummary>(`/v1/customers/${id}/summary`);
+  const { data, error, loading, refetch } = useRecord<CustomerSummary>(`/v1/customers/${id}/summary`);
 
   if (loading) return <Page title="Customer"><Loading label="Loading this account…" /></Page>;
   if (error || !data) {
     return (
       <Page title="Customer" eyebrow="Revenue">
         <Card>
-          <SectionError
-            error={error ?? ({ status: 404, body: { message: 'No customer came back.' } } as ApiClientError)}
+          <RecordMissing
+            error={error ?? ({ status: 404, body: { message: `No account with the id ${id}.` } } as ApiClientError)}
             path={`GET /v1/customers/${id}/summary`}
             onRetry={refetch}
+            noun="account"
+            backTo="/billing/customers"
+            backLabel="Back to customers"
           />
         </Card>
       </Page>
@@ -561,7 +609,7 @@ export function CustomerDetailPage() {
       title={customer.name}
       eyebrow="Customer"
       badge={customer.delinquent ? <span style={{ marginLeft: 'var(--space-4)' }}><Badge tone="danger" dot pill>Delinquent</Badge></span> : undefined}
-      subtitle={data.headline}
+      subtitle={accountHeadline(data, f)}
       breadcrumbs={<RecordLink to="/billing/customers">Customers</RecordLink>}
       actions={
         <Inline gap={3}>
@@ -601,7 +649,9 @@ export function CustomerDetailPage() {
             <Headline
               label="MRR"
               value={f.money(data.mrr, { currency: customer.currency })}
-              caption={`${f.money(data.arr, { currency: customer.currency })} a year · ${data.subscriptions.live} live`}
+              // The count beside the money is counted the same way the money is,
+              // so a $0.00 MRR is never captioned "1 live".
+              caption={`${f.money(data.arr, { currency: customer.currency })} a year · ${subscriptionCountShort(data, f)}`}
             />
             <Headline
               label="Balance"
@@ -641,6 +691,27 @@ export function CustomerDetailPage() {
 }
 
 /**
+ * The one-line account summary, counted the way the money beside it is counted.
+ *
+ * The server's own `headline` says "2 live subscriptions, $570.00 MRR" — and
+ * MRR excludes a paused agreement while `live` includes it, so the two halves
+ * of one sentence are computed on different definitions of live. Rather than
+ * pick a side, the count is split whenever they disagree: "1 billing, 1 paused
+ * · $570.00 MRR" is both figures reconciled in the sentence itself.
+ */
+function accountHeadline(summary: CustomerSummary, f: BillingFormatter): string {
+  const { by_status: byStatus, total } = summary.subscriptions;
+  const billing = (byStatus.active ?? 0) + (byStatus.trialing ?? 0) + (byStatus.past_due ?? 0);
+  const paused = byStatus.paused ?? 0;
+  const mrr = f.money(summary.mrr, { currency: summary.customer.currency });
+  if (total === 0) return 'No subscription on this account yet — nothing recurring is billed here.';
+  const counted = paused > 0
+    ? `${billing === 0 ? 'Nothing billing' : `${f.plural(billing, 'subscription')} billing`} and ${f.number(paused)} paused`
+    : f.plural(billing, 'live subscription');
+  return `${counted} · ${mrr} MRR${paused > 0 ? ' — paused agreements are excluded from MRR' : ''}.`;
+}
+
+/**
  * The summary's attention lines, with the ids and enums taken out.
  *
  * The server writes them for any client — "Collection on sub_sGghNQZy96toyJYU
@@ -669,15 +740,39 @@ function AttentionLine({ line, summary }: { line: string; summary: CustomerSumma
   );
 }
 
+/** "1 billing, 1 paused, 3 in all" — never a live count that the MRR disagrees with. */
+function subscriptionCount(summary: CustomerSummary, f: BillingFormatter): string {
+  const { by_status: byStatus, total } = summary.subscriptions;
+  const billing = (byStatus.active ?? 0) + (byStatus.trialing ?? 0) + (byStatus.past_due ?? 0);
+  const paused = byStatus.paused ?? 0;
+  if (total === 0) return 'None on this account';
+  return paused > 0
+    ? `${f.number(billing)} billing, ${f.number(paused)} paused, ${f.number(total)} in all`
+    : `${f.number(billing)} billing of ${f.number(total)}`;
+}
+
+/** The same split, for the caption under a money tile. */
+function subscriptionCountShort(summary: CustomerSummary, f: BillingFormatter): string {
+  const { by_status: byStatus } = summary.subscriptions;
+  const billing = (byStatus.active ?? 0) + (byStatus.trialing ?? 0) + (byStatus.past_due ?? 0);
+  const paused = byStatus.paused ?? 0;
+  return paused > 0
+    ? `${f.number(billing)} billing, ${f.number(paused)} paused`
+    : `${f.number(billing)} live`;
+}
+
 function OverviewTab({ summary, onNewSubscription }: { summary: CustomerSummary; onNewSubscription: () => void }) {
   const f = useBillingFormat();
   const next = summary.next_invoice;
+  // Lifetime value is what this account has actually been billed, so a zero
+  // period count is the one fact that separates "all settled" from "untouched".
+  const billedEver = summary.lifetime_value.periods_billed > 0 || summary.open_invoices.total > 0;
   return (
     <div className="bl-cols">
       <Stack gap={6}>
         <Card
           title="Subscriptions"
-          description={`${summary.subscriptions.live} live of ${summary.subscriptions.total}`}
+          description={subscriptionCount(summary, f)}
           actions={<Button size="sm" variant="secondary" iconLeft={<Icons.plus size={13} />} onClick={onNewSubscription}>New</Button>}
         >
           {summary.subscriptions.data.length === 0 && (
@@ -709,9 +804,21 @@ function OverviewTab({ summary, onNewSubscription }: { summary: CustomerSummary;
           ))}
         </Card>
 
-        <Card title="Open invoices" description={summary.open_invoices.total > 0 ? 'Still owed by this account.' : 'Nothing is outstanding.'}>
+        <Card title="Open invoices" description={summary.open_invoices.total > 0 ? 'Still owed by this account.' : billedEver ? 'Nothing is outstanding.' : 'Nothing has been billed yet.'}>
           {summary.open_invoices.data.length === 0 && (
-            <EmptyState size="sm" inline illustration={null} title="Nothing outstanding" body="Every bill raised on this account has been settled." />
+            // An account created a minute ago has not settled anything; saying
+            // so is the difference between a fact and a flattering guess.
+            billedEver
+              ? <EmptyState size="sm" inline illustration={null} title="Nothing outstanding" body="Every bill raised on this account has been settled." />
+              : (
+                <EmptyState
+                  size="sm"
+                  inline
+                  illustration={null}
+                  title="No bill has been raised yet"
+                  body="The first invoice lands when a subscription's period opens, or when you bill what is waiting by hand."
+                />
+              )
           )}
           {summary.open_invoices.data.map((invoice) => (
             <div key={invoice.id} className="bl-row">
@@ -736,7 +843,10 @@ function OverviewTab({ summary, onNewSubscription }: { summary: CustomerSummary;
               <div key={item.id} className="bl-row">
                 <div className="bl-row__main">
                   <div className="bl-row__title">{item.description}</div>
-                  <div className="bl-row__sub">{item.explanation}</div>
+                  {/* The sentence, without the ten-digit rational the server
+                      appends for auditors — the invoice's own lines keep that
+                      behind a disclosure, and this card has no room for one. */}
+                  <div className="bl-row__sub">{prorationCopy(item.explanation, item.proration).sentence}</div>
                 </div>
                 <div className="bl-row__aside">{f.money(item.amount, { currency: item.currency })}</div>
               </div>
@@ -811,12 +921,22 @@ function LedgerTab({ summary, onGrant }: { summary: CustomerSummary; onGrant: ()
         <div className="bl-tablewrap">
           <table className="bl-lines">
             <thead>
-              <tr><th>When</th><th>What happened</th><th>Type</th><th className="bl-num">Amount</th><th className="bl-num">Balance after</th></tr>
+              <tr>
+                <th>When</th>
+                <th>What happened</th>
+                <th>Type</th>
+                {/* The tile above says "$100.00 of credit". Printing the same
+                    fact here as "-$100.00" made one screen state a balance two
+                    ways, so the sign is spelled out in the words the tile uses
+                    and the header says which way is which. */}
+                <th className="bl-num" title="A credit reduces what the account owes; a charge adds to it.">Movement</th>
+                <th className="bl-num" title="The balance the account stood at after this movement.">Balance after</th>
+              </tr>
             </thead>
             <tbody>
               {rows.map((row: BalanceTransaction) => (
                 <tr key={row.id}>
-                  <td className="bl-nowrap">{f.day(row.created, { withYear: true })}</td>
+                  <td className="bl-nowrap">{f.date(row.created, { withYear: true })}</td>
                   <td>
                     <div>{row.description}</div>
                     {row.invoice && <div className="bl-lines__why"><RecordLink to={invoiceHref(row.invoice)} mono>{row.invoice}</RecordLink></div>}
@@ -824,10 +944,10 @@ function LedgerTab({ summary, onGrant }: { summary: CustomerSummary; onGrant: ()
                   <td><Badge tone="neutral">{humanize(row.type)}</Badge></td>
                   <td className="bl-num">
                     <span className={row.amount < 0 ? 'bl-amount bl-amount--credit' : 'bl-amount'}>
-                      {f.money(row.amount, { currency: row.currency, signDisplay: 'exceptZero' })}
+                      {balanceWords(row.amount, row.currency, f)}
                     </span>
                   </td>
-                  <td className="bl-num">{f.money(row.ending_balance, { currency: row.currency })}</td>
+                  <td className="bl-num">{balanceWords(row.ending_balance, row.currency, f, 'settled')}</td>
                 </tr>
               ))}
             </tbody>
@@ -883,7 +1003,10 @@ function DetailsTab({ customer, onPatch }: { customer: Customer; onPatch: (body:
               />
             )}
         </FieldRow>
-        <FieldRow label="Net terms" hint="Days until an invoice raised on this account is due.">
+        <FieldRow
+          label="Net terms"
+          hint="Days until an invoice sent for payment is due. A subscription that charges the card on file collects the moment a bill is raised, so nothing on it waits for this."
+        >
           <InlineEdit
             label="Net terms"
             value={String(customer.invoice_settings.days_until_due ?? 0)}
@@ -909,7 +1032,12 @@ function DetailsTab({ customer, onPatch }: { customer: Customer; onPatch: (body:
             onSave={(value) => onPatch({ tax_exempt: value })}
           />
         </FieldRow>
-        <FieldRow label="Created">{f.day(customer.created, { withYear: true })}</FieldRow>
+        <FieldRow
+          label="Created"
+          hint={invoiceClockNote(customer.created, f)}
+        >
+          {f.date(customer.created, { withYear: true })}
+        </FieldRow>
         <FieldRow label="Id"><span className="u-mono bl-sub">{customer.id}</span></FieldRow>
       </Card>
 
@@ -934,14 +1062,224 @@ function DetailsTab({ customer, onPatch }: { customer: Customer; onPatch: (body:
 
         <TaxRegistrationsCard customer={customer} />
 
-        {Object.keys(customer.metadata).length > 0 && (
-          <Card title="Metadata">
-            {Object.entries(customer.metadata).map(([key, value]) => (
-              <FieldRow key={key} label={key}><span className="u-mono bl-sub">{value}</span></FieldRow>
-            ))}
-          </Card>
-        )}
+        <DocumentSettingsCard customer={customer} onPatch={onPatch} />
+
+        <MetadataCard customer={customer} onPatch={onPatch} />
       </Stack>
     </div>
+  );
+}
+
+/**
+ * What this account's own copy of a bill says.
+ *
+ * Two different lifetimes, and the copy has to be honest about both. A custom
+ * field is read from the customer every time the document is rendered, so
+ * changing one changes every bill this account already holds. The footer is
+ * snapshotted onto the invoice the moment it is raised — `invoices.ts` copies
+ * `customer.invoice_settings.footer` onto the record — so a change here reaches
+ * the next bill and leaves the ones already issued exactly as they were sent.
+ */
+function DocumentSettingsCard({ customer, onPatch }: {
+  customer: Customer; onPatch: (body: Record<string, unknown>) => Promise<unknown>;
+}) {
+  const fields = customer.invoice_settings.custom_fields;
+  const [adding, setAdding] = useState(false);
+  const [name, setName] = useState('');
+  const [value, setValue] = useState('');
+  const setFields = (next: { name: string; value: string }[]) =>
+    onPatch({ invoice_settings: { custom_fields: next } });
+
+  // Both halves are collected before anything is written, because a reference
+  // is printed in the bill-to block the moment it exists — a row added with a
+  // placeholder in it is a placeholder on the customer's own document.
+  const add = async () => {
+    if (!name.trim() || !value.trim()) return;
+    await setFields([...fields, { name: name.trim(), value: value.trim() }]);
+    setName('');
+    setValue('');
+    setAdding(false);
+  };
+
+  return (
+    <Card
+      title="The customer’s copy"
+      description="What this account’s printed invoice carries beyond the lines and the totals."
+      actions={
+        <Button
+          size="sm"
+          variant="secondary"
+          iconLeft={<Icons.plus size={13} />}
+          disabled={fields.length >= 4 || adding}
+          title={fields.length >= 4 ? 'Four is the most an invoice can print.' : undefined}
+          onClick={() => setAdding(true)}
+        >
+          Add a reference
+        </Button>
+      }
+    >
+      <FieldRow
+        label="Footer"
+        hint="Printed under the totals. Copied onto each bill as it is raised, so bills already issued keep the wording they were sent with."
+      >
+        <InlineEdit
+          label="Invoice footer"
+          value={customer.invoice_settings.footer ?? ''}
+          empty="Nothing is printed under the totals"
+          onSave={(next) => onPatch({ invoice_settings: { footer: next } })}
+        />
+      </FieldRow>
+      {fields.length === 0 && !adding && (
+        <FieldRow label="References" hint="A PO number, a cost centre, a contract id — printed in the bill-to block.">
+          <span className="bl-inline__empty">None on this account</span>
+        </FieldRow>
+      )}
+      {fields.map((field, index) => (
+        <FieldRow
+          key={`${field.name}-${index}`}
+          label={(
+            <InlineEdit
+              label={`Reference ${index + 1} name`}
+              value={field.name}
+              onSave={(next) => setFields(fields.map((row, i) => (i === index ? { ...row, name: next } : row)))}
+            />
+          )}
+        >
+          <Inline gap={3} justify="between">
+            <InlineEdit
+              label={`Reference ${index + 1} value`}
+              value={field.value}
+              onSave={(next) => setFields(fields.map((row, i) => (i === index ? { ...row, value: next } : row)))}
+            />
+            <Button
+              size="sm"
+              variant="ghost"
+              aria-label={`Remove the reference ${field.name}`}
+              iconLeft={<Icons.trash size={13} />}
+              onClick={() => { void setFields(fields.filter((_, i) => i !== index)); }}
+            />
+          </Inline>
+        </FieldRow>
+      ))}
+      {adding && (
+        <div className="bl-metaadd">
+          <Input
+            size="sm"
+            aria-label="Reference name"
+            placeholder="Purchase order"
+            value={name}
+            autoFocus
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void add(); } }}
+          />
+          <Input
+            size="sm"
+            aria-label="Reference value"
+            placeholder="NW-2026-0142"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void add(); } }}
+          />
+          <Inline gap={2}>
+            <Button size="sm" variant="primary" disabled={!name.trim() || !value.trim()} onClick={() => { void add(); }}>Save</Button>
+            <Button size="sm" variant="ghost" onClick={() => { setAdding(false); setName(''); setValue(''); }}>Cancel</Button>
+          </Inline>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/**
+ * Metadata, editable.
+ *
+ * `PATCH /v1/customers/:id` merges the map it is sent onto the one already
+ * there — `{ ...before.metadata, ...input.metadata }` — and nothing in that
+ * write path treats any value as a deletion. So there is no "remove", because
+ * there is no route that removes: a key can be given a new value or emptied,
+ * and the control says which of those it does.
+ */
+function MetadataCard({ customer, onPatch }: {
+  customer: Customer; onPatch: (body: Record<string, unknown>) => Promise<unknown>;
+}) {
+  const [adding, setAdding] = useState(false);
+  const [key, setKey] = useState('');
+  const [value, setValue] = useState('');
+  const entries = Object.entries(customer.metadata);
+
+  const replace = (next: Record<string, string>) => onPatch({ metadata: next });
+
+  const add = async () => {
+    if (!key.trim()) return;
+    await replace({ ...customer.metadata, [key.trim()]: value.trim() });
+    setKey('');
+    setValue('');
+    setAdding(false);
+  };
+
+  return (
+    <Card
+      title="Metadata"
+      description="Your own keys, carried on the record and returned on every read of it. The API merges what it is sent, so a key can be re-valued or emptied but never removed."
+      actions={
+        <Button size="sm" variant="secondary" iconLeft={<Icons.plus size={13} />} onClick={() => setAdding(true)}>
+          Add a key
+        </Button>
+      }
+    >
+      {entries.length === 0 && !adding && (
+        <FieldRow label="Nothing yet">
+          <span className="bl-inline__empty">No metadata is set on this account</span>
+        </FieldRow>
+      )}
+      {entries.map(([name, held]) => (
+        <FieldRow key={name} label={<span className="u-mono">{name}</span>}>
+          <Inline gap={3} justify="between">
+            <InlineEdit
+              label={`Value of ${name}`}
+              value={held}
+              empty="Empty"
+              mono
+              onSave={(next) => replace({ ...customer.metadata, [name]: next })}
+            />
+            <Tooltip content={`Empties ${name}. The key stays on the record — the billing API has no route that removes one.`}>
+              <Button
+                size="sm"
+                variant="ghost"
+                aria-label={`Clear the value of ${name}`}
+                disabled={held === ''}
+                iconLeft={<Icons.trash size={13} />}
+                onClick={() => { void replace({ ...customer.metadata, [name]: '' }); }}
+              />
+            </Tooltip>
+          </Inline>
+        </FieldRow>
+      ))}
+      {adding && (
+        <div className="bl-metaadd">
+          <Input
+            size="sm"
+            aria-label="Metadata key"
+            placeholder="contract_id"
+            value={key}
+            autoFocus
+            onChange={(e) => setKey(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void add(); } }}
+          />
+          <Input
+            size="sm"
+            aria-label="Metadata value"
+            placeholder="NW-2026-0142"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void add(); } }}
+          />
+          <Inline gap={2}>
+            <Button size="sm" variant="primary" disabled={!key.trim()} onClick={() => { void add(); }}>Save</Button>
+            <Button size="sm" variant="ghost" onClick={() => { setAdding(false); setKey(''); setValue(''); }}>Cancel</Button>
+          </Inline>
+        </div>
+      )}
+    </Card>
   );
 }

@@ -1,7 +1,7 @@
 import { defineModule } from '../../kernel/module';
 import type { Ctx } from '../../kernel/context';
 import type { AiCompletionRequest, AiMessage } from '../../kernel/ai';
-import { created, list, roleAtLeast, type Req } from '../../kernel/http';
+import { created, list, noContent, roleAtLeast, type Req } from '../../kernel/http';
 import { badRequest, forbidden, notFound } from '../../../shared/errors';
 import type { SchemaNode } from '../../../shared/validate';
 import v from '../../../shared/validate';
@@ -10,7 +10,7 @@ import { AI_MIGRATIONS } from './schema';
 import { AiStore, publicApproval, publicMessage, publicRun, publicSpan, publicThread, recordNamer } from './store';
 import { aiTools, metricCatalogue } from './tools';
 import {
-  aiRuntime, type AiCallContext, type AiTraceSink, type AinCompletion, type PendingApproval,
+  aiRuntime, maskSecrets, type AiCallContext, type AiTraceSink, type AinCompletion, type PendingApproval,
 } from '../../ai/runtime';
 import { accountUsage, describeUsage } from '../../ai/usage';
 import { workspaceProfile } from '../../ai/grounding';
@@ -76,6 +76,30 @@ function assertMayAuthoriseWrites(req: Req): void {
   );
 }
 
+/**
+ * A queued write as the API describes it.
+ *
+ * `PendingApproval` carries two copies of the arguments, and the split is
+ * between *masking* and *capping*, not between "shown" and "run". Masking is
+ * the safety property and holds everywhere; the 400-character cap belongs to
+ * the trace alone, and `publicApproval` already refuses it for the reason that
+ * governs here too — an operator cannot consent to a note whose decisive last
+ * sentence has been replaced with an ellipsis.
+ *
+ * This is the *first* place a queued write is shown: it is the reply to the
+ * very call that asked for the approval. Taking `pending.args` echoed the
+ * trace's capped copy back, so `POST /v1/ai/complete` answered with a note
+ * ending in `…` while `GET /v1/ai/approvals` held it whole — one write
+ * described two ways, which is the gap that fix was closing, read from the
+ * other end. So: mask, and never cap.
+ */
+const publicPending = (pending: PendingApproval) => ({
+  tool: pending.tool,
+  args: maskSecrets(pending.rawArgs ?? pending.args),
+  reason: pending.reason,
+  readOnly: pending.readOnly,
+});
+
 const isMember = (ctx: Ctx, orgId: string, userId: string): boolean =>
   !!ctx.db.get<{ user_id: string }>(
     `SELECT user_id FROM memberships WHERE org_id = ? AND user_id = ?`, orgId, userId);
@@ -94,6 +118,12 @@ const isMember = (ctx: Ctx, orgId: string, userId: string): boolean =>
  * live member of this org — a key created by someone who has since left, a
  * session whose membership was revoked — resolves to null rather than to a
  * stranger: an unattributed note is a small loss, a 400 on every write is not.
+ *
+ * `authenticate` now asks the same question at the door and refuses both of
+ * those callers outright, so in a served request the only null this returns is
+ * a key with no `created_by` at all. It stays because this is also reachable
+ * with an injected `auth` — and because the answer here and the answer there
+ * disagreeing, "nobody" against "an admin", is the bug this pair keeps having.
  */
 function actorFor(ctx: Ctx, auth: Req['auth']): string | null {
   if (auth.userId) return isMember(ctx, auth.orgId, auth.userId) ? auth.userId : null;
@@ -481,6 +511,30 @@ export default defineModule({
 
     /* A scheduled follow-up is a durable job, so the time machine replays it. */
     ctx.jobs.handle('ai.followup', (payload: { recordId: string; note: string; assigneeId: string | null; runId: string | null }, job) => {
+      // The record is asked about here for the same reason `POST
+      // /v1/ai/approvals/:id` asks about it: "a note written onto a record that
+      // is gone is a write nobody asked for landing where nobody will read it."
+      // That guard stood at the decide door only, and this is the one tool
+      // whose write is deferred — by up to a year — so it is the one place the
+      // record is most likely to have moved. Archived, the note landed on a
+      // timeline nobody reads; deleted, `crm.associate` threw and the job spent
+      // its eight retries and died `failed`, with the approved write gone and
+      // nothing anywhere saying so.
+      //
+      // `merged` is deliberately let through rather than blocked: the surviving
+      // record is where the account's timeline now lives, and `crm.associate`
+      // resolves the loser onto the winner, so following the merge lands the
+      // note where the operator would look for it. Refusing it here would lose
+      // an approved write to keep a symmetry nobody asked for.
+      const standing = recordStanding(ctx, job.org_id, payload.recordId);
+      if (standing.state === 'archived' || standing.state === 'missing') {
+        ctx.emit(job.org_id, 'ai.followup.skipped', {
+          record_id: payload.recordId, note: payload.note, run_id: payload.runId,
+          reason: standing.state, detail: describeStanding(standing),
+        }, { objectId: payload.recordId, objectType: 'record', actorType: 'agent' });
+        ctx.log.warn('ai.followup_skipped', { record: payload.recordId, reason: standing.state });
+        return;
+      }
       // The same rule the request path applies, at the other end of a job that
       // may have been waiting a year: the note this writes carries its assignee
       // as `owner_id`, which rejects anyone who is not a member. A teammate who
@@ -593,7 +647,7 @@ export default defineModule({
         citations: completion.citations ?? [],
         reasoning: completion.reasoning ?? [],
         analysis: describeAnalysis(completion),
-        pending_approvals: completion.pendingApprovals,
+        pending_approvals: completion.pendingApprovals.map(publicPending),
         usage: {
           input_tokens: completion.usage.inputTokens,
           output_tokens: completion.usage.outputTokens,
@@ -693,6 +747,55 @@ export default defineModule({
       };
     }, { summary: 'Retrieve a conversation with its messages and runs', tags: ['ai'] });
 
+    router.patch('/v1/ai/threads/:id', (req: Req, c: Ctx) => {
+      const thread = store.thread(req.auth.orgId, req.params.id);
+      if (!thread) throw notFound('ai thread', req.params.id);
+      const body = req.body as { title?: string; status?: 'open' | 'archived' };
+      if (body.title === undefined && body.status === undefined) {
+        throw badRequest('nothing_to_change', 'Send a title, a status, or both.', 'status');
+      }
+      const updated = store.updateThread(req.auth.orgId, thread.id, body)!;
+      const actor = actorFor(c, req.auth);
+      if (body.status && body.status !== thread.status) {
+        c.emit(req.auth.orgId, body.status === 'archived' ? 'ai.thread.archived' : 'ai.thread.reopened',
+          { id: thread.id, title: updated.title }, {
+            objectId: thread.id, objectType: 'ai_thread', actorId: actor, actorType: 'user',
+            previous: { status: thread.status },
+          });
+      }
+      if (body.title !== undefined && body.title !== thread.title) {
+        c.emit(req.auth.orgId, 'ai.thread.renamed', { id: thread.id, title: updated.title }, {
+          objectId: thread.id, objectType: 'ai_thread', actorId: actor, actorType: 'user',
+          previous: { title: thread.title },
+        });
+      }
+      return publicThread(updated);
+    }, {
+      summary: 'Rename a conversation, or archive and reopen it', tags: ['ai'],
+      body: v.object({
+        title: v.optional(v.string({ min: 1, max: 200 })),
+        status: v.optional(v.enum(['open', 'archived'] as const)),
+      }),
+    });
+
+    router.del('/v1/ai/threads/:id', (req: Req, c: Ctx) => {
+      const thread = store.thread(req.auth.orgId, req.params.id);
+      if (!thread) throw notFound('ai thread', req.params.id);
+      const actor = actorFor(c, req.auth);
+      const removed = c.atomic(() => store.deleteThread(req.auth.orgId, thread.id));
+      c.emit(req.auth.orgId, 'ai.thread.deleted', { id: thread.id, title: thread.title, messages: removed }, {
+        objectId: thread.id, objectType: 'ai_thread', actorId: actor, actorType: 'user',
+      });
+      c.audit({
+        orgId: req.auth.orgId, actorId: actor, actorType: 'user', action: 'ai.thread.deleted',
+        targetType: 'ai_thread', targetId: thread.id,
+        summary: `Deleted the conversation "${thread.title}" and its ${removed} message${removed === 1 ? '' : 's'}`,
+        before: { title: thread.title, message_count: thread.message_count },
+        requestId: req.requestId,
+      });
+      return noContent();
+    }, { summary: 'Delete a conversation and its messages', tags: ['ai'], roles: ['member'] });
+
     router.get('/v1/ai/threads/:id/messages', (req: Req) => {
       const thread = store.thread(req.auth.orgId, req.params.id);
       if (!thread) throw notFound('ai thread', req.params.id);
@@ -717,7 +820,7 @@ export default defineModule({
         message: publicMessage(messages[messages.length - 1]),
         citations: answer.citations,
         reasoning: answer.reasoning,
-        pending_approvals: answer.pendingApprovals,
+        pending_approvals: answer.pendingApprovals.map(publicPending),
         usage: {
           input_tokens: answer.usage.inputTokens,
           output_tokens: answer.usage.outputTokens,
@@ -791,7 +894,7 @@ export default defineModule({
       const spans = store.spans(req.auth.orgId, run.id);
       return {
         ...publicRun(run, spans),
-        approvals: store.approvals(req.auth.orgId).filter((a) => a.run_id === run.id)
+        approvals: store.approvals(req.auth.orgId, { runId: run.id, limit: 200 })
           .map((a) => publicApproval(a, recordNamer(ctx, req.auth.orgId))),
         timings: {
           total_ms: run.duration_ms,
@@ -803,13 +906,28 @@ export default defineModule({
 
     /* -------------------------------- approvals ---------------------------- */
 
+    // A queue that holds back a write and reports `has_more: false` has lost
+    // it as surely as the dedupe that collapsed two cards into one: the page
+    // says how many are waiting and whether there are more behind it.
     router.get('/v1/ai/approvals', (req: Req) => {
-      const q = req.query as { status?: string };
+      const q = req.query as { status?: string; limit?: number; offset?: number };
+      const scope = { status: q.status ?? 'pending' };
+      const limit = q.limit ?? 50;
+      const offset = q.offset ?? 0;
       const nameOf = recordNamer(ctx, req.auth.orgId);
-      return list(store.approvals(req.auth.orgId, q.status ?? 'pending').map((a) => publicApproval(a, nameOf)));
+      const rows = store.approvals(req.auth.orgId, { ...scope, limit, offset });
+      const totalCount = store.countApprovals(req.auth.orgId, scope);
+      return list(rows.map((a) => publicApproval(a, nameOf)), {
+        totalCount,
+        hasMore: offset + rows.length < totalCount,
+      });
     }, {
       summary: 'Writes an agent is waiting to make', tags: ['ai'],
-      query: v.object({ status: v.optional(v.enum(['pending', 'approved', 'declined'] as const)) }),
+      query: v.object({
+        status: v.optional(v.enum(['pending', 'approved', 'declined'] as const)),
+        limit: v.optional(v.int({ min: 1, max: 200 })),
+        offset: v.optional(v.int({ min: 0, max: 10_000 })),
+      }),
     });
 
     router.post('/v1/ai/approvals/:id', async (req: Req, c: Ctx) => {
@@ -823,100 +941,121 @@ export default defineModule({
       if (approval.status !== 'pending') {
         throw badRequest('approval_decided', `This request was already ${approval.status}.`, 'id');
       }
-      const body = req.body as { decision: 'approve' | 'decline'; note?: string };
-      if (body.decision === 'decline') {
-        store.decideApproval(req.auth.orgId, approval.id, 'declined', decidedBy, body.note ?? 'Declined by an operator.');
-        c.emit(req.auth.orgId, 'ai.approval.declined', { id: approval.id, tool: approval.tool, run_id: approval.run_id }, {
-          objectId: approval.id, objectType: 'ai_approval', actorId: decidedBy, actorType: 'user',
-        });
-        return publicApproval(store.approval(req.auth.orgId, approval.id)!, recordNamer(c, req.auth.orgId));
-      }
-
-      // Arguments are re-validated here, not just when the plan was made: an
-      // approval can sit in the queue while the schema, the record or the
-      // assignee it names changes underneath it.
-      const definition = runtime.tool(approval.tool);
-      const args = JSON.parse(approval.args) as Record<string, unknown>;
-      if (!definition) {
-        store.decideApproval(req.auth.orgId, approval.id, 'declined', decidedBy,
-          `Blocked: no tool named "${approval.tool}" is registered any more.`);
-        throw badRequest('tool_unavailable', `"${approval.tool}" is no longer registered, so this approval cannot be executed.`, 'id');
+      // One approval is one write. Reading the row, finding it pending and then
+      // executing across an `await` is not one transaction, so two people
+      // pressing Approve — or one client retrying — both passed the check above
+      // and both ran the tool: two notes on the customer's timeline for one
+      // approval. This is the claim the job queue already makes before it runs a
+      // row, on the path where the loss is a customer record rather than a job.
+      if (!store.claimApproval(req.auth.orgId, approval.id, decidedBy)) {
+        throw badRequest('approval_decided', 'Someone else is deciding this request right now.', 'id');
       }
       try {
-        definition.input.parse(args);
+        const body = req.body as { decision: 'approve' | 'decline'; note?: string };
+        if (body.decision === 'decline') {
+          store.decideApproval(req.auth.orgId, approval.id, 'declined', decidedBy, body.note ?? 'Declined by an operator.');
+          c.emit(req.auth.orgId, 'ai.approval.declined', { id: approval.id, tool: approval.tool, run_id: approval.run_id }, {
+            objectId: approval.id, objectType: 'ai_approval', actorId: decidedBy, actorType: 'user',
+          });
+          return publicApproval(store.approval(req.auth.orgId, approval.id)!, recordNamer(c, req.auth.orgId));
+        }
+
+        // Arguments are re-validated here, not just when the plan was made: an
+        // approval can sit in the queue while the schema, the record or the
+        // assignee it names changes underneath it.
+        const definition = runtime.tool(approval.tool);
+        const args = JSON.parse(approval.args) as Record<string, unknown>;
+        if (!definition) {
+          store.decideApproval(req.auth.orgId, approval.id, 'declined', decidedBy,
+            `Blocked: no tool named "${approval.tool}" is registered any more.`);
+          throw badRequest('tool_unavailable', `"${approval.tool}" is no longer registered, so this approval cannot be executed.`, 'id');
+        }
+        try {
+          definition.input.parse(args);
+        } catch (e) {
+          const message = (e as Error).message;
+          store.decideApproval(req.auth.orgId, approval.id, 'declined', decidedBy, `Blocked: ${message}`);
+          c.emit(req.auth.orgId, 'ai.approval.declined', {
+            id: approval.id, tool: approval.tool, run_id: approval.run_id, reason: 'invalid_arguments',
+          }, { objectId: approval.id, objectType: 'ai_approval', actorId: decidedBy, actorType: 'user' });
+          throw badRequest(
+            'approval_arguments_invalid',
+            `This approval cannot run: ${message} It has been declined rather than executed with bad arguments.`,
+            'args',
+          );
+        }
+
+        // Shape is not the only thing that can change under a queued approval.
+        // The record it names can be archived, merged or deleted while it waits,
+        // and a note written onto a record that is gone is a write nobody asked
+        // for landing where nobody will read it.
+        const moved = writeTargets(args)
+          .map((id) => recordStanding(c, req.auth.orgId, id))
+          .filter((standing) => standing.state !== 'live');
+        if (moved.length) {
+          const why = moved.map(describeStanding).join('; ');
+          store.decideApproval(req.auth.orgId, approval.id, 'declined', decidedBy,
+            `Blocked: ${why}.`);
+          c.emit(req.auth.orgId, 'ai.approval.declined', {
+            id: approval.id, tool: approval.tool, run_id: approval.run_id, reason: 'target_changed',
+            targets: moved.map((s) => ({ id: s.id, state: s.state })),
+          }, { objectId: approval.id, objectType: 'ai_approval', actorId: decidedBy, actorType: 'user' });
+          throw badRequest(
+            'approval_target_changed',
+            `This approval cannot run: ${why}. It was prepared against ${moved.length === 1 ? 'a record' : 'records'} that changed while it waited, so it has been declined rather than written to ${moved.length === 1 ? 'the wrong place' : 'the wrong places'}. Ask again and I will prepare it against what is there now.`,
+            'args',
+          );
+        }
+
+        const call: AiCallContext = {
+          ctx: c,
+          orgId: req.auth.orgId,
+          actorId: decidedBy,
+          actorType: 'user',
+          runId: approval.run_id,
+          threadId: approval.thread_id,
+          feature: 'approval',
+          allowWrites: true,
+          approvals: [approval.tool],
+          startedNs: process.hrtime.bigint(),
+        };
+        const execution = await runtime.execute(approval.tool, args, call, definition);
+        // The execution appended a span to a run that had already been stamped
+        // with its step count, so the run list and the run's own trace stopped
+        // agreeing about how many steps it took.
+        store.syncSpanCount(req.auth.orgId, approval.run_id);
+        store.decideApproval(
+          req.auth.orgId, approval.id, 'approved', decidedBy,
+          execution.ok ? execution.span.summary : `Failed: ${execution.error?.message}`,
+        );
+        const stillWaiting = c.db.count(
+          `SELECT COUNT(*) FROM ai_approvals WHERE org_id = ? AND run_id = ? AND status = 'pending'`,
+          req.auth.orgId, approval.run_id);
+        if (execution.ok && !stillWaiting) {
+          c.db.patch('ai_runs', 'id', approval.run_id, { status: 'succeeded' });
+        }
+        c.emit(req.auth.orgId, 'ai.approval.granted', {
+          id: approval.id, tool: approval.tool, run_id: approval.run_id, ok: execution.ok,
+        }, { objectId: approval.id, objectType: 'ai_approval', actorId: decidedBy, actorType: 'user' });
+        c.audit({
+          orgId: req.auth.orgId, actorId: decidedBy, actorType: 'user', action: 'ai.approval.granted',
+          targetType: 'ai_approval', targetId: approval.id, summary: `Approved ${approval.tool} for run ${approval.run_id}`,
+          after: execution.ok ? { result: execution.span.summary } : { error: execution.error?.message },
+          requestId: req.requestId,
+        });
+        return {
+          ...publicApproval(store.approval(req.auth.orgId, approval.id)!, recordNamer(c, req.auth.orgId)),
+          executed: execution.ok,
+          result: execution.ok ? execution.result : null,
+          error: execution.error ?? null,
+        };
       } catch (e) {
-        const message = (e as Error).message;
-        store.decideApproval(req.auth.orgId, approval.id, 'declined', decidedBy, `Blocked: ${message}`);
-        c.emit(req.auth.orgId, 'ai.approval.declined', {
-          id: approval.id, tool: approval.tool, run_id: approval.run_id, reason: 'invalid_arguments',
-        }, { objectId: approval.id, objectType: 'ai_approval', actorId: decidedBy, actorType: 'user' });
-        throw badRequest(
-          'approval_arguments_invalid',
-          `This approval cannot run: ${message} It has been declined rather than executed with bad arguments.`,
-          'args',
-        );
+        // Every deliberate exit above has already written a terminal status, so
+        // this only fires when something unexpected did — and a claim nobody
+        // finished must not leave an approval that can never be decided again.
+        store.releaseApproval(req.auth.orgId, approval.id);
+        throw e;
       }
-
-      // Shape is not the only thing that can change under a queued approval.
-      // The record it names can be archived, merged or deleted while it waits,
-      // and a note written onto a record that is gone is a write nobody asked
-      // for landing where nobody will read it.
-      const moved = writeTargets(args)
-        .map((id) => recordStanding(c, req.auth.orgId, id))
-        .filter((standing) => standing.state !== 'live');
-      if (moved.length) {
-        const why = moved.map(describeStanding).join('; ');
-        store.decideApproval(req.auth.orgId, approval.id, 'declined', decidedBy,
-          `Blocked: ${why}.`);
-        c.emit(req.auth.orgId, 'ai.approval.declined', {
-          id: approval.id, tool: approval.tool, run_id: approval.run_id, reason: 'target_changed',
-          targets: moved.map((s) => ({ id: s.id, state: s.state })),
-        }, { objectId: approval.id, objectType: 'ai_approval', actorId: decidedBy, actorType: 'user' });
-        throw badRequest(
-          'approval_target_changed',
-          `This approval cannot run: ${why}. It was prepared against ${moved.length === 1 ? 'a record' : 'records'} that changed while it waited, so it has been declined rather than written to ${moved.length === 1 ? 'the wrong place' : 'the wrong places'}. Ask again and I will prepare it against what is there now.`,
-          'args',
-        );
-      }
-
-      const call: AiCallContext = {
-        ctx: c,
-        orgId: req.auth.orgId,
-        actorId: decidedBy,
-        actorType: 'user',
-        runId: approval.run_id,
-        threadId: approval.thread_id,
-        feature: 'approval',
-        allowWrites: true,
-        approvals: [approval.tool],
-        startedNs: process.hrtime.bigint(),
-      };
-      const execution = await runtime.execute(approval.tool, args, call, definition);
-      store.decideApproval(
-        req.auth.orgId, approval.id, 'approved', decidedBy,
-        execution.ok ? execution.span.summary : `Failed: ${execution.error?.message}`,
-      );
-      const stillWaiting = c.db.count(
-        `SELECT COUNT(*) FROM ai_approvals WHERE org_id = ? AND run_id = ? AND status = 'pending'`,
-        req.auth.orgId, approval.run_id);
-      if (execution.ok && !stillWaiting) {
-        c.db.patch('ai_runs', 'id', approval.run_id, { status: 'succeeded' });
-      }
-      c.emit(req.auth.orgId, 'ai.approval.granted', {
-        id: approval.id, tool: approval.tool, run_id: approval.run_id, ok: execution.ok,
-      }, { objectId: approval.id, objectType: 'ai_approval', actorId: decidedBy, actorType: 'user' });
-      c.audit({
-        orgId: req.auth.orgId, actorId: decidedBy, actorType: 'user', action: 'ai.approval.granted',
-        targetType: 'ai_approval', targetId: approval.id, summary: `Approved ${approval.tool} for run ${approval.run_id}`,
-        after: execution.ok ? { result: execution.span.summary } : { error: execution.error?.message },
-        requestId: req.requestId,
-      });
-      return {
-        ...publicApproval(store.approval(req.auth.orgId, approval.id)!, recordNamer(c, req.auth.orgId)),
-        executed: execution.ok,
-        result: execution.ok ? execution.result : null,
-        error: execution.error ?? null,
-      };
     }, {
       summary: 'Approve or decline a write an agent asked to make', tags: ['ai'], roles: ['member'],
       body: v.object({

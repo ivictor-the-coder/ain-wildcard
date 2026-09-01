@@ -759,16 +759,23 @@ export default defineModule({
         invoices_note: invoices.mixed_currency
           ? `Bills were raised in ${invoices.currencies.join(', ')}, so invoices.billed, collected, outstanding and written_off are every currency's minor units added together — a figure in no currency at all. invoices.by_currency is the one to read, and to show.`
           : null,
-        // Bills that charged no tax, and how many of those are a zero nobody
-        // decided on. `missing_tax_location` is the backlog: an account with no
-        // country on it, billed at 0% because there was nothing to bill it at.
+        // Bills that charged no tax, and how many of those are a figure nobody
+        // decided on. `missing_tax_location` is the backlog: an account whose
+        // address Ain could not place, billed at whatever it could work out.
+        //
+        // The sentence used to name the country and only the country, which is
+        // the half of the question the hold started with. It now counts bills
+        // whose country is perfectly good and whose *state* is missing in a
+        // country registered state by state, and telling that finance team to
+        // find an account with "no resolvable country" sends them looking at
+        // the one field that is already right.
         untaxed_invoices: {
           count: invoices.untaxed,
           missing_tax_location: invoices.missing_tax_location,
           held_in_draft: invoices.held_for_tax_location,
           detail: invoices.missing_tax_location === 0
-            ? 'Every bill on the book was taxed against a country Ain could resolve.'
-            : `${invoices.missing_tax_location} bill${invoices.missing_tax_location === 1 ? '' : 's'} were raised for accounts with no resolvable country, so the tax on them was never worked out. Find them with GET /v1/invoices?tax=missing.`,
+            ? 'Every bill on the book was taxed against an address Ain could place.'
+            : `${invoices.missing_tax_location} bill${invoices.missing_tax_location === 1 ? ' was' : 's were'} raised for accounts whose address Ain could not place — it needs a country, and a state in a country whose tax is registered state by state — so the tax on ${invoices.missing_tax_location === 1 ? 'it' : 'them'} could not be worked out in full. Find ${invoices.missing_tax_location === 1 ? 'it' : 'them'} with GET /v1/invoices?tax=missing.`,
         },
       };
     }, {
@@ -914,7 +921,7 @@ export default defineModule({
     }, {
       summary: 'List invoices', tags: ['billing'],
       description:
-        'status=open_like is everything still owed — drafts held back by a paused subscription and finalised bills alike. due_before finds what is overdue. tax=missing is the other queue: bills raised for an account with no resolvable country, where 0% means "we never learned where they are" rather than "nothing is due".',
+        'status=open_like is everything still owed — drafts held back by a paused subscription and finalised bills alike. due_before finds what is overdue. tax=missing is the other queue: bills still standing for an account whose address Ain could not place — no country, or no state in a country whose tax is registered state by state — where the figure means "we never learned where they are" rather than "nothing is due".',
       query: v.object({
         customer: v.optional(v.id('cus')),
         subscription: v.optional(v.id('sub')),
@@ -1057,7 +1064,7 @@ export default defineModule({
       {
         summary: 'Whether bills are held back over a customer location Ain cannot resolve', tags: ['billing'],
         description:
-          'On, an invoice for an account with no resolvable country is kept as a draft and POST /v1/invoices/:id/finalize answers customer_tax_location_invalid, because 0% there means "we do not know" and the supplier is who the authority collects from. Off, the bill finalises anyway — the status is still computed, still counted on the overview and still findable with GET /v1/invoices?tax=missing.',
+          'On, an invoice for an account whose address Ain cannot place — no country, or no state in a country whose tax is registered state by state — is kept as a draft and POST /v1/invoices/:id/finalize answers customer_tax_location_invalid, because a short figure there means "we do not know" and the supplier is who the authority collects from. Off, the bill finalises anyway — the status is still computed, still counted on the overview and still findable with GET /v1/invoices?tax=missing.',
       });
 
     router.post('/v1/billing/automatic_tax', (req: Req, c: Ctx) => {
@@ -1075,11 +1082,17 @@ export default defineModule({
 
     router.get('/v1/tax_rates', (req: Req, c: Ctx) => {
       const q = req.query as { country?: string; active?: boolean; limit?: number };
-      const data = new TaxRates(c, req.auth.orgId).list(q);
-      return list(data.map(taxRatePayload), { totalCount: data.length, url: '/v1/tax_rates' });
+      const rates = new TaxRates(c, req.auth.orgId);
+      const data = rates.list(q);
+      // The page is bounded at 500; the register is not. A workspace that has
+      // registered its US districts has thousands, and a count taken from the
+      // page would report the bound back as the size of the book.
+      const totalCount = rates.count(q);
+      return list(data.map(taxRatePayload), { totalCount, hasMore: data.length < totalCount, url: '/v1/tax_rates' });
     }, {
       summary: 'Where this workspace is registered to collect tax', tags: ['billing'],
-      description: 'A customer address is matched against these: the most specific active rate wins, state before country. An address that matches nothing is charged nothing, and the invoice says so.',
+      description:
+        'A customer address is matched against every one of these, and owes the sum of all that match: a supply into Manhattan is in the state, the city and the transit district at once, so the bill carries a row for each and charges 4% + 4.5% + 0.375%. Country-wide rates match every address in the country and stack under the state ones. An address that matches nothing is charged nothing, and the invoice says so.',
       query: v.object({
         country: v.optional(v.string({ min: 2, max: 2 })),
         active: v.optional(v.boolean()),
@@ -1092,7 +1105,7 @@ export default defineModule({
       {
         summary: 'Register a tax rate', tags: ['billing'], roles: ['admin'], idempotent: true, body: taxRateBody,
         description:
-          'One active rate per country and state, so an address can never match two. The percentage is stored as an exact decimal string and snapshotted onto every line it touches, which is why retiring a rate never changes an invoice already raised under it.',
+          'One active rate per jurisdiction, named by `jurisdiction`: registering the same one twice over an address would charge it twice and is refused, while a genuinely different jurisdiction over the same address stacks with it and both are charged. The percentage is stored as an exact decimal string and snapshotted onto every line it touches, which is why retiring a rate never changes an invoice already raised under it.',
       });
 
     router.get('/v1/tax_rates/:id', (req: Req, c: Ctx) =>
@@ -1347,6 +1360,10 @@ export default defineModule({
             })),
             balance_applied_display: show(invoice.balance_applied),
             total_display: show(invoice.total),
+            // Why a bill is a draft is part of why it is what it is, and it is
+            // the one answer that is not on the lines.
+            automatic_tax: invoice.automatic_tax,
+            status_detail: describeInvoiceStatus(invoice, locale()),
             // The same predicate the payload publishes, not a second reading of
             // it: an `adds_up: true` that checks fewer identities than
             // `assertBalanced` is a copilot telling a customer a bill is sound
@@ -1388,9 +1405,17 @@ export default defineModule({
             tax_display: show(invoice.tax),
             taxes: invoice.total_taxes.map((row) =>
               `${row.display_name} ${row.percentage}% (${row.jurisdiction}): ${show(row.amount)}`),
+            // Whether this bill can be sent at all. Reading out "their next
+            // bill is $499.00" for an account Ain cannot place is a total
+            // nobody will be asked to pay: that bill is held as a draft until
+            // a country is on the record.
+            automatic_tax: invoice.automatic_tax,
             balance_applied_display: show(invoice.balance_applied),
             total_display: show(invoice.total),
-            adds_up: invoice.subtotal + invoice.tax + invoice.balance_applied === invoice.total,
+            // The same predicate the invoice payload publishes, for the reason
+            // `invoiceAddsUp` gives: a shorter copy of it goes on answering
+            // "adds up" for a bill whose jurisdictions do not.
+            adds_up: invoiceAddsUp(invoice),
           };
         },
       },
@@ -1526,9 +1551,13 @@ function automaticTaxPayload(ctx: Ctx, orgId: string) {
     enabled,
     invoices_missing_a_tax_location: totals.missing_tax_location,
     invoices_held_in_draft: totals.held_for_tax_location,
+    // Both halves of the question the hold actually asks. It began as "is
+    // there a country?" and the sentence stayed there while the hold learned to
+    // read the register: a US bill held for a missing state was explained, on
+    // the settings screen that holds it, as an account with no country.
     detail: enabled
-      ? 'A bill for an account with no resolvable country is held as a draft until one is on file. Nothing goes out taxed at a zero nobody decided on.'
-      : 'Bills for accounts with no resolvable country finalise with no tax on them. They are still marked, still counted on the overview, and still findable with GET /v1/invoices?tax=missing.',
+      ? 'A bill for an account whose address Ain cannot place — no country, or no state in a country whose tax is registered state by state — is held as a draft until the address is complete. Nothing goes out taxed at a figure nobody decided on.'
+      : 'Bills for accounts whose address Ain cannot place finalise with whatever tax it could work out, which may be none of it. They are still marked, still counted on the overview, and still findable with GET /v1/invoices?tax=missing.',
   };
 }
 
@@ -1549,8 +1578,22 @@ function invoiceAddsUp(invoice: Invoice): boolean {
       || line.taxes.reduce((total, entry) => total + entry.amount, 0) === line.tax.amount)
     && invoice.total_taxes.reduce((total, row) => total + row.amount, 0) === invoice.tax
     && invoice.subtotal + invoice.tax + invoice.balance_applied === invoice.total
+    && invoice.total >= 0
+    // Nothing may be credited that was not billed — the payload's own reading
+    // of the ceiling `assertBalanced` takes from the notes themselves.
+    && invoice.pre_payment_credit_notes_amount + invoice.post_payment_credit_notes_amount <= invoice.total
+    // A withdrawn bill is owed nothing, and everything else accounts for
+    // itself. The writer gained this clause when `CreditNotes.void()` was found
+    // putting a bill's full value back as *due* on one that had been struck
+    // out; this reader — the one a screen, the API's `reconciles` and the
+    // copilot's `adds_up` all answer from — kept the older half of the pair and
+    // went on saying a void invoice claiming $527.69 was due added up. A reader
+    // that checks fewer identities than the writer enforces is not a shorter
+    // answer, it is a wrong one, on the one state the writer cannot reach to
+    // fix.
     && (invoice.status === 'void'
-      || invoice.amount_paid + invoice.pre_payment_credit_notes_amount + invoice.amount_due === invoice.total);
+      ? invoice.amount_due === 0
+      : invoice.amount_paid + invoice.pre_payment_credit_notes_amount + invoice.amount_due === invoice.total);
 }
 
 /**
@@ -1623,7 +1666,13 @@ function taxRatePayload(rate: TaxRate) {
 function describeInvoiceStatus(invoice: Invoice, locale: string): string {
   switch (invoice.status) {
     case 'draft':
-      return 'Held as a draft — collection is paused on this subscription, so nothing has been sent.';
+      // A draft has two reasons now, and they send a support agent to two
+      // different places. The tax-location hold arrived without this sentence
+      // being told about it, so every held bill blamed a pause that was not
+      // there while the account sat without a country on it.
+      return invoice.automatic_tax.status === 'requires_location_inputs' && invoice.automatic_tax.enabled
+        ? 'Held as a draft — Ain could not place this account’s address, so the tax on it could not be worked out and nothing has been sent. It needs a country, and a state in a country whose tax is registered state by state. Complete the address and finalise it.'
+        : 'Held as a draft — collection is paused on this subscription, so nothing has been sent.';
     case 'open':
       return invoice.due_date
         ? `Owed, due ${longDate(invoice.due_date, locale)}.`

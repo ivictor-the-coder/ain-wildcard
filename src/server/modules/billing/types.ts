@@ -403,8 +403,22 @@ export interface ChangePreview {
    * the customer balance.
    */
   amount_due_now: number;
-  /** The tax inside `amount_due_now`, so the gap from `net` is named. */
+  /**
+   * The tax on that bill, so the gap from the pre-tax `net` is named. Signed
+   * the way the lines are: a change that credits more than it charges credits
+   * the tax with it, and the figure is negative.
+   */
   tax_due_now: number;
+  /**
+   * Whether the bill `always_invoice` would raise can be sent at all.
+   *
+   * `amount_due_now` is what that bill is worth; this is whether anyone is
+   * about to be asked for it. A change on an account with no resolvable
+   * country raises a bill that is held as a draft, and a screen that prints
+   * the figure on a "collect now" button without this is promising money that
+   * is not going to arrive.
+   */
+  automatic_tax: AutomaticTax;
   /** What the account holds today — credit is negative, Stripe's convention. */
   customer_balance: number;
   next_invoice: {
@@ -494,9 +508,12 @@ export interface InvoiceLine {
   taxes: LineTaxAmount[];
   /**
    * `taxes` rolled up: the amount is their sum, and the rate fields name the
-   * single rate when there is one. Where several jurisdictions taxed the line,
-   * `rate` is null because no one rate produced the figure and `percentage` is
-   * their combined rate — which is what a US invoice means by "8.875%".
+   * rate that produced it. Where several jurisdictions taxed the line, `rate`
+   * is null because no one rate produced the figure and `percentage` is their
+   * combined rate — which is what a US invoice means by "8.875%". Where the
+   * jurisdictions were treated differently — one reverse charged, another
+   * charged — only the ones charged the way the line was are combined, so the
+   * rate stated is always the rate the amount was worked out at.
    */
   tax: InvoiceLineTax;
   /** True once the invoice was voided and the line let go of what it claimed. */
@@ -537,7 +554,11 @@ export interface InvoiceLineTax {
   rate: string | null;
   display_name: string | null;
   jurisdiction: string | null;
-  /** An exact decimal string — "19", "8.875". Combined where rates stack. */
+  /**
+   * An exact decimal string — "19", "8.875". Where rates stack it is the
+   * combined rate of the jurisdictions that were charged the way the line was,
+   * so `amount` is always `taxable base x percentage`.
+   */
   percentage: string | null;
   tax_type: TaxType | null;
   behavior: TaxBehavior | null;
@@ -548,11 +569,13 @@ export interface InvoiceLineTax {
 /**
  * Whether Ain worked the tax out for this bill, and whether it could.
  *
- * `complete` is a decision: a country was resolved and either a rate applied or
- * none is registered there. `requires_location_inputs` is the absence of one —
- * no address, an address with no country, a country that is not a country — and
- * it is a different thing from a zero. A bill that says 0% because Ain never
- * learned where the customer is has not been zero-rated; it has been guessed
+ * `complete` is a decision: the address was placed against the register, and
+ * either a rate applied or none is registered where it lands.
+ * `requires_location_inputs` is the absence of one — no address, an address
+ * with no country, a country that is not a country, or a country whose tax is
+ * registered state by state on an address that names no state — and it is a
+ * different thing from a figure. A bill short because Ain never learned where
+ * the customer is has not been zero-rated or part-rated; it has been guessed
  * at, and the workspace is the one the authority comes to for the difference.
  */
 export const AUTOMATIC_TAX_STATUSES = ['complete', 'requires_location_inputs'] as const;

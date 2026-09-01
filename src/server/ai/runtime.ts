@@ -93,7 +93,24 @@ export interface AiRunFinish {
 
 export interface PendingApproval {
   tool: string;
+  /**
+   * What the card *shows*: secrets masked and long strings capped, because
+   * this travels into the completion response, the `ai.approval.requested`
+   * event and the trace.
+   */
   args: Record<string, unknown>;
+  /**
+   * What the approval will actually *run*: the validated arguments, whole.
+   *
+   * These are two different things and were one. `ai_approvals.args` is
+   * re-parsed and re-executed when a person presses Approve, so storing the
+   * display copy meant a note longer than the 400-character display cap was
+   * approved in full and written truncated — the approval executed a
+   * different write from the one it showed. It also collapsed the dedupe:
+   * two writes agreeing in their first 400 characters produced one card, the
+   * exact failure `requestApproval` keys on the write to prevent.
+   */
+  rawArgs: Record<string, unknown>;
   reason: string;
   readOnly: boolean;
 }
@@ -184,10 +201,28 @@ export const aiRuntime = (ctx: Ctx): AinAiRuntime => ctx.ai as AinAiRuntime;
 
 const SECRET_KEY = /(password|secret|token|api[_-]?key|authorization|credential)/i;
 
-export function redactArgs(args: Record<string, unknown>): Record<string, unknown> {
+/**
+ * Mask anything credential-shaped, and change nothing else.
+ *
+ * The two halves of redaction protect different things and belong to
+ * different surfaces. Masking is a safety property — it must hold anywhere a
+ * payload is shown. The 400-character cap is only about keeping a trace row
+ * small, and it must not reach a surface where a person is being asked to
+ * approve the text: an operator cannot consent to a note whose last sentence
+ * has been replaced with an ellipsis.
+ */
+export function maskSecrets(args: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(args ?? {})) {
-    if (SECRET_KEY.test(key)) { out[key] = '[redacted]'; continue; }
+    out[key] = SECRET_KEY.test(key) ? '[redacted]' : value;
+  }
+  return out;
+}
+
+/** Masking plus the trace's length cap. For spans and event payloads only. */
+export function redactArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(maskSecrets(args))) {
     if (typeof value === 'string' && value.length > 400) { out[key] = `${value.slice(0, 400)}…`; continue; }
     out[key] = value;
   }
@@ -410,6 +445,7 @@ export function createAiRuntime(config: Config): AinAiRuntime {
         const pending: PendingApproval = {
           tool: name,
           args: redactArgs(parsed as Record<string, unknown>),
+          rawArgs: parsed as Record<string, unknown>,
           reason: tool.readOnly
             ? `${name} is marked as needing a person to approve it before it runs.`
             : `${name} changes workspace data, so a person approves it before it runs.`,

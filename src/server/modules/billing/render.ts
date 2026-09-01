@@ -166,7 +166,7 @@ export function renderInvoice(ctx: Ctx, orgId: string, billing: Billing, invoice
     parties(customer, issuer),
     summaryStrip(invoice, show, day, window),
     lineTable(invoice, show, window, inclusive),
-    taxSummary(charged, zeroRated, show),
+    taxSummary(invoice, charged, zeroRated, show),
     totals(invoice, show),
     creditNoteBlock(notes, show, day),
     payment(invoice, issuer, show, day),
@@ -314,14 +314,27 @@ function lineTable(
 </section>`;
 }
 
+/**
+ * The document's own answer to "why is there no tax on this?".
+ *
+ * There are two of those and they are not the same sentence. "This address was
+ * placed and nothing is registered where it lands" is a decision; "this address
+ * could not be placed" is the absence of one, and printing the first over the
+ * second tells a customer, on the document they file, that no rate exists in a
+ * country where eight are registered and active — which is the claim the line
+ * explanations stopped making and this section went on making, on the half of
+ * the bill anybody outside the workspace actually reads.
+ */
 function taxSummary(
-  charged: Invoice['total_taxes'], zeroRated: Invoice['total_taxes'], show: (n: number) => string,
+  invoice: Invoice, charged: Invoice['total_taxes'], zeroRated: Invoice['total_taxes'], show: (n: number) => string,
 ): string {
   if (!charged.length && !zeroRated.length) {
     return `
 <section>
   <h2>Tax</h2>
-  <p class='muted'>No tax rate is registered for this address, so nothing has been charged.</p>
+  <p class='muted'>${invoice.automatic_tax.status === 'requires_location_inputs'
+    ? 'No tax has been charged: the address on this account could not be placed against a tax register — it needs a country, and a state in a country whose tax is registered state by state — so no rate could be applied. This is not a zero-rating. Send us the full address and we will reissue this bill.'
+    : 'No tax rate is registered for this address, so nothing has been charged.'}</p>
 </section>`;
   }
   const row = (entry: Invoice['total_taxes'][number]) => `

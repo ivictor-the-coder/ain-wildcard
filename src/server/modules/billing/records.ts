@@ -409,10 +409,20 @@ function hydrateLineTaxes(row: any, amount: number): LineTaxAmount[] {
  * beside them — two places holding the same number is how they come to disagree.
  *
  * One rate is reported exactly as it was resolved. Several are reported as what
- * they are together: their amounts summed, their percentages combined into the
- * one rate a US customer recognises ("8.875%"), and no `rate` id, because no
- * single rate produced the figure and naming one of the three would be the same
- * lie this list exists to stop telling.
+ * they are together: their amounts summed and their percentages combined into
+ * the one rate a US customer recognises ("8.875%").
+ *
+ * The rate quoted here has to be the rate that produced the amount beside it.
+ * Where the jurisdictions were treated alike — three US rates all charged, an
+ * EU VAT wholly reverse charged — that is every one of them, and the combined
+ * figure is the one the customer checks their own return against. Where they
+ * were not, it is only the ones that were treated the way the line was:
+ * combining a reverse-charged 19% VAT with a 2% city levy that *was* charged
+ * printed "21%" against €2.00 of tax, a rate no authority has ever charged, on
+ * the document a customer files against. `render.ts` already builds the bill's
+ * own combined line from the rates that charged; this is the same rule, on the
+ * figure every other reader of a line — the credit note, the ledger, the API —
+ * takes the line's tax from.
  */
 export function rollUpLineTax(taxes: LineTaxAmount[]): InvoiceLineTax {
   const amount = taxes.reduce((total, entry) => total + entry.amount, 0);
@@ -432,20 +442,35 @@ export function rollUpLineTax(taxes: LineTaxAmount[]): InvoiceLineTax {
   }
   const one = <T>(values: (T | null)[]): T | null =>
     values.every((value) => value === values[0]) ? values[0] : null;
-  const type = one(taxes.map((entry) => entry.tax_type));
-  const reason = one(taxes.map((entry) => entry.reason));
-  const percentages = taxes.map((entry) => entry.percentage).filter((pct): pct is string => !!pct);
+  // A line where one jurisdiction reverse charged and another did not was
+  // still taxed; the entries carry which was which.
+  const reason = one(taxes.map((entry) => entry.reason)) ?? 'taxable';
+  // Reasons can only disagree by one jurisdiction shifting while another
+  // charges, so the entries that share the line's own reason are exactly the
+  // ones the amount came from. The fallback is defensive: a set that somehow
+  // matches none of them is still described by all of them rather than by
+  // nothing at all.
+  const charged = taxes.filter((entry) => entry.reason === reason);
+  const named = charged.length ? charged : taxes;
+  const type = one(named.map((entry) => entry.tax_type));
+  const percentages = named.map((entry) => entry.percentage).filter((pct): pct is string => !!pct);
   return {
     amount,
-    rate: null,
-    display_name: type ? TAX_TYPE_LABELS[type] : 'Tax',
-    jurisdiction: [...new Set(taxes.map((entry) => entry.jurisdiction).filter(Boolean))].join(' + ') || null,
+    // No single rate produced a figure several of them made, and naming one of
+    // the three would be the lie the list exists to stop telling. Where only
+    // one of the jurisdictions charged, that one *is* the rate behind the
+    // figure, and it is named.
+    rate: named.length === 1 ? named[0].rate : null,
+    display_name: named.length === 1
+      ? named[0].display_name
+      : type ? TAX_TYPE_LABELS[type] : 'Tax',
+    jurisdiction: [...new Set(named.map((entry) => entry.jurisdiction).filter(Boolean))].join(' + ') || null,
     percentage: percentages.length ? combinePercentages(percentages) : null,
     tax_type: type,
-    // A line where one jurisdiction reverse charged and another did not was
-    // still taxed; the entries carry which was which.
-    reason: reason ?? 'taxable',
-    behavior: taxes[0].behavior,
+    reason,
+    behavior: named[0].behavior,
+    // Every jurisdiction's sentence, charged or not: the line still has to
+    // explain the zero it did not charge as well as the figure it did.
     explanation: taxes.map((entry) => entry.explanation).filter(Boolean).join(' ') || null,
   };
 }
@@ -564,9 +589,13 @@ export function describeAutomaticTax(status: AutomaticTaxStatus, enabled: boolea
   if (status === 'complete') {
     return 'The tax on this bill was worked out from the country on the customer’s record.';
   }
+  // Two ways an address fails to place, and the sentence has to cover both: no
+  // country on the record, or a country whose tax is registered state by state
+  // and no state with it. Naming only the first sent a finance team looking for
+  // a country that was already there.
   return enabled
-    ? 'No country could be resolved for this customer, so no tax could be worked out. Put a country on the account and this bill will finalise.'
-    : 'No country could be resolved for this customer, so no tax was worked out. Automatic tax is turned off for this workspace, so the bill was finalised anyway.';
+    ? 'This customer’s address could not be placed — it needs a country, and a state in a country whose tax is registered state by state — so no tax could be worked out. Complete the address and this bill will finalise.'
+    : 'This customer’s address could not be placed — it needs a country, and a state in a country whose tax is registered state by state — so no tax was worked out. Automatic tax is turned off for this workspace, so the bill was finalised anyway.';
 }
 
 export function hydrateInvoice(row: any, lines: InvoiceLine[], automaticTaxEnabled = true): Invoice {

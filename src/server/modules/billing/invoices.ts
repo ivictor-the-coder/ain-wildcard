@@ -176,6 +176,22 @@ export class Invoices {
       : 'requires_location_inputs';
   }
 
+  /**
+   * What is missing from this account's address, named, so the refusal sends
+   * whoever reads it to the field they have to fill in.
+   *
+   * A country-only address in a country registered state by state is as
+   * unplaceable as one with no country at all, and telling that account's owner
+   * to "put a country on the address" points at the one field that is already
+   * right.
+   */
+  private taxLocationGap(orgId: string, customer: Customer): string {
+    const resolved = new TaxRates(this.ctx, orgId).forCustomer(customer);
+    return resolved.missing_location === 'state'
+      ? `${customer.name}'s address says ${resolved.country} and no state, and ${resolved.country} tax is registered state by state, so Ain cannot tell which jurisdiction the supply is in`
+      : `Ain has no country for ${customer.name}, so the tax on it was never worked out`;
+  }
+
   invoice(orgId: string, id: string): Invoice | null {
     const row = this.ctx.db.get<Record<string, unknown>>(
       `SELECT * FROM billing_invoices WHERE org_id = ? AND id = ?`, orgId, id,
@@ -203,10 +219,18 @@ export class Invoices {
     if (filter.created_after !== undefined) { clauses.push('i.created >= ?'); params.push(filter.created_after); }
     if (filter.created_before !== undefined) { clauses.push('i.created <= ?'); params.push(filter.created_before); }
     if (filter.due_before !== undefined) { clauses.push('i.due_date IS NOT NULL AND i.due_date <= ?'); params.push(filter.due_before); }
-    // `missing` is not "no tax was charged": it is "no country could be
-    // resolved, so nothing could be worked out", which is the queue a finance
-    // team clears before those bills can go out.
-    if (filter.tax === 'missing') clauses.push(`i.automatic_tax_status = 'requires_location_inputs'`);
+    // `missing` is not "no tax was charged": it is "the address could not be
+    // placed, so the tax on it was never worked out", which is the queue a
+    // finance team clears before those bills can go out.
+    //
+    // A withdrawn bill is off that queue, and the count on the overview has
+    // always said so — `missing_tax_location` excludes `void`, exactly as
+    // `untaxed` and `held_for_tax_location` do. This filter did not, so the one
+    // query the overview's own sentence sends you to went on listing a bill the
+    // sentence beside it had stopped counting: void the held draft, which is
+    // the escape hatch the hold leaves open, and the book reads "every bill was
+    // taxed against an address Ain could place" over a queue that never empties.
+    if (filter.tax === 'missing') clauses.push(`i.automatic_tax_status = 'requires_location_inputs' AND i.status != 'void'`);
     if (filter.tax === 'zero') clauses.push('i.tax = 0');
     if (filter.tax === 'charged') clauses.push('i.tax != 0');
     if (filter.query) {
@@ -750,7 +774,7 @@ export class Invoices {
     if (taxStatus === 'requires_location_inputs' && invoice.automatic_tax.enabled) {
       throw badRequest(
         'customer_tax_location_invalid',
-        `Invoice ${invoice.number} cannot be finalised: Ain has no country for ${customer.name}, so the tax on it was never worked out — a zero here would mean "we do not know", not "nothing is due". Put a country on the account (PATCH /v1/customers/${customer.id} with an address) and finalise again, or turn the hold off for the whole workspace with POST /v1/billing/automatic_tax.`,
+        `Invoice ${invoice.number} cannot be finalised: ${this.taxLocationGap(orgId, customer)} — a zero here would mean "we do not know", not "nothing is due". Complete the address (PATCH /v1/customers/${customer.id}) and finalise again, or turn the hold off for the whole workspace with POST /v1/billing/automatic_tax.`,
         'customer',
         { invoice: id, customer: customer.id, automatic_tax_status: taxStatus },
       );
@@ -794,10 +818,22 @@ export class Invoices {
     let tax = 0;
     for (const line of invoice.lines) {
       const behavior: TaxBehavior = line.price ? book.find(line.price)?.tax_behavior ?? 'unspecified' : 'unspecified';
-      // The held line's `amount` is still the pricing engine's own number: a
-      // line taxed at nothing had nothing taken out of it, whatever its
-      // behaviour, so this is the same base `issue()` started from.
-      const split = rates.split(line.amount, behavior, line.currency, resolved);
+      // The number `issue()` started from, rebuilt — not the number the held
+      // line happens to carry.
+      //
+      // "A held line was taxed at nothing, so its `amount` is still the
+      // pricing engine's own number" held only while a bill was held for want
+      // of a country, when nothing could match. A bill held for want of a
+      // *state* can already carry tax, because a country-wide rate matches an
+      // address whose state is missing — and an inclusive line's `amount` is
+      // then the base with that tax already taken out of it. Re-splitting the
+      // base as though it were the listed price bills the customer less than
+      // they were quoted and taxes every jurisdiction on the shortfall: a
+      // $100.00 inclusive line held at a country-wide 2% and released into
+      // 2% + 5.75% ends up a $98.04 bill. An exclusive line's amount is its base either way, which
+      // is why this is a no-op for every bill raised before the state hold.
+      const priced = line.tax.behavior === 'inclusive' ? line.amount + line.tax.amount : line.amount;
+      const split = rates.split(priced, behavior, line.currency, resolved);
       const taxes = snapshotTax(rates, split, where);
       const rolled = rollUpLineTax(taxes);
       this.ctx.db.patch('billing_invoice_lines', 'id', line.id, {
@@ -866,7 +902,7 @@ export class Invoices {
       && invoice.automatic_tax.status === 'requires_location_inputs') {
       throw badRequest(
         'customer_tax_location_invalid',
-        `Invoice ${invoice.number} is still a draft: Ain has no country for this account, so the tax on it was never worked out and the bill was never sent. Put a country on the account and finalise it, then record the payment.`,
+        `Invoice ${invoice.number} is still a draft: Ain could not place this account's address, so the tax on it was never worked out and the bill was never sent. Complete the address — a country, and a state in a country whose tax is registered state by state — and finalise it, then record the payment.`,
         'customer',
         { invoice: id, customer: invoice.customer, automatic_tax_status: invoice.automatic_tax.status },
       );
@@ -889,6 +925,16 @@ export class Invoices {
   /**
    * Withdraw a bill that should never have been sent. The balance it drew down
    * goes back where it came from, because a voided invoice consumed nothing.
+   *
+   * A bill with a credit note standing against it is refused for the same
+   * reason a paid one is: the note is a numbered document that was already
+   * sent, and withdrawing the bill under it leaves a correction pointing at
+   * nothing. Nothing here reaches into the notes, because a reader that counts
+   * them does not read through the invoice — `revenue/collections` sums
+   * `billing_credit_notes` on their own while excluding voided invoices from
+   * everything else, so the month goes on reporting a credit against a bill it
+   * no longer says was billed. Voiding the notes first is the sequence that
+   * leaves both books saying the same thing.
    */
   voidInvoice(orgId: string, id: string, meta?: WriteMeta, at?: number): Invoice {
     const invoice = this.require(orgId, id);
@@ -898,6 +944,22 @@ export class Invoices {
         'invoice_paid',
         `Invoice ${invoice.number} has been paid, so withdrawing it would erase a bill the money was collected against. Credit it instead: POST /v1/credit_notes with { "invoice": "${invoice.id}" }.`,
         { status: invoice.status },
+      );
+    }
+    const standing = this.ctx.db.all<{ id: string; number: string; total: number }>(
+      `SELECT id, number, total FROM billing_credit_notes
+        WHERE org_id = ? AND invoice_id = ? AND status = 'issued' ORDER BY sequence ASC`,
+      orgId, id,
+    );
+    if (standing.length) {
+      const worth = formatMoney(
+        money(standing.reduce((total, note) => total + Number(note.total), 0), invoice.currency),
+        { locale: this.billing.locale(orgId) },
+      );
+      throw conflict(
+        'invoice_has_credit_notes',
+        `Invoice ${invoice.number} has ${standing.length === 1 ? 'a credit note' : `${standing.length} credit notes`} standing against it (${standing.map((note) => note.number).join(', ')}, ${worth}), so withdrawing it would leave a correction the customer has already been sent pointing at a bill that no longer exists — and the credit would go on being reported against a bill that is not. Withdraw ${standing.length === 1 ? 'it' : 'them'} first with POST /v1/credit_notes/${standing[0].id}/void, then void this.`,
+        { status: invoice.status, credit_notes: standing.map((note) => note.id) },
       );
     }
     const now = at ?? this.ctx.now();
@@ -951,7 +1013,7 @@ export class Invoices {
       && invoice.automatic_tax.status === 'requires_location_inputs') {
       throw badRequest(
         'customer_tax_location_invalid',
-        `Invoice ${invoice.number} is still a draft: Ain has no country for this account, so the tax on it was never worked out and the bill was never sent. There is nothing to write off — put a country on the account and finalise it first, or withdraw it with POST /v1/invoices/${id}/void.`,
+        `Invoice ${invoice.number} is still a draft: Ain could not place this account's address, so the tax on it was never worked out and the bill was never sent. There is nothing to write off — complete the address and finalise it first, or withdraw it with POST /v1/invoices/${id}/void.`,
         'customer',
         { invoice: id, customer: invoice.customer, automatic_tax_status: invoice.automatic_tax.status },
       );
@@ -1019,6 +1081,16 @@ export class Invoices {
           invoice: id, subtotal: invoice.subtotal, tax: invoice.tax,
           balance_applied: invoice.balance_applied, total: invoice.total,
         },
+      );
+    }
+    // A withdrawn bill is owed nothing. It is the one identity the clause below
+    // exempts void invoices from, so nothing else was left asserting it — and
+    // `CreditNotes.void()` recomputes `amount_due` from `total` without ever
+    // asking whether the bill it is putting back is still standing.
+    if (invoice.status === 'void' && invoice.amount_due !== 0) {
+      throw internal(
+        `Invoice ${invoice.number} was withdrawn but says ${invoice.amount_due} is still due on it.`,
+        { invoice: id, amount_due: invoice.amount_due, status: invoice.status },
       );
     }
     // Cash and credit together account for the whole bill. Without this, an

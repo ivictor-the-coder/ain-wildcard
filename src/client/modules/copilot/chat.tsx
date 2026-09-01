@@ -15,15 +15,19 @@ import { api, invalidate, useMutation, type ApiClientError } from '@/client/kern
 import { useRouter } from '@/client/kernel/router';
 import { useSession } from '@/client/kernel/session';
 import {
-  Badge, Banner, Button, Card, EmptyState, ErrorState, Icons, MessageSquareIcon, Page, SearchInput,
-  Select, Skeleton, SkeletonText, Switch, Textarea, humanize, useFormat, usePrefersReducedMotion,
-  useToast, type SelectOption,
+  Badge, Banner, Button, Card, ConfirmDialog, EmptyState, ErrorState, Field, Icons, Input, MenuButton,
+  MessageSquareIcon, Modal, Page, SearchInput, Select, Skeleton, SkeletonText, Switch, Textarea,
+  humanize, useFormat, usePrefersReducedMotion, useToast, type MenuSection, type SelectOption,
 } from '@/client/design';
 import {
-  parseBlocks, refusalOf, useAiStatus, useApprovals, useSuggestions, useThread, useThreads, useTools,
-  useRun, type AiApproval, type AiMessage, type AiReply, type AiRun, type AiThread, type ThreadDetail,
+  parseBlocks, refusalOf, useAiStatus, useAllApprovals, useSuggestions, useThread, useThreads,
+  useTools, useRun,
+  type AiApproval, type AiMessage, type AiReply, type AiRun, type AiThread, type ThreadDetail,
 } from './api';
-import { ApprovalCard, CitationChips, ConfidenceBadge, ReasoningList, TraceSteps } from './trace';
+import {
+  ApprovalCard, ApprovalResolution, CitationChips, ConfidenceBadge, ReasoningList, TraceSteps,
+} from './trace';
+import { DraftDialog } from './draft';
 
 /* ------------------------------- typewriter ------------------------------- */
 
@@ -89,7 +93,7 @@ function TracePanel({ runId }: { runId: string }) {
   if (!run.data) return <SkeletonText lines={4} />;
   return (
     <div style={{ display: 'grid', gap: 'var(--space-5)' }}>
-      <TraceSteps spans={run.data.trace} />
+      <TraceSteps spans={run.data.trace} decidedAfter={run.data.finished} />
       <details className="cp-details">
         <summary>The engine’s working notes ({run.data.reasoning.length})</summary>
         <div style={{ marginTop: 'var(--space-4)' }}>
@@ -116,6 +120,13 @@ function AssistantMessage({
   const refusal = refusalOf(run);
   const lowConfidence = !!run && run.confidence !== null && run.confidence < 0.55 && !refusal;
 
+  // The prose was composed when the engine stopped: it says "Nothing has been
+  // written" and always will. Once a decision has been made it is history, not
+  // the current state of the workspace, and the turn has to say so.
+  const waiting = approvals.filter((approval) => approval.status === 'pending');
+  const decided = approvals.filter((approval) => approval.status !== 'pending');
+  const superseded = decided.length > 0 && waiting.length === 0;
+
   return (
     <div className="cp-msg cp-msg--assistant">
       <div className="cp-answer">
@@ -124,7 +135,13 @@ function AssistantMessage({
             {run ? run.model : 'Copilot'}
           </Badge>
           {run && <ConfidenceBadge run={run} refused={!!refusal} />}
-          {run?.status === 'needs_approval' && <Badge tone="warning" size="sm">waiting for approval</Badge>}
+          {(waiting.length > 0 || (run?.status === 'needs_approval' && approvals.length === 0))
+            && <Badge tone="warning" size="sm">waiting for approval</Badge>}
+          {superseded && (
+            <Badge tone={decided.some((a) => a.status === 'approved') ? 'success' : 'neutral'} size="sm">
+              {decided.some((a) => a.status === 'approved') ? 'decided — written' : 'decided — declined'}
+            </Badge>
+          )}
           {run?.status === 'failed' && <Badge tone="danger" size="sm">failed</Badge>}
           <span>{f.relative(message.created)}</span>
           {run && (
@@ -156,12 +173,24 @@ function AssistantMessage({
           <Banner tone="danger" title="This run failed">{run.error}</Banner>
         )}
 
-        <AnswerBody content={shown} revealing={!done} />
+        <div className={superseded ? 'cp-superseded' : undefined}>
+          <AnswerBody content={shown} revealing={!done} />
+        </div>
 
         <CitationChips citations={message.citations.length ? message.citations : run?.citations ?? []} />
 
-        {approvals.map((approval) => (
+        {waiting.map((approval) => (
           <ApprovalCard key={approval.id} approval={approval} onDecided={onDecided} />
+        ))}
+
+        {superseded && (
+          <p className="cp-note cp-superseded__note">
+            The answer above was written before you decided. What actually happened:
+          </p>
+        )}
+
+        {decided.map((approval) => (
+          <ApprovalResolution key={approval.id} approval={approval} />
         ))}
 
         {run && (
@@ -173,7 +202,7 @@ function AssistantMessage({
               iconLeft={<Icons.terminal size={13} />}
               onClick={() => setShowTrace((value) => !value)}
             >
-              {showTrace ? 'Hide the steps' : `Show the ${f.plural(run.span_count, 'step')} behind this`}
+              {showTrace ? 'Hide the steps' : 'Show the steps behind this'}
             </Button>
             <Button size="sm" variant="ghost" iconLeft={<Icons.external size={13} />} onClick={() => onOpenRun(run.id)}>
               Open the full trace
@@ -205,7 +234,7 @@ export function CopilotPage() {
   const selected = location.query.thread ?? '';
   const thread = useThread(selected || null);
   const suggestions = useSuggestions();
-  const approvals = useApprovals('pending');
+  const approvals = useAllApprovals();
   const ai = useAiStatus();
   const tools = useTools();
 
@@ -213,6 +242,10 @@ export function CopilotPage() {
   const [allowWrites, setAllowWrites] = useState(false);
   const [pendingQuestion, setPendingQuestion] = useState<string | null>(null);
   const [newestMessage, setNewestMessage] = useState<string | null>(null);
+  const [drafting, setDrafting] = useState(location.query.draft === '1');
+  const [renaming, setRenaming] = useState<AiThread | null>(null);
+  const [renameTo, setRenameTo] = useState('');
+  const [deleting, setDeleting] = useState<AiThread | null>(null);
   const streamRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
@@ -224,6 +257,10 @@ export function CopilotPage() {
     if (selected || !list.length || location.query.new === '1') return;
     setQuery({ thread: list[0].id }, { replace: true });
   }, [selected, list, location.query.new, setQuery]);
+
+  useEffect(() => {
+    if (location.query.draft === '1') { setDrafting(true); setQuery({ draft: undefined }, { replace: true }); }
+  }, [location.query.draft, setQuery]);
 
   useEffect(() => {
     if (location.query.ask) {
@@ -269,11 +306,21 @@ export function CopilotPage() {
       // carries `allow_writes`, so folding the two calls into one is what made
       // the first question of a conversation silently unable to prepare a write.
       const created = await api.post<ThreadDetail>('/v1/ai/threads', { title: content.slice(0, 120) });
-      const reply = await api.post<AiReply>(`/v1/ai/threads/${encodeURIComponent(created.id)}/messages`, {
-        content,
-        ...(allowWrites ? { allow_writes: true } : {}),
-      });
-      return { threadId: created.id, messageId: reply.message.id };
+      try {
+        const reply = await api.post<AiReply>(`/v1/ai/threads/${encodeURIComponent(created.id)}/messages`, {
+          content,
+          ...(allowWrites ? { allow_writes: true } : {}),
+        });
+        return { threadId: created.id, messageId: reply.message.id };
+      } catch (e) {
+        // The thread exists only to hold the question. If the question never
+        // landed, it is an empty row indistinguishable from a fresh
+        // conversation — and one more of them for every retry — so it is rolled
+        // back with the failure. The toast below still hands the sentence back.
+        await api.del(`/v1/ai/threads/${encodeURIComponent(created.id)}`).catch(() => undefined);
+        invalidate('/v1/ai/threads');
+        throw e;
+      }
     },
     {
       onSuccess: ({ threadId, messageId }) => {
@@ -284,17 +331,118 @@ export function CopilotPage() {
       },
       onError: (e: ApiClientError) => {
         setPendingQuestion(null);
-        toast.error('The copilot did not answer', e.body.message, { duration: 0 });
+        toast.error('The copilot did not answer', `${e.body.message} Your question is still in the box.`, { duration: 0 });
       },
     },
   );
+
+  /* ---------------------------- housekeeping ----------------------------- */
+
+  const refreshList = useCallback(() => { invalidate('/v1/ai/threads'); }, []);
+
+  const setStatusOf = useMutation<{ thread: AiThread; to: 'open' | 'archived' }, AiThread>(
+    ({ thread, to }) => api.patch<AiThread>(`/v1/ai/threads/${encodeURIComponent(thread.id)}`, { status: to }),
+    {
+      onSuccess: (updated, { to }) => {
+        refreshList();
+        invalidate(`/v1/ai/threads/${updated.id}`);
+        // The thread has just left the list that is on screen, so the selection
+        // has to leave with it or the rail highlights a row nobody can see.
+        if (updated.id === selected && to !== status) setQuery({ thread: undefined, new: '1' });
+        toast.success(
+          to === 'archived' ? 'Archived' : 'Back in Open',
+          to === 'archived'
+            ? `“${updated.title}” is out of the way. Switch the list to Archived to read it again.`
+            : `“${updated.title}” is in the open conversations again.`,
+          {
+            action: {
+              label: to === 'archived' ? 'Undo' : 'Archive again',
+              onClick: () => { void setStatusOf.run({ thread: updated, to: to === 'archived' ? 'open' : 'archived' }).catch(() => undefined); },
+            },
+          },
+        );
+      },
+      onError: (e) => toast.error('The conversation did not move', e.body.message),
+    },
+  );
+
+  const rename = useMutation<{ id: string; title: string }, AiThread>(
+    ({ id, title }) => api.patch<AiThread>(`/v1/ai/threads/${encodeURIComponent(id)}`, { title }),
+    {
+      onSuccess: (updated) => {
+        refreshList();
+        invalidate(`/v1/ai/threads/${updated.id}`);
+        setRenaming(null);
+        toast.success('Renamed', `This conversation is now “${updated.title}”.`);
+      },
+      onError: (e) => { if (!e.body.param) toast.error('The rename did not stick', e.body.message); },
+    },
+  );
+
+  const remove = useMutation<AiThread, void>(
+    (thread) => api.del<void>(`/v1/ai/threads/${encodeURIComponent(thread.id)}`),
+    {
+      onSuccess: (_result, thread) => {
+        refreshList();
+        setDeleting(null);
+        if (thread.id === selected) setQuery({ thread: undefined, new: '1' });
+        toast.success('Deleted', `“${thread.title}” and its messages are gone. The runs behind it stay in the log.`);
+      },
+      onError: (e) => toast.error('The conversation was not deleted', e.body.message),
+    },
+  );
+
+  const threadMenu = useCallback((row: AiThread): MenuSection[] => [
+    {
+      id: 'edit',
+      items: [
+        {
+          id: 'rename',
+          label: 'Rename…',
+          icon: <Icons.edit size={14} />,
+          onSelect: () => { setRenaming(row); setRenameTo(row.title); },
+        },
+        row.status === 'archived'
+          ? {
+            id: 'reopen',
+            label: 'Move back to Open',
+            icon: <Icons.inbox size={14} />,
+            onSelect: () => { void setStatusOf.run({ thread: row, to: 'open' }).catch(() => undefined); },
+          }
+          : {
+            id: 'archive',
+            label: 'Archive',
+            description: 'Stays readable under Archived',
+            icon: <Icons.folder size={14} />,
+            onSelect: () => { void setStatusOf.run({ thread: row, to: 'archived' }).catch(() => undefined); },
+          },
+      ],
+    },
+    {
+      id: 'danger',
+      items: [{
+        id: 'delete',
+        label: 'Delete',
+        description: row.message_count ? `${f.plural(row.message_count, 'message')} go with it` : 'Nothing was ever said in it',
+        icon: <Icons.trash size={14} />,
+        danger: true,
+        onSelect: () => setDeleting(row),
+      }],
+    },
+  ], [f, setStatusOf]);
 
   const ask = useCallback((question: string) => {
     const content = question.trim();
     if (!content || send.loading) return;
     setDraft('');
     setPendingQuestion(content);
-    void send.run(content).catch(() => undefined);
+    // The engine blipping is not a reason to lose the sentence a person typed.
+    // It goes back in the box — unless they have already typed something else —
+    // with the caret in it, so Enter retries.
+    void send.run(content).catch(() => {
+      setDraft((current) => current || content);
+      requestAnimationFrame(() => composerRef.current?.focus());
+    });
   }, [send]);
 
   const startNew = () => {
@@ -304,8 +452,7 @@ export function CopilotPage() {
     composerRef.current?.focus();
   };
 
-  const approvalsFor = (runId: string | null) =>
-    (approvals.data?.data ?? []).filter((approval) => approval.run_id === runId);
+  const approvalsFor = (runId: string | null) => (runId ? approvals.byRun.get(runId) ?? [] : []);
 
   const provider = ai.data?.provider;
   const composing = !selected || location.query.new === '1';
@@ -323,6 +470,9 @@ export function CopilotPage() {
       }
       actions={
         <>
+          <Button iconLeft={<Icons.edit size={14} />} onClick={() => setDrafting(true)}>
+            Draft
+          </Button>
           <Button iconLeft={<Icons.activity size={14} />} onClick={() => navigate('/copilot/runs')}>
             Runs &amp; traces
           </Button>
@@ -382,32 +532,55 @@ export function CopilotPage() {
                 body={filter
                   ? `Nothing here is titled like “${filter}”.`
                   : status === 'archived'
-                    ? 'Archived conversations stay readable — none of this workspace’s threads have been archived.'
+                    ? 'Archive a conversation from the ⋯ menu on its row and it moves here — still readable, out of the way.'
                     : 'Ask the first question and it starts one.'}
+                action={filter
+                  ? <Button size="sm" onClick={() => setFilter('')}>Clear the filter</Button>
+                  : status === 'archived'
+                    ? <Button size="sm" onClick={() => setStatus('open')}>Back to the open ones</Button>
+                    : <Button size="sm" variant="primary" onClick={startNew}>Ask something</Button>}
               />
             )}
             {visibleThreads.map((row: AiThread) => (
-              <button
-                key={row.id}
-                type="button"
-                className={`cp-thread${row.id === selected ? ' is-active' : ''}`}
-                aria-current={row.id === selected ? 'true' : undefined}
-                onClick={() => { setQuery({ thread: row.id, new: undefined }); setPendingQuestion(null); }}
-              >
-                <span className="cp-thread__title">{row.title}</span>
-                <span className="cp-thread__meta">
-                  <MessageSquareIcon size={11} />
-                  {f.plural(row.message_count, 'message')}
-                  <span>·</span>
-                  {f.relative(row.last_message_at ?? row.updated)}
-                </span>
-              </button>
+              <div className={`cp-threadrow${row.id === selected ? ' is-active' : ''}`} key={row.id}>
+                <button
+                  type="button"
+                  className={`cp-thread${row.id === selected ? ' is-active' : ''}`}
+                  aria-current={row.id === selected ? 'true' : undefined}
+                  onClick={() => { setQuery({ thread: row.id, new: undefined }); setPendingQuestion(null); }}
+                >
+                  <span className="cp-thread__title">{row.title}</span>
+                  <span className="cp-thread__meta">
+                    <MessageSquareIcon size={11} />
+                    {f.plural(row.message_count, 'message')}
+                    <span>·</span>
+                    {f.relative(row.last_message_at ?? row.updated)}
+                    {row.status === 'archived' && (
+                      <>
+                        <span>·</span>
+                        <span>archived</span>
+                      </>
+                    )}
+                  </span>
+                </button>
+                <MenuButton
+                  className="cp-threadrow__menu"
+                  size="sm"
+                  label={`Rename, archive or delete “${row.title}”`}
+                  sections={threadMenu(row)}
+                />
+              </div>
             ))}
           </div>
         </Card>
 
         <div className="cp-convo">
-          <div className="cp-stream" ref={streamRef} aria-live="polite" aria-busy={send.loading}>
+          <div
+            className={`cp-stream${!composing && messages.length > 0 ? ' cp-stream--messages' : ''}`}
+            ref={streamRef}
+            aria-live="polite"
+            aria-busy={send.loading}
+          >
             {thread.error && (
               <ErrorState
                 title="This conversation could not be read"
@@ -535,6 +708,70 @@ export function CopilotPage() {
           </form>
         </div>
       </div>
+
+      <DraftDialog open={drafting} onClose={() => setDrafting(false)} />
+
+      <Modal
+        open={!!renaming}
+        onClose={() => setRenaming(null)}
+        size="sm"
+        title="Rename this conversation"
+        description="The title is how you will find it again in the rail. Nothing about the answers changes."
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setRenaming(null)}>Cancel</Button>
+            <Button
+              variant="primary"
+              loading={rename.loading}
+              disabled={!renameTo.trim() || renameTo.trim() === renaming?.title}
+              onClick={() => {
+                if (!renaming) return;
+                void rename.run({ id: renaming.id, title: renameTo.trim() }).catch(() => undefined);
+              }}
+            >
+              Rename
+            </Button>
+          </>
+        }
+      >
+        <form
+          className="pl-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!renaming || !renameTo.trim()) return;
+            void rename.run({ id: renaming.id, title: renameTo.trim() }).catch(() => undefined);
+          }}
+        >
+          <Field
+            label="Title"
+            required
+            error={rename.error?.body.param === 'title' ? rename.error.body.message : null}
+            hint="Up to 200 characters."
+          >
+            <Input
+              value={renameTo}
+              onChange={(e) => setRenameTo(e.target.value)}
+              maxLength={200}
+              autoFocus
+              aria-label="Conversation title"
+            />
+          </Field>
+        </form>
+      </Modal>
+
+      <ConfirmDialog
+        open={!!deleting}
+        onCancel={() => setDeleting(null)}
+        onConfirm={() => { if (deleting) void remove.run(deleting).catch(() => undefined); }}
+        loading={remove.loading}
+        title={`Delete “${deleting?.title ?? ''}”?`}
+        body={
+          deleting?.message_count
+            ? `Its ${f.plural(deleting.message_count, 'message')} go with it and cannot be brought back. The runs behind them stay in the run log, with their traces and costs. Archive instead if you only want it out of the way.`
+            : 'Nothing was ever said in this one, so there is nothing to lose. The runs behind it, if any, stay in the run log.'
+        }
+        confirmLabel="Delete the conversation"
+      />
     </Page>
   );
 }

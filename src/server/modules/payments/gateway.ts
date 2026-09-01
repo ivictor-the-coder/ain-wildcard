@@ -983,10 +983,15 @@ export class Gateway {
    * A part payment — a won dispute over half a charge, say — is written here,
    * because billing has no notion of a bill that is partly collected and this
    * is the honest way to record one without inventing a status for it.
+   *
+   * `restoring` marks the calls where nothing is arriving: cash going back
+   * exactly where it already was, because the thing that displaced it has been
+   * undone. See the note on the `pay()` branch — it is the whole reason the
+   * flag exists.
    */
   applyCollection(
     orgId: string, invoiceId: string, amount: number,
-    opts: { note: string; at?: number; charge?: string | null; meta?: WriteMeta },
+    opts: { note: string; at?: number; charge?: string | null; meta?: WriteMeta; restoring?: boolean },
   ): Invoice {
     const invoice = this.billing.invoices.require(orgId, invoiceId);
     if (amount <= 0) return invoice;
@@ -1004,8 +1009,24 @@ export class Gateway {
     const applied = Math.min(amount, room);
     const excess = amount - applied;
 
+    // Calling billing's `pay()` is this module saying the word "settled", and
+    // a bill that has been written off is a decision a person made. Money
+    // *arriving* on one reverses that decision honestly — a debit that settles
+    // after the write-off was collected after all. Money going *back* where it
+    // already was does not: a chargeback won back and the cash a withdrawn
+    // credit note puts back were both sitting on that bill before anyone gave
+    // up on it, so putting them back has to leave the write-off exactly as it
+    // found it. `settleCreditedExcess` already keeps that rule on the way out —
+    // "a bill written off stays written off" — and without it here the two
+    // halves disagree: a bad debt settles itself, `invoice.paid` goes out over
+    // it, and billing turns that into a revived subscription, with nothing
+    // collected at all.
+    const settles = applied > 0
+      && invoice.amount_paid + applied >= collectable
+      && !(opts.restoring && invoice.status === 'uncollectible');
+
     let after = invoice;
-    if (applied > 0 && invoice.amount_paid + applied >= collectable) {
+    if (settles) {
       after = this.billing.invoices.pay(orgId, invoiceId, { note: opts.note, at: now }, opts.meta);
     } else if (applied > 0) {
       this.ctx.db.patch('billing_invoices', 'id', invoiceId, {
@@ -1014,7 +1035,13 @@ export class Gateway {
       });
       this.billing.invoices.assertBalanced(orgId, invoiceId);
       after = this.billing.invoices.require(orgId, invoiceId);
-      this.ctx.emit(orgId, 'invoice.partially_paid', after, {
+      // This branch means the same thing either way — cash was written onto the
+      // bill and this module did not settle it — but the two reasons are not
+      // the same event. Something still owed is a part payment; nothing owed is
+      // the written-off case above, where the cash went back to where it was
+      // and the bill stayed a bad debt. Calling that one "partially paid" over
+      // a bill with nothing due would be the same untruth `invoice.paid` was.
+      this.ctx.emit(orgId, after.amount_due > 0 ? 'invoice.partially_paid' : 'invoice.payment_restored', after, {
         objectId: invoiceId, objectType: 'invoice', previous: { amount_paid: invoice.amount_paid, amount_due: invoice.amount_due },
         actorId: opts.meta?.actorId, actorType: opts.meta?.actorType, requestId: opts.meta?.requestId,
       });
@@ -1022,7 +1049,193 @@ export class Gateway {
     if (excess > 0) {
       after = this.recordOverpayment(orgId, after, excess, { at: now, charge: opts.charge ?? null, meta: opts.meta });
     }
+    this.assertCashHeld(orgId, invoiceId);
     return after;
+  }
+
+  /**
+   * The bill shrank under money that was already on it.
+   *
+   * The mirror of the case `recordOverpayment` was written for, and the reason
+   * it cannot be the only one handled: there are two ways a bill and the cash
+   * against it can end up out of step, and they are the same event in the two
+   * possible orders. A debit that settles days after a credit note landed is
+   * money arriving against a bill that has already shrunk — `applyCollection`
+   * sees the room is gone and puts the difference on the account. A credit note
+   * raised against a bill that has *already* been part paid is the same
+   * shortfall arriving the other way round, and nothing was watching for it:
+   * billing routes a note as a post-payment credit only when the invoice is
+   * `paid`, so a bill holding $400.00 of a customer's cash takes a $499.00
+   * credit note entirely against what it was billed, `amount_paid` is left
+   * larger than the bill can ever hold, and `amount_due` goes to *minus* $400.00
+   * — a figure no screen can act on, no ledger records, and the customer holds
+   * neither the money nor a credit for it.
+   *
+   * So the excess comes off the bill and onto the account, exactly as it would
+   * have done had the cash arrived second. `amount_paid + pre-payment credit
+   * notes + amount_due === total` stays true, and so does the one this file
+   * exists for: nothing collected is ever discarded.
+   */
+  settleCreditedExcess(
+    orgId: string, invoiceId: string, opts: { note: string; at?: number; meta?: WriteMeta },
+  ): Invoice {
+    return this.ctx.atomic(() => {
+      const invoice = this.billing.invoices.require(orgId, invoiceId);
+      // A withdrawn bill holds nothing it was owed: `applyCollection` already
+      // lands every unit against it on the account, so there is nothing here to
+      // move and `amount_paid` on it is a record of what was taken before it
+      // was struck out rather than cash the document is holding.
+      if (invoice.status === 'void') return invoice;
+      const collectable = invoice.total - invoice.pre_payment_credit_notes_amount;
+      const excess = invoice.amount_paid - collectable;
+      if (excess <= 0) return invoice;
+      const now = opts.at ?? this.ctx.now();
+      this.ctx.db.patch('billing_invoices', 'id', invoiceId, {
+        amount_paid: collectable, amount_due: 0, payment_note: opts.note, updated: now,
+      });
+      this.billing.invoices.assertBalanced(orgId, invoiceId);
+      let after = this.recordOverpayment(orgId, this.billing.invoices.require(orgId, invoiceId), excess, {
+        at: now, charge: null, meta: opts.meta,
+        reason: `${formatMoney(money(excess, invoice.currency), { locale: this.locale(orgId) })} of what had been collected against invoice ${invoice.number} is more than the bill is owed now that it has been credited. It is credit on the account and comes off the next bill.`,
+      });
+      // What is left of the bill is covered, so it is settled — and `pay()` is
+      // billing's to say, because `invoice.paid` has to reach the recovery
+      // schedule and the timeline from where every other subscriber expects it.
+      // Only from `open`: a bill written off stays written off, and a paid one
+      // is already there.
+      if (after.status === 'open') {
+        after = this.billing.invoices.pay(orgId, invoiceId, { note: opts.note, at: now }, opts.meta);
+      }
+      this.assertCashHeld(orgId, invoiceId);
+      return after;
+    });
+  }
+
+  /**
+   * The bill grew back over cash this module had already moved off it.
+   *
+   * `settleCreditedExcess` is only half a pair. A credit note can be withdrawn,
+   * and billing's `void` puts back exactly what the note took *as the note
+   * recorded it* — the whole amount onto `amount_due`, because the row says
+   * `pre_payment_amount` — while the slice of it this module had since carried
+   * onto the customer's account stays where it is. The bill is then owed the
+   * full amount again with `amount_paid` at zero, and $400.00 of the
+   * customer's money is filed as credit *against that same invoice*: the
+   * payments view reports `cash_collected` 40000, `amount_paid` 0 and
+   * `amount_due` 49900 in one breath, and the next presentation — a retry, a
+   * dunning window, a customer paying their own bill — charges the card the
+   * whole $499.00 for a bill they had already paid $400.00 of.
+   *
+   * So the mirror: what the bill can hold again comes back off the account and
+   * onto it, through the same door money always arrives by. Capped at the room
+   * the void actually created, so real overpayment — cash that outran the bill
+   * rather than cash a note displaced — stays on the account where it belongs.
+   *
+   * The invariant both halves keep, and the one `assertCashHeld` now holds
+   * everywhere: a bill that can still absorb money is never simultaneously
+   * holding a customer's cash as credit against itself.
+   */
+  restoreCreditedExcess(
+    orgId: string, invoiceId: string, opts: { note: string; at?: number; meta?: WriteMeta },
+  ): Invoice {
+    return this.ctx.atomic(() => {
+      const invoice = this.billing.invoices.require(orgId, invoiceId);
+      // A struck-out bill absorbs nothing, exactly as in `applyCollection`:
+      // money against it belongs to the customer, not to a withdrawn document.
+      if (invoice.status === 'void') return invoice;
+      const room = Math.max(0, invoice.total - invoice.pre_payment_credit_notes_amount - invoice.amount_paid);
+      const held = this.overpaidOn(orgId, invoiceId);
+      const back = Math.min(room, held);
+      if (back <= 0) return invoice;
+      const now = opts.at ?? this.ctx.now();
+      const shown = formatMoney(money(back, invoice.currency), { locale: this.locale(orgId) });
+      this.reverseOverpayment(orgId, invoice, back, {
+        at: now, note: opts.note, meta: opts.meta,
+        reason: `${shown} of the credit invoice ${invoice.number} put on this account goes back onto the bill: the credit note that shrank it was withdrawn, so the bill is owed that money again and is holding the cash for it.`,
+        resolution: `${shown} had been collected against ${invoice.number} and moved to the account when a credit note shrank the bill past it. The note was withdrawn, so the bill charges that money again and the cash is recorded against it rather than left as credit the next presentation would collect a second time.`,
+      });
+      // Back through the one door money arrives by, so the bill is settled by
+      // billing's own `pay()` if this covers it and `invoice.paid` reaches the
+      // recovery schedule from where every subscriber expects it. `back` is
+      // capped at the room, so nothing here can spill onto the account again —
+      // and `restoring` says this is not a collection at all, so a bill that
+      // was written off while holding this very cash stays written off rather
+      // than settling itself the moment the note is withdrawn.
+      const after = this.applyCollection(orgId, invoiceId, back, {
+        note: opts.note, at: now, charge: null, meta: opts.meta, restoring: true,
+      });
+      this.assertCashHeld(orgId, invoiceId);
+      return after;
+    });
+  }
+
+  /**
+   * The three things that have to be true of the cash on a bill, checked
+   * against what was written rather than against what was computed.
+   *
+   * Billing's `assertBalanced` holds `amount_paid + pre-payment credit notes +
+   * amount_due === total`, which is necessary and not sufficient: every one of
+   * the three ways this module has lost money satisfied it. A bill that took
+   * more than it could ever be owed satisfies it with a negative `amount_due`;
+   * a refund that gave back the cash and left the credit it made satisfies it
+   * with a credit balance nothing collected; a bill that grew back over cash
+   * this module had moved off it satisfies it while holding the customer's
+   * money as credit against itself, so the next presentation collects it
+   * twice. So the halves the identity cannot see are asserted here, and they
+   * take the transaction down rather than reaching a customer.
+   *
+   * What is deliberately *not* asserted is the whole identity — net cash in
+   * === `amount_paid` + overpayment credit. A bill can be settled by bank
+   * transfer through billing's own `pay()`, and cash this module never saw is
+   * not a defect. The property test drives the sequences where payments is the
+   * only way money moves, and holds the identity itself there.
+   */
+  private assertCashHeld(orgId: string, invoiceId: string): void {
+    const credit = this.overpaidOn(orgId, invoiceId);
+    if (credit < 0) {
+      throw internal(
+        `Invoice ${invoiceId} has given back ${-credit} more overpayment credit than was ever collected past it, so a refund has been paid out twice.`,
+        { invoice: invoiceId, amount_overpaid: credit },
+      );
+    }
+    const invoice = this.billing.invoices.require(orgId, invoiceId);
+    // A struck-out bill is the one case where cash on the document outruns what
+    // the document is owed by design: `voidInvoice` leaves whatever was
+    // collected in `amount_paid` so a refund can still reach it.
+    if (invoice.status === 'void') return;
+    const collectable = invoice.total - invoice.pre_payment_credit_notes_amount;
+    if (invoice.amount_paid < 0 || invoice.amount_paid > collectable) {
+      throw internal(
+        `Invoice ${invoice.number} records ${invoice.amount_paid} collected but can only ever be owed ${collectable}, so ${invoice.amount_paid - collectable} of a customer's money is on a bill that cannot hold it and on nobody's account.`,
+        {
+          invoice: invoiceId, amount_paid: invoice.amount_paid, collectable,
+          total: invoice.total, pre_payment_credit_notes_amount: invoice.pre_payment_credit_notes_amount,
+        },
+      );
+    }
+    if (invoice.amount_due < 0) {
+      throw internal(
+        `Invoice ${invoice.number} is owed ${invoice.amount_due}, which is not a bill anybody can act on.`,
+        { invoice: invoiceId, amount_due: invoice.amount_due, amount_paid: invoice.amount_paid, collectable },
+      );
+    }
+    // The third, and the one the identity is blindest to, because it balances
+    // perfectly while it is false: a bill that can still absorb money holding
+    // the customer's cash as credit against *itself*. `applyCollection` only
+    // ever lands the excess once the room is gone, so credit and room are
+    // never both positive — every path that shrinks the bill under cash moves
+    // it, and every path that grows the bill back has to move it back, or the
+    // next presentation collects money the customer has already paid on this
+    // very invoice.
+    if (credit > 0 && invoice.amount_paid < collectable) {
+      throw internal(
+        `Invoice ${invoice.number} can still absorb ${collectable - invoice.amount_paid} and is at the same time holding ${credit} of the customer's cash as credit against itself, so presenting it again would collect money they have already paid on it.`,
+        {
+          invoice: invoiceId, amount_overpaid: credit, amount_paid: invoice.amount_paid,
+          collectable, amount_due: invoice.amount_due,
+        },
+      );
+    }
   }
 
   /**
@@ -1043,7 +1256,7 @@ export class Gateway {
    */
   private recordOverpayment(
     orgId: string, invoice: Invoice, excess: number,
-    opts: { at: number; charge: string | null; meta?: WriteMeta },
+    opts: { at: number; charge: string | null; meta?: WriteMeta; reason?: string },
   ): Invoice {
     const customer = this.ctx.svc.billing.requireCustomer(orgId, invoice.customer);
     if (customer.currency !== invoice.currency) {
@@ -1059,9 +1272,10 @@ export class Gateway {
     const shown = formatMoney(money(excess, invoice.currency), { locale });
     const txn = this.billing.adjustBalance(orgId, customer.id, -excess, {
       type: 'invoice_overpayment',
-      description: opts.charge
-        ? `${shown} more than invoice ${invoice.number} was owed arrived with ${opts.charge}. It is credit on the account and comes off the next bill.`
-        : `${shown} more than invoice ${invoice.number} was owed was collected against it. It is credit on the account and comes off the next bill.`,
+      description: opts.reason
+        ?? (opts.charge
+          ? `${shown} more than invoice ${invoice.number} was owed arrived with ${opts.charge}. It is credit on the account and comes off the next bill.`
+          : `${shown} more than invoice ${invoice.number} was owed was collected against it. It is credit on the account and comes off the next bill.`),
       subscription: invoice.subscription, invoice: invoice.id, createdAt: opts.at,
     });
     this.ctx.emit(orgId, 'invoice.overpaid', {
@@ -1144,7 +1358,7 @@ export class Gateway {
         { invoice: invoiceId, amount, amount_paid: current.amount_paid, amount_overpaid: overpaid },
       );
     }
-    if (moved <= 0) return current;
+    if (moved <= 0) { this.assertCashHeld(orgId, invoiceId); return current; }
     const paid = current.amount_paid - moved;
     // A withdrawn bill is owed nothing and cannot become owed again: taking its
     // cash back leaves it struck out and empty, not open for the difference.
@@ -1169,6 +1383,7 @@ export class Gateway {
       previous: { amount_paid: current.amount_paid, amount_due: current.amount_due, status: current.status },
       actorId: opts.meta?.actorId, actorType: opts.meta?.actorType, requestId: opts.meta?.requestId,
     });
+    this.assertCashHeld(orgId, invoiceId);
     return after;
   }
 
@@ -1184,14 +1399,15 @@ export class Gateway {
    */
   private reverseOverpayment(
     orgId: string, invoice: Invoice, amount: number,
-    opts: { at: number; note: string; meta?: WriteMeta },
+    opts: { at: number; note: string; meta?: WriteMeta; reason?: string; resolution?: string },
   ): Invoice {
     const customer = this.ctx.svc.billing.requireCustomer(orgId, invoice.customer);
     const locale = this.locale(orgId);
     const shown = formatMoney(money(amount, invoice.currency), { locale });
     const txn = this.billing.adjustBalance(orgId, customer.id, amount, {
       type: 'invoice_overpayment',
-      description: `${shown} of the credit invoice ${invoice.number} put on this account went back with the money that made it. ${opts.note}`,
+      description: opts.reason
+        ?? `${shown} of the credit invoice ${invoice.number} put on this account went back with the money that made it. ${opts.note}`,
       subscription: invoice.subscription, invoice: invoice.id, createdAt: opts.at,
     });
     this.ctx.emit(orgId, 'invoice.overpayment_reversed', {
@@ -1201,7 +1417,8 @@ export class Gateway {
       amount_overpaid: this.overpaidOn(orgId, invoice.id),
       balance_transaction: txn.id, customer_balance: txn.ending_balance,
       note: opts.note,
-      resolution: `${shown} was collected past what ${invoice.number} was owed and credited to ${customer.name}'s account. That cash has now gone back to them, so the credit went with it — the bill itself is unchanged, because it never held this money.`,
+      resolution: opts.resolution
+        ?? `${shown} was collected past what ${invoice.number} was owed and credited to ${customer.name}'s account. That cash has now gone back to them, so the credit went with it — the bill itself is unchanged, because it never held this money.`,
     }, {
       objectId: invoice.id, objectType: 'invoice',
       actorId: opts.meta?.actorId, actorType: opts.meta?.actorType, requestId: opts.meta?.requestId,
@@ -1396,8 +1613,14 @@ export class Gateway {
 
       if (dispute.invoice) {
         if (won) {
+          // The network gives back money it took off this bill, which is the
+          // same cash `openDispute` reversed out of it — not a collection. So
+          // it lands as a restoration: a bill written off while the case was
+          // open, or before it, keeps its write-off instead of being settled by
+          // money it was already holding when someone gave up on it.
           this.applyCollection(orgId, dispute.invoice, dispute.amount, {
-            note: `${shown} returned after dispute ${id} was won.`, at: now, charge: charge.id, meta,
+            note: `${shown} returned after dispute ${id} was won.`,
+            at: now, charge: charge.id, meta, restoring: true,
           });
         } else {
           // The money is gone and will not be collected: that is precisely what

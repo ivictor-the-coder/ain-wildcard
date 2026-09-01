@@ -6,14 +6,13 @@ import { useMemo } from 'react';
 import type { CommandDef, NavItem, RouteDef, WidgetDef } from '@/client/kernel/registry-types';
 import { useQuery } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
-import { useSession } from '@/client/kernel/session';
 import {
-  Badge, Button, Card, ChevronRightIcon, EmptyState, ErrorState, Icons, SkeletonText, useFormat
+  Badge, Button, Card, ChevronRightIcon, EmptyState, ErrorState, Icons, SkeletonText
 } from '@/client/design';
 import { DealsPage } from './deals';
 import { DealRecordPage } from './record';
 import {
-  accountOf, dealAmount, dealCloseDate, recordHref, str,
+  accountOf, dealAmount, dealCloseDate, recordHref, str, useDealFormat,
   type DealListEnvelope, type DealRecord,
 } from './api';
 import './pipeline.css';
@@ -29,16 +28,15 @@ const DealRecordRoute = () => {
 
 /** The open deals whose close date is inside the next six weeks, soonest first. */
 function ClosingSoon() {
-  const f = useFormat();
-  const session = useSession();
+  const f = useDealFormat();
   const { navigate } = useRouter();
-  const now = session.now();
+  const today = f.calendarToday();
   const { data, error, loading, refetch } = useQuery<DealListEnvelope>('/v1/records/deal', {
     sort: 'close_date', order: 'asc', limit: 60, expand: 'associations',
   });
 
   const rows = useMemo(() => {
-    const horizon = now + 42 * DAY_MS;
+    const horizon = today + 42 * DAY_MS;
     return (data?.data ?? [])
       .filter((deal: DealRecord) => str(deal.properties.deal_status) === 'open')
       .filter((deal) => {
@@ -46,7 +44,7 @@ function ClosingSoon() {
         return close !== null && close <= horizon;
       })
       .slice(0, 6);
-  }, [data, now]);
+  }, [data, today]);
 
   const committed = rows.reduce((sum, deal) => sum + dealAmount(deal), 0);
 
@@ -78,7 +76,7 @@ function ClosingSoon() {
       )}
       {!error && rows.map((deal) => {
         const close = dealCloseDate(deal);
-        const overdue = close !== null && close < now;
+        const overdue = close !== null && close < today;
         return (
           <button
             key={deal.id}
@@ -89,7 +87,7 @@ function ClosingSoon() {
             <span className="pl-widgetrow__text">
               <span className="pl-widgetrow__title u-truncate">{deal.display_name}</span>
               <span className="pl-widgetrow__sub u-truncate">
-                {accountOf(deal)?.display_name ?? 'No account'} · {close !== null ? f.date(close, { withYear: false }) : 'no close date'}
+                {accountOf(deal)?.display_name ?? 'No account'} · {close !== null ? f.calendarDate(close, { withYear: false }) : 'no close date'}
               </span>
             </span>
             <span className="pl-widgetrow__amount">{f.money(dealAmount(deal))}</span>

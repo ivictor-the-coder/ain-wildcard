@@ -32,7 +32,7 @@ import {
   describeCadence, isMetered, longDate, Pricebook, recurringLines, recurringSubtotal, remainingMillis,
   sameCadence, shortDate, type PricedItem,
 } from './cycle';
-import type { Cadence, ChangePreview, ProrationLine, RecurringLine, SubscriptionStatus } from './types';
+import type { AutomaticTax, Cadence, ChangePreview, ProrationLine, RecurringLine, SubscriptionStatus } from './types';
 
 /** One item as it exists now, or as it is being asked to exist. */
 export interface ItemState {
@@ -276,6 +276,12 @@ export interface PreviewInput extends ProrateInput {
    * short by the tax on every exclusive-priced account in the book.
    */
   taxOf(lines: { price: string | null; amount: number; currency: string }[]): { base: number; tax: number };
+  /**
+   * Whether a bill for this account can be placed. Read from the same call the
+   * invoice makes, so a preview cannot promise a collection the bill it
+   * predicts will be held back from making.
+   */
+  automaticTax: AutomaticTax;
 }
 
 /**
@@ -303,14 +309,22 @@ export function previewChange(input: PreviewInput): ChangePreview {
   // screen that reads this field prints it on the button that takes the money.
   // So it is priced the way the invoice will price it, through the invoice's
   // own call.
+  //
+  // The bill is raised for exactly these lines whenever the behaviour settles
+  // and there are any, which is the condition read here. Reading it as "and the
+  // lines net positive" instead was the same mistake sign-flipped: a downgrade
+  // that credits $200.00 against an account carrying $400.00 forward raises a
+  // bill that collects $188.50, and the preview answered $0.00 for it — on the
+  // same button, one direction over.
   const settles = input.behavior === 'always_invoice';
-  const dueNow = settles && set.net > 0
+  const dueNow = settles && set.lines.length
     ? input.taxOf(set.lines.map((line) => ({ price: line.price, amount: line.amount, currency: line.currency })))
     : null;
   const taxDueNow = dueNow ? dueNow.tax : 0;
-  // A credit balance is drawn down by this bill and can never take it below
-  // zero, exactly as `Invoices.issue()` decides it — so an account holding
-  // more credit than the change is worth is collected from for nothing.
+  // The balance is drawn down by this bill and can never take it below zero,
+  // exactly as `Invoices.issue()` decides it — so an account holding more
+  // credit than the change is worth is collected from for nothing, and an
+  // account that owes more than the change hands back still owes the rest.
   const amountDueNow = dueNow ? Math.max(0, dueNow.base + dueNow.tax + input.customerBalance) : 0;
 
   // The recurring fee for the period after the change, on the basis the bill
@@ -362,6 +376,7 @@ export function previewChange(input: PreviewInput): ChangePreview {
     net: set.net,
     amount_due_now: amountDueNow,
     tax_due_now: taxDueNow,
+    automatic_tax: input.automaticTax,
     customer_balance: input.customerBalance,
     next_invoice: {
       date: input.nextInvoiceDate,

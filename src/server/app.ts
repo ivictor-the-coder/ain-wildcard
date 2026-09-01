@@ -89,10 +89,55 @@ const WRITE_SCOPE = /(^|:)(write|admin|\*)$/;
  * routes declare `meta.scopes`, a `["crm:write"]` key is a member everywhere,
  * not only in CRM. That is a narrowing the platform still owes its customers,
  * and it belongs on the routes rather than in a guess made here.
+ *
+ * Nor is what the key asked for the whole answer: it is a ceiling the key's
+ * author still has to reach. `authenticate` applies `boundedByAuthor` below.
  */
 function keyRole(scopes: string[]): Role {
   if (scopes.includes('*')) return 'admin';
   return scopes.some((s) => WRITE_SCOPE.test(s.trim().toLowerCase())) ? 'member' : 'readonly';
+}
+
+/**
+ * A key may never carry authority its author does not currently hold.
+ *
+ * Minting a key is gated at `admin`, so at the moment of issue the author
+ * outranks anything `keyRole` can return and this changes nothing — it is only
+ * a later demotion that bites, and then it bites in exactly the direction the
+ * demotion meant. It takes the lower of the two rungs and never the higher, so
+ * a `["crm:read"]` key minted by the owner stays `readonly` instead of
+ * inheriting `owner` — the mirror-image bug of the one this closes.
+ */
+function boundedByAuthor(scoped: Role, author: Role | undefined): Role {
+  if (author === undefined) return scoped;
+  return roleAtLeast(scoped, author) ? author : scoped;
+}
+
+/**
+ * What an idempotency key is a key *for*: the whole request, not the part of
+ * it that happened to be hashed.
+ *
+ * `idempotency_key_in_use` is the promise that reusing a key on a different
+ * request is refused rather than answered. Hashing only the path and the body
+ * broke that promise for every route whose meaning lives in the query string
+ * or the verb: `DELETE /v1/records/company/:id` and
+ * `DELETE /v1/records/company/:id?permanent=true` carry no body and hash the
+ * same, so the permanent delete replayed the archive's `204` — the operator
+ * was told a record had been destroyed for good while it sat there archived.
+ *
+ * It is the same identity `requestApproval` and `schedule_followup` were
+ * re-keyed on one wave ago, at the outermost door: what identifies a write is
+ * the write, so a key names a method, a path, a query and a body together. The
+ * query is canonicalised — keys sorted, repeats sorted within a key — so a
+ * genuine retry that reorders `?a=1&b=2` still replays rather than conflicting.
+ */
+function canonicalRequest(method: string, path: string, query: Record<string, string[]>, body: unknown): unknown {
+  return {
+    m: method,
+    p: path,
+    q: Object.keys(query).sort().map((key) => [key, [...query[key]].sort()]),
+    b: body,
+  };
 }
 
 export async function createApp(options: AppOptions = {}): Promise<App> {
@@ -233,6 +278,7 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
       cookieHeader.split(';').map((c) => c.trim().split('=')).filter((p) => p.length === 2).map(([k, ...v]) => [k, decodeURIComponent(v.join('='))]),
     );
     const sessionToken = cookies['ain_session'] || headers['x-ain-session'] || '';
+    let removedFromWorkspace = false;
 
     if (bearer) {
       const row = db.get<any>(`SELECT * FROM api_keys WHERE token_hash = ? AND revoked_at IS NULL`, hashToken(bearer));
@@ -241,9 +287,36 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
       // scope is set the moment the credential names an org — before the first
       // clock read, not after.
       scope.orgId = row.org_id;
+      // A membership is the authority at *both* credential entry points, or at
+      // neither. Asking it only of the cookie left "Remove a teammate" meaning
+      // nothing: Marcus's session was refused here while, in the same breath,
+      // the key he had minted answered `GET /v1/me` with `role: admin`, listed
+      // the workspace's credentials, moved its clock and seated a new owner —
+      // and could mint him a replacement cookie's worth of authority whenever
+      // he liked. It is the same split answer the session branch below was
+      // written to close: `actorFor` in the AI module already resolves this
+      // exact caller to `null` "because they are not a live member", so the two
+      // halves of one question said "nobody" and "an admin" at once.
+      //
+      // A key with no `created_by` has no human principal to ask about, and is
+      // a workspace credential whose only kill switch is `revoked_at`. That
+      // used to be the one way authority outlived a removal — an admin minted
+      // a key *through* a key, the child lost its author, and the grandchild
+      // survived the removal its parent died of. `POST /v1/api-keys` now
+      // inherits the minting credential's own principal, so the only keys that
+      // reach here unattributed are the ones a migration or a fixture put
+      // there. Nothing a person creates escapes this question any more.
+      const author = row.created_by
+        ? db.get<{ role: Role }>(`SELECT role FROM memberships WHERE org_id = ? AND user_id = ?`, row.org_id, row.created_by)
+        : undefined;
+      if (row.created_by && !author) {
+        throw unauthorized('The account that created this API key is no longer a member of this workspace.');
+      }
+      // Stamped only once the credential is known to be live, so a dead key
+      // cannot keep reporting "last used a moment ago" in the key list.
       db.patch('api_keys', 'id', row.id, { last_used: clock.now() });
       const scopes = parseJson<string[]>(row.scopes, ['*']);
-      const role: Role = keyRole(scopes);
+      const role: Role = boundedByAuthor(keyRole(scopes), author?.role);
       return { kind: 'api_key', orgId: row.org_id, keyId: row.id, role, scopes, livemode: !!row.livemode };
     }
     if (sessionToken) {
@@ -258,12 +331,34 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
       // headline feature; it must not be able to sign anyone out. `expires` is
       // minted on the wall clock (`core.createSession`), so the two agree.
       if (row && row.expires > Date.now()) {
-        const member = db.get<any>(`SELECT role FROM memberships WHERE org_id = ? AND user_id = ?`, row.org_id, row.user_id);
-        return { kind: 'session', orgId: row.org_id, userId: row.user_id, role: (member?.role as Role) || 'member', scopes: ['*'], livemode: true };
+        // The membership *is* the identity, and its role is the authority.
+        // `POST /v1/auth/login` already refuses an account that belongs to no
+        // workspace; `DELETE /v1/users/:id` removes the membership and leaves
+        // the session row, so the same question has to be asked again here.
+        //
+        // Defaulting a missing membership to `member` did not merely fail to
+        // sign a removed teammate out — it *promoted* them. Nina is an analyst,
+        // refused `allow_writes` on the copilot by the `member` bar the
+        // approvals route is gated at; the moment she was removed from the
+        // workspace her still-live session authenticated as `member` and the
+        // identical write landed. It is the sign-flip of the actor rule one
+        // module over, which already resolves exactly this caller to `null`
+        // because they are "not a live member": the two halves of one question
+        // answered "nobody" and "a member" at the same time.
+        const member = db.get<{ role: Role }>(`SELECT role FROM memberships WHERE org_id = ? AND user_id = ?`, row.org_id, row.user_id);
+        if (member) {
+          return { kind: 'session', orgId: row.org_id, userId: row.user_id, role: member.role, scopes: ['*'], livemode: true };
+        }
+        // Not a hard throw: the browser holding this cookie still has to reach
+        // the public surface — `/v1/health` to see the API is up, and
+        // `POST /v1/auth/logout` to put the dead cookie down.
+        removedFromWorkspace = true;
       }
     }
     if (isPublic) return { kind: 'anonymous', orgId: config.defaultOrgId, role: 'readonly', scopes: [], livemode: true };
-    throw unauthorized();
+    throw unauthorized(removedFromWorkspace
+      ? 'This account is no longer a member of this workspace.'
+      : undefined);
   }
 
   function idempotencyGuard(req: Req, key: string, hash: string): HandleResponse | null {
@@ -337,7 +432,7 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
 
       idemKey = headers['idempotency-key'] || '';
       if (idemKey && (req.method === 'POST' || req.method === 'DELETE')) {
-        const hash = createHash('sha256').update(JSON.stringify({ p: path, b: input.body ?? {} })).digest('hex');
+        const hash = createHash('sha256').update(JSON.stringify(canonicalRequest(req.method, path, parsedQuery.all, input.body ?? {}))).digest('hex');
         const replay = idempotencyGuard(req, idemKey, hash);
         if (replay) return { ...replay, headers: { ...replay.headers, 'request-id': requestId } };
       }

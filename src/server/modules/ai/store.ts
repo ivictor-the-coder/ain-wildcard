@@ -11,6 +11,7 @@ import { parseJson } from '../../kernel/db';
 import { describeWrite } from '../../ai/synth';
 import { newId } from '../../../shared/ids';
 import { dayKey } from '../../../shared/time';
+import { maskSecrets } from '../../ai/runtime';
 import type { AiRunFinish, AiRunStart, AiTraceSpan, PendingApproval } from '../../ai/runtime';
 
 export interface ThreadRow {
@@ -147,23 +148,45 @@ export function recordNamer(ctx: Ctx, orgId: string): (id: string) => string | n
   };
 }
 
-export const publicApproval = (row: ApprovalRow, nameOf: (id: string) => string | null = () => null) => ({
-  object: 'ai_approval' as const,
-  id: row.id,
-  run_id: row.run_id,
-  thread_id: row.thread_id,
-  tool: row.tool,
-  args: parseJson<Record<string, unknown>>(row.args, {}),
-  /** The write in plain English, so a person can approve it without reading JSON. */
-  preview: describeWrite(row.tool, parseJson<Record<string, unknown>>(row.args, {}), nameOf),
-  reason: row.reason,
-  status: row.status,
-  outcome: row.outcome,
-  requested_by: row.requested_by,
-  decided_by: row.decided_by,
-  decided_at: row.decided_at,
-  created: row.created,
-});
+/**
+ * The card as a person reads it.
+ *
+ * The stored arguments are the ones that will run, so the card shows them
+ * whole: masked where a field is credential-shaped, never truncated. Capping
+ * the rendering at 400 characters — as the trace does — would put an operator
+ * in the position of approving a note whose decisive last sentence they cannot
+ * see, which is the same gap as executing text that was never shown, read from
+ * the other side.
+ */
+export const publicApproval = (row: ApprovalRow, nameOf: (id: string) => string | null = () => null) => {
+  const args = maskSecrets(parseJson<Record<string, unknown>>(row.args, {}));
+  return {
+    object: 'ai_approval' as const,
+    id: row.id,
+    run_id: row.run_id,
+    thread_id: row.thread_id,
+    tool: row.tool,
+    args,
+    /** The write in plain English, so a person can approve it without reading JSON. */
+    preview: describeWrite(row.tool, args, nameOf),
+    reason: row.reason,
+    status: row.status,
+    outcome: row.outcome,
+    requested_by: row.requested_by,
+    decided_by: row.decided_by,
+    decided_at: row.decided_at,
+    created: row.created,
+  };
+};
+
+/** One WHERE clause for both the page of approvals and the count beside it. */
+function approvalScope(orgId: string, opts: { status?: string; runId?: string }): { where: string; params: unknown[] } {
+  const where = ['org_id = ?'];
+  const params: unknown[] = [orgId];
+  if (opts.status) { where.push('status = ?'); params.push(opts.status); }
+  if (opts.runId) { where.push('run_id = ?'); params.push(opts.runId); }
+  return { where: where.join(' AND '), params };
+}
 
 export class AiStore {
   constructor(private readonly ctx: Ctx) {}
@@ -205,6 +228,45 @@ export class AiStore {
     return status
       ? this.ctx.db.count(`SELECT COUNT(*) FROM ai_threads WHERE org_id = ? AND status = ?`, orgId, status)
       : this.ctx.db.count(`SELECT COUNT(*) FROM ai_threads WHERE org_id = ?`, orgId);
+  }
+
+  /**
+   * Rename a conversation, or move it between open and archived.
+   *
+   * `updated` is deliberately left alone: archiving a thread is housekeeping,
+   * not activity, and bumping it would jump the thread to the top of the list it
+   * was just filed away from.
+   */
+  updateThread(orgId: string, id: string, patch: { title?: string; status?: 'open' | 'archived' }): ThreadRow | undefined {
+    const fields: Record<string, unknown> = {};
+    if (patch.title !== undefined) fields.title = patch.title.slice(0, 200);
+    if (patch.status !== undefined) fields.status = patch.status;
+    if (Object.keys(fields).length) {
+      if (patch.title !== undefined) fields.updated = this.ctx.now();
+      this.ctx.db.run(
+        `UPDATE ai_threads SET ${Object.keys(fields).map((k) => `${k} = ?`).join(', ')} WHERE org_id = ? AND id = ?`,
+        ...(Object.values(fields) as never[]), orgId, id,
+      );
+    }
+    return this.thread(orgId, id);
+  }
+
+  /**
+   * Delete a conversation and its messages.
+   *
+   * The runs stay. A run is the record of what the engine did — which tools it
+   * called, what it cost, what a person approved — and that is an audit trail,
+   * not correspondence; deleting the thread it was asked in must not erase it.
+   * Their `thread_id` is cleared so nothing offers to open a conversation that
+   * is gone.
+   */
+  deleteThread(orgId: string, id: string): number {
+    const messages = this.ctx.db.count(`SELECT COUNT(*) FROM ai_messages WHERE org_id = ? AND thread_id = ?`, orgId, id);
+    this.ctx.db.run(`DELETE FROM ai_messages WHERE org_id = ? AND thread_id = ?`, orgId, id);
+    this.ctx.db.run(`UPDATE ai_runs SET thread_id = NULL WHERE org_id = ? AND thread_id = ?`, orgId, id);
+    this.ctx.db.run(`UPDATE ai_approvals SET thread_id = NULL WHERE org_id = ? AND thread_id = ?`, orgId, id);
+    this.ctx.db.run(`DELETE FROM ai_threads WHERE org_id = ? AND id = ?`, orgId, id);
+    return messages;
   }
 
   addMessage(orgId: string, threadId: string, input: {
@@ -305,21 +367,55 @@ export class AiStore {
     return this.ctx.db.count(`SELECT COUNT(*) FROM ai_runs WHERE ${where.join(' AND ')}`, ...(params as never[]));
   }
 
+  /**
+   * Re-stamp a run's step count from the spans it actually has.
+   *
+   * `span_count` is written once, when the run finishes. A write that stopped
+   * for approval and executed later appends a span after that, so the stored
+   * count and the trace disagreed — the run list said 5 steps where the run's
+   * own trace listed 6.
+   */
+  syncSpanCount(orgId: string, runId: string): void {
+    this.ctx.db.run(
+      `UPDATE ai_runs SET span_count = (SELECT COUNT(*) FROM ai_spans WHERE org_id = ? AND run_id = ?) WHERE org_id = ? AND id = ?`,
+      orgId, runId, orgId, runId,
+    );
+  }
+
   spans(orgId: string, runId: string): SpanRow[] {
     return this.ctx.db.all<SpanRow>(`SELECT * FROM ai_spans WHERE org_id = ? AND run_id = ? ORDER BY seq ASC`, orgId, runId);
   }
 
   /* ------------------------------ approvals ------------------------------ */
 
+  /**
+   * Queue one write for a person to confirm, without queueing it twice.
+   *
+   * The dedupe is what stops one tool call from raising two identical cards
+   * when the gate is reached more than once, and it has to be keyed on the
+   * *write*, not on the tool. Keyed on `(run, tool)` alone it also collapsed
+   * two genuinely different writes — a note on Rheinwerk and a note on Vektor,
+   * planned in one run — into the first one's row: the completion answered
+   * `pending_approvals: [two writes]`, the queue held one card, and approving
+   * it executed the first while the second was lost with nothing anywhere
+   * saying so. That is the same identity the decide route is claimed for, at
+   * the other end: one approval is one write, so two writes are two approvals.
+   */
   requestApproval(input: PendingApproval & { runId: string; orgId: string; actorId: string | null; threadId?: string | null }): ApprovalRow {
+    // The *executable* arguments, not the display copy. `input.args` has been
+    // through the trace's 400-character cap, and this column is what the
+    // decide route re-parses and re-runs: storing the capped copy both
+    // executed a truncated write and made every pair of writes agreeing in
+    // their first 400 characters look like one card to the dedupe below.
+    const args = JSON.stringify(input.rawArgs ?? input.args);
     const existing = this.ctx.db.get<ApprovalRow>(
-      `SELECT * FROM ai_approvals WHERE org_id = ? AND run_id = ? AND tool = ? AND status = 'pending'`,
-      input.orgId, input.runId, input.tool,
+      `SELECT * FROM ai_approvals WHERE org_id = ? AND run_id = ? AND tool = ? AND args = ? AND status = 'pending'`,
+      input.orgId, input.runId, input.tool, args,
     );
     if (existing) return existing;
     const row: ApprovalRow = {
       id: newId('approval'), org_id: input.orgId, run_id: input.runId, thread_id: input.threadId ?? null,
-      tool: input.tool, args: JSON.stringify(input.args), reason: input.reason, status: 'pending',
+      tool: input.tool, args, reason: input.reason, status: 'pending',
       outcome: null, requested_by: input.actorId, decided_by: null, decided_at: null, created: this.ctx.now(),
     };
     this.ctx.db.insert('ai_approvals', { ...row });
@@ -330,10 +426,58 @@ export class AiStore {
     return this.ctx.db.get<ApprovalRow>(`SELECT * FROM ai_approvals WHERE org_id = ? AND id = ?`, orgId, id);
   }
 
-  approvals(orgId: string, status?: string, limit = 50): ApprovalRow[] {
-    return status
-      ? this.ctx.db.all<ApprovalRow>(`SELECT * FROM ai_approvals WHERE org_id = ? AND status = ? ORDER BY created DESC LIMIT ?`, orgId, status, limit)
-      : this.ctx.db.all<ApprovalRow>(`SELECT * FROM ai_approvals WHERE org_id = ? ORDER BY created DESC LIMIT ?`, orgId, limit);
+  /**
+   * Cards, narrowed by what is being asked for.
+   *
+   * `runId` is a filter rather than something the caller applies afterwards.
+   * Reading the newest 50 in the workspace and *then* keeping the ones from one
+   * run means a run audits as having asked for nothing the moment fifty newer
+   * cards exist — the run detail is exactly where "what did this agent want to
+   * do" is answered, so it may not be answered by a workspace-wide window.
+   */
+  approvals(orgId: string, opts: { status?: string; runId?: string; limit?: number; offset?: number } = {}): ApprovalRow[] {
+    const { where, params } = approvalScope(orgId, opts);
+    return this.ctx.db.all<ApprovalRow>(
+      `SELECT * FROM ai_approvals WHERE ${where} ORDER BY created DESC LIMIT ? OFFSET ?`,
+      ...(params as never[]), Math.min(opts.limit ?? 50, 200), opts.offset ?? 0,
+    );
+  }
+
+  /** How many cards that same scope holds, so a truncated page can say so. */
+  countApprovals(orgId: string, opts: { status?: string; runId?: string } = {}): number {
+    const { where, params } = approvalScope(orgId, opts);
+    return this.ctx.db.count(`SELECT COUNT(*) FROM ai_approvals WHERE ${where}`, ...(params as never[]));
+  }
+
+  /**
+   * Take exclusive hold of a pending approval before acting on it.
+   *
+   * The same claim `JobQueue.runOne` makes before it runs a job row, for the
+   * same reason and against a worse loss. Reading the row, checking it is
+   * pending and then executing the write is not one transaction — there is an
+   * `await` in the middle — so two people pressing Approve, or one client
+   * retrying without an idempotency key, both saw `pending` and both executed:
+   * two notes on the customer's timeline, two `ai.approval.granted` events, two
+   * audit rows, and a single approval record that says the write happened once.
+   *
+   * `decided_at` is the claim. Exactly one caller sees `changes === 1`; the
+   * row stays `pending` until that caller writes the real decision onto it, so
+   * a claim that is never finished is released rather than left holding a
+   * write nobody made.
+   */
+  claimApproval(orgId: string, id: string, decidedBy: string | null): boolean {
+    return this.ctx.db.run(
+      `UPDATE ai_approvals SET decided_by = ?, decided_at = ? WHERE org_id = ? AND id = ? AND status = 'pending' AND decided_at IS NULL`,
+      decidedBy, this.ctx.now(), orgId, id,
+    ).changes === 1;
+  }
+
+  /** Give a claim back, for a decision that ended somewhere it did not expect. */
+  releaseApproval(orgId: string, id: string): void {
+    this.ctx.db.run(
+      `UPDATE ai_approvals SET decided_by = NULL, decided_at = NULL WHERE org_id = ? AND id = ? AND status = 'pending'`,
+      orgId, id,
+    );
   }
 
   decideApproval(orgId: string, id: string, status: 'approved' | 'declined', decidedBy: string | null, outcome?: string): void {

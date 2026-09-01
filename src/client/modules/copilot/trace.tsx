@@ -15,7 +15,8 @@ import {
   iconByName, useFormat, useToast,
 } from '@/client/design';
 import {
-  CITATION_ICON, SPAN_ICON, SPAN_TONE, citationHref, confidenceBand,
+  CITATION_ICON, OUTCOME_LABEL, OUTCOME_TONE, SPAN_ICON, SPAN_TONE, citationHref, confidenceBand,
+  humanTool, outcomeSummary, recordLink, runOutcome, writeTargets,
   type AiApproval, type AiRun, type AiSpan, type Citation,
 } from './api';
 
@@ -111,14 +112,41 @@ function Step({ span, slowest }: { span: AiSpan; slowest: number }) {
   );
 }
 
-export function TraceSteps({ spans }: { spans: AiSpan[] }) {
+/**
+ * The steps, in the order they happened.
+ *
+ * A write approved ten minutes after the run stopped is executed then, not when
+ * it was planned, and the store hands it back at whatever sequence number it was
+ * allocated — which slots it above the plan that asked for it and makes the
+ * causal story unreadable. Sorting by the clock puts it where it belongs, and a
+ * divider marks the moment a person made the call.
+ */
+export function TraceSteps({ spans, decidedAfter }: { spans: AiSpan[]; decidedAfter?: number | null }) {
+  const f = useFormat();
   if (!spans.length) {
     return <p className="cp-note">This run recorded no steps — nothing was planned and no tool was called.</p>;
   }
-  const slowest = spans.reduce((top, span) => Math.max(top, span.duration_ms), 0);
+  const ordered = [...spans].sort((a, b) => (a.started - b.started) || (a.seq - b.seq));
+  const slowest = ordered.reduce((top, span) => Math.max(top, span.duration_ms), 0);
+  const boundary = decidedAfter ?? null;
+  let dividerDrawn = false;
   return (
     <div className="cp-steps">
-      {spans.map((span) => <Step key={span.id} span={span} slowest={slowest} />)}
+      {ordered.map((span) => {
+        const after = boundary !== null && span.started > boundary && !dividerDrawn;
+        if (after) dividerDrawn = true;
+        return (
+          <div key={span.id} style={{ display: 'contents' }}>
+            {after && (
+              <div className="cp-divider">
+                <Icons.shield size={12} />
+                <span>A person approved the write here — {f.dateTime(span.started)}</span>
+              </div>
+            )}
+            <Step span={span} slowest={slowest} />
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -142,9 +170,12 @@ export function ApprovalCard({ approval, onDecided }: { approval: AiApproval; on
       invalidates: ['/v1/ai/approvals', '/v1/ai/runs', '/v1/ai/threads', '/v1/ai/status', '/v1/records', '/v1/events'],
       onSuccess: (result, decision) => {
         if (decision === 'approve') {
-          toast.success(`${approval.tool} ran`, result.outcome ?? 'The write landed.');
+          // The engine hands back a wire line; the person who pressed the button
+          // gets the same sentence the card above it is written in.
+          const { text } = outcomeSummary({ ...approval, status: 'approved', outcome: result.outcome });
+          toast.success('Written to the workspace', text);
         } else {
-          toast.info('Declined', `${approval.tool} was not run. Nothing changed.`);
+          toast.info('Declined', `${humanTool(approval.tool)} was not run. Nothing changed.`);
         }
         onDecided?.();
       },
@@ -153,6 +184,7 @@ export function ApprovalCard({ approval, onDecided }: { approval: AiApproval; on
   );
 
   const pending = approval.status === 'pending';
+  const summary = pending ? null : outcomeSummary(approval);
 
   return (
     <Card
@@ -174,11 +206,13 @@ export function ApprovalCard({ approval, onDecided }: { approval: AiApproval; on
           <Banner tone="danger" title="The decision was refused">{decide.error.body.message}</Banner>
         )}
 
-        {!pending && approval.outcome && (
+        {summary && (
           <Banner tone={approval.status === 'approved' ? 'success' : 'neutral'} compact>
-            {approval.outcome}
+            {summary.text}
           </Banner>
         )}
+
+        {approval.status === 'approved' && <WrittenTo approval={approval} />}
 
         <div className="cp-approval__actions">
           <Badge tone="neutral" size="sm" icon={<Icons.terminal size={11} />}>{approval.tool}</Badge>
@@ -209,9 +243,95 @@ export function ApprovalCard({ approval, onDecided }: { approval: AiApproval; on
           )}
         </div>
 
-        {showArgs && <pre className="cp-code">{pretty(approval.args)}</pre>}
+        {showArgs && (
+          <>
+            <pre className="cp-code">{pretty(approval.args)}</pre>
+            {summary?.raw && (
+              <>
+                <div className="cp-chips__label">What the tool returned</div>
+                <pre className="cp-code">{summary.raw}</pre>
+              </>
+            )}
+          </>
+        )}
       </div>
     </Card>
+  );
+}
+
+/** The records a landed write is now on, as links. */
+export function WrittenTo({ approval }: { approval: AiApproval }) {
+  const { navigate } = useRouter();
+  const targets = writeTargets(approval.args);
+  if (!targets.length) return null;
+  return (
+    <div className="cp-chips">
+      <span className="cp-chips__label">Written to</span>
+      {targets.map((id) => {
+        const link = recordLink(id);
+        const Glyph = iconByName(CITATION_ICON[link?.type ?? ''] ?? 'link');
+        // "Note on Ferro Norte Siderurgia" names the record; with more than one
+        // target there is no way to tell which name belongs to which id, so the
+        // id stands rather than a wrong name.
+        const name = targets.length === 1
+          ? / on (.+)$/.exec(approval.preview[0] ?? '')?.[1] ?? id
+          : id;
+        return (
+          <button
+            key={id}
+            type="button"
+            className="cp-chip"
+            disabled={!link}
+            title={link ? `Open ${name}` : `${id} has no screen in this workspace`}
+            onClick={() => { if (link) navigate(link.href); }}
+          >
+            <Glyph size={12} />
+            <span className="u-truncate">{name}</span>
+            <span className="cp-chip__type">{humanize(link?.type ?? 'record')}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * What became of a write, after the decision.
+ *
+ * The assistant's own turn was composed before anyone pressed anything — it says
+ * "Nothing has been written" and it will say that forever. This block is the
+ * conversation's record of what actually happened, so re-reading the thread a
+ * week later tells the truth instead of the plan.
+ */
+export function ApprovalResolution({ approval }: { approval: AiApproval }) {
+  const f = useFormat();
+  const [showArgs, setShowArgs] = useState(false);
+  const written = approval.status === 'approved';
+  const summary = outcomeSummary(approval);
+  return (
+    <div className={`cp-resolution${written ? ' is-written' : ''}`} data-approval={approval.id}>
+      <div className="cp-resolution__head">
+        <Badge tone={written ? 'success' : 'neutral'} size="sm" icon={written ? <Icons.check size={11} /> : <Icons.shield size={11} />}>
+          {written ? 'Approved and written' : 'Declined'}
+        </Badge>
+        <span className="cp-note">
+          {approval.decided_at ? f.relative(approval.decided_at) : 'just now'} · {humanTool(approval.tool)}
+        </span>
+      </div>
+      <p className="cp-resolution__line">{summary.text}</p>
+      {written && <WrittenTo approval={approval} />}
+      <div className="cp-chips">
+        <Button size="sm" variant="ghost" aria-expanded={showArgs} onClick={() => setShowArgs((v) => !v)}>
+          {showArgs ? 'Hide what ran' : 'Show what ran'}
+        </Button>
+      </div>
+      {showArgs && (
+        <>
+          <pre className="cp-code">{pretty(approval.args)}</pre>
+          {summary.raw && <pre className="cp-code">{summary.raw}</pre>}
+        </>
+      )}
+    </div>
   );
 }
 
@@ -257,18 +377,35 @@ export function ConfidenceBadge({ run, refused }: { run: AiRun; refused?: boolea
   );
 }
 
-export function RunFacts({ run, toolMs }: { run: AiRun; toolMs?: number }) {
+export function RunFacts({ run, toolMs, approvals, steps }: {
+  run: AiRun;
+  toolMs?: number;
+  /** Every approval this run raised, so a decided one is not still "waiting". */
+  approvals?: AiApproval[];
+  /** The trace as rendered, so the step count matches the panel below it. */
+  steps?: number;
+}) {
   const f = useFormat();
+  const outcome = runOutcome(run, approvals);
+  const stepCount = steps ?? run.span_count;
   const facts: { label: string; value: string; hint?: string }[] = [
-    { label: 'Outcome', value: humanize(run.status), hint: run.error ?? undefined },
+    {
+      label: 'Outcome',
+      value: OUTCOME_LABEL[outcome],
+      hint: run.error ?? (outcome === 'written' ? 'A person approved the write and it ran' : outcome === 'declined' ? 'A person declined it; nothing was written' : undefined),
+    },
     { label: 'Answered by', value: run.model, hint: humanize(run.provider) },
     { label: 'Intent', value: run.intent ? humanize(run.intent) : '—', hint: run.confidence === null ? undefined : `question read at ${Math.round(run.confidence * 100)}%` },
-    { label: 'Duration', value: `${f.number(run.duration_ms)} ms`, hint: toolMs === undefined ? `${f.plural(run.steps, 'step')}` : `${f.number(toolMs)} ms in tools` },
+    { label: 'Duration', value: `${f.number(run.duration_ms)} ms`, hint: toolMs === undefined ? `${f.plural(stepCount, 'step')}` : `${f.number(toolMs)} ms in tools` },
     { label: 'Tokens', value: f.number(run.usage.input_tokens + run.usage.output_tokens), hint: `${f.number(run.usage.input_tokens)} in · ${f.number(run.usage.output_tokens)} out` },
     {
-      label: 'Cost',
-      value: run.usage.cost_micros > 0 ? f.money(run.usage.cost_cents) : 'No marginal cost',
-      hint: `${f.plural(run.usage.credits, 'credit')} charged`,
+      // Credits are what the workspace is charged; provider spend is what it
+      // cost us. "No marginal cost / 5 credits charged" read as a contradiction.
+      label: 'Charged',
+      value: f.plural(run.usage.credits, 'credit'),
+      hint: run.usage.cost_micros > 0
+        ? `${f.money(run.usage.cost_cents)} of provider spend`
+        : 'Answered in-house — no provider spend',
     },
   ];
   return (

@@ -2581,8 +2581,13 @@ describe('an API key is a first-class caller of the agent surface', () => {
 
   test('a follow-up whose assignee is no longer a member still lands, unassigned', async () => {
     const runtime = aiRuntime(app.ctx);
+    // A *live* account: this test is about the assignee having left, and a
+    // follow-up onto an archived or merged-away record is refused when it comes
+    // due for its own reasons. Earlier tests in this file archive companies, and
+    // an unordered `LIMIT 1` was free to hand this one of them.
     const company = app.ctx.db.get<{ id: string }>(
-      `SELECT id FROM crm_records WHERE org_id = ? AND object_type = 'company' LIMIT 1`, ORG)!;
+      `SELECT id FROM crm_records WHERE org_id = ? AND object_type = 'company'
+         AND archived = 0 AND merged_into IS NULL LIMIT 1`, ORG)!;
     const runId = `run_departed_${app.ctx.now()}`;
     app.ctx.db.insert('ai_runs', {
       id: runId, org_id: ORG, thread_id: null, feature: 'test', provider: 'builtin', model: ENGINE_MODEL,
@@ -2627,5 +2632,193 @@ describe('an API key is a first-class caller of the agent surface', () => {
     );
     const draft = await withKey('POST', '/v1/ai/draft', { instruction: 'Write a short check-in email' });
     assert.ok(draft.status < 400, JSON.stringify(draft.body).slice(0, 200));
+  });
+});
+
+/* ---------- one approval is one write, however many people press it ------- */
+
+/**
+ * `JobQueue.runOne` claims a job row before running it, because "`due()` and
+ * this call are not one transaction" and two drains racing one row means two
+ * invoices for one period. `POST /v1/ai/approvals/:id` is that shape one module
+ * over — read the row, find it pending, then execute across an `await` — on the
+ * path where running the row twice writes twice to a customer's timeline. It
+ * had no claim, so two people pressing Approve both executed and the approval
+ * record still said the write happened once.
+ */
+describe('an approval executes once, whoever presses it and however often', () => {
+  const target = () => app.ctx.db.get<{ id: string; display_name: string }>(
+    `SELECT id, display_name FROM crm_records WHERE org_id = ? AND object_type = 'company' AND display_name LIKE 'Rheinwerk%'`,
+    ORG)!;
+  const notes = () => app.ctx.db.count(
+    `SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'note'`, ORG);
+
+  /** Queue a real write and return the approval this run is waiting on. */
+  async function queued(phrase: string): Promise<string> {
+    const answer = await expectOk('POST', '/v1/ai/complete', {
+      prompt: `Add a note to ${target().display_name} saying "${phrase}"`, allow_writes: true,
+    });
+    const row = app.ctx.db.get<{ id: string }>(
+      `SELECT id FROM ai_approvals WHERE org_id = ? AND run_id = ? AND status = 'pending'`, ORG, answer.run_id);
+    assert.ok(row, `precondition: the write did not stop at the approval gate (${answer.content?.slice(0, 120)})`);
+    return row!.id;
+  }
+
+  const decide = (id: string, decision: 'approve' | 'decline') =>
+    call('POST', `/v1/ai/approvals/${id}`, { decision });
+
+  test('two people pressing Approve at once write to the customer once, not twice', async () => {
+    const id = await queued('The shipment cleared customs on Tuesday');
+    const before = notes();
+
+    const [a, b] = await Promise.all([decide(id, 'approve'), decide(id, 'approve')]);
+    const answers = [a.status, b.status].sort();
+
+    assert.equal(
+      notes() - before, 1,
+      `one approval put ${notes() - before} notes on the customer's timeline, and the approval record says it happened once`,
+    );
+    assert.deepEqual(answers, [200, 400], `exactly one caller may execute the write: got ${answers.join()}`);
+    assert.equal(
+      app.ctx.db.count(`SELECT COUNT(*) FROM events WHERE org_id = ? AND type = 'ai.approval.granted' AND object_id = ?`, ORG, id), 1,
+      'the event log announced one approval as granted twice',
+    );
+    assert.equal(
+      app.ctx.db.count(`SELECT COUNT(*) FROM audit_log WHERE org_id = ? AND target_id = ?`, ORG, id), 1,
+      'the audit trail recorded one approval as granted twice',
+    );
+    assert.equal(app.ctx.db.pluck<string>(`SELECT status FROM ai_approvals WHERE id = ?`, id), 'approved');
+  });
+
+  test('approve racing decline resolves one way, and the write matches the answer', async () => {
+    const id = await queued('Heike confirmed the site survey date');
+    const before = notes();
+    const [x, y] = await Promise.all([decide(id, 'approve'), decide(id, 'decline')]);
+
+    assert.deepEqual([x.status, y.status].sort(), [200, 400], 'both decisions were accepted for one request');
+    const status = app.ctx.db.pluck<string>(`SELECT status FROM ai_approvals WHERE id = ?`, id);
+    assert.equal(
+      notes() - before, status === 'approved' ? 1 : 0,
+      `the approval record says "${status}" and the customer's timeline disagrees`,
+    );
+  });
+
+  test('two declines land one decline, not two', async () => {
+    const id = await queued('Spare parts stock was replenished on Friday');
+    const before = notes();
+    const [p, q] = await Promise.all([decide(id, 'decline'), decide(id, 'decline')]);
+
+    assert.deepEqual([p.status, q.status].sort(), [200, 400]);
+    assert.equal(
+      app.ctx.db.count(`SELECT COUNT(*) FROM events WHERE org_id = ? AND type = 'ai.approval.declined' AND object_id = ?`, ORG, id), 1,
+      'one decline was announced twice',
+    );
+    assert.equal(app.ctx.db.pluck<string>(`SELECT status FROM ai_approvals WHERE id = ?`, id), 'declined');
+    assert.equal(notes() - before, 0, 'a declined approval wrote anyway');
+  });
+
+  test('and the ordinary single decision still runs, and is still final', async () => {
+    const id = await queued('The acceptance test is booked for the 14th');
+    const before = notes();
+    const approved = await expectOk('POST', `/v1/ai/approvals/${id}`, { decision: 'approve' });
+
+    assert.equal(approved.executed, true, 'claiming the row stopped the very caller who claimed it');
+    assert.equal(approved.status, 'approved');
+    assert.equal(notes() - before, 1, 'the note the operator approved never reached the timeline');
+
+    const again = await decide(id, 'approve');
+    assert.equal(again.status, 400);
+    assert.equal(again.body.error.code, 'approval_decided');
+    assert.equal(notes() - before, 1, 'pressing Approve a second time wrote a second time');
+  });
+
+  test('a blocked approval is declined and finished, never stranded mid-claim', async () => {
+    const id = await queued('The commissioning window moved to March');
+    const gone = target();
+    app.ctx.db.run(`DELETE FROM crm_records WHERE org_id = ? AND id = ?`, ORG, gone.id);
+
+    const blocked = await decide(id, 'approve');
+    assert.equal(blocked.status, 400);
+    assert.equal(blocked.body.error.code, 'approval_target_changed');
+    // A claim that ends in a decline is a finished decision, not a held lock:
+    // the row is terminal, so nobody is left holding a write nobody made.
+    assert.equal(app.ctx.db.pluck<string>(`SELECT status FROM ai_approvals WHERE id = ?`, id), 'declined');
+
+    app.ctx.db.insert('crm_records', {
+      id: gone.id, org_id: ORG, object_type: 'company', display_name: gone.display_name,
+      owner_id: null, created_by: null, archived: 0, merged_into: null,
+      created: app.ctx.now(), updated: app.ctx.now(),
+    });
+  });
+});
+
+/* ------------------ two writes are two approvals, not one ----------------- */
+
+describe('one approval is one write, at the end the queue is filled from', () => {
+  const notes = () =>
+    app.ctx.db.count(`SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'note'`, ORG);
+
+  const companies = () =>
+    app.ctx.db.all<{ id: string; display_name: string }>(
+      `SELECT id, display_name FROM crm_records WHERE org_id = ? AND object_type = 'company' AND archived = 0
+       ORDER BY display_name LIMIT 2`, ORG);
+
+  test('a run that plans two different writes with one tool queues two cards, not one', async () => {
+    // Straight at the gate `execute()` enforces, which is what the planner
+    // reaches when a request names two accounts: same run, same tool, two
+    // genuinely different writes.
+    const runtime = aiRuntime(app.ctx);
+    const [first, second] = companies();
+    assert.ok(first && second, 'precondition: the workspace has two companies');
+
+    const context = callContext({ allowWrites: true, approvals: [] });
+    const a = await runtime.execute('add_note', { record_ids: [first.id], body: 'The pilot line passed acceptance.' }, context);
+    const b = await runtime.execute('add_note', { record_ids: [second.id], body: 'The commissioning date moved to March.' }, context);
+
+    assert.equal(a.ok, false);
+    assert.equal(a.error?.code, 'approval_required');
+    assert.equal(b.ok, false);
+    assert.equal(b.error?.code, 'approval_required');
+    assert.equal(context.pendingApprovals?.length, 2, 'the run reported two writes waiting');
+
+    const rows = app.ctx.db.all<{ id: string; args: string }>(
+      `SELECT id, args FROM ai_approvals WHERE org_id = ? AND run_id = ? AND status = 'pending' ORDER BY created ASC`,
+      ORG, context.runId!);
+    assert.equal(
+      rows.length, 2,
+      `the run answered with ${context.pendingApprovals?.length} writes waiting but the queue holds ${rows.length}`,
+    );
+    // Both cards are stamped in the same millisecond, so compare them as the
+    // set of writes the queue is holding rather than as an order.
+    const targets = rows.map((r) => (JSON.parse(r.args) as { record_ids: string[] }).record_ids[0]).sort();
+    assert.deepEqual(targets, [first.id, second.id].sort(), 'the second write was collapsed onto the first one\'s card');
+
+    // And each card, approved, writes its own note onto its own record.
+    const before = notes();
+    for (const row of rows) {
+      const decided = await expectOk('POST', `/v1/ai/approvals/${row.id}`, { decision: 'approve' });
+      assert.equal(decided.executed, true);
+    }
+    assert.equal(notes() - before, 2, 'two approved writes did not produce two notes');
+    const written = app.ctx.db.all<{ properties: string }>(
+      `SELECT properties FROM crm_records WHERE org_id = ? AND object_type = 'note' ORDER BY created DESC LIMIT 2`, ORG)
+      .map((r) => (JSON.parse(r.properties) as { body?: string }).body);
+    assert.ok(written.includes('The pilot line passed acceptance.'));
+    assert.ok(written.includes('The commissioning date moved to March.'));
+  });
+
+  test('but the same write reaching the gate twice is still one card', async () => {
+    const runtime = aiRuntime(app.ctx);
+    const [first] = companies();
+    const context = callContext({ allowWrites: true, approvals: [] });
+    const args = { record_ids: [first.id], body: 'The retrofit quote is with procurement.' };
+
+    await runtime.execute('add_note', args, context);
+    await runtime.execute('add_note', { ...args }, context);
+
+    assert.equal(
+      app.ctx.db.count(`SELECT COUNT(*) FROM ai_approvals WHERE org_id = ? AND run_id = ?`, ORG, context.runId!), 1,
+      'one write asked for twice must not ask a person twice',
+    );
   });
 });

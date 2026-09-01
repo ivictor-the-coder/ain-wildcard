@@ -19,6 +19,7 @@ import {
   type SortSpec, type ViewDef, type WorkspaceUser,
 } from './api';
 import { PropertyEditor, RecordPicker, ValueView } from './values';
+import { fromZonedInput, toZonedInput, zoneLabel } from './time';
 
 /* --------------------------- validation plumbing -------------------------- */
 
@@ -51,18 +52,28 @@ function editableProperties(properties: PropertyDef[]): PropertyDef[] {
   return properties.filter((p) => !p.read_only && !p.hidden && !p.calculated && !p.rollup && p.type !== 'computed');
 }
 
+/** What the create form needs to know about the object it is creating. */
+export interface RecordFormObject {
+  name: string;
+  label: string;
+  plural_label: string;
+  description?: string | null;
+}
+
 export interface RecordFormDialogProps {
   open: boolean;
   onClose: () => void;
-  objectType: ObjectTypeDef;
+  objectType: RecordFormObject;
   properties: PropertyDef[];
   users: WorkspaceUser[];
   /** Ids the new record is linked to the moment it exists. */
   associateTo?: string[];
+  /** Names what it will be linked to, so the form says so before it is saved. */
+  associateLabel?: string;
   onCreated?: (record: CrmRecord) => void;
 }
 
-export function RecordFormDialog({ open, onClose, objectType, properties, users, associateTo, onCreated }: RecordFormDialogProps) {
+export function RecordFormDialog({ open, onClose, objectType, properties, users, associateTo, associateLabel, onCreated }: RecordFormDialogProps) {
   const toast = useToast();
   const session = useSession();
   const formId = useId();
@@ -130,7 +141,9 @@ export function RecordFormDialog({ open, onClose, objectType, properties, users,
       onClose={onClose}
       size="lg"
       title={`New ${objectType.label.toLowerCase()}`}
-      description={objectType.description ?? undefined}
+      description={associateLabel
+        ? `Created and linked to ${associateLabel} in one write — no second step to forget.`
+        : objectType.description ?? undefined}
       footer={
         <>
           <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
@@ -195,11 +208,20 @@ export function RecordFormDialog({ open, onClose, objectType, properties, users,
 
 /* -------------------------------- save view ------------------------------- */
 
+/**
+ * `new` forks the working state into a fresh view, `update` writes it back onto
+ * the one on screen, and `rename` touches only the name, the description and
+ * who can see it — so fixing a typo in a shared view never quietly ships the
+ * columns the person happened to have open at the time.
+ */
+export type SaveViewMode = 'new' | 'update' | 'rename';
+
 export interface SaveViewDialogProps {
   open: boolean;
   onClose: () => void;
   objectType: string;
-  /** When set the dialog renames and re-saves that view instead of adding one. */
+  mode: SaveViewMode;
+  /** The view being written back to, in `update` and `rename`. */
   existing: ViewDef | null;
   columns: string[];
   filter: FilterNode | null;
@@ -209,7 +231,7 @@ export interface SaveViewDialogProps {
   onSaved: (view: ViewDef) => void;
 }
 
-export function SaveViewDialog({ open, onClose, objectType, existing, columns, filter, sort, properties, onSaved }: SaveViewDialogProps) {
+export function SaveViewDialog({ open, onClose, objectType, mode, existing, columns, filter, sort, properties, onSaved }: SaveViewDialogProps) {
   const toast = useToast();
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -247,11 +269,18 @@ export function SaveViewDialog({ open, onClose, objectType, existing, columns, f
     setBusy(true);
     setError(null);
     try {
-      const view = existing
-        ? await updateView(existing.id, { name, description, columns, filter, sort, shared })
-        : await saveView({ object_type: objectType, name, description, columns, filter, sort, shared });
+      const view = existing && mode === 'rename'
+        ? await updateView(existing.id, { name, description, shared })
+        : existing
+          ? await updateView(existing.id, { name, description, columns, filter, sort, shared })
+          : await saveView({ object_type: objectType, name, description, columns, filter, sort, shared });
       crmChanged('/v1/views');
-      toast.success(existing ? 'View updated' : 'View saved', `“${view.name}” now holds this filter, these columns and this sort.`);
+      toast.success(
+        mode === 'rename' ? 'View renamed' : existing ? 'View updated' : 'View saved',
+        mode === 'rename'
+          ? `Everyone who has this view bookmarked sees “${view.name}” now — the filter and the columns are untouched.`
+          : `“${view.name}” now holds this filter, these columns and this sort.`,
+      );
       onSaved(view);
       onClose();
     } catch (e) {
@@ -268,13 +297,15 @@ export function SaveViewDialog({ open, onClose, objectType, existing, columns, f
       open={open}
       onClose={onClose}
       size="sm"
-      title={existing ? `Update “${existing.name}”` : 'Save this view'}
-      description="A view remembers the filter, the columns and the sort — not the rows."
+      title={mode === 'rename' ? `Rename “${existing?.name ?? 'this view'}”` : existing ? `Update “${existing.name}”` : 'Save this view'}
+      description={mode === 'rename'
+        ? 'Only the name, the description and who can see it change. The filter, the columns and the sort stay as they are.'
+        : 'A view remembers the filter, the columns and the sort — not the rows.'}
       footer={
         <>
           <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
           <Button variant="primary" loading={busy} disabled={!name.trim()} onClick={() => { void submit(); }}>
-            {existing ? 'Save changes' : 'Save view'}
+            {mode === 'rename' ? 'Rename view' : existing ? 'Save changes' : 'Save view'}
           </Button>
         </>
       }
@@ -288,11 +319,13 @@ export function SaveViewDialog({ open, onClose, objectType, existing, columns, f
         </Field>
         <Checkbox checked={shared} onChange={setShared} label="Share with the workspace" hint="Everyone sees it in the view bar." />
         {error && !error.body.param && <Banner tone="danger" compact>{errorMessage(error)}</Banner>}
-        <div className="crm-viewsummary">
-          <Badge tone="neutral" size="sm">{columns.length} columns</Badge>
-          <Badge tone={filter ? 'purple' : 'neutral'} size="sm">{filter ? 'Filtered' : 'No filter'}</Badge>
-          <Badge tone="neutral" size="sm">{sortSummary}</Badge>
-        </div>
+        {mode !== 'rename' && (
+          <div className="crm-viewsummary">
+            <Badge tone="neutral" size="sm">{columns.length} columns</Badge>
+            <Badge tone={filter ? 'purple' : 'neutral'} size="sm">{filter ? 'Filtered' : 'No filter'}</Badge>
+            <Badge tone="neutral" size="sm">{sortSummary}</Badge>
+          </div>
+        )}
       </div>
     </Modal>
   );
@@ -636,13 +669,18 @@ export function LogActivityDialog({ open, onClose, kind, record, properties, use
             </Field>
           ))}
         </div>
-        <Field label="When" hint="Backdate it if this happened earlier — the timeline orders on this.">
+        <Field
+          label="When"
+          hint={`Backdate it if this happened earlier — the timeline orders on this. Times are ${zoneLabel(occurredAt, session.timeZone)}.`}
+        >
           <Input
             type="datetime-local"
-            value={toLocalInput(occurredAt)}
+            value={toZonedInput(occurredAt, session.timeZone)}
             onChange={(e) => {
-              const parsed = Date.parse(e.target.value);
-              if (Number.isFinite(parsed)) setOccurredAt(parsed);
+              // Read back as a wall clock in the workspace's zone, which is the
+              // zone this field just rendered in and the one the timeline reads.
+              const parsed = fromZonedInput(e.target.value, session.timeZone);
+              if (parsed !== null) setOccurredAt(parsed);
             }}
             aria-label="When this happened"
           />
@@ -650,12 +688,6 @@ export function LogActivityDialog({ open, onClose, kind, record, properties, use
       </div>
     </Modal>
   );
-}
-
-const pad = (n: number) => String(n).padStart(2, '0');
-function toLocalInput(ts: number): string {
-  const d = new Date(ts);
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 /* ------------------------------ inline property --------------------------- */

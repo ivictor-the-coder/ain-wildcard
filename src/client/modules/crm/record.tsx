@@ -24,7 +24,7 @@ import {
   useUsers,
   type AssociationSummary, type CrmRecord, type ObjectTypeDef, type PropertyDef, type TimelineItem,
 } from './api';
-import { InlineProperty, LogActivityDialog, activityMeta } from './dialogs';
+import { InlineProperty, LogActivityDialog, RecordFormDialog, activityMeta } from './dialogs';
 import { RecordPicker, UserChip, ValueView } from './values';
 import { listHref, recordHref } from './list';
 
@@ -58,6 +58,26 @@ const KIND_TONE: Record<TimelineItem['kind'], 'brand' | 'info' | 'purple' | 'neu
 };
 
 const ACTIVITY_KINDS = ['note', 'call', 'meeting', 'email', 'task'] as const;
+
+/**
+ * The shell labels the last breadcrumb from the route's static title, which is
+ * all a route knows before its record has answered — so three open tabs all
+ * read "Home › Contacts › Contact". The record's own name is the crumb worth
+ * having, and it is only knowable here. The shell owns that node, so this
+ * writes the text and puts the type label back on the way out; React leaves it
+ * alone in between, because it only touches a text node whose value changed.
+ */
+function useRecordCrumb(name: string | null | undefined, fallback: string): void {
+  useEffect(() => {
+    const current = document.querySelector<HTMLElement>('nav[aria-label="Breadcrumb"] [aria-current="page"]');
+    if (!current) return;
+    const label = name || fallback;
+    if (current.textContent !== label) current.textContent = label;
+    return () => {
+      if (current.isConnected && current.textContent === label) current.textContent = fallback;
+    };
+  }, [name, fallback]);
+}
 
 /**
  * `/similar` scores 0–100 already. Clamping is cheap insurance: a percentage
@@ -108,6 +128,8 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
 
   const [logging, setLogging] = useState<(typeof ACTIVITY_KINDS)[number] | null>(null);
   const [linking, setLinking] = useState<string | null>(null);
+  /** Object type being created from the associations rail, linked on save. */
+  const [linkingNew, setLinkingNew] = useState<string | null>(null);
   const [merging, setMerging] = useState<CrmRecord | null>(null);
   const [confirmArchive, setConfirmArchive] = useState(false);
   const [confirmDestroy, setConfirmDestroy] = useState(false);
@@ -116,6 +138,7 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
   const [primaryBusy, setPrimaryBusy] = useState<string | null>(null);
 
   const activityProps = useProperties(logging);
+  const newLinkProps = useProperties(linkingNew);
 
   const objectDef = useMemo<ObjectTypeDef | undefined>(
     () => schema.data?.object_types.find((t) => t.name === objectType) as ObjectTypeDef | undefined,
@@ -144,6 +167,21 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
     queueMicrotask(() => { if (live) document.title = `${data.display_name} · Ain`; });
     return () => { live = false; };
   }, [data]);
+
+  useRecordCrumb(data?.display_name, objectDef?.label ?? humanize(objectType));
+
+  /**
+   * Who this person works for. It was only in the right-hand rail, which on a
+   * narrow window is below the fold — so the first question anyone asks about a
+   * contact was the last thing the page answered.
+   */
+  const employer = useMemo<AssociationSummary | null>(() => {
+    if (!data || objectType === 'company') return null;
+    const edges = (data.associations ?? []).filter(
+      (edge) => edge.object_type === 'company' && edge.association_type !== 'activity_to_record',
+    );
+    return edges.find((edge) => edge.is_primary) ?? edges[0] ?? null;
+  }, [data, objectType]);
 
   const setOwner = async (ownerId: string | null) => {
     if (!data) return;
@@ -254,6 +292,8 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
   }
 
   const primary = objectDef?.primary_property ?? 'name';
+  const lifecycleProp = properties.find((p) => p.name === 'lifecycle_stage');
+  const lifecycleValue = lifecycleProp ? data.properties.lifecycle_stage ?? null : null;
   const secondary = objectDef?.secondary_property ?? null;
   const secondaryProp = secondary ? properties.find((p) => p.name === secondary) : undefined;
   const associations = data.associations ?? [];
@@ -266,6 +306,7 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
   }
   const duplicates = similar.data?.data ?? [];
   const linkTargets = (schema.data?.object_types ?? []).filter((t) => t.category === 'record');
+  const newLinkTarget = linkTargets.find((t) => t.name === linkingNew) ?? null;
   const typeLabel = (name: string): string =>
     (schema.data?.object_types.find((t) => t.name === name)?.label ?? humanize(name)).toLowerCase();
 
@@ -295,9 +336,34 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
       width="wide"
       eyebrow={objectDef?.label ?? humanize(objectType)}
       title={data.display_name}
-      badge={data.archived ? <Badge tone="warning" size="sm">Archived</Badge> : undefined}
+      badge={
+        // Who they are to the business belongs beside the name, not three
+        // scrolls down a properties rail.
+        (lifecycleValue || data.archived) ? (
+          <Inline gap={2}>
+            {lifecycleValue && <ValueView property={lifecycleProp} value={lifecycleValue} users={userIndex} compact />}
+            {data.archived && <Badge tone="warning" size="sm">Archived</Badge>}
+          </Inline>
+        ) : undefined
+      }
       subtitle={
         <>
+          {employer && (
+            <>
+              <a
+                className="crm-link"
+                href={recordHref(employer.object_type, employer.record_id)}
+                onClick={(e) => {
+                  if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+                  e.preventDefault();
+                  navigate(recordHref(employer.object_type, employer.record_id));
+                }}
+              >
+                {employer.display_name}
+              </a>
+              {' · '}
+            </>
+          )}
           Created {f.date(data.created)} · last touched {f.relative(data.updated)}
           {data.merged_from ? ` · reached through merged id ${data.merged_from}` : ''}
         </>
@@ -348,6 +414,21 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
                   <div className="crm-identity__sub u-truncate">
                     <ValueView property={secondaryProp} value={data.properties[secondary] ?? null} users={userIndex} compact />
                   </div>
+                )}
+                {employer && (
+                  <a
+                    className="crm-identity__at"
+                    href={recordHref(employer.object_type, employer.record_id)}
+                    onClick={(e) => {
+                      if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+                      e.preventDefault();
+                      navigate(recordHref(employer.object_type, employer.record_id));
+                    }}
+                  >
+                    <Icons.building size={12} />
+                    <span className="u-truncate">{employer.display_name}</span>
+                    {employer.is_primary && <Icons.star size={11} title={`Primary ${typeLabel(employer.object_type)}`} />}
+                  </a>
                 )}
               </div>
             </div>
@@ -628,7 +709,28 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
         initialType={linking ?? ''}
         exclude={associations.map((a) => a.record_id)}
         onLink={link}
+        onCreateNew={(type) => { setLinking(null); setLinkingNew(type); }}
       />
+
+      {/* The other half of linking: the record you want does not exist yet. It
+          is created and associated in one write, so nobody has to remember to
+          come back and link it. */}
+      {linkingNew && newLinkTarget && (
+        <RecordFormDialog
+          open
+          onClose={() => setLinkingNew(null)}
+          objectType={newLinkTarget}
+          properties={newLinkProps.data?.data ?? []}
+          users={users.data?.data ?? []}
+          associateTo={[data.id]}
+          associateLabel={data.display_name}
+          onCreated={(created) => {
+            crmChanged();
+            record.refetch();
+            toast.success('Linked to the new record', `${created.display_name} was created and linked to ${data.display_name}.`);
+          }}
+        />
+      )}
 
       <MergeDialog
         open={!!merging}
@@ -688,13 +790,14 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
 
 /* ------------------------------- link dialog ------------------------------ */
 
-function LinkDialog({ open, onClose, types, initialType, exclude, onLink }: {
+function LinkDialog({ open, onClose, types, initialType, exclude, onLink, onCreateNew }: {
   open: boolean;
   onClose: () => void;
   types: { name: string; label: string }[];
   initialType: string;
   exclude: string[];
   onLink: (id: string, primary: boolean) => Promise<void>;
+  onCreateNew: (objectType: string) => void;
 }) {
   const [type, setType] = useState(initialType);
   const [target, setTarget] = useState('');
@@ -713,6 +816,10 @@ function LinkDialog({ open, onClose, types, initialType, exclude, onLink }: {
       description="Ain infers the association type from the two object types, and its label from the type."
       footer={
         <>
+          <Button variant="ghost" iconLeft={<Icons.plus size={14} />} onClick={() => onCreateNew(active)} disabled={busy || !active}>
+            Create a new one
+          </Button>
+          <span className="u-spacer" />
           <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
           <Button
             variant="primary"

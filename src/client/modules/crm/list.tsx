@@ -19,11 +19,11 @@ import type { ApiClientError } from '@/client/kernel/api';
 import {
   archiveRecord, crmChanged, deleteView, fetchAllRecords, restoreRecord, updateView, useProperties,
   useRecordSearch, useSchema, useUserIndex, useUsers, useViews,
-  type CrmRecord, type FilterNode, type ObjectTypeDef, type PropertyDef, type PropertyValue,
+  type CrmRecord, type FilterNode, type ObjectTypeDef, type PropertyDef, type PropertyType, type PropertyValue,
   type SortSpec, type ViewDef,
 } from './api';
 import { FilterBuilder, FilterSummary, RECORD_FIELDS, countConditions, filterableProperties, pruneFilter } from './filter-builder';
-import { BulkLinkDialog, BulkOwnerDialog, BulkPropertyDialog, RecordFormDialog, SaveViewDialog } from './dialogs';
+import { BulkLinkDialog, BulkOwnerDialog, BulkPropertyDialog, RecordFormDialog, SaveViewDialog, type SaveViewMode } from './dialogs';
 import { UserChip, ValueView, cellValue, exportValue } from './values';
 import { downloadCsv, exportFilename, toCsv } from './csv';
 
@@ -55,11 +55,56 @@ export const listHref = (objectType: string): string =>
 
 export const recordHref = (objectType: string, id: string): string => `${listHref(objectType)}/${id}`;
 
-const defaultColumns = (objectDef: ObjectTypeDef, views: ViewDef[]): string[] => {
+/**
+ * Types worth a column before anyone has said what they want to see. Long text
+ * and JSON are excluded because one row of either fills the grid.
+ */
+const GLANCEABLE: PropertyType[] = [
+  'enum', 'multi_enum', 'date', 'datetime', 'currency', 'number', 'bool', 'user', 'reference',
+  'string', 'email', 'phone', 'url',
+];
+
+/**
+ * An object nobody has built a view for still has to arrive useful. A task
+ * list showing only "Task, Owner, Last modified" is technically a list and
+ * practically a wall — so the first few of the object's own properties come
+ * with it, in the order the data model puts them.
+ */
+const defaultColumns = (objectDef: ObjectTypeDef, views: ViewDef[], properties: PropertyDef[]): string[] => {
   const preferred = views.find((v) => v.is_default) ?? views[0];
   if (preferred?.columns.length) return preferred.columns;
-  return [objectDef.primary_property, ...(objectDef.secondary_property ? [objectDef.secondary_property] : []), 'owner_id', 'updated'];
+  const named = [objectDef.primary_property, ...(objectDef.secondary_property ? [objectDef.secondary_property] : [])];
+  const taken = new Set(named);
+  const glance = properties
+    .filter((p) => !p.hidden && !taken.has(p.name) && GLANCEABLE.includes(p.type))
+    .slice(0, 4)
+    .map((p) => p.name);
+  return [...named, ...glance, 'owner_id', 'updated'];
 };
+
+/**
+ * The narrowest a column of each type stays readable at. An enum cell is a
+ * coloured pill with a word in it, a user cell is an avatar plus a name, a
+ * datetime is "Aug 31, 2026" — none of them survive being squeezed to a
+ * proportion of whatever is left over.
+ */
+const MIN_COLUMN_WIDTH: Partial<Record<PropertyType, number>> = {
+  enum: 132, multi_enum: 160, user: 152, reference: 168, date: 132, datetime: 148,
+  bool: 112, string: 168, email: 208, url: 184, phone: 148, json: 200,
+};
+
+const DEFAULT_MIN_WIDTH = 148;
+
+/** Wide enough for the header to read, never wider than a column deserves. */
+export function columnWidth(property: PropertyDef, numeric: () => number): number {
+  if (property.type === 'text') return 280;
+  const header = property.label.length * 7 + 38;
+  if (property.type === 'currency' || property.type === 'number') {
+    return Math.min(220, Math.ceil(Math.max(96, header, numeric() + 34)));
+  }
+  const floor = MIN_COLUMN_WIDTH[property.type] ?? DEFAULT_MIN_WIDTH;
+  return Math.ceil(Math.max(floor, Math.min(260, header)));
+}
 
 const sameFilter = (a: FilterNode | null, b: FilterNode | null): boolean =>
   JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
@@ -156,6 +201,7 @@ const isDensity = (v: unknown): v is Density => v === 'comfortable' || v === 'co
 /** What the address bar asked for on the way in, consumed exactly once. */
 interface LinkState {
   q: string;
+  archived: boolean;
   filter: FilterNode | null;
   hasFilter: boolean;
   sort: SortSpec[];
@@ -205,6 +251,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
   if (!bootRef.current) {
     bootRef.current = {
       q: location.query.q ?? '',
+      archived: location.query.archived === '1',
       filter: decodeFilterParam(location.query.f),
       hasFilter: !!location.query.f,
       sort: decodeSortParam(location.query.s),
@@ -221,7 +268,9 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
   const [sort, setSort] = useState<SortSpec[]>([]);
   const [seeded, setSeeded] = useState<string>('');
   const [search, setSearch] = useState(boot.q);
-  const [showArchived, setShowArchived] = useState(false);
+  // Archived rides in the query string beside the search, the filter and the
+  // sort: "here are the ones we archived last week" has to be a link too.
+  const [showArchived, setShowArchived] = useState(boot.archived);
   const [selected, setSelected] = useState<string[]>([]);
   const query = useDebouncedValue(search, 250);
 
@@ -234,10 +283,11 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
   // time from a view that had not loaded yet.
   const seedKey = `${objectType}:${activeView?.id ?? 'none'}`;
   useEffect(() => {
-    if (!objectDef || views.loading || seeded === seedKey) return;
+    // Properties decide the default columns, so seeding waits for them too.
+    if (!objectDef || views.loading || objects.loading || seeded === seedKey) return;
     const link = boot;
     const stored = readPref(columnsKey, isColumnList);
-    setColumns(stored ?? (activeView?.columns.length ? activeView.columns : defaultColumns(objectDef, viewList)));
+    setColumns(stored ?? (activeView?.columns.length ? activeView.columns : defaultColumns(objectDef, viewList, properties)));
     setColumnsPinned(!!stored);
     setDensity(readPref(densityKey, isDensity) ?? 'comfortable');
     setFilter(link.pending && link.hasFilter ? link.filter : (activeView?.filter ?? null));
@@ -245,7 +295,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
     link.pending = false;
     setSelected([]);
     setSeeded(seedKey);
-  }, [seedKey, seeded, activeView, objectDef, viewList, views.loading, columnsKey, densityKey]);
+  }, [seedKey, seeded, activeView, objectDef, viewList, views.loading, objects.loading, properties, columnsKey, densityKey]);
 
   /* ------------------------ mirror the state into the url ------------------ */
 
@@ -279,8 +329,12 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
     if ((location.query.q ?? '') !== query.trim()) patch.q = query.trim() || undefined;
     if ((location.query.f ?? '') !== filterParam) patch.f = filterParam || undefined;
     if ((location.query.s ?? '') !== sortParam) patch.s = sortParam || undefined;
+    if ((location.query.archived === '1') !== showArchived) patch.archived = showArchived ? '1' : undefined;
     if (Object.keys(patch).length) setQuery(patch);
-  }, [seeded, query, filterParam, sortParam, location.path, location.query.q, location.query.f, location.query.s, ownPath, setQuery]);
+  }, [
+    seeded, query, filterParam, sortParam, showArchived, location.path,
+    location.query.q, location.query.f, location.query.s, location.query.archived, ownPath, setQuery,
+  ]);
 
   const chooseColumns = useCallback((next: string[]) => {
     setColumns(next);
@@ -315,7 +369,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
 
   const [creating, setCreating] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
-  const [savingView, setSavingView] = useState<'new' | 'update' | null>(null);
+  const [savingView, setSavingView] = useState<SaveViewMode | null>(null);
   const [bulk, setBulk] = useState<'owner' | 'property' | 'link' | null>(null);
   const [confirmArchive, setConfirmArchive] = useState<string[] | null>(null);
   const [confirmDeleteView, setConfirmDeleteView] = useState<ViewDef | null>(null);
@@ -341,6 +395,26 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
   }, [objectDef]);
 
   /* --------------------------------- columns -------------------------------- */
+
+  /** Pixels the widest figure in a numeric column needs, in tabular digits. */
+  const numericWidth = useCallback((property: PropertyDef, rows: CrmRecord[]): number => {
+    const render = (n: number) => (property.type === 'currency'
+      ? f.money(n, { currency: property.currency ?? session.currency, trimZeroFraction: true })
+      : f.number(n));
+    let longest = 0;
+    let sum = 0;
+    for (const row of rows) {
+      const raw = fieldValue(row, property.name);
+      if (raw === null || raw === undefined || raw === '') continue;
+      const n = Number(raw);
+      if (!Number.isFinite(n)) continue;
+      sum += n;
+      longest = Math.max(longest, render(n).length);
+    }
+    // The sticky footer sums the column, and its total is the widest thing in it.
+    if (property.type === 'currency' && sum !== 0) longest = Math.max(longest, render(sum).length);
+    return longest * 7.6;
+  }, [f, session.currency]);
 
   const tableColumns = useMemo<DataTableColumn<CrmRecord>[]>(() => {
     if (!objectDef) return [];
@@ -382,26 +456,25 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
         headerTitle: property.description ? `${property.label} — ${property.description}` : property.label,
         sortable: true,
         align: property.type === 'currency' || property.type === 'number' ? 'right' : 'left',
-        // A numeric column is only as wide as its digits, so a long label like
-        // "Connected assets" truncated while the figures beside it had room to
-        // spare. Sizing it to its own header — and no wider — reads the label
-        // without taking the width the enum badges need to stay whole.
-        width: property.type === 'text'
-          ? 280
-          : property.type === 'currency' || property.type === 'number'
-            ? Math.min(164, Math.max(96, property.label.length * 7 + 38))
-            : undefined,
+        // Every column carries a width, and every width has a floor. A numeric
+        // column is sized to its own digits — a $457,920.00 deal rendering as
+        // "$457,920…" is worse than no column at all — and everything else to
+        // the least it can be read at. Leaving text columns unsized let the
+        // table divide a 1100px window into five 45px stubs whose enum cells
+        // were a bare coloured dot; with floors the sum outgrows the container
+        // and the wrapper's `overflow-x` starts doing its job instead.
+        width: columnWidth(property, () => numericWidth(property, result.rows)),
         accessor: (row) => cellValue(property, fieldValue(row, name)),
         cell: (row) => (name === 'owner_id'
           ? <UserChip id={row.owner_id} user={row.owner_id ? userIndex.get(row.owner_id) : undefined} />
           : <ValueView property={property} value={fieldValue(row, name)} users={userIndex} compact />),
         ...(property.type === 'currency'
-          ? { total: (rows: CrmRecord[]) => <span className="crm-num">{f.money(rows.reduce((n, r) => n + Number(fieldValue(r, name) ?? 0), 0), { currency: property.currency ?? session.currency })}</span> }
+          ? { total: (rows: CrmRecord[]) => <span className="crm-num">{f.money(rows.reduce((n, r) => n + Number(fieldValue(r, name) ?? 0), 0), { currency: property.currency ?? session.currency, trimZeroFraction: true })}</span> }
           : {}),
       });
     }
     return built;
-  }, [objectDef, columns, propertyIndex, userIndex, objectType, navigate, f, session.currency]);
+  }, [objectDef, columns, propertyIndex, userIndex, objectType, navigate, f, session.currency, numericWidth, result.rows]);
 
   const tableState = useMemo<TableState>(() => ({
     query: '',
@@ -447,7 +520,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
         row.id,
         ...columns.map((name) => exportValue(definitionFor(propertyIndex, name), fieldValue(row, name), userIndex)),
       ]);
-      downloadCsv(exportFilename(objectDef?.plural_label ?? objectType, session.now()), toCsv(headers, lines));
+      downloadCsv(exportFilename(objectDef?.plural_label ?? objectType, session.now(), session.timeZone), toCsv(headers, lines));
       toast.success(
         `${rows.length} rows exported`,
         'Picklists and owners carry the labels the grid shows; money is a decimal and dates are ISO-8601, ready to re-import.',
@@ -510,13 +583,25 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
   const conditions = countConditions(pruned);
   const selectedRows = result.rows.filter((r) => selected.includes(r.id));
 
+  // A shared view is a team asset, not a personal scratchpad: the three views
+  // a sales team lives in have to be fixable in place. The server is the
+  // authority on what this person may write — it accepts a rename, a new
+  // filter and a new default on a built-in view — so the menu no longer
+  // second-guesses it. The one thing the server does refuse is deleting a view
+  // that ships with Ain, and that item says so instead of vanishing.
   const viewMenu: MenuSection[] = [
     {
       id: 'view',
       label: activeView ? activeView.name : 'This view',
       items: [
-        ...(dirty && activeView && !activeView.system
-          ? [{ id: 'save', label: 'Save changes to this view', icon: <Icons.check size={14} />, onSelect: () => setSavingView('update') }]
+        ...(dirty && activeView
+          ? [{
+            id: 'save',
+            label: 'Save changes to this view',
+            description: activeView.shared ? 'Everyone who uses this view gets them' : undefined,
+            icon: <Icons.check size={14} />,
+            onSelect: () => setSavingView('update'),
+          }]
           : []),
         { id: 'saveas', label: 'Save as a new view', icon: <Icons.plus size={14} />, onSelect: () => setSavingView('new') },
         ...(dirty
@@ -527,24 +612,49 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
             onSelect: () => { clearPref(columnsKey); setColumnsPinned(false); setSeeded(''); },
           }]
           : []),
-        ...(activeView && !activeView.system
-          ? [{
+      ],
+    },
+    ...(activeView
+      ? [{
+        id: 'view-manage',
+        label: 'Manage',
+        items: [
+          {
+            id: 'rename',
+            label: 'Rename this view…',
+            icon: <Icons.edit size={14} />,
+            onSelect: () => setSavingView('rename'),
+          },
+          {
             id: 'default',
             label: activeView.is_default ? 'Already the default view' : 'Make it the default view',
+            description: activeView.is_default ? undefined : `${objectDef.plural_label} open on it`,
             icon: <Icons.star size={14} />,
             disabled: activeView.is_default,
             onSelect: async () => {
-              await updateView(activeView.id, { is_default: true });
-              crmChanged('/v1/views');
-              toast.success('Default view set', `${objectDef.plural_label} open on “${activeView.name}” now.`);
+              try {
+                await updateView(activeView.id, { is_default: true });
+                crmChanged('/v1/views');
+                toast.success('Default view set', `${objectDef.plural_label} open on “${activeView.name}” now.`);
+              } catch (e) {
+                toast.error('Default not changed', (e as ApiClientError).body.message);
+              }
             },
-          }]
-          : []),
-        ...(activeView && !activeView.system
-          ? [{ id: 'delete', label: 'Delete this view', icon: <Icons.trash size={14} />, danger: true, onSelect: () => setConfirmDeleteView(activeView) }]
-          : []),
-      ],
-    },
+          },
+          {
+            id: 'delete',
+            label: 'Delete this view',
+            // Built-in views are the server's rule, not the screen's opinion:
+            // it refuses the DELETE, so the item stays visible and says why.
+            description: activeView.system ? 'Ships with Ain — save a copy and delete that instead' : undefined,
+            icon: <Icons.trash size={14} />,
+            danger: !activeView.system,
+            disabled: activeView.system,
+            onSelect: () => setConfirmDeleteView(activeView),
+          },
+        ],
+      } satisfies MenuSection]
+      : []),
   ];
 
   const columnMenu: MenuSection[] = [
@@ -571,7 +681,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
           onSelect: () => {
             clearPref(columnsKey);
             setColumnsPinned(false);
-            setColumns(activeView?.columns.length ? activeView.columns : defaultColumns(objectDef, viewList));
+            setColumns(activeView?.columns.length ? activeView.columns : defaultColumns(objectDef, viewList, properties));
           },
         }],
       } satisfies MenuSection]
@@ -727,14 +837,15 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
             <Button size="sm" variant="danger-ghost" iconLeft={<Icons.trash size={13} />} onClick={() => setConfirmArchive(ids)}>Archive</Button>
           </Inline>
         )}
-        footer={
+        // A failed read knows nothing about how many rows there are, and the
+        // table's own pager would say "0 rows" beside it. Drop the whole strip
+        // and let the error state, which has the message and the retry, speak.
+        footer={result.error ? undefined : (
           <div className="crm-tablefoot">
             <span>
               {result.loading || result.stale
                 ? 'Reading…'
-                : result.error
-                  ? `— ${objectDef.plural_label.toLowerCase()} match this view`
-                  : `${f.number(result.total)} ${f.plural(result.total, objectDef.label.toLowerCase(), { hideCount: true })} match this view`}
+                : `${f.number(result.total)} ${f.plural(result.total, objectDef.label.toLowerCase(), { hideCount: true })} ${result.total === 1 ? 'matches' : 'match'} this view`}
             </span>
             {result.hasMore && (
               <Button size="sm" variant="secondary" loading={result.loadingMore} onClick={result.loadMore}>
@@ -743,7 +854,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
             )}
             {selectedRows.length > 0 && <Badge tone="brand" size="sm">{selectedRows.length} selected</Badge>}
           </div>
-        }
+        )}
       />
 
       <Modal
@@ -795,14 +906,18 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
         open={savingView !== null}
         onClose={() => setSavingView(null)}
         objectType={objectType}
-        existing={savingView === 'update' ? activeView : null}
+        mode={savingView ?? 'new'}
+        existing={savingView === 'update' || savingView === 'rename' ? activeView : null}
         columns={columns}
         filter={pruned}
         sort={sort}
         properties={filterableProperties(properties)}
         onSaved={(view) => {
-          // The view now carries these columns, so the local override has
-          // nothing left to say and the view becomes the default again.
+          // A rename touched nothing the grid is showing, so the grid keeps
+          // showing it — including changes the operator has not saved yet.
+          if (savingView === 'rename') return;
+          // Otherwise the view now carries these columns, so the local override
+          // has nothing left to say and the view becomes the default again.
           clearPref(prefKey('columns', objectType, view.id));
           clearPref(columnsKey);
           setColumnsPinned(false);

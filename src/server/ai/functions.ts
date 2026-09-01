@@ -417,7 +417,10 @@ export function describeRecord(workspace: WorkspaceProfile, record: RecordSummar
   if (record.object_type === 'deal') {
     detail.push(formatMoney({ amount: Number(props.amount ?? 0), currency: workspace.currency }, { locale: workspace.locale, trimZeroFraction: true }));
     if (props.deal_stage) detail.push(humanise(String(props.deal_stage)));
-    if (props.close_date) detail.push(`closes ${formatDate(Number(props.close_date), { locale: workspace.locale, timeZone: workspace.timezone })}`);
+    // `close_date` is a calendar day stored as midnight UTC, not an instant:
+    // read back in a zone west of Greenwich it reports the evening before, so
+    // the citation under an answer disagrees with the deal board it links to.
+    if (props.close_date) detail.push(`closes ${formatDate(Number(props.close_date), { locale: workspace.locale, timeZone: 'UTC' })}`);
   } else if (record.object_type === 'ticket') {
     if (props.priority) detail.push(`${humanise(String(props.priority))} priority`);
     if (props.status) detail.push(humanise(String(props.status)));

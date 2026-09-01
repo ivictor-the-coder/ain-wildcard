@@ -901,3 +901,283 @@ describe('POST /v1/time/advance replays the queue chronologically', () => {
     app.close();
   });
 });
+
+/* --------- the membership is the identity, and the role is the authority --- */
+
+/**
+ * The other half of the question the AI surface already answers.
+ *
+ * `actorFor` resolves a caller who is no longer a member of the workspace to
+ * `null` — "not a live member", so nothing they write can be attributed to
+ * them. `authenticate` was answering the same question with `(member?.role) ||
+ * 'member'`, so a removed teammate's still-live cookie came back as a *member*
+ * of the workspace they had just been removed from. That is not a stale
+ * session, it is a promotion: `member` is exactly the rung
+ * `POST /v1/ai/approvals/:id` is gated at and the rung the copilot's
+ * `allow_writes` gate reads, so an analyst refused a write one minute was
+ * granted it the minute they were removed.
+ *
+ * `POST /v1/auth/login` already refuses an account that belongs to no
+ * workspace. The check existed where the credential is minted and was missing
+ * where it is used.
+ */
+describe('a session is only a session while the membership behind it exists', () => {
+  async function signedIn(email: string) {
+    const app = await createApp({ db: 'memory', seed: true, config: { env: 'test' } });
+    const login = await app.handle({ method: 'POST', path: '/v1/auth/login', body: { email, password: 'demo1234' } });
+    assert.equal(login.status, 200, `precondition: ${email} could not sign in`);
+    return { app, headers: { cookie: String(login.headers['set-cookie']).split(';')[0] } };
+  }
+
+  const ownerOf = (orgId: string): Auth =>
+    ({ kind: 'session', orgId, userId: 'usr_seed01', role: 'owner', scopes: ['*'], livemode: true });
+
+  const notes = (app: App, orgId: string) =>
+    app.db.count(`SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'note'`, orgId);
+
+  test('a removed teammate is not promoted to member by their own removal', async () => {
+    // Nina is an analyst: under the member bar, and refused a copilot write.
+    const { app, headers } = await signedIn('nina@northwind.io');
+    const orgId = app.ctx.config.defaultOrgId;
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/me', headers })).body.role, 'analyst');
+
+    const company = app.db.get<{ display_name: string }>(
+      `SELECT display_name FROM crm_records WHERE org_id = ? AND object_type = 'company' LIMIT 1`, orgId)!;
+    const write = () => app.handle({
+      method: 'POST', path: '/v1/ai/complete',
+      body: {
+        prompt: `Add a note to ${company.display_name} saying "Written by someone who was removed."`,
+        allow_writes: true, approvals: ['add_note'],
+      },
+      headers,
+    });
+    assert.equal((await write()).status, 403, 'precondition: an analyst may not authorise an agent write');
+
+    // The membership goes and the session stays. `DELETE /v1/users/:id` no
+    // longer leaves this behind — it ends the sessions it removes — so the
+    // shape is made by hand: it is what any *other* path that drops a
+    // membership leaves, and what a request already in flight sees. The door
+    // check is defence in depth now rather than the only defence, and defence
+    // in depth still has to hold.
+    app.db.run(`DELETE FROM memberships WHERE org_id = ? AND user_id = 'usr_seed06'`, orgId);
+    assert.equal(app.db.count(`SELECT COUNT(*) FROM memberships WHERE org_id = ? AND user_id = 'usr_seed06'`, orgId), 0);
+    assert.equal(
+      app.db.count(`SELECT COUNT(*) FROM sessions WHERE org_id = ? AND user_id = 'usr_seed06'`, orgId), 1,
+      'precondition: the session outlives the membership, which is the whole point of this test',
+    );
+
+    const before = notes(app, orgId);
+    const after = await write();
+    assert.equal(
+      after.status, 401,
+      `a teammate removed from the workspace still reached it, as ${JSON.stringify((await app.handle({ method: 'GET', path: '/v1/me', headers })).body?.role)}`,
+    );
+    assert.equal(notes(app, orgId), before, 'a removed teammate wrote to a customer record through the copilot');
+
+    const me = await app.handle({ method: 'GET', path: '/v1/me', headers });
+    assert.equal(me.status, 401, 'the workspace still answered "who am I" for someone who is not in it');
+    assert.match(me.body.error.message, /no longer a member/);
+    app.close();
+  });
+
+  test('every other authority a removed teammate held goes with the membership', async () => {
+    const { app, headers } = await signedIn('marcus@northwind.io');
+    const orgId = app.ctx.config.defaultOrgId;
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/me', headers })).body.role, 'admin');
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/api-keys', headers })).status, 200);
+
+    await app.handle({ method: 'DELETE', path: '/v1/users/usr_seed02', auth: ownerOf(orgId) });
+
+    for (const probe of [
+      { method: 'GET', path: '/v1/api-keys' },
+      { method: 'GET', path: '/v1/audit-log' },
+      { method: 'POST', path: '/v1/time/advance', body: { days: 1 } },
+      { method: 'DELETE', path: '/v1/api-keys/ak_seed_demo' },
+      { method: 'GET', path: '/v1/records/company' },
+    ]) {
+      const res = await app.handle({ ...probe, headers });
+      assert.equal(res.status, 401, `${probe.method} ${probe.path} still answered a removed admin with ${res.status}`);
+    }
+    app.close();
+  });
+
+  test('but a teammate who is still a member keeps exactly the role they hold', async () => {
+    const { app, headers } = await signedIn('dana@northwind.io');
+    const me = await app.handle({ method: 'GET', path: '/v1/me', headers });
+    assert.equal(me.status, 200);
+    assert.equal(me.body.role, 'owner', 'refusing the removed must not re-grade the present');
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/audit-log', headers })).status, 200);
+
+    // The role still comes from the membership row, not from a default.
+    app.db.run(`UPDATE memberships SET role = 'readonly' WHERE org_id = ? AND user_id = 'usr_seed01'`, app.ctx.config.defaultOrgId);
+    const demoted = await app.handle({ method: 'GET', path: '/v1/me', headers });
+    assert.equal(demoted.body.role, 'readonly');
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/audit-log', headers })).status, 403, 'a demotion is a demotion');
+    app.close();
+  });
+
+  test('the public surface still answers, so the dead cookie can be put down', async () => {
+    const { app, headers } = await signedIn('nina@northwind.io');
+    const orgId = app.ctx.config.defaultOrgId;
+    app.db.run(`DELETE FROM memberships WHERE org_id = ? AND user_id = 'usr_seed06'`, orgId);
+
+    const health = await app.handle({ method: 'GET', path: '/v1/health', headers });
+    assert.equal(health.status, 200, 'a removed teammate\'s browser could not even ask whether the API was up');
+
+    const out = await app.handle({ method: 'POST', path: '/v1/auth/logout', headers });
+    assert.equal(out.status, 200, 'a removed teammate could not sign out, so the cookie stayed in the browser');
+    assert.equal(app.db.count(`SELECT COUNT(*) FROM sessions WHERE user_id = 'usr_seed06'`), 0);
+    app.close();
+  });
+
+  test('and the key that teammate minted goes with them, or removal removes nobody', async () => {
+    // The cookie was refused above. This is the other door into the same
+    // workspace, and it was answering `role: admin` in the same breath.
+    const { app, headers: cookie } = await signedIn('marcus@northwind.io');
+    const orgId = app.ctx.config.defaultOrgId;
+    const minted = await app.handle({
+      method: 'POST', path: '/v1/api-keys', body: { name: 'Marcus back door', scopes: ['*'] }, headers: cookie,
+    });
+    assert.equal(minted.status, 201);
+    const headers = { authorization: `Bearer ${minted.body.secret}` };
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/me', headers })).body.role, 'admin');
+
+    await app.handle({ method: 'DELETE', path: '/v1/users/usr_seed02', auth: ownerOf(orgId) });
+
+    for (const probe of [
+      { method: 'GET', path: '/v1/me' },
+      { method: 'GET', path: '/v1/api-keys' },
+      { method: 'GET', path: '/v1/audit-log' },
+      { method: 'POST', path: '/v1/time/advance', body: { days: 1 } },
+      { method: 'DELETE', path: '/v1/api-keys/ak_seed_demo' },
+      { method: 'POST', path: '/v1/api-keys', body: { name: 'Replacement', scopes: ['*'] } },
+      { method: 'POST', path: '/v1/users', body: { email: 'ghost@northwind.io', name: 'Ghost', role: 'owner' } },
+      { method: 'GET', path: '/v1/records/company' },
+    ]) {
+      const res = await app.handle({ ...probe, headers });
+      assert.equal(res.status, 401,
+        `${probe.method} ${probe.path} answered a removed admin's key with ${res.status}`);
+    }
+    assert.equal(app.db.count(`SELECT COUNT(*) FROM memberships WHERE org_id = ? AND role = 'owner'`, orgId), 1,
+      'a removed admin seated a second owner through his key');
+    app.close();
+  });
+
+  test('the seeded integration key dies with Dana, and says why', async () => {
+    const app = await createApp({ db: 'memory', seed: true, config: { env: 'test' } });
+    const orgId = app.ctx.config.defaultOrgId;
+    const headers = { authorization: `Bearer sk_test_${'ain_demo_workspace_key_0001'}` };
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/records/company', headers })).status, 200);
+    const lastUsed = app.db.pluck<number>(`SELECT last_used FROM api_keys WHERE id = 'ak_seed_demo'`);
+
+    app.db.run(`DELETE FROM memberships WHERE org_id = ? AND user_id = 'usr_seed01'`, orgId);
+    const refused = await app.handle({ method: 'GET', path: '/v1/records/company', headers });
+    assert.equal(refused.status, 401, 'ak_seed_demo was created by Dana and outlived her membership');
+    assert.match(refused.body.error.message, /no longer a member of this workspace/);
+    assert.equal(app.db.pluck<number>(`SELECT last_used FROM api_keys WHERE id = 'ak_seed_demo'`), lastUsed,
+      'a refused credential kept reporting itself as just used');
+    app.close();
+  });
+
+  test('a demotion is a demotion at both doors, not only at the cookie', async () => {
+    // The sign-flip of removal, and the likelier administrative action: an
+    // owner who catches a rogue admin drops their role. The session below
+    // already obeys that; the key must not be the way back up.
+    const { app, headers: cookie } = await signedIn('marcus@northwind.io');
+    const orgId = app.ctx.config.defaultOrgId;
+    const minted = await app.handle({
+      method: 'POST', path: '/v1/api-keys', body: { name: 'Marcus key', scopes: ['*'] }, headers: cookie,
+    });
+    const headers = { authorization: `Bearer ${minted.body.secret}` };
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/me', headers })).body.role, 'admin');
+
+    await app.handle({ method: 'PATCH', path: '/v1/users/usr_seed02', body: { role: 'readonly' }, auth: ownerOf(orgId) });
+
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/me', headers })).body.role, 'readonly');
+    assert.equal((await app.handle({ method: 'POST', path: '/v1/time/advance', body: { days: 1 }, headers })).status, 403,
+      'a demoted admin moved the workspace clock through the key he still held');
+    assert.equal((await app.handle({ method: 'DELETE', path: '/v1/api-keys/ak_seed_demo', headers })).status, 403,
+      'a demoted admin revoked the workspace\'s other credentials');
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/records/company', headers })).status, 200,
+      'the demotion took the escalation, not the read surface');
+    app.close();
+  });
+
+  test('the bound only ever lowers a key — it is not a promotion to its author', async () => {
+    const app = await createApp({ db: 'memory', seed: true, config: { env: 'test' } });
+    const orgId = app.ctx.config.defaultOrgId;
+    const minted = await app.handle({
+      method: 'POST', path: '/v1/api-keys', body: { name: 'Reporting key', scopes: ['crm:read'] }, auth: ownerOf(orgId),
+    });
+    const headers = { authorization: `Bearer ${minted.body.secret}` };
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/me', headers })).body.role, 'readonly',
+      'a read key minted by the owner inherited the owner');
+    assert.equal((await app.handle({ method: 'POST', path: '/v1/time/advance', body: { days: 1 }, headers })).status, 403);
+
+    // And every rung a live author can issue still authenticates as itself.
+    for (const [scopes, role] of [[['*'], 'admin'], [['crm:write'], 'member'], [['metering:write'], 'member']] as const) {
+      const key = await app.handle({
+        method: 'POST', path: '/v1/api-keys', body: { name: `k ${scopes.join()}`, scopes: [...scopes] }, auth: ownerOf(orgId),
+      });
+      const me = await app.handle({ method: 'GET', path: '/v1/me', headers: { authorization: `Bearer ${key.body.secret}` } });
+      assert.equal(me.status, 200, `a live author's ${scopes.join()} key was refused`);
+      assert.equal(me.body.role, role, `${scopes.join()} authenticated as ${me.body.role}`);
+    }
+    app.close();
+  });
+
+  test('a key with no author is a workspace credential, and revoke is its kill switch', async () => {
+    // `created_by` is null, which since minting became transitive only a
+    // migration or a fixture can produce: there is no membership to ask
+    // about, and closing this would shut every such integration the moment
+    // anyone left.
+    const app = await createApp({ db: 'memory', seed: true, config: { env: 'test' } });
+    const orgId = app.ctx.config.defaultOrgId;
+    const minted = await app.handle({
+      method: 'POST', path: '/v1/api-keys', body: { name: 'Machine credential', scopes: ['*'] }, auth: ownerOf(orgId),
+    });
+    app.db.run(`UPDATE api_keys SET created_by = NULL WHERE id = ?`, minted.body.id);
+    const headers = { authorization: `Bearer ${minted.body.secret}` };
+
+    app.db.run(`DELETE FROM memberships WHERE org_id = ?`, orgId);
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/records/company', headers })).status, 200);
+
+    app.db.run(`UPDATE api_keys SET revoked_at = ? WHERE id = ?`, app.ctx.now(), minted.body.id);
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/records/company', headers })).status, 401);
+    app.close();
+  });
+
+  test('both halves of the question now give one answer', async () => {
+    // `actorFor` resolved this caller to "nobody" while `authenticate` called
+    // them an admin. Whichever way the workspace changes, the two must agree.
+    const { app, headers: cookie } = await signedIn('marcus@northwind.io');
+    const orgId = app.ctx.config.defaultOrgId;
+    const minted = await app.handle({
+      method: 'POST', path: '/v1/api-keys', body: { name: 'Marcus key', scopes: ['*'] }, headers: cookie,
+    });
+    const headers = { authorization: `Bearer ${minted.body.secret}` };
+    const company = app.db.get<{ display_name: string }>(
+      `SELECT display_name FROM crm_records WHERE org_id = ? AND object_type = 'company' LIMIT 1`, orgId)!;
+    const write = () => app.handle({
+      method: 'POST', path: '/v1/ai/complete',
+      body: {
+        prompt: `Add a note to ${company.display_name} saying "Filed through the key."`,
+        allow_writes: true, approvals: ['add_note'],
+      },
+      headers,
+    });
+
+    const before = notes(app, orgId);
+    assert.ok((await write()).status < 400, 'a live admin\'s key must still drive the agent surface');
+    assert.equal(notes(app, orgId), before + 1);
+    assert.equal(app.db.pluck<string>(
+      `SELECT owner_id FROM crm_records WHERE org_id = ? AND object_type = 'note' ORDER BY created DESC LIMIT 1`, orgId),
+      'usr_seed02', 'the write was attributed to somebody other than the key\'s author');
+
+    await app.handle({ method: 'DELETE', path: '/v1/users/usr_seed02', auth: ownerOf(orgId) });
+    const after = await write();
+    assert.equal(after.status, 401, `a removed admin wrote through his key (${after.status})`);
+    assert.equal(notes(app, orgId), before + 1);
+    app.close();
+  });
+});
