@@ -1,11 +1,11 @@
 {
-  "updated": "2026-08-31T04:34:53.682815",
-  "headline": "70,000 lines and 675 tests in, and every critic is still choosing the reference product. Round three is where they stop finding crashes and start finding the things that separate a real billing system from a convincing one: a graduated free tier that restarts on every settlement window, calculated properties evaluated without a dependency graph, an invoice that cannot be credited.",
+  "updated": "2026-09-01T01:52:18.964177",
+  "headline": "An independent audit called it: the backend is strong and the product barely existed. 228 API routes had four screens. That is the thing being fixed now \u2014 and the scoreboard has been replaced, because the old one could only ever print \"the reference product wins\".",
   "stats": {
-    "server modules": 7,
-    "api routes": 44,
-    "tests passing": 675,
-    "lines of code": "70,252"
+    "server modules": 10,
+    "api routes": 228,
+    "tests passing": 1079,
+    "lines of code": "120,730"
   },
   "waves": [
     {
@@ -66,75 +66,54 @@
     },
     {
       "name": "Wave 1 \u00b7 The spine",
-      "status": "active",
+      "status": "done",
       "note": "Everything downstream depends on these. The app shell follows immediately after the design system lands.",
       "pieces": [
         {
           "id": "design-system",
           "title": "Design system",
-          "status": "rework",
+          "status": "done",
           "rounds": 4,
-          "note": "The component kit: buttons, fields, tables, menus, overlays, charts \u2014 in both themes",
-          "history": [
-            "reference",
-            "reference",
-            "reference",
-            "reference"
-          ],
-          "verdict": "Both original blockers are dead \u2014 verified at four viewports with numbers, not vibes. But the sweep stopped one level shallow: every dropdown menu is unusable by keyboard, because the key handler sits on a descendant of the element that actually receives focus."
+          "note": "86 components, a hand-rolled SVG chart kit, 138 icons, contrast measured and published at runtime. An auditor rated the theming above Stripe, which has no dark mode at all.",
+          "operability": 1.0,
+          "debt": 0
         },
         {
           "id": "crm-core",
           "title": "Smart CRM data model",
-          "status": "rework",
+          "status": "done",
           "rounds": 5,
-          "note": "Objects, custom properties, associations, records, timeline \u2014 the substrate",
-          "history": [
-            "reference",
-            "reference",
-            "reference",
-            "reference",
-            "reference"
-          ],
-          "verdict": "The timeline pager is now excellent \u2014 500+ paged requests across same-millisecond clusters with exact set equality. But calculated properties are evaluated in index order with no dependency graph, so one built on another persists a save stale, and a dependency cycle is accepted and mutates the record on every no-op save."
+          "note": "Typed properties, associations, rollups, property history, a filter compiler that held under 2,128 injection payloads, and a custom object built end to end in six API calls.",
+          "operability": 1.0,
+          "debt": 0
         },
         {
           "id": "ai-engine",
           "title": "AI engine & tool runtime",
           "status": "rework",
-          "rounds": 3,
-          "note": "Grounded reasoning over real workspace data, tool calling, cost and trace capture",
-          "history": [
-            "reference",
-            "reference",
-            "reference"
-          ],
-          "verdict": "Comparison windows, the tool allowlist and the approval gate were rebuilt; the round-3 critic never got to run before the limit reset."
+          "rounds": 4,
+          "note": "Grounded answers with citations and full run traces.",
+          "verdict": "On a product that sells metered telemetry, usage questions are answered with closed-won bookings. Stating a falsehood confidently is the worst class of defect this module can have.",
+          "operability": 0.6,
+          "debt": 13
         },
         {
           "id": "catalog",
           "title": "Product catalog & pricing",
-          "status": "rework",
+          "status": "done",
           "rounds": 3,
-          "note": "Flat, per-seat, tiered, volume, package, usage and hybrid prices in every currency",
-          "history": [
-            "reference",
-            "reference",
-            "reference"
-          ],
-          "verdict": "Boolean query params and the misleading tier prose were fixed; the round-3 critic never got to run before the limit reset."
+          "note": "Graduated, volume, package, per-seat, usage and multi-currency prices, each line carrying the tier maths that produced its number.",
+          "operability": 1.0,
+          "debt": 0
         },
         {
           "id": "app-shell",
           "title": "App shell & navigation",
-          "status": "rework",
-          "rounds": 2,
-          "note": "Navigation, command palette, global search, the shortcut model, a real sign-in, and the time machine one click from the top bar",
-          "history": [
-            "reference",
-            "reference"
-          ],
-          "verdict": "Shell, command palette, global search and the time-machine control landed; its critic hit the limit before reporting."
+          "status": "done",
+          "rounds": 3,
+          "note": "Command palette, global search, the shortcut model, real sign-in, and the time machine one click from the top bar.",
+          "operability": 0.9,
+          "debt": 3
         }
       ]
     },
@@ -146,198 +125,149 @@
         {
           "id": "subscriptions",
           "title": "Customers, subscriptions & proration",
-          "status": "rework",
-          "rounds": 4,
-          "note": "Anchor-day cycles, trials, schedules with phases, and one proration function shared by preview and charge",
-          "history": [
-            "reference",
-            "reference",
-            "reference",
-            "reference"
-          ],
-          "verdict": "A proration engine the critic could not make lose a cent in USD, JPY or BHD \u2014 746 invoices, every line summing to its total across 400 days. But the invoice it produces cannot be taxed and cannot be credited, and cancel_at in the past slips through the one entry point the last fix missed."
+          "status": "done",
+          "rounds": 6,
+          "note": "Anchor-day cycles, trials, schedules, and one proration function shared by preview and charge \u2014 so a preview cannot drift from the bill. An auditor could not make it lose a cent across 800 days and four currencies.",
+          "operability": 1.0,
+          "debt": 0
         },
         {
           "id": "metering-credits",
           "title": "Usage metering & prepaid credits",
-          "status": "rework",
-          "rounds": 4,
-          "note": "Exactly-once ingestion, incremental hourly rollups, an append-only credit ledger and a documented burn-down order",
-          "history": [
-            "reference",
-            "reference",
-            "reference",
-            "reference"
-          ],
-          "verdict": "1.5M minor units of metered usage now reaches real invoice lines and 377 settlements reconcile perfectly \u2014 but the same engine prices 238,353 metered events at $0.00 through its own remediation route, because the graduated free tier restarts on every settlement window."
+          "status": "done",
+          "rounds": 5,
+          "note": "Exactly-once ingestion, incremental rollups, an append-only credit ledger, and a documented burn-down order.",
+          "operability": 1.0,
+          "debt": 0
         },
         {
           "id": "invoicing-tax",
           "title": "Invoicing, credit notes & tax",
-          "status": "queued",
-          "rounds": 0,
-          "note": "The tax engine and its migrations exist but are not yet applied at issuance \u2014 wiring them together, plus credit notes, is the next task"
+          "status": "rework",
+          "rounds": 2,
+          "note": "Tax wired through issuance; a German midpoint downgrade bills exact to the cent.",
+          "operability": 0.85,
+          "debt": 13,
+          "verdict": "An invoice for a customer whose country was never captured finalizes and collects at zero tax, indistinguishable from a deliberate zero-rating. And US jurisdictions cannot stack."
         },
         {
           "id": "payments",
           "title": "Payments, retries & dunning",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Payment methods, failures, retry strategy, recovery, grace periods"
+          "status": "rework",
+          "rounds": 2,
+          "note": "Simulated processor with real decline codes, smart retries and a recovery surface.",
+          "operability": 0.8,
+          "debt": 30,
+          "verdict": "Refunding an overpayment pays the customer twice and re-bills them \u2014 the same clamp the last fix removed, surviving one function down with the sign flipped."
         },
         {
           "id": "entitlements",
           "title": "Entitlements & feature gating",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Features, limits, real-time checks the product can call"
+          "status": "done",
+          "rounds": 2,
+          "note": "Features, limits and live usage-backed checks with a real upgrade path.",
+          "operability": 1.0,
+          "debt": 0
         },
         {
           "id": "revenue",
           "title": "Revenue reporting",
-          "status": "queued",
-          "rounds": 0,
-          "note": "MRR movement, churn, cohorts, deferred revenue, collections"
+          "status": "rework",
+          "rounds": 2,
+          "note": "MRR movement, churn, cohorts, deferred revenue and collections.",
+          "operability": 0.7,
+          "debt": 10,
+          "verdict": "Workspace MRR was computed from the first 200 subscriptions and summed across currencies: $200.00 reported where the answer was $57,417.83."
         }
       ]
     },
     {
-      "name": "Wave 3 \u00b7 Customer platform",
-      "status": "queued",
-      "note": "HubSpot parity for the people who actually work the business every day.",
+      "name": "Wave 3 \u00b7 The product surface",
+      "status": "active",
+      "note": "The audit\u2019s central finding: 224 of 228 API routes had no screen. This is where the effort now goes, judged on whether a human can finish the job.",
       "pieces": [
         {
-          "id": "records",
-          "title": "Contact, company & record pages",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Timeline, properties, associations, inline editing, activity"
+          "id": "billing-screens",
+          "title": "Subscriptions, customers & invoices",
+          "status": "critique",
+          "rounds": 1,
+          "operability": 0.75,
+          "debt": 6,
+          "note": "Live: 35 subscriptions with status pills, currency-bucketed totals and cancel-at-period-end badges. The proration preview is the centrepiece \u2014 the exact credit and charge lines before you commit."
         },
         {
-          "id": "deals",
-          "title": "Deals & pipelines",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Kanban, stages, weighted forecast, deal rooms"
+          "id": "crm-screens",
+          "title": "Contacts, companies & record pages",
+          "status": "critique",
+          "rounds": 1,
+          "operability": 0.75,
+          "debt": 6,
+          "note": "Live: 148 contacts under saved views, the full filter builder, coloured lifecycle stages, owner avatars and CSV export."
         },
         {
-          "id": "lists",
-          "title": "Lists & segmentation",
-          "status": "queued",
-          "rounds": 0,
-          "note": "A filter builder that handles real conditions, active and static lists"
+          "id": "pipeline-copilot",
+          "title": "Deals board & copilot",
+          "status": "building",
+          "rounds": 1,
+          "operability": 0.5,
+          "debt": 9,
+          "note": "A kanban that moves the deal, and a copilot whose every claim carries citations and every tool call is an inspectable step."
         },
         {
-          "id": "inbox",
-          "title": "Shared inbox & conversations",
+          "id": "revenue-screens",
+          "title": "Revenue, usage, credits & dunning",
           "status": "queued",
           "rounds": 0,
-          "note": "Threads, email, chat, assignment, snoozes, SLA timers"
-        },
-        {
-          "id": "tickets",
-          "title": "Support desk",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Tickets, queues, escalation, satisfaction"
-        },
-        {
-          "id": "marketing",
-          "title": "Campaigns, email & forms",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Campaign builder, email composer, forms, landing pages, attribution"
-        },
-        {
-          "id": "sequences",
-          "title": "Sequences",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Multi-step cadences with enrollment rules and reply detection"
-        },
-        {
-          "id": "reporting",
-          "title": "Reports & dashboards",
-          "status": "queued",
-          "rounds": 0,
-          "note": "A real report builder over every object, saved dashboards, charts"
+          "note": "The MRR waterfall, credit burn-down, and the recovery screen that makes money back. Lost to a container restart before it started."
         }
       ]
     },
     {
-      "name": "Wave 4 \u00b7 Autonomy",
-      "status": "queued",
-      "note": "The part that actually runs the business without a human in the loop.",
+      "name": "Wave P0 \u00b7 Criticals & blast radius",
+      "status": "active",
+      "note": "Every fix is now followed by an agent whose job is not to confirm it, but to hunt the same mistake in the reverse operation, the sibling call and the undo \u2014 because twice now a fix has created its own mirror image.",
       "pieces": [
         {
-          "id": "workflows",
-          "title": "Workflow automation",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Triggers, branches, delays, goals, enrollment, a visual builder that edits real workflows"
+          "id": "jobs",
+          "title": "Atomic job claim",
+          "status": "done",
+          "rounds": 1,
+          "operability": 1.0,
+          "debt": 0,
+          "note": "Two concurrent drains could both run one renewal, billing a period twice. Now UPDATE \u2026 WHERE status = pending; 3 of 4 new tests fail on the old code."
         },
         {
-          "id": "agents",
-          "title": "Autonomous agents",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Prospecting, support, success, finance and ops agents with runs, traces and approvals"
+          "id": "merge",
+          "title": "Rollups excluded from record merge",
+          "status": "done",
+          "rounds": 1,
+          "operability": 1.0,
+          "debt": 0,
+          "note": "Defining any max rollup broke dedupe permanently. The first regression test I wrote passed with and without the fix and proved nothing; the second one fails correctly."
         },
         {
-          "id": "copilot",
-          "title": "Copilot",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Ask anything about the business; grounded answers with citations and actions"
+          "id": "payments-money",
+          "title": "Refunds, overpayment & presentment",
+          "status": "building",
+          "rounds": 1,
+          "debt": 30,
+          "note": "A refunded overpayment paid twice, an ACH debit presented three times, an idempotency key returning another customer\u2019s intent."
         },
         {
-          "id": "insights",
-          "title": "Scoring & insights",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Lead score, health score, churn risk, next best action, forecast"
-        }
-      ]
-    },
-    {
-      "name": "Wave 5 \u00b7 Surfaces",
-      "status": "queued",
-      "note": "Where customers and developers meet the platform.",
-      "pieces": [
-        {
-          "id": "portal",
-          "title": "Customer billing portal",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Self-serve plan changes, payment methods, invoice history, cancel flow"
+          "id": "billing-tax-guard",
+          "title": "Untaxed invoices & MRR truncation",
+          "status": "building",
+          "rounds": 1,
+          "debt": 23,
+          "note": "Hold an invoice in draft when the tax location is unknown, stack US jurisdictions, and aggregate MRR over every subscription rather than the first page."
         },
         {
-          "id": "checkout",
-          "title": "Pricing, quotes & checkout",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Plan picker, quotes, a checkout that actually completes"
-        },
-        {
-          "id": "developers",
-          "title": "API, webhooks & SDK",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Signed webhook delivery with retries, an API reference, a typed SDK"
-        },
-        {
-          "id": "admin",
-          "title": "Settings & administration",
-          "status": "queued",
-          "rounds": 0,
-          "note": "Roles, teams, data quality, import/export, audit"
-        },
-        {
-          "id": "home",
-          "title": "Home, search & onboarding",
-          "status": "queued",
-          "rounds": 0,
-          "note": "The first screen, global search, notifications, a setup guide that knows what is done"
+          "id": "platform-safety",
+          "title": "Privilege, tenancy & client resilience",
+          "status": "building",
+          "rounds": 1,
+          "debt": 33,
+          "note": "A readonly session could write through the copilot; the time machine was process-global across tenants; one failed fetch blanked the whole app."
         }
       ]
     }

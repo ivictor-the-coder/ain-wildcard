@@ -31,17 +31,23 @@ const inFlight = tally('building') + tally('critique') + tally('rework');
 const rounds = all.reduce((n, p) => n + (p.rounds || 0), 0);
 const sentBack = all.reduce((n, p) => n + Math.max(0, (p.rounds || 0) - (p.status === 'done' ? 1 : 0)), 0);
 
-/* Round pips encode who won each blind comparison — the one fact that decides
-   whether a piece ships, so it gets the structural device. */
-const pips = (p) => {
-  const history = p.history && p.history.length
-    ? p.history
-    : Array.from({ length: p.rounds || 0 }, (_, i) => (p.status === 'done' && i === (p.rounds || 0) - 1 ? 'ain' : 'reference'));
-  if (!history.length) return '';
-  return `<span class="pips" title="${history.length} critic round${history.length === 1 ? '' : 's'}">${
-    history.map((h) => `<i class="pip ${h}" title="${h === 'ain' ? 'critic chose Ain' : h === 'tie' ? 'critic called it a tie' : 'critic chose the reference product'}"></i>`).join('')
-  }</span>`;
+/* Operability is the number that moves: of the capabilities a piece claims, how
+   many can a human actually complete through the UI. A verdict that only ever
+   printed "the reference product wins" could not distinguish a finished module
+   from one that merely had no crashes. */
+const meter = (p) => {
+  if (p.operability === undefined || p.operability === null) return '';
+  const pct = Math.round(p.operability * 100);
+  return `<span class="meter" title="Operability: ${pct}% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:${pct}%"></i></span>
+      <span class="meter__num">${pct}%</span>
+    </span>`;
 };
+
+const debt = (p) => (p.debt === undefined || p.debt === null ? '' :
+  `<span class="debt ${p.debt === 0 ? 'clear' : p.debt > 20 ? 'high' : 'some'}" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt ${p.debt}</span>`);
+
+const roundBadge = (p) => (p.rounds ? `<span class="rounds">${p.rounds} round${p.rounds === 1 ? '' : 's'}</span>` : '');
 
 const pieceRow = (p) => {
   const s = STATUS[p.status] || STATUS.queued;
@@ -51,7 +57,9 @@ const pieceRow = (p) => {
         <div class="row__head">
           <h3 class="row__title">${esc(p.title)}</h3>
           <span class="chip ${s.cls}">${s.label}</span>
-          ${pips(p)}
+          ${meter(p)}
+          ${debt(p)}
+          ${roundBadge(p)}
         </div>
         ${p.note ? `<p class="row__note">${esc(p.note)}</p>` : ''}
         ${p.verdict ? `<blockquote class="row__verdict"><span class="row__verdictlabel">Critic</span>${esc(p.verdict)}</blockquote>` : ''}
@@ -200,11 +208,14 @@ h1,h2,h3 { font-family:var(--font-display); margin:0; text-wrap:balance; }
 .chip.building, .chip.critique { color:var(--ours); border-color:var(--ours); background:var(--ours-soft); }
 .chip.rework { color:var(--warn); border-color:var(--warn); background:var(--warn-soft); }
 
-.pips { display:inline-flex; gap:3px; align-items:center; }
-.pip { width:7px; height:7px; border-radius:2px; display:block; }
-.pip.reference { background:var(--theirs); }
-.pip.ain { background:var(--ours); }
-.pip.tie { background:var(--line-2); }
+.meter { display:inline-flex; align-items:center; gap:6px; }
+.meter__track { width:54px; height:5px; border-radius:99px; background:var(--sunk); border:1px solid var(--line); overflow:hidden; display:block; }
+.meter__track i { display:block; height:100%; background:var(--ours); }
+.meter__num { font-family:var(--font-mono); font-size:11px; color:var(--ink-2); }
+.debt { font-family:var(--font-mono); font-size:10.5px; padding:1px 6px; border-radius:5px; border:1px solid var(--line-2); color:var(--ink-3); }
+.debt.clear { color:var(--good); border-color:var(--good); background:var(--good-soft); }
+.debt.some { color:var(--warn); border-color:var(--warn); background:var(--warn-soft); }
+.debt.high { color:var(--theirs); border-color:var(--theirs); background:var(--theirs-soft); }
 
 footer { margin-top:44px; padding-top:18px; border-top:1px solid var(--line); font-size:12.5px; color:var(--ink-3); max-width:74ch; }
 footer code { font-family:var(--font-mono); font-size:11.5px; color:var(--ink-2); }
@@ -230,14 +241,16 @@ footer code { font-family:var(--font-mono); font-size:11.5px; color:var(--ink-2)
     </div>
 
     <div class="legend">
-      <h4>Round pips</h4>
+      <h4>How a piece clears</h4>
       <ul>
-        <li><span class="pips"><i class="pip reference"></i></span> critic chose HubSpot / Stripe</li>
-        <li><span class="pips"><i class="pip ain"></i></span> critic chose Ain</li>
+        <li><b>Operability</b> &ge; 80% drivable</li>
+        <li><b>Zero P0</b> defects open</li>
+        <li>at most <b>two P1</b>, each owned</li>
+        <li>every fix has a test that <b>fails without it</b></li>
       </ul>
     </div>
 
-    <p class="rule">A piece clears only when a critic with <b>fresh context</b> ran the real software, compared it blind against the reference product, and picked ours with <b>zero blocking issues</b>. Builders never grade their own work.</p>
+    <p class="rule">The first gate asked a critic to pick us over Stripe with <b>zero</b> blocking issues. That is unsatisfiable for real software, so it printed "reference wins" 25 times running and told us nothing. It now measures <b>Operability</b> &mdash; can a human actually complete the job on screen &mdash; and <b>Defect Debt</b>, both of which move.</p>
   </aside>
 
   <main>
@@ -245,7 +258,7 @@ footer code { font-family:var(--font-mono); font-size:11.5px; color:var(--ink-2)
 
     <div class="strip">
       <div class="strip__bar" role="img" aria-label="${cleared} of ${all.length} pieces cleared">${segments}</div>
-      <div class="strip__meta"><span>${cleared} of ${all.length} pieces cleared</span><span>${sentBack} rework${sentBack === 1 ? '' : 's'} demanded</span></div>
+      <div class="strip__meta"><span>${cleared} of ${all.length} pieces cleared</span><span>${rounds} critic rounds</span></div>
     </div>
 
     ${state.waves.map(waveBand).join('')}
