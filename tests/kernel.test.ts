@@ -1,5 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { createApp, type App } from '../src/server/app';
 import type { Auth } from '../src/server/kernel/http';
 import { Db } from '../src/server/kernel/db';
@@ -1179,5 +1181,53 @@ describe('a session is only a session while the membership behind it exists', ()
     assert.equal(after.status, 401, `a removed admin wrote through his key (${after.status})`);
     assert.equal(notes(app, orgId), before + 1);
     app.close();
+  });
+});
+
+describe('the navigation registry cannot advertise a dead end', () => {
+  /**
+   * Read the client modules as source rather than importing them: the registry
+   * pulls in .css, which node cannot load, and this is a build-time property of
+   * the files anyway.
+   */
+  const readModules = () => {
+    const dir = join(process.cwd(), 'src/client/modules');
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => join(dir, d.name, 'routes.tsx'))
+      .filter((f) => existsSync(f))
+      .map((f) => readFileSync(f, 'utf8'));
+  };
+
+  const routes = () => readModules().flatMap((src) =>
+    [...src.matchAll(/\{[^{}]*?path:\s*'([^']+)'[^{}]*?\}/g)].map((m) => ({
+      path: m[1].replace(/\/+$/, '') || '/',
+      bare: /layout:\s*'bare'/.test(m[0]),
+    })));
+
+  const navTargets = () => readModules().flatMap((src) => {
+    const block = src.match(/export const nav[^=]*=\s*\[([\s\S]*?)\n\];/);
+    if (!block) return [];
+    return [...block[1].matchAll(/to:\s*'([^']+)'/g)].map((m) => m[1].split('?')[0].replace(/\/+$/, '') || '/');
+  });
+
+  test('no nav entry points at a route that drops the shell', () => {
+    const bare = new Set(routes().filter((r) => r.bare).map((r) => r.path));
+    const deadEnds = navTargets().filter((to) => bare.has(to));
+
+    // A `bare` route renders with no sidebar, no breadcrumbs, no command
+    // palette and no global key handler. That is right for sign-in and the
+    // customer portal, and wrong for anywhere the product's own navigation
+    // sends you — there is no way back out.
+    assert.deepEqual(deadEnds, [], `nav sends people to shell-less routes: ${deadEnds.join(', ')}`);
+  });
+
+  test('every nav destination resolves to a registered route', () => {
+    const known = routes().map((r) => r.path);
+    const prefixes = known.filter((p) => p.includes(':')).map((p) => p.split('/:')[0]);
+    const broken = navTargets().filter((to) =>
+      !known.includes(to) && !prefixes.some((prefix) => to.startsWith(prefix)));
+
+    assert.deepEqual(broken, [], `nav points at routes nothing registers: ${broken.join(', ')}`);
   });
 });

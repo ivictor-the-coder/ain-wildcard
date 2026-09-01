@@ -2614,7 +2614,7 @@ function DesignSystemPage() {
           </div>
         </aside>
 
-        <main className="sg__main" id="main" tabIndex={-1}>
+        <div className="sg__main">
           <header className="sg__topbar">
             <span className="sg__crumb">Ain · Design system</span>
             <span className="u-spacer" />
@@ -2699,14 +2699,14 @@ function DesignSystemPage() {
             <NavigationSection />
             <LayoutSection />
           </div>
-        </main>
+        </div>
       </div>
     </ToastProvider>
   );
 }
 
 export const routes: RouteDef[] = [
-  { path: '/design', element: DesignSystemPage, title: 'Design system', layout: 'bare' },
+  { path: '/design', element: DesignSystemPage, title: 'Design system' },
 ];
 
 export const nav: NavItem[] = [
