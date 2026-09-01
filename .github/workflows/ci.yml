@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # Only the default branch runs on push. Everything else is covered by the
+  # pull_request event, so a commit on a branch with an open PR is not built
+  # twice.
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
 
 concurrency:
