@@ -137,7 +137,7 @@ export function DealRecordPage({ id }: { id: string }) {
   const f = useDealFormat();
   const session = useSession();
   const toast = useToast();
-  const { navigate } = useRouter();
+  const { navigate, location, setQuery } = useRouter();
 
   const record = useQuery<DealDetail>(`/v1/records/deal/${encodeURIComponent(id)}`, { expand: 'timeline' });
   const history = useQuery<StageHistory>(`/v1/records/deal/${encodeURIComponent(id)}/stage-history`);
@@ -181,6 +181,23 @@ export function DealRecordPage({ id }: { id: string }) {
   );
 
   const [editing, setEditing] = useState<string | null>(null);
+  /**
+   * `?edit=Deal information` opens the edit form on that property group, and
+   * `?edit=1` opens the whole of it.
+   *
+   * It exists so a dead end elsewhere can hand over to the screen that works.
+   * The copilot cannot set a deal's amount or its owner — its write extractor
+   * reads a stage and nothing else — and until now the only thing it could say
+   * about that was "name the property and the value", which is advice the
+   * reader has already followed. This is the link it offers instead, and it
+   * lands with the field on screen rather than on a page to hunt through.
+   */
+  useEffect(() => {
+    const asked = location.query.edit;
+    if (!asked) return;
+    setEditing(asked === '1' ? '' : asked);
+    setQuery({ edit: undefined }, { replace: true });
+  }, [location.query.edit, setQuery]);
   const [logging, setLogging] = useState(false);
   const [move, setMove] = useState<PipelineStage | null>(null);
   const [archiving, setArchiving] = useState(false);
@@ -692,6 +709,7 @@ export function DealRecordPage({ id }: { id: string }) {
         pipelines={pipelines.data?.data ?? []}
         users={users.data?.data ?? []}
         focusGroup={editing || null}
+
         onClose={() => setEditing(null)}
         onSaved={refresh}
       />

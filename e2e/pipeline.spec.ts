@@ -2803,9 +2803,22 @@ test('a write prepared against a sibling of the deal that was named is stopped',
       const warned = await card.locator('.ain-banner--danger').count() > 0;
 
       if (preview.includes(named.display_name)) {
-        // Resolved correctly: no warning, and the button says what it always says.
+        // Resolved correctly: no warning about the target.
         expect(warned, `the right deal was targeted and the card cried wolf:\n${question}\n${preview}`).toBe(false);
-        await expect(card.getByRole('button', { name: 'Approve and run' })).toBeEnabled();
+        // And one click away — unless the card has a consequence of its own to
+        // put in front of the operator first, which is the other reason a write
+        // waits: a stage change that reopens or closes the deal, or one whose
+        // deal this card could not read. Then the acknowledgement is what
+        // enables it, and that is the point of it.
+        const straightThrough = card.getByRole('button', { name: 'Approve and run' });
+        if (await straightThrough.count()) await expect(straightThrough).toBeEnabled();
+        else {
+          const gated = card.getByRole('button', { name: 'Approve anyway' });
+          await expect(gated).toBeDisabled();
+          await card.locator('.ain-check__input').check();
+          await expect(gated).toBeEnabled();
+          await card.getByRole('button', { name: 'Decline' }).click();
+        }
       } else {
         misTargeted += 1;
         // Resolved to something else: the card has to say so, above the
@@ -3134,4 +3147,127 @@ test('the copilot composer is reachable without tabbing through every conversati
   // Typing a C into the box still types a C.
   await page.keyboard.type('cost');
   await expect(page.getByRole('textbox', { name: 'Ask the copilot' })).toHaveValue('cost');
+});
+
+/**
+ * A one-line stage change that puts a closed-lost deal back in the forecast.
+ *
+ * "Move the … first pilot attempt deal to Negotiation" is prepared as
+ * `update_record` with a two-line preview — the deal's name, and `Deal stage →
+ * negotiation`. Approving it moved five things: the stage, the status from lost
+ * to open, the forecast category from closed to commit, the probability from 0%
+ * to 80%, and $223,440 of business written off in March back into open pipeline
+ * and into the forecast. The operator approved "change the stage".
+ */
+test('a stage change that reopens a closed deal states it, and waits to be acknowledged', async ({ page, request }) => {
+  const pipelines = await getJson<{ data: PipelineDef[] }>(request, '/api/v1/pipelines/deal');
+  const deals = await getJson<DealList>(request, '/api/v1/records/deal?limit=200');
+  const lost = deals.data.find((row) => row.properties.deal_status === 'lost');
+  test.skip(!lost, 'nothing is closed lost on this workspace');
+  const home = pipelines.data.find((p) => p.name === lost!.properties.pipeline);
+  const reopenTo = home?.stages.find((s) => !s.is_closed && s.probability > 0);
+  test.skip(!reopenTo, 'that pipeline has no open stage to reopen into');
+
+  await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+  await page.getByRole('switch', { name: 'Let it prepare writes' }).click();
+  await page.getByRole('textbox', { name: 'Ask the copilot' })
+    .fill(`Move the ${lost!.display_name} deal to ${reopenTo!.label}`);
+  await page.getByRole('button', { name: 'Ask', exact: true }).click();
+  await expect(page.getByText('Waiting for your approval').first()).toBeVisible({ timeout: 40_000 });
+
+  const card = page.locator('.ain-card', { hasText: 'Waiting for your approval' }).first();
+  // Only when the engine actually prepared the write on the deal that was named.
+  const preview = await card.locator('.cp-approval__preview').innerText();
+  test.skip(!preview.includes(lost!.display_name), 'the engine prepared this against a different record');
+
+  // Every consequence, in the card, in those words.
+  const banner = card.locator('.ain-banner--danger').first();
+  await expect(banner).toBeVisible();
+  await expect(banner).toContainText('closed state');
+  await expect(banner).toContainText('reopens it');
+  await expect(banner).toContainText('Open pipeline gains');
+  await expect(banner).toContainText('forecast');
+
+  // And it is not one click away.
+  const approve = card.getByRole('button', { name: /^Approve/ });
+  await expect(approve).toBeDisabled();
+  await card.locator('.ain-check__input').check();
+  await expect(approve).toBeEnabled();
+
+  // Nothing was written, and the deal is where it was.
+  await card.getByRole('button', { name: 'Decline' }).click();
+  await expect(page.locator('.cp-resolution').last()).toBeVisible({ timeout: 30_000 });
+  const after = await deal(request, lost!.id);
+  expect(after.properties.deal_stage).toBe(lost!.properties.deal_stage);
+  expect(after.properties.deal_status).toBe('lost');
+});
+
+/**
+ * A thread that narrows every later question to an earlier question's subject.
+ *
+ * Ask about a teammate's pipeline, ask something unrelated, then ask "What is
+ * our open pipeline?" and the answer is one carried-over record's — $315,900
+ * against a workspace total of $9,010,960, with nothing on the card but a calm
+ * grey chip. The scope has to be visible and it has to come off.
+ */
+test('a scope carried between questions is shown, and can be taken off', async ({ page }) => {
+  await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+  const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
+  for (const question of ['How much open pipeline does Marcus Ilori own?', 'How many tickets are escalated?', 'What is our open pipeline?']) {
+    await composer.fill(question);
+    await composer.press('Enter');
+    await expect(page.locator('.cp-answer').last().locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
+    // The newest answer is typed out a character at a time, so its text is
+    // empty for the first second and a half. The caret is what says it is done.
+    await expect(page.locator('.cp-answer').last().locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+  }
+
+  const carried = page.locator('.cp-carried').last();
+  test.skip(await carried.count() === 0, 'this engine carried nothing between the turns');
+  // The composer says what the conversation will put on the next question.
+  await expect(carried).toContainText('This conversation is scoped to');
+
+  // And the answer itself says the figure is not the workspace's.
+  const answer = page.locator('.cp-answer').last();
+  await expect(answer.locator('.cp-carried').first()).toBeVisible();
+  await expect(answer.locator('.ain-banner--danger').first()).toContainText('scoped to a record you did not name');
+
+  // Taking it off re-asks the same question with nothing to inherit, and the
+  // figure changes to the workspace's own.
+  const before = (await answer.locator('.cp-answer__body').innerText()).trim();
+  expect(before, 'the carried answer never finished rendering').not.toBe('');
+  await answer.getByRole('button', { name: /Ask it without/ }).click();
+  const fresh = page.locator('.cp-answer').last();
+  await expect(fresh.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
+  await expect(fresh.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+  await expect(page.locator('.cp-carried')).toHaveCount(0);
+  expect((await fresh.locator('.cp-answer__body').innerText()).trim()).not.toBe(before);
+});
+
+/**
+ * A filter the plan invented, ANDed in, and reported as the answer.
+ *
+ * "How many deals did we close in Q2 2026?" is planned over the eight *open*
+ * stages and answers "0". No word of that sentence says "open". The banner
+ * beside it was right and not enough: a reader who has read the 0 has taken it.
+ */
+test('an answer measured with a filter nobody asked for is not shown as an answer', async ({ page, request }) => {
+  const deals = await getJson<DealList>(request, '/api/v1/records/deal?limit=200');
+  const closed = deals.data.filter((row) => {
+    const at = Number(row.properties.close_date ?? 0);
+    return ['won', 'lost'].includes(String(row.properties.deal_status))
+      && at >= Date.UTC(2026, 3, 1) && at < Date.UTC(2026, 6, 1);
+  });
+  test.skip(closed.length === 0, 'nothing closed in Q2 2026 on this workspace');
+
+  const answer = await askCopilot(page, 'How many deals did we close in Q2 2026?');
+  test.skip(!await scopeWasChecked(page, answer), 'the workspace vocabulary did not load, so nothing was checked');
+  const quarantine = answer.locator('.cp-quarantine');
+  test.skip(await quarantine.count() === 0, 'this engine no longer invents the filter');
+
+  await expect(answer.locator('.ain-banner--danger').first())
+    .toContainText('not an answer to the question you asked');
+  // The figure is kept and it is not in the answer slot: a closed disclosure.
+  await expect(quarantine).not.toHaveAttribute('open', '');
+  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0);
 });

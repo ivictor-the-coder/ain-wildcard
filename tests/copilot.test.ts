@@ -16,14 +16,26 @@ import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
 import {
-  agreeWithTheCount, correctPipelineDenial, correctedProse, misreadRefusal, propertyVocabulary,
-  reconcileScope, recordPhraseMismatch, scopeChips, warningSentence, withoutCurrencyClaim,
-  withoutWriteParameter,
+  agreeWithTheCount, correctPipelineDenial, correctedProse, isWiderName, metricsMeasured,
+  misreadRefusal, namedQualifiers, propertyVocabulary,
+  reconcileScope, recordPhraseMismatch, refusalDisprovedByThread, scopeChips, warningSentence,
+  withoutCurrencyClaim, withoutRefusedQualifier, withoutWriteParameter,
   type QualifierVerdict, type VocabPropertyDef, type Vocabulary,
 } from '../src/client/modules/copilot/scope-core';
-import { confidenceChip, refusalOf } from '../src/client/modules/copilot/answer-core';
-import { dedupeCitations } from '../src/client/modules/copilot/citations';
-import { approvalOutcome, runOutcome, type AiApproval } from '../src/client/modules/copilot/api';
+import {
+  carriedScope, confidenceChip, contradictsCarried, noWritePrepared, propertyAsked, refusalOf,
+} from '../src/client/modules/copilot/answer-core';
+import { dedupeCitations, writeTargetLabel } from '../src/client/modules/copilot/citations';
+import {
+  consequenceLines, dealNamedIn, editHref, linkedTargetOf, needsAcknowledgement, stageConsequences,
+  stageWriteOf, type DealNow,
+} from '../src/client/modules/copilot/write-core';
+import {
+  EMPTY_LEDGER, checkDunning, draftsFromAccount, ledgerFrom, ledgerTotal,
+} from '../src/client/modules/copilot/draft-core';
+import {
+  approvalOutcome, decidedBadge, runOutcome, type AiApproval,
+} from '../src/client/modules/copilot/api';
 
 /* ============================ the workspace ============================== */
 
@@ -779,5 +791,617 @@ describe('the records an answer was read from', () => {
       { id: 'tkt_nw_09', label: 'Dashboard loads slowly with 900 assets selected', type: 'ticket' },
     ];
     assert.deepEqual(dedupeCitations(rows).map((row) => row.id), ['tkt_nw_09', 'tkt_nw_11']);
+  });
+});
+
+/* ==================================================================== *
+ *  The second sweep: what a critic found beside the deal board.
+ *  Every fixture below is verbatim output from this engine against the
+ *  seeded Northwind workspace, captured from a booted app.
+ * ==================================================================== */
+
+/** The board with the numbers a stage change restamps, as `/v1/pipelines/deal` returns them. */
+const column = (pipeline: string, pipelineLabel: string) =>
+  (name: string, label: string, probability: number, forecastCategory: string, isClosed = false, isWon = false) =>
+    ({ pipeline, pipelineLabel, name, label, isClosed, isWon, probability, forecastCategory });
+
+const nbc = column('new_business', 'New business');
+const rnc = column('renewal', 'Renewal');
+
+const BOARD: Vocabulary = {
+  ...VOCAB,
+  pipelines: [
+    {
+      name: 'new_business',
+      label: 'New business',
+      stages: [
+        nbc('qualification', 'Qualification', 10, 'pipeline'),
+        nbc('discovery', 'Discovery', 25, 'pipeline'),
+        nbc('technical_validation', 'Technical validation', 45, 'pipeline'),
+        nbc('proposal', 'Proposal sent', 60, 'best_case'),
+        nbc('negotiation', 'Negotiation', 80, 'commit'),
+        nbc('closed_won', 'Closed won', 100, 'closed', true, true),
+        nbc('closed_lost', 'Closed lost', 0, 'closed', true, false),
+      ],
+    },
+    {
+      name: 'renewal',
+      label: 'Renewal',
+      stages: [
+        rnc('renewal_outreach', 'Renewal outreach', 40, 'pipeline'),
+        rnc('usage_review', 'Usage & value review', 60, 'best_case'),
+        rnc('commercial_terms', 'Commercial terms', 75, 'commit'),
+        rnc('negotiation', 'Negotiation', 90, 'commit'),
+        rnc('closed_won', 'Renewed', 100, 'closed', true, true),
+        rnc('closed_lost', 'Churned', 0, 'closed', true, false),
+      ],
+    },
+  ],
+};
+
+/* ========= P0 · approving a one-line stage change reopens a deal ========== */
+
+/**
+ * `deal_nw_15` — Pemberton Auto Systems — first pilot attempt.
+ *
+ * Closed lost at $223,440 in the New business pipeline, probability 0,
+ * forecast category `closed`. "Move the Pemberton Auto Systems — first pilot
+ * attempt deal to Negotiation" prepares `update_record` with `{properties:
+ * {deal_stage: "negotiation"}}` and a two-line preview:
+ *
+ *   Deal Pemberton Auto Systems — first pilot attempt
+ *   Deal stage → negotiation
+ *
+ * Approving it changed five things, read back off `/v1/records/deal/deal_nw_15`
+ * after the decision: stage closed_lost → negotiation, **deal_status lost →
+ * open**, forecast_category closed → commit, probability 0 → 80, and $223,440
+ * of business written off in March back in open pipeline and in the forecast.
+ * The card named one of the five.
+ */
+const LOST_DEAL: DealNow = {
+  id: 'deal_nw_15',
+  name: 'Pemberton Auto Systems — first pilot attempt',
+  stage: 'closed_lost',
+  status: 'lost',
+  amount: 22_344_000,
+  probability: 0,
+  forecastCategory: 'closed',
+};
+
+describe('a stage change that reopens a closed-lost deal', () => {
+  it('is read off the write and the record as a change of closed state', () => {
+    const write = stageWriteOf('update_record', {
+      object_type: 'deal', id: 'deal_nw_15', properties: { deal_stage: 'negotiation' },
+    });
+    assert.deepEqual(write, { recordId: 'deal_nw_15', objectType: 'deal', stage: 'negotiation' });
+
+    const c = stageConsequences(LOST_DEAL, 'negotiation', BOARD);
+    assert.equal(c.closedState, 'reopens');
+    assert.deepEqual(c.status, { from: 'lost', to: 'open' });
+    // Open pipeline counts an open deal at its whole amount and a closed one at
+    // nothing, so reopening this one puts all $223,440 back into it.
+    assert.equal(c.pipelineDelta, 22_344_000);
+    // The forecast counts it at the stage's own probability: 80% of $223,440.
+    assert.equal(c.forecastDelta, 17_875_200);
+    assert.deepEqual(c.probability, { from: 0, to: 80 });
+    assert.deepEqual(c.forecastCategory, { from: 'closed', to: 'commit' });
+  });
+
+  it('says so on the card in those words, before the money', () => {
+    const c = stageConsequences(LOST_DEAL, 'negotiation', BOARD);
+    const lines = consequenceLines(c, (minor) => `$${(minor / 100).toLocaleString('en-US')}`);
+    assert.equal(lines[0].kind, 'closed');
+    assert.match(lines[0].text, /closed state/);
+    assert.match(lines[0].text, /reopens it/);
+    const said = lines.map((line) => line.text).join(' ');
+    assert.match(said, /Status lost → open\./);
+    assert.match(said, /Open pipeline gains \$223,440/);
+    assert.match(said, /weighted forecast gains \$178,752/);
+    assert.match(said, /Forecast category closed → commit\./);
+  });
+
+  it('holds the Approve button until a person has acknowledged it', () => {
+    const c = stageConsequences(LOST_DEAL, 'negotiation', BOARD);
+    assert.equal(needsAcknowledgement(c, false), true);
+    // And when the deal could not be read at all, which is the other way a
+    // person can end up approving a reopening they were never shown.
+    assert.equal(needsAcknowledgement(null, true), true);
+  });
+
+  it('leaves an ordinary move between two open stages alone', () => {
+    const open: DealNow = {
+      id: 'deal_nw_46', name: 'Kilbride Dairy Systems — line 3 instrumentation',
+      stage: 'discovery', status: 'open', amount: 1_824_000, probability: 25, forecastCategory: 'pipeline',
+    };
+    const c = stageConsequences(open, 'negotiation', BOARD);
+    assert.equal(c.closedState, 'unchanged');
+    assert.equal(c.pipelineDelta, 0);
+    assert.equal(needsAcknowledgement(c, false), false);
+    assert.equal(consequenceLines(c, (m) => String(m)).some((line) => line.kind === 'closed'), false);
+  });
+
+  it('says a stage from another pipeline will fail before it is approved', () => {
+    // The engine prepared exactly this, and the tool answered `Failed:
+    // "commercial_terms" belongs to the Renewal pipeline, not New business.`
+    const open: DealNow = {
+      id: 'deal_nw_46', name: 'Kilbride Dairy Systems — line 3 instrumentation',
+      stage: 'negotiation', status: 'open', amount: 1_824_000, probability: 80, forecastCategory: 'commit',
+    };
+    const c = stageConsequences(open, 'commercial_terms', BOARD);
+    assert.equal(c.wrongPipeline, true);
+    assert.equal(needsAcknowledgement(c, false), true);
+  });
+
+  it('marks a close as a change of closed state too', () => {
+    const open: DealNow = {
+      id: 'deal_nw_50', name: 'Norbjerg Vindkraft — multi-site rollout',
+      stage: 'negotiation', status: 'open', amount: 10_442_000, probability: 80, forecastCategory: 'commit',
+    };
+    const c = stageConsequences(open, 'closed_lost', BOARD);
+    assert.equal(c.closedState, 'closes');
+    assert.equal(c.pipelineDelta, -10_442_000);
+    assert.match(consequenceLines(c, (m) => String(m))[0].text, /closed state/);
+  });
+});
+
+/* ============= P0 · a failed write badged "decided — written" ============= */
+
+describe('the badge on a decided write', () => {
+  const failed: Pick<AiApproval, 'status' | 'outcome'> = {
+    status: 'approved',
+    outcome: 'Failed: "commercial_terms" belongs to the Renewal pipeline, not New business. '
+      + 'New business stages: qualification, discovery, technical_validation, proposal, negotiation, closed_won, closed_lost.',
+  };
+  const landed: Pick<AiApproval, 'status' | 'outcome'> = {
+    status: 'approved',
+    outcome: 'object=record id=deal_nw_15 object_type=deal display_name=Pemberton Auto Systems — first pilot attempt',
+  };
+
+  it('does not call a refused write written', () => {
+    assert.deepEqual(decidedBadge([failed]), { label: 'decided — the write failed', tone: 'danger' });
+  });
+
+  it('still says written when the tool wrote', () => {
+    assert.deepEqual(decidedBadge([landed]), { label: 'decided — written', tone: 'success' });
+  });
+
+  it('says declined when nothing was approved', () => {
+    assert.deepEqual(decidedBadge([{ status: 'declined', outcome: null }]), { label: 'decided — declined', tone: 'neutral' });
+  });
+});
+
+/* ========== P0 · a dunning draft that states no money is owed ============= */
+
+/**
+ * Brightline Foods, `cmp_nw_04`, billing customer `cus_G68fGPXpftVKfbf8`.
+ *
+ * `GET /v1/invoices?status=open_like` holds NR-000032 for $127,840, due
+ * 2026-07-08 — 56 days before the workspace clock. `POST /v1/ai/draft` with
+ * that company's id writes the chase around those figures; with the id of one
+ * of its deals — the only kind of id this dialog has ever sent — it writes the
+ * body below, and the dialog offered it for logging.
+ */
+const BRIGHTLINE_LEDGER = ledgerFrom(
+  [{ number: 'NR-000032', amount_due: 12_784_000, currency: 'usd', due_date: Date.UTC(2026, 6, 8), status: 'open' }],
+  Date.UTC(2026, 8, 2),
+);
+
+const DEAL_ID_DRAFT = {
+  subject: 'No unpaid invoice on Brightline Foods — renewal + asset uplift — nothing to chase',
+  body: 'I have not drafted a chase for Brightline Foods — renewal + asset uplift: the billing ledger shows '
+    + 'no invoice with an amount still due on that account — every issued invoice is paid, void or draft. '
+    + 'Naming a bill that does not exist is worse than sending nothing, so there is no letter here.',
+};
+
+const ACCOUNT_DRAFT = {
+  subject: 'Invoice NR-000032 for Brightline Foods — $127,840.00 outstanding',
+  body: 'Hi Marlene,\n\nInvoice NR-000032 for $127,840.00 is still outstanding, due Jul 8, 2026 — 56 days ago.',
+};
+
+describe('a chase checked against the ledger it is about', () => {
+  it('reads the real figures off the real invoices', () => {
+    assert.equal(BRIGHTLINE_LEDGER.state, 'read');
+    assert.equal(BRIGHTLINE_LEDGER.bills.length, 1);
+    assert.equal(BRIGHTLINE_LEDGER.bills[0].number, 'NR-000032');
+    assert.equal(BRIGHTLINE_LEDGER.bills[0].amountDue, 12_784_000);
+    assert.equal(BRIGHTLINE_LEDGER.bills[0].daysOverdue, 56);
+    assert.equal(ledgerTotal(BRIGHTLINE_LEDGER), 12_784_000);
+  });
+
+  it('refuses the draft that declares $127,840 of 56-day-old debt paid', () => {
+    const verdict = checkDunning(DEAL_ID_DRAFT, BRIGHTLINE_LEDGER);
+    assert.equal(verdict.state, 'contradicted');
+    assert.match(verdict.state === 'contradicted' ? verdict.why : '', /nothing is owed/);
+  });
+
+  it('accepts the draft that names the invoice the ledger holds', () => {
+    assert.deepEqual(checkDunning(ACCOUNT_DRAFT, BRIGHTLINE_LEDGER), { state: 'ok' });
+  });
+
+  it('refuses to draft at all when the figures cannot be resolved', () => {
+    const verdict = checkDunning(ACCOUNT_DRAFT, { ...EMPTY_LEDGER, why: 'no billing customer' });
+    assert.equal(verdict.state, 'unresolved');
+  });
+
+  it('refuses a chase against an account that owes nothing', () => {
+    const clean = ledgerFrom([], Date.UTC(2026, 8, 2));
+    assert.equal(checkDunning(ACCOUNT_DRAFT, clean).state, 'contradicted');
+    // The engine's own "nothing to chase" is the truth for that account.
+    assert.deepEqual(checkDunning(DEAL_ID_DRAFT, clean), { state: 'ok' });
+  });
+
+  it('composes a chase from the account and everything else from the deal', () => {
+    assert.equal(draftsFromAccount('dunning'), true);
+    assert.equal(draftsFromAccount('follow_up'), false);
+  });
+});
+
+/* ====== P0 · a thread that narrows every later question to one record ===== */
+
+/**
+ * Three turns in one conversation, captured from a booted app.
+ *
+ *   1. "How much open pipeline does Marcus Ilori own?" → $1,878,120, correct.
+ *   2. "How many tickets are escalated?"               → carried Marcus Barnes.
+ *   3. "What is our open pipeline?"                    → $315,900.
+ *
+ * The workspace total is $9,010,960. Turn 3 is 28× out, scoped to a *contact*
+ * the reader never named, and the only thing on the card that said so was a
+ * calm grey chip reading `ACCOUNT · Marcus Barnes`.
+ */
+const CARRIED_RUN = {
+  reasoning: [
+    'No period in the question, and Open pipeline is measured as of now, so no reporting period applies.',
+    'Resolved 1 record: Marcus Barnes (contact, 0.66, trigram).',
+    '"this turn" names nothing on its own; carried Marcus Barnes from the previous turn, and the answer is scoped to it.',
+    'Metric: Open pipeline (matched "open pipeline", score 1).',
+  ],
+};
+
+describe('a scope inherited from an earlier question', () => {
+  it('is read out of the run and named', () => {
+    const held = carriedScope(CARRIED_RUN);
+    assert.equal(held?.subject, 'Marcus Barnes');
+    assert.equal(held?.pinned, false);
+  });
+
+  it('is a pinned record when that is where it came from', () => {
+    const held = carriedScope({
+      reasoning: ['"it" names nothing on its own; carried Brightline Foods from the record this conversation is pinned to, and the answer is scoped to it.'],
+    });
+    assert.equal(held?.subject, 'Brightline Foods');
+    assert.equal(held?.pinned, true);
+  });
+
+  it('is a contradiction when the question asks about the whole workspace', () => {
+    const held = carriedScope(CARRIED_RUN);
+    assert.equal(contradictsCarried('What is our open pipeline?', held), true);
+  });
+
+  it('is not a contradiction when the question names the carried record itself', () => {
+    const held = carriedScope(CARRIED_RUN);
+    assert.equal(contradictsCarried('What is our open pipeline on Marcus Barnes?', held), false);
+  });
+
+  it('is shown but not called a contradiction when the question names nothing either way', () => {
+    const held = carriedScope(CARRIED_RUN);
+    assert.equal(contradictsCarried('How many tickets are escalated?', held), false);
+    assert.equal(held?.subject, 'Marcus Barnes');
+  });
+
+  it('says nothing about a run that carried nothing', () => {
+    assert.equal(carriedScope({ reasoning: ['Metric: Open pipeline (matched "open pipeline", score 1).'] }), null);
+  });
+});
+
+/* ====== P0 · a filter nobody asked for, ANDed in, reported as 0 =========== */
+
+/**
+ * "How many deals did we close in Q2 2026?" — verbatim.
+ *
+ * The plan ANDed the eight open stages against the Q2 close-date window the
+ * question really did name, and answered "Northwind Robotics has 0 open deals
+ * closing in Q2 2026." The workspace closed 8 deals worth $613,760 in Q2. No
+ * word of the question produced the word "open".
+ */
+const INVENTED_CALL = {
+  name: 'record_aggregate',
+  arguments: {
+    object_type: 'deal',
+    measure: 'count',
+    conditions: [{ property: 'deal_stage', op: 'in', values: OPEN_STAGES }],
+    date_property: 'close_date',
+    start: Date.UTC(2026, 3, 1),
+    end: Date.UTC(2026, 6, 1),
+  },
+};
+
+describe('a filter no word of the question produced', () => {
+  const report = reconcileScope({
+    question: 'How many deals did we close in Q2 2026?',
+    prose: 'Northwind Robotics has 0 open deals closing in Q2 2026.',
+    toolCalls: [INVENTED_CALL],
+    reasoning: [
+      'Qualifier ledger settled: metric "How many deals" bound → record_aggregate; period "Q2 2026" bound → record_aggregate.',
+      'Ran record_aggregate in 2ms → 0.',
+    ],
+    vocab: VOCAB,
+  });
+
+  it('is named as a filter rather than only as a wider scope', () => {
+    assert.equal(report.invented.length, 1);
+    assert.equal(report.invented[0].kind, 'status');
+    assert.equal(report.invented[0].used, 'open deals only');
+    assert.equal(report.invented[0].asked, 'Closed deals');
+  });
+
+  it('keeps the warning that was already right', () => {
+    assert.equal(verdictOf(report.verdicts, 'status')?.state, 'substituted');
+  });
+
+  it('finds none where the measure the question named implies the filter', () => {
+    // "How much open pipeline does Marcus Ilori own?" runs over the same eight
+    // stages and says "open" because Open pipeline *is* the open stages.
+    const fine = reconcileScope({
+      question: 'How much open pipeline does Marcus Ilori own?',
+      prose: '$1,878,120 in open pipeline across 9 open deals owned by Marcus Ilori.',
+      toolCalls: [{
+        name: 'record_aggregate',
+        arguments: {
+          object_type: 'deal', measure: 'sum', property: 'amount',
+          conditions: [{ property: 'deal_stage', op: 'in', values: OPEN_STAGES }],
+          owner_id: 'usr_seed02',
+        },
+      }],
+      reasoning: [
+        'Qualifier ledger settled: metric "open pipeline" bound → record_aggregate; owner "Marcus Ilori" bound → record_aggregate.',
+        'Ran record_aggregate in 3ms → $1,878,120.',
+      ],
+      vocab: VOCAB,
+      resolveId: (id) => (id === 'usr_seed02' ? 'Marcus Ilori' : null),
+    });
+    assert.deepEqual(fine.invented, []);
+    assert.deepEqual(fine.unscoped, []);
+  });
+
+  it('finds none where the question named the stage the query used', () => {
+    const fine = reconcileScope({
+      question: 'How many deals are in Negotiation?',
+      prose: 'Northwind Robotics has 6 deals in Negotiation.',
+      toolCalls: [{
+        name: 'record_aggregate',
+        arguments: {
+          object_type: 'deal', measure: 'count',
+          conditions: [{ property: 'deal_stage', op: 'in', values: ['negotiation'] }],
+        },
+      }],
+      reasoning: ['Ran record_aggregate in 1ms → 6.'],
+      vocab: VOCAB,
+    });
+    assert.deepEqual(fine.invented, []);
+  });
+});
+
+/* ============ P1 · the reconciliation crying wolf on "close" ============== */
+
+/**
+ * "How much open pipeline do we expect to close this quarter?" — verbatim.
+ *
+ * The engine reads it exactly right: open deals now, close date inside Q3, and
+ * answers $4,014,120 across 16 deals. The surface then topped that correct
+ * answer with a red "You asked about closed deals. This figure counts open
+ * deals." and turned its STATUS chip red — because the verb "close" was read as
+ * the status, in a sentence whose own second word is "open".
+ */
+describe('a question that says "open pipeline" and the verb "close"', () => {
+  const answer = {
+    question: 'How much open pipeline do we expect to close this quarter?',
+    prose: '$4,014,120 in open pipeline across 16 open deals closing in Q3 2026.',
+    toolCalls: [{
+      name: 'record_aggregate',
+      arguments: {
+        object_type: 'deal', measure: 'sum', property: 'amount',
+        conditions: [{ property: 'deal_stage', op: 'in', values: OPEN_STAGES }],
+        date_property: 'close_date', start: Date.UTC(2026, 6, 1), end: Date.UTC(2026, 8, 31),
+      },
+    }],
+    reasoning: [
+      'Qualifier ledger settled: metric "open pipeline" bound → record_aggregate; period "this quarter" bound → record_aggregate.',
+      'Ran record_aggregate in 3ms → $4,014,120 (16 open deals).',
+    ],
+    vocab: VOCAB,
+  };
+
+  it('is not accused of asking about closed deals', () => {
+    const named = namedQualifiers(answer.question, VOCAB);
+    assert.equal(named.some((q) => q.kind === 'status' && q.value === 'closed'), false);
+    const report = reconcileScope(answer);
+    assert.equal(verdictOf(report.verdicts, 'status'), undefined);
+    assert.deepEqual(report.unscoped, []);
+    assert.deepEqual(report.invented, []);
+  });
+
+  it('leaves the status chip calm rather than red', () => {
+    const report = reconcileScope(answer);
+    const chips = scopeChips(report.answering[0], VOCAB, report.verdicts, {
+      window: () => 'Q3 2026', name: (id) => id,
+    });
+    assert.equal(chips.find((chip) => chip.kind === 'status')?.wide, false);
+  });
+
+  it('still hears "closed" when the question really is about closed deals', () => {
+    // The 0-for-8 substitution above depends on this staying true.
+    const named = namedQualifiers('How many deals did we close in Q2 2026?', VOCAB);
+    assert.equal(named.find((q) => q.kind === 'status')?.value, 'closed');
+  });
+});
+
+/* ======== P1 · a note or task prepared for a deal, landing on the account = */
+
+describe('the record a note or a task would land on', () => {
+  it('is read off the "Linked to" line of a task, wherever it sits', () => {
+    // `create_record` prepared for "the Sakamoto Seiki — packaging line uplift
+    // deal", associated to `cmp_nw_35` — the company.
+    const preview = [
+      'New task', 'Subject: Follow up with Sakamoto Seiki', 'Occurred at: Sep 2, 2026',
+      'Status: not_started', 'Task type: follow_up', 'Priority: medium', 'Due at: Sep 4, 2026',
+      'Owner id: usr_seed03', 'Linked to Sakamoto Seiki',
+    ];
+    assert.equal(writeTargetLabel('create_record', {}, preview), null);
+    assert.equal(linkedTargetOf(preview), 'Sakamoto Seiki');
+    const mismatch = recordPhraseMismatch(
+      'Create a task on the Sakamoto Seiki — packaging line uplift deal to call the CFO on Friday',
+      'Sakamoto Seiki',
+    );
+    assert.equal(mismatch?.used, 'Sakamoto Seiki');
+    assert.match(mismatch?.asked ?? '', /packaging line uplift/);
+    assert.equal(isWiderName(mismatch?.asked ?? '', 'Sakamoto Seiki'), true);
+  });
+
+  it('is read off a note the same way', () => {
+    assert.equal(linkedTargetOf(['Note on Ferro Norte Siderurgia', 'Subject: CFO signed off']), 'Ferro Norte Siderurgia');
+  });
+
+  it('names nothing when the preview names nothing', () => {
+    assert.equal(linkedTargetOf(['New task', 'Subject: Call someone']), null);
+  });
+});
+
+/* ========= P1 · a refusal this same conversation already disproved ======== */
+
+describe('a ranking refusal', () => {
+  const refusal = { code: 'qualifier_unbound', message: '1 qualifier could not be bound: metric "break".' };
+
+  it('is contradicted by an earlier turn that measured the same thing', () => {
+    const disproved = refusalDisprovedByThread(
+      refusal,
+      'Break open pipeline down by owner.',
+      VOCAB,
+      [{ question: 'Which account has the most open pipeline?', metrics: ['pipeline'] }],
+    );
+    assert.equal(disproved?.measure.id, 'pipeline');
+    assert.equal(disproved?.question, 'Which account has the most open pipeline?');
+  });
+
+  it('reads the measures a turn ran off its own arguments', () => {
+    assert.deepEqual(
+      metricsMeasured([{ name: 'business_metric', arguments: { metric: 'pipeline', group_by: 'account' } }]),
+      ['pipeline'],
+    );
+  });
+
+  it('stands where nothing in the thread has measured it', () => {
+    assert.equal(refusalDisprovedByThread(refusal, 'Break open pipeline down by owner.', VOCAB, []), null);
+    assert.equal(
+      refusalDisprovedByThread(refusal, 'Break open pipeline down by owner.', VOCAB,
+        [{ question: 'How many tickets are escalated?', metrics: ['tickets_created'] }]),
+      null,
+    );
+  });
+});
+
+/* ========== P1 · the copilot cannot set a deal's amount or owner ========== */
+
+describe('a write the engine could not prepare', () => {
+  const run = {
+    reasoning: [
+      'Intent act (confidence 99%, margin 4.08); signals: act.update "Set the" +4.08',
+      'No write prepared: the request looks like update_record, but I could not tell which property to set '
+        + '— name the property and the value, e.g. "move <deal> to Negotiation".',
+      'Ran account_profile in 6ms → Kilbride Dairy Systems.',
+    ],
+  };
+
+  it('is read as the fact it is rather than left as a dead end', () => {
+    assert.equal(noWritePrepared(run)?.tool, 'update_record');
+  });
+
+  it('knows which property the sentence named', () => {
+    assert.equal(propertyAsked('Set the amount on the Kilbride Dairy Systems — line 3 instrumentation deal to $2,000,000')?.property, 'amount');
+    assert.equal(propertyAsked('Change the owner of the Kilbride Dairy Systems — line 3 instrumentation deal to Marcus Ilori')?.property, 'owner_id');
+    assert.equal(propertyAsked('Move the deal to Negotiation'), null);
+  });
+
+  it('finds the one deal on the account the question named', () => {
+    const deals = [
+      { id: 'deal_nw_46', display_name: 'Kilbride Dairy Systems — line 3 instrumentation' },
+      { id: 'deal_nw_47', display_name: 'Kilbride Dairy Systems — line 2 monitoring' },
+    ];
+    assert.equal(
+      dealNamedIn('Set the amount on the Kilbride Dairy Systems — line 3 instrumentation deal to $2,000,000', deals)?.id,
+      'deal_nw_46',
+    );
+    // Two names both inside one sentence is the sibling problem, so it names neither.
+    assert.equal(dealNamedIn('Compare Kilbride Dairy Systems — line 3 instrumentation with Kilbride Dairy Systems — line 2 monitoring', deals), null);
+  });
+
+  it('links to the deal record with the group that holds the property', () => {
+    assert.equal(editHref('deal_nw_46', 'Deal information'), '/deals/deal_nw_46?edit=Deal%20information');
+    assert.equal(editHref('deal_nw_46', ''), '/deals/deal_nw_46?edit=1');
+  });
+});
+
+/* ======== P1 · a suggested starter question that produces no answer ======= */
+
+/**
+ * "Which support tickets need attention today?" is one of the five prompts
+ * this workspace prints on its own empty state, and this engine answers it:
+ * "You asked about the period 'today', and I could not apply it to anything I
+ * can measure." The same sentence without the word "today" returns all seven
+ * tickets that need attention. A suggested prompt is a promise.
+ */
+describe('a starter question the engine refuses', () => {
+  const refusal = { code: 'qualifier_unbound', message: '1 qualifier could not be bound: period "today".' };
+
+  it('is offered back without the qualifier that could not be bound', () => {
+    assert.equal(
+      withoutRefusedQualifier('Which support tickets need attention today?', refusal),
+      'Which support tickets need attention?',
+    );
+  });
+
+  it('drops a row cut-off the same way', () => {
+    assert.equal(
+      withoutRefusedQualifier('What is our top 2 pipeline by value?',
+        { code: 'qualifier_unbound', message: '1 qualifier could not be bound: limit "2".' }),
+      'What is our top pipeline by value?',
+    );
+  });
+
+  it('leaves a question whose head noun is what was refused alone', () => {
+    // "Which support tickets need?" is not a rephrasing of anything.
+    assert.equal(
+      withoutRefusedQualifier('Which support tickets need attention today?',
+        { code: 'qualifier_unbound', message: '1 qualifier could not be bound: status "attention".' }),
+      null,
+    );
+  });
+
+  it('offers nothing where there was no refusal', () => {
+    assert.equal(withoutRefusedQualifier('What is our open pipeline?', null), null);
+  });
+
+  /**
+   * The fifth starter prompt, refused by the same engine on one word.
+   *
+   * "How did bookings last quarter compare with the quarter before?" comes back
+   * `1 token unaccounted for: "before"`. Without that word it answers $334,840
+   * against $1,791,400 — the comparison the prompt promised.
+   */
+  it('drops a word the engine could not place at all', () => {
+    assert.equal(
+      withoutRefusedQualifier('How did bookings last quarter compare with the quarter before?',
+        { code: 'question_not_covered', message: '1 token unaccounted for: "before".' }),
+      'How did bookings last quarter compare with the quarter?',
+    );
+  });
+
+  it('never takes the grammar out of a sentence to do it', () => {
+    // "What open pipeline?" is not a question anybody would press.
+    assert.equal(
+      withoutRefusedQualifier('What is our open pipeline?',
+        { code: 'question_not_covered', message: '2 tokens unaccounted for: "our", "is".' }),
+      null,
+    );
   });
 });

@@ -117,6 +117,108 @@ export function parseBlocks(content: string): Block[] {
  * between an honest "I did not answer that" and a confident-looking paragraph
  * that happens to contain no numbers.
  */
+/* ------------------------- what the thread carried ------------------------ */
+
+/**
+ * A scope this answer inherited from an earlier question rather than from this
+ * one.
+ *
+ * The engine writes it in its own notes — `"this turn" names nothing on its
+ * own; carried Marcus Barnes from the previous turn, and the answer is scoped
+ * to it.` — and then answers "What is our open pipeline?" with $315,900, one
+ * contact's single deal, against a workspace total of $9,010,960. The prose
+ * mentions it in a closing sentence under the number, and the scope row draws a
+ * calm grey `ACCOUNT · Marcus Barnes` chip that reads as a scope the reader
+ * asked for.
+ *
+ * A thread that narrows every later question to an earlier question's subject
+ * has to say so where the reader is looking, and let them take it off.
+ */
+export interface CarriedScope {
+  /** The record the answer was scoped to. */
+  subject: string | null;
+  /** True when it came from the record the conversation is pinned to. */
+  pinned: boolean;
+  /** A measure carried forward from the question this one follows. */
+  measure: string | null;
+  /** The earlier question a carried measure came from. */
+  from: string | null;
+}
+
+const CARRIED_SUBJECT = /names nothing on its own; carried (.+?) from (the previous turn|the record this conversation is pinned to), and the answer is scoped to it\.?$/;
+const CARRIED_MEASURE = /names no measure of its own; carried (.+?) forward from "(.*)", the question it follows\.?$/;
+
+export function carriedScope(run: { reasoning?: string[] } | undefined | null): CarriedScope | null {
+  let subject: string | null = null;
+  let pinned = false;
+  let measure: string | null = null;
+  let from: string | null = null;
+  for (const line of run?.reasoning ?? []) {
+    const held = CARRIED_SUBJECT.exec(line.trim());
+    if (held) { subject = held[1].trim(); pinned = held[2].startsWith('the record'); continue; }
+    const inherited = CARRIED_MEASURE.exec(line.trim());
+    if (inherited) { measure = inherited[1].trim(); from = inherited[2].trim(); }
+  }
+  return subject || measure ? { subject, pinned, measure, from } : null;
+}
+
+/**
+ * Words that ask about the whole workspace, so a carried record contradicts them.
+ *
+ * "What is our open pipeline?" is a question about Northwind Robotics. Answered
+ * $315,900 for a contact carried in from two questions ago, it is wrong by
+ * 28×, and the only thing on the card that says which set it counted is a chip
+ * the size of a postage stamp.
+ */
+const WHOLE_WORKSPACE = /(^|[^a-z])(our|the workspace|across the workspace|company[ -]wide|overall|in total|altogether)([^a-z]|$)/i;
+
+/** Whether this question's own words contradict a scope carried into it. */
+export function contradictsCarried(question: string, carried: CarriedScope | null): boolean {
+  if (!carried?.subject) return false;
+  const text = question.toLowerCase();
+  if (text.includes(carried.subject.toLowerCase())) return false;
+  return WHOLE_WORKSPACE.test(text);
+}
+
+/* --------------------------- a write not prepared ------------------------- */
+
+/**
+ * A request to change something that the engine read and then did nothing with.
+ *
+ * "Set the amount on the Kilbride Dairy Systems — line 3 instrumentation deal
+ * to $2,000,000" comes back "I changed nothing… I could not tell which property
+ * to set — name the property and the value, e.g. 'move <deal> to Negotiation'."
+ * The property was named, in the first four words. The engine's write extractor
+ * only reads a stage, and the example it offers is the one thing it can already
+ * do — so the sentence is a dead end that reads like the reader's mistake.
+ *
+ * It is a fact worth keeping and a bad last word, so the fact is kept and the
+ * surface hands over the screen where the property really can be set.
+ */
+const NO_WRITE = /^No write prepared: the request looks like ([a-z_]+), but (.+)$/;
+
+export function noWritePrepared(run: { reasoning?: string[] } | undefined | null): { tool: string; why: string } | null {
+  for (const line of run?.reasoning ?? []) {
+    const match = NO_WRITE.exec(line.trim());
+    if (match) return { tool: match[1].replace(/\s+/g, '_'), why: match[2] };
+  }
+  return null;
+}
+
+/** The deal properties this product can set, in the words a question writes them. */
+const SETTABLE: { word: RegExp; property: string; label: string; group: string }[] = [
+  { word: /\b(amount|value|deal size|acv|price)\b/i, property: 'amount', label: 'the amount', group: 'Deal information' },
+  { word: /\b(owner|owned by|assign(?:ee|ed)?|rep)\b/i, property: 'owner_id', label: 'the owner', group: '' },
+  { word: /\b(close date|closing date|expected close)\b/i, property: 'close_date', label: 'the close date', group: 'Deal information' },
+  { word: /\b(next step)\b/i, property: 'next_step', label: 'the next step', group: 'Sales' },
+];
+
+/** The property a request named that the engine could not prepare a write for. */
+export function propertyAsked(question: string): { property: string; label: string; group: string } | null {
+  const found = SETTABLE.find((row) => row.word.test(question));
+  return found ? { property: found.property, label: found.label, group: found.group } : null;
+}
+
 export function refusalOf(run: { reasoning?: string[] } | undefined | null): { code: string; message: string } | null {
   for (const line of run?.reasoning ?? []) {
     // "Refused (period_unresolved): …" and "Refused after the run

@@ -590,3 +590,81 @@ a.cp-chip { text-decoration: none; }
   letter-spacing: var(--tracking-wide);
   color: var(--text-tertiary);
 }
+
+/* -------------------------- carried thread scope -------------------------- */
+
+/*
+ * The scope a thread puts on questions that name none of their own.
+ *
+ * It is drawn as a row rather than folded into the scope bar because it is not
+ * something the query decided: it is something the conversation decided, and
+ * the only control over it is here.
+ */
+.cp-carried {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  padding: var(--space-2) var(--space-3);
+  border: 1px dashed var(--border-warning, var(--border-strong));
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+}
+.cp-carried--composer {
+  margin-bottom: var(--space-3);
+}
+.cp-carried__label {
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-tertiary);
+}
+.cp-carried__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  max-width: 100%;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  background: var(--bg-surface);
+  font-size: var(--text-xs);
+  color: var(--text-primary);
+}
+.cp-carried__from {
+  color: var(--text-tertiary);
+  font-size: var(--text-2xs);
+}
+.cp-carried__drop {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--text-link, var(--text-secondary));
+  font: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.cp-carried__drop:hover { background: var(--bg-hover); }
+.cp-carried__drop:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+/* --------------------------- a quarantined answer ------------------------- */
+
+/*
+ * A figure measured with a filter nobody asked for is not printed in the
+ * answer slot. It is kept — throwing away what the engine returned would be
+ * worse — behind a summary that says what it actually is.
+ */
+.cp-quarantine > summary {
+  color: var(--text-danger, var(--text-secondary));
+}
+.cp-quarantine[open] > summary {
+  margin-bottom: var(--space-3);
+}

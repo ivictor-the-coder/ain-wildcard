@@ -11,7 +11,7 @@
  * as one. Neither is dressed up.
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { api, invalidate, useMutation, type ApiClientError } from '@/client/kernel/api';
+import { api, invalidate, useMutation, useQuery, type ApiClientError, type ListEnvelope } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import { useSession } from '@/client/kernel/session';
 import {
@@ -20,10 +20,13 @@ import {
   humanize, useFormat, useHotkey, usePrefersReducedMotion, useToast, type MenuSection, type SelectOption,
 } from '@/client/design';
 import {
-  boardHref, carriedThrough, correctedProse, dedupeCitations, deniedPipeline, misreadRefusal, parseBlocks,
-  parseBreakdown,
-  reconcileBreakdown, reconcileScope,
+  boardHref, carriedScope, carriedThrough, contradictsCarried, correctedProse, decidedBadge,
+  dealNamedIn, dedupeCitations, deniedPipeline, editHref, metricsMeasured, misreadRefusal,
+  noWritePrepared,
+  parseBlocks, parseBreakdown, propertyAsked,
+  reconcileBreakdown, reconcileScope, refusalDisprovedByThread,
   refusalOf, rephraseAsBreakdown, splitToolEcho, useAiStatus, useAllApprovals, useSuggestions,
+  withoutRefusedQualifier,
   useThread, useThreads,
   useTools, useRun, useVocabulary, withoutBreakdown,
   type AiApproval, type AiMessage, type AiReply, type AiRun, type AiThread,
@@ -151,9 +154,10 @@ function TracePanel({ runId }: { runId: string }) {
 }
 
 function AssistantMessage({
-  message, run, approvals, newest, question, vocab, vocabUnread, vocabPartial, vocabLoading, onDecided,
+  message, run, approvals, newest, question, suggested, priors, vocab, vocabUnread, vocabPartial, vocabLoading,
+  onDecided,
   onOpenRun,
-  onAsk, onOpenRecords,
+  onAsk, onAskFresh, onOpenRecords,
 }: {
   message: AiMessage;
   run: AiRun | undefined;
@@ -161,6 +165,10 @@ function AssistantMessage({
   newest: boolean;
   /** The question this answer answers, as the run recorded it. */
   question: string;
+  /** True when this workspace offered the question as a starter prompt. */
+  suggested: boolean;
+  /** What earlier turns in this thread measured, so a refusal can be held to them. */
+  priors: { question: string; metrics: string[] }[];
   vocab: Vocabulary;
   /** True when the pipelines, teammates or metrics could not be read. */
   vocabUnread: boolean;
@@ -172,6 +180,8 @@ function AssistantMessage({
   onOpenRun: (id: string) => void;
   /** Puts a suggested rephrasing back into the thread as the next question. */
   onAsk: (question: string) => void;
+  /** Asks the same question in a new conversation, so nothing is carried into it. */
+  onAskFresh: (question: string) => void;
   /** Opens a screen this answer pointed at but could not measure over. */
   onOpenRecords: (href: string) => void;
 }) {
@@ -229,6 +239,15 @@ function AssistantMessage({
   // a refusal: a question that was answered does not need rewording.
   const rephrase = useMemo(() => rephraseAsBreakdown(question, vocab), [question, vocab]);
 
+  /**
+   * The same question without the qualifier the engine could not bind.
+   *
+   * "Which support tickets need attention today?" is one of this product's own
+   * five starter prompts and this engine refuses it on the word "today". The
+   * same sentence without it answers with all seven tickets.
+   */
+  const dropped = useMemo(() => withoutRefusedQualifier(question, refusal), [question, refusal]);
+
   // A pipeline the answer says this workspace does not have, that it does.
   const denied = useMemo(() => deniedPipeline(prose, vocab), [prose, vocab]);
 
@@ -236,6 +255,40 @@ function AssistantMessage({
   // "open pipeline" refused as an unbindable *status*, one line under a chip
   // offering the rephrasing that answers it perfectly.
   const misread = useMemo(() => misreadRefusal(refusal, vocab), [refusal, vocab]);
+
+  // And the other disproof, which is stronger because the reader watched it
+  // happen: this same conversation already measured the thing the refusal says
+  // it cannot bind. "Break open pipeline down by owner." is refused for the
+  // word "break", two turns after open pipeline was computed and ranked.
+  const disproved = useMemo(
+    () => refusalDisprovedByThread(refusal, question, vocab, priors),
+    [refusal, question, vocab, priors],
+  );
+
+  /**
+   * The scope this turn inherited from an earlier one.
+   *
+   * The engine writes it in its own notes and then answers "What is our open
+   * pipeline?" with one carried-over contact's single deal. The chip states it
+   * where the reader is looking, and takes it off in one press by asking the
+   * same question in a conversation with no history to inherit.
+   */
+  const inherited = useMemo(() => carriedScope(run), [run]);
+  const inheritedContradicted = inherited ? contradictsCarried(question, inherited) : false;
+
+  // A request to set a property the engine's write extractor cannot read. The
+  // deal is found on the account it did cite, so the dead end becomes a link
+  // to the screen where the property is editable.
+  const noWrite = useMemo(() => noWritePrepared(run), [run]);
+  const wanted = noWrite ? propertyAsked(question) : null;
+  const account = wanted ? citations.find((c) => c.type === 'company' || c.type === 'customer_company') : undefined;
+  const accountDeals = useQuery<ListEnvelope<{ id: string; display_name: string }>>(
+    account ? '/v1/records/deal' : null,
+    account ? { q: account.label, limit: 25 } : undefined,
+  );
+  const settable = wanted && accountDeals.data
+    ? dealNamedIn(question, accountDeals.data.data)
+    : null;
 
   /**
    * The engine's own sentences, with the ones this card disproves corrected.
@@ -261,7 +314,16 @@ function AssistantMessage({
   // The breakdown sentence is lifted out of the prose so it can be reconciled
   // against the board rather than read as a settled list of stage figures.
   const body = breakdown ? withoutBreakdown(corrected) : corrected;
-  const { shown, done } = useReveal(body, newest);
+  /**
+   * An answer with a filter nobody asked for in it is not shown as an answer.
+   *
+   * "How many deals did we close in Q2 2026?" is planned over the eight *open*
+   * stages and answers "0". The banner above says so; a reader who has read the
+   * 0 has already taken the 0, which is why the prose goes behind a disclosure
+   * that names what it actually measured rather than sitting in the answer slot.
+   */
+  const quarantined = scope.invented.length > 0 && scope.answering.length > 0;
+  const { shown, done } = useReveal(body, newest && !quarantined);
 
   // The prose was composed when the engine stopped: it says "Nothing has been
   // written" and always will. Once a decision has been made it is history, not
@@ -281,9 +343,7 @@ function AssistantMessage({
           {(waiting.length > 0 || (run?.status === 'needs_approval' && approvals.length === 0))
             && <Badge tone="warning" size="sm">waiting for approval</Badge>}
           {superseded && (
-            <Badge tone={decided.some((a) => a.status === 'approved') ? 'success' : 'neutral'} size="sm">
-              {decided.some((a) => a.status === 'approved') ? 'decided — written' : 'decided — declined'}
-            </Badge>
+            <Badge tone={decidedBadge(decided).tone} size="sm">{decidedBadge(decided).label}</Badge>
           )}
           {run?.status === 'failed' && <Badge tone="danger" size="sm">failed</Badge>}
           <span>{f.relative(message.created)}</span>
@@ -309,13 +369,70 @@ function AssistantMessage({
           </Banner>
         )}
 
-        {refusal && !misread && (
-          <Banner tone="warning" title="The engine refused to answer this one" bar>
-            {refusal.message}
-            {' '}
-            <span className="cp-mono">({refusal.code})</span>
+        {refusal && !misread && disproved && (
+          <Banner tone="danger" bar title="This conversation has already answered that">
+            <p>
+              It says it cannot bind what you asked for. <strong>{disproved.measure.label}</strong> is a
+              measure this workspace publishes, and this thread computed it{' '}
+              {priors.length === 1 ? 'one question ago' : 'earlier'} — for “{disproved.question}”. The
+              refusal below is about the wording, not about the measure.
+            </p>
+            <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
+              {refusal.message} <span className="cp-mono">({refusal.code})</span>
+            </p>
+            {rephrase && <RephraseLink question={rephrase} onAsk={onAsk} />}
+            {dropped && <RephraseLink question={dropped} onAsk={onAsk} />}
+            {board && <BoardLink board={board} />}
+          </Banner>
+        )}
+
+        {refusal && !misread && !disproved && (
+          <Banner
+            tone={suggested ? 'danger' : 'warning'}
+            bar
+            title={suggested
+              ? 'This was one of the suggested questions, and it did not answer'
+              : 'The engine refused to answer this one'}
+          >
+            {suggested && (
+              <p>
+                A prompt this workspace offered you is a promise. This one was refused
+                {dropped ? ', and the same question without the part it could not place answers it:' : '.'}
+              </p>
+            )}
+            <p className={suggested ? 'cp-note' : undefined} style={suggested ? { marginTop: 'var(--space-3)' } : undefined}>
+              {refusal.message} <span className="cp-mono">({refusal.code})</span>
+            </p>
+            {dropped && <RephraseLink question={dropped} onAsk={onAsk} />}
             {rephrase && <RephraseLink question={rephrase} onAsk={onAsk} />}
             {board && <BoardLink board={board} />}
+          </Banner>
+        )}
+
+        {noWrite && wanted && (
+          <Banner tone="warning" bar title={`The copilot cannot set ${wanted.label} on a deal`}>
+            <p>
+              It reads a stage change and nothing else, so it prepared no write and changed nothing.
+              {settable
+                ? ' The field is editable on the deal itself:'
+                : ' Open the deal and edit it there.'}
+            </p>
+            {settable && (
+              <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
+                <a
+                  className="cp-chip"
+                  href={editHref(settable.id, wanted.group)}
+                  onClick={(e) => {
+                    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+                    e.preventDefault();
+                    onOpenRecords(editHref(settable.id, wanted.group));
+                  }}
+                >
+                  <Icons.edit size={12} />
+                  <span className="u-truncate">Set {wanted.label} on {settable.display_name}</span>
+                </a>
+              </p>
+            )}
           </Banner>
         )}
 
@@ -338,6 +455,61 @@ function AssistantMessage({
               <Icons.tickets size={12} />
               <span className="u-truncate">Open the {denied.objectType}s</span>
             </a>
+          </Banner>
+        )}
+
+        {inherited?.subject && (
+          <div className="cp-carried">
+            <span className="cp-carried__label">Carried into this question</span>
+            <span className="cp-carried__chip">
+              <Icons.link size={11} />
+              <span className="u-truncate">{inherited.subject}</span>
+              <span className="cp-carried__from">
+                {inherited.pinned ? 'this conversation’s record' : 'the question before it'}
+              </span>
+            </span>
+            <button
+              type="button"
+              className="cp-carried__drop"
+              onClick={() => onAskFresh(question)}
+              title={`Ask “${question}” in a new conversation, where nothing is carried in`}
+            >
+              <Icons.x size={11} />
+              Ask it without {inherited.subject}
+            </button>
+          </div>
+        )}
+
+        {inheritedContradicted && inherited?.subject && (
+          <Banner tone="danger" bar title="This answer is scoped to a record you did not name">
+            <p>
+              You asked about the whole workspace. The answer below was measured for{' '}
+              <strong>{inherited.subject}</strong> alone, carried in from{' '}
+              {inherited.pinned ? 'the record this conversation is pinned to' : 'an earlier question'} —
+              so the figure is one record’s, not Northwind Robotics’s.
+            </p>
+          </Banner>
+        )}
+
+        {scope.invented.length > 0 && scope.answering.length > 0 && (
+          <Banner tone="danger" bar title="This is not an answer to the question you asked">
+            <p>
+              The query narrowed on something no word of your question named, and then reported the
+              figure as the answer:
+            </p>
+            <ul className="cp-scope__reasons">
+              {scope.invented.map((filter) => (
+                <li key={`${filter.kind}:${filter.used}`}>
+                  It filtered to <strong>{filter.used}</strong> and ANDed that into the query. No word of
+                  your question produced that {filter.kind} filter — you asked about{' '}
+                  {filter.asked.toLowerCase()}.
+                </li>
+              ))}
+            </ul>
+            <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
+              The figure is held back rather than printed as an answer to a question it did not answer.
+            </p>
+            {board && <BoardLink board={board} />}
           </Banner>
         )}
 
@@ -382,11 +554,20 @@ function AssistantMessage({
 
         <ScopeBar report={scope} vocab={vocab} loading={vocabLoading} unread={vocabUnread} />
 
-        <div className={superseded ? 'cp-superseded' : undefined}>
-          <AnswerBody content={shown} revealing={!done} />
-        </div>
+        {quarantined ? (
+          <details className="cp-details cp-quarantine">
+            <summary>Show the figure the engine returned, and what it measured instead</summary>
+            <div className={superseded ? 'cp-superseded' : undefined}>
+              <AnswerBody content={body} revealing={false} />
+            </div>
+          </details>
+        ) : (
+          <div className={superseded ? 'cp-superseded' : undefined}>
+            <AnswerBody content={shown} revealing={!done} />
+          </div>
+        )}
 
-        {done && breakdown && <BreakdownPanel report={breakdown.report} pipeline={breakdown.pipeline} />}
+        {done && !quarantined && breakdown && <BreakdownPanel report={breakdown.report} pipeline={breakdown.pipeline} />}
 
         {done && <ToolEchoes echoes={echoes} notes={notes} />}
 
@@ -459,6 +640,9 @@ export function CopilotPage() {
   const [pendingQuestion, setPendingQuestion] = useState<string | null>(null);
   const [newestMessage, setNewestMessage] = useState<string | null>(null);
   const [drafting, setDrafting] = useState(location.query.draft === '1');
+  // Set by the "drop it" control on the thread's carried-scope chip: the next
+  // question is asked where there is no earlier turn to inherit a subject from.
+  const [dropScope, setDropScope] = useState(false);
   const [renaming, setRenaming] = useState<AiThread | null>(null);
   const [renameTo, setRenameTo] = useState('');
   const renameField = useRef<HTMLInputElement>(null);
@@ -510,6 +694,38 @@ export function CopilotPage() {
     return '';
   }, [messages, runsById]);
 
+  /**
+   * What every earlier turn in this thread actually measured.
+   *
+   * A refusal that says a measure cannot be bound is disproved by this thread
+   * having computed it two questions ago, and that is the disproof a reader can
+   * check without leaving the screen.
+   */
+  const priorsFor = useCallback((index: number): { question: string; metrics: string[] }[] => {
+    const out: { question: string; metrics: string[] }[] = [];
+    for (let i = 0; i < index; i += 1) {
+      const earlier = messages[i];
+      if (earlier.role !== 'assistant') continue;
+      const metrics = metricsMeasured(earlier.tool_calls ?? []);
+      if (!metrics.length) continue;
+      const run = earlier.run_id ? runsById.get(earlier.run_id) : undefined;
+      out.push({ question: run?.question ?? messages[i - 1]?.content ?? '', metrics });
+    }
+    return out;
+  }, [messages, runsById]);
+
+  /** The scope this thread is currently carrying into questions that name none. */
+  const threadScope = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].role !== 'assistant') continue;
+      const run = messages[i].run_id ? runsById.get(messages[i].run_id as string) : undefined;
+      const held = carriedScope(run);
+      if (held?.subject) return held;
+      return null;
+    }
+    return null;
+  }, [messages, runsById]);
+
   useEffect(() => {
     const node = streamRef.current;
     if (node) node.scrollTop = node.scrollHeight;
@@ -545,6 +761,18 @@ export function CopilotPage() {
   useHotkey('c', () => composerRef.current?.focus());
 
 
+  /**
+   * The questions this workspace offers on its own empty state.
+   *
+   * They are printed as a promise — press one and get an answer — so a refusal
+   * on one of them is a different, louder failure than a refusal on a sentence
+   * somebody typed, and the card says which it is.
+   */
+  const starters = useMemo(
+    () => new Set((suggestions.data?.data ?? []).map((row) => row.question)),
+    [suggestions.data],
+  );
+
   const visibleThreads = useMemo(() => {
     const needle = filter.trim().toLowerCase();
     return needle ? list.filter((row) => row.title.toLowerCase().includes(needle)) : list;
@@ -556,9 +784,9 @@ export function CopilotPage() {
     invalidate(`/v1/ai/threads/${threadId}`, '/v1/ai/threads', '/v1/ai/approvals', '/v1/ai/runs', '/v1/ai/status');
   }, []);
 
-  const send = useMutation<string, { threadId: string; messageId: string | null }>(
-    async (content) => {
-      if (selected) {
+  const send = useMutation<{ content: string; fresh?: boolean }, { threadId: string; messageId: string | null }>(
+    async ({ content, fresh }) => {
+      if (selected && !fresh) {
         const reply = await api.post<AiReply>(`/v1/ai/threads/${encodeURIComponent(selected)}/messages`, {
           content,
           ...(allowWrites ? { allow_writes: true } : {}),
@@ -695,19 +923,31 @@ export function CopilotPage() {
     },
   ], [f, setStatusOf]);
 
-  const ask = useCallback((question: string) => {
+  /**
+   * Ask, optionally in a conversation with no history to inherit.
+   *
+   * `fresh` is what the carried-scope chip's × does. The engine carries a
+   * subject forward whenever a turn names none of its own, and there is no
+   * per-message way to tell it not to — so the way to ask a question with
+   * nothing carried into it is to ask it where there is nothing to carry.
+   */
+  const askIn = useCallback((question: string, fresh: boolean) => {
     const content = question.trim();
     if (!content || send.loading) return;
     setDraft('');
+    setDropScope(false);
     setPendingQuestion(content);
     // The engine blipping is not a reason to lose the sentence a person typed.
     // It goes back in the box — unless they have already typed something else —
     // with the caret in it, so Enter retries.
-    void send.run(content).catch(() => {
+    void send.run({ content, fresh }).catch(() => {
       setDraft((current) => current || content);
       requestAnimationFrame(() => composerRef.current?.focus());
     });
   }, [send]);
+
+  const ask = useCallback((question: string) => askIn(question, dropScope), [askIn, dropScope]);
+  const askFresh = useCallback((question: string) => askIn(question, true), [askIn]);
 
   const startNew = () => {
     setQuery({ thread: undefined, new: '1' });
@@ -946,6 +1186,8 @@ export function CopilotPage() {
                   approvals={approvalsFor(message.run_id)}
                   newest={message.id === newestMessage && index === messages.length - 1}
                   question={questionFor(message, index)}
+                  suggested={starters.has(questionFor(message, index))}
+                  priors={priorsFor(index)}
                   vocab={vocabulary.vocab}
                   vocabUnread={!!vocabulary.error}
                   vocabPartial={vocabulary.partial}
@@ -953,6 +1195,7 @@ export function CopilotPage() {
                   onDecided={() => { if (selected) refreshAfterAnswer(selected); }}
                   onOpenRun={(id) => navigate(`/copilot/runs/${id}`)}
                   onAsk={ask}
+                  onAskFresh={askFresh}
                   onOpenRecords={navigate}
                 />
               )
@@ -973,6 +1216,40 @@ export function CopilotPage() {
               </>
             )}
           </div>
+
+          {/* The scope this thread will put on the next question that names
+              none of its own, before it is asked rather than after. Removing it
+              is the only way to ask an unscoped question here: the engine
+              carries a subject forward whenever a turn resolves nothing, and no
+              message parameter turns that off. */}
+          {threadScope?.subject && !composing && (
+            <div className="cp-carried cp-carried--composer">
+              <span className="cp-carried__label">This conversation is scoped to</span>
+              <span className="cp-carried__chip">
+                <Icons.link size={11} />
+                <span className="u-truncate">{threadScope.subject}</span>
+              </span>
+              {dropScope ? (
+                <span className="cp-note">
+                  Dropped — your next question starts a new conversation, so nothing is carried into it.
+                  {' '}
+                  <button type="button" className="cp-carried__drop" onClick={() => setDropScope(false)}>
+                    Keep it after all
+                  </button>
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="cp-carried__drop"
+                  onClick={() => setDropScope(true)}
+                  title={`Questions that name no record are answered for ${threadScope.subject}. Drop it and the next one is asked with nothing carried in.`}
+                >
+                  <Icons.x size={11} />
+                  Drop it
+                </button>
+              )}
+            </div>
+          )}
 
           {/* The landmark the skip link targets. Its name is deliberately not
               "Ask the copilot" — that is the textarea's own name, and two things

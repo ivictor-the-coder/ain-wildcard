@@ -25,7 +25,18 @@
 
 /* ------------------------------- vocabulary ------------------------------- */
 
-export interface VocabStage { pipeline: string; pipelineLabel: string; name: string; label: string; isClosed: boolean; isWon: boolean }
+export interface VocabStage {
+  pipeline: string;
+  pipelineLabel: string;
+  name: string;
+  label: string;
+  isClosed: boolean;
+  isWon: boolean;
+  /** The probability this column stamps on a deal, where the board publishes one. */
+  probability?: number | null;
+  /** The forecast bucket this column stamps — `pipeline`, `commit`, `closed`. */
+  forecastCategory?: string | null;
+}
 export interface VocabPipeline { name: string; label: string; stages: VocabStage[] }
 export interface VocabPerson { id: string; name: string }
 /** One row of `GET /v1/ai/metrics` — the platform's own metric catalogue. */
@@ -818,6 +829,31 @@ const STATUS_WORDS: { word: RegExp; value: string; label: string }[] = [
 ];
 
 /**
+ * The bare verb "close", which is about a date rather than about an outcome.
+ *
+ * "How much open pipeline do we expect to close this quarter?" is a question
+ * about deals that are open *now* and whose close date falls in the quarter —
+ * the engine reads it exactly that way and answers $4,014,120 correctly. The
+ * word "close" in it is the verb, not the status, and reading it as the status
+ * put a red "You asked about closed deals. This figure counts open deals." over
+ * a right answer and turned its STATUS chip red beside it. A guard that fires
+ * on correct answers is how the ones over real substitutions get ignored.
+ *
+ * "closed" is left out of this: "the deals we closed in Q2" really is a status,
+ * and that question really is answered "0 open deals".
+ */
+const CLOSE_VERB = /^closes?$/;
+
+/**
+ * The question naming the open set outright — the engine's own `OPEN_WORDS`.
+ *
+ * This is what decides the ambiguity above. When the sentence says "open
+ * pipeline" or "open deals" in so many words, the set it is asking about is
+ * settled, and a loose "close" elsewhere in it is the verb.
+ */
+const OPEN_SET = /(^|[^a-z])(open|active|live|outstanding)\s+(deals?|opportunit(?:y|ies)|pipelines?)([^a-z]|$)/;
+
+/**
  * The qualifiers a question names, matched against this workspace's vocabulary.
  *
  * Precision matters more than recall here, because every match becomes a claim
@@ -888,10 +924,14 @@ export function namedQualifiers(question: string, vocab: Vocabulary): NamedQuali
   // and "win" is inside it, which put "You asked about won deals. This figure
   // counts every status." over a correct win-rate answer.
   const measurePhrase = norm(metricAsked(text, vocab, consumed)?.phrase ?? '');
+  const namesOpenSet = OPEN_SET.test(text);
   for (const status of STATUS_WORDS) {
     const hit = status.word.exec(text);
     if (!hit) continue;
     if (measurePhrase && hasPhrase(measurePhrase, hit[2])) break;
+    // The set is already named in the sentence, so a bare "close" in it is the
+    // verb — the date these open deals land on, not a second status filter.
+    if (namesOpenSet && status.value !== 'open' && CLOSE_VERB.test(hit[2])) continue;
     add({ kind: 'status', text: status.value, label: status.label, value: status.value });
     break;
   }
@@ -1110,6 +1150,108 @@ export function misreadRefusal(
   return null;
 }
 
+/**
+ * A refusal this same conversation has already disproved.
+ *
+ * "Break open pipeline down by owner." is refused with `metric "break"` — the
+ * verb read as a measure — and the refusal then lists open pipeline among the
+ * measures it can compute, one paragraph under a thread where it has just
+ * computed open pipeline by account and by owner. `misreadRefusal` catches the
+ * catalogue half of this; the other half is the thread's own history, which is
+ * the strongest disproof there is because the reader watched it happen.
+ */
+export interface DisprovedRefusal {
+  /** The measure the refusal says it cannot bind. */
+  measure: VocabMetric;
+  /** The earlier question in this thread that measured it. */
+  question: string;
+}
+
+/** Every metric a run measured, read off the arguments it passed. */
+export const metricsMeasured = (calls: ToolCallLike[]): string[] =>
+  [...new Set(calls.map((call) => str((call.arguments ?? {}).metric)).filter((id): id is string => !!id))];
+
+export function refusalDisprovedByThread(
+  refusal: { code: string; message: string } | null | undefined,
+  question: string,
+  vocab: Vocabulary,
+  priors: { question: string; metrics: string[] }[],
+): DisprovedRefusal | null {
+  if (!refusal || !priors.length) return null;
+  const text = norm(question);
+  const group = groupAsked(text);
+  const named = metricAsked(text, vocab, new Set(group ? [norm(group.noun)] : []));
+  if (!named) return null;
+  const prior = priors.find((row) => row.metrics.includes(named.metric.id));
+  return prior ? { measure: named.metric, question: prior.question } : null;
+}
+
+/**
+ * The same question with the qualifier the engine could not bind taken out.
+ *
+ * "Which support tickets need attention today?" is one of the five starter
+ * questions this product prints on its own empty state, and this engine
+ * refuses it: `1 qualifier could not be bound: period "today"`. The same
+ * sentence without the word "today" returns all seven tickets that need
+ * attention. A suggested prompt is a promise, and a promise that ends in a
+ * refusal has to end in one press instead.
+ *
+ * Only a period or a row cut-off is dropped. Those modify a question; a status
+ * or a measure *is* the question, and "Which support tickets need?" is not a
+ * rephrasing of anything.
+ */
+const DROPPABLE = new Set(['period', 'limit']);
+
+/**
+ * The other half of the same repair: a word the engine could not place at all.
+ *
+ * "How did bookings last quarter compare with the quarter before?" is the fifth
+ * starter prompt, and it comes back `1 token unaccounted for: "before"`. The
+ * same sentence without that one word — "…compare with the quarter?" — answers
+ * $334,840 against $1,791,400, which is the comparison the prompt promised.
+ */
+const UNACCOUNTED = /\btokens?\s+unaccounted\s+for:\s*(.+?)\.?$/i;
+
+const unaccountedTokens = (message: string): string[] => {
+  const found = UNACCOUNTED.exec(message);
+  if (!found) return [];
+  return [...found[1].matchAll(/"([^"]+)"/g)]
+    .map((match) => match[1].trim())
+    // A closed-class word is the sentence's grammar, not a qualifier in it:
+    // dropping "is" and "our" out of "What is our open pipeline?" leaves
+    // "What open pipeline?", which is not a question anybody would press.
+    .filter((token) => token && !FILLER.has(norm(token)));
+};
+
+export function withoutRefusedQualifier(
+  question: string,
+  refusal: { code: string; message: string } | null | undefined,
+): string | null {
+  if (!refusal) return null;
+  let out = question;
+  let dropped = false;
+  const phrases = [
+    ...[...refusal.message.matchAll(new RegExp(REFUSED_QUALIFIER.source, 'gi'))]
+      .filter((match) => DROPPABLE.has(match[1].toLowerCase()))
+      .map((match) => match[2]),
+    ...unaccountedTokens(refusal.message),
+  ];
+  for (const raw of phrases) {
+    const phrase = raw.trim();
+    if (!phrase) continue;
+    const pattern = new RegExp(`(^|[^A-Za-z0-9])${phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9])`, 'i');
+    if (!pattern.test(out)) continue;
+    out = out.replace(pattern, '$1');
+    dropped = true;
+  }
+
+  if (!dropped) return null;
+  const tidied = out.replace(/\s{2,}/g, ' ').replace(/\s+([?.!,])/g, '$1').trim();
+  // Something has to be left to ask.
+  const words = tidied.replace(/[^A-Za-z0-9]+/g, ' ').trim().split(' ').filter(Boolean);
+  return words.length >= 3 && norm(tidied) !== norm(question) ? tidied : null;
+}
+
 /* -------------------- sentences the answer should not keep ---------------- */
 
 /** "A", "A and B", "A, B and C". */
@@ -1244,6 +1386,13 @@ export interface ScopeReport {
   unscoped: QualifierVerdict[];
   /** Qualifiers this surface can neither confirm nor contradict — never a warning. */
   unchecked: QualifierVerdict[];
+  /**
+   * Filters the query ANDed in that no word of the question produced.
+   *
+   * Not a warning: an answer with one of these in it is not an answer, and the
+   * surface stops presenting it as one.
+   */
+  invented: InventedFilter[];
   /** The id → name lookup the report was built with, so chips can use it too. */
   resolve: (id: string) => string | null;
 }
@@ -1417,8 +1566,92 @@ export function reconcileScope(input: ReconcileInput): ScopeReport {
     verdicts: kept,
     unscoped: kept.filter((v) => v.state !== 'bound' && v.state !== 'unchecked'),
     unchecked: kept.filter((v) => v.state === 'unchecked'),
+    invented: inventedFilters({ question: input.question, answering, verdicts: kept, vocab: input.vocab }),
     resolve,
   };
+}
+
+/* --------------------- a filter nobody asked for --------------------------- */
+
+/**
+ * A narrowing the query added that no word of the question produced.
+ *
+ * "How many deals did we close in Q2 2026?" is planned as a count over the
+ * eight *open* stages with a Q2 close-date window, and answered "Northwind
+ * Robotics has 0 open deals closing in Q2 2026." The true answer is 8 deals
+ * worth $613,760. Nothing in that sentence says "open"; the filter came from
+ * the planner, it was ANDed against the period the question really did name,
+ * and the 0 it produced was printed in the engine's ordinary confident voice.
+ *
+ * The banner beside it was already right and was not enough: a reader who has
+ * read "0" has taken the 0. So this names the invented filter as a fact of its
+ * own, and the surface that gets one stops presenting the prose as an answer.
+ */
+export interface InventedFilter {
+  kind: QualifierKind;
+  /** The filter the query ran with, in this workspace's words. */
+  used: string;
+  /** What the question asked for on that same dimension. */
+  asked: string;
+  /** The step that carried it. */
+  tool: string | null;
+}
+
+/** The dimensions a query writes a literal filter value on. */
+const FILTER_KINDS: QualifierKind[] = ['status', 'stage', 'pipeline', 'object'];
+
+/**
+ * Whether the measure the question named already carries this outcome.
+ *
+ * "How much pipeline does Marcus own?" runs over the open stages and says
+ * "open" nowhere — because Open pipeline *is* the open stages. A filter the
+ * measure's own definition produced is not a filter nobody asked for.
+ */
+const measureImplies = (text: string, vocab: Vocabulary, status: string): boolean => {
+  const named = metricAsked(text, vocab);
+  return !!named && hasPhrase(norm(named.metric.label), status);
+};
+
+export function inventedFilters(input: {
+  question: string;
+  answering: Measurement[];
+  verdicts: QualifierVerdict[];
+  vocab: Vocabulary;
+}): InventedFilter[] {
+  const text = norm(input.question);
+  const contradicted = new Map(
+    input.verdicts.filter((v) => v.state === 'substituted' && FILTER_KINDS.includes(v.kind)).map((v) => [v.kind, v]),
+  );
+  if (!contradicted.size) return [];
+  const out: InventedFilter[] = [];
+  const claim = (kind: QualifierKind, used: string, tool: string) => {
+    const verdict = contradicted.get(kind);
+    if (!verdict || out.some((row) => row.kind === kind)) return;
+    out.push({ kind, used, asked: verdict.asked, tool });
+  };
+
+  for (const measurement of input.answering) {
+    const scope = measurement.scope;
+    // A status filter proper: the whole open set, or the whole won or lost set,
+    // with no stage the question could have named behind it.
+    if (scope.status && !scope.stages.length
+      && !hasPhrase(text, scope.status) && !measureImplies(text, input.vocab, scope.status)) {
+      claim('status', `${scope.status} deals only`, measurement.tool);
+    }
+    if (scope.stages.length && scope.stages.every((name) =>
+      !hasPhrase(text, labelOfStage(name, scope.pipeline, input.vocab)) && !hasPhrase(text, humanizeName(name)))) {
+      claim('stage', scope.stages.map((name) => labelOfStage(name, scope.pipeline, input.vocab)).join(', '), measurement.tool);
+    }
+    if (scope.pipeline
+      && !hasPhrase(text, labelOfPipeline(scope.pipeline, input.vocab)) && !hasPhrase(text, humanizeName(scope.pipeline))) {
+      claim('pipeline', labelOfPipeline(scope.pipeline, input.vocab), measurement.tool);
+    }
+    const type = scope.objectType;
+    if (type && !hasPhrase(text, type) && !hasPhrase(text, pluralOf(humanizeName(type).toLowerCase()))) {
+      claim('object', pluralOf(humanizeName(type).toLowerCase()), measurement.tool);
+    }
+  }
+  return out;
 }
 
 /**

@@ -1129,7 +1129,10 @@ export function outcomeStages(metricId: string | null, qualifiers: QualifierLedg
   if (!metricId || !OPEN_BOOK_METRICS.has(metricId)) return [];
   const entry = qualifiers?.first('status');
   const outcome = entry?.resolved?.value;
-  if (outcome !== 'won' && outcome !== 'lost') return [];
+  // "Decided" is both outcomes at once — "how many deals did we close in Q2?"
+  // asks what was settled, won and lost together, and the open book is not an
+  // answer to it in either direction.
+  if (outcome !== 'won' && outcome !== 'lost' && outcome !== 'decided') return [];
   return (entry?.resolved?.values ?? []).map(String);
 }
 

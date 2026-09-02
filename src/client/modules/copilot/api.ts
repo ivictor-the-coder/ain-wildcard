@@ -275,6 +275,26 @@ export function approvalOutcome(approval: Pick<AiApproval, 'status' | 'outcome'>
   return keyValues(approval.outcome) ? 'written' : (FAILED_OUTCOME.test(approval.outcome) ? 'failed' : 'written');
 }
 
+/**
+ * The badge on a turn whose write has been decided.
+ *
+ * It read the *decision* — `status === 'approved'` — and stamped a green
+ * "decided — written" on a write the tool then refused: `Failed:
+ * "commercial_terms" belongs to the Renewal pipeline, not New business.` The
+ * resolution block three lines below said so correctly, and the badge above it
+ * said the opposite. What the tool did is the only thing that says whether the
+ * workspace changed.
+ */
+export function decidedBadge(approvals: Pick<AiApproval, 'status' | 'outcome'>[]): {
+  label: string;
+  tone: 'success' | 'danger' | 'neutral';
+} {
+  const outcomes = approvals.map(approvalOutcome);
+  if (outcomes.includes('failed')) return { label: 'decided — the write failed', tone: 'danger' };
+  if (outcomes.includes('written')) return { label: 'decided — written', tone: 'success' };
+  return { label: 'decided — declined', tone: 'neutral' };
+}
+
 export function runOutcome(
   run: { status: string; reasoning?: string[] },
   approvals: AiApproval[] | undefined,
@@ -368,7 +388,14 @@ export const useTools = (): QueryResult<ListEnvelope<AiTool>> => useQuery<ListEn
 interface PipelinePayload {
   name: string;
   label: string;
-  stages: { name: string; label: string; is_closed: boolean; is_won: boolean }[];
+  stages: {
+    name: string;
+    label: string;
+    is_closed: boolean;
+    is_won: boolean;
+    probability?: number | null;
+    forecast_category?: string | null;
+  }[];
 }
 interface UserPayload { id: string; name: string }
 interface MetricPayload { id: string; label: string; unit: string; keywords: string[]; snapshot: boolean }
@@ -434,6 +461,11 @@ export function useVocabulary(): VocabularyRead {
         label: stage.label,
         isClosed: stage.is_closed,
         isWon: stage.is_won,
+        // What the column restamps on a deal that lands in it. The approval
+        // card states the forecast a write moves, and it cannot do that from
+        // the write's own arguments — they carry one stage name.
+        probability: stage.probability ?? null,
+        forecastCategory: stage.forecast_category ?? null,
       })),
     }));
     const catalogue = (metrics.data?.data ?? []).map((metric) => ({
@@ -466,24 +498,32 @@ export function useVocabulary(): VocabularyRead {
 
 
 export {
-  confidenceBand, confidenceChip, parseBlocks, refusalOf, splitToolEcho,
+  carriedScope, confidenceBand, confidenceChip, contradictsCarried, noWritePrepared, parseBlocks,
+  propertyAsked, refusalOf, splitToolEcho,
 } from './answer-core';
-export type { Block, ConfidenceBand, StepNote, ToolEcho } from './answer-core';
+export type { Block, CarriedScope, ConfidenceBand, StepNote, ToolEcho } from './answer-core';
+
+export {
+  consequenceLines, dealNamedIn, editHref, linkedTargetOf, needsAcknowledgement, stageConsequences,
+  stageWriteOf, statusOfStage,
+} from './write-core';
+export type { Consequence, DealNow, StageConsequences, StageWrite } from './write-core';
 
 export {
   EMPTY_VOCABULARY, MONEY_TOTAL, QUALIFIER_KINDS, UNMEASURED, agreeWithTheCount, boardHref, boundScopeOf,
   carriedThrough, correctPipelineDenial, correctedProse,
   countedObject, currencyAsked, currencyOfFigure, figureSpeaks, figureUnits, groupAsked, humanizeName,
   isWiderName, labelOfPipeline, labelOfStage, lastInstantOf, looksLikeRecordId, measurementsOf,
-  metricAsked, misreadRefusal, namedQualifiers, openStagesOf, parseBreakdown, parseLedger,
-  propertyVocabulary, reconcileBreakdown,
+  metricAsked, metricsMeasured, misreadRefusal, namedQualifiers, openStagesOf, parseBreakdown,
+  parseLedger, refusalDisprovedByThread,
+  inventedFilters, propertyVocabulary, reconcileBreakdown,
   deniedPipeline, reconcileScope, recordPhraseMismatch, rephraseAsBreakdown, scopeChips, unknownMeasure,
-  warningSentence, windowText, withoutCurrencyClaim, withoutWriteParameter,
+  warningSentence, windowText, withoutCurrencyClaim, withoutRefusedQualifier, withoutWriteParameter,
   withoutBreakdown,
 } from './scope-core';
 export type {
-  BoundScope, BreakdownBucket, BreakdownReport, BucketVerdict, Evidence, LedgerEntry, Measurement,
-  MisreadRefusal,
+  BoundScope, BreakdownBucket, BreakdownReport, BucketVerdict, DisprovedRefusal, Evidence,
+  InventedFilter, LedgerEntry, Measurement, MisreadRefusal,
   NamedQualifier, QualifierKind, QualifierState, QualifierVerdict, RecordMismatch, ScopeChip,
   ScopeReport, VocabMetric, VocabOtherPipeline, VocabPipeline, VocabPropertyDef, VocabPropertyValue,
   VocabStage, Vocabulary, WindowFormat,

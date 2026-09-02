@@ -42,6 +42,10 @@ import {
 } from './dimensions';
 import { propertyMap } from './query';
 import {
+  auditCoverage, carriesComparison, coverageRefusal, numbersIn,
+  type CoverageClaim, type CoverageNumeric,
+} from './coverage';
+import {
   accountProfile, businessMetric, recordAggregate, recordSearch, recordTimeline, workspaceSearch,
   type AccountProfileResult, type TimelineItem,
 } from './functions';
@@ -49,7 +53,7 @@ import { composeDraft, detectDraftKind, detectTone, type DraftKind, type DraftRe
 import { extractStructured, normaliseResponseSchema } from './extract';
 import { synthesise, type ResultOutcome, type StepResult } from './synth';
 import { accountUsage, estimateTokens, messageTokens, toolTokens } from './usage';
-import { EMAIL_PATTERN, ID_PATTERN, QUOTED_PATTERN, humanise, listPhrase, normalise, truncate } from './text';
+import { EMAIL_PATTERN, ID_PATTERN, QUOTED_PATTERN, acronymOf, contentWords, humanise, listPhrase, normalise, stem, truncate } from './text';
 
 export const ENGINE_MODEL = 'ain-engine-1';
 
@@ -183,6 +187,14 @@ const STRONG = 0.7;
 const METER_MIN = 0.5;
 const METER_STRONG = 0.6;
 const METER_MARGIN = 0.06;
+/**
+ * How much of a meter's own name the question has to hold before an account
+ * that shares one word with it stops mattering. Two thirds: "Peak connected
+ * robots" written out in full is the meter; "operative at its seat" holding one
+ * word of "Active operator seats" is a company's name and a question's
+ * furniture.
+ */
+const METER_LABEL_COVERAGE = 0.66;
 
 /**
  * The words that actually did the matching, for the sentence that asks which
@@ -664,6 +676,425 @@ function priorEntities(req: AiCompletionRequest, index: EntityIndex, options: Pa
 }
 
 /** The two periods a comparison will measure, and how they were chosen. */
+/**
+ * The narrowings a planned step actually carries.
+ *
+ * Read off the arguments rather than off a list of tool names, so a capability
+ * added tomorrow is measured by the same rule: a property in a `conditions`
+ * entry, a stage, an owner, a pipeline, a subject, a meter, an association.
+ */
+export function narrowingKeys(step: { tool: string; args: Record<string, unknown> }): Set<string> {
+  const keys = new Set<string>();
+  const conditions = step.args.conditions;
+  if (Array.isArray(conditions)) {
+    for (const condition of conditions) {
+      const property = (condition as { property?: unknown } | null)?.property;
+      if (typeof property === 'string') keys.add(property);
+    }
+  }
+  for (const name of ['stage', 'stages', 'owner_id', 'pipeline', 'subject_id', 'customer_id', 'meter', 'associated_to_any', 'status']) {
+    const value = step.args[name];
+    if (value === undefined || value === null || value === '') continue;
+    if (Array.isArray(value) && !value.length) continue;
+    keys.add(name);
+  }
+  return keys;
+}
+
+/** The rows a step measures, so two steps are only compared over the same ones. */
+function stepDomain(step: { tool: string; args: Record<string, unknown> }): string | null {
+  const objectType = step.args.object_type;
+  if (typeof objectType === 'string') return objectType;
+  const metric = step.args.metric;
+  // Every sales measure in this catalogue is computed over deal rows, so a
+  // deal search and a pipeline total are two readings of the same set.
+  if (typeof metric === 'string') return DEAL_METRICS.has(metric) ? 'deal' : `metric:${metric}`;
+  return null;
+}
+
+/** Narrowings a measure carries by definition rather than because it was asked for. */
+const IMPLICIT_KEYS = new Set(['deal_stage', 'stage', 'stages', 'status']);
+
+const DEAL_METRICS = new Set([
+  'pipeline', 'weighted_pipeline', 'closed_won', 'closed_lost', 'bookings', 'deal_count',
+  'average_deal_size', 'win_rate', 'sales_cycle', 'forecast',
+]);
+
+/**
+ * Drop every step that measures the same rows as another step with strictly
+ * fewer of the question's narrowings on it.
+ *
+ * The survivor is the step that carries the reader's words. Nothing is dropped
+ * when the two steps measure different things — a ticket count beside a deal
+ * total is two answers to a two-part question, not a wide one and a narrow one.
+ */
+export function narrowestSteps<T extends { tool: string; args: Record<string, unknown> }>(steps: T[]): T[] {
+  if (steps.length < 2) return steps;
+  const keyed = steps.map((step) => ({ step, domain: stepDomain(step), keys: narrowingKeys(step) }));
+  return keyed
+    .filter((candidate) => !keyed.some((other) => other !== candidate
+      && other.domain !== null && other.domain === candidate.domain
+      && other.keys.size > candidate.keys.size
+      && [...candidate.keys].every((key) => other.keys.has(key))
+      // A stage set is not a narrowing the reader wrote — it is how the wider
+      // measure is defined. The briefing runs `business_metric` beside a search
+      // over the open stages, and dropping the overview because its evidence
+      // rows name the stages it is already over left the reader's period bound
+      // to nothing. Only a genuinely extra dimension demotes a step.
+      && [...other.keys].some((key) => !candidate.keys.has(key) && !IMPLICIT_KEYS.has(key))))
+    .map((candidate) => candidate.step);
+}
+
+/**
+ * The intents whose answers state a number.
+ *
+ * The failure this gate exists to stop is a figure that answers a different
+ * question, so it runs over the question shapes that produce figures. A draft,
+ * a plan, a briefing and a diagnosis are prose built from cited facts and are
+ * governed by the citation rules instead; holding a summary to the same token
+ * accounting would refuse "catch me up on Meridian" for the word "catch".
+ */
+const COVERED_INTENTS = new Set<TaskIntent>(['aggregate', 'compare', 'lookup']);
+
+/** The grain, counting and boundary words a period is written with. */
+const PERIOD_WORDS = [
+  'year', 'years', 'quarter', 'quarters', 'month', 'months', 'week', 'weeks', 'day', 'days',
+  'hour', 'hours', 'fortnight', 'half', 'halves', 'season', 'ytd', 'qtd', 'mtd', 'trailing',
+  'rolling', 'over', 'through', 'across', 'ending', 'ended', 'starting', 'started', 'between',
+  'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven',
+  'twelve', 'twenty', 'thirty', 'sixty', 'ninety',
+  'jan', 'january', 'feb', 'february', 'mar', 'march', 'apr', 'april', 'may', 'jun', 'june',
+  'jul', 'july', 'aug', 'august', 'sep', 'sept', 'september', 'oct', 'october', 'nov',
+  'november', 'dec', 'december',
+];
+
+/** The words that ask for one end of an ordering. */
+const SUPERLATIVES = [
+  'biggest', 'largest', 'highest', 'greatest', 'top', 'best', 'most', 'maximum', 'max',
+  'smallest', 'lowest', 'least', 'fewest', 'worst', 'bottom', 'minimum', 'min',
+  'oldest', 'newest', 'latest', 'soonest', 'first', 'last', 'longest', 'shortest',
+  'biggest', 'ranked', 'ranking', 'rank', 'order', 'ordered', 'sorted', 'leading',
+];
+
+/** The verbs a metered workspace measures volume with. */
+const USAGE_VERBS = [
+  'send', 'sent', 'sending', 'stream', 'streamed', 'streaming', 'ingest', 'ingested',
+  'consume', 'consumed', 'consumption', 'burn', 'burned', 'burnt', 'push', 'pushed',
+  'emit', 'emitted', 'upload', 'uploaded', 'store', 'stored', 'storing', 'meter',
+  'metered', 'metering', 'use', 'used', 'usage', 'peak', 'peaked', 'draw', 'drew', 'drawn',
+];
+
+/** The words that put a name in an owner slot. */
+const OWNERSHIP = [
+  'own', 'owns', 'owned', 'owning', 'owner', 'owners', 'ownership',
+  'assigned', 'belongs', 'belonging', 'managed', 'manages', 'managing', 'manager',
+  'carrying', 'carries', 'carry', 'carried', 'book', 'books', 'led', 'leads', 'leading',
+  'rep', 'reps', 'representative', 'seller', 'ae', 'quota', 'working', 'runs', 'run',
+];
+
+/** The nouns a question uses for each object type this engine can query. */
+const TYPE_NOUNS: Record<string, string[]> = {
+  deal: ['deal', 'deals', 'opportunity', 'opportunities', 'pipeline'],
+  company: ['company', 'companies', 'account', 'accounts', 'business', 'businesses', 'logo', 'logos', 'organisation', 'organization'],
+  customer: ['customer', 'customers', 'client', 'clients', 'account', 'accounts'],
+  contact: ['contact', 'contacts', 'person', 'people', 'buyer', 'buyers', 'champion', 'champions', 'stakeholder', 'stakeholders'],
+  ticket: ['ticket', 'tickets', 'case', 'cases', 'issue', 'issues', 'escalation', 'escalations'],
+  invoice: ['invoice', 'invoices', 'bill', 'bills'],
+  subscription: ['subscription', 'subscriptions', 'plan', 'plans'],
+  credit: ['credit', 'credits', 'grant', 'grants', 'balance', 'balances'],
+  usage: ['usage', 'used', 'consumption', 'consumed', 'metered', 'meter', 'meters', 'metering'],
+  activity: ['activity', 'activities', 'meeting', 'meetings', 'call', 'calls', 'email', 'emails', 'note', 'notes', 'task', 'tasks'],
+  payment: ['payment', 'payments', 'paid', 'collection', 'collections'],
+  product: ['product', 'products', 'price', 'prices', 'plan', 'plans'],
+};
+
+/**
+ * The rows each measure in the catalogue is computed over.
+ *
+ * Used to check that the object type the question named is the object type some
+ * planned step actually queries — the difference between "how many billing
+ * tickets do we have?" answered from the support desk and answered with
+ * $76,450.05 of collected revenue.
+ */
+const METRIC_ROWS: Record<string, string> = {
+  spend: 'invoice', revenue: 'invoice', invoiced: 'invoice', outstanding: 'invoice',
+  pipeline: 'deal', weighted_pipeline: 'deal', closed_won: 'deal', closed_lost: 'deal',
+  win_rate: 'deal', avg_deal_size: 'deal', sales_cycle: 'deal', deal_count: 'deal',
+  new_customers: 'company', customers: 'company', churn: 'company',
+  open_tickets: 'ticket', tickets_created: 'ticket', resolution_time: 'ticket', csat: 'ticket',
+  activities: 'activity', meetings: 'activity',
+  connected_assets: 'company',
+  net_revenue_retention: 'subscription', gross_revenue_retention: 'subscription',
+  mrr: 'subscription', arr: 'subscription',
+};
+
+/** The object types some planned step really reads rows from. */
+export function queriedTypes(plan: { tool: string; args: Record<string, unknown> }[], groupBy: GroupBy = 'none'): Set<string> {
+  const out = new Set<string>();
+  // A breakdown by account reads the accounts, whatever the measure is over.
+  if (groupBy === 'account') { out.add('company'); out.add('customer'); }
+  if (groupBy === 'owner') out.add('user');
+  for (const step of plan) {
+    const objectType = step.args.object_type;
+    if (typeof objectType === 'string') out.add(objectType);
+    const metric = step.args.metric;
+    if (typeof metric === 'string' && METRIC_ROWS[metric]) out.add(METRIC_ROWS[metric]);
+    if (step.args.meter) out.add('usage');
+    // A capability named for its own domain reads that domain's rows.
+    const domain = step.tool.split('_')[0];
+    if (domain === 'billing') out.add('invoice');
+    if (domain === 'credits') out.add('credit');
+    if (step.tool.includes('invoice')) out.add('invoice');
+    if (step.tool.includes('subscription')) out.add('subscription');
+    if (step.tool.includes('usage') || step.tool.includes('meter')) out.add('usage');
+    if (step.tool.includes('customer')) { out.add('customer'); out.add('company'); }
+    if (step.tool === 'account_profile') { out.add('company'); out.add('customer'); out.add('deal'); out.add('contact'); out.add('ticket'); }
+    if (step.tool === 'record_timeline' || step.tool === 'workspace_search') out.add('activity');
+  }
+  // A company question and a customer question read the same accounts.
+  if (out.has('company')) out.add('customer');
+  if (out.has('customer')) out.add('company');
+  return out;
+}
+
+/** Every record id that reached a planned step's arguments. */
+export function idsInPlan(plan: { args: Record<string, unknown> }[]): Set<string> {
+  const out = new Set<string>();
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 6 || value === null || value === undefined) return;
+    if (typeof value === 'string') { if (/^[a-z][a-z_]*_[A-Za-z0-9]{2,}$/.test(value)) out.add(value); return; }
+    if (Array.isArray(value)) { for (const item of value) visit(item, depth + 1); return; }
+    if (typeof value === 'object') for (const item of Object.values(value as Record<string, unknown>)) visit(item, depth + 1);
+  };
+  for (const step of plan) visit(step.args, 0);
+  return out;
+}
+
+/**
+ * Every word this workspace's own job titles are made of, plus their acronyms.
+ *
+ * A profile step hands back the account's buying committee, so a question that
+ * names a role is answered by it — and "CFO" is how anyone writes "Chief
+ * Financial Officer".
+ */
+const titleCache = new Map<string, string[]>();
+export function jobTitleWords(ctx: Ctx, orgId: string): string[] {
+  const cached = titleCache.get(orgId);
+  if (cached) return cached;
+  const titles = ctx.db.all<{ title: string }>(
+    `SELECT DISTINCT json_extract(properties, '$.job_title') AS title FROM crm_records
+      WHERE org_id = ? AND object_type = 'contact' AND json_extract(properties, '$.job_title') IS NOT NULL`,
+    orgId,
+  ).map((row) => row.title).filter(Boolean);
+  const out = new Set<string>();
+  for (const title of titles) {
+    for (const word of normalise(title).split(' ')) if (word.length > 1) out.add(word);
+    const acronym = acronymOf(title);
+    if (acronym.length >= 2) out.add(normalise(acronym));
+  }
+  const words = [...out];
+  titleCache.set(orgId, words);
+  return words;
+}
+
+/** Every numeric property a record search can compare against, per type. */
+export function numericProperties(ctx: Ctx, orgId: string, types: string[]): CoverageNumeric[] {
+  const out: CoverageNumeric[] = [];
+  for (const objectType of types) {
+    if (!CRM_OBJECT_TYPES.has(objectType)) continue;
+    for (const [property, definition] of propertyMap(ctx, orgId, objectType)) {
+      if (definition.type !== 'number' && definition.type !== 'currency') continue;
+      out.push({ objectType, property, noun: definition.label });
+    }
+  }
+  return out;
+}
+
+/**
+ * Every span of the question some part of this run consumed.
+ *
+ * One entry per claimant, with the claimant named, so a refusal can tell the
+ * reader what *was* read as well as what was not.
+ */
+export function coverageClaims(input: {
+  question: string;
+  metric: MetricDetection | null;
+  windows: TimeWindow[];
+  mentions: { text: string }[];
+  entities: ResolvedEntity[];
+  qualifiers: QualifierLedger;
+  recordFilters: RecordFilter[];
+  types: string[];
+  meter: ResolvedEntity | null;
+  currencyWord: { code: string; matched: string } | null;
+  order: { text: string } | null;
+  /** The record ids that reached a planned step's arguments. */
+  usedIds: Set<string>;
+  /** The object types some planned step actually queries. */
+  queriedTypes: Set<string>;
+  ranking: boolean;
+  ownerBound: boolean;
+  dateNoun: { property: string; label: string; text: string } | null;
+  /** Every phrase this workspace uses to name one of its own dimensions. */
+  dimensionAnchors: string[];
+  /** The capabilities the plan runs, with the words they publish themselves under. */
+  capabilities: { name: string; description: string }[];
+  plannedArgs: { tool: string; args: Record<string, unknown> }[];
+  balance: boolean;
+  usage: boolean;
+  /** Job titles and their acronyms, when a step returns people. */
+  roleWords: string[];
+  /** The meters and features a ledger step's numbers are denominated in. */
+  units: string[];
+}): CoverageClaim[] {
+  const claims: CoverageClaim[] = [];
+  if (input.metric) claims.push({ text: input.metric.matched, by: `the measure ${input.metric.metric.label}` });
+  for (const window of input.windows) claims.push({ text: window.matched, by: `the period ${window.label}` });
+  for (const mention of input.mentions) claims.push({ text: mention.text, by: 'a period' });
+  // The grain and counting words a period is written with. "over the last six
+  // months" resolves to one window whose own `matched` span is shorter than the
+  // phrase the reader typed; the rest of that phrase is the period, not stray
+  // content, and it is spent the moment the window binds.
+  if (input.windows.length || input.mentions.length) {
+    for (const word of PERIOD_WORDS) claims.push({ text: word, by: 'the period' });
+  }
+  // A record only spends the reader's words when the plan actually queried it.
+  //
+  // "How many security tickets do we have?" resolved the ticket *called*
+  // "Security review: outbound firewall rules for OT segment" at 0.56, ran
+  // nothing about it, and the word "security" was reported as read — so the
+  // answer was all 35 tickets with the reader's filter silently gone. A record
+  // the plan never reached explains nothing and claims nothing.
+  for (const entity of input.entities) {
+    if (!input.usedIds.has(entity.entity.id)) continue;
+    claims.push({ text: entity.mention, by: `the ${entity.entity.type} ${entity.entity.label}` });
+    claims.push({ text: entity.entity.label, by: `the ${entity.entity.type} ${entity.entity.label}` });
+    for (const alias of entity.entity.aliases) claims.push({ text: alias, by: `the ${entity.entity.type} ${entity.entity.label}` });
+  }
+  for (const entry of input.qualifiers.entries) {
+    claims.push({ text: entry.text, by: `the ${kindNoun(entry.kind)} "${entry.text}"` });
+    if (entry.resolved?.label) claims.push({ text: entry.resolved.label, by: `the ${kindNoun(entry.kind)} "${entry.text}"` });
+  }
+  for (const filter of input.recordFilters) {
+    claims.push({ text: filter.matched, by: `the ${(filter.noun ?? filter.property).toLowerCase()} filter` });
+    if (filter.label) claims.push({ text: filter.label, by: `the ${(filter.noun ?? filter.property).toLowerCase()} filter` });
+  }
+  // The noun a question uses for its rows is only spent when some step queried
+  // those rows. "How many billing tickets do we have?" planned `business_metric`
+  // over *invoices* and answered with $76,450.05 collected — a revenue figure
+  // under a question about support tickets, with the word "tickets" reported as
+  // understood because the sentence contained it.
+  for (const type of input.types) {
+    if (!input.queriedTypes.has(type)) continue;
+    for (const noun of TYPE_NOUNS[type] ?? [type]) claims.push({ text: noun, by: `the ${type} rows` });
+  }
+  if (input.meter && input.usedIds.has(input.meter.entity.id)) {
+    claims.push({ text: input.meter.mention, by: `the meter ${input.meter.entity.label}` });
+    claims.push({ text: input.meter.entity.label, by: `the meter ${input.meter.entity.label}` });
+  }
+  if (input.currencyWord) claims.push({ text: input.currencyWord.matched, by: `the currency ${input.currencyWord.code.toUpperCase()}` });
+  if (input.order) claims.push({ text: input.order.text, by: 'the ordering' });
+  // A superlative is the instruction that produced the ordering, and the
+  // ordering is in the plan. "Who is my biggest customer?" spends "biggest" on
+  // the ranking exactly as "in Q2" spends its words on the period.
+  const ordered = input.plannedArgs.some((step) => step.args.order_by !== undefined
+    || step.args.direction !== undefined || step.args.limit !== undefined);
+  if (input.ranking || input.order || ordered) {
+    for (const word of SUPERLATIVES) claims.push({ text: word, by: 'the ranking' });
+  }
+  // The verbs that put a name in an owner slot, once an owner is bound.
+  if (input.ownerBound) {
+    for (const word of OWNERSHIP) claims.push({ text: word, by: 'the owner' });
+  }
+  // The noun that picked the date column — "created", "closing", "due".
+  if (input.dateNoun) claims.push({ text: input.dateNoun.text, by: `the ${input.dateNoun.label} column` });
+  // A measure's own vocabulary. "What is the Renewal pipeline worth?" spends
+  // "worth" on Open pipeline, and "how much did we book" spends "book" on
+  // closed-won bookings — both are the measure's own words, not stray content.
+  if (input.metric) {
+    for (const phrase of [input.metric.metric.label, ...(input.metric.metric.phrases ?? []), ...input.metric.metric.keywords]) {
+      claims.push({ text: phrase, by: `the measure ${input.metric.metric.label}` });
+    }
+  }
+  // The names this workspace gives its own dimensions — "stage", "category",
+  // "product area", "came from". A dimension's *name* narrows nothing on its
+  // own; only a value does, and a value is claimed only when it binds.
+  for (const anchor of input.dimensionAnchors) claims.push({ text: anchor, by: 'a dimension this workspace enumerates' });
+  // A capability spends the words of its own name and of the sentence this
+  // workspace publishes it under. "Show me the recovery queue" runs
+  // `payments_recovery_queue`; "which accounts have gone quiet" runs the
+  // capability whose own description is about accounts that have gone quiet.
+  // Those words are read, by the tool, and reading them is what the plan is.
+  for (const capability of input.capabilities) {
+    claims.push({ text: capability.name.replace(/[._]/g, ' '), by: `\`${capability.name}\`` });
+    for (const word of capability.name.split(/[._]/)) claims.push({ text: word, by: `\`${capability.name}\`` });
+    for (const word of contentWords(capability.description)) claims.push({ text: word, by: `\`${capability.name}\`` });
+  }
+  // The names of the arguments a step was actually given. `stale_accounts` is
+  // called with `days: 120`, so the reader's word "days" is the parameter this
+  // plan filled — reading it back as an unknown noun refused a question this
+  // engine answers exactly.
+  for (const step of input.plannedArgs) {
+    for (const [key, value] of Object.entries(step.args)) {
+      if (value === undefined || value === null) continue;
+      for (const word of key.split('_')) claims.push({ text: word, by: `\`${step.tool}.${key}\`` });
+      // A column the step was told to order, group or date by is named in the
+      // sentence too: "by amount", "closing soonest", "by stage".
+      if (['order_by', 'group_by', 'date_property', 'measure', 'property'].includes(key) && typeof value === 'string') {
+        for (const word of value.split('_')) claims.push({ text: word, by: `\`${step.tool}.${key}\`` });
+      }
+    }
+    // "a 36-month contract term" is `contract_term_months`, and the column's
+    // own name is what the reader wrote.
+    const conditions = step.args.conditions;
+    if (!Array.isArray(conditions)) continue;
+    for (const condition of conditions) {
+      const property = (condition as { property?: unknown } | null)?.property;
+      if (typeof property !== 'string') continue;
+      for (const word of property.split('_')) claims.push({ text: word, by: `the ${property.replace(/_/g, ' ')} filter` });
+    }
+  }
+  // The vocabulary of every measure in the catalogue, once one of them bound.
+  // "How many open deals do we have and what are they worth?" measures the
+  // count and mentions the value; the second measure is a second question, not
+  // an unread word, and the answer names both.
+  if (input.metric) {
+    for (const word of measureWords()) {
+      claims.push({ text: word, by: 'the measure vocabulary' });
+      // "we booked" and "did we book" are the same verb as "bookings"; one
+      // stemming pass leaves "booking", which is not the word the reader wrote.
+      const twice = stem(stem(word));
+      if (twice !== word && twice.length >= 3) claims.push({ text: twice, by: 'the measure vocabulary' });
+    }
+  }
+  // The predicate that made this a balance question rather than a consumption
+  // question — "left", "remaining", "unused".
+  if (input.balance) for (const word of ['left', 'remaining', 'remain', 'remains', 'unused', 'balance']) {
+    claims.push({ text: word, by: 'the credit balance' });
+  }
+  // A meter in a balance question names the denomination of the pot rather than
+  // a filter on it — "how many telemetry events are left" is a credit question
+  // measured in telemetry events — so the meter's own words are spent by it.
+  if (input.balance && input.meter) {
+    claims.push({ text: input.meter.mention, by: `the unit ${input.meter.entity.label}` });
+    claims.push({ text: input.meter.entity.label, by: `the unit ${input.meter.entity.label}` });
+  }
+  // The verbs a metered workspace measures with, once the plan reads a meter.
+  if (input.usage) for (const word of USAGE_VERBS) claims.push({ text: word, by: 'the metered volume' });
+  // A step that returns an account's card returns its buying committee with it,
+  // so the job titles this workspace holds — and their acronyms — are words
+  // that step reads. "Who is the CFO at Meridian Forge Systems?" is answered
+  // off the profile, and "CFO" is the workspace's own Chief Financial Officer.
+  for (const role of input.roleWords) claims.push({ text: role, by: 'a job title this workspace holds' });
+  for (const unit of input.units) claims.push({ text: unit, by: 'a unit this workspace meters in' });
+  // "Broken down by owner" is an instruction to the query, and the words that
+  // spell it are spent on the grouping.
+  const grouping = input.question.match(/\b(?:split|splits|broken\s+(?:down|out)|break\s+(?:down|out)|grouped|group|bucketed|segmented|sliced)(?:\s+up)?\s+by\s+[a-z]+\b/i)
+    ?? input.question.match(/\b(?:by|per|each)\s+(?:month|quarter|week|day|year|rep|reps|owner|owners|stage|stages|industry|industries|region|regions|product|products|customer|customers|account|accounts|pipeline|pipelines|source|sources|type|types|category|categories)\b/i);
+  if (grouping) claims.push({ text: grouping[0], by: 'the grouping' });
+  return claims;
+}
+
 export function comparisonWindows(question: string, windows: TimeWindow[], now: number): WindowPair | null {
   const named = windows.filter((w) => w.end > w.start);
   // "the same period last year" is one period and an instruction, not two
@@ -742,7 +1173,7 @@ export function builtinEngine(): AiProvider {
         : null;
       const followsOn = !ownMetric && !!carriedQuestion && FOLLOW_UP.test(question);
       const inheritedMetric = followsOn ? detectMetric(carriedQuestion!) : null;
-      const metric = ownMetric ?? inheritedMetric;
+      let metric = ownMetric ?? inheritedMetric;
       if (inheritedMetric) {
         reasoning.push(`"${question.trim()}" names no measure of its own; carried ${inheritedMetric.metric.label} forward from "${truncate(carriedQuestion!, 60)}", the question it follows.`);
       }
@@ -842,7 +1273,7 @@ export function builtinEngine(): AiProvider {
         reasoning.push(`Dropped ${recordFilters.length - named.length} record ${recordFilters.length - named.length === 1 ? 'filter' : 'filters'} whose words are part of a record's own name (${recordFilters.filter((f) => insideAName(f.matched)).map((f) => `"${f.matched}"`).join(', ')}) — a value inside a name is the name.`);
         recordFilters = named;
       }
-      const entities = dropQualifierWords(
+      let entities = dropQualifierWords(
         resolveOwnerSlots(question, dropPeriodWords(dropTypeConfusion(carriedFrom.entities), question)),
         recordFilters,
       );
@@ -869,7 +1300,7 @@ export function builtinEngine(): AiProvider {
         const dropped = carriedFrom.entities.filter((e) => !entities.includes(e));
         reasoning.push(`Dropped ${dropped.length} weaker ${dropped.length === 1 ? 'match' : 'matches'} on a teammate's own name (${dropped.map((e) => `${e.entity.label} — ${e.entity.type}`).join(', ')}): a person named in an owner slot is an owner, and a lower-scoring record of another type is a different question, not a fallback.`);
       }
-      const subject = asSubject(entities.find((e) => SUBJECT_TYPES.includes(e.entity.type)));
+      let subject = asSubject(entities.find((e) => SUBJECT_TYPES.includes(e.entity.type)));
       reasoning.push(entities.length
         ? `Resolved ${entities.length} ${entities.length === 1 ? 'record' : 'records'}: ${entities.slice(0, 3).map((e) => `${e.entity.label} (${e.entity.type}, ${e.score.toFixed(2)}, ${e.rule})`).join('; ')}.`
         : 'No workspace record matched the question by id, email, domain, name, acronym or trigram similarity.');
@@ -890,8 +1321,24 @@ export function builtinEngine(): AiProvider {
       const subjectWords = new Set(entities
         .filter((e) => SUBJECT_TYPES.includes(e.entity.type))
         .flatMap((e) => normalise(e.entity.label).split(' ').filter((word) => word.length > 3)));
+      // A meter whose *whole name* is written in the question is that meter,
+      // whatever account name shares a word with it.
+      //
+      // `Peak connected robots` was unreachable by every phrasing: the account
+      // Granite Peak Mining Equipment lends the word "peak" to the subject-word
+      // filter, and the filter dropped the meter on that one overlap — so
+      // "Peak connected robots for August 2026" came back as Granite Peak's
+      // 132 connected assets, a different account's number under the meter's
+      // own name. The test is how much of the meter's name the question
+      // actually holds, not whether one word of it is also somebody's.
+      const labelCoverage = (m: ResolvedEntity): number => {
+        const asked = new Set(normalise(question).split(' '));
+        const label = normalise(m.entity.label).split(' ').filter((word) => word.length > 2);
+        return label.length ? label.filter((word) => asked.has(word)).length / label.length : 0;
+      };
       const meters = resolveEntities(question, index, { only: ['meter'], limit: 3, minScore: METER_MIN })
         .filter((m) => ['id', 'name_exact', 'alias_exact', 'core_exact'].includes(m.rule)
+          || labelCoverage(m) >= METER_LABEL_COVERAGE
           || !normalise(m.mention).split(' ').some((word) => subjectWords.has(word)));
       // A meter's name is matched against a span of the sentence, and the span
       // carries the sentence's furniture with it: "How many robots did
@@ -933,9 +1380,42 @@ export function builtinEngine(): AiProvider {
       // the number exists.
       const quantityAsked = /\bhow\s+(?:many|much)\b/i.test(question)
         && /\b(meter|meters|metered|metering|peak|peaked|use|used|using|consume[ds]?|consumed|ingest(?:ed)?|stream(?:ed)?|store[ds]?|send|sent|burn(?:ed|t)?)\b/i.test(question);
+      // The question wrote a meter's whole name, and a sales measure matched on
+      // a fragment of that same name. `Peak connected robots` lost every
+      // phrasing to the `connected_assets` metric and to the account Granite
+      // Peak Mining Equipment, both of which matched on words belonging to the
+      // meter — so a published meter was unreachable and one phrasing answered
+      // it with a different account's asset count. When the meter's name is
+      // what the sentence says, the meter is the measure and the words are its
+      // own, not a company's.
+      const meterOwnsMeasure = !!meter && labelCoverage(meter) >= METER_LABEL_COVERAGE
+        && (!metric || normalise(metric.matched).split(' ').filter((w) => w.length > 2)
+          .every((word) => normalise(meter.entity.label).split(' ').includes(word)));
+      if (meterOwnsMeasure && meter) {
+        const meterWords = new Set(normalise(meter.entity.label).split(' ').filter((w) => w.length > 2));
+        // Only the content of the span counts: "was our peak" is the word
+        // "peak" plus two words of grammar, and the record it matched borrowed
+        // that one word from the meter.
+        const borrowed = entities.filter((e) => {
+          if (e.entity.type === 'meter') return false;
+          const said = contentWords(e.mention).filter((word) => word.length > 2);
+          return said.length > 0 && said.every((word) => meterWords.has(word));
+        });
+        reasoning.push(`"${question.trim()}" writes out ${meter.entity.label} in full, so ${metric ? `the measure "${metric.matched}"` : 'the measure'} and ${borrowed.length ? listPhrase(borrowed.map((e) => e.entity.label)) : 'nothing else'} matched on that meter's own words; the meter is what this question names.`);
+        metric = null;
+        entities = entities.filter((e) => !borrowed.includes(e));
+        subject = asSubject(entities.find((e) => SUBJECT_TYPES.includes(e.entity.type)));
+      }
       const usageFromMeter = !!meters[0] && !metric
-        && (meters[0].score >= METER_STRONG || (!!meter && quantityAsked))
-        && !namedTypes.includes('usage') && (intent.intent === 'aggregate' || intent.intent === 'compare');
+        && (meters[0].score >= METER_STRONG || (!!meter && quantityAsked)
+          // The question wrote the meter's name out; that is not a weak match,
+          // it is the name.
+          || (!!meter && labelCoverage(meters[0]) >= METER_LABEL_COVERAGE))
+        && !namedTypes.includes('usage')
+        // A question that writes a meter's name out is a usage question however
+        // it is phrased: "Peak connected robots for August 2026" is not a
+        // lookup of an account whose name shares a word with it.
+        && (intent.intent === 'aggregate' || intent.intent === 'compare' || meterOwnsMeasure);
       const meterTypes = usageFromMeter ? [...namedTypes, 'usage'] : namedTypes;
       if (usageFromMeter) {
         reasoning.push(`"${meters[0].mention}" is ${meters[0].entity.label}, a meter in ${workspace.name}, and the question names no sales metric — so this is a question about metered usage.`);
@@ -1165,7 +1645,22 @@ export function builtinEngine(): AiProvider {
       const planned = refusal
         ? { steps: [] as PlannedStep[], skipped: [] as SkippedTool[], blocked: [] as BlockedCapability[] }
         : planTools(planInput);
-      const plan = planned.steps;
+      // A step that measures more than the question asked for never leads.
+      //
+      // "Which open deals are worth over $400,000?" planned `business_metric`
+      // for the whole open book *and* `record_search` for the seven rows above
+      // the threshold, and the answer opened "Northwind Robotics is carrying
+      // $9,010,960 in open pipeline, from 38 open deals" — the reader's own
+      // threshold gone from the headline, and a reader stops at the first
+      // number. A step that carries strictly fewer of the question's
+      // narrowings than another step over the same rows is not a wider
+      // context, it is a different question, so it is dropped rather than
+      // printed first and qualified afterwards.
+      const plan = narrowestSteps(planned.steps);
+      if (plan.length !== planned.steps.length) {
+        const dropped = planned.steps.filter((step) => !plan.includes(step));
+        reasoning.push(`Dropped ${dropped.length} ${dropped.length === 1 ? 'step' : 'steps'} that measure more than the question asked for (${dropped.map((s) => `\`${s.tool}\``).join(', ')}): ${listPhrase(plan.map((s) => `\`${s.tool}\``))} ${plan.length === 1 ? 'carries' : 'carry'} every narrowing this question named, and a wider figure in the first sentence is the answer a reader keeps.`);
+      }
       // A capability the question asked for and the run could not arm is
       // reported with the values it was missing, using the workspace's own
       // names for them: "name a meter" is only actionable next to the meters.
@@ -1341,7 +1836,85 @@ export function builtinEngine(): AiProvider {
       } else if (qualifiers.entries.length) {
         reasoning.push(`Qualifier ledger settled: ${qualifiers.entries.map((q) => `${q.kind} "${q.text}" ${q.state}${q.binding ? ` → ${q.binding.tool}` : ''}`).join('; ')}.`);
       }
-      const runnable = qualifierRefused ? [] : plan;
+      /* 6c. account for the whole question, not the parts that were recognised */
+      // The ledger above is a lexicon: it holds the qualifier kinds somebody
+      // enumerated, and a question that narrowed itself on a twenty-sixth kind
+      // named nothing it could hold. This gate is the inverse. It walks the
+      // question's own tokens and requires each one to be claimed by some part
+      // of the plan — the measure, a period, a record, a filter, an object
+      // type, a tool argument — or to be closed-class grammar. Everything else
+      // is a gap, and a gap is a refusal that names the word.
+      // Nothing was planned, so nothing can be substituted: a question with no
+      // capability behind it already refuses itself in its own words, and a
+      // second refusal about an unread token would be an apology for not
+      // narrowing an answer that does not exist.
+      const coverage = asking && !refusal && !qualifierRefused && plan.length > 0 && COVERED_INTENTS.has(intent.intent)
+        ? auditCoverage({
+            question,
+            claims: coverageClaims({
+              metric, windows, mentions, entities, qualifiers, recordFilters, types,
+              meter, currencyWord, order: namedOrder, question,
+              usedIds: idsInPlan(plan),
+              queriedTypes: queriedTypes(plan, groupBy),
+              ranking,
+              ownerBound: qualifiers.entries.some((q) => q.kind === 'owner')
+                || entities.some((e) => e.entity.type === 'user') || groupBy === 'owner',
+              dateNoun: dateNounIn(question),
+              dimensionAnchors: [...new Set([...types, 'deal', 'company', 'ticket', 'contact']
+                .filter((type) => CRM_OBJECT_TYPES.has(type))
+                .flatMap((type) => dimensionsOf(ctx, orgId, type, new Set()).flatMap((d) => d.anchors)))],
+              // A capability the plan reached brings its whole family with it:
+              // `credits.balance` is one verb of the credit ledger, and the
+              // ledger's own words for what it holds — grants, burn order,
+              // settlement — are published by its siblings. A question that
+              // names the ledger in one of those words has named the thing the
+              // plan is reading, not a word nobody here uses.
+              capabilities: (() => {
+                const families = new Set(plan.map((step) => step.tool.split(/[._]/)[0]));
+                return available
+                  .filter((tool) => plan.some((step) => step.tool === tool.name)
+                    || families.has(tool.name.split(/[._]/)[0]))
+                  .map((tool) => ({ name: tool.name, description: tool.description }));
+              })(),
+              // The meters and features these ledgers are denominated in.
+              units: plan.some((step) => /credit|entitlement|meter|usage|subscription/.test(step.tool))
+                ? index.entities.filter((e) => e.type === 'meter').flatMap((e) => [e.label, ...e.aliases])
+                : [],
+              plannedArgs: plan.map((step) => ({ tool: step.tool, args: step.args })),
+              balance: balanceQuestion,
+              usage: types.includes('usage') || !!meter || plan.some((step) => !!step.args.meter),
+              roleWords: plan.some((step) => step.tool === 'account_profile' || step.args.object_type === 'contact'
+                || step.tool === 'record_timeline')
+                ? jobTitleWords(ctx, orgId)
+                : [],
+            }),
+            boundNumbers: plan.flatMap((step) => numbersIn(step.args)),
+            boundComparison: plan.some((step) => carriesComparison(step.args)),
+            objectTypes: types,
+            vocabulary: {
+              dimensions: [...new Set([...types, ...(types.includes('deal') ? ['company'] : [])])]
+                .filter((type) => CRM_OBJECT_TYPES.has(type))
+                .flatMap((type) => dimensionsOf(ctx, orgId, type, new Set())
+                  .map((d) => ({ objectType: d.objectType, property: d.property, noun: d.noun, options: d.options }))),
+              numeric: numericProperties(ctx, orgId, types),
+              meters: index.entities.filter((e) => e.type === 'meter').map((e) => e.label),
+              metrics: metricIds().map((id) => metricById(id)?.label ?? id),
+            },
+            workspaceName: workspace.name,
+          })
+        : null;
+      const uncovered = coverage ? coverageRefusal(coverage, workspace.name) : null;
+      if (coverage) {
+        reasoning.push(`Token accounting: ${coverage.accounted.length} of ${coverage.tokens.length} content tokens claimed by the plan, ${coverage.ignored.length} closed-class, ${coverage.gaps.length} unaccounted${coverage.gaps.length ? ` (${coverage.gaps.map((g) => `"${g.token}"`).join(', ')})` : ''}.`);
+      }
+      if (uncovered) {
+        reasoning.push(`Refused (question_not_covered): ${uncovered.why}`);
+        runtime?.note(call, 'plan', 'question_not_covered', uncovered.why);
+      }
+      const notCovered: Refusal | null = uncovered
+        ? { code: 'qualifier_unbound', why: uncovered.why, content: uncovered.content }
+        : null;
+      const runnable = qualifierRefused || notCovered ? [] : plan;
 
       reasoning.push(plan.length
         ? `Plan (${plan.length} ${plan.length === 1 ? 'step' : 'steps'}, budget ${budget.steps}): ${plan.map((s) => s.tool).join(' → ')}.`
@@ -1373,7 +1946,7 @@ export function builtinEngine(): AiProvider {
       }
 
       const remaining = Math.max(0, budget.steps - (call.steps ?? steps.length));
-      const second = refusal || qualifierRefused ? [] : replan(planInput, executed, Math.min(remaining, 2), planned.skipped);
+      const second = refusal || qualifierRefused || notCovered ? [] : replan(planInput, executed, Math.min(remaining, 2), planned.skipped);
       if (second.length) {
         passes += 1;
         reasoning.push(`Second pass: ${second.map((s) => `${s.tool} — ${s.why}`).join(' ')}`);
@@ -1443,7 +2016,7 @@ export function builtinEngine(): AiProvider {
         reasoning.push(`Refused after the run (qualifier_unbound): ${afterRun.why}`);
         runtime?.note(call, 'plan', 'qualifier_unbound', afterRun.why);
       }
-      const answerRefusal: Refusal | null = refusal ?? qualifierRefused
+      const answerRefusal: Refusal | null = refusal ?? qualifierRefused ?? notCovered
         ?? (afterRun ? { code: 'qualifier_unbound' as const, why: afterRun.why, content: afterRun.content } : null);
 
       /* 8. draft, extract or answer */

@@ -18,10 +18,14 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, invalidate, useMutation, useQuery, type ApiClientError, type ListEnvelope } from '@/client/kernel/api';
+import { useSession } from '@/client/kernel/session';
 import {
   Badge, Banner, Button, Combobox, Field, Icons, Input, Modal, Select, SkeletonText, Textarea,
-  humanize, useToast, type ComboOption, type SelectOption,
+  humanize, useFormat, useToast, type ComboOption, type SelectOption,
 } from '@/client/design';
+import {
+  EMPTY_LEDGER, checkDunning, draftsFromAccount, ledgerFrom, ledgerTotal, type LedgerRead,
+} from './draft-core';
 
 /** What each kind actually produces, so the control that steers is legible. */
 const KINDS: { value: string; label: string; hint: string }[] = [
@@ -29,6 +33,11 @@ const KINDS: { value: string; label: string; hint: string }[] = [
   { value: 'intro', label: 'Intro', hint: 'A first touch — who we are, and why this account.' },
   { value: 'check_in', label: 'Check-in', hint: 'A light touch on a deal that has gone quiet.' },
   { value: 'renewal', label: 'Renewal', hint: 'Ahead of the contract end, with what the account runs today.' },
+  {
+    value: 'dunning',
+    label: 'Payment chase',
+    hint: 'Names the invoices still due on the account, with the amounts and how late they are. Written from the ledger, and refused if the ledger cannot be read.',
+  },
   { value: 'meeting_recap', label: 'Meeting recap', hint: 'What was agreed and who does what next.' },
   { value: 'call_summary', label: 'Call summary', hint: 'A record of the last call, for the timeline.' },
   { value: 'meeting_notes', label: 'Meeting notes', hint: 'Notes as notes — no greeting, no sign-off.' },
@@ -112,6 +121,10 @@ export function DraftDialog({
   onLogged?: () => void;
 }) {
   const toast = useToast();
+  const f = useFormat();
+  // The workspace's clock, not the browser's: `POST /v1/time/advance` moves the
+  // ledger's idea of "56 days late" and the chase has to move with it.
+  const session = useSession();
   const [kind, setKind] = useState<string>('follow_up');
   const [tone, setTone] = useState<string>('direct');
   const [ownLine, setOwnLine] = useState('');
@@ -181,6 +194,49 @@ export function DraftDialog({
     [record.data],
   );
 
+  /**
+   * The account behind the record, and its ledger.
+   *
+   * A chase is a claim about invoices, invoices hang off a billing customer,
+   * and a billing customer hangs off the *company* — never off the deal this
+   * dialog searches. Handing `POST /v1/ai/draft` a deal id is why every chase
+   * it produced opened "the billing ledger shows no invoice with an amount
+   * still due on that account" for accounts that owed six figures.
+   */
+  const chasing = draftsFromAccount(kind);
+  const account = useMemo(
+    () => (targetType === 'company'
+      ? { record_id: targetId, display_name: targetName }
+      : (record.data?.associations ?? []).find((row) => row.object_type === 'company')),
+    [record.data, targetType, targetId, targetName],
+  );
+  const customers = useQuery<ListEnvelope<{ id: string; name: string }>>(
+    open && chasing && account?.record_id ? '/v1/customers' : null,
+    { crm_record_id: account?.record_id ?? '', limit: 1 },
+  );
+  const customerId = customers.data?.data[0]?.id ?? null;
+  const invoices = useQuery<ListEnvelope<{ number: string; amount_due: number; currency: string; due_date: number | null; status: string }>>(
+    open && chasing && customerId ? '/v1/invoices' : null,
+    { customer: customerId ?? '', status: 'open_like', limit: 20 },
+  );
+  const ledgerLoading = chasing && (record.loading || customers.loading || invoices.loading);
+  const ledger: LedgerRead = useMemo(() => {
+    if (!chasing) return EMPTY_LEDGER;
+    if (!account?.record_id) {
+      return { ...EMPTY_LEDGER, why: 'This record is not linked to a company, so there is no billing account to read.' };
+    }
+    if (customers.error || invoices.error) {
+      return { ...EMPTY_LEDGER, why: (customers.error ?? invoices.error)?.body.message ?? 'The billing ledger did not answer.' };
+    }
+    if (ledgerLoading) return { ...EMPTY_LEDGER, why: 'Still reading this account’s billing ledger.' };
+    if (!customerId) {
+      return { ...EMPTY_LEDGER, why: `${account.display_name} has no billing customer, so it has no invoices to chase.` };
+    }
+    return ledgerFrom(invoices.data?.data ?? [], session.now());
+  }, [chasing, account, customers.error, customers.data, invoices.error, invoices.data, customerId, ledgerLoading, session]);
+  const owed = ledgerTotal(ledger);
+  const verdict = chasing && draft ? checkDunning(draft, ledger) : null;
+
   const searchDeals = useMemo(() => async (query: string): Promise<ComboOption[]> => {
     const page = await api.get<ListEnvelope<RecordRow>>('/v1/records/deal', { q: query, limit: 8 });
     for (const row of page.data) names.current.set(row.id, row.display_name);
@@ -190,13 +246,17 @@ export function DraftDialog({
   const kindHint = KINDS.find((row) => row.value === kind)?.hint ?? '';
   const toneHint = TONES.find((row) => row.value === tone)?.hint ?? '';
 
+  // A chase is composed from the account, because that is the record the
+  // ledger hangs off; everything else is composed from the deal.
+  const composeFrom = chasing ? account?.record_id ?? targetId : targetId;
+
   const write = useMutation<void, AiDraft>(
     () => api.post<AiDraft>('/v1/ai/draft', {
       // The engine reads the kind and the tone from these fields; the sentence
       // below travels with them so the run log records what was asked for.
       instruction: ownLine.trim() || `${humanize(kind)} in a ${tone} tone`,
-      ...(targetId ? { record_id: targetId } : {}),
-      ...(contactId ? { contact_id: contactId } : {}),
+      ...(composeFrom ? { record_id: composeFrom } : {}),
+      ...(contactId && !chasing ? { contact_id: contactId } : {}),
       kind,
       tone,
     }),
@@ -210,8 +270,13 @@ export function DraftDialog({
     },
   );
 
+  // A chase belongs on the account's timeline, next to the invoices it is about.
+  const logType = chasing && account?.record_id ? 'company' : targetType;
+  const logId = chasing && account?.record_id ? account.record_id : targetId;
+  const logName = chasing && account?.display_name ? account.display_name : targetName;
+
   const log = useMutation<void, { id: string }>(
-    () => api.post<{ id: string }>(`/v1/records/${targetType}/${encodeURIComponent(targetId)}/activities`, {
+    () => api.post<{ id: string }>(`/v1/records/${logType}/${encodeURIComponent(logId)}/activities`, {
       type: 'email',
       subject: editSubject.trim() || undefined,
       body: editBody.trim() || undefined,
@@ -219,8 +284,8 @@ export function DraftDialog({
     {
       invalidates: ['/v1/records', '/v1/events'],
       onSuccess: () => {
-        invalidate(`/v1/records/${targetType}/${targetId}`);
-        toast.success('Logged on the timeline', `The draft is on ${targetName || 'the record'} as an email activity.`);
+        invalidate(`/v1/records/${logType}/${logId}`);
+        toast.success('Logged on the timeline', `The draft is on ${logName || 'the record'} as an email activity.`);
         onLogged?.();
         onClose();
       },
@@ -228,7 +293,11 @@ export function DraftDialog({
     },
   );
 
-  const canWrite = !!targetId;
+  // A chase whose figures could not be read is not drafted at all: a dunning
+  // letter that tells a delinquent customer they are square is worse than no
+  // letter, and the only way to be sure it does not is to have read the ledger.
+  const canWrite = !!targetId && (!chasing || ledger.state === 'read');
+  const blockedByLedger = chasing && verdict?.state === 'contradicted';
 
   return (
     <Modal
@@ -245,11 +314,12 @@ export function DraftDialog({
             <Button
               variant="primary"
               loading={log.loading}
-              disabled={!editBody.trim()}
+              disabled={!editBody.trim() || blockedByLedger}
+              title={blockedByLedger ? 'This draft contradicts the ledger, so it cannot be logged.' : undefined}
               iconLeft={<Icons.note size={14} />}
               onClick={() => { void log.run().catch(() => undefined); }}
             >
-              Log on {targetName ? shortName(targetName) : 'the record'}
+              Log on {logName ? shortName(logName) : 'the record'}
             </Button>
           </>
         ) : (
@@ -257,8 +327,9 @@ export function DraftDialog({
             <Button variant="ghost" onClick={onClose}>Cancel</Button>
             <Button
               variant="primary"
-              loading={write.loading}
+              loading={write.loading || ledgerLoading}
               disabled={!canWrite}
+              title={chasing && ledger.state === 'unread' ? ledger.why : undefined}
               iconLeft={<Icons.sparkles size={14} />}
               onClick={() => { void write.run().catch(() => undefined); }}
             >
@@ -296,6 +367,43 @@ export function DraftDialog({
             {subject && (
               <Banner tone="neutral" compact>
                 Writing about <strong>{subject.name}</strong>.
+              </Banner>
+            )}
+
+            {chasing && ledger.state === 'unread' && (
+              <Banner tone="danger" bar title="No chase can be written for this record">
+                {ledger.why} A dunning letter is a claim about money made to a customer, so it is not
+                drafted from figures this screen has not read.
+              </Banner>
+            )}
+
+            {chasing && ledger.state === 'read' && ledger.bills.length === 0 && (
+              <Banner tone="warning" compact title="Nothing is outstanding on this account">
+                {account?.display_name ?? 'This account'} has no invoice with an amount still due, so a
+                chase would name a bill that does not exist. The draft will say so rather than invent one.
+              </Banner>
+            )}
+
+            {chasing && ledger.state === 'read' && ledger.bills.length > 0 && (
+              <Banner
+                tone="info"
+                title={owed === null
+                  ? `${ledger.bills.length} invoices outstanding on ${account?.display_name ?? 'this account'}`
+                  : `${f.money(owed, { currency: ledger.currencies[0] })} outstanding on ${account?.display_name ?? 'this account'}`}
+              >
+                <ul className="cp-scope__reasons">
+                  {ledger.bills.slice(0, 4).map((bill) => (
+                    <li key={bill.number}>
+                      {bill.number} — {f.money(bill.amountDue, { currency: bill.currency })}
+                      {bill.dueAt ? `, due ${f.date(bill.dueAt, { timeZone: 'UTC' })}` : ''}
+                      {bill.daysOverdue ? ` (${bill.daysOverdue} days past due)` : ''}
+                    </li>
+                  ))}
+                </ul>
+                <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
+                  Read from the billing ledger just now. The draft is checked against these figures
+                  before it can be logged.
+                </p>
               </Banner>
             )}
 
@@ -382,6 +490,20 @@ export function DraftDialog({
                 </span>
               )}
             </div>
+
+            {verdict?.state === 'contradicted' && (
+              <Banner tone="danger" bar title="This draft contradicts the ledger">
+                <p>{verdict.why} It cannot be logged.</p>
+                <ul className="cp-scope__reasons">
+                  {ledger.bills.slice(0, 4).map((bill) => (
+                    <li key={bill.number}>
+                      {bill.number} — {f.money(bill.amountDue, { currency: bill.currency })}
+                      {bill.daysOverdue ? `, ${bill.daysOverdue} days past due` : ''}
+                    </li>
+                  ))}
+                </ul>
+              </Banner>
+            )}
 
             {draft.recipient && (
               <Banner tone="info" compact>

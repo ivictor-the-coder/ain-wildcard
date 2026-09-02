@@ -1435,6 +1435,18 @@ const METRIC_IMPLIES_STATUS: Record<string, 'open' | 'won' | 'lost'> = {
 const WON_WORDS = /\b(won|win|closed[\s-]?won|landed|signed)\b/i;
 const LOST_WORDS = /\b(lost|lose|losing|closed[\s-]?lost|churned|dropped)\b/i;
 const OPEN_WORDS = /\b(open|active|live|in\s+flight|outstanding)\s+(?:deals?|opportunit(?:y|ies)|pipeline)\b/i;
+/**
+ * "Closed", said of what already happened, means won *and* lost.
+ *
+ * "How many deals did we close in Q2 2026?" was answered "Northwind Robotics
+ * has 0 open deals closing in Q2 2026" — a false zero, under a caption naming
+ * the opposite of the question: the reader asked what was decided and the
+ * engine counted the open book against a close-date column that no open deal in
+ * that past quarter can satisfy. The tense is what tells the two apart: "deals
+ * closing this month" is a forward look at the open book and stays one.
+ */
+const DECIDED_WORDS =
+  /\b(?:did\s+(?:we|they|you|i)\s+clos(?:e|ed)|(?:we|they)\s+closed|closed\s+(?:deals?|opportunit(?:y|ies))|deals?\s+(?:we\s+)?closed|clos(?:e|ed)\s+out)\b/i;
 
 export interface QualifierParseInput {
   question: string;
@@ -1860,13 +1872,28 @@ export function parseQualifiers(input: QualifierParseInput): QualifierLedger {
       const word = normalise(text).split(' ');
       return word.length <= measure.length && word.every((one, at) => measure[at] === one);
     };
-    const record = (status: 'open' | 'won' | 'lost', text: string, label: string, values: string[]) => {
+    const record = (status: 'open' | 'won' | 'lost' | 'decided', text: string, label: string, values: string[]) => {
       if (implied === status) return;
       if (METRIC_IMPLIES_STATUS[input.metric?.metric.id ?? ''] === status && ownsOutcome(text)) return;
       ledger.add(entry('status', text, { kind: 'status', value: status, label, property: 'deal_stage', values }));
     };
     if (!stageNamed) {
-      if (LOST_WORDS.test(question) && input.stages.lost.length) {
+      // A measure that *is* an outcome owns the word: "what did we close last
+      // quarter and why?" is closed-won bookings, and reading "close" as a
+      // second, wider outcome filter refused a question the engine answers.
+      // "What did we close last quarter and why?" is a request for the won and
+      // lost splits side by side, which the explain plan builds out of two
+      // aggregates; there is one outcome filter per aggregate and no single
+      // one for the ledger to hold. The decided reading belongs to the
+      // questions that end in one number or one list.
+      const outcomeMeasure = METRIC_IMPLIES_STATUS[input.metric?.metric.id ?? ''];
+      const counted = input.intent === 'aggregate' || input.intent === 'compare' || input.intent === 'lookup';
+      if (counted && DECIDED_WORDS.test(question) && input.stages.won.length && input.stages.lost.length
+        && outcomeMeasure !== 'won' && outcomeMeasure !== 'lost'
+        && !WON_WORDS.test(question) && !LOST_WORDS.test(question)) {
+        record('decided', question.match(DECIDED_WORDS)![0], 'closed — won or lost',
+          [...input.stages.won, ...input.stages.lost]);
+      } else if (LOST_WORDS.test(question) && input.stages.lost.length) {
         record('lost', question.match(LOST_WORDS)![0], 'closed lost', input.stages.lost);
       } else if (WON_WORDS.test(question) && input.stages.won.length) {
         record('won', question.match(WON_WORDS)![0], 'closed won', input.stages.won);

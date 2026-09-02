@@ -8,7 +8,7 @@
  * approval card that shows a write before it happens.
  */
 import { useState } from 'react';
-import { api, useMutation } from '@/client/kernel/api';
+import { api, useMutation, useQuery } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import {
   AlertTriangleIcon,
@@ -17,10 +17,11 @@ import {
 } from '@/client/design';
 import {
   CITATION_ICON, OUTCOME_LABEL, OUTCOME_TONE, SPAN_ICON, SPAN_TONE, approvalOutcome, citationHref,
-  confidenceBand, confidenceChip,
-  humanTool, outcomeSummary, recordLink, recordPhraseMismatch, runOutcome, writeTargetLabel,
-  writeTargets,
-  type AiApproval, type AiRun, type AiSpan, type Citation,
+  confidenceBand, confidenceChip, consequenceLines,
+  humanTool, isWiderName, linkedTargetOf, needsAcknowledgement, outcomeSummary, recordLink,
+  recordPhraseMismatch,
+  runOutcome, stageConsequences, stageWriteOf, useRun, useVocabulary, writeTargetLabel, writeTargets,
+  type AiApproval, type AiRun, type AiSpan, type Citation, type StageConsequences,
 } from './api';
 
 /* ------------------------------- citations -------------------------------- */
@@ -216,6 +217,84 @@ export function TraceSteps({ spans, decidedAfter }: { spans: AiSpan[]; decidedAf
 
 /* -------------------------------- approvals ------------------------------- */
 
+/** One deal, as `/v1/records/deal/:id` returns it. */
+interface DealRow { id: string; display_name: string; properties: Record<string, unknown> }
+
+const pendingApproval = (approval: { status: string }): boolean => approval.status === 'pending';
+
+const numberOf = (value: unknown): number | null =>
+  (typeof value === 'number' && Number.isFinite(value) ? value : null);
+
+const textOf = (value: unknown): string | null => (typeof value === 'string' && value ? value : null);
+
+const dealNow = (row: DealRow) => ({
+  id: row.id,
+  name: row.display_name,
+  stage: textOf(row.properties.deal_stage),
+  status: textOf(row.properties.deal_status),
+  amount: numberOf(row.properties.amount),
+  probability: numberOf(row.properties.probability),
+  forecastCategory: textOf(row.properties.forecast_category),
+});
+
+/**
+ * Everything a stage write does, above the write it says it is.
+ *
+ * "Deal stage → negotiation" on a closed-lost deal reopens it. The stage line
+ * is true and it is not the whole write: the status changes, the deal
+ * re-enters open pipeline at its full amount, and the forecast picks it up at
+ * the new stage's probability. Approving a one-line preview is not approving
+ * that, so the card says all of it and the button waits for a person to
+ * acknowledge the part they were not told.
+ */
+function WriteConsequences({ consequences, unread, onRetry }: {
+  consequences: StageConsequences | null;
+  unread: boolean;
+  /** Reads the deal again — a rate-limited read must not latch the card shut. */
+  onRetry: () => void;
+}) {
+  const f = useFormat();
+  if (unread) {
+    return (
+      <Banner tone="warning" bar title="This write’s consequences could not be worked out">
+        <p>
+          This is a stage change, and the deal it names could not be read — so this card cannot tell you
+          whether it reopens a closed deal or moves the forecast.
+        </p>
+        <p className="cp-chips" style={{ marginTop: 'var(--space-3)' }}>
+          <Button size="sm" variant="secondary" onClick={onRetry}>Read the deal again</Button>
+        </p>
+      </Banner>
+    );
+  }
+  if (!consequences) return null;
+  const lines = consequenceLines(consequences, (minor) => f.money(minor));
+  if (!lines.length && !consequences.wrongPipeline) return null;
+  const closes = consequences.closedState !== 'unchanged';
+  return (
+    <Banner
+      tone={closes || consequences.wrongPipeline ? 'danger' : 'info'}
+      bar={closes || consequences.wrongPipeline}
+      title={consequences.closedState === 'reopens'
+        ? 'This write reopens a closed deal'
+        : consequences.closedState === 'closes'
+          ? 'This write closes an open deal'
+          : 'What this write changes beyond the stage'}
+    >
+      {consequences.wrongPipeline && consequences.to && consequences.from && (
+        <p>
+          <strong>{consequences.to.label}</strong> is a column of {consequences.to.pipelineLabel}, and this
+          deal is on {consequences.from.pipelineLabel}. The tool refuses a stage from another pipeline, so
+          approving this will fail and nothing will be written.
+        </p>
+      )}
+      <ul className="cp-scope__reasons">
+        {lines.map((line) => <li key={line.text}>{line.text}</li>)}
+      </ul>
+    </Banner>
+  );
+}
+
 /**
  * The last thing a person reads before a write lands.
  *
@@ -243,8 +322,41 @@ export function ApprovalCard({ approval, question, onDecided }: {
    * gets. A write is the one answer that cannot be taken back, so it gets the
    * loudest version of the same check.
    */
-  const target = writeTargetLabel(approval.tool, approval.args, approval.preview);
-  const mismatch = question && target ? recordPhraseMismatch(question, target) : null;
+  // `linkedTargetOf` reads the "Linked to …" line wherever it sits: a task
+  // prepared for "the Sakamoto Seiki — packaging line uplift deal" is
+  // associated to the *company* and says so on its eighth preview line, under a
+  // first line that reads "New task" — so the card raised nothing at all.
+  const target = writeTargetLabel(approval.tool, approval.args, approval.preview)
+    ?? linkedTargetOf(approval.preview);
+  // The queue and the dashboard card hand no question down, and the guard that
+  // catches a write prepared against the wrong record is the whole reason this
+  // card is worth reading. The run knows what was asked, so the card asks it
+  // rather than going without — one read, only where it is missing.
+  const runRead = useRun(question ? null : approval.run_id, pendingApproval(approval));
+  const asked = question ?? runRead.data?.question ?? '';
+  const mismatch = asked && target ? recordPhraseMismatch(asked, target) : null;
+
+  /**
+   * What this write would do beyond the property it names.
+   *
+   * The deal is read here rather than taken from the write, because the write
+   * carries one stage name and every consequence below is a difference between
+   * that stage and the one the deal is in right now.
+   */
+  const stageWrite = stageWriteOf(approval.tool, approval.args);
+  const vocabulary = useVocabulary();
+  const dealRead = useQuery<DealRow>(
+    stageWrite && pendingApproval(approval) ? `/v1/records/deal/${encodeURIComponent(stageWrite.recordId)}` : null,
+  );
+  const consequences = stageWrite && dealRead.data && vocabulary.vocab.pipelines.length
+    ? stageConsequences(dealNow(dealRead.data), stageWrite.stage, vocabulary.vocab)
+    : null;
+  // A stage write whose deal or board could not be read is the one case where
+  // silence is not available: this surface cannot say whether the write reopens
+  // a closed deal, and saying nothing would let it through unseen.
+  const consequencesUnread = !!stageWrite && pendingApproval(approval)
+    && (!!dealRead.error || !!vocabulary.error || (!dealRead.loading && !vocabulary.loading && !consequences));
+  const mustAcknowledge = needsAcknowledgement(consequences, consequencesUnread);
 
   const decide = useMutation<'approve' | 'decline', { executed?: boolean; status: string; outcome: string | null }>(
     (decision) => api.post(`/v1/ai/approvals/${encodeURIComponent(approval.id)}`, { decision }),
@@ -275,6 +387,17 @@ export function ApprovalCard({ approval, question, onDecided }: {
   const pending = approval.status === 'pending';
   const landed = approvalOutcome(approval);
   const summary = pending ? null : outcomeSummary(approval);
+  const blocked = mismatch
+    ? `This write targets ${mismatch.used}, not ${mismatch.asked}.`
+    : consequencesUnread
+      ? 'This card could not work out what this write does to the deal.'
+      : consequences?.closedState === 'reopens'
+        ? 'This reopens a closed deal and puts it back in the pipeline and the forecast.'
+        : consequences?.closedState === 'closes'
+          ? 'This closes an open deal and takes it out of the pipeline and the forecast.'
+          : consequences?.wrongPipeline
+            ? 'That stage belongs to another pipeline, so this write will fail.'
+            : null;
 
   return (
     <Card
@@ -291,9 +414,11 @@ export function ApprovalCard({ approval, question, onDecided }: {
         {pending && mismatch && (
           <Banner tone="danger" bar title="This write is not on the record you named">
             <p>
-              You asked about <strong>{mismatch.asked}</strong>. This write would change{' '}
-              <strong>{mismatch.used}</strong> — a different record on the same account, and nothing
-              in the arguments below says which one you meant.
+              You asked about <strong>{mismatch.asked}</strong>. This write would land on{' '}
+              <strong>{mismatch.used}</strong> — {isWiderName(mismatch.asked, mismatch.used)
+                ? 'the account above it, not the record you named'
+                : 'a different record on the same account'}, and nothing in the arguments below says
+              which one you meant.
             </p>
             <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
               Decline it and ask again naming the record in full, or tick the box to write to{' '}
@@ -312,6 +437,28 @@ export function ApprovalCard({ approval, question, onDecided }: {
         <div className="cp-approval__preview">
           {approval.preview.map((line, i) => <span key={i}>{line}</span>)}
         </div>
+
+        {pending && (
+          <WriteConsequences
+            consequences={consequences}
+            unread={consequencesUnread}
+            onRetry={dealRead.refetch}
+          />
+        )}
+
+        {pending && mustAcknowledge && !mismatch && (
+          <Checkbox
+            checked={acknowledged}
+            onChange={setAcknowledged}
+            label={consequencesUnread
+              ? 'Yes — approve it without knowing what it does to the forecast'
+              : consequences?.closedState === 'reopens'
+                ? `Yes — reopen ${consequences.from ? `this ${consequences.from.label.toLowerCase()} deal` : 'this closed deal'} and put it back in the forecast`
+                : consequences?.closedState === 'closes'
+                  ? 'Yes — close this deal and take it out of the forecast'
+                  : 'Yes — run it anyway'}
+          />
+        )}
 
         {decide.error && (
           <Banner tone="danger" title="The decision was refused">{decide.error.body.message}</Banner>
@@ -349,14 +496,14 @@ export function ApprovalCard({ approval, question, onDecided }: {
                 size="sm"
                 variant="primary"
                 loading={decide.loading}
-                disabled={!!mismatch && !acknowledged}
-                title={mismatch && !acknowledged
-                  ? `This write targets ${mismatch.used}, not ${mismatch.asked}. Confirm the record above first.`
+                disabled={((!!mismatch || mustAcknowledge) && !acknowledged) || dealRead.loading}
+                title={blocked
+                  ? `${blocked} Confirm it above first.`
                   : undefined}
                 iconLeft={<Icons.check size={13} />}
                 onClick={() => { void decide.run('approve').catch(() => undefined); }}
               >
-                {mismatch ? 'Approve anyway' : 'Approve and run'}
+                {mismatch || mustAcknowledge ? 'Approve anyway' : 'Approve and run'}
               </Button>
             </>
           )}
