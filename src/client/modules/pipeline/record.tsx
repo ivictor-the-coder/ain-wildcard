@@ -7,14 +7,14 @@
  * The stage rail at the top is the primary control: clicking a stage is the
  * same move the board makes, with the same confirmation.
  */
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api, invalidate, useMutation, useQuery, type ApiClientError, type ListEnvelope } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import { useSession } from '@/client/kernel/session';
 import {
-  Avatar, Badge, Banner, Breadcrumbs, Button, Card, ChevronRightIcon, ConfirmDialog, DescriptionList,
-  EmptyState, ErrorState, GitBranchIcon, humanize, iconByName, Icons, MenuButton, Page, Skeleton,
-  SkeletonText, Split, Timeline, useToast,
+  Avatar, Badge, Banner, Breadcrumbs, Button, Card, ChevronLeftIcon, ChevronRightIcon, ConfirmDialog,
+  DescriptionList, EmptyState, ErrorState, GitBranchIcon, humanize, iconByName, IconButton, Icons,
+  MenuButton, Page, Skeleton, SkeletonText, Split, Timeline, useToast,
   type DescriptionItem, type MenuSection, type TimelineEntry,
 } from '@/client/design';
 import {
@@ -26,7 +26,67 @@ import {
 } from './api';
 import { EditDealDialog, LogActivityDialog, PipelineMoveDialog, StageMoveDialog } from './dialogs';
 import { AccountCard, CommitteeCard } from './associations';
+import { InlineProperty } from './inline';
 import { DraftDialog } from '../copilot/draft';
+
+/**
+ * The stage rail's scroller, with an edge that says there is more.
+ *
+ * Eight stages do not fit a 1100px record page, and `overflow-x: auto` on its
+ * own is invisible on any platform with overlay scrollbars: the last stage was
+ * simply sliced off at the card's edge with nothing to suggest it existed. The
+ * fade and the nudge button appear only on the side that actually has more, and
+ * are out of the Tab order because tabbing a stage already scrolls it into view.
+ */
+function StageRail({ children }: { children: ReactNode }) {
+  const scroller = useRef<HTMLDivElement>(null);
+  const [edges, setEdges] = useState({ left: false, right: false });
+
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const read = () => setEdges({
+      left: el.scrollLeft > 2,
+      right: Math.ceil(el.scrollLeft + el.clientWidth) < el.scrollWidth - 2,
+    });
+    read();
+    el.addEventListener('scroll', read, { passive: true });
+    const observer = new ResizeObserver(read);
+    observer.observe(el);
+    return () => { el.removeEventListener('scroll', read); observer.disconnect(); };
+  }, [children]);
+
+  const nudge = (direction: 1 | -1) => {
+    const el = scroller.current;
+    if (el) el.scrollBy({ left: direction * Math.round(el.clientWidth * 0.7), behavior: 'smooth' });
+  };
+
+  return (
+    <div className={`pl-railwrap${edges.left ? ' has-left' : ''}${edges.right ? ' has-right' : ''}`}>
+      <div className="pl-rail" ref={scroller}>{children}</div>
+      {edges.left && (
+        <IconButton
+          className="pl-rail__nudge pl-rail__nudge--left"
+          size="sm"
+          tabIndex={-1}
+          label="Earlier stages"
+          icon={<ChevronLeftIcon size={14} />}
+          onClick={() => nudge(-1)}
+        />
+      )}
+      {edges.right && (
+        <IconButton
+          className="pl-rail__nudge pl-rail__nudge--right"
+          size="sm"
+          tabIndex={-1}
+          label="Later stages"
+          icon={<ChevronRightIcon size={14} />}
+          onClick={() => nudge(1)}
+        />
+      )}
+    </div>
+  );
+}
 
 const DAY_MS = 86_400_000;
 
@@ -171,6 +231,21 @@ export function DealRecordPage({ id }: { id: string }) {
     invalidate(`/v1/records/deal/${id}`, '/v1/records/deal', '/v1/pipelines');
     record.refetch();
     history.refetch();
+  };
+
+  /**
+   * Send the person to the control that actually moves a deal.
+   *
+   * The stage and the pipeline are the two properties this page will not edit
+   * in place, because writing them restamps the probability, the forecast
+   * category and the close stamps. The rail at the top is where that move is
+   * made, with its confirmation — so the property row points at it rather than
+   * opening a dialog for a stage nobody chose.
+   */
+  const focusStageRail = () => {
+    const rail = document.querySelector<HTMLElement>('.pl-rail');
+    rail?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    rail?.querySelector<HTMLButtonElement>('.pl-rail__step:not([disabled])')?.focus();
   };
 
   /* ------------------------------- failure -------------------------------- */
@@ -367,7 +442,7 @@ export function DealRecordPage({ id }: { id: string }) {
 
       {pipeline && (
         <Card title="Stage" description={`Clicking a stage moves the deal and restamps its probability, forecast category and close stamps.`}>
-          <div className="pl-rail">
+          <StageRail>
             {pipeline.stages.map((s) => {
               const current = s.name === stage?.name;
               const done = !!stage && s.position < stage.position && !s.is_closed;
@@ -386,7 +461,7 @@ export function DealRecordPage({ id }: { id: string }) {
                 </button>
               );
             })}
-          </div>
+          </StageRail>
         </Card>
       )}
 
@@ -487,8 +562,8 @@ export function DealRecordPage({ id }: { id: string }) {
 
         <Card
           title="Properties"
-          description="Every field on this deal, in the workspace's own display order"
-          actions={<Button size="sm" variant="secondary" iconLeft={<Icons.edit size={13} />} onClick={() => setEditing('')}>Edit</Button>}
+          description="Every field on this deal, in the workspace’s own display order. Click a value to change it."
+          actions={<Button size="sm" variant="secondary" iconLeft={<Icons.edit size={13} />} onClick={() => setEditing('')}>Edit them all</Button>}
         >
           {properties.error && (
             <ErrorState
@@ -514,10 +589,17 @@ export function DealRecordPage({ id }: { id: string }) {
                   items={rows.map<DescriptionItem>((property) => ({
                     key: property.name,
                     term: property.label,
-                    value: renderValue(property, deal.properties[property.name]),
-                    hint: property.read_only || property.calculated
-                      ? <Badge size="sm" tone="neutral">derived</Badge>
-                      : undefined,
+                    value: (
+                      <InlineProperty
+                        deal={deal}
+                        property={property}
+                        currency={session.currency}
+                        display={renderValue(property, deal.properties[property.name])}
+                        onSaved={refresh}
+                        onMoveStage={focusStageRail}
+                        onMovePipeline={() => setRepiping(true)}
+                      />
+                    ),
                   }))}
                 />
               </section>

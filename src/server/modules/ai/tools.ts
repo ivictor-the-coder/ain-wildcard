@@ -12,7 +12,8 @@ import type { Ctx } from '../../kernel/context';
 import v from '../../../shared/validate';
 import { DAY } from '../../../shared/time';
 import {
-  accountProfile, businessMetric, recordAggregate, recordSearch, recordTimeline, workspaceSearch,
+  accountProfile, businessMetric, delinquentCustomers, meteredUsage, recordAggregate, recordSearch, recordTimeline,
+  staleAccounts, workspaceSearch,
 } from '../../ai/functions';
 import { metricById, metricIds } from '../../ai/metrics';
 import { composeDraft, DRAFT_KINDS, TONES, detectDraftKind, detectTone, type DraftKind, type Tone } from '../../ai/draft';
@@ -70,6 +71,7 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
         subject_id: v.optional(v.string({ max: 80, description: 'Company, contact or billing customer id to scope the metric to.' })),
         group_by: v.optional(v.enum(GROUP_BY)),
         compare: v.optional(v.boolean()),
+        currency: v.optional(v.string({ min: 3, max: 3, description: 'Restrict a money metric to one book, e.g. usd. Omit to get one figure per currency.' })),
       }),
       run: (args: Parameters<typeof businessMetric>[2], _c, meta) => businessMetric(ctx, meta.orgId, args),
     },
@@ -110,8 +112,50 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
         start: v.optional(v.timestamp()),
         end: v.optional(v.timestamp()),
         associated_to: v.optional(v.string({ max: 80 })),
+        owner_id: v.optional(v.string({ max: 80, description: 'Only records owned by this teammate.' })),
       }),
       run: (args: Parameters<typeof recordAggregate>[2], _c, meta) => recordAggregate(ctx, meta.orgId, args),
+    },
+    {
+      name: 'metered_usage',
+      description:
+        'How much of one meter was consumed over a period — for the whole workspace, or for one billing customer. ' +
+        'Honours the meter\u2019s own aggregation (sum, count, max, last or unique), names the accounts behind the number, and says where a workspace figure means something other than a total. ' +
+        'Use this for "how many telemetry events did we meter last month"; use metering.list_meters only when no meter has been named.',
+      readOnly: true,
+      tags: ['ai', 'usage', 'billing'],
+      input: v.object({
+        meter: v.string({ min: 1, max: 80, description: 'Meter id or the event name it reads, e.g. telemetry_events.' }),
+        customer: v.optional(v.string({ max: 80, description: 'Billing customer id. Omit for the whole workspace.' })),
+        start: v.timestamp(),
+        end: v.timestamp(),
+        window_label: v.optional(v.string({ max: 60 })),
+      }),
+      run: (args: { meter: string; customer?: string; start: number; end: number; window_label?: string }, _c, meta) =>
+        meteredUsage(ctx, meta.orgId, args),
+    },
+    {
+      name: 'delinquent_customers',
+      description:
+        'The customers who owe money, from the customer ledger: what each one has outstanding, across how many open invoices, how far past due the oldest is, and whether a subscription of theirs is in payment recovery. '
+        + 'This is the capability behind "which customers are past due", "who owes us money" and "who is in arrears" — a question about customers, which subscription status cannot answer.',
+      readOnly: true,
+      tags: ['ai', 'billing', 'collections'],
+      input: v.object({ limit: v.optional(v.int({ min: 1, max: 50 })) }),
+      run: (args: { limit?: number }, _c, meta) => delinquentCustomers(ctx, meta.orgId, args),
+    },
+    {
+      name: 'stale_accounts',
+      description:
+        'Accounts nobody has touched: companies with no logged activity for longer than the threshold, quietest first, each with how long it has been and what open pipeline is sitting on it. ' +
+        'This is the capability behind "which accounts have gone quiet", "who has gone cold" and "what have we not touched".',
+      readOnly: true,
+      tags: ['ai', 'crm'],
+      input: v.object({
+        days: v.optional(v.int({ min: 1, max: 3650, description: 'How many days of silence counts as quiet. Defaults to 45.' })),
+        limit: v.optional(v.int({ min: 1, max: 50 })),
+      }),
+      run: (args: { days?: number; limit?: number }, _c, meta) => staleAccounts(ctx, meta.orgId, args),
     },
     {
       name: 'record_timeline',

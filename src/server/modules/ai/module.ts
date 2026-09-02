@@ -6,6 +6,7 @@ import { badRequest, forbidden, notFound } from '../../../shared/errors';
 import type { SchemaNode } from '../../../shared/validate';
 import v from '../../../shared/validate';
 import { DAY, dayKey, formatDate } from '../../../shared/time';
+import { formatMoney } from '../../../shared/money';
 import { AI_MIGRATIONS } from './schema';
 import { AiStore, publicApproval, publicMessage, publicRun, publicSpan, publicThread, recordNamer } from './store';
 import { aiTools, metricCatalogue } from './tools';
@@ -16,10 +17,11 @@ import { accountUsage, describeUsage } from '../../ai/usage';
 import { workspaceProfile } from '../../ai/grounding';
 import { stageSets } from '../../ai/metrics';
 import { invalidateIndex } from '../../ai/grounding';
-import { accountProfile, recordSearch, recordTimeline } from '../../ai/functions';
+import { accountProfile, recordSearch, recordTimeline, type AccountProfileResult } from '../../ai/functions';
 import { recordStanding, type RecordStanding } from '../../ai/query';
-import { composeDraft, detectDraftKind, detectTone, DRAFT_KINDS, TONES, type DraftKind, type DraftResult, type Tone } from '../../ai/draft';
+import { composeDraft, detectDraftKind, detectTone, DRAFT_KINDS, TONES, type DraftKind, type DraftResult, type OutstandingInvoice, type Tone } from '../../ai/draft';
 import { truncate } from '../../ai/text';
+import { normaliseResponseSchema, schemaNamesNoFields } from '../../ai/extract';
 
 /**
  * Argument fields that name a record a write will land on.
@@ -180,6 +182,30 @@ declare module '../../kernel/services' {
   interface ServiceRegistry { ai: AiService }
 }
 
+/**
+ * The unpaid bills behind a dunning draft.
+ *
+ * A chase with no invoice number, no amount and no due date in it cannot be
+ * acted on by the person who receives it, and the person who sends it has to
+ * look all three up and retype them. They are on the ledger; this reads them.
+ */
+function outstandingFor(ctx: Ctx, orgId: string, account: AccountProfileResult | null): OutstandingInvoice[] {
+  const billing = ctx.svc.billing;
+  if (!billing || !account) return [];
+  const customer = billing.customerByCrmRecord(orgId, account.id);
+  if (!customer) return [];
+  const workspace = workspaceProfile(ctx, orgId);
+  return billing.invoices(orgId, { customer: customer.id, status: 'open_like', limit: 10 })
+    .filter((invoice) => invoice.amount_due > 0)
+    .map((invoice) => ({
+      number: invoice.number,
+      amount_due_formatted: formatMoney({ amount: invoice.amount_due, currency: invoice.currency }, { locale: workspace.locale }),
+      due_at: invoice.due_date ?? null,
+      days_overdue: invoice.due_date && invoice.due_date < ctx.now() ? Math.floor((ctx.now() - invoice.due_date) / DAY) : null,
+      status: invoice.status,
+    }));
+}
+
 const SYSTEM_PROMPT = (ctx: Ctx, orgId: string): string => {
   const workspace = workspaceProfile(ctx, orgId);
   return [
@@ -234,6 +260,21 @@ function describeAnalysis(completion: AinCompletion) {
     draft_kind: analysis.draftKind,
     plan: analysis.plan,
     skipped: analysis.skipped,
+    // Capabilities the question asked for that this run would not fake, and
+    // what became of every result it did get. Both are the difference between
+    // an answer and a confident answer to a different question.
+    blocked: analysis.blocked.map((entry) => ({
+      object_type: entry.objectType,
+      scope: entry.scope,
+      reason: entry.reason,
+      tool: entry.tool,
+      other_scope: entry.otherScope,
+      missing: entry.missing,
+      options: entry.options ?? [],
+      ambiguous: !!entry.ambiguous,
+      matched: entry.matched ?? null,
+    })),
+    results: analysis.results,
     carried_subject: analysis.carriedSubject,
     steps: analysis.steps,
     passes: analysis.passes,
@@ -340,6 +381,11 @@ export default defineModule({
       // A conversation pinned to an account is pinned for every turn of it.
       // Turn two says "they", and this is the only place that knows who.
       const thread = opts.threadId ? store.thread(orgId, opts.threadId) : undefined;
+      // A thread id that names no thread is a caller error, not a request to
+      // answer detached. Answering it with a 200 left the reply attached to
+      // nothing and the caller never told — while every other thread route
+      // 404s on the same id.
+      if (opts.threadId && !thread) throw notFound('ai thread', opts.threadId);
       return {
         ctx,
         orgId,
@@ -430,6 +476,7 @@ export default defineModule({
         const sender = workspace.people.find((p) => p.id === opts.actorId) ?? workspace.people[0] ?? null;
         return composeDraft({
           workspace,
+          outstanding: outstandingFor(ctx, orgId, account),
           kind: opts.kind ?? detectDraftKind(instruction),
           tone: opts.tone ?? detectTone(instruction),
           instruction,
@@ -611,6 +658,17 @@ export default defineModule({
       if (!body.messages?.length && !body.prompt) {
         throw badRequest('missing_prompt', 'Send either `prompt` or a `messages` array.', 'prompt');
       }
+      // An object schema naming no members used to come back as the JSON
+      // literal `null` with a 200 — indistinguishable from "nothing could be
+      // extracted", and the caller had nothing to correct.
+      if (body.response_schema && schemaNamesNoFields(body.response_schema)) {
+        throw badRequest(
+          'response_schema_invalid',
+          'An object `response_schema` must name its members, either as `fields` or as JSON Schema\'s `properties` — e.g. {"type":"object","properties":{"risk":{"type":"string"}}}. Both spellings are accepted.',
+          'response_schema',
+        );
+      }
+      const responseSchema = body.response_schema ? normaliseResponseSchema(body.response_schema) : undefined;
       assertMayAuthoriseWrites(req);
       const opts: AskOptions = askOptions(req, {
         threadId: body.thread_id ?? null,
@@ -619,7 +677,7 @@ export default defineModule({
         approvals: body.approvals,
         toolNames: body.tools,
         intent: body.intent,
-        responseSchema: body.response_schema,
+        responseSchema,
         maxSteps: body.max_steps,
         model: body.model,
       });
@@ -628,7 +686,7 @@ export default defineModule({
         ? await svc().complete(req.auth.orgId, {
             messages: body.messages as AiMessage[],
             intent: body.intent,
-            responseSchema: body.response_schema,
+            responseSchema,
             model: body.model,
           }, opts)
         : (await svc().ask(req.auth.orgId, body.prompt!, opts)).completion;
@@ -664,7 +722,11 @@ export default defineModule({
       };
     }, {
       summary: 'Run a completion against the workspace with tools and a full trace',
-      description: 'Answers from the workspace\'s own records. Without an ANTHROPIC_API_KEY the built-in deterministic engine answers; with one, the hosted model takes over and uses the same tool runtime.',
+      description:
+        'Answers from the workspace\'s own records. Without an ANTHROPIC_API_KEY the built-in deterministic engine answers; with one, the hosted model takes over and uses the same tool runtime.\n\n'
+        + '`response_schema` returns JSON of exactly that shape instead of prose. An object schema names its members as `fields` or as JSON Schema\'s `properties` — both spellings are accepted, and an object schema carrying neither is rejected with `response_schema_invalid` rather than answered with a silent `null`. '
+        + 'Each member is `{"type": "string" | "number" | "integer" | "boolean" | "array" | "object", …}`; an array\'s element type is `of` or `items`. '
+        + 'A field nothing could fill honestly comes back `null` and is named in the run\'s reasoning rather than guessed at — including a money field on a workspace that bills in several currencies, where there is no single figure to give.',
       tags: ['ai'],
       body: v.object({
         prompt: v.optional(v.string({ min: 1, max: 20_000 })),
@@ -687,8 +749,13 @@ export default defineModule({
     /* -------------------------------- threads ------------------------------ */
 
     router.post('/v1/ai/threads', async (req: Req, c: Ctx) => {
-      const body = req.body as { title?: string; message?: string; subject_id?: string; subject_type?: string };
-      const title = body.title ?? (body.message ? truncate(body.message, 70) : 'New conversation');
+      const body = req.body as { title?: string; message?: string; content?: string; subject_id?: string; subject_type?: string };
+      // The two ways into a conversation take the same thing, so they take the
+      // same names. Starting a thread with `content` and then being told the
+      // reply route wants `content` when the start route wanted `message` is a
+      // 400 nobody can guess their way past.
+      const opening = body.message ?? body.content;
+      const title = body.title ?? (opening ? truncate(opening, 70) : 'New conversation');
       const startedBy = actorFor(ctx, req.auth);
       const thread = store.createThread(req.auth.orgId, {
         title,
@@ -699,8 +766,8 @@ export default defineModule({
       c.emit(req.auth.orgId, 'ai.thread.created', { id: thread.id, title }, {
         objectId: thread.id, objectType: 'ai_thread', actorId: startedBy, actorType: 'user',
       });
-      if (!body.message) return created({ ...publicThread(thread), messages: [] });
-      const answer = await svc().reply(req.auth.orgId, thread.id, body.message, askOptions(req));
+      if (!opening) return created({ ...publicThread(thread), messages: [] });
+      const answer = await svc().reply(req.auth.orgId, thread.id, opening, askOptions(req));
       return created({
         ...publicThread(store.thread(req.auth.orgId, thread.id)!),
         messages: store.messages(req.auth.orgId, thread.id).map(publicMessage),
@@ -710,7 +777,8 @@ export default defineModule({
       summary: 'Start a copilot conversation', tags: ['ai'],
       body: v.object({
         title: v.optional(v.string({ min: 1, max: 200 })),
-        message: v.optional(v.string({ min: 1, max: 20_000 })),
+        message: v.optional(v.string({ min: 1, max: 20_000, description: 'The opening message. `content` is accepted as an alias, so both thread routes take the same field.' })),
+        content: v.optional(v.string({ min: 1, max: 20_000, description: 'Alias for `message`.' })),
         subject_id: v.optional(v.string({ max: 80 })),
         subject_type: v.optional(v.string({ max: 40 })),
       }),
@@ -806,8 +874,12 @@ export default defineModule({
       const thread = store.thread(req.auth.orgId, req.params.id);
       if (!thread) throw notFound('ai thread', req.params.id);
       assertMayAuthoriseWrites(req);
-      const body = req.body as { content: string; allow_writes?: boolean; approvals?: string[]; tools?: string[] };
-      const answer = await svc().reply(req.auth.orgId, thread.id, body.content, askOptions(req, {
+      const body = req.body as { content?: string; message?: string; allow_writes?: boolean; approvals?: string[]; tools?: string[] };
+      const text = body.content ?? body.message;
+      if (!text) {
+        throw badRequest('parameter_missing', 'Send the text as `content` (or `message`, which is accepted as an alias).', 'content');
+      }
+      const answer = await svc().reply(req.auth.orgId, thread.id, text, askOptions(req, {
         allowWrites: body.allow_writes,
         approvals: body.approvals,
         toolNames: body.tools,
@@ -830,7 +902,8 @@ export default defineModule({
     }, {
       summary: 'Send a message and get the grounded reply', tags: ['ai'],
       body: v.object({
-        content: v.string({ min: 1, max: 20_000 }),
+        content: v.optional(v.string({ min: 1, max: 20_000, description: 'The message text. `message` is accepted as an alias; exactly one of the two is required.' })),
+        message: v.optional(v.string({ min: 1, max: 20_000, description: 'Alias for `content`.' })),
         allow_writes: v.optional(v.boolean()),
         approvals: v.optional(v.array(v.string({ max: 60 }), { max: 10 })),
         tools: v.optional(v.array(v.string({ max: 60 }), { max: 40 })),

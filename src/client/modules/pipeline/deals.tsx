@@ -1,18 +1,25 @@
 /**
  * The deal board.
  *
- * A column per stage of one pipeline, the deals inside it, and — the number a
+ * A column per stage of a pipeline, the deals inside it, and — the number a
  * sales leader actually opens this screen for — the weighted forecast each
  * column carries. Every figure is the server's: the stage probabilities come
  * from `/v1/pipelines/deal`, each card's `weighted_amount` is computed by the
  * CRM when the deal is written, and the column totals are those values summed
  * over the cards on screen.
  *
+ * It draws one pipeline, or every pipeline at once as a strip each. The second
+ * is not a nicety: the dashboard counts commit across pipelines, so a card
+ * reading "$3,636,580.00 across 14 deals" had nowhere to send you but a board
+ * showing seven of them. Stages are identified by (pipeline, stage) throughout,
+ * because all three of this workspace's pipelines have a stage called
+ * `qualification` and two of them call it something different on screen.
+ *
  * Moving a card is a real write. Dropping it into a stage that closes the deal,
  * or one the workspace has required properties for, stops at a confirmation
  * that says what the move does to the forecast and collects what is missing.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, useMutation, useQuery, type ApiClientError } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import { useSession } from '@/client/kernel/session';
@@ -25,15 +32,15 @@ import {
   type TableState,
 } from '@/client/design';
 import {
-  HORIZON_LABEL, SORTS, viewToState,
+  ALL_PIPELINES, HORIZON_LABEL, HORIZONS, SORTS, matchesHorizon, snapshotMove, stageKey, viewToState,
   accountOf, civilDay, dealAmount, dealCloseDate, dealEnteredStage, dealPipeline, dealStage,
   dealWeighted, num, recordHref, str, totalsOf, useDealFormat, useDealProperties, usePipelines,
-  useUserIndex, useUsers, useVelocity,
+  useUserIndex, useUsers, useVelocities,
   type BoardState, type CalendarFormat, type DealListEnvelope, type DealRecord, type DealView,
   type Horizon, type Pipeline, type PipelineStage, type StageVelocity,
 } from './api';
 import { ViewBar } from './views';
-import { NewDealDialog, StageMoveDialog } from './dialogs';
+import { NewDealDialog, StageMoveDialog, useUndoMove } from './dialogs';
 import { BulkOwnerDialog, BulkStageDialog } from './bulk';
 
 const DAY_MS = 86_400_000;
@@ -41,11 +48,10 @@ const PAGE_SIZE = 200;
 
 type Display = 'board' | 'table';
 
-const quarterEnd = (now: number): number => {
-  const date = new Date(now);
-  const month = date.getUTCMonth();
-  return Date.UTC(date.getUTCFullYear(), month - (month % 3) + 3, 1);
-};
+/** Where the keyboard should land after a stage-move dialog closes. */
+const landedFrom = (move: { deal: DealRecord; stage: PipelineStage } | null) => (
+  move ? { id: move.deal.id, stage: move.stage.name, pipeline: dealPipeline(move.deal) } : null
+);
 
 /**
  * A stat tile's label, badged when the figure under it is the filtered set
@@ -172,10 +178,13 @@ function DealCard({
 /* -------------------------------- column --------------------------------- */
 
 function StageColumn({
-  stage, deals, velocity, ceiling, children, over, onDragOver, onDragLeave, onDrop, onAdd,
+  stage, pipeline, deals, stalled, velocity, ceiling, children, over, onDragOver, onDragLeave, onDrop, onAdd,
 }: {
   stage: PipelineStage;
+  pipeline: string;
   deals: DealRecord[];
+  /** How many of the cards *on screen* are past this stage's own threshold. */
+  stalled: number;
   velocity: StageVelocity | undefined;
   ceiling: number;
   children: React.ReactNode;
@@ -190,6 +199,9 @@ function StageColumn({
   const share = ceiling > 0 ? Math.min(100, Math.round((totals.amount / ceiling) * 100)) : 0;
 
   return (
+    // `tabIndex={-1}` keeps the column out of the Tab order — eight columns
+    // before the first card would be punishing — while leaving it somewhere the
+    // keyboard can be *put* when the card it was following has left the board.
     <section
       className={`pl-col${over ? ' is-over' : ''}${stage.is_closed ? ' is-closed' : ''}`}
       onDragOver={onDragOver}
@@ -197,6 +209,8 @@ function StageColumn({
       onDrop={onDrop}
       aria-label={`${stage.label} — ${f.plural(totals.deals, 'deal')}, ${f.money(totals.amount)}`}
       data-stage={stage.name}
+      data-pipeline={pipeline}
+      tabIndex={-1}
     >
       <header className="pl-col__head">
         <div className="pl-col__title">
@@ -212,7 +226,13 @@ function StageColumn({
         {velocity && velocity.median_days_in_stage > 0 && (
           <span className="pl-col__weighted">
             Median {f.plural(velocity.median_days_in_stage, 'day')} here
-            {velocity.stalled_records > 0 ? ` · ${velocity.stalled_records} stalled` : ''}
+            {/* Counted over the cards drawn here, not over the stage: every
+                other figure in this header is, and a filtered column reading
+                "0 deals · $0.00 · 2 stalled" is counting deals it is not
+                showing. A deal in a closed stage is finished, not stuck,
+                however long it has sat there, so a closed column never reports
+                stalled deals at all. */}
+            {!stage.is_closed && stalled > 0 ? ` · ${stalled} stalled` : ''}
           </span>
         )}
       </header>
@@ -276,19 +296,55 @@ export function DealsPage() {
     ...(query ? { q: query } : {}),
   });
 
-  const board = useMemo(() => {
-    const list = pipelines.data?.data ?? [];
-    return list.find((p) => p.name === pipelineName) ?? list.find((p) => p.is_default) ?? list[0];
-  }, [pipelines.data, pipelineName]);
+  const known = useMemo(() => pipelines.data?.data ?? [], [pipelines.data]);
 
-  const velocity = useVelocity(board?.name);
-  const velocityByStage = useMemo(
-    () => new Map((velocity.data?.stages ?? []).map((row) => [row.stage, row])),
-    [velocity.data],
+  /**
+   * Whether the board is showing every pipeline at once.
+   *
+   * A pipeline actually named `all` wins, because the lookup below runs first —
+   * the sentinel can only mean "every pipeline" in a workspace that has no
+   * pipeline by that name.
+   */
+  const allMode = pipelineName === ALL_PIPELINES && !known.some((p) => p.name === ALL_PIPELINES);
+
+  /** The pipeline everything single-pipeline hangs off: the one that is selected. */
+  const board = useMemo(
+    () => known.find((p) => p.name === pipelineName) ?? known.find((p) => p.is_default) ?? known[0],
+    [known, pipelineName],
   );
+
+  /** The pipelines drawn on this board — one, or every one of them. */
+  const boards = useMemo(
+    () => (allMode ? known : board ? [board] : []),
+    [allMode, known, board],
+  );
+
+  const boardNames = useMemo(() => boards.map((p) => p.name), [boards]);
+  const onBoard = useMemo(() => new Set(boardNames), [boardNames]);
+  const pipelineByName = useMemo(() => new Map(known.map((p) => [p.name, p])), [known]);
+
+  /**
+   * How many deals have genuinely stopped moving.
+   *
+   * `/v1/pipelines/deal/:id/velocity` counts every record sitting in its stage
+   * longer than that stage's own threshold, and a closed stage has a threshold
+   * like any other — so the 25 deals parked in Closed won were counted as
+   * stalled, and the tile read "28 stalled" over a board of 22 open deals. A
+   * deal that has closed has not stalled, it has finished. Only the open stages
+   * can stall, and the same rule already governs the figure this tile shows
+   * once a filter is on, so the two now measure the same thing.
+   *
+   * Indexed by (pipeline, stage): all three pipelines have a `qualification`
+   * stage, and a threshold learned from one of them is not a fact about the
+   * others.
+   */
+  const velocity = useVelocities(boardNames);
+  const velocityByStage = velocity.byStage;
+  const stalledOpen = velocity.stalledOpen;
 
   const [newOpen, setNewOpen] = useState(location.query.new === '1');
   const [newStage, setNewStage] = useState<string | undefined>(undefined);
+  const [newPipeline, setNewPipeline] = useState<string | undefined>(undefined);
   const [dragging, setDragging] = useState<string | null>(null);
   const [over, setOver] = useState<string | null>(null);
   const [pending, setPending] = useState<Record<string, string>>({});
@@ -301,13 +357,16 @@ export function DealsPage() {
   );
   const [bulkStage, setBulkStage] = useState<PipelineStage | null>(null);
   const [bulkOwner, setBulkOwner] = useState(false);
-  const [refocus, setRefocus] = useState<string | null>(null);
+  const [bulkDone, setBulkDone] = useState(0);
+  const [refocus, setRefocus] = useState<{ id: string; stage: string; pipeline: string } | null>(null);
+  const newDealButton = useRef<HTMLButtonElement>(null);
 
   useEffect(() => { if (location.query.new === '1') setNewOpen(true); }, [location.query.new]);
 
   const closeNew = useCallback(() => {
     setNewOpen(false);
     setNewStage(undefined);
+    setNewPipeline(undefined);
     if (location.query.new) setQuery({ new: undefined }, { replace: true });
   }, [location.query.new, setQuery]);
 
@@ -327,6 +386,13 @@ export function DealsPage() {
     }
   }, [deals.data, pending]);
 
+  /**
+   * A drop lands the moment the pointer is released — there is no confirmation
+   * on an open-to-open move and there should not be one — so the way back
+   * travels with the notification instead.
+   */
+  const offerUndo = useUndoMove();
+
   const moveNow = useMutation<{ deal: DealRecord; stage: PipelineStage }, DealRecord>(
     ({ deal, stage }) => api.patch<DealRecord>(`/v1/records/deal/${encodeURIComponent(deal.id)}`, {
       properties: { deal_stage: stage.name },
@@ -334,9 +400,11 @@ export function DealsPage() {
     {
       invalidates: ['/v1/records/deal', '/v1/pipelines', '/v1/crm/overview'],
       onSuccess: (updated, args) => {
+        const from = board?.stages.find((s) => s.name === dealStage(args.deal));
         toast.success(
           `Moved to ${args.stage.label}`,
           `${updated.display_name} now forecasts ${f.money(num(updated.properties.weighted_amount))} at ${num(updated.properties.probability)}%.`,
+          { action: offerUndo(snapshotMove(args.deal, { deal_stage: args.stage.name }), from?.label ?? 'its old stage') },
         );
       },
       onError: (e: ApiClientError) => toast.error('The stage did not change', e.body.message),
@@ -357,6 +425,11 @@ export function DealsPage() {
     let timer = 0;
     let cancelled = false;
     const until = Date.now() + 1400;
+    // Past this the card has had every chance to come back; if it has not, it
+    // is not going to, and waiting out the rest of the window would leave the
+    // caret on `<body>` for another second.
+    const settled = Date.now() + 800;
+    const lostFocus = () => !document.activeElement || document.activeElement === document.body;
     const land = () => {
       if (cancelled) return;
       // The card is remounted twice — once when the optimistic move drops it in
@@ -364,16 +437,46 @@ export function DealsPage() {
       // remount drops whatever was focused inside it. So the caret is put back
       // for as long as the move takes, and only ever when it has been lost:
       // a person who has clicked somewhere else keeps their focus.
-      const lost = !document.activeElement || document.activeElement === document.body;
-      const card = document.querySelector<HTMLElement>(`.pl-card[data-deal="${CSS.escape(refocus)}"]`);
+      const card = document.querySelector<HTMLElement>(`.pl-card[data-deal="${CSS.escape(refocus.id)}"]`);
       const target = card?.querySelector<HTMLElement>('.pl-card__menu') ?? card?.querySelector<HTMLElement>('.pl-card__name');
-      if (lost && target) target.focus();
-      if (Date.now() < until) timer = window.setTimeout(land, 60);
-      else setRefocus(null);
+      if (lostFocus() && target) target.focus();
+      const gone = !card && Date.now() > settled;
+      if (!gone && Date.now() < until) { timer = window.setTimeout(land, 60); return; }
+      // A close through the dialog usually ends with the card nowhere on the
+      // board — closed stages are hidden by default, and a filtered board drops
+      // it too. Landing on the destination column announces where it went; the
+      // header's own primary action is the last resort, and both beat `<body>`,
+      // which is 25 Tab stops from anything on this page.
+      if (lostFocus()) {
+        const column = document.querySelector<HTMLElement>(
+          `.pl-col[data-pipeline="${CSS.escape(refocus.pipeline)}"][data-stage="${CSS.escape(refocus.stage)}"]`,
+        );
+        (column ?? newDealButton.current)?.focus();
+      }
+      setRefocus(null);
     };
     timer = window.setTimeout(land, 0);
     return () => { cancelled = true; window.clearTimeout(timer); };
   }, [refocus]);
+
+  /**
+   * Put the keyboard back in the grid after a bulk write.
+   *
+   * `Modal` restores focus to whatever opened it, and what opened these two is
+   * a button inside the table's bulk bar — which is gone by the time the dialog
+   * closes, because the write cleared the selection that drew it. So the
+   * restore lands on `<body>`, 49 Tab presses from anything on this page. The
+   * grid's own entry row is where the next action is.
+   */
+  useEffect(() => {
+    if (!bulkDone) return;
+    const frame = requestAnimationFrame(() => {
+      if (document.activeElement && document.activeElement !== document.body) return;
+      const row = document.querySelector<HTMLElement>('.ain-table tbody tr[tabindex]');
+      (row ?? newDealButton.current)?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [bulkDone]);
 
   const requestMove = useCallback((deal: DealRecord, stage: PipelineStage) => {
     if (dealStage(deal) === stage.name) return;
@@ -383,7 +486,7 @@ export function DealsPage() {
         && (deal.properties[p.name] === undefined || deal.properties[p.name] === null || deal.properties[p.name] === ''));
     if (needs) { setMove({ deal, stage }); return; }
     setPending((prev) => ({ ...prev, [deal.id]: stage.name }));
-    setRefocus(deal.id);
+    setRefocus({ id: deal.id, stage: stage.name, pipeline: dealPipeline(deal) });
     void moveNow.run({ deal, stage }).catch(() => {
       setPending((prev) => { const next = { ...prev }; delete next[deal.id]; return next; });
     });
@@ -399,49 +502,63 @@ export function DealsPage() {
   // instant — otherwise "overdue" flips for four hours every evening.
   const today = civilDay(now, session.timeZone);
   const visible = useMemo(() => {
-    const rows = (deals.data?.data ?? []).filter((deal) => !deal.archived && dealPipeline(deal) === board?.name);
-    const lastDay = horizon === '30'
-      ? today + 30 * DAY_MS
-      : horizon === 'quarter' ? quarterEnd(today) - DAY_MS : null;
+    const rows = (deals.data?.data ?? []).filter((deal) => !deal.archived && onBoard.has(dealPipeline(deal)));
     return rows.filter((deal) => {
       if (forecast && str(deal.properties.forecast_category) !== forecast) return false;
-      if (horizon === 'all') return true;
-      const close = dealCloseDate(deal);
-      if (close === null) return false;
-      if (horizon === 'overdue') return close < today;
-      return lastDay !== null && close <= lastDay;
+      return matchesHorizon(dealCloseDate(deal), horizon, today);
     });
-  }, [deals.data, board?.name, forecast, horizon, today]);
+  }, [deals.data, onBoard, forecast, horizon, today]);
 
-  const columns = useMemo(
-    () => (board?.stages ?? []).filter((stage) => showClosed || !stage.is_closed),
-    [board, showClosed],
+  /** The columns each drawn pipeline contributes, in pipeline order. */
+  const columnsOf = useCallback(
+    (pipeline: Pipeline) => pipeline.stages.filter((stage) => showClosed || !stage.is_closed),
+    [showClosed],
   );
+
+  /** Every column on screen, keyed by the pipeline it belongs to as well as its name. */
+  const columnKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const pipeline of boards) for (const stage of columnsOf(pipeline)) keys.add(stageKey(pipeline.name, stage.name));
+    return keys;
+  }, [boards, columnsOf]);
+
+  const keyOf = useCallback((deal: DealRecord) => stageKey(dealPipeline(deal), stageOf(deal)), [stageOf]);
 
   // Both views show the same set: hiding the closed columns has to take those
   // deals out of the table as well, or the header count and the grid disagree.
-  const inView = useMemo(() => {
-    const names = new Set(columns.map((stage) => stage.name));
-    return visible.filter((deal) => names.has(stageOf(deal)));
-  }, [columns, visible, stageOf]);
+  const inView = useMemo(
+    () => visible.filter((deal) => columnKeys.has(keyOf(deal))),
+    [columnKeys, visible, keyOf],
+  );
 
   const byStage = useMemo(() => {
     const map = new Map<string, DealRecord[]>();
-    for (const stage of columns) map.set(stage.name, []);
-    for (const deal of inView) {
-      const list = map.get(stageOf(deal));
-      if (list) list.push(deal);
+    for (const key of columnKeys) map.set(key, []);
+    for (const deal of inView) map.get(keyOf(deal))?.push(deal);
+    return map;
+  }, [columnKeys, inView, keyOf]);
+
+  /**
+   * The tallest column's money, per pipeline.
+   *
+   * The bar under a column head is that column's share of the biggest one, and
+   * on an all-pipelines board a single workspace-wide ceiling flattens a small
+   * pipeline into three invisible slivers. Each pipeline is scaled against its
+   * own busiest stage, which is the comparison the bar is there to make.
+   */
+  const ceilings = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const pipeline of boards) {
+      let top = 0;
+      for (const stage of columnsOf(pipeline)) {
+        top = Math.max(top, totalsOf(byStage.get(stageKey(pipeline.name, stage.name)) ?? []).amount);
+      }
+      map.set(pipeline.name, top);
     }
     return map;
-  }, [columns, inView, stageOf]);
+  }, [boards, columnsOf, byStage]);
 
-  const ceiling = useMemo(() => {
-    let top = 0;
-    for (const stage of columns) top = Math.max(top, totalsOf(byStage.get(stage.name) ?? []).amount);
-    return top;
-  }, [columns, byStage]);
-
-  const boardShown = useMemo(() => columns.reduce((n, stage) => n + (byStage.get(stage.name)?.length ?? 0), 0), [columns, byStage]);
+  const boardShown = inView.length;
   const toolbarFiltered = !!query || !!owner || !!forecast || horizon !== 'all';
   const truncated = !!deals.data?.has_more;
 
@@ -452,10 +569,14 @@ export function DealsPage() {
     horizon !== 'all' && HORIZON_LABEL[horizon].toLowerCase(),
   ].filter(Boolean), [query, owner, forecast, horizon, userIndex]);
 
-  const stageByName = useMemo(
-    () => new Map((board?.stages ?? []).map((stage) => [stage.name, stage])),
-    [board],
-  );
+  const stageByKey = useMemo(() => {
+    const map = new Map<string, PipelineStage>();
+    for (const pipeline of known) for (const stage of pipeline.stages) map.set(stageKey(pipeline.name, stage.name), stage);
+    return map;
+  }, [known]);
+
+  /** The stage a deal is actually in, read from its own pipeline's stage list. */
+  const stageFor = useCallback((deal: DealRecord) => stageByKey.get(keyOf(deal)), [stageByKey, keyOf]);
 
   /* ------------------------------- toolbars ------------------------------- */
 
@@ -483,13 +604,13 @@ export function DealsPage() {
   // after New business has to keep pointing at New business when the workspace
   // makes another pipeline the default.
   const boardState: BoardState = useMemo(() => ({
-    pipeline: board?.name ?? pipelineName,
+    pipeline: allMode ? ALL_PIPELINES : board?.name ?? pipelineName,
     owner,
     forecast,
     horizon,
     sort: sortKey,
     closed: showClosed,
-  }), [board?.name, pipelineName, owner, forecast, horizon, sortKey, showClosed]);
+  }), [allMode, board?.name, pipelineName, owner, forecast, horizon, sortKey, showClosed]);
 
   const applyView = useCallback((view: DealView | null) => {
     if (!view) { setQuery({ view: undefined }); return; }
@@ -512,8 +633,8 @@ export function DealsPage() {
   }, [setQuery, toast]);
 
   const pipelineLabel = useCallback(
-    (name: string) => (pipelines.data?.data ?? []).find((p) => p.name === name)?.label ?? name,
-    [pipelines.data],
+    (name: string) => (name === ALL_PIPELINES ? 'Every pipeline' : pipelineByName.get(name)?.label ?? name),
+    [pipelineByName],
   );
   const ownerName = useCallback(
     (id: string) => userIndex.get(id)?.name ?? id,
@@ -536,9 +657,13 @@ export function DealsPage() {
 
   /* --------------------------------- table -------------------------------- */
 
+  // The label its own pipeline gives that stage. Reading it off whichever
+  // pipeline is selected renders an Expansion deal sitting in "Expansion
+  // identified" as "Qualification", because both pipelines call that stage
+  // `qualification` internally.
   const stageLabel = useCallback(
-    (name: string) => (board?.stages ?? []).find((stage) => stage.name === name)?.label ?? humanize(name),
-    [board],
+    (deal: DealRecord) => stageFor(deal)?.label ?? humanize(stageOf(deal)),
+    [stageFor, stageOf],
   );
 
   const tableColumns = useMemo<DataTableColumn<DealRecord>[]>(() => [
@@ -560,13 +685,21 @@ export function DealsPage() {
       filter: 'set',
       cell: (row) => accountOf(row)?.display_name ?? <span className="pl-muted">—</span>,
     },
+    ...(allMode ? [{
+      id: 'pipeline',
+      header: 'Pipeline',
+      width: 150,
+      accessor: (row: DealRecord) => pipelineLabel(dealPipeline(row)),
+      filter: 'set' as const,
+      cell: (row: DealRecord) => pipelineLabel(dealPipeline(row)),
+    }] : []),
     {
       id: 'stage',
       header: 'Stage',
       width: 160,
-      accessor: (row) => stageLabel(stageOf(row)),
+      accessor: (row) => stageLabel(row),
       filter: 'set',
-      cell: (row) => <Badge size="sm" tone="info">{stageLabel(stageOf(row))}</Badge>,
+      cell: (row) => <Badge size="sm" tone="info">{stageLabel(row)}</Badge>,
     },
     {
       id: 'amount',
@@ -632,7 +765,7 @@ export function DealsPage() {
         return entered ? f.plural(Math.floor((now - entered) / DAY_MS), 'day') : <span className="pl-muted">—</span>;
       },
     },
-  ], [f, now, stageOf, stageLabel, userIndex]);
+  ], [allMode, f, now, pipelineLabel, stageLabel, userIndex]);
 
   /**
    * The table's own search box and column chips, lifted out of the grid.
@@ -668,9 +801,8 @@ export function DealsPage() {
   // the rows it was handed. The subtitle counts these.
   const gridRows = useMemo(() => {
     if (!tableNarrows) return inView;
-    const names = new Set(columns.map((stage) => stage.name));
-    return narrowed.filter((deal) => names.has(stageOf(deal)));
-  }, [tableNarrows, inView, narrowed, columns, stageOf]);
+    return narrowed.filter((deal) => columnKeys.has(keyOf(deal)));
+  }, [tableNarrows, inView, narrowed, columnKeys, keyOf]);
 
   const filtered = toolbarFiltered || tableNarrows;
   const shown = display === 'table' ? gridRows.length : boardShown;
@@ -710,25 +842,56 @@ export function DealsPage() {
     let openDeals = 0;
     let wonDeals = 0;
     for (const deal of narrowed) {
-      const stage = stageByName.get(stageOf(deal));
+      const stage = stageFor(deal);
       if (stage?.is_won) { won += dealAmount(deal); wonDeals += 1; continue; }
       if (stage?.is_closed) continue;
       open += dealAmount(deal);
       weighted += dealWeighted(deal);
       openDeals += 1;
       const entered = dealEnteredStage(deal);
-      const stallsAfter = velocityByStage.get(stage?.name ?? '')?.stalled_after_days ?? 0;
+      const stallsAfter = velocityByStage.get(keyOf(deal))?.stalled_after_days ?? 0;
       if (entered && stallsAfter > 0 && Math.floor((now - entered) / DAY_MS) > stallsAfter) stalled += 1;
     }
     return { open, weighted, won, stalled, openDeals, wonDeals, deals: narrowed.length };
-  }, [narrowed, stageByName, stageOf, velocityByStage, now]);
+  }, [narrowed, stageFor, keyOf, velocityByStage, now]);
+
+  /**
+   * The server's own totals for the pipelines on screen.
+   *
+   * `/v1/pipelines/deal` publishes them per pipeline; showing several at once
+   * adds them up rather than recomputing anything from the page of deals, so
+   * the unfiltered tiles stay whole-set figures however many pipelines are on.
+   */
+  const boardTotals = useMemo(() => {
+    let open = 0;
+    let weighted = 0;
+    let won = 0;
+    let records = 0;
+    for (const pipeline of boards) {
+      open += pipeline.open_amount ?? 0;
+      weighted += pipeline.weighted_amount ?? 0;
+      won += pipeline.won_amount ?? 0;
+      records += pipeline.record_count;
+    }
+    return { open, weighted, won, records };
+  }, [boards]);
+
+  // A median is a property of one pipeline's own closed deals; there is no
+  // honest way to average three of them, so the all-pipelines board says what
+  // it is showing instead of quoting a number nothing measured.
+  const medianDaysToClose = !allMode && board
+    ? velocity.byPipeline.get(board.name)?.median_days_to_close ?? null
+    : null;
 
   const rowActions = useCallback((row: DealRecord): MenuSection[] => [
     { id: 'open', items: [{ id: 'open', label: 'Open deal', icon: <Icons.external size={14} />, onSelect: () => openDeal(row) }] },
     {
+      // A deal's stages are its own pipeline's stages. Offering the selected
+      // pipeline's list would put "Move to Renewal outreach" on a new-business
+      // deal, which is a pipeline change the record page does properly.
       id: 'move',
       label: 'Move to stage',
-      items: (board?.stages ?? [])
+      items: (pipelineByName.get(dealPipeline(row))?.stages ?? [])
         .filter((stage) => stage.name !== stageOf(row))
         .map((stage) => ({
           id: stage.name,
@@ -737,7 +900,7 @@ export function DealsPage() {
           onSelect: () => requestMove(row, stage),
         })),
     },
-  ], [board, openDeal, requestMove, stageOf]);
+  ], [pipelineByName, openDeal, requestMove, stageOf]);
 
   /* -------------------------------- render -------------------------------- */
 
@@ -761,10 +924,11 @@ export function DealsPage() {
       ? `Reading ${board ? board.label : 'the pipeline'}…`
       : board
         ? (() => {
-          const openRows = onScreen.filter((deal) => !board.stages.find((s) => s.name === stageOf(deal))?.is_closed);
+          const openRows = onScreen.filter((deal) => !stageFor(deal)?.is_closed);
           const open = totalsOf(openRows);
+          const where = allMode ? `across ${f.plural(boards.length, 'pipeline')}` : `on ${board.label}`;
           return [
-            `${f.plural(shown, 'deal')} on ${board.label}${showClosed ? '' : ', open stages only'}`,
+            `${f.plural(shown, 'deal')} ${where}${showClosed ? '' : ', open stages only'}`,
             `${f.money(open.amount)} open`,
             `${f.money(open.weighted)} weighted`,
           ].join(' · ');
@@ -787,7 +951,7 @@ export function DealsPage() {
               { value: 'table', label: 'Table', icon: <Icons.table size={14} /> },
             ]}
           />
-          <Button variant="primary" iconLeft={<Icons.plus size={14} />} onClick={() => setNewOpen(true)}>
+          <Button ref={newDealButton} variant="primary" iconLeft={<Icons.plus size={14} />} onClick={() => setNewOpen(true)}>
             New deal
           </Button>
         </>
@@ -798,19 +962,19 @@ export function DealsPage() {
           <Card padding="tight">
             <Stat
               label={<StatLabel filtered={filtered}>Open pipeline</StatLabel>}
-              value={unmeasured ? '—' : f.money(filtered ? filteredTotals.open : board.open_amount ?? 0)}
+              value={unmeasured ? '—' : f.money(filtered ? filteredTotals.open : boardTotals.open)}
               icon={<Icons.funnel size={15} />}
               caption={unmeasured
                 ? unmeasuredWhy
                 : filtered
                   ? `${f.plural(filteredTotals.openDeals, 'open deal')} matching ${filterSummary}`
-                  : `${f.plural(board.record_count, 'deal')} have passed through ${board.label}`}
+                  : `${f.plural(boardTotals.records, 'deal')} have passed through ${allMode ? `${f.plural(boards.length, 'pipeline')}` : board.label}`}
             />
           </Card>
           <Card padding="tight">
             <Stat
               label={<StatLabel filtered={filtered}>Weighted forecast</StatLabel>}
-              value={unmeasured ? '—' : f.money(filtered ? filteredTotals.weighted : board.weighted_amount ?? 0)}
+              value={unmeasured ? '—' : f.money(filtered ? filteredTotals.weighted : boardTotals.weighted)}
               icon={<Icons.target size={15} />}
               caption={unmeasured ? unmeasuredWhy : 'Each open deal at its stage probability'}
             />
@@ -818,15 +982,17 @@ export function DealsPage() {
           <Card padding="tight">
             <Stat
               label={<StatLabel filtered={filtered}>Closed won</StatLabel>}
-              value={unmeasured ? '—' : f.money(filtered ? filteredTotals.won : board.won_amount ?? 0)}
+              value={unmeasured ? '—' : f.money(filtered ? filteredTotals.won : boardTotals.won)}
               icon={<CheckCircleIcon size={15} />}
               caption={unmeasured
                 ? unmeasuredWhy
                 : filtered
                   ? `${f.plural(filteredTotals.wonDeals, 'won deal')} in this filter`
-                  : velocity.data
-                    ? `Median ${f.plural(velocity.data.median_days_to_close, 'day')} to close`
-                    : 'Booked on this pipeline'}
+                  : allMode
+                    ? `Booked across ${f.plural(boards.length, 'pipeline')}`
+                    : medianDaysToClose !== null
+                      ? `Median ${f.plural(medianDaysToClose, 'day')} to close`
+                      : 'Booked on this pipeline'}
             />
           </Card>
           <Card padding="tight">
@@ -836,9 +1002,9 @@ export function DealsPage() {
                 ? '—'
                 : filtered
                   ? f.number(filteredTotals.stalled)
-                  : velocity.data ? f.number(velocity.data.stalled_records) : '—'}
+                  : velocity.byStage.size ? f.number(stalledOpen) : '—'}
               icon={<AlertTriangleIcon size={15} />}
-              caption={unmeasured ? unmeasuredWhy : "Sitting longer than twice their stage's median"}
+              caption={unmeasured ? unmeasuredWhy : "Open deals sitting longer than twice their stage's median"}
             />
           </Card>
         </div>
@@ -855,15 +1021,22 @@ export function DealsPage() {
         />
         <span className="pl-toolbar__rule" aria-hidden="true" />
         <Select
-          value={board?.name ?? ''}
+          value={allMode ? ALL_PIPELINES : board?.name ?? ''}
           onChange={(next) => setQuery({ pipeline: next })}
           size="sm"
           icon={<Icons.layers size={13} />}
           aria-label="Pipeline"
-          options={(pipelines.data?.data ?? []).map<SelectOption>((p) => ({
-            value: p.name,
-            label: `${p.label}${p.is_default ? ' (default)' : ''}`,
-          }))}
+          options={[
+            ...known.map<SelectOption>((p) => ({
+              value: p.name,
+              label: `${p.label}${p.is_default ? ' (default)' : ''}`,
+            })),
+            // Offered only when it means something: with one pipeline in the
+            // workspace, "every pipeline" is the pipeline.
+            ...(known.length > 1 && !known.some((p) => p.name === ALL_PIPELINES)
+              ? [{ value: ALL_PIPELINES, label: 'Every pipeline' }]
+              : []),
+          ]}
         />
         <Select
           value={owner}
@@ -887,7 +1060,7 @@ export function DealsPage() {
           size="sm"
           icon={<Icons.calendar size={13} />}
           aria-label="Close date"
-          options={(Object.keys(HORIZON_LABEL) as Horizon[]).map<SelectOption>((value) => ({ value, label: HORIZON_LABEL[value] }))}
+          options={HORIZONS.map<SelectOption>((value) => ({ value, label: HORIZON_LABEL[value] }))}
         />
         <Select
           value={sortKey}
@@ -918,7 +1091,7 @@ export function DealsPage() {
       {truncated && (
         <Banner tone="info" compact bar>
           Showing the first {f.number(PAGE_SIZE)} deals of {f.number(deals.data?.total_count ?? 0)} by {sort.label.toLowerCase()}.
-          The stat cards above are computed by the server over every deal on this pipeline; the column totals cover the ones on screen.
+          The stat cards above are computed by the server over every deal on {allMode ? 'every pipeline' : 'this pipeline'}; the column totals cover the ones on screen.
         </Banner>
       )}
 
@@ -930,7 +1103,7 @@ export function DealsPage() {
             code={`${error.status} ${deals.error ? '/v1/records/deal' : '/v1/pipelines/deal'}`}
             requestId={error.body.request_id ?? null}
             action={
-              <Button variant="primary" iconLeft={<Icons.refresh size={14} />} onClick={() => { deals.refetch(); pipelines.refetch(); }}>
+              <Button variant="primary" iconLeft={<Icons.refresh size={14} />} onClick={() => { deals.refetch(); pipelines.refetch(); velocity.refetch(); }}>
                 Try again
               </Button>
             }
@@ -954,9 +1127,9 @@ export function DealsPage() {
 
       {!error && !loading && board && populated === 0 && (
         <EmptyState
-          title={filtered ? 'No deal matches these filters' : `${board.label} has no deals yet`}
+          title={filtered ? 'No deal matches these filters' : `${allMode ? 'No pipeline' : board.label} has ${allMode ? 'any' : 'no'} deals yet`}
           body={filtered
-            ? `Nothing on ${board.label} matches ${filterSummary}.`
+            ? `Nothing on ${allMode ? 'any pipeline' : board.label} matches ${filterSummary}.`
             : `Open the first opportunity and it lands in ${board.stages[0]?.label ?? 'the first stage'} at ${board.stages[0]?.probability ?? 0}%.`}
           action={filtered
             ? <Button variant="primary" onClick={clearFilters}>Clear filters</Button>
@@ -965,55 +1138,106 @@ export function DealsPage() {
         />
       )}
 
-      {!error && !loading && board && populated > 0 && display === 'board' && (
-        <div className="pl-board">
-          {columns.map((stage) => (
-            <StageColumn
-              key={stage.name}
-              stage={stage}
-              deals={byStage.get(stage.name) ?? []}
-              velocity={velocityByStage.get(stage.name)}
-              ceiling={ceiling}
-              over={over === stage.name}
-              onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setOver(stage.name); }}
-              onDragLeave={() => setOver((current) => (current === stage.name ? null : current))}
-              onDrop={(e) => {
-                e.preventDefault();
-                setOver(null);
-                const id = e.dataTransfer.getData('text/plain') || dragging;
-                setDragging(null);
-                const deal = inView.find((row) => row.id === id);
-                if (deal) requestMove(deal, stage);
-              }}
-              onAdd={() => { setNewStage(stage.name); setNewOpen(true); }}
-            >
-              {(byStage.get(stage.name) ?? []).map((deal) => (
-                <DealCard
-                  key={deal.id}
-                  deal={deal}
-                  stages={board.stages}
-                  currentStage={board.stages.find((s) => s.name === stageOf(deal))}
-                  velocity={velocityByStage.get(stageOf(deal))}
-                  ownerName={deal.owner_id ? userIndex.get(deal.owner_id)?.name ?? null : null}
-                  busy={!!pending[deal.id]}
-                  dragging={dragging === deal.id}
-                  onOpen={() => openDeal(deal)}
-                  onMove={(stageTo) => requestMove(deal, stageTo)}
-                  onDragStart={() => setDragging(deal.id)}
-                  onDragEnd={() => { setDragging(null); setOver(null); }}
-                />
-              ))}
-            </StageColumn>
-          ))}
-        </div>
-      )}
+      {!error && !loading && board && populated > 0 && display === 'board' && boards.map((pipeline) => {
+        const strip = columnsOf(pipeline);
+        const rows = strip.flatMap((stage) => byStage.get(stageKey(pipeline.name, stage.name)) ?? []);
+        const openRows = rows.filter((deal) => !stageFor(deal)?.is_closed);
+        const totals = totalsOf(openRows);
+        return (
+          <section className="pl-strip" key={pipeline.name} aria-label={pipeline.label}>
+            {allMode && (
+              <header className="pl-strip__head">
+                <h2 className="pl-strip__name">{pipeline.label}</h2>
+                <span className="pl-strip__meta">
+                  {f.plural(rows.length, 'deal')} · {f.money(totals.amount)} open · {f.money(totals.weighted)} weighted
+                </span>
+                <Button
+                  size="sm"
+                  variant="link"
+                  onClick={() => setQuery({ pipeline: pipeline.name })}
+                >
+                  Only {pipeline.label}
+                </Button>
+              </header>
+            )}
+            <div className="pl-board">
+              {strip.map((stage) => {
+                const key = stageKey(pipeline.name, stage.name);
+                const held = byStage.get(key) ?? [];
+                const after = velocityByStage.get(key)?.stalled_after_days ?? 0;
+                const stalled = after <= 0 ? 0 : held.filter((deal) => {
+                  const entered = dealEnteredStage(deal);
+                  return entered !== null && Math.floor((now - entered) / DAY_MS) > after;
+                }).length;
+                // A card can only be dropped into its own pipeline: dragging a
+                // renewal into a new-business column would be a pipeline change,
+                // which the deal record does properly and a drop cannot say.
+                const draggedHere = !!dragging && inView.some((row) => row.id === dragging && dealPipeline(row) === pipeline.name);
+                return (
+                  <StageColumn
+                    key={key}
+                    stage={stage}
+                    pipeline={pipeline.name}
+                    deals={held}
+                    stalled={stalled}
+                    velocity={velocityByStage.get(key)}
+                    ceiling={ceilings.get(pipeline.name) ?? 0}
+                    over={over === key}
+                    onDragOver={(e) => {
+                      if (dragging && !draggedHere) return;
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = 'move';
+                      setOver(key);
+                    }}
+                    onDragLeave={() => setOver((current) => (current === key ? null : current))}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      setOver(null);
+                      const id = e.dataTransfer.getData('text/plain') || dragging;
+                      setDragging(null);
+                      const deal = inView.find((row) => row.id === id);
+                      if (!deal) return;
+                      if (dealPipeline(deal) !== pipeline.name) {
+                        toast.info(
+                          'That deal is on another pipeline',
+                          `${deal.display_name} is on ${pipelineLabel(dealPipeline(deal))}. Open it and use “Move to another pipeline” — the stage and the forecast are restamped together.`,
+                        );
+                        return;
+                      }
+                      requestMove(deal, stage);
+                    }}
+                    onAdd={() => { setNewStage(stage.name); setNewPipeline(pipeline.name); setNewOpen(true); }}
+                  >
+                    {held.map((deal) => (
+                      <DealCard
+                        key={deal.id}
+                        deal={deal}
+                        stages={pipeline.stages}
+                        currentStage={stageFor(deal)}
+                        velocity={velocityByStage.get(keyOf(deal))}
+                        ownerName={deal.owner_id ? userIndex.get(deal.owner_id)?.name ?? null : null}
+                        busy={!!pending[deal.id]}
+                        dragging={dragging === deal.id}
+                        onOpen={() => openDeal(deal)}
+                        onMove={(stageTo) => requestMove(deal, stageTo)}
+                        onDragStart={() => setDragging(deal.id)}
+                        onDragEnd={() => { setDragging(null); setOver(null); }}
+                      />
+                    ))}
+                  </StageColumn>
+                );
+              })}
+            </div>
+          </section>
+        );
+      })}
 
       {!error && !loading && board && populated > 0 && display === 'table' && (
         <DataTable<DealRecord>
           rows={inView}
           columns={tableColumns}
           getRowId={(row) => row.id}
-          caption={`Deals on ${board.label}`}
+          caption={allMode ? 'Deals across every pipeline' : `Deals on ${board.label}`}
           onRowClick={openDeal}
           rowActions={rowActions}
           selectable
@@ -1022,11 +1246,23 @@ export function DealsPage() {
           bulkActions={(ids) => {
             const picked = inView.filter((row) => ids.includes(row.id));
             const totals = totalsOf(picked);
+            // Stages belong to a pipeline. A selection spanning two of them has
+            // no shared stage list, so the menu says which pipelines are in the
+            // way rather than offering a move that would silently mean two
+            // different things.
+            const spans = [...new Set(picked.map(dealPipeline))];
+            const one = spans.length === 1 ? pipelineByName.get(spans[0]) : undefined;
             return (
               <>
                 <span className="ain-table__bulknote">
                   {f.money(totals.amount)} · {f.money(totals.weighted)} weighted
                 </span>
+                {!one && (
+                  <span className="ain-table__bulknote">
+                    On {spans.map(pipelineLabel).join(' and ')} — pick one pipeline to move stage.
+                  </span>
+                )}
+                {one && (
                 <MenuButton
                   size="sm"
                   variant="secondary"
@@ -1034,11 +1270,11 @@ export function DealsPage() {
                   icon={<GitBranchIcon size={13} />}
                   sections={[{
                     id: 'stages',
-                    label: 'Move to stage',
+                    label: `Move to a ${one.label} stage`,
                     // A deal already sitting in the destination is not moved, so
                     // it is not quoted either: this preview is computed over the
                     // same set the confirmation will commit.
-                    items: (board?.stages ?? []).map((stage) => {
+                    items: (one?.stages ?? []).map((stage) => {
                       const moving = picked.filter((row) => stageOf(row) !== stage.name);
                       const amount = moving.reduce((sum, row) => sum + dealAmount(row), 0);
                       return {
@@ -1058,6 +1294,7 @@ export function DealsPage() {
                 >
                   Move stage
                 </MenuButton>
+                )}
                 <Button size="sm" variant="secondary" iconLeft={<Icons.user size={13} />} onClick={() => setBulkOwner(true)}>
                   Reassign
                 </Button>
@@ -1071,7 +1308,12 @@ export function DealsPage() {
           showFilters
           value={tableState}
           onChange={setTableState}
-          footer={<span className="pl-note">{f.plural(gridRows.length, 'deal')} on {board.label}{showClosed ? '' : ', open stages only'}</span>}
+          footer={(
+            <span className="pl-note">
+              {f.plural(gridRows.length, 'deal')} {allMode ? `across ${f.plural(boards.length, 'pipeline')}` : `on ${board.label}`}
+              {showClosed ? '' : ', open stages only'}
+            </span>
+          )}
         />
       )}
 
@@ -1081,7 +1323,7 @@ export function DealsPage() {
         pipelines={pipelines.data?.data ?? []}
         properties={properties.data?.data ?? []}
         users={users.data?.data ?? []}
-        defaultPipeline={board?.name}
+        defaultPipeline={newPipeline ?? (allMode ? known.find((p) => p.is_default)?.name ?? known[0]?.name : board?.name)}
         defaultStage={newStage}
         onCreated={(deal) => navigate(recordHref('deal', deal.id))}
       />
@@ -1090,10 +1332,12 @@ export function DealsPage() {
         open={!!bulkStage}
         deals={inView.filter((row) => selection.includes(row.id))}
         stage={bulkStage}
-        stages={board?.stages ?? []}
+        stages={bulkStage
+          ? known.find((p) => p.stages.some((s) => s.name === bulkStage.name && s.id === bulkStage.id))?.stages ?? []
+          : []}
         properties={properties.data?.data ?? []}
         onClose={() => setBulkStage(null)}
-        onDone={() => { setBulkStage(null); setSelection([]); }}
+        onDone={() => { setBulkStage(null); setSelection([]); setBulkDone((n) => n + 1); }}
       />
 
       <BulkOwnerDialog
@@ -1101,7 +1345,7 @@ export function DealsPage() {
         deals={inView.filter((row) => selection.includes(row.id))}
         users={users.data?.data ?? []}
         onClose={() => setBulkOwner(false)}
-        onDone={() => { setBulkOwner(false); setSelection([]); }}
+        onDone={() => { setBulkOwner(false); setSelection([]); setBulkDone((n) => n + 1); }}
       />
 
       <StageMoveDialog
@@ -1110,8 +1354,8 @@ export function DealsPage() {
         from={move ? board?.stages.find((s) => s.name === dealStage(move.deal)) : undefined}
         to={move?.stage ?? null}
         properties={properties.data?.data ?? []}
-        onClose={() => { const id = move?.deal.id ?? null; setMove(null); setRefocus(id); }}
-        onMoved={() => { const id = move?.deal.id ?? null; setMove(null); setRefocus(id); }}
+        onClose={() => { setMove(null); setRefocus(landedFrom(move)); }}
+        onMoved={() => { setMove(null); setRefocus(landedFrom(move)); }}
       />
     </Page>
   );

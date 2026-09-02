@@ -18,6 +18,18 @@
 }
 .pl-toolbar__search { width: min(280px, 40vw); }
 
+/*
+ * Below this the filter row has already wrapped once, and the trailing switch
+ * ends up hard against the right edge of the content area with its label
+ * running off it. Giving the search box the whole of the last line puts the
+ * switch on its own row, inside the page, where it can still be read.
+ */
+@media (max-width: 1180px) {
+  .pl-toolbar__spacer { display: none; }
+  .pl-toolbar__search { flex: 1 1 240px; width: auto; }
+  .pl-toolbar > .ain-switch { flex: 1 0 100%; }
+}
+
 .pl-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -37,6 +49,31 @@
 }
 
 /* -------------------------------- board ---------------------------------- */
+
+/* One pipeline's worth of columns. On a single-pipeline board it is invisible;
+   with every pipeline on screen it is what separates one from the next. */
+.pl-strip { display: grid; gap: var(--space-3); min-width: 0; }
+.pl-strip + .pl-strip { margin-top: var(--space-5); }
+
+.pl-strip__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.pl-strip__name {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+}
+.pl-strip__meta {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
 
 .pl-board {
   display: grid;
@@ -63,6 +100,13 @@
   background: var(--accent-subtle);
 }
 .pl-col.is-closed { background: var(--bg-subtle); }
+/* The column is a landing place, not a tab stop: when a move takes the card the
+   keyboard was following off the board, focus is put here so the caret is not
+   left on `<body>`. `:focus-visible` is what draws the ring, so a keyboard-driven
+   move announces where it went and a click on the column's own padding — which
+   also focuses a tabindex="-1" element — draws nothing. */
+.pl-col:focus { outline: none; }
+.pl-col:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
 .pl-col__head {
   padding: var(--space-5) var(--space-5) var(--space-4);
@@ -213,13 +257,48 @@
 
 /* ------------------------------- stage rail ------------------------------ */
 
+.pl-railwrap { position: relative; }
 .pl-rail {
   display: flex;
   gap: var(--space-2);
   overflow-x: auto;
   padding-bottom: var(--space-2);
   scrollbar-width: thin;
+  scroll-padding-inline: var(--space-8);
 }
+/* The fade is the affordance: an overlay scrollbar is invisible until you are
+   already scrolling, which is too late to tell you a stage is off-screen. */
+.pl-railwrap::before,
+.pl-railwrap::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: var(--space-4);
+  width: var(--space-9);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+.pl-railwrap::before {
+  left: 0;
+  background: linear-gradient(to right, var(--bg-surface), transparent);
+}
+.pl-railwrap::after {
+  right: 0;
+  background: linear-gradient(to left, var(--bg-surface), transparent);
+}
+.pl-railwrap.has-left::before,
+.pl-railwrap.has-right::after { opacity: 1; }
+.pl-rail__nudge {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-sm);
+}
+.pl-rail__nudge--left { left: calc(var(--space-2) * -1); }
+.pl-rail__nudge--right { right: calc(var(--space-2) * -1); }
 .pl-rail__step {
   flex: 1 1 0;
   min-width: 116px;
@@ -369,6 +448,30 @@
   font-weight: var(--weight-medium);
 }
 
+/* The two lines under the widget's rows: what it could not draw, and what is
+   already past due. Both are links to the board filtered to exactly that set. */
+.pl-widgetmore {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-3) var(--space-4);
+  margin-top: var(--space-1);
+  border: 0;
+  border-top: 1px solid var(--border-subtle);
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+}
+.pl-widgetmore:hover { background: var(--bg-hover); color: var(--text-secondary); }
+.pl-widgetmore:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.pl-widgetmore > svg:last-child { margin-left: auto; flex: 0 0 auto; }
+.pl-widgetmore--warn { color: var(--text-secondary); }
+
 .pl-muted { color: var(--text-tertiary); }
 
 .pl-details > summary {
@@ -392,3 +495,41 @@
    move that half-worked has to say which half, by name. */
 .pl-refusals { margin: var(--space-2) 0 0; padding-left: var(--space-5); display: grid; gap: var(--space-2); }
 .pl-refusals li { font-size: var(--text-xs); line-height: var(--leading-normal); }
+
+/* ------------------------- inline property editing ------------------------ */
+
+.pl-inline { display: flex; align-items: center; gap: var(--space-3); min-width: 0; flex-wrap: wrap; }
+.pl-inline__text { min-width: 0; overflow-wrap: anywhere; }
+
+.pl-inline__read {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  max-width: 100%;
+  padding: var(--space-1) var(--space-2);
+  margin: calc(var(--space-1) * -1) calc(var(--space-2) * -1);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: text;
+}
+.pl-inline__read:hover { background: var(--bg-hover); border-color: var(--border-subtle); }
+.pl-inline__read:focus-visible { outline: none; box-shadow: var(--focus-ring); border-color: var(--border-focus); }
+.pl-inline__read.is-empty { color: var(--text-tertiary); font-style: italic; }
+.pl-inline__pencil { flex: none; opacity: 0; color: var(--text-tertiary); transition: opacity var(--dur-fast) var(--ease-out); }
+.pl-inline__read:hover .pl-inline__pencil,
+.pl-inline__read:focus-visible .pl-inline__pencil { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .pl-inline__pencil { transition: none; } }
+
+.pl-inline--editing { display: grid; gap: var(--space-3); width: 100%; }
+.pl-inline__editor { min-width: 0; }
+.pl-inline__actions { display: flex; align-items: center; gap: var(--space-2); }
+.pl-inline__hint { margin: 0; font-size: var(--text-2xs); color: var(--text-tertiary); }
+.pl-inline__error { margin: 0; font-size: var(--text-xs); color: var(--text-danger); }
+
+.pl-inline--derived .pl-inline__text,
+.pl-inline--linked .pl-inline__text { color: var(--text-primary); }

@@ -33,19 +33,81 @@ const signIn = async (page: Page, request: APIRequestContext) => {
   await page.request.post('/api/v1/auth/demo');
 };
 
-const board = async (page: Page, query = '') => {
-  await page.goto(`/deals${query}`, { waitUntil: 'networkidle' });
-  await page.waitForSelector('.pl-col');
+/**
+ * Read JSON from the API, once the API is willing to answer.
+ *
+ * Every assertion below checks the server rather than the screen, so a refused
+ * read is not a failing product — it is a failing question. The platform's
+ * per-principal rate limiter is 600 requests a real minute and a 69-test suite
+ * in one worker runs close to it, which used to surface as `undefined.find` and
+ * "expected 5, received 0" on whichever test was unlucky. Asking again after a
+ * moment is what the retry-after header is for.
+ */
+const getJson = async <T = unknown>(request: APIRequestContext, url: string): Promise<T> => {
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await request.get(url);
+    if (response.ok()) return (await response.json()) as T;
+    if (attempt >= 3) throw new Error(`${response.status()} ${url}: ${await response.text()}`);
+    await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)));
+  }
 };
 
+/** The same, for the writes and searches a test sets itself up with. */
+const postJson = async <T = unknown>(
+  request: APIRequestContext, url: string, data: unknown,
+): Promise<T> => {
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await request.post(url, { data });
+    if (response.ok()) return (await response.json()) as T;
+    // Only a rate limit is worth repeating: a POST that failed for any other
+    // reason may well have written something, and asking twice would write it
+    // twice.
+    if (attempt >= 3 || response.status() !== 429) {
+      throw new Error(`${response.status()} ${url}: ${await response.text()}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)));
+  }
+};
+
+/**
+ * Open a screen and wait for the thing that proves it rendered.
+ *
+ * A page whose first reads were refused — the API's own per-principal rate
+ * limiter is the usual one, and a suite of 69 tests in one worker runs close to
+ * its ceiling — stays broken until something asks again: `useQuery` caches the
+ * failure rather than retrying it. That produced a failure roughly once every
+ * ten full runs, always on whichever test happened to be holding the page when
+ * the bucket emptied, and a gate that cries wolf gets ignored. So a reload is
+ * attempted twice, which is what a person would do; a screen that is genuinely
+ * broken still fails, three times over.
+ */
+const visit = async (page: Page, path: string, selector: string) => {
+  for (let attempt = 0; ; attempt += 1) {
+    await page.goto(path, { waitUntil: 'networkidle' });
+    try {
+      await page.waitForSelector(selector, { timeout: 12_000 });
+      return;
+    } catch (e) {
+      if (attempt >= 2) throw e;
+      await page.waitForTimeout(3_000);
+    }
+  }
+};
+
+const board = async (page: Page, query = '') => visit(page, `/deals${query}`, '.pl-col');
+
+/** The same board, as a table. */
+const table = async (page: Page, query = '') =>
+  visit(page, `/deals?display=table${query}`, 'tbody tr');
+
 const pipelines = async (request: APIRequestContext): Promise<PipelineDef[]> =>
-  ((await (await request.get('/api/v1/pipelines/deal')).json()) as { data: PipelineDef[] }).data;
+  (await getJson<{ data: PipelineDef[] }>(request, '/api/v1/pipelines/deal')).data;
 
 const deal = async (request: APIRequestContext, id: string): Promise<DealRecord> =>
-  (await (await request.get(`/api/v1/records/deal/${id}`)).json()) as DealRecord;
+  getJson<DealRecord>(request, `/api/v1/records/deal/${id}`);
 
 const findDeal = async (request: APIRequestContext, name: string): Promise<DealRecord | undefined> => {
-  const list = (await (await request.get(`/api/v1/records/deal?q=${encodeURIComponent(name)}&limit=5`)).json()) as DealList;
+  const list = await getJson<DealList>(request, `/api/v1/records/deal?q=${encodeURIComponent(name)}&limit=5`);
   return list.data.find((row) => row.display_name === name);
 };
 
@@ -117,7 +179,7 @@ test('the board is built from the workspace’s own pipeline, and every figure i
 test('the stat row quotes the pipeline totals the server computed', async ({ page, request }) => {
   await board(page);
   const [defaultPipeline] = (await pipelines(request)).filter((p) => p.is_default);
-  const summary = (await (await request.get('/api/v1/pipelines/deal')).json()) as {
+  const summary = (await getJson(request, '/api/v1/pipelines/deal')) as {
     data: (PipelineDef & { open_amount: number; weighted_amount: number })[];
   };
   const row = summary.data.find((p) => p.name === defaultPipeline.name)!;
@@ -314,7 +376,7 @@ test('Escape closes the stage confirmation without writing anything', async ({ p
 /* ============================== deal record =============================== */
 
 test('the deal record shows the forecast the stage produced and its own history', async ({ page, request }) => {
-  const list = (await (await request.get('/api/v1/records/deal?limit=1&sort=amount&order=desc')).json()) as DealList;
+  const list = (await getJson(request, '/api/v1/records/deal?limit=1&sort=amount&order=desc')) as DealList;
   const row = list.data[0];
   await page.goto(`/deals/${row.id}`, { waitUntil: 'networkidle' });
 
@@ -327,7 +389,7 @@ test('the deal record shows the forecast the stage produced and its own history'
 });
 
 test('logging an activity from the deal record lands on the record’s timeline', async ({ page, request }) => {
-  const list = (await (await request.get('/api/v1/records/deal?limit=1')).json()) as DealList;
+  const list = (await getJson(request, '/api/v1/records/deal?limit=1')) as DealList;
   const row = list.data[0];
   await page.goto(`/deals/${row.id}`, { waitUntil: 'networkidle' });
 
@@ -340,13 +402,13 @@ test('logging an activity from the deal record lands on the record’s timeline'
 
   await expect(dialog).toBeHidden();
   await expect.poll(async () => {
-    const timeline = (await (await request.get(`/api/v1/records/deal/${row.id}/timeline`)).json()) as { data: { title: string }[] };
+    const timeline = (await getJson(request, `/api/v1/records/deal/${row.id}/timeline`)) as { data: { title: string }[] };
     return timeline.data.some((item) => item.title.includes(subject));
   }).toBe(true);
 });
 
 test('the stage rail moves the deal', async ({ page, request }) => {
-  const list = (await (await request.get('/api/v1/records/deal?limit=1')).json()) as DealList;
+  const list = (await getJson(request, '/api/v1/records/deal?limit=1')) as DealList;
   const row = list.data[0];
   const startStage = row.properties.deal_stage as string;
   const all = await pipelines(request);
@@ -366,8 +428,7 @@ test('the stage rail moves the deal', async ({ page, request }) => {
 /* ================================ copilot ================================= */
 
 test('a suggested question is answered from this workspace, with citations that navigate', async ({ page }) => {
-  await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
-  await page.waitForSelector('.cp-suggest__item');
+  await visit(page, '/copilot?new=1', '.cp-suggest__item');
 
   await page.locator('.cp-suggest__item').first().click();
   await expect(page.locator('.cp-answer').last()).toBeVisible({ timeout: 30_000 });
@@ -383,23 +444,34 @@ test('a suggested question is answered from this workspace, with citations that 
 test('every answer can be opened down to the tool call and its arguments', async ({ page, request }) => {
   // Pick a run the engine really did call a tool in, so the assertion is about
   // the UI rather than about which question happened to be asked last.
-  const runs = (await (await request.get('/api/v1/ai/runs?limit=25')).json()) as
-    { data: { id: string; thread_id: string | null }[] };
+  const runs = await getJson<{ data: { id: string; thread_id: string | null }[] }>(
+    request, '/api/v1/ai/runs?limit=25');
   let target: { thread_id: string; span: string } | null = null;
   for (const run of runs.data) {
     if (!run.thread_id) continue;
-    const detail = (await (await request.get(`/api/v1/ai/runs/${run.id}`)).json()) as
-      { trace: { id: string; kind: string; args: Record<string, unknown> }[] };
+    const detail = await getJson<{ trace: { id: string; kind: string; args: Record<string, unknown> }[] }>(
+      request, `/api/v1/ai/runs/${run.id}`);
     const span = detail.trace.find((s) => s.kind === 'tool' && Object.keys(s.args ?? {}).length > 0);
     if (span) { target = { thread_id: run.thread_id, span: span.id }; break; }
   }
   expect(target, 'no run in this workspace called a tool').not.toBeNull();
 
-  await page.goto(`/copilot?thread=${target!.thread_id}`, { waitUntil: 'networkidle' });
-  for (const button of await page.getByRole('button', { name: /Show the .* behind this/ }).all()) {
-    await button.click();
+  // The trace panel fetches the run when it is opened, and a refused fetch
+  // leaves it empty for good — so open it again rather than wait out a minute
+  // on a panel that has already given up.
+  for (let attempt = 0; ; attempt += 1) {
+    await visit(page, `/copilot?thread=${target!.thread_id}`, '.cp-answer');
+    for (const button of await page.getByRole('button', { name: /Show the .* behind this/ }).all()) {
+      await button.click();
+    }
+    try {
+      await page.waitForSelector('.cp-step', { timeout: 12_000 });
+      break;
+    } catch (e) {
+      if (attempt >= 2) throw e;
+      await page.waitForTimeout(3_000);
+    }
   }
-  await page.waitForSelector('.cp-step');
 
   // A tool step opens to the exact arguments the engine passed.
   const step = page.locator(`.cp-step[data-span="${target!.span}"]`);
@@ -410,11 +482,10 @@ test('every answer can be opened down to the tool call and its arguments', async
 });
 
 test('the run log is the workspace’s own runs, and one opens to its full trace', async ({ page, request }) => {
-  const runs = (await (await request.get('/api/v1/ai/runs?limit=100')).json()) as {
+  const runs = (await getJson(request, '/api/v1/ai/runs?limit=100')) as {
     data: { id: string; question: string }[]; total_count: number;
   };
-  await page.goto('/copilot/runs', { waitUntil: 'networkidle' });
-  await page.waitForSelector('table tbody tr[data-index]');
+  await visit(page, '/copilot/runs', 'table tbody tr[data-index]');
   expect(await page.locator('table tbody tr[data-index]').count()).toBe(runs.data.length);
 
   await page.locator('table tbody tr[data-index]').first().click();
@@ -426,7 +497,7 @@ test('the run log is the workspace’s own runs, and one opens to its full trace
 test('a write the copilot prepares stops at an approval card, and approving it runs it', async ({ page, request }) => {
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
 
-  const company = (await (await request.get('/api/v1/records/company?limit=1')).json()) as
+  const company = (await getJson(request, '/api/v1/records/company?limit=1')) as
     { data: { id: string; display_name: string }[] };
   const target = company.data[0];
   const marker = `Playwright approval ${Date.now()}`;
@@ -442,13 +513,13 @@ test('a write the copilot prepares stops at an approval card, and approving it r
   await expect(page.locator('.cp-code').filter({ hasText: 'record_ids' }).first()).toBeVisible();
 
   // Nothing has been written yet.
-  const before = (await (await request.get(`/api/v1/records/company/${target.id}/timeline`)).json()) as
+  const before = (await getJson(request, `/api/v1/records/company/${target.id}/timeline`)) as
     { data: { title: string; body: string | null }[] };
   expect(before.data.some((item) => (item.body ?? '').includes(marker))).toBe(false);
 
   await page.getByRole('button', { name: 'Approve and run' }).first().click();
   await expect.poll(async () => {
-    const after = (await (await request.get(`/api/v1/records/company/${target.id}/timeline`)).json()) as
+    const after = (await getJson(request, `/api/v1/records/company/${target.id}/timeline`)) as
       { data: { title: string; body: string | null }[] };
     return after.data.some((item) => `${item.title} ${item.body ?? ''}`.includes(marker));
   }, { timeout: 20_000 }).toBe(true);
@@ -490,13 +561,13 @@ interface AssociationRow {
 const associations = async (
   request: APIRequestContext, dealId: string, type: string,
 ): Promise<AssociationRow[]> =>
-  ((await (await request.get(
-    `/api/v1/records/deal/${dealId}/associations?association_type=${type}`,
-  )).json()) as { data: AssociationRow[] }).data;
+  (await getJson<{ data: AssociationRow[] }>(
+    request, `/api/v1/records/deal/${dealId}/associations?association_type=${type}`,
+  )).data;
 
 /** A deal that already has both an account and a committee, so both cards are live. */
 const linkedDeal = async (request: APIRequestContext): Promise<DealRecord> => {
-  const list = (await (await request.get('/api/v1/records/deal?limit=20&expand=associations')).json()) as {
+  const list = (await getJson(request, '/api/v1/records/deal?limit=20&expand=associations')) as {
     data: (DealRecord & { associations?: AssociationRow[] })[];
   };
   const found = list.data.find((row) =>
@@ -584,8 +655,7 @@ test('an unlinked deal offers a way to link one, and the empty state is honest',
 /* ================================= bulk =================================== */
 
 test('the table moves several deals at once, and states the forecast change first', async ({ page, request }) => {
-  await page.goto('/deals?display=table', { waitUntil: 'networkidle' });
-  await page.waitForSelector('tbody tr');
+  await table(page);
 
   const boxes = page.locator('tbody input[type="checkbox"]');
   await boxes.nth(0).check();
@@ -631,8 +701,7 @@ test('a bulk move to a closing stage demands the reason a single move demands', 
   const lost = stages.find((s) => s.is_closed && !s.is_won);
   test.skip(!lost, 'this pipeline has no losing stage');
 
-  await page.goto('/deals?display=table', { waitUntil: 'networkidle' });
-  await page.waitForSelector('tbody tr');
+  await table(page);
   await page.locator('tbody input[type="checkbox"]').nth(0).check();
   await page.getByRole('button', { name: 'Move stage' }).click();
   await page.getByRole('menuitem', { name: new RegExp(lost!.label) }).click();
@@ -645,14 +714,13 @@ test('a bulk move to a closing stage demands the reason a single move demands', 
 });
 
 test('the bulk bar reassigns a set of deals to one teammate', async ({ page, request }) => {
-  await page.goto('/deals?display=table', { waitUntil: 'networkidle' });
-  await page.waitForSelector('tbody tr');
+  await table(page);
   await page.locator('tbody input[type="checkbox"]').nth(0).check();
 
   const name = (await page.locator('tbody tr').first().locator('td').nth(1).innerText()).trim();
   const before = await findDeal(request, name);
 
-  const users = ((await (await request.get('/api/v1/users')).json()) as { data: { id: string; name: string }[] }).data;
+  const users = (await getJson<{ data: { id: string; name: string }[] }>(request, '/api/v1/users')).data;
   const next = users.find((user) => user.id !== before?.owner_id)!;
 
   await page.getByRole('button', { name: 'Reassign' }).click();
@@ -667,7 +735,7 @@ test('the bulk bar reassigns a set of deals to one teammate', async ({ page, req
 test('the copilot drafts from a deal’s own facts, and the draft can be edited before it is logged', async ({ page, request }) => {
   const target = await linkedDeal(request);
   const timeline = async (): Promise<{ data: { title: string; body: string | null }[] }> =>
-    (await (await request.get(`/api/v1/records/deal/${target.id}/timeline`)).json()) as never;
+    (await getJson(request, `/api/v1/records/deal/${target.id}/timeline`)) as never;
 
   await page.goto(`/deals/${target.id}`, { waitUntil: 'networkidle' });
   await page.getByRole('button', { name: 'Move stage' }).click();
@@ -805,14 +873,29 @@ test('a deal closed today books today, not yesterday', async ({ page, request })
   await page.getByRole('button', { name: 'Move stage' }).click();
   await page.getByRole('menuitem').filter({ hasText: won.label }).first().click();
   const dialog = page.getByRole('dialog');
-  // The day it books is stated, and editable, before the write.
-  const stamp = (await dialog.getByRole('button', { name: 'Close date' }).innerText()).trim();
+  // The day it books is stated, and editable, before the write. The picker
+  // mounts empty and is filled on the dialog's own effect, so it is read once
+  // it holds a date — reading it a frame early got "Pick a date", which
+  // `Date.parse` turns into a RangeError three lines down.
+  const stampField = dialog.getByRole('button', { name: 'Close date' });
+  await expect(stampField).toHaveText(/\w+ \d{1,2}, \d{4}/);
+  const stamp = (await stampField.innerText()).trim();
   await dialog.getByLabel('Close reason').selectOption({ index: 1 });
   await dialog.getByRole('button', { name: 'Mark won' }).click();
 
   await expect.poll(async () => (await deal(request, id)).properties.deal_status, { timeout: 15_000 }).toBe('won');
-  await expect(page.locator('.pl-fact').filter({ hasText: 'Close date' })).toContainText(stamp);
-  await expect(page.locator('.pl-fact').filter({ hasText: 'Close date' })).toContainText('today');
+
+  // The record the server settled on is what the screen has to read back. The
+  // assertion used to race the page's own refresh and caught it mid-flight,
+  // reading "Not set" out of a tile the write had not reached yet.
+  const stored = Number((await deal(request, id)).properties.close_date);
+  expect(new Date(stored).toISOString().slice(0, 10))
+    .toBe(new Date(Date.parse(`${stamp} UTC`)).toISOString().slice(0, 10));
+
+  await page.reload({ waitUntil: 'networkidle' });
+  const closeFact = page.locator('.pl-fact').filter({ hasText: 'Close date' });
+  await expect(closeFact).toContainText(stamp);
+  await expect(closeFact).toContainText('today');
 
   await request.delete(`/api/v1/records/deal/${id}`);
 });
@@ -828,18 +911,36 @@ test('a win can only be closed for a reason a win can carry', async ({ page, req
   const won = defaultPipeline.stages.find((s) => s.is_won)!;
   const lost = defaultPipeline.stages.find((s) => s.is_closed && !s.is_won)!;
 
-  await board(page);
-  const from = await stageWithACard(page, defaultPipeline.stages.filter((s) => !s.is_closed));
-  const card = cardsIn(page, from.name).first();
-  await card.getByRole('button', { name: /^Actions for / }).click();
-  await page.getByRole('menuitem').filter({ hasText: won.label }).first().click();
-  const winReasons = await page.getByRole('dialog').getByLabel('Close reason').locator('option').allInnerTexts();
-  await page.keyboard.press('Escape');
+  // Its own deal, on its own name, rather than whichever card the board happens
+  // to draw first: the two menus below are opened a second apart, and a
+  // refetch that reorders the column between them used to make the second one
+  // a different deal — or a detached element.
+  const probe = await postJson<DealRecord>(request, '/api/v1/records/deal', {
+    properties: {
+      name: `Reason probe ${Date.now()}`,
+      amount: 6_200_00,
+      pipeline: defaultPipeline.name,
+      deal_stage: defaultPipeline.stages.find((s) => !s.is_closed)!.name,
+    },
+  });
 
-  await card.getByRole('button', { name: /^Actions for / }).click();
-  await page.getByRole('menuitem').filter({ hasText: lost.label }).first().click();
-  const lossReasons = await page.getByRole('dialog').getByLabel('Close reason').locator('option').allInnerTexts();
-  await page.keyboard.press('Escape');
+  await board(page);
+  const card = page.locator(`.pl-card[data-deal="${probe.id}"]`);
+  await card.scrollIntoViewIfNeeded();
+
+  const reasonsFor = async (stage: StageDef): Promise<string[]> => {
+    await card.locator('.pl-card__menu').click();
+    await page.getByRole('menuitem').filter({ hasText: stage.label }).first().click();
+    const picker = page.getByRole('dialog').getByLabel('Close reason');
+    await expect(picker).toBeVisible();
+    const options = await picker.locator('option').allInnerTexts();
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    return options;
+  };
+
+  const winReasons = await reasonsFor(won);
+  const lossReasons = await reasonsFor(lost);
 
   // Neither list is the whole enum, and no reason is offered for both outcomes.
   expect(winReasons.length).toBeGreaterThan(1);
@@ -848,6 +949,8 @@ test('a win can only be closed for a reason a win can carry', async ({ page, req
   expect(overlap).toEqual([]);
   expect(lossReasons.join(' ')).toContain('Lost to competitor');
   expect(winReasons.join(' ')).not.toContain('Lost to competitor');
+
+  await request.delete(`/api/v1/records/deal/${probe.id}`);
 });
 
 /* ============================== honest states ============================= */
@@ -865,7 +968,7 @@ test('the board header does not quote a total it has not measured', async ({ pag
 });
 
 test('filtering the board moves the stat cards with it', async ({ page, request }) => {
-  const users = ((await (await request.get('/api/v1/users')).json()) as { data: { id: string; name: string }[] }).data;
+  const users = (await getJson<{ data: { id: string; name: string }[] }>(request, '/api/v1/users')).data;
   await page.goto(`/deals?owner=${users[0].id}`, { waitUntil: 'networkidle' });
   await page.waitForTimeout(600);
   const summary = page.locator('.pl-summary');
@@ -877,8 +980,7 @@ test('filtering the board moves the stat cards with it', async ({ page, request 
 });
 
 test('the bulk stage menu quotes only the deals that would move', async ({ page }) => {
-  await page.goto('/deals?display=table', { waitUntil: 'networkidle' });
-  await page.waitForSelector('tbody tr');
+  await table(page);
   for (let i = 0; i < 3; i++) await page.locator('tbody input[type="checkbox"]').nth(i).check();
   const stages = await page.locator('tbody tr').evaluateAll((rows) =>
     rows.slice(0, 3).map((row) => (row.querySelector('td:nth-child(4)')?.textContent ?? '').trim()));
@@ -889,7 +991,12 @@ test('the bulk stage menu quotes only the deals that would move', async ({ page 
   if (repeated) {
     const item = page.getByRole('menuitem').filter({ hasText: repeated }).first();
     const moving = 3 - stages.filter((s) => s === repeated).length;
-    await expect(item).toContainText(moving === 1 ? '1 deal' : `${moving} deals`);
+    // All three can sit in the same column — which sort order and which deals
+    // the workspace holds decide that, not this test. A destination with
+    // nothing to move says so in words rather than offering "0 deals".
+    await expect(item).toContainText(
+      moving === 0 ? 'All of them are here already' : moving === 1 ? '1 deal' : `${moving} deals`,
+    );
   }
   const other = page.getByRole('menuitem').filter({ hasText: /Closed won/ }).first();
   await expect(other).toContainText('3 deals');
@@ -922,8 +1029,8 @@ test('the keyboard keeps its place after a stage move from a card menu', async (
  */
 test('the conversation records what became of an approved write', async ({ page, request }) => {
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
-  const company = ((await (await request.get('/api/v1/records/company?limit=1')).json()) as
-    { data: { id: string; display_name: string }[] }).data[0];
+  const company = (await getJson<{ data: { id: string; display_name: string }[] }>(
+    request, '/api/v1/records/company?limit=1')).data[0];
   const marker = `Aftermath ${Date.now()}`;
 
   await page.getByRole('switch', { name: 'Let it prepare writes' }).click();
@@ -946,8 +1053,8 @@ test('the conversation records what became of an approved write', async ({ page,
 
 test('a declined write leaves the needs-approval queue', async ({ page, request }) => {
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
-  const company = ((await (await request.get('/api/v1/records/company?limit=1')).json()) as
-    { data: { id: string; display_name: string }[] }).data[0];
+  const company = (await getJson<{ data: { id: string; display_name: string }[] }>(
+    request, '/api/v1/records/company?limit=1')).data[0];
 
   await page.getByRole('switch', { name: 'Let it prepare writes' }).click();
   await page.getByLabel('Ask the copilot').fill(`Log a note on ${company.display_name} saying Declined ${Date.now()}`);
@@ -969,13 +1076,12 @@ test('a declined write leaves the needs-approval queue', async ({ page, request 
 });
 
 test('a run trace counts and orders the steps the same way twice', async ({ page, request }) => {
-  const runs = ((await (await request.get('/api/v1/ai/runs?limit=50')).json()) as { data: { id: string }[] }).data;
-  const detailed = await Promise.all(runs.slice(0, 12).map(async (row) =>
-    (await (await request.get(`/api/v1/ai/runs/${row.id}`)).json()) as
-      { id: string; trace: { started: number }[] }));
+  const runs = (await getJson<{ data: { id: string }[] }>(request, '/api/v1/ai/runs?limit=50')).data;
+  const detailed = await Promise.all(runs.slice(0, 12).map((row) =>
+    getJson<{ id: string; trace: { started: number }[] }>(request, `/api/v1/ai/runs/${row.id}`)));
   const target = detailed.find((row) => row.trace.length > 2) ?? detailed[0];
 
-  await page.goto(`/copilot/runs/${target.id}`, { waitUntil: 'networkidle' });
+  await visit(page, `/copilot/runs/${target.id}`, '.cp-step');
   const rendered = await page.locator('.cp-step').count();
   expect(rendered).toBe(target.trace.length);
   const head = await page.locator('.ain-page__subtitle').first().innerText();
@@ -1002,12 +1108,20 @@ test('a copilot request that fails keeps the question you typed', async ({ page 
 test('the copilot composer is reachable on a short window', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 460 });
   await page.goto('/copilot', { waitUntil: 'networkidle' });
-  await page.waitForTimeout(600);
-  const box = (await page.getByRole('button', { name: 'Ask', exact: true }).boundingBox())!;
-  expect(box.y + box.height).toBeLessThanOrEqual(460);
-  const [scrollHeight, clientHeight] = await page.evaluate(() =>
-    [document.documentElement.scrollHeight, document.documentElement.clientHeight]);
-  expect(scrollHeight).toBeLessThanOrEqual(clientHeight + 1);
+
+  // Polled rather than slept on: the header's own height settles when the
+  // status line arrives, and a fixed wait is a coin toss about whether it has.
+  const ask = page.getByRole('button', { name: 'Ask', exact: true });
+  await expect(ask).toBeVisible();
+  await expect.poll(async () => {
+    const box = await ask.boundingBox();
+    return box ? Math.round(box.y + box.height) : Number.MAX_SAFE_INTEGER;
+  }, { timeout: 10_000 }).toBeLessThanOrEqual(460);
+
+  await expect.poll(
+    async () => page.evaluate(() => document.documentElement.scrollHeight - document.documentElement.clientHeight),
+    { timeout: 10_000 },
+  ).toBeLessThanOrEqual(1);
 });
 
 /**
@@ -1018,7 +1132,7 @@ test('the copilot composer is reachable on a short window', async ({ page }) => 
 test('a deal can be moved onto another pipeline, stage and all', async ({ page, request }) => {
   const all = await pipelines(request);
   if (all.length < 2) test.skip();
-  const list = (await (await request.get('/api/v1/records/deal?limit=20')).json()) as DealList;
+  const list = (await getJson(request, '/api/v1/records/deal?limit=20')) as DealList;
   const target = list.data.find((row) => row.properties.pipeline === all.find((p) => p.is_default)!.name)!;
   const before = { pipeline: target.properties.pipeline, stage: target.properties.deal_stage };
 
@@ -1062,7 +1176,7 @@ test('the copilot quotes a close date as the day it is stored, not the evening b
   const utcDay = (ts: number): string =>
     new Date(ts).toLocaleDateString('en-US', { timeZone: 'UTC', month: 'short', day: 'numeric', year: 'numeric' });
 
-  const list = (await (await request.get('/api/v1/records/deal?limit=200&expand=associations')).json()) as {
+  const list = (await getJson(request, '/api/v1/records/deal?limit=200&expand=associations')) as {
     data: (DealRecord & { associations?: AssociationRow[] })[];
   };
   const byCompany = new Map<string, { name: string; deals: { id: string; day: string }[] }>();
@@ -1116,7 +1230,7 @@ test('a conversation can be renamed, archived, brought back and deleted', async 
   const title = `Housekeeping probe ${Date.now()}`;
   const created = (await (await request.post('/api/v1/ai/threads', { data: { title } })).json()) as { id: string };
   const stateOf = async (): Promise<{ title: string; status: string }> =>
-    (await (await request.get(`/api/v1/ai/threads/${created.id}`)).json()) as { title: string; status: string };
+    (await getJson(request, `/api/v1/ai/threads/${created.id}`)) as { title: string; status: string };
 
   const menuFor = async (name: string) => {
     const row = page.locator('.cp-threadrow').filter({ hasText: name });
@@ -1162,7 +1276,7 @@ test('a conversation can be renamed, archived, brought back and deleted', async 
  */
 test('a first question that fails leaves no empty conversation behind', async ({ page, request }) => {
   const count = async (): Promise<number> =>
-    ((await (await request.get('/api/v1/ai/threads?limit=100')).json()) as { data: unknown[] }).data.length;
+    ((await getJson(request, '/api/v1/ai/threads?limit=100')) as { data: unknown[] }).data.length;
   const before = await count();
 
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
@@ -1187,22 +1301,49 @@ test('a first question that fails leaves no empty conversation behind', async ({
  * grid's own filter used to narrow the rows and leave the four tiles and the
  * subtitle quoting the whole pipeline above them.
  */
-test('the table’s own filter moves the stat cards with it', async ({ page }) => {
-  await page.goto('/deals?display=table', { waitUntil: 'networkidle' });
-  await page.waitForSelector('tbody tr');
-  const total = await page.locator('tbody tr').count();
-  const account = (await page.locator('tbody tr').first().locator('td').nth(2).innerText()).trim();
-  expect(account.length).toBeGreaterThan(0);
+/**
+ * The filter and the tiles read one set.
+ *
+ * This used to filter on whatever account the first row of the default board
+ * happened to show, which made it a test of what the tests before it had left
+ * behind: it starved when earlier tests churned the deals out from under it,
+ * and it could pick a term that matched every row. It brings its own rows now,
+ * and takes them away again.
+ */
+test('the table’s own filter moves the stat cards with it', async ({ page, request }) => {
+  const defaultPipeline = (await pipelines(request)).find((p) => p.is_default)!;
+  const marker = `Filter probe ${Date.now()}`;
+  const made: string[] = [];
+  for (const suffix of ['A', 'B']) {
+    const row = await postJson<DealRecord>(request, '/api/v1/records/deal', {
+      properties: {
+        name: `${marker} ${suffix}`,
+        amount: 111_000_00,
+        pipeline: defaultPipeline.name,
+        deal_stage: defaultPipeline.stages[0].name,
+      },
+    });
+    made.push(row.id);
+  }
 
-  await page.getByRole('searchbox', { name: 'Search table rows' }).fill(account);
-  await expect.poll(async () => page.locator('tbody tr').count(), { timeout: 10_000 }).toBeLessThan(total);
+  try {
+    await table(page);
+    await expect.poll(async () => page.locator('tbody tr').count(), { timeout: 20_000 }).toBeGreaterThan(2);
+    const total = await page.locator('tbody tr').count();
 
-  const summary = page.locator('.pl-summary');
-  await expect(summary).toContainText('filtered');
-  const open = (await summary.locator('.ain-stat__value').first().innerText()).trim();
-  const subtitle = await page.locator('.ain-page__subtitle').first().innerText();
-  expect(subtitle).toContain(`${open} open`);
-  expect(subtitle).toContain(`${await page.locator('tbody tr').count()} deal`);
+    await page.getByRole('searchbox', { name: 'Search table rows' }).fill(marker);
+    await expect.poll(async () => page.locator('tbody tr').count(), { timeout: 10_000 }).toBe(2);
+    expect(total).toBeGreaterThan(2);
+
+    const summary = page.locator('.pl-summary');
+    await expect(summary).toContainText('filtered');
+    const open = (await summary.locator('.ain-stat__value').first().innerText()).trim();
+    const subtitle = await page.locator('.ain-page__subtitle').first().innerText();
+    expect(subtitle).toContain(`${open} open`);
+    expect(subtitle).toContain('2 deals');
+  } finally {
+    for (const id of made) await request.delete(`/api/v1/records/deal/${id}`);
+  }
 });
 
 /* ================================= views ================================= */
@@ -1224,10 +1365,10 @@ interface ViewRow {
  * product, and what someone saved elsewhere shows up on this menu.
  */
 test('a filtered board can be saved as a named view, re-applied, updated and deleted', async ({ page, request }) => {
-  const users = ((await (await request.get('/api/v1/users')).json()) as { data: { id: string; name: string }[] }).data;
+  const users = (await getJson<{ data: { id: string; name: string }[] }>(request, '/api/v1/users')).data;
   const owner = users[0];
   const views = async (): Promise<ViewRow[]> =>
-    ((await (await request.get('/api/v1/views?object_type=deal')).json()) as { data: ViewRow[] }).data;
+    ((await getJson(request, '/api/v1/views?object_type=deal')) as { data: ViewRow[] }).data;
   const name = `Probe view ${Date.now()}`;
   const conditions = (row: ViewRow | undefined) =>
     (row?.filter?.filters ?? []).map((c) => `${c.property}:${c.operator}:${JSON.stringify(c.value ?? c.values)}`);
@@ -1279,8 +1420,8 @@ test('a filtered board can be saved as a named view, re-applied, updated and del
  * across two screens.
  */
 test('the run list counts the same steps the run’s own trace lists', async ({ page, request }) => {
-  const company = ((await (await request.get('/api/v1/records/company?limit=1')).json()) as
-    { data: { id: string; display_name: string }[] }).data[0];
+  const company = (await getJson<{ data: { id: string; display_name: string }[] }>(
+    request, '/api/v1/records/company?limit=1')).data[0];
   const marker = `Steps probe ${Date.now()}`;
 
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
@@ -1294,11 +1435,10 @@ test('the run list counts the same steps the run’s own trace lists', async ({ 
 
   const runId = await page.evaluate(async () =>
     ((await (await fetch('/api/v1/ai/runs?limit=1')).json()) as { data: { id: string }[] }).data[0].id);
-  const detail = (await (await request.get(`/api/v1/ai/runs/${runId}`)).json()) as { trace: unknown[] };
+  const detail = (await getJson(request, `/api/v1/ai/runs/${runId}`)) as { trace: unknown[] };
   expect(detail.trace.length).toBeGreaterThan(0);
 
-  await page.goto('/copilot/runs', { waitUntil: 'networkidle' });
-  await page.waitForSelector('tbody tr');
+  await visit(page, '/copilot/runs', 'tbody tr');
   const headers = await page.locator('thead th').allInnerTexts();
   const stepsColumn = headers.findIndex((header) => header.trim().startsWith('Steps'));
   expect(stepsColumn).toBeGreaterThanOrEqual(0);
@@ -1308,4 +1448,785 @@ test('the run list counts the same steps the run’s own trace lists', async ({ 
   await page.goto(`/copilot/runs/${runId}`, { waitUntil: 'networkidle' });
   await expect(page.locator('.ain-page__subtitle').first())
     .toContainText(`${detail.trace.length} step`);
+});
+
+/* ========================= what the board measures ========================= */
+
+/**
+ * A deal parked in Closed won has not stalled — it has finished.
+ *
+ * `/v1/pipelines/deal/:id/velocity` counts every record sitting in its stage
+ * for longer than that stage's own threshold, and a closed stage has one like
+ * any other. The tile quoted that number whole, so the board reported more
+ * stalled deals than it had open deals, and the moment any filter was applied
+ * it dropped to the open-stage figure — the same tile answering two questions.
+ */
+test('the stalled tile counts only the deals that can still stall', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const def = defs.find((p) => p.is_default) ?? defs[0];
+  const velocity = (await getJson(request, `/api/v1/pipelines/deal/${def.name}/velocity`)) as {
+    stalled_records: number;
+    stages: { is_closed: boolean; stalled_records: number }[];
+  };
+  const openStalled = velocity.stages.filter((s) => !s.is_closed).reduce((n, s) => n + s.stalled_records, 0);
+  const closedStalled = velocity.stages.filter((s) => s.is_closed).reduce((n, s) => n + s.stalled_records, 0);
+  // The gap between the two is what this test exists to catch. If the demo
+  // workspace ever stops parking finished deals in a closed stage, this fails
+  // loudly rather than passing without measuring anything.
+  expect(closedStalled).toBeGreaterThan(0);
+
+  await board(page, `?pipeline=${def.name}`);
+  const tile = page.locator('.pl-summary .ain-stat').nth(3);
+  await expect(tile).toContainText('Stalled');
+  // A stat reading "—" has measured nothing: the velocity read behind it was
+  // refused, and no amount of waiting turns that into a number — only asking
+  // again does. A wrong number still fails, which is the point of the test.
+  await expect.poll(async () => {
+    const shown = (await tile.locator('.ain-stat__value').innerText()).trim();
+    if (shown === '—') await board(page, `?pipeline=${def.name}`);
+    return shown;
+  }, { timeout: 30_000 }).toBe(String(openStalled));
+
+  // And the closed columns never claim a stalled deal of their own.
+  await board(page, `?pipeline=${def.name}&closed=1`);
+  for (const stage of def.stages.filter((s) => s.is_closed)) {
+    await expect(page.locator(`.pl-col[data-stage="${stage.name}"]`)).not.toContainText('stalled');
+  }
+});
+
+/**
+ * "Closing within 30 days" has to mean the next 30 days.
+ *
+ * Both close-date windows were open at the bottom, so a deal whose close date
+ * passed months ago counted as closing within 30 days, as closing this quarter,
+ * and as past its close date, all at once — and none of that agreed with what
+ * saving the board as a view actually stored (`close_date between today and
+ * +30d`), so a view read back showed a different set than the board it came from.
+ */
+test('a close date that has already passed is not "closing within 30 days"', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const def = defs.find((p) => p.is_default) ?? defs[0];
+  const stage = def.stages.find((s) => !s.is_closed)!;
+  const created = (await (await request.post('/api/v1/records/deal', {
+    data: {
+      properties: {
+        name: `Horizon check — long overdue ${Date.now()}`,
+        amount: 4_100_00,
+        pipeline: def.name,
+        deal_stage: stage.name,
+        close_date: Date.now() - 200 * 86_400_000,
+      },
+    },
+  })).json()) as DealRecord;
+
+  const card = (query: string) =>
+    page.locator(`.pl-card[data-deal="${created.id}"]`).describe(query);
+
+  // The board has finished when it has drawn either its columns or the empty
+  // state; asserting a card is absent before that would pass without looking.
+  const settled = async (horizon: string) => {
+    await page.goto(`/deals?pipeline=${def.name}${horizon}`, { waitUntil: 'networkidle' });
+    await page.waitForSelector('.pl-board, .ain-empty');
+  };
+
+  await settled('');
+  await expect(card('any close date')).toHaveCount(1);
+
+  await settled('&horizon=overdue');
+  await expect(card('past its close date')).toHaveCount(1);
+
+  await settled('&horizon=30');
+  await expect(card('closing within 30 days')).toHaveCount(0);
+
+  await settled('&horizon=quarter');
+  await expect(card('closing this quarter')).toHaveCount(0);
+
+  // It is taken away again. Left on the board it is a deal with a close date
+  // 200 days behind us and a name saying so, sitting in an open stage where
+  // any later test that closes a card off the board restamps it to today —
+  // which puts "long overdue" inside the six-week window and fails the card
+  // test 700 lines below for a product behaviour that is correct.
+  await request.delete(`/api/v1/records/deal/${created.id}`);
+});
+
+/* ================================== undo ================================== */
+
+/**
+ * A drop commits the moment the pointer is released, so the way back travels
+ * with the notification. Undo is not a local rewind: it PATCHes the deal back
+ * to the stage it came from, and the server is asked whether it landed.
+ */
+test('a stage move can be undone from the notification it lands with', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const def = defs.find((p) => p.is_default) ?? defs[0];
+  const open = def.stages.filter((s) => !s.is_closed);
+  await board(page, `?pipeline=${def.name}`);
+
+  const from = await stageWithACard(page, open);
+  const id = (await cardsIn(page, from.name).first().getAttribute('data-deal'))!;
+  const to = open.find((s) => s.name !== from.name)!;
+
+  await dragCardTo(page, id, to.name);
+  await expect.poll(async () => (await deal(request, id)).properties.deal_stage, { timeout: 10_000 })
+    .toBe(to.name);
+
+  await page.getByRole('button', { name: 'Undo' }).click();
+  await expect.poll(async () => (await deal(request, id)).properties.deal_stage, { timeout: 10_000 })
+    .toBe(from.name);
+  const back = await deal(request, id);
+  expect(back.properties.probability).toBe(from.probability);
+});
+
+/**
+ * Closing a deal writes more than a stage — a close date, an outcome reason —
+ * and undo has to put all of it back, not just the column the card sits in.
+ */
+test('undoing a close puts the close date and the reason back too', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const def = defs.find((p) => p.is_default) ?? defs[0];
+  const won = def.stages.find((s) => s.is_won)!;
+  const open = def.stages.filter((s) => !s.is_closed);
+  await board(page, `?pipeline=${def.name}&closed=1`);
+
+  const from = await stageWithACard(page, open);
+  const id = (await cardsIn(page, from.name).first().getAttribute('data-deal'))!;
+  const before = await deal(request, id);
+
+  await dragCardTo(page, id, won.name);
+  await expect(page.getByRole('dialog')).toBeVisible();
+  const reason = page.getByRole('dialog').getByLabel('Close reason');
+  await reason.selectOption({ index: 1 });
+  await page.getByRole('button', { name: 'Mark won' }).click();
+
+  await expect.poll(async () => (await deal(request, id)).properties.deal_status, { timeout: 10_000 })
+    .toBe('won');
+
+  await page.getByRole('button', { name: 'Undo' }).click();
+  await expect.poll(async () => (await deal(request, id)).properties.deal_stage, { timeout: 10_000 })
+    .toBe(from.name);
+  const after = await deal(request, id);
+  expect(after.properties.deal_status).toBe('open');
+  expect(after.properties.close_reason ?? null).toBe(before.properties.close_reason ?? null);
+  expect(after.properties.close_date ?? null).toBe(before.properties.close_date ?? null);
+  expect(after.properties.closed_at ?? null).toBe(null);
+});
+
+/* ======================== editing where you read =========================== */
+
+/**
+ * Correcting one field should cost one click, not a modal holding eleven.
+ */
+test('a deal property is corrected where it is read, and the server keeps it', async ({ page, request }) => {
+  await board(page);
+  const card = page.locator('.pl-card').first();
+  const id = (await card.getAttribute('data-deal'))!;
+  await card.locator('.pl-card__name').click();
+  await page.waitForSelector('.pl-proplist');
+
+  const row = page.getByRole('button', { name: /^Edit Next step/ });
+  await row.scrollIntoViewIfNeeded();
+  await row.click();
+
+  const wanted = `Send the security questionnaire ${Date.now()}`;
+  const input = page.getByLabel('Next step', { exact: true });
+  await input.fill(wanted);
+  await input.press('Enter');
+
+  await expect.poll(async () => (await deal(request, id)).properties.next_step, { timeout: 10_000 })
+    .toBe(wanted);
+  await expect(page.getByRole('button', { name: /^Edit Next step/ })).toBeVisible();
+});
+
+/** Every type gets the control it asks for, not a text box for all of them. */
+test('an inline editor is the one the property type asks for', async ({ page }) => {
+  await board(page);
+  await page.locator('.pl-card__name').first().click();
+  await page.waitForSelector('.pl-proplist');
+
+  await page.getByRole('button', { name: /^Edit Amount/ }).click();
+  // A currency is money in the workspace's own currency, never raw minor units.
+  await expect(page.getByLabel('Amount', { exact: true })).toHaveAttribute('inputmode', /decimal|numeric/);
+  await page.keyboard.press('Escape');
+
+  await page.getByRole('button', { name: /^Edit Deal type/ }).click();
+  await expect(page.getByLabel('Deal type', { exact: true })).toHaveRole('combobox');
+  await page.keyboard.press('Escape');
+
+  // The two properties a stage move owns are not edited in place: writing them
+  // restamps the probability and the forecast category, so they keep their
+  // confirmation and this row points at it.
+  await expect(page.getByRole('button', { name: /^Edit Stage/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Move to another stage' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Move to another pipeline' })).toBeVisible();
+});
+
+/**
+ * A refusal from the server lands under the field that caused it, and the
+ * value on the record does not move.
+ */
+test('an inline edit the server refuses says so under the field', async ({ page, request }) => {
+  await board(page);
+  const card = page.locator('.pl-card').first();
+  const id = (await card.getAttribute('data-deal'))!;
+  const before = await deal(request, id);
+  await card.locator('.pl-card__name').click();
+  await page.waitForSelector('.pl-proplist');
+
+  await page.getByRole('button', { name: /^Edit Deal name/ }).click();
+  const input = page.getByLabel('Deal name', { exact: true });
+  await input.fill('');
+  await input.press('Enter');
+
+  await expect(page.locator('.pl-inline__error')).toBeVisible();
+  expect((await deal(request, id)).properties.name).toBe(before.properties.name);
+});
+
+/* ==================== the run log's own filters ============================ */
+
+/**
+ * The feature menu was built from the rows the server had already filtered by
+ * feature, so choosing one deleted every other option from the menu that chose
+ * it. The catalogue comes from `/v1/ai/usage`, which counts runs by feature
+ * whatever the list is showing.
+ */
+test('the run log keeps every feature in the menu that filters by it', async ({ page, request }) => {
+  await request.post('/api/v1/ai/complete', {
+    data: { prompt: 'What is our open pipeline?', feature: 'agent' },
+  });
+  const usage = (await getJson(request, '/api/v1/ai/usage?days=365')) as {
+    by_feature: { key: string }[];
+  };
+  const features = usage.by_feature.map((row) => row.key);
+  expect(features.length).toBeGreaterThan(1);
+
+  await visit(page, '/copilot/runs?feature=agent', 'tbody tr');
+  const menu = page.getByLabel('Feature', { exact: true });
+  const offered = await menu.locator('option').allInnerTexts();
+  // The menu writes a key as the label a person reads — `record_summary` is
+  // offered as "Record summary" — so the two are compared in one shape rather
+  // than raw, which passed only for as long as every feature key was one word.
+  const readable = (key: string) => key.replace(/[_-]+/g, ' ').trim().toLowerCase();
+  const offeredNames = offered.map(readable);
+  for (const name of features) {
+    expect(offeredNames, `the menu should offer ${name}`).toContain(readable(name));
+  }
+
+  // And it is still a working control: switching back is one choice, not a
+  // round trip through "every feature".
+  await menu.selectOption('copilot');
+  await expect.poll(async () => new URL(page.url()).searchParams.get('feature')).toBe('copilot');
+});
+
+/**
+ * A trace answers "why did it say that"; the next question is always "does it
+ * still say that". Asking again starts a new run against today's data — it is
+ * not a replay, and the button does not pretend to be one.
+ */
+test('a run can be put to the engine again from its own trace', async ({ page, request }) => {
+  const log = (await getJson(request, '/api/v1/ai/runs?limit=20')) as {
+    data: { id: string; question: string }[];
+  };
+  const run = log.data.find((row) => row.question.trim().length > 0)!;
+
+  await page.goto(`/copilot/runs/${run.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Ask it again' }).click();
+
+  await page.waitForURL(/\/copilot/, { timeout: 10_000 });
+  await expect(page.getByRole('textbox', { name: 'Ask the copilot' })).toHaveValue(run.question);
+  // A fresh conversation, not an edit of the one the run came from.
+  await expect(page.getByRole('button', { name: 'Ask', exact: true })).toBeEnabled();
+});
+
+/* ================= what the numbers on screen are counting ================= */
+
+/** The workspace runs in en-US/USD; the screen formats through the same rules. */
+const money = (minor: number): string =>
+  new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(minor / 100);
+
+const searchDeals = async (request: APIRequestContext, filter: unknown): Promise<DealList> =>
+  postJson<DealList>(request, '/api/v1/records/deal/search', {
+    filter, sort: [{ property: 'close_date', direction: 'asc' }], limit: 200,
+  });
+
+const sumAmounts = (rows: DealRecord[]): number =>
+  rows.reduce((total, row) => total + Number(row.properties.amount ?? 0), 0);
+
+/** Open, closing inside six weeks — the set the dashboard card claims to quote. */
+const OPEN_IN_SIX_WEEKS = {
+  op: 'and',
+  filters: [
+    { property: 'deal_status', operator: 'eq', value: 'open' },
+    { property: 'close_date', operator: 'between', values: ['today', '+42d'] },
+  ],
+};
+
+/** Open, and the close date has already gone by. Not commit, whatever it says. */
+const OPEN_OVERDUE = {
+  op: 'and',
+  filters: [
+    { property: 'deal_status', operator: 'eq', value: 'open' },
+    { property: 'close_date', operator: 'before', value: 'today' },
+  ],
+};
+
+const closingSoonCard = (page: Page) =>
+  page.locator('.ain-card').filter({ hasText: 'Closing in the next six weeks' }).first();
+
+/**
+ * The dashboard, with the six-week card actually holding numbers.
+ *
+ * The card retries a refused read itself and then renders its own error state
+ * with a retry button rather than a blank space — so when the suite has drained
+ * the API's request budget, press the button the product offers instead of
+ * reporting a defect it does not have.
+ */
+const dashboard = async (page: Page) => {
+  await visit(page, '/', '.ain-card');
+  const card = closingSoonCard(page);
+  const caption = card.locator('.ain-card__desc').first();
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      await expect(caption).toContainText('across', { timeout: 15_000 });
+      return card;
+    } catch (e) {
+      const retry = card.getByRole('button', { name: 'Try again' });
+      if (attempt === 3 || !(await retry.count())) throw e;
+      await retry.click();
+    }
+  }
+  return card;
+};
+
+/**
+ * The card totalled the six rows it had room to draw and captioned the result
+ * as the six-week number — $1.87M where the window really held $4.84M. The
+ * money and the count belong to the matching set; the cap belongs in the words.
+ */
+test('the six-week commit card totals the window, not the rows it draws', async ({ page, request }) => {
+  const matching = await searchDeals(request, OPEN_IN_SIX_WEEKS);
+  expect(matching.data.length, 'the window has to overflow the card for this to mean anything')
+    .toBeGreaterThan(6);
+
+  const card = await dashboard(page);
+  const caption = card.locator('.ain-card__desc').first();
+  await expect(caption).toContainText(`across ${matching.data.length} deals`);
+  await expect(caption).toContainText(money(sumAmounts(matching.data)));
+
+  // …and it says how much of that it is showing, rather than implying it is all.
+  await expect(card.locator('.pl-widgetrow')).toHaveCount(6);
+  await expect(caption).toContainText('showing 6');
+});
+
+/**
+ * "Next six weeks" has a floor. Four of the six rows the card used to draw were
+ * badged overdue, and $1.08M of the figure it quoted was already past due.
+ */
+test('deals past their close date are counted apart from six-week commit', async ({ page, request }) => {
+  const overdue = await searchDeals(request, OPEN_OVERDUE);
+  expect(overdue.data.length, 'this workspace has no overdue deals to separate').toBeGreaterThan(0);
+
+  const card = await dashboard(page);
+
+  // Nothing under a "next six weeks" heading has a close date behind us. Asked
+  // of the two sets the server itself returns, not of the rows' rendered text:
+  // matching the word "overdue" anywhere in a row failed on any deal whose
+  // *name* contained it, and this suite creates one.
+  const drawn = (await card.locator('.pl-widgetrow__title').allInnerTexts()).map((t) => t.trim());
+  expect(drawn.length).toBeGreaterThan(0);
+  const pastDue = new Set(overdue.data.map((row) => row.display_name));
+  expect(drawn.filter((name) => pastDue.has(name))).toEqual([]);
+
+  // They are still counted — on their own line, in their own words.
+  const line = card.locator('.pl-widgetmore--warn');
+  await expect(line).toContainText(`${overdue.data.length} open deals`);
+  await expect(line).toContainText(money(sumAmounts(overdue.data)));
+});
+
+/** The card's button has to land on the window the card counted, not another one. */
+test('the card opens the board on the same six-week window it quoted', async ({ page }) => {
+  const card = await dashboard(page);
+  await card.getByRole('button', { name: 'Open the board' }).click();
+
+  await page.waitForSelector('.pl-col');
+  await expect(page.getByLabel('Close date')).toHaveValue('42');
+  await expect(page.locator('.pl-summary')).toContainText('filtered');
+});
+
+/* ===================== keyboard saves on inline editors ==================== */
+
+/**
+ * The hint under an inline editor reads "Enter saves". For every numeric type
+ * it did not: the editor closed, no PATCH left the page, and the typed amount
+ * was gone. Only free text committed.
+ */
+test('Enter saves an inline money edit, which is what the hint promises', async ({ page, request }) => {
+  await board(page);
+  const card = page.locator('.pl-card').first();
+  const id = (await card.getAttribute('data-deal'))!;
+  await card.locator('.pl-card__name').click();
+  await page.waitForSelector('.pl-proplist');
+
+  const before = Number((await deal(request, id)).properties.amount ?? 0);
+  const wanted = before + 123_400;
+
+  await page.getByRole('button', { name: /^Edit Amount/ }).click();
+  await expect(page.locator('.pl-inline__hint')).toContainText('Enter saves');
+  const input = page.getByLabel('Amount', { exact: true });
+  await input.fill(String(wanted / 100));
+  await input.press('Enter');
+
+  await expect.poll(async () => Number((await deal(request, id)).properties.amount), { timeout: 10_000 })
+    .toBe(wanted);
+
+  await request.patch(`/api/v1/records/deal/${id}`, { data: { properties: { amount: before } } });
+});
+
+/** The same keystroke, on a plain number rather than money. */
+test('Enter saves an inline number edit too', async ({ page, request }) => {
+  await board(page);
+  const card = page.locator('.pl-card').first();
+  const id = (await card.getAttribute('data-deal'))!;
+  const before = (await deal(request, id)).properties.contract_term_months ?? null;
+  await card.locator('.pl-card__name').click();
+  await page.waitForSelector('.pl-proplist');
+
+  const row = page.getByRole('button', { name: /^Edit Term \(months\)/ });
+  await row.scrollIntoViewIfNeeded();
+  await row.click();
+  const input = page.getByLabel('Term (months)', { exact: true });
+  await input.fill('37');
+  await input.press('Enter');
+
+  await expect.poll(async () => (await deal(request, id)).properties.contract_term_months, { timeout: 10_000 })
+    .toBe(37);
+
+  await request.patch(`/api/v1/records/deal/${id}`, { data: { properties: { contract_term_months: before } } });
+});
+
+/* ========================= where the caret lands ========================== */
+
+/**
+ * A dialog whose first focusable node is its own close button eats the first
+ * Space of whatever you type into it — and takes the dialog with it.
+ */
+test('the save-view dialog opens with the caret in the name field', async ({ page }) => {
+  await board(page);
+  await page.getByRole('button', { name: 'Views' }).click();
+  await page.getByRole('menuitem', { name: 'Save this board as a view…' }).click();
+
+  const field = page.getByLabel('View name');
+  await expect(field).toBeFocused();
+
+  // Typing straight away has to reach the field. A Space landing on Close
+  // dismissed the dialog and lost everything typed before it.
+  await page.keyboard.type('Monday forecast call');
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(field).toHaveValue('Monday forecast call');
+  await page.keyboard.press('Escape');
+});
+
+test('the draft dialog opens with the caret in its first field', async ({ page }) => {
+  await page.goto('/copilot?draft=1', { waitUntil: 'networkidle' });
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('combobox', { name: 'About which deal' })).toBeFocused();
+  await page.keyboard.press('Escape');
+});
+
+/**
+ * The form the draft replaces is unmounted when it lands, so the caret fell to
+ * `<body>` with an editable subject, an editable body and two actions on screen.
+ */
+test('the caret follows the draft onto its subject line', async ({ page, request }) => {
+  const target = await linkedDeal(request);
+  await page.goto(`/deals/${target.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Move stage' }).click();
+  await page.getByRole('menuitem', { name: 'Draft a follow-up' }).click();
+  await page.getByRole('button', { name: 'Write the draft' }).click();
+
+  const subject = page.getByRole('textbox', { name: 'Subject' });
+  await expect(subject).toBeVisible({ timeout: 30_000 });
+  await expect(subject).toBeFocused();
+  await page.keyboard.press('Escape');
+});
+
+/**
+ * A close through the confirmation usually ends with the card nowhere on the
+ * board, so the refocus that follows a card had nothing to land on and the
+ * keyboard fell to `<body>` — 25 Tab stops from anything on the page.
+ */
+test('the keyboard lands somewhere after a close through the dialog', async ({ page, request }) => {
+  const defaultPipeline = (await pipelines(request)).find((p) => p.is_default)!;
+  const lost = defaultPipeline.stages.find((s) => s.is_closed && !s.is_won)!;
+  const created = await postJson<DealRecord>(request, '/api/v1/records/deal', {
+    properties: {
+      name: `Focus probe ${Date.now()}`,
+      amount: 4_500_00,
+      pipeline: defaultPipeline.name,
+      deal_stage: defaultPipeline.stages[0].name,
+    },
+  });
+
+  await board(page);
+  const card = page.locator(`.pl-card[data-deal="${created.id}"]`);
+  await card.scrollIntoViewIfNeeded();
+  await card.locator('.pl-card__menu').click();
+  await page.getByRole('menuitem').filter({ hasText: lost.label }).first().click();
+
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Close reason').selectOption({ index: 1 });
+  await dialog.getByRole('button', { name: /^Mark closed$/ }).click();
+
+  await expect.poll(async () => (await deal(request, created.id)).properties.deal_status, { timeout: 15_000 })
+    .toBe('lost');
+
+  await expect.poll(async () => page.evaluate(() => {
+    const active = document.activeElement;
+    if (!active || active === document.body) return 'body';
+    return active.closest('.pl-col')?.getAttribute('data-stage')
+      ?? active.getAttribute('data-stage')
+      ?? active.tagName.toLowerCase();
+  }), { timeout: 10_000 }).not.toBe('body');
+
+  await request.delete(`/api/v1/records/deal/${created.id}`);
+});
+
+/* ============================ undo, everywhere ============================ */
+
+/**
+ * Every stage move on this board offers a way back. A bulk reassignment wrote
+ * the same number of records and offered none, so three deals handed to the
+ * wrong rep meant finding and fixing three records one at a time.
+ */
+test('a bulk reassignment can be undone from the notification it lands with', async ({ page, request }) => {
+  await table(page);
+  const boxes = page.locator('tbody input[type="checkbox"]');
+  await boxes.nth(0).check();
+  await boxes.nth(1).check();
+
+  const names: string[] = [];
+  for (const row of await page.locator('tbody tr').all()) {
+    const box = row.locator('input[type="checkbox"]');
+    if (await box.count() && await box.isChecked()) names.push((await row.locator('td').nth(1).innerText()).trim());
+  }
+  expect(names.length).toBe(2);
+  const before = await Promise.all(names.map((name) => findDeal(request, name)));
+
+  const users = (await getJson<{ data: { id: string; name: string }[] }>(request, '/api/v1/users')).data;
+  const next = users.find((user) => before.every((row) => row?.owner_id !== user.id))!;
+
+  await page.getByRole('button', { name: 'Reassign' }).click();
+  await page.getByLabel('New owner').selectOption(next.id);
+  await page.getByRole('button', { name: 'Reassign', exact: true }).last().click();
+
+  await expect.poll(async () => {
+    const rows = await Promise.all(names.map((name) => findDeal(request, name)));
+    return rows.every((row) => row?.owner_id === next.id);
+  }, { timeout: 15_000 }).toBe(true);
+
+  await page.getByRole('button', { name: 'Undo' }).click();
+
+  await expect.poll(async () => {
+    const rows = await Promise.all(names.map((name) => findDeal(request, name)));
+    return names.every((name, i) => rows[i]?.owner_id === (before[i]?.owner_id ?? null));
+  }, { timeout: 15_000 }).toBe(true);
+});
+
+/* ====================== picking the right person ========================= */
+
+/**
+ * The picker searched the whole workspace with no bias toward the deal's own
+ * account, so on the screen whose job is naming the people who have to say yes,
+ * one ArrowDown and Enter linked a stranger from another company.
+ */
+test('the buying-committee picker offers the deal’s own account first', async ({ page, request }) => {
+  const target = await linkedDeal(request);
+  const account = (await associations(request, target.id, 'deal_to_company'))[0];
+  const onAccount = (await getJson<{ data: { id: string; display_name: string }[] }>(
+    request, `/api/v1/records/contact?associated_to=${account.record_id}&limit=20`,
+  )).data;
+  const linked = new Set((await associations(request, target.id, 'deal_to_contact')).map((row) => row.record_id));
+  const offerable = onAccount.filter((row) => !linked.has(row.id));
+  expect(offerable.length, 'this account has no unlinked contacts to rank').toBeGreaterThan(0);
+
+  await page.goto(`/deals/${target.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Add', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Contacts' }).click();
+  await expect(page.getByRole('option').first()).toBeVisible({ timeout: 15_000 });
+
+  // The list leads with the account, under a heading that says so…
+  await expect(page.getByText(`On ${account.display_name}`)).toBeVisible();
+  // …and the row one ArrowDown reaches is one of that account's own people.
+  const first = (await page.getByRole('option').first().innerText()).trim();
+  expect(offerable.some((row) => first.startsWith(row.display_name))).toBe(true);
+
+  await page.keyboard.press('Escape');
+  await page.keyboard.press('Escape');
+});
+
+/* ==================== the answer, and only the answer ==================== */
+
+/**
+ * The engine may append the raw result of any tool it did not fully spend.
+ * Printed as prose under a finished answer — one display label and two internal
+ * names in the same bullet list — that reads like a debug console nobody
+ * deleted, so the screen splits it off. What the tools returned stays reachable,
+ * named for what it is; the prose stays prose. (The shape of the split itself is
+ * pinned by the unit tests in `tests/pipeline.test.ts`.)
+ */
+test('an answer reads as an answer, not as a console dump under one', async ({ page }) => {
+  await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+  const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
+  await composer.fill('What is our open pipeline by stage?');
+  await composer.press('Enter');
+
+  const answer = page.locator('.cp-answer').last();
+  await expect(answer).toContainText('open pipeline', { timeout: 30_000 });
+  await expect(answer.locator('.cp-answer__body')).toContainText('Breakdown:');
+  // The answer is typed out; nothing about the prose can be judged until the
+  // caret that marks the reveal in progress is gone.
+  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 30_000 });
+
+  const body = answer.locator('.cp-answer__body');
+  await expect(body).not.toContainText('also returned');
+
+  // Nor the other shape the same leak takes: a closing paragraph telling a
+  // sales manager that a named internal capability "carries no field I can name
+  // to you", that printing it "would put primary keys and column names in front
+  // of you", and to go and read a trace — on a run whose own trace records that
+  // same capability returning three rows. Whatever ran without contributing is
+  // recorded beside the answer, not asserted inside it.
+  await expect(body).not.toContainText('could not read anything back');
+  await expect(body).not.toContainText('primary keys');
+  await expect(body).not.toContainText('run’s trace');
+  await expect(body).not.toContainText("run's trace");
+
+  const echo = answer.locator('.cp-echo');
+  if (await echo.count()) {
+    await expect(echo).toContainText('not used in the answer');
+    await echo.locator('summary').click();
+    await expect(echo.locator('.cp-echo__body')).not.toHaveText('');
+  }
+});
+
+/* ===================== every pipeline on one board ======================== */
+
+/**
+ * The dashboard counts across pipelines; the board could only ever draw one.
+ *
+ * So the six-week card read "$3,636,580.00 across 14 deals" and its own link
+ * opened a board headed "7 deals on New business" — the number was right and
+ * the only screen offered to explain it showed half of it.
+ */
+test('the six-week card opens a board holding every deal it counted', async ({ page, request }) => {
+  const matching = await searchDeals(request, OPEN_IN_SIX_WEEKS);
+  const card = await dashboard(page);
+  await expect(card.locator('.ain-card__desc').first()).toContainText(`across ${matching.data.length} deals`);
+
+  await card.getByRole('button', { name: 'Open the board' }).click();
+  await page.waitForSelector('.pl-col');
+
+  await expect(page.getByLabel('Pipeline')).toHaveValue('all');
+  await expect(page.getByLabel('Close date')).toHaveValue('42');
+  // The board's own header counts the same deals the card counted.
+  await expect(page.locator('.ain-page__subtitle, header p').first())
+    .toContainText(`${matching.data.length} deals`);
+  await expect(page.locator('.pl-summary')).toContainText(money(sumAmounts(matching.data)));
+});
+
+test('the board can hold every pipeline at once, each with its own stages', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  expect(defs.length, 'this workspace has only one pipeline, so there is nothing to hold at once')
+    .toBeGreaterThan(1);
+
+  await board(page, '?pipeline=all');
+  // One strip per pipeline, named as the workspace names it.
+  const strips = page.locator('.pl-strip__name');
+  await expect(strips).toHaveCount(defs.length);
+  for (const def of defs) await expect(strips.filter({ hasText: def.label })).toHaveCount(1);
+
+  // …and a stage two pipelines both call `qualification` internally is drawn
+  // once per pipeline, under each pipeline's own label for it.
+  const keys = await page.$$eval('.pl-col', (els) => els.map((e) => `${e.getAttribute('data-pipeline')}/${e.getAttribute('data-stage')}`));
+  expect(new Set(keys).size).toBe(keys.length);
+  const open = defs.reduce((n, def) => n + def.stages.filter((s) => !s.is_closed).length, 0);
+  expect(keys.length).toBe(open);
+
+  // Narrowing back to one pipeline is one click from the strip that names it.
+  await page.getByRole('button', { name: `Only ${defs[1].label}` }).click();
+  await expect.poll(async () => new URL(page.url()).searchParams.get('pipeline')).toBe(defs[1].name);
+  await expect(page.locator('.pl-strip')).toHaveCount(1);
+});
+
+/* ========================= where the caret lands ========================== */
+
+/**
+ * Three dialogs opened with the caret on their own × Close button, so the first
+ * keystroke dismissed them. The close-won one is the worst of the three: it
+ * gathers a *required* close reason, and Space or Enter on landing threw the
+ * dialog away instead of answering it.
+ */
+test('a closing dialog opens on the field it needs, not on its dismiss button', async ({ page, request }) => {
+  const defaultPipeline = (await pipelines(request)).find((p) => p.is_default)!;
+  const won = defaultPipeline.stages.find((s) => s.is_won)!;
+  const created = await postJson<DealRecord>(request, '/api/v1/records/deal', {
+    properties: {
+      name: `Caret probe ${Date.now()}`,
+      amount: 7_300_00,
+      pipeline: defaultPipeline.name,
+      deal_stage: defaultPipeline.stages[0].name,
+    },
+  });
+
+  await board(page);
+  const card = page.locator(`.pl-card[data-deal="${created.id}"]`);
+  await card.scrollIntoViewIfNeeded();
+  await card.locator('.pl-card__menu').click();
+  await page.getByRole('menuitem').filter({ hasText: won.label }).first().click();
+
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel('Close reason')).toBeFocused();
+
+  await page.keyboard.press('Escape');
+  await request.delete(`/api/v1/records/deal/${created.id}`);
+});
+
+test('the bulk reassign dialog opens on the owner picker and hands the keyboard back', async ({ page }) => {
+  await table(page);
+  const boxes = page.locator('tbody input[type="checkbox"]');
+  await boxes.nth(0).check();
+  await boxes.nth(1).check();
+
+  await page.getByRole('button', { name: 'Reassign' }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.getByLabel('New owner')).toBeFocused();
+
+  const owners = await dialog.getByLabel('New owner').locator('option').evaluateAll(
+    (options) => options.map((o) => (o as HTMLOptionElement).value).filter(Boolean),
+  );
+  await dialog.getByLabel('New owner').selectOption(owners[0]);
+  await dialog.getByRole('button', { name: 'Reassign', exact: true }).click();
+
+  // The bar that held the trigger is gone with the selection it described, so
+  // restoring focus to it lands on `<body>` — 49 Tab presses from anything.
+  await expect.poll(async () => page.evaluate(() => (
+    !document.activeElement || document.activeElement === document.body ? 'body' : 'somewhere'
+  )), { timeout: 10_000 }).toBe('somewhere');
+});
+
+test('the copilot puts the caret where you type, on arrival and after an answer', async ({ page }) => {
+  await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+  const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
+  await expect(composer).toBeFocused();
+
+  await composer.fill('How many open deals do we have?');
+  await composer.press('Enter');
+  await expect(page.locator('.cp-answer').last()).toContainText('deal', { timeout: 30_000 });
+
+  // The composer is cleared and re-rendered as the turn lands, which used to
+  // drop the caret onto the document.
+  await expect.poll(async () => page.evaluate(() => (
+    !document.activeElement || document.activeElement === document.body ? 'body' : 'somewhere'
+  )), { timeout: 15_000 }).toBe('somewhere');
 });

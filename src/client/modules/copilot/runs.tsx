@@ -6,24 +6,30 @@
  * arguments, how long each took, what it cost in tokens and credits, and how it
  * ended. HubSpot will tell you Breeze did something; this says why.
  */
-import { useCallback, useMemo, useState } from 'react';
-import { useQuery, type ListEnvelope } from '@/client/kernel/api';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { api, useQuery, type ApiClientError, type ListEnvelope } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import {
   AlertTriangleIcon, Badge, Banner, Button, Card, DataTable, EmptyState, ErrorState, Icons,
   MessageSquareIcon, Page, SegmentedControl, Select, SkeletonText, Stat, humanize, useFormat,
+  useToast,
   type DataTableColumn, type SelectOption,
 } from '@/client/design';
 import {
-  OUTCOME_LABEL, OUTCOME_TONE, refusalOf, runOutcome, useAllApprovals, useApprovals, useRun,
+  OUTCOME_LABEL, OUTCOME_TONE, refusalOf, runOutcome, useAllApprovals, useApprovals,
+  useFeatureCatalogue, useRun,
   type AiRun, type RunDetail, type RunOutcome,
 } from './api';
 import { ApprovalQueue, CitationChips, ReasoningList, RunFacts, TraceSteps } from './trace';
+
+/** How many runs one read of the log brings back, and how far each “show more” goes. */
+const PAGE = 100;
 
 /* ------------------------------- run list --------------------------------- */
 
 export function RunsPage() {
   const f = useFormat();
+  const toast = useToast();
   const { location, navigate, setQuery } = useRouter();
   const status = location.query.status ?? '';
   const feature = location.query.feature ?? '';
@@ -35,9 +41,50 @@ export function RunsPage() {
   // really happened, so the filter is computed from the same answer the column
   // shows.
   const runs = useQuery<ListEnvelope<AiRun>>('/v1/ai/runs', {
-    limit: 100,
+    limit: PAGE,
     ...(feature ? { feature } : {}),
   });
+
+  /**
+   * The rest of the log, a page at a time.
+   *
+   * `/v1/ai/runs` answers at most 100 rows, and this screen used to ask for 100
+   * and stop — so on an observability surface the run you are hunting is the one
+   * you cannot reach. The next pages are fetched by offset and appended, which
+   * keeps the table one growing list and keeps the tiles above totalling exactly
+   * what is on screen.
+   */
+  const [older, setOlder] = useState<AiRun[]>([]);
+  const [reading, setReading] = useState(false);
+  useEffect(() => { setOlder([]); }, [feature]);
+
+  const read = useMemo(() => {
+    const seen = new Set<string>();
+    const out: AiRun[] = [];
+    for (const run of [...(runs.data?.data ?? []), ...older]) {
+      if (seen.has(run.id)) continue;
+      seen.add(run.id);
+      out.push(run);
+    }
+    return out;
+  }, [runs.data, older]);
+
+  const logged = runs.data?.total_count ?? read.length;
+
+  const readMore = useCallback(async () => {
+    setReading(true);
+    try {
+      const page = await api.get<ListEnvelope<AiRun>>('/v1/ai/runs', {
+        limit: PAGE, offset: read.length, ...(feature ? { feature } : {}),
+      });
+      setOlder((current) => [...current, ...page.data]);
+    } catch (e) {
+      toast.error('The rest of the log did not answer', (e as ApiClientError).body.message);
+    } finally {
+      setReading(false);
+    }
+  }, [read.length, feature, toast]);
+
   const decisions = useAllApprovals();
   const approvals = useApprovals(location.query.approvals ?? 'pending');
 
@@ -47,13 +94,20 @@ export function RunsPage() {
   );
 
   const rows = useMemo(
-    () => (runs.data?.data ?? []).filter((run) => !status || outcomeOf(run) === status),
-    [runs.data, status, outcomeOf],
+    () => read.filter((run) => !status || outcomeOf(run) === status),
+    [read, status, outcomeOf],
   );
 
+  // Never from `rows`: those are already narrowed by the very control this list
+  // fills, so picking a feature used to delete every other feature from the menu.
+  const catalogue = useFeatureCatalogue();
   const features = useMemo(
-    () => [...new Set(rows.map((run) => run.feature))].sort(),
-    [rows],
+    () => [...new Set([
+      ...(catalogue.data?.by_feature ?? []).map((bucket) => bucket.key),
+      ...read.map((run) => run.feature),
+      ...(feature ? [feature] : []),
+    ])].sort(),
+    [catalogue.data, read, feature],
   );
 
   const totals = useMemo(() => {
@@ -232,7 +286,23 @@ export function RunsPage() {
         <>
           <div className="pl-summary">
             <Card padding="tight">
-              <Stat label="Runs in view" value={f.number(totals.count)} icon={<Icons.activity size={15} />} caption={status ? `Filtered to ${humanize(status)}` : 'Newest first, up to 100'} />
+              <Stat
+                label="Runs in view"
+                value={f.number(totals.count)}
+                icon={<Icons.activity size={15} />}
+                caption={
+                  status
+                    ? `${f.plural(read.length, 'run')} read${logged > read.length ? ` of ${f.number(logged)} logged` : ''}, filtered to ${humanize(status).toLowerCase()}`
+                    : logged > read.length
+                      ? `The newest ${f.number(read.length)} of ${f.number(logged)} in the log`
+                      : feature
+                        ? `Every ${humanize(feature).toLowerCase()} run this workspace has logged`
+                        // Not "every run": the draft engine composes without
+                        // opening a run, so it has nothing to show here and the
+                        // caption says so rather than over-claiming.
+                        : 'Every question and agent run this workspace has logged — drafting does not open one'
+                }
+              />
             </Card>
             <Card padding="tight">
               <Stat label="Tokens" value={f.compact(totals.tokens)} icon={<Icons.cpu size={15} />} caption={`${f.plural(totals.credits, 'credit')} charged`} />
@@ -285,6 +355,16 @@ export function RunsPage() {
                 action={<Button variant="primary" iconLeft={<Icons.refresh size={14} />} onClick={runs.refetch}>Try again</Button>}
               />
             </Card>
+          )}
+
+          {!runs.error && runs.data && logged > read.length && (
+            <Banner tone="info" compact bar>
+              The newest {f.number(read.length)} of {f.plural(logged, 'run')} are on screen, and every figure above totals those.
+              {' '}
+              <Button size="sm" variant="link" loading={reading} onClick={() => { void readMore(); }}>
+                Read {f.number(Math.min(PAGE, logged - read.length))} more
+              </Button>
+            </Banner>
           )}
 
           {!runs.error && (
@@ -372,6 +452,17 @@ export function RunDetailPage({ id }: { id: string }) {
       subtitle={`${f.dateTime(detail.started)} · ${detail.model} · ${f.plural(steps, 'step')} · ${f.number(detail.duration_ms)} ms`}
       actions={
         <>
+          {detail.question && (
+            <Button
+              iconLeft={<Icons.refresh size={14} />}
+              // Not a replay: the engine reads the workspace as it is now, so
+              // this starts a new run whose trace can be put beside this one.
+              title="Put the same question to the engine again, against today’s data"
+              onClick={() => navigate(`/copilot?new=1&ask=${encodeURIComponent(detail.question)}`)}
+            >
+              Ask it again
+            </Button>
+          )}
           {detail.thread_id && (
             <Button
               iconLeft={<MessageSquareIcon size={14} />}

@@ -13,38 +13,16 @@ import { useFormat, type DateOptions, type Formatter } from '@/client/design';
 
 /* --------------------------- what the board is ---------------------------- */
 
-export type Horizon = 'all' | 'overdue' | '30' | 'quarter';
+export {
+  ALL_PIPELINES, DAY_MS, HORIZON_LABEL, HORIZONS, SIX_WEEK_DAYS, SORTS, conditionsOf, describeBoardState,
+  horizonWindow, matchesHorizon, quarterEnd, quarterStart, sameBoardState, stageKey, stateToView,
+  viewToState,
+} from './board-core';
+export type {
+  BoardState, FilterCondition, FilterGroup, FilterNode, Horizon, StoredView,
+} from './board-core';
 
-export const HORIZON_LABEL: Record<Horizon, string> = {
-  all: 'Any close date',
-  overdue: 'Past its close date',
-  '30': 'Closing within 30 days',
-  quarter: 'Closing this quarter',
-};
-
-export const SORTS: { value: string; label: string; sort: string; order: 'asc' | 'desc' }[] = [
-  { value: 'amount', label: 'Largest first', sort: 'amount', order: 'desc' },
-  { value: 'close', label: 'Closing soonest', sort: 'close_date', order: 'asc' },
-  { value: 'stage', label: 'Longest in stage', sort: 'stage_entered_at', order: 'asc' },
-  { value: 'updated', label: 'Recently updated', sort: 'updated', order: 'desc' },
-];
-
-/**
- * Everything a saved view remembers.
- *
- * Not the free-text search: a view is the shape of the question ("Priya's
- * commit deals closing this quarter"), and the search box is how you find one
- * record inside it. HubSpot draws the same line, and saving the search would
- * make every view stale the moment the deal it named was renamed.
- */
-export interface BoardState {
-  pipeline: string;
-  owner: string;
-  forecast: string;
-  horizon: Horizon;
-  sort: string;
-  closed: boolean;
-}
+import { DAY_MS, stageKey, type FilterNode } from './board-core';
 
 /* -------------------------------- payloads ------------------------------- */
 
@@ -214,10 +192,6 @@ export interface PropertyEnvelope extends ListEnvelope<PropertyDef> {
 /** Every pipeline a deal can sit in, with its stages and live stage totals. */
 /* ------------------------------ saved views ------------------------------- */
 
-export interface FilterCondition { property: string; operator: string; value?: unknown; values?: unknown[] }
-export interface FilterGroup { op: 'and' | 'or'; filters: (FilterGroup | FilterCondition)[] }
-export type FilterNode = FilterGroup | FilterCondition;
-
 export interface DealView {
   object: 'view';
   id: string;
@@ -239,89 +213,6 @@ export interface DealView {
 export const useDealViews = (): QueryResult<ListEnvelope<DealView>> =>
   useQuery<ListEnvelope<DealView>>('/v1/views', { object_type: 'deal' });
 
-const isGroup = (node: FilterNode): node is FilterGroup =>
-  typeof (node as FilterGroup).op === 'string' && Array.isArray((node as FilterGroup).filters);
-
-/** Every leaf condition in a view's filter, whatever it is nested inside. */
-export function conditionsOf(node: FilterNode | null): FilterCondition[] {
-  if (!node) return [];
-  if (!isGroup(node)) return [node];
-  return node.filters.flatMap((child) => conditionsOf(child));
-}
-
-const CLOSE_WINDOW: Record<string, Horizon> = {
-  'today|+30d': '30',
-  'start_of_quarter|end_of_quarter': 'quarter',
-};
-
-/**
- * A saved view, read back as the board controls that produced it.
- *
- * The server stores a real filter tree — the same one the record search
- * compiles — so a view saved here is a view the API understands, not an opaque
- * blob only this screen can read. Reading it back means recognising the handful
- * of shapes these controls can write; `readable` says whether that succeeded,
- * so a view built elsewhere is never silently shown as something it is not.
- */
-export function viewToState(view: DealView): { state: BoardState; readable: boolean } {
-  const state: BoardState = { pipeline: '', owner: '', forecast: '', horizon: 'all', sort: 'amount', closed: true };
-  let readable = view.filter === null || isGroup(view.filter);
-  for (const condition of conditionsOf(view.filter)) {
-    const value = typeof condition.value === 'string' ? condition.value : '';
-    if (condition.property === 'pipeline' && condition.operator === 'eq') state.pipeline = value;
-    else if (condition.property === 'owner_id' && condition.operator === 'eq') state.owner = value;
-    else if (condition.property === 'forecast_category' && condition.operator === 'eq') state.forecast = value;
-    else if (condition.property === 'deal_status' && condition.operator === 'eq' && value === 'open') state.closed = false;
-    else if (condition.property === 'close_date' && condition.operator === 'before' && value === 'today') state.horizon = 'overdue';
-    else if (condition.property === 'close_date' && condition.operator === 'between') {
-      const key = (condition.values ?? []).map(String).join('|');
-      if (CLOSE_WINDOW[key]) state.horizon = CLOSE_WINDOW[key];
-      else readable = false;
-    } else readable = false;
-  }
-  const sort = SORTS.find((row) => row.sort === view.sort[0]?.property && row.order === (view.sort[0]?.direction ?? 'asc'));
-  if (sort) state.sort = sort.value;
-  return { state, readable };
-}
-
-/** The same journey the other way: the board's controls as a stored filter. */
-export function stateToView(state: BoardState): { filter: FilterNode | null; sort: DealView['sort'] } {
-  const filters: FilterCondition[] = [];
-  if (state.pipeline) filters.push({ property: 'pipeline', operator: 'eq', value: state.pipeline });
-  if (!state.closed) filters.push({ property: 'deal_status', operator: 'eq', value: 'open' });
-  if (state.owner) filters.push({ property: 'owner_id', operator: 'eq', value: state.owner });
-  if (state.forecast) filters.push({ property: 'forecast_category', operator: 'eq', value: state.forecast });
-  if (state.horizon === 'overdue') filters.push({ property: 'close_date', operator: 'before', value: 'today' });
-  if (state.horizon === '30') filters.push({ property: 'close_date', operator: 'between', values: ['today', '+30d'] });
-  if (state.horizon === 'quarter') filters.push({ property: 'close_date', operator: 'between', values: ['start_of_quarter', 'end_of_quarter'] });
-  const chosen = SORTS.find((row) => row.value === state.sort) ?? SORTS[0];
-  return {
-    filter: filters.length ? { op: 'and', filters } : null,
-    sort: [{ property: chosen.sort, direction: chosen.order }],
-  };
-}
-
-export const sameBoardState = (a: BoardState, b: BoardState): boolean =>
-  a.pipeline === b.pipeline && a.owner === b.owner && a.forecast === b.forecast
-  && a.horizon === b.horizon && a.sort === b.sort && a.closed === b.closed;
-
-/** What a view narrows to, in the words its own controls use. */
-export function describeBoardState(state: BoardState, o: {
-  pipelineLabel: (name: string) => string;
-  ownerName: (id: string) => string;
-  forecastLabel: (value: string) => string;
-}): string {
-  const parts = [
-    state.pipeline && o.pipelineLabel(state.pipeline),
-    state.owner && o.ownerName(state.owner),
-    state.forecast && o.forecastLabel(state.forecast),
-    state.horizon !== 'all' && HORIZON_LABEL[state.horizon].toLowerCase(),
-    state.closed ? 'closed stages included' : 'open stages only',
-    (SORTS.find((row) => row.value === state.sort) ?? SORTS[0]).label.toLowerCase(),
-  ].filter(Boolean);
-  return parts.join(' · ');
-}
-
 export const usePipelines = (): QueryResult<ListEnvelope<Pipeline>> =>
   useQuery<ListEnvelope<Pipeline>>('/v1/pipelines/deal');
 
@@ -340,6 +231,179 @@ export const useVelocity = (pipeline: string | undefined): QueryResult<PipelineV
     pipeline ? `/v1/pipelines/deal/${encodeURIComponent(pipeline)}/velocity` : null,
   );
 
+export interface VelocityIndex {
+  /** Every stage of every pipeline asked for, keyed by `stageKey`. */
+  byStage: Map<string, StageVelocity>;
+  byPipeline: Map<string, PipelineVelocity>;
+  /** Open deals past their own stage's stall threshold, across the pipelines asked for. */
+  stalledOpen: number;
+  loading: boolean;
+  error: ApiClientError | null;
+  refetch: () => void;
+}
+
+/**
+ * Stage velocity for several pipelines at once.
+ *
+ * `useVelocity` reads one, which is all a single-pipeline board needs. The
+ * all-pipelines board needs every one of them, and a hook cannot be called in a
+ * loop, so this reads them together and indexes the result by (pipeline, stage).
+ */
+export function useVelocities(pipelines: string[]): VelocityIndex {
+  const key = pipelines.join(',');
+  const [rows, setRows] = useState<PipelineVelocity[] | null>(null);
+  const [error, setError] = useState<ApiClientError | null>(null);
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() => {
+    if (!key) { setRows([]); setError(null); return; }
+    let live = true;
+    setError(null);
+    Promise.all(key.split(',').map((name) => (
+      api.get<PipelineVelocity>(`/v1/pipelines/deal/${encodeURIComponent(name)}/velocity`)
+    )))
+      .then((all) => { if (live) { setRows(all); setError(null); } })
+      .catch((raw: unknown) => { if (live) { setRows(null); setError(raw as ApiClientError); } });
+    return () => { live = false; };
+  }, [key, nonce]);
+
+  return useMemo(() => {
+    const byStage = new Map<string, StageVelocity>();
+    const byPipeline = new Map<string, PipelineVelocity>();
+    let stalledOpen = 0;
+    for (const pipeline of rows ?? []) {
+      byPipeline.set(pipeline.pipeline, pipeline);
+      for (const stage of pipeline.stages) {
+        byStage.set(stageKey(pipeline.pipeline, stage.stage), stage);
+        // A deal in a closed stage has finished, not stalled, however long it
+        // has sat there.
+        if (!stage.is_closed) stalledOpen += stage.stalled_records;
+      }
+    }
+    return {
+      byStage,
+      byPipeline,
+      stalledOpen,
+      loading: !!key && rows === null && !error,
+      error,
+      refetch: () => setNonce((n) => n + 1),
+    };
+  }, [rows, error, key]);
+}
+
+/* -------------------------- searching the whole set ----------------------- */
+
+/**
+ * A filtered set of deals, counted over the *whole* set rather than the page.
+ *
+ * `GET /v1/records/deal` answers one page, so anything that totals its rows is
+ * quoting a property of the page size. The dashboard widget did exactly that
+ * and captioned six rows as if they were the six-week commit. This runs the
+ * same filter the saved views store through `POST /v1/records/deal/search`,
+ * follows the cursor to the end, and reports `total` from the server's own
+ * count — so a caption can say what matched and, separately, how much of it is
+ * drawn.
+ */
+export interface DealSearch {
+  /** Every matching deal that was fetched, in the order the sort asked for. */
+  deals: DealRecord[];
+  /** What the server says matched, whether or not every row came back. */
+  total: number;
+  /** The sum of `amount` over the whole matching set, or null when truncated. */
+  amount: number | null;
+  /** True when the workspace holds more matches than the ceiling fetches. */
+  truncated: boolean;
+  loading: boolean;
+  error: ApiClientError | null;
+  refetch: () => void;
+}
+
+const SEARCH_PAGE = 200;
+/** Past this the widget stops paging and says the total is the server's, not its own. */
+export const SEARCH_CEILING = 2000;
+
+export interface DealSearchBody {
+  filter?: FilterNode;
+  sort?: { property: string; direction?: 'asc' | 'desc' }[];
+  expand?: string[];
+  properties?: string[];
+}
+
+interface SearchPage extends ListEnvelope<DealRecord> { total_count?: number }
+
+/** Every deal the filter matches, following the cursor to the end or the ceiling. */
+export async function fetchDealSearch(
+  body: DealSearchBody,
+): Promise<{ deals: DealRecord[]; total: number; truncated: boolean }> {
+  const deals: DealRecord[] = [];
+  let cursor: string | null = null;
+  let total = 0;
+  for (let page = 0; page < SEARCH_CEILING / SEARCH_PAGE; page += 1) {
+    const result: SearchPage = await api.post<SearchPage>('/v1/records/deal/search', {
+      ...body,
+      limit: SEARCH_PAGE,
+      ...(cursor ? { cursor } : {}),
+    });
+    deals.push(...result.data);
+    total = typeof result.total_count === 'number' ? result.total_count : deals.length;
+    if (!result.has_more || !result.next_cursor) return { deals, total, truncated: false };
+    cursor = result.next_cursor;
+  }
+  return { deals, total, truncated: true };
+}
+
+/**
+ * Whether asking again is worth anything.
+ *
+ * A refusal that is about *this* request — a bad filter, a property that does
+ * not exist — will be refused identically a second later. A rate limit, a
+ * dropped connection or a server that fell over is about the moment, and a
+ * dashboard card that gives up on the first one of those shows an error where a
+ * number belongs.
+ */
+const worthRetrying = (e: ApiClientError): boolean =>
+  e.status === 0 || e.status === 429 || e.status >= 500;
+
+export function useDealSearch(body: DealSearchBody | null): DealSearch {
+  const key = body ? JSON.stringify(body) : null;
+  const [state, setState] = useState<{ deals: DealRecord[]; total: number; truncated: boolean } | null>(null);
+  const [error, setError] = useState<ApiClientError | null>(null);
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() => {
+    if (!key) { setState(null); setError(null); return; }
+    let live = true;
+    let timer = 0;
+    setError(null);
+    const attempt = (tries: number) => {
+      fetchDealSearch(JSON.parse(key) as DealSearchBody)
+        .then((result) => { if (live) { setState(result); setError(null); } })
+        .catch((raw: unknown) => {
+          if (!live) return;
+          const e = raw as ApiClientError;
+          if (tries < 2 && worthRetrying(e)) {
+            timer = window.setTimeout(() => attempt(tries + 1), 1200 * (tries + 1));
+            return;
+          }
+          setState(null);
+          setError(e);
+        });
+    };
+    attempt(0);
+    return () => { live = false; window.clearTimeout(timer); };
+  }, [key, nonce]);
+
+  return {
+    deals: state?.deals ?? [],
+    total: state?.total ?? 0,
+    amount: state && !state.truncated ? state.deals.reduce((sum, deal) => sum + dealAmount(deal), 0) : null,
+    truncated: state?.truncated ?? false,
+    loading: !!key && !state && !error,
+    error,
+    refetch: () => setNonce((n) => n + 1),
+  };
+}
+
 /* ------------------------------ calendar dates ---------------------------- */
 
 /**
@@ -356,8 +420,6 @@ export const useVelocity = (pipeline: string | undefined): QueryResult<PipelineV
  * Instants — `closed_at`, `stage_entered_at`, `created` — are genuine moments in
  * time and keep the workspace's zone. Only calendar days come through here.
  */
-export const DAY_MS = 86_400_000;
-
 export type CalendarFormat = Formatter & {
   /** A date-only property, read back in the day it was stored as. */
   calendarDate(ts: number | null | undefined, o?: Omit<DateOptions, 'timeZone'>): string;
@@ -492,6 +554,84 @@ export function stageRequirements(
 
 export const emptyValue = (value: unknown): boolean =>
   value === undefined || value === null || value === '';
+
+/* --------------------------------- undo ---------------------------------- */
+
+/**
+ * Everything a stage move overwrote on one deal, so it can be put back.
+ *
+ * A move is the most consequential thing this board does — it restamps the
+ * probability, the forecast category and, on a closing stage, the close date —
+ * and until now the only way back from a mis-drop was to remember which column
+ * the card came from. The snapshot is taken from the record as it was read,
+ * before the write, and holds the previous value of every property the write
+ * names plus the close date, which the server stamps on a close and does not
+ * put back when the deal is reopened.
+ *
+ * The stage-owned fields are deliberately absent: `probability`,
+ * `forecast_category`, `deal_status` and `closed_at` are derived from the stage
+ * and the server refuses a write to them, so restoring the stage restores them.
+ */
+export interface MoveSnapshot {
+  id: string;
+  name: string;
+  /** The stage it was in, for the sentence the undo toast is written in. */
+  stage: string;
+  properties: Record<string, unknown>;
+}
+
+export function snapshotMove(deal: DealRecord, written: Record<string, unknown>): MoveSnapshot {
+  const properties: Record<string, unknown> = {};
+  for (const key of Object.keys(written)) {
+    if (key === 'close_date') continue;
+    properties[key] = deal.properties[key] ?? null;
+  }
+  properties.close_date = deal.properties.close_date ?? null;
+  return { id: deal.id, name: deal.display_name, stage: dealStage(deal), properties };
+}
+
+/** Put one deal back exactly as the snapshot found it. */
+export const revertMove = (snapshot: MoveSnapshot): Promise<DealRecord> =>
+  api.patch<DealRecord>(`/v1/records/deal/${encodeURIComponent(snapshot.id)}`, { properties: snapshot.properties });
+
+interface BatchOutcome { errors: number; results: { status: string }[] }
+
+/** Put a whole bulk move back, in one batch, and say how many landed. */
+export async function revertMoves(snapshots: MoveSnapshot[]): Promise<number> {
+  const batch = await api.post<BatchOutcome>('/v1/records/deal/batch', {
+    operation: 'update',
+    records: snapshots.map((snapshot) => ({ id: snapshot.id, properties: snapshot.properties })),
+  });
+  return batch.results.filter((row) => row.status === 'updated').length;
+}
+
+/**
+ * Who owned each deal before a reassignment.
+ *
+ * A bulk reassignment writes every deal on its own, exactly as a bulk stage
+ * move does, so the way back is the same shape: each deal keeps the id of the
+ * teammate it came from, and a deal that had no owner goes back to having
+ * none. Reassigning three deals to the wrong rep used to mean opening and
+ * fixing them one at a time, while the identical stage move next to it offered
+ * Undo in the notification it landed with.
+ */
+export interface OwnerSnapshot {
+  id: string;
+  name: string;
+  owner_id: string | null;
+}
+
+export const snapshotOwner = (deal: DealRecord): OwnerSnapshot =>
+  ({ id: deal.id, name: deal.display_name, owner_id: deal.owner_id ?? null });
+
+/** Hand every deal back to whoever held it, and say how many landed. */
+export async function revertOwners(snapshots: OwnerSnapshot[]): Promise<number> {
+  const batch = await api.post<BatchOutcome>('/v1/records/deal/batch', {
+    operation: 'update',
+    records: snapshots.map((snapshot) => ({ id: snapshot.id, properties: {}, owner_id: snapshot.owner_id })),
+  });
+  return batch.results.filter((row) => row.status === 'updated').length;
+}
 
 /* ---------------------------- win and loss reasons ------------------------ */
 

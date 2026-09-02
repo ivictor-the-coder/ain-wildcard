@@ -164,8 +164,14 @@ export const useRun = (id: string | null, enabled = true): QueryResult<RunDetail
 export const useSuggestions = (): QueryResult<ListEnvelope<AiSuggestion>> =>
   useQuery<ListEnvelope<AiSuggestion>>('/v1/ai/suggestions');
 
+/**
+ * The queue answers 50 rows unless asked otherwise, and this is the only read
+ * of it: a conversation re-read next month has to find the write it approved,
+ * and the approvals tab has to be the whole queue rather than its first page.
+ * 200 is the server's own ceiling on this route.
+ */
 export const useApprovals = (status = 'pending'): QueryResult<ListEnvelope<AiApproval>> =>
-  useQuery<ListEnvelope<AiApproval>>('/v1/ai/approvals', { status });
+  useQuery<ListEnvelope<AiApproval>>('/v1/ai/approvals', { status, limit: 200 });
 
 /**
  * Every approval, whatever it was decided.
@@ -310,6 +316,26 @@ export const humanTool = (tool: string): string => {
 
 export const useAiStatus = (): QueryResult<AiStatus> => useQuery<AiStatus>('/v1/ai/status');
 
+export interface AiUsageBucket { key: string; runs: number; credits: number }
+export interface AiUsageReport {
+  object: 'ai_usage';
+  totals: { runs: number; credits: number; input_tokens: number; output_tokens: number };
+  by_feature: AiUsageBucket[];
+  by_model: AiUsageBucket[];
+}
+
+/**
+ * Every feature the engine has run for, whatever the run log is filtered to.
+ *
+ * The feature menu used to be built from the rows on screen — which the server
+ * had already filtered by feature — so choosing "agent" left "agent" as the
+ * only option in the menu that chose it, and the way back to any other feature
+ * was gone. `/v1/ai/usage` counts runs by feature independently of the list, so
+ * the menu keeps every choice it started with.
+ */
+export const useFeatureCatalogue = (days = 365): QueryResult<AiUsageReport> =>
+  useQuery<AiUsageReport>('/v1/ai/usage', { days });
+
 export const useTools = (): QueryResult<ListEnvelope<AiTool>> => useQuery<ListEnvelope<AiTool>>('/v1/ai/tools');
 
 /* -------------------------------- helpers -------------------------------- */
@@ -358,29 +384,10 @@ export function refusalOf(run: AiRun | undefined | null): { code: string; messag
   return null;
 }
 
-export type ConfidenceBand = 'high' | 'medium' | 'low';
-
-export const confidenceBand = (confidence: number | null): ConfidenceBand =>
-  confidence === null ? 'low' : confidence >= 0.8 ? 'high' : confidence >= 0.55 ? 'medium' : 'low';
-
-/** Assistant prose arrives as paragraphs, some of them bullet lists. */
-export interface Block { kind: 'text' | 'list'; lines: string[] }
-
-export function parseBlocks(content: string): Block[] {
-  const blocks: Block[] = [];
-  for (const chunk of content.split(/\n{2,}/)) {
-    const trimmed = chunk.trim();
-    if (!trimmed) continue;
-    const lines = trimmed.split('\n');
-    const bullets = lines.filter((line) => /^[•\-*]\s+/.test(line.trim()));
-    if (bullets.length && bullets.length === lines.length) {
-      blocks.push({ kind: 'list', lines: lines.map((line) => line.trim().replace(/^[•\-*]\s+/, '')) });
-    } else {
-      blocks.push({ kind: 'text', lines });
-    }
-  }
-  return blocks;
-}
+export {
+  confidenceBand, parseBlocks, splitToolEcho,
+} from './answer-core';
+export type { Block, ConfidenceBand, StepNote, ToolEcho } from './answer-core';
 
 export const SPAN_TONE: Record<AiSpan['kind'], 'brand' | 'info' | 'teal' | 'purple' | 'neutral'> = {
   plan: 'purple',

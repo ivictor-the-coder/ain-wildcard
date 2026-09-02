@@ -10,7 +10,7 @@
  * — the refusal is rendered as a refusal. A low-confidence answer is labelled
  * as one. Neither is dressed up.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api, invalidate, useMutation, type ApiClientError } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import { useSession } from '@/client/kernel/session';
@@ -20,9 +20,10 @@ import {
   humanize, useFormat, usePrefersReducedMotion, useToast, type MenuSection, type SelectOption,
 } from '@/client/design';
 import {
-  parseBlocks, refusalOf, useAiStatus, useAllApprovals, useSuggestions, useThread, useThreads,
-  useTools, useRun,
+  parseBlocks, refusalOf, splitToolEcho, useAiStatus, useAllApprovals, useSuggestions, useThread,
+  useThreads, useTools, useRun,
   type AiApproval, type AiMessage, type AiReply, type AiRun, type AiThread, type ThreadDetail,
+  type StepNote, type ToolEcho,
 } from './api';
 import {
   ApprovalCard, ApprovalResolution, CitationChips, ConfidenceBadge, ReasoningList, TraceSteps,
@@ -76,6 +77,45 @@ function AnswerBody({ content, revealing }: { content: string; revealing: boolea
   );
 }
 
+/**
+ * What a tool reported that the answer did not spend, under the answer.
+ *
+ * Collapsed, named for what it is, and with the engine's internal identifiers
+ * written out — a list reading "New business / expansion / renewal" is three
+ * pipelines, two of them printed as database values, and it belongs beside the
+ * answer rather than inside it.
+ */
+function ToolEchoes({ echoes, notes }: { echoes: ToolEcho[]; notes: StepNote[] }) {
+  if (!echoes.length && !notes.length) return null;
+  const total = echoes.reduce((n, echo) => n + echo.items.length, 0) + notes.length;
+  return (
+    <details className="cp-details cp-echo">
+      <summary>
+        {total === 1 ? 'One more thing a tool returned' : `${total} more things the tools returned`}
+        {' — not used in the answer'}
+      </summary>
+      <div className="cp-echo__body">
+        {echoes.map((echo) => (
+          <div key={echo.tool}>
+            <p className="cp-note">
+              <span className="cp-mono">{echo.tool}</span> also returned:
+            </p>
+            <ul>
+              {echo.items.map((item) => <li key={item}>{humanize(item)}</li>)}
+            </ul>
+          </div>
+        ))}
+        {notes.map((note) => (
+          <p className="cp-note" key={note.step}>
+            Nothing in the answer came from the <strong>{note.step}</strong> step.
+            What it returned is in the steps below.
+          </p>
+        ))}
+      </div>
+    </details>
+  );
+}
+
 /** The steps behind one answer, fetched only when a person asks to see them. */
 function TracePanel({ runId }: { runId: string }) {
   const run = useRun(runId);
@@ -116,7 +156,10 @@ function AssistantMessage({
 }) {
   const f = useFormat();
   const [showTrace, setShowTrace] = useState(false);
-  const { shown, done } = useReveal(message.content, newest);
+  // The tool echo is not prose and is not typed out as prose: the answer is
+  // what gets revealed, and what the tools returned beyond it sits under it.
+  const { prose, echoes, notes } = useMemo(() => splitToolEcho(message.content), [message.content]);
+  const { shown, done } = useReveal(prose, newest);
   const refusal = refusalOf(run);
   const lowConfidence = !!run && run.confidence !== null && run.confidence < 0.55 && !refusal;
 
@@ -176,6 +219,8 @@ function AssistantMessage({
         <div className={superseded ? 'cp-superseded' : undefined}>
           <AnswerBody content={shown} revealing={!done} />
         </div>
+
+        {done && <ToolEchoes echoes={echoes} notes={notes} />}
 
         <CitationChips citations={message.citations.length ? message.citations : run?.citations ?? []} />
 
@@ -245,9 +290,11 @@ export function CopilotPage() {
   const [drafting, setDrafting] = useState(location.query.draft === '1');
   const [renaming, setRenaming] = useState<AiThread | null>(null);
   const [renameTo, setRenameTo] = useState('');
+  const renameField = useRef<HTMLInputElement>(null);
   const [deleting, setDeleting] = useState<AiThread | null>(null);
   const streamRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const shellRef = useRef<HTMLDivElement>(null);
 
   // A thread has to be chosen before anything can be shown; the newest one is
   // the only sensible default, and it is written into the URL so the choice
@@ -280,6 +327,31 @@ export function CopilotPage() {
     const node = streamRef.current;
     if (node) node.scrollTop = node.scrollHeight;
   }, [messages.length, pendingQuestion]);
+
+  /**
+   * Where the keyboard is on this screen, which was nowhere.
+   *
+   * `<body>` is 49 Tab presses from the "Approve and run" button on a prepared
+   * write — the whole sidebar, the shell chrome and the conversation list come
+   * first — and that is where the caret sat on load and again after every
+   * answer rendered, because the composer is cleared and re-rendered as the
+   * turn lands. A pending approval is the one thing that outranks the composer:
+   * it is a decision the run is blocked on.
+   *
+   * Focus is only ever *taken* from `<body>`; a person who has clicked into the
+   * thread list or a citation keeps where they are.
+   */
+  const landFocus = useCallback(() => {
+    const frame = requestAnimationFrame(() => {
+      if (document.activeElement && document.activeElement !== document.body) return;
+      const approve = document.querySelector<HTMLElement>('.cp-approval__actions button');
+      (approve ?? composerRef.current)?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, []);
+
+  // On mount, and again each time an answer lands.
+  useEffect(landFocus, [landFocus, newestMessage]);
 
   const visibleThreads = useMemo(() => {
     const needle = filter.trim().toLowerCase();
@@ -457,6 +529,29 @@ export function CopilotPage() {
   const provider = ai.data?.provider;
   const composing = !selected || location.query.new === '1';
 
+  /**
+   * The transcript takes whatever room is left, measured rather than guessed.
+   *
+   * The shell used to subtract a fixed 208px of chrome from the viewport. The
+   * page header is not a fixed height: its subtitle grows a line the moment a
+   * write is waiting for approval, and on a short window that one line pushed
+   * the composer — the box you type in — off the bottom of the page. The top of
+   * the shell is where it actually is, so the only thing that scrolls is the
+   * stream.
+   */
+  const subtitleShape = `${provider?.label ?? ''}|${ai.data?.tools ?? 0}|${ai.data?.runs_today ?? 0}|${ai.data?.pending_approvals ?? 0}`;
+  useLayoutEffect(() => {
+    const el = shellRef.current;
+    if (!el) return;
+    const measure = () => {
+      const top = Math.round(el.getBoundingClientRect().top + window.scrollY);
+      el.style.setProperty('--cp-shell-top', `${top}px`);
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [subtitleShape]);
+
   /* -------------------------------- render -------------------------------- */
 
   return (
@@ -488,7 +583,7 @@ export function CopilotPage() {
         </Banner>
       )}
 
-      <div className="cp-shell">
+      <div className="cp-shell" ref={shellRef}>
         <Card
           className="cp-rail"
           padding="tight"
@@ -715,6 +810,7 @@ export function CopilotPage() {
         open={!!renaming}
         onClose={() => setRenaming(null)}
         size="sm"
+        initialFocus={renameField}
         title="Rename this conversation"
         description="The title is how you will find it again in the rail. Nothing about the answers changes."
         footer={
@@ -749,10 +845,10 @@ export function CopilotPage() {
             hint="Up to 200 characters."
           >
             <Input
+              ref={renameField}
               value={renameTo}
               onChange={(e) => setRenameTo(e.target.value)}
               maxLength={200}
-              autoFocus
               aria-label="Conversation title"
             />
           </Field>

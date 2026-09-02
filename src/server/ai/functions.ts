@@ -11,10 +11,10 @@
 import type { Ctx } from '../kernel/context';
 import { DAY, formatDate, formatRelative } from '../../shared/time';
 import { formatMoney } from '../../shared/money';
-import { billingSources, entityIndex, workspaceProfile, type WorkspaceProfile } from './grounding';
+import { billingSources, entityIndex, hasTable, workspaceProfile, type WorkspaceProfile } from './grounding';
 import { resolveEntities, type ResolvedEntity } from './resolve';
 import {
-  accountSnapshot, detectGrouping, metricById, metricIds, topAccounts,
+  accountSnapshot, detectGrouping, metricById, metricIds, stageSets, topAccounts,
   type GroupBy, type MetricResult, type MetricSubject,
 } from './metrics';
 import { aggregate, associatedRecords, fetchRecords, getRecord, propertyMap, type Condition, type RecordSummary } from './query';
@@ -168,7 +168,7 @@ export function accountProfile(ctx: Ctx, orgId: string, args: { id: string }): A
 export interface MetricToolResult extends Omit<MetricResult, 'window'> {
   window: { label: string; start: number; end: number; partial: boolean };
   change: { previous: number; previous_formatted: string; delta: number; percent: number | null } | null;
-  top_accounts: { id: string; label: string; formatted: string }[];
+  top_accounts: { id: string; label: string; formatted: string; currency: string | null }[];
   /** The rows behind the number, named — an answer can cite them by name. */
   evidence: { id: string; label: string; type: string }[];
 }
@@ -186,20 +186,54 @@ function customerName(ctx: Ctx, orgId: string, id: string): string | null {
   return row?.nm?.trim() || null;
 }
 
-/** Resolve record ids to display names so citations read as records, not ids. */
+/**
+ * Resolve ids to display names so citations read as records, not primary keys.
+ *
+ * A citation a reader cannot identify is not a citation. The MRR answer cited
+ * `sub_i4bvky9acvO3okb7` six times, with the id as its own label, because the
+ * rows behind recurring revenue are subscriptions and `getRecord` only knows
+ * the CRM. Subscriptions and invoices are named through the ledger that owns
+ * them, and anything that still cannot be named is dropped rather than printed.
+ */
 function labelIds(ctx: Ctx, orgId: string, ids: string[], fallbackType: string): { id: string; label: string; type: string }[] {
   if (!ids.length) return [];
-  const found = new Map<string, { label: string; type: string }>();
+  const out: { id: string; label: string; type: string }[] = [];
+  const billing = ctx.svc.billing;
   for (const id of ids) {
     const record = getRecord(ctx, orgId, id);
-    if (record) found.set(id, { label: record.display_name, type: record.object_type });
+    if (record) { out.push({ id, label: record.display_name, type: record.object_type }); continue; }
+    if (billing && id.startsWith('sub_')) {
+      const sub = billing.subscription(orgId, id);
+      const name = sub ? billing.customer(orgId, sub.customer)?.name : null;
+      // Two subscriptions on one account are two rows a reader has to tell
+      // apart, so the plan they are on is part of the name.
+      if (name) {
+        // The ledger's own description often already opens with the account
+        // name; repeating it makes "Meridian Forge Systems — Meridian Forge
+        // Systems — Predictive Maintenance AI".
+        const plan = sub?.description?.trim() ?? '';
+        const detail = plan && !plan.toLowerCase().startsWith(name.toLowerCase()) ? plan : '';
+        out.push({ id, label: detail ? `${name} — ${detail}` : plan || `${name} subscription`, type: 'subscription' });
+        continue;
+      }
+    }
+    if (billing && id.startsWith('in_')) {
+      const invoice = billing.invoice(orgId, id);
+      if (invoice?.number) { out.push({ id, label: invoice.number, type: 'invoice' }); continue; }
+    }
+    if (billing && id.startsWith('cus_')) {
+      const name = billing.customer(orgId, id)?.name;
+      if (name) { out.push({ id, label: name, type: 'customer' }); continue; }
+    }
+    void fallbackType;
   }
-  return ids.map((id) => ({ id, label: found.get(id)?.label ?? id, type: found.get(id)?.type ?? fallbackType }));
+  return out;
 }
 
 /** Compute one metric, with the previous period for context when it exists. */
 export function businessMetric(ctx: Ctx, orgId: string, args: {
   metric: string; start?: number; end?: number; window_label?: string; subject_id?: string; group_by?: GroupBy; compare?: boolean;
+  currency?: string;
 }): MetricToolResult | { error: string; available: string[] } {
   const definition = metricById(args.metric);
   if (!definition) return { error: `Unknown metric "${args.metric}".`, available: metricIds() };
@@ -227,11 +261,18 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
       : { id: args.subject_id, type: 'customer', label: customerName(ctx, orgId, args.subject_id) ?? args.subject_id };
   }
 
-  const input = { ctx, workspace, window, subject, groupBy: args.group_by ?? 'none' };
+  const input = {
+    ctx, workspace, window, subject, groupBy: args.group_by ?? 'none',
+    currency: args.currency ? args.currency.toLowerCase() : null,
+  };
   const result = definition.compute(input);
-  const change = args.compare !== false && !definition.snapshot
+  // A delta needs two numbers in one currency. When the metric came back as
+  // several books there is no single figure to subtract, and quoting one
+  // anyway is how a 45%-inflated sum got a growth rate attached to it.
+  const change = args.compare !== false && !definition.snapshot && !result.mixedCurrency
     ? (() => {
         const prior = definition.compute({ ...input, window: previousWindow(window), groupBy: 'none' });
+        if (prior.mixedCurrency) return null;
         const delta = result.value - prior.value;
         return {
           previous: prior.value,
@@ -244,13 +285,294 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
 
   const accounts = args.group_by === 'account' && !result.groups.length ? topAccounts(input, definition, 5) : [];
 
+  // A grouping that was asked for and never applied has to be said out loud.
+  // "What is our win rate by owner" answered with one workspace-wide number is
+  // an answer to a different question, and nothing in it tells the reader that
+  // the "by owner" half of their sentence was dropped on the way in.
+  const requested = args.group_by && args.group_by !== 'none' ? args.group_by : null;
+  const dropped = !!requested && !result.groups.length && !accounts.length && result.count > 0
+    && !(result.note ?? '').includes(requested);
+  const note = dropped
+    ? [
+        result.note,
+        `${result.label} does not break down by ${requested} — nothing behind this number carries that grouping —`,
+        `so this is the figure for ${subject?.label ?? workspace.name} as a whole.`,
+      ].filter(Boolean).join(' ')
+    : result.note;
+
   return {
     ...result,
+    note,
     window: { label: window.label, start: window.start, end: window.end, partial: window.partial },
     change,
-    top_accounts: accounts.map((a) => ({ id: a.key, label: a.label, formatted: a.formatted })),
+    top_accounts: accounts.map((a) => ({ id: a.key, label: a.label, formatted: a.formatted, currency: a.currency })),
     evidence: labelIds(ctx, orgId, result.ids, result.sourceKind === 'invoices' ? 'invoice' : 'record'),
   };
+}
+
+/* ------------------------------ metered usage ----------------------------- */
+
+export interface MeteredUsageResult {
+  object: 'metered_usage';
+  meter: { id: string; name: string; event_name: string; aggregation: string; unit_label: string | null };
+  scope: 'workspace' | 'account';
+  subject: { id: string; label: string } | null;
+  window: { label: string; start: number; end: number };
+  value: number;
+  formatted: string;
+  event_count: number;
+  accounts: number;
+  /** The accounts behind the number, largest first. */
+  by_account: { id: string; label: string; value: number; formatted: string; event_count: number }[];
+  /** Stated whenever the aggregation makes a workspace figure mean something particular. */
+  note: string | null;
+}
+
+const UNIT_FORMAT = (value: number, unit: string | null, locale: string): string => {
+  const number = Number.isInteger(value) ? value.toLocaleString(locale) : Number(value.toFixed(2)).toLocaleString(locale);
+  // "49,716,642 event" is the kind of sentence that makes a reader distrust the
+  // number in front of it. The meter's unit label is singular by convention.
+  if (!unit) return number;
+  // "GBs" is not a word. A symbol unit — GB, MB, CPU — is already plural.
+  const symbol = unit === unit.toUpperCase() && /^[A-Z]{1,4}$/.test(unit);
+  const plural = value === 1 || symbol || /s$/i.test(unit) ? unit : `${unit}s`;
+  return `${number} ${plural}`;
+};
+
+/**
+ * Every account that streamed into one meter over a period.
+ *
+ * The metering module's own `/v1/meters/:id/customers` reads this from the
+ * pre-aggregate; the copilot has to read the same rows or it answers with a
+ * different total than the module it is quoting.
+ */
+function meterCustomerIds(ctx: Ctx, orgId: string, meterId: string, start: number, end: number): string[] {
+  if (!hasTable(ctx.db, 'meter_event_summaries')) {
+    const billing = ctx.svc.billing;
+    return billing ? billing.customers(orgId, { limit: 500 }).map((c) => c.id) : [];
+  }
+  const HOUR_MS = 3_600_000;
+  return ctx.db.all<{ customer_id: string }>(
+    `SELECT customer_id FROM meter_event_summaries
+     WHERE org_id = ? AND meter_id = ? AND hour_start >= ? AND hour_start < ?
+     GROUP BY customer_id
+     ORDER BY TOTAL(sum_micro) DESC, COALESCE(SUM(event_count), 0) DESC, customer_id ASC
+     LIMIT 500`,
+    orgId, meterId, Math.floor(start / HOUR_MS) * HOUR_MS, Math.ceil(end / HOUR_MS) * HOUR_MS,
+  ).map((r) => r.customer_id);
+}
+
+/**
+ * A metering customer id, in the words a reader recognises.
+ *
+ * The billing book names most of them. An account that meters without an
+ * invoicing record still belongs to a company in the CRM, and the resolver
+ * finds it from the id the same way it finds a company from a phrase — so
+ * `cus_nw_pemberton` reads as "Pemberton Auto Systems" rather than as a primary
+ * key. Anything that still cannot be named comes back null, and the caller says
+ * so rather than pretending the id is a name.
+ */
+function meterCustomerLabel(ctx: Ctx, orgId: string, customerId: string): string | null {
+  const billed = ctx.svc.billing?.customer(orgId, customerId)?.name ?? customerName(ctx, orgId, customerId);
+  if (billed) return billed;
+  const hits = resolveEntities(customerId, entityIndex(ctx, orgId), { only: ['company'], limit: 1, minScore: 0.55 });
+  return hits[0]?.entity.label ?? null;
+}
+
+/**
+ * How much of one meter was consumed, over one period.
+ *
+ * A workspace that sells metered telemetry gets asked "how many telemetry
+ * events did we meter last month" constantly, and the only capability the
+ * metering module publishes for it takes a single customer — so the question
+ * used to reach `list_meters` and come back with the six-line catalogue and no
+ * number in it. This sums the meter across the accounts that used it, honouring
+ * the meter's own aggregation, and says out loud where a workspace figure means
+ * something other than a total.
+ */
+export function meteredUsage(ctx: Ctx, orgId: string, args: {
+  meter: string; customer?: string; start: number; end: number; window_label?: string;
+}): MeteredUsageResult | { error: string; meters?: { id: string; name: string; event_name: string }[] } {
+  const metering = ctx.svc.metering;
+  const workspace = workspaceProfile(ctx, orgId);
+  if (!metering) return { error: 'No module in this workspace meters usage, so there is nothing to total.' };
+  const meter = metering.meter(orgId, args.meter);
+  if (!meter) {
+    return {
+      error: `No meter in this workspace is called "${args.meter}".`,
+      meters: metering.meters(orgId).map((m) => ({ id: m.id, name: m.name, event_name: m.event_name })),
+    };
+  }
+  if (!(args.end > args.start)) return { error: 'The period ends before it starts.' };
+
+  const window = { label: args.window_label ?? 'the selected period', start: args.start, end: args.end };
+  const scope: 'workspace' | 'account' = args.customer ? 'account' : 'workspace';
+  // The accounts that streamed into this meter, read from the meter's own
+  // ledger. Building this list from the billing book instead silently dropped
+  // every account that meters without an invoicing record — on the seeded
+  // workspace that was 47.5M of 97.2M telemetry events, two of the three
+  // biggest consumers, stated as the workspace total with no caveat.
+  const customerIds = args.customer ? [args.customer] : meterCustomerIds(ctx, orgId, meter.id, args.start, args.end);
+
+  const rows: MeteredUsageResult['by_account'] = [];
+  let events = 0;
+  let unnamed = 0;
+  for (const customerId of customerIds) {
+    const usage = metering.usageForPeriod(orgId, meter.id, customerId, args.start, args.end);
+    if (!usage.event_count) continue;
+    events += usage.event_count;
+    const named = meterCustomerLabel(ctx, orgId, customerId);
+    if (!named) unnamed += 1;
+    rows.push({
+      id: customerId,
+      label: named ?? customerId,
+      value: usage.value,
+      formatted: UNIT_FORMAT(usage.value, meter.unit_label, workspace.locale),
+      event_count: usage.event_count,
+    });
+  }
+  rows.sort((a, b) => b.value - a.value || a.label.localeCompare(b.label));
+
+  // Each aggregation composes differently across accounts, and three of the
+  // five do not compose into "the workspace total" at all without saying so.
+  const values = rows.map((r) => r.value);
+  const total = values.reduce((a, v) => a + v, 0);
+  const value = meter.aggregation === 'max' ? Math.max(0, ...values) : total;
+  const unnamedNote = unnamed
+    ? `${unnamed} of the ${rows.length} accounts on this meter have no billing customer record, so they are named by their metering id.`
+    : null;
+  const aggregationNote = scope === 'account' ? null
+    : meter.aggregation === 'max'
+      ? `${meter.name} records a high-water mark per account, so a workspace figure is the largest single account's peak — ${rows[0]?.label ?? 'no account'} — not a fleet-wide peak, which nothing here records.`
+      : meter.aggregation === 'last'
+        ? `${meter.name} is a closing reading per account, so the workspace figure is those closing readings added together.`
+        : meter.aggregation === 'unique'
+          ? `${meter.name} counts distinct subjects inside one account, so the workspace figure adds each account's own distinct count.`
+          : null;
+  const note = [aggregationNote, unnamedNote].filter(Boolean).join(' ') || null;
+
+  return {
+    object: 'metered_usage',
+    meter: { id: meter.id, name: meter.name, event_name: meter.event_name, aggregation: meter.aggregation, unit_label: meter.unit_label },
+    scope,
+    subject: args.customer
+      ? { id: args.customer, label: meterCustomerLabel(ctx, orgId, args.customer) ?? args.customer }
+      : null,
+    window,
+    value,
+    formatted: UNIT_FORMAT(value, meter.unit_label, workspace.locale),
+    event_count: events,
+    accounts: rows.length,
+    by_account: rows.slice(0, 8),
+    note,
+  };
+}
+
+/* ------------------------- customers who owe money ------------------------ */
+
+export interface DelinquentCustomersResult {
+  object: 'delinquent_customers';
+  total: number;
+  customers: {
+    id: string; name: string; currency: string;
+    outstanding: number; outstanding_formatted: string;
+    open_invoices: number; oldest_due_at: number | null; days_overdue: number | null;
+    past_due_subscriptions: number;
+  }[];
+}
+
+/**
+ * The customers who owe money, from the customer ledger.
+ *
+ * "Which customers are past due?" was answered from subscription status — a
+ * different table about a different thing that happened to hold two rows with
+ * the same names. On another book those two sets differ, and the substitution
+ * would be invisible: the sentence says customers and the rows are
+ * subscriptions.
+ */
+export function delinquentCustomers(ctx: Ctx, orgId: string, args: { limit?: number } = {}): DelinquentCustomersResult | { error: string } {
+  const billing = ctx.svc.billing;
+  if (!billing) return { error: 'No module in this workspace keeps a customer ledger, so there is nothing to read.' };
+  const workspace = workspaceProfile(ctx, orgId);
+  const limit = Math.min(args.limit ?? 20, 50);
+  const rows = billing.customers(orgId, { delinquent: true, limit: 200 });
+  const customers = rows.map((customer) => {
+    const invoices = billing.invoices(orgId, { customer: customer.id, status: 'open_like', limit: 100 })
+      .filter((invoice) => invoice.amount_due > 0);
+    const outstanding = invoices.reduce((sum, invoice) => sum + invoice.amount_due, 0);
+    const dues = invoices.map((i) => i.due_date).filter((d): d is number => typeof d === 'number');
+    const oldest = dues.length ? Math.min(...dues) : null;
+    const currency = invoices[0]?.currency ?? customer.currency ?? workspace.currency;
+    return {
+      id: customer.id,
+      name: customer.name,
+      currency,
+      outstanding,
+      outstanding_formatted: formatMoney({ amount: outstanding, currency }, { locale: workspace.locale }),
+      open_invoices: invoices.length,
+      oldest_due_at: oldest,
+      days_overdue: oldest && oldest < ctx.now() ? Math.floor((ctx.now() - oldest) / DAY) : null,
+      past_due_subscriptions: billing.subscriptions(orgId, { customer: customer.id, limit: 50 })
+        .filter((sub) => sub.status === 'past_due').length,
+    };
+  }).sort((a, b) => b.outstanding - a.outstanding || a.name.localeCompare(b.name));
+  return { object: 'delinquent_customers', total: customers.length, customers: customers.slice(0, limit) };
+}
+
+/* ----------------------------- accounts gone quiet ------------------------ */
+
+export interface StaleAccountsResult {
+  object: 'stale_accounts';
+  threshold_days: number;
+  total: number;
+  accounts: {
+    id: string; name: string; owner: string | null;
+    days_since_activity: number | null; last_activity_at: number | null;
+    open_pipeline: number; open_pipeline_formatted: string; type: string | null;
+  }[];
+}
+
+/**
+ * Accounts nobody has touched.
+ *
+ * "Which accounts have gone quiet?" used to come back as the eight most
+ * recently created companies, ordered by recency, with no staleness in it at
+ * all — while the suggestion feed on the same workspace was already saying
+ * "nobody has logged activity on Aconcagua Alimentos in over 45 days". The
+ * signal existed and the question could not reach it.
+ */
+export function staleAccounts(ctx: Ctx, orgId: string, args: { days?: number; limit?: number }): StaleAccountsResult {
+  const workspace = workspaceProfile(ctx, orgId);
+  const threshold = Math.max(1, args.days ?? 45);
+  const cutoff = workspace.now - threshold * DAY;
+  const limit = Math.min(args.limit ?? 8, 50);
+  const stages = new Set(stageSets(ctx, orgId).open);
+  const rows: StaleAccountsResult['accounts'] = [];
+  for (const company of fetchRecords(ctx, orgId, { objectType: 'company', limit: 500 })) {
+    const last = Number(company.properties.last_activity_at ?? 0) || null;
+    // An account nobody has ever touched is quieter than one touched a year
+    // ago, so it counts — with a null age rather than an invented one.
+    if (last && last > cutoff) continue;
+    const open = associatedRecords(ctx, orgId, company.id, 'deal', 40)
+      .filter((d) => stages.has(String(d.properties.deal_stage ?? '')))
+      .reduce((sum, d) => sum + Number(d.properties.amount ?? 0), 0);
+    rows.push({
+      id: company.id,
+      name: company.display_name,
+      owner: personName(workspace, company.owner_id),
+      days_since_activity: last ? Math.floor((workspace.now - last) / DAY) : null,
+      last_activity_at: last,
+      open_pipeline: open,
+      open_pipeline_formatted: formatMoney({ amount: open, currency: workspace.currency }, { locale: workspace.locale, trimZeroFraction: true }),
+      type: typeof company.properties.type === 'string' ? company.properties.type : null,
+    });
+  }
+  // Quietest first: never touched, then longest since.
+  rows.sort((a, b) =>
+    (b.days_since_activity ?? Number.MAX_SAFE_INTEGER) - (a.days_since_activity ?? Number.MAX_SAFE_INTEGER)
+    || b.open_pipeline - a.open_pipeline
+    || a.name.localeCompare(b.name));
+  return { object: 'stale_accounts', threshold_days: threshold, total: rows.length, accounts: rows.slice(0, limit) };
 }
 
 export interface TimelineItem {
@@ -353,13 +675,15 @@ export interface RecordAggregateResult {
   matched_records: number;
   groups: { key: string; label: string; value: number; count: number }[];
   sample_ids: string[];
+  /** The same rows, named — a citation reading "matched record" identifies nothing. */
+  samples: { id: string; label: string }[];
 }
 
 /** Count, sum or average any property of any object type, with grouping. */
 export function recordAggregate(ctx: Ctx, orgId: string, args: {
   object_type: string; measure?: 'count' | 'sum' | 'avg' | 'min' | 'max'; property?: string;
   conditions?: Condition[]; group_by?: string; start?: number; end?: number; date_property?: string;
-  associated_to?: string;
+  associated_to?: string; owner_id?: string;
 }): RecordAggregateResult | { error: string } {
   const workspace = workspaceProfile(ctx, orgId);
   const properties = propertyMap(ctx, orgId, args.object_type);
@@ -380,6 +704,9 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
     measure: measure === 'count' ? undefined : { property: args.property!, fn: measure },
     groupBy: args.group_by,
     associatedTo: args.associated_to,
+    // A rep named in the question is a filter on the count. Without it "how
+    // many open deals does Priya have" answered with the workspace's 38.
+    ownerId: args.owner_id,
     sampleIds: 6,
   });
 
@@ -403,6 +730,7 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
       count: g.count,
     })),
     sample_ids: result.ids,
+    samples: labelIds(ctx, orgId, result.ids, args.object_type).map((row) => ({ id: row.id, label: row.label })),
   };
 }
 

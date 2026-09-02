@@ -6,18 +6,124 @@
  * written for it — and a validation error comes back bound to the `param` the
  * server named, under the control it belongs to.
  */
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { api, invalidate, useMutation, type ApiClientError, type ListEnvelope } from '@/client/kernel/api';
 import { useSession } from '@/client/kernel/session';
 import {
   Badge, Banner, Button, Combobox, DatePicker, Field, Input, Modal, MoneyInput, NumberInput,
-  Select, Textarea, humanize, useFormat, useToast, type ComboOption, type SelectOption,
+  Select, Textarea, focusableWithin, humanize, useFormat, useToast,
+  type ComboOption, type SelectOption,
 } from '@/client/design';
 import {
-  emptyValue, num, reasonOptions, stageRequirements, str, useDealFormat, useOutcomeSplit,
-  type DealRecord, type Pipeline, type PipelineStage, type PropertyDef, type PropertyOption,
-  type WorkspaceUser,
+  emptyValue, num, reasonOptions, revertMove, revertMoves, revertOwners, snapshotMove,
+  stageRequirements, str, useDealFormat, useOutcomeSplit,
+  type DealRecord, type MoveSnapshot, type OwnerSnapshot, type Pipeline, type PipelineStage,
+  type PropertyDef, type PropertyOption, type WorkspaceUser,
 } from './api';
+
+/* ---------------------------- undoing a move ------------------------------ */
+
+export interface UndoAction { label: string; onClick: () => void }
+
+/**
+ * The way back from a stage move, as an action a notification can carry.
+ *
+ * A move is committed the instant a card is dropped or a confirmation is
+ * accepted, and it rewrites the deal's probability, its forecast category and —
+ * on a closing stage — its close date and outcome reason. Every one of those is
+ * put back: the snapshot holds the previous value of each property the move
+ * wrote, and the stage-owned figures follow the stage home by themselves.
+ *
+ * One implementation, so the board, the stage rail and the bulk bar all undo
+ * the same amount of the same write.
+ */
+export function useUndoMove(): (snapshot: MoveSnapshot, fromLabel: string) => UndoAction {
+  const toast = useToast();
+  const f = useFormat();
+  const undo = useMutation<{ snapshot: MoveSnapshot; label: string }, DealRecord>(
+    ({ snapshot }) => revertMove(snapshot),
+    {
+      invalidates: ['/v1/records/deal', '/v1/pipelines', '/v1/crm/overview'],
+      onSuccess: (restored, { label }) => {
+        invalidate(`/v1/records/deal/${restored.id}`);
+        toast.success(
+          `Back in ${label}`,
+          `${restored.display_name} forecasts ${f.money(num(restored.properties.weighted_amount))} at ${num(restored.properties.probability)}% again. Its time-in-stage clock restarted.`,
+        );
+      },
+      onError: (e: ApiClientError) => toast.error('The move was not undone', e.body.message),
+    },
+  );
+  return useCallback((snapshot, fromLabel) => ({
+    label: 'Undo',
+    onClick: () => { void undo.run({ snapshot, label: fromLabel }).catch(() => undefined); },
+  }), [undo]);
+}
+
+/** The same thing for a move that touched many deals at once. */
+export function useUndoBulkMove(): (snapshots: MoveSnapshot[], fromLabel: string) => UndoAction {
+  const toast = useToast();
+  const undo = useMutation<{ snapshots: MoveSnapshot[]; label: string }, number>(
+    ({ snapshots }) => revertMoves(snapshots),
+    {
+      invalidates: ['/v1/records/deal', '/v1/pipelines', '/v1/crm/overview'],
+      onSuccess: (restored, { snapshots, label }) => {
+        if (restored === snapshots.length) {
+          toast.success(
+            `${restored} ${restored === 1 ? 'deal is' : 'deals are'} back where they were`,
+            `Every one of them is in ${label} again, at the probability that stage carries.`,
+          );
+        } else {
+          toast.warning(
+            `${restored} of ${snapshots.length} were put back`,
+            'The rest were refused — open them and check what changed since the move.',
+          );
+        }
+      },
+      onError: (e: ApiClientError) => toast.error('The move was not undone', e.body.message),
+    },
+  );
+  return useCallback((snapshots, fromLabel) => ({
+    label: 'Undo',
+    onClick: () => { void undo.run({ snapshots, label: fromLabel }).catch(() => undefined); },
+  }), [undo]);
+}
+
+/**
+ * The way back from a bulk reassignment.
+ *
+ * A stage move in bulk lands with Undo; a reassignment in bulk landed with
+ * nothing, even though the dialog had just quoted the pipeline that was
+ * changing hands and each deal is written separately either way. Every deal
+ * goes back to the teammate that held it, including the ones that held nobody.
+ */
+export function useUndoBulkReassign(): (snapshots: OwnerSnapshot[], fromLabel: string) => UndoAction {
+  const toast = useToast();
+  const undo = useMutation<{ snapshots: OwnerSnapshot[]; label: string }, number>(
+    ({ snapshots }) => revertOwners(snapshots),
+    {
+      invalidates: ['/v1/records/deal', '/v1/pipelines', '/v1/crm/overview'],
+      onSuccess: (restored, { snapshots, label }) => {
+        if (restored === snapshots.length) {
+          toast.success(
+            `${restored} ${restored === 1 ? 'deal is' : 'deals are'} back with ${label}`,
+            'Ownership is exactly where it was before the reassignment.',
+          );
+        } else {
+          toast.warning(
+            `${restored} of ${snapshots.length} were handed back`,
+            'The rest were refused — open them and check who owns them now.',
+          );
+        }
+      },
+      onError: (e: ApiClientError) => toast.error('The reassignment was not undone', e.body.message),
+    },
+  );
+  return useCallback((snapshots, fromLabel) => ({
+    label: 'Undo',
+    onClick: () => { void undo.run({ snapshots, label: fromLabel }).catch(() => undefined); },
+  }), [undo]);
+}
 
 /* ------------------------------ value editors ----------------------------- */
 
@@ -389,18 +495,28 @@ export function StageMoveDialog({
 
   const missing = requirements.required.filter((property) => emptyValue(draft[property.name]));
 
+  const offerUndo = useUndoMove();
+  const firstControl = useFirstControl();
+
+  // Taken before the write, from the record as it was read, so the notification
+  // that announces the move already knows how to take it back.
+  const undoSnapshot = useRef<MoveSnapshot | null>(null);
+
   const move = useMutation<void, DealRecord>(async () => {
     if (!deal || !to) throw new Error('no deal');
     const props: Draft = { deal_stage: to.name };
     for (const [key, value] of Object.entries(draft)) if (!emptyValue(value)) props[key] = value;
     if (stampsClose && closeDate !== null) props.close_date = closeDate;
+    undoSnapshot.current = snapshotMove(deal, props);
     return api.patch<DealRecord>(`/v1/records/deal/${encodeURIComponent(deal.id)}`, { properties: props });
   }, {
     invalidates: ['/v1/records/deal', '/v1/pipelines', '/v1/crm/overview'],
     onSuccess: (updated) => {
+      const snapshot = undoSnapshot.current;
       toast.success(
         `Moved to ${to?.label}`,
         `${updated.display_name} now forecasts ${f.money(num(updated.properties.weighted_amount))} at ${num(updated.properties.probability)}%.`,
+        snapshot ? { action: offerUndo(snapshot, from?.label ?? 'its old stage') } : undefined,
       );
       onMoved();
       onClose();
@@ -417,6 +533,7 @@ export function StageMoveDialog({
     <Modal
       open={open}
       onClose={onClose}
+      initialFocus={firstControl.initialFocus}
       size="md"
       title={`Move to ${to.label}`}
       description={deal?.display_name}
@@ -435,7 +552,7 @@ export function StageMoveDialog({
         </>
       }
     >
-      <div className="pl-form">
+      <div className="pl-form" ref={firstControl.body}>
         {banner && <Banner tone="danger" title="The stage did not change">{banner}</Banner>}
 
         <div className="pl-movesummary">
@@ -561,17 +678,24 @@ export function PipelineMoveDialog({
   );
   const missing = requirements.required.filter((property) => emptyValue(draft[property.name]));
 
+  const offerUndo = useUndoMove();
+  const undoSnapshot = useRef<MoveSnapshot | null>(null);
+  const from = current?.stages.find((s) => s.name === str(deal?.properties.deal_stage));
+
   const move = useMutation<void, DealRecord>(async () => {
     if (!deal || !chosen || !chosenStage) throw new Error('no destination');
     const props: Draft = { pipeline: chosen.name, deal_stage: chosenStage.name };
     for (const [key, value] of Object.entries(draft)) if (!emptyValue(value)) props[key] = value;
+    undoSnapshot.current = snapshotMove(deal, props);
     return api.patch<DealRecord>(`/v1/records/deal/${encodeURIComponent(deal.id)}`, { properties: props });
   }, {
     invalidates: ['/v1/records/deal', '/v1/pipelines', '/v1/crm/overview'],
     onSuccess: (updated) => {
+      const snapshot = undoSnapshot.current;
       toast.success(
         `Moved to ${chosen?.label}`,
         `${updated.display_name} is in ${chosenStage?.label} at ${num(updated.properties.probability)}%.`,
+        snapshot ? { action: offerUndo(snapshot, from?.label ?? current?.label ?? 'its old stage') } : undefined,
       );
       onMoved();
       onClose();
@@ -580,7 +704,6 @@ export function PipelineMoveDialog({
   });
 
   const amount = deal ? num(deal.properties.amount) : 0;
-  const from = current?.stages.find((s) => s.name === str(deal?.properties.deal_stage));
   const banner = unboundError(move.error, ['pipeline', 'deal_stage', ...requirements.required.map((p) => p.name)]);
 
   return (
@@ -888,6 +1011,34 @@ export function LogActivityDialog({
 }
 
 /* --------------------------------- helper --------------------------------- */
+
+/**
+ * Land the caret on the first thing you can actually fill in.
+ *
+ * `Modal` focuses the first focusable node in the whole dialog when it opens,
+ * and that node is the × in the header — so the first keystroke on the close-won
+ * dialog, which is gathering a *required* close reason, threw the dialog away
+ * instead of answering it. The dialogs that get this right (New deal, Save view)
+ * name the control themselves; these ones cannot, because what the first control
+ * is depends on which properties the stage requires. So the body is measured
+ * when the trap activates and its first control is handed over.
+ *
+ * The returned ref reads live rather than holding a node, because `Modal` asks
+ * for `initialFocus.current` in its own effect — after this body has mounted,
+ * before anything has been focused.
+ */
+export function useFirstControl(): {
+  body: RefObject<HTMLDivElement>;
+  initialFocus: RefObject<HTMLElement | null>;
+} {
+  const body = useRef<HTMLDivElement>(null);
+  const initialFocus = useMemo(() => ({
+    get current(): HTMLElement | null {
+      return body.current ? focusableWithin(body.current)[0] ?? null : null;
+    },
+  }), []);
+  return { body, initialFocus };
+}
 
 export function DialogHint({ children }: { children: ReactNode }) {
   return <p className="pl-note">{children}</p>;

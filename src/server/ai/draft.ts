@@ -11,7 +11,7 @@ import { formatMoney } from '../../shared/money';
 import { DAY, formatDate } from '../../shared/time';
 import type { WorkspaceProfile } from './grounding';
 import type { AccountProfileResult, TimelineItem } from './functions';
-import { firstName, humanise, listPhrase, truncate } from './text';
+import { firstName, humanise, listPhrase, normalise, truncate } from './text';
 
 export const DRAFT_KINDS = [
   'follow_up', 'intro', 'check_in', 'renewal', 'dunning', 'meeting_recap',
@@ -28,6 +28,15 @@ export interface DraftSender {
   email: string | null;
 }
 
+/** One unpaid bill, in the words the recipient's own copy uses. */
+export interface OutstandingInvoice {
+  number: string;
+  amount_due_formatted: string;
+  due_at: number | null;
+  days_overdue: number | null;
+  status: string;
+}
+
 export interface DraftInput {
   workspace: WorkspaceProfile;
   kind: DraftKind;
@@ -37,6 +46,15 @@ export interface DraftInput {
   contactId?: string | null;
   timeline: TimelineItem[];
   sender: DraftSender | null;
+  /**
+   * The bills a dunning note is about.
+   *
+   * "Our records show an invoice on your account is still outstanding" names no
+   * invoice, no amount and no date, so the recipient cannot act on it and the
+   * sender has to look the numbers up and retype them. A chase with no number
+   * in it is not a chase.
+   */
+  outstanding?: OutstandingInvoice[];
 }
 
 export interface DraftResult {
@@ -85,11 +103,15 @@ export function detectTone(text: string): Tone {
 }
 
 const greeting = (tone: Tone, name: string): string => {
-  const first = firstName(name) || 'there';
+  const resolved = firstName(name);
+  const first = resolved || 'there';
   switch (tone) {
     case 'formal': return `Dear ${name || 'Sir or Madam'},`;
-    case 'concise': return `${first} —`;
-    case 'urgent': return `${first},`;
+    // With a name, dropping the "Hi" is the register an urgent note wants. With
+    // none, the same branch opened the message "there," — which is not a
+    // greeting in any register.
+    case 'concise': return resolved ? `${first} —` : `Hi ${first},`;
+    case 'urgent': return resolved ? `${first},` : `Hi ${first},`;
     case 'warm': return `Hi ${first},`;
     default: return `Hi ${first},`;
   }
@@ -252,14 +274,32 @@ export function composeDraft(input: DraftInput): DraftResult {
       break;
     }
     case 'dunning': {
-      subject = `Invoice for ${name} — payment outstanding`;
-      paragraphs.push(tone === 'apologetic'
-        ? 'Apologies for the chase — our records show an invoice on your account is still outstanding.'
-        : 'Our records show an invoice on your account is still outstanding.');
-      paragraphs.push('If it has already gone out, please ignore this note. If it is stuck in approvals, tell me who to talk to and I will take it from there.');
-      paragraphs.push(tone === 'urgent'
+      const bills = input.outstanding ?? [];
+      subject = bills.length === 1
+        ? `Invoice ${bills[0].number} for ${name} — ${bills[0].amount_due_formatted} outstanding`
+        : `Invoice for ${name} — payment outstanding`;
+      const overdue = bills.filter((b) => (b.days_overdue ?? 0) > 0);
+      paragraphs.push(bills.length
+        ? [
+            tone === 'apologetic' ? 'Apologies for the chase —' : '',
+            bills.length === 1
+              ? `invoice ${bills[0].number} for ${bills[0].amount_due_formatted} is still outstanding${bills[0].due_at ? `, due ${calendarDay(workspace, bills[0].due_at)}` : ''}${(bills[0].days_overdue ?? 0) > 0 ? ` — ${bills[0].days_overdue} days ago` : ''}.`
+              : `${bills.length} invoices on your account are still outstanding.`,
+          ].filter(Boolean).join(' ').replace(/^—\s*/, '').replace(/^(\w)/, (m) => (tone === 'apologetic' ? m : m.toUpperCase()))
+        : tone === 'apologetic'
+          ? 'Apologies for the chase — our records show an invoice on your account is still outstanding.'
+          : 'Our records show an invoice on your account is still outstanding.');
+      if (bills.length > 1) {
+        paragraphs.push(bills.slice(0, 6).map((b) =>
+          `• ${b.number} — ${b.amount_due_formatted}${b.due_at ? `, due ${calendarDay(workspace, b.due_at)}` : ''}${(b.days_overdue ?? 0) > 0 ? ` (${b.days_overdue} days past due)` : ''}`).join('\n'));
+      }
+      const many = bills.length > 1;
+      paragraphs.push(many
+        ? 'If those have already gone out, please ignore this note. If any of them is stuck in approvals, tell me who to talk to and I will take it from there.'
+        : 'If it has already gone out, please ignore this note. If it is stuck in approvals, tell me who to talk to and I will take it from there.');
+      paragraphs.push(tone === 'urgent' || overdue.length
         ? 'Service continues as normal for now, but I would rather resolve this before it reaches the automated suspension step.'
-        : 'You can settle it from the billing portal, or reply here and I will send a fresh copy.');
+        : `You can settle ${many ? 'them' : 'it'} from the billing portal, or reply here and I will send ${many ? 'fresh copies' : 'a fresh copy'}.`);
       break;
     }
     case 'meeting_recap': {
@@ -309,9 +349,22 @@ export function composeDraft(input: DraftInput): DraftResult {
       paragraphs.push(facts.ticket
         ? `An update on ${facts.ticket.subject}, raised ${day(workspace, facts.ticket.created)} and currently ${facts.ticket.status.toLowerCase()} at ${facts.ticket.priority.toLowerCase()} priority.`
         : `An update on the issue you raised.`);
-      paragraphs.push(tone === 'apologetic'
-        ? 'I am sorry this has taken as long as it has. Here is exactly where it stands and what happens next.'
-        : 'Here is where it stands and what happens next.');
+      // "Here is where it stands and what happens next." followed by nothing is
+      // a heading for a paragraph that was never written. The last thing that
+      // actually happened on the record is where it stands.
+      // The last thing that happened ON THIS TICKET — not the last thing that
+      // happened on the account, which is a different subject and reads as this
+      // one's status. Nothing else on the timeline is about this escalation.
+      const latest = facts.ticket
+        ? input.timeline.find((i) => i.kind !== 'property_change' && !composedHere(i.title)
+            && normalise(i.title).includes(normalise(facts.ticket!.subject)))
+        : undefined;
+      if (tone === 'apologetic') paragraphs.push('I am sorry this has taken as long as it has.');
+      if (latest) {
+        paragraphs.push(`Where it stands: ${latest.title}${latest.body ? ` — ${truncate(latest.body.replace(/\s+/g, ' ').trim(), 220)}` : ''} (${latest.when}).`);
+      } else if (facts.ticket) {
+        paragraphs.push(`Where it stands: the ticket is ${facts.ticket.status.toLowerCase().replace(/_/g, ' ')} at ${facts.ticket.priority.toLowerCase()} priority and nothing has been logged against it since it was raised, which is itself the thing I am chasing internally.`);
+      }
       paragraphs.push('I will update you again as soon as the next step lands, whether or not it is resolved by then.');
       break;
     }

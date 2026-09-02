@@ -18,7 +18,8 @@ import {
   Icons, MenuButton, Modal, useToast,
   type ComboOption, type MenuSection,
 } from '@/client/design';
-import { recordHref, type DealRecord, type RecordAssociation } from './api';
+import { accountOf, recordHref, type DealRecord, type RecordAssociation } from './api';
+import { useFirstControl } from './dialogs';
 
 interface RecordOption { id: string; display_name: string; properties: Record<string, unknown> }
 
@@ -53,7 +54,8 @@ function describe(row: RecordOption, objectType: string): string | undefined {
  * Adding four people is four picks either way; this way all four are reachable.
  */
 export function LinkRecordDialog({
-  open, deal, objectType, associationType, title, description, label, repeat, exclude, onClose, onLinked,
+  open, deal, objectType, associationType, title, description, label, repeat, exclude,
+  nearRecord, nearLabel, onClose, onLinked,
 }: {
   open: boolean;
   deal: DealRecord;
@@ -66,22 +68,55 @@ export function LinkRecordDialog({
   repeat?: boolean;
   /** Record ids already linked, hidden from the results so nothing is offered twice. */
   exclude: string[];
+  /** A record whose own links come first — the deal's account, for the committee. */
+  nearRecord?: string;
+  /** What that record is called, for the heading over its half of the list. */
+  nearLabel?: string;
   onClose: () => void;
   onLinked: () => void;
 }) {
   const toast = useToast();
+  const firstControl = useFirstControl();
   const [chosen, setChosen] = useState('');
   const [added, setAdded] = useState<string[]>([]);
 
   useEffect(() => { if (open) { setChosen(''); setAdded([]); } }, [open]);
 
+  const toOption = useCallback((row: RecordOption, group?: string): ComboOption => ({
+    value: row.id,
+    label: row.display_name,
+    description: describe(row, objectType) ?? row.id,
+    ...(group ? { group } : {}),
+  }), [objectType]);
+
+  /**
+   * The people on this deal's own account first, then the rest of the workspace.
+   *
+   * Typing one letter used to return whoever the workspace search ranked first
+   * — six contacts from three other companies, and not one from the account the
+   * deal belongs to — on the very screen whose job is naming the people who have
+   * to say yes. One ArrowDown and Enter linked a stranger. The account's own
+   * contacts are fetched with `associated_to` and put under a heading of their
+   * own; everyone else stays reachable underneath.
+   */
   const search = useCallback(async (query: string): Promise<ComboOption[]> => {
-    const page = await api.get<ListEnvelope<RecordOption>>(`/v1/records/${objectType}`, { q: query, limit: 20 });
-    return page.data
-      .filter((row) => !exclude.includes(row.id))
-      .slice(0, 8)
-      .map((row) => ({ value: row.id, label: row.display_name, description: describe(row, objectType) ?? row.id }));
-  }, [objectType, exclude]);
+    const params = { q: query, limit: 20 };
+    const [near, everyone] = await Promise.all([
+      nearRecord
+        ? api.get<ListEnvelope<RecordOption>>(`/v1/records/${objectType}`, { ...params, associated_to: nearRecord })
+        : Promise.resolve(null),
+      api.get<ListEnvelope<RecordOption>>(`/v1/records/${objectType}`, params),
+    ]);
+    const usable = (rows: RecordOption[]) => rows.filter((row) => !exclude.includes(row.id));
+    const onAccount = usable(near?.data ?? []).slice(0, 8);
+    const seen = new Set(onAccount.map((row) => row.id));
+    const rest = usable(everyone.data).filter((row) => !seen.has(row.id)).slice(0, onAccount.length ? 6 : 8);
+    if (!onAccount.length) return rest.map((row) => toOption(row));
+    return [
+      ...onAccount.map((row) => toOption(row, `On ${nearLabel ?? 'this account'}`)),
+      ...rest.map((row) => toOption(row, 'Elsewhere in this workspace')),
+    ];
+  }, [objectType, exclude, nearRecord, nearLabel, toOption]);
 
   const link = useMutation<void, LinkResult>(
     () => api.post<LinkResult>('/v1/associations', {
@@ -112,6 +147,7 @@ export function LinkRecordDialog({
     <Modal
       open={open}
       onClose={onClose}
+      initialFocus={firstControl.initialFocus}
       size="md"
       title={title}
       description={description}
@@ -129,7 +165,7 @@ export function LinkRecordDialog({
         </>
       }
     >
-      <div className="pl-form">
+      <div className="pl-form" ref={firstControl.body}>
         {link.error && <Banner tone="danger" title="Nothing was linked">{link.error.body.message}</Banner>}
         {added.length > 0 && (
           <Banner tone="success" compact>
@@ -139,7 +175,7 @@ export function LinkRecordDialog({
         <Field
           label={label}
           hint={repeat
-            ? 'Type to search this workspace’s contacts. The dialog stays open so you can add several.'
+            ? `${nearLabel ? `${nearLabel}’s own contacts come first; everyone else is underneath` : 'Type to search this workspace’s contacts'}. The dialog stays open so you can add several.`
             : 'Type to search this workspace’s companies. A deal belongs to exactly one account, so this replaces the current link.'}
         >
           <Combobox
@@ -280,6 +316,9 @@ export function CommitteeCard({ deal, contacts, onChanged }: {
   const toast = useToast();
   const [adding, setAdding] = useState(false);
   const [removing, setRemoving] = useState<RecordAssociation | null>(null);
+  // The committee is drawn from the account the deal belongs to far more often
+  // than from the rest of the workspace, so the account leads the picker.
+  const account = accountOf(deal);
 
   const remove = useMutation<RecordAssociation, void>(
     (association) => api.del(`/v1/associations/${encodeURIComponent(association.id)}`),
@@ -355,6 +394,8 @@ export function CommitteeCard({ deal, contacts, onChanged }: {
         description={`The people who have to say yes to ${deal.display_name}.`}
         label="Contacts"
         exclude={contacts.map((contact) => contact.record_id)}
+        nearRecord={account?.record_id}
+        nearLabel={account?.display_name}
         onClose={() => setAdding(false)}
         onLinked={onChanged}
       />

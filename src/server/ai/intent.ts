@@ -129,6 +129,26 @@ const SIGNALS: SignalDef[] = [
   S('ts.diagnose', 'troubleshoot', 2.0, /\b(diagnose|debug|investigate|look\s+into|troubleshoot|what'?s\s+wrong)\b/i),
 ];
 
+/**
+ * A question is not a command, however many verbs it shares with one.
+ *
+ * "Which deals close this month?" fires `act.update` on "close this" and is
+ * answered "I changed nothing — the request did not resolve to a write I can
+ * prepare", which is the single most common thing a rep types into a CRM
+ * copilot. A leading interrogative is decisive about mood: what follows it is
+ * a request for information, and the write signals it fires are the verbs of
+ * the question, not an instruction. Modal openers ("can you update…", "could
+ * we move…") are deliberately not here — those really are polite commands.
+ */
+const LEADING_INTERROGATIVE = /^\s*(?:so\s+|and\s+|ok(?:ay)?,?\s+|hey,?\s+)?(which|what|whats|what's|who|whose|whom|when|where|how|why)\b/i;
+
+/**
+ * An imperative the sentence carries anyway — "which deals should I close, and
+ * move the top one to Negotiation" is two clauses and the second is a write.
+ * A write verb after one of these keeps its weight.
+ */
+const EXPLICIT_COMMAND = /(?:\b(?:please|go ahead and)\b|\b(?:can|could|would|will)\s+you\b|;|,\s*(?:and\s+)?then\b)/i;
+
 const NEGATION_CUES = [
   "don't", 'do not', "doesn't", 'dont', 'not', 'no need to', 'never', 'without', 'skip',
   'instead of', 'rather than', 'other than', 'except', 'excluding', 'avoid', 'stop',
@@ -167,6 +187,10 @@ export function classifyIntent(message: string, hint?: string): IntentResult {
   const scopes = negationScopes(text);
   const length = Math.max(text.length, 1);
 
+  const interrogative = LEADING_INTERROGATIVE.exec(text);
+  const commanded = EXPLICIT_COMMAND.test(text);
+  const questioned = !!interrogative && !commanded;
+
   for (const def of SIGNALS) {
     const match = text.match(def.re);
     if (!match || match.index === undefined) continue;
@@ -174,9 +198,24 @@ export function classifyIntent(message: string, hint?: string): IntentResult {
     const negated = scopes.some((s) => at >= s.at && at < s.end);
     // A verb in the opening clause is the request; the same word later is context.
     const lead = at / length < 0.25 ? 1.2 : 1;
-    const applied = negated ? -def.weight * 0.55 : def.weight * lead;
+    // "Which deals close this month" opens with an interrogative, so `close` is
+    // the deal's own verb and not an instruction to close anything. The signal
+    // is recorded as it fired, and cancelled, so the trace can defend it.
+    const moodBlocked = questioned && def.intent === 'act';
+    const applied = moodBlocked ? -def.weight * 0.55 : negated ? -def.weight * 0.55 : def.weight * lead;
     scores[def.intent] += applied;
-    signals.push({ id: def.id, intent: def.intent, weight: def.weight, matched: match[0], at, negated, applied: Number(applied.toFixed(2)) });
+    signals.push({
+      id: moodBlocked ? `${def.id}.interrogative` : def.id,
+      intent: def.intent, weight: def.weight, matched: match[0], at,
+      negated: negated || moodBlocked,
+      applied: Number(applied.toFixed(2)),
+    });
+  }
+  if (questioned) {
+    // The opening word is itself the strongest thing the sentence says about
+    // what it wants, and it is asking rather than telling.
+    scores.lookup += 1.2;
+    signals.push({ id: 'mood.interrogative', intent: 'lookup', weight: 1.2, matched: interrogative![1], at: 0, negated: false, applied: 1.2 });
   }
 
   // A caller-supplied hint is evidence, never a command: signals can outvote it.

@@ -10,7 +10,7 @@
  * own, so "12 moved, 2 refused" is a real answer and is rendered as one rather
  * than collapsed into a single failure.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, useMutation } from '@/client/kernel/api';
 import { useSession } from '@/client/kernel/session';
 import {
@@ -18,11 +18,15 @@ import {
   type SelectOption,
 } from '@/client/design';
 import {
-  dealAmount, dealStage, dealWeighted, emptyValue, reasonOptions, stageRequirements, useDealFormat,
-  useOutcomeSplit,
-  type DealRecord, type PipelineStage, type PropertyDef, type WorkspaceUser,
+  dealAmount, dealStage, dealWeighted, emptyValue, reasonOptions, snapshotMove, snapshotOwner,
+  stageRequirements, useDealFormat, useOutcomeSplit,
+  type DealRecord, type MoveSnapshot, type OwnerSnapshot, type PipelineStage, type PropertyDef,
+  type WorkspaceUser,
 } from './api';
-import { PropertyInput, errorFor, unboundError, type Draft } from './dialogs';
+import {
+  PropertyInput, errorFor, unboundError, useFirstControl, useUndoBulkMove, useUndoBulkReassign,
+  type Draft,
+} from './dialogs';
 
 interface BatchRow {
   index: number;
@@ -134,21 +138,25 @@ export function BulkStageDialog({
 
   const missing = required.filter((property) => emptyValue(draft[property.name]));
 
+  const offerUndo = useUndoBulkMove();
+  // Each deal goes back to its *own* stage, not to one shared origin: a bulk
+  // move that swept four columns into Negotiation has four ways home.
+  const undoSnapshots = useRef<MoveSnapshot[]>([]);
+
   const move = useMutation<void, BatchResult>(async () => {
     if (!stage) throw new Error('no stage');
     const shared: Draft = { deal_stage: stage.name };
     for (const [key, value] of Object.entries(draft)) if (!emptyValue(value)) shared[key] = value;
-    return api.post<BatchResult>('/v1/records/deal/batch', {
-      operation: 'update',
-      records: moving.map((deal) => ({
-        id: deal.id,
-        // A deal that already carries a close stamp keeps the day it closed on;
-        // only a fresh close takes the day chosen here.
-        properties: stage.is_closed && closeDate !== null && emptyValue(deal.properties.closed_at)
-          ? { ...shared, close_date: closeDate }
-          : shared,
-      })),
-    });
+    const records = moving.map((deal) => ({
+      id: deal.id,
+      // A deal that already carries a close stamp keeps the day it closed on;
+      // only a fresh close takes the day chosen here.
+      properties: stage.is_closed && closeDate !== null && emptyValue(deal.properties.closed_at)
+        ? { ...shared, close_date: closeDate }
+        : shared,
+    }));
+    undoSnapshots.current = moving.map((deal, i) => snapshotMove(deal, records[i].properties));
+    return api.post<BatchResult>('/v1/records/deal/batch', { operation: 'update', records });
   }, {
     invalidates: ['/v1/records/deal', '/v1/pipelines', '/v1/crm/overview'],
     onSuccess: (batch) => {
@@ -160,9 +168,17 @@ export function BulkStageDialog({
           `${batch.errors} were refused — the reasons are on the dialog.`,
         );
       } else {
+        // Only the rows that actually landed are offered back.
+        const landed = new Set(moved.map((row) => row.id));
+        const undoable = undoSnapshots.current.filter((snapshot) => landed.has(snapshot.id));
+        const origins = new Set(undoable.map((snapshot) => snapshot.stage));
+        const home = origins.size === 1
+          ? stages.find((s) => s.name === [...origins][0])?.label ?? 'their old stage'
+          : 'the stage each came from';
         toast.success(
           `${f.plural(moved.length, 'deal')} moved to ${stage?.label}`,
           `${f.money(totals.next)} now forecasts at ${stage?.probability}%.`,
+          undoable.length ? { action: offerUndo(undoable, home) } : undefined,
         );
         onDone(moved.map((row) => row.id ?? ''));
         onClose();
@@ -310,11 +326,29 @@ export function BulkOwnerDialog({
   const amount = useMemo(() => deals.reduce((sum, deal) => sum + dealAmount(deal), 0), [deals]);
   const owner = users.find((user) => user.id === ownerId);
 
+  const firstControl = useFirstControl();
+  const offerUndo = useUndoBulkReassign();
+  // Taken before the write, the way `snapshotMove` is for a stage change: three
+  // deals handed to the wrong rep is otherwise three records to find and fix.
+  const undoSnapshots = useRef<OwnerSnapshot[]>([]);
+  // Named from the deals themselves rather than from the picker, because a
+  // selection can span several reps — "back with Marcus Vandermeer" when they
+  // all came from one, "back with the reps they came from" when they did not.
+  const cameFrom = useMemo(() => {
+    const owners = new Set(deals.map((deal) => deal.owner_id ?? ''));
+    if (owners.size !== 1) return 'the reps they came from';
+    const only = [...owners][0];
+    return only ? users.find((user) => user.id === only)?.name ?? 'their previous owner' : 'nobody';
+  }, [deals, users]);
+
   const assign = useMutation<void, BatchResult>(
-    () => api.post<BatchResult>('/v1/records/deal/batch', {
-      operation: 'update',
-      records: deals.map((deal) => ({ id: deal.id, properties: {}, ...(ownerId ? { owner_id: ownerId } : {}) })),
-    }),
+    () => {
+      undoSnapshots.current = deals.map(snapshotOwner);
+      return api.post<BatchResult>('/v1/records/deal/batch', {
+        operation: 'update',
+        records: deals.map((deal) => ({ id: deal.id, properties: {}, ...(ownerId ? { owner_id: ownerId } : {}) })),
+      });
+    },
     {
       invalidates: ['/v1/records/deal', '/v1/pipelines', '/v1/crm/overview'],
       onSuccess: (batch) => {
@@ -326,9 +360,12 @@ export function BulkOwnerDialog({
             `${batch.errors} were refused — the reasons are on the dialog.`,
           );
         } else {
+          const landed = new Set(moved.map((row) => row.id));
+          const undoable = undoSnapshots.current.filter((snapshot) => landed.has(snapshot.id));
           toast.success(
             `${f.plural(moved.length, 'deal')} now owned by ${owner?.name}`,
             `${f.money(amount)} of pipeline changed hands.`,
+            undoable.length ? { action: offerUndo(undoable, cameFrom) } : undefined,
           );
           onDone(moved.map((row) => row.id ?? ''));
           onClose();
@@ -342,6 +379,7 @@ export function BulkOwnerDialog({
     <Modal
       open={open}
       onClose={onClose}
+      initialFocus={firstControl.initialFocus}
       size="sm"
       title={`Reassign ${f.plural(deals.length, 'deal')}`}
       description={`${f.money(amount)} of pipeline moves to whoever you choose.`}
@@ -359,7 +397,7 @@ export function BulkOwnerDialog({
         </>
       }
     >
-      <div className="pl-form">
+      <div className="pl-form" ref={firstControl.body}>
         {unboundError(assign.error, ['owner_id']) && (
           <Banner tone="danger" title="Nothing was reassigned">{assign.error?.body.message}</Banner>
         )}

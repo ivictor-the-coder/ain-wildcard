@@ -23,18 +23,21 @@ import {
   detectGrouping, detectMetric, isRankingQuestion, linkedCustomerIds, metricById, metricIds, stageSets,
   type GroupBy, type MetricDetection, type MetricSubject,
 } from './metrics';
-import { comprehend, isUsableEntity, refusalFor, workspaceVocabulary, type Refusal } from './clarify';
-import { askedFor, ledgerToolFor, planTools, planWrite, replan, isWriteBlocked, type BuiltinTool, type PlannedStep, type SkippedTool, type WindowPair, type WriteBlocked } from './plan';
+import { comprehend, isUsableEntity, pronounBoundInSentence, refusalFor, workspaceVocabulary, type Refusal } from './clarify';
+import {
+  askedFor, ledgerToolFor, namedCapability, planTools, planWrite, replan, isWriteBlocked,
+  type BlockedCapability, type BuiltinTool, type PlannedStep, type SkippedTool, type WindowPair, type WriteBlocked,
+} from './plan';
 import { propertyMap } from './query';
 import {
   accountProfile, businessMetric, recordAggregate, recordSearch, recordTimeline, workspaceSearch,
   type AccountProfileResult, type TimelineItem,
 } from './functions';
 import { composeDraft, detectDraftKind, detectTone, type DraftKind, type DraftResult, type Tone } from './draft';
-import { extractStructured } from './extract';
-import { synthesise, type StepResult } from './synth';
+import { extractStructured, normaliseResponseSchema } from './extract';
+import { synthesise, type ResultOutcome, type StepResult } from './synth';
 import { accountUsage, estimateTokens, messageTokens, toolTokens } from './usage';
-import { EMAIL_PATTERN, ID_PATTERN, QUOTED_PATTERN, truncate } from './text';
+import { EMAIL_PATTERN, ID_PATTERN, QUOTED_PATTERN, normalise, truncate } from './text';
 
 export const ENGINE_MODEL = 'ain-engine-1';
 
@@ -64,6 +67,10 @@ export interface EngineAnalysis {
   plan: { tool: string; why: string; args: Record<string, unknown> }[];
   /** Tools the question matched but could not arm, and what they were missing. */
   skipped: SkippedTool[];
+  /** Ledger capabilities the question asked for and this run refused to fake. */
+  blocked: BlockedCapability[];
+  /** Every successful step, and whether the answer rendered its result or said why not. */
+  results: ResultOutcome[];
   /** The record carried in from the conversation when this turn named none. */
   carriedSubject: MetricSubject | null;
   steps: { tool: string; ok: boolean; code: string | null; ms: number }[];
@@ -104,8 +111,72 @@ function pinnedSubject(call: AiCallContext, index: EntityIndex): ResolvedEntity 
   };
 }
 
+/**
+ * The price a meter is billed on.
+ *
+ * Metering measures; the catalogue prices. The link between them is the meter's
+ * own `price_lookup_key`, which is how the seeded graduated telemetry price is
+ * found from the meter a question named.
+ */
+function meterPriceKey(ctx: Ctx, orgId: string, meterId: string | null): string | null {
+  if (!meterId || !ctx.svc.metering) return null;
+  const meter = ctx.svc.metering.meter(orgId, meterId);
+  const key = meter?.metadata?.price_lookup_key ?? meter?.metadata?.price ?? null;
+  return typeof key === 'string' && key.trim() ? key.trim() : null;
+}
+
+/** Magnitude words as people write them next to a quantity. */
+const MAGNITUDES: Record<string, number> = { k: 1e3, thousand: 1e3, m: 1e6, million: 1e6, bn: 1e9, billion: 1e9 };
+
+/**
+ * The quantity a question names, for a price question that has one.
+ *
+ * "How much would 50 million telemetry events cost?" carries the number the
+ * price has to be evaluated at. A year is not a quantity, and neither is a
+ * figure written with a currency symbol in front of it — that is a price.
+ */
+export function quantityIn(question: string): number | null {
+  let best: number | null = null;
+  const pattern = /(^|[^\w$£€])(\d[\d,.]*)\s*(k|m|bn|thousand|million|billion)?\b/gi;
+  for (const match of question.matchAll(pattern)) {
+    const digits = Number(match[2].replace(/,/g, ''));
+    if (!Number.isFinite(digits)) continue;
+    const scale = match[3] ? MAGNITUDES[match[3].toLowerCase()] ?? 1 : 1;
+    // A bare four-digit number in the 1900–2100 range is a year.
+    if (!match[3] && digits >= 1900 && digits <= 2100 && Number.isInteger(digits)) continue;
+    const value = Math.round(digits * scale);
+    if (value > 0 && (best === null || value > best)) best = value;
+  }
+  return best;
+}
+
 /** A hit strong enough to be what this sentence is about, not a near-miss. */
 const STRONG = 0.7;
+
+/**
+ * How a question reaches a meter.
+ *
+ * `METER_MIN` is the floor for considering one at all; `METER_STRONG` is what
+ * it takes for a meter alone to make the sentence a usage question, so the word
+ * "telemetry" inside a question about a product's price does not turn it into
+ * one; `METER_MARGIN` is how far ahead the best meter has to be before the
+ * engine will pick it rather than ask which was meant.
+ */
+const METER_MIN = 0.5;
+const METER_STRONG = 0.6;
+const METER_MARGIN = 0.06;
+
+/**
+ * The words that actually did the matching, for the sentence that asks which
+ * meter was meant. The mention a resolver scores on is an n-gram with the
+ * sentence's filler still in it — quoting "much telemetry did" back at someone
+ * reads as a parser talking to itself.
+ */
+export function sharedWords(mention: string, labels: string[]): string {
+  const inEvery = normalise(mention).split(' ').filter((word) =>
+    word.length > 2 && labels.every((label) => normalise(label).split(' ').includes(word)));
+  return inEvery.join(' ') || mention;
+}
 
 /**
  * Which records this turn is about, given that it is turn five of a
@@ -352,8 +423,8 @@ export function builtinEngine(): AiProvider {
       }
 
       /* 3. which records — this turn's, and the ones the thread is already about */
-      const types = mentionedTypes(question);
-      const prefer = metric?.metric.supportsSubject ? ['company', 'customer', 'contact'] : types;
+      const namedTypes = mentionedTypes(question);
+      const prefer = metric?.metric.supportsSubject ? ['company', 'customer', 'contact'] : namedTypes;
       const index = entityIndex(ctx, orgId);
       const options = { prefer, limit: 6, dedupe: true };
       const deictic = deicticMention(question);
@@ -377,6 +448,30 @@ export function builtinEngine(): AiProvider {
         runtime?.note(call, 'resolve', 'resolve_entities', entities.slice(0, 4).map((e) => e.explain).join(' | '));
       }
 
+      /* 3b. which meter — a workspace that sells metered usage names its meters */
+      const meters = resolveEntities(question, index, { only: ['meter'], limit: 3, minScore: METER_MIN });
+      const decisive = meters.length === 1 || (meters.length > 1 && meters[0].score - meters[1].score >= METER_MARGIN);
+      const meter = decisive ? meters[0] : null;
+      // Two meters matched and neither is clearly the one meant. Picking the
+      // alphabetically-first is how a question about telemetry sent gets
+      // answered with telemetry stored, which is a different number.
+      const rivalMeters = decisive ? [] : meters.slice(0, 3);
+      if (meter) {
+        reasoning.push(`Meter: ${meter.entity.label} (matched "${meter.mention}", ${meter.score.toFixed(2)}, ${meter.rule}) — metered usage is read from the meter, not from a sales metric.`);
+      } else if (rivalMeters.length) {
+        reasoning.push(`${rivalMeters.length} meters match "${sharedWords(rivalMeters[0].mention, rivalMeters.map((m) => m.entity.label))}" within ${METER_MARGIN} of each other (${rivalMeters.map((m) => m.entity.label).join(', ')}); none is decisive, so no meter is passed to the usage capability.`);
+      }
+      // A question that names a meter and no metric is a usage question,
+      // whatever nouns it happens to use for it: "how much telemetry did they
+      // send" says nothing the CRM holds, and answering it from bookings is
+      // the substitution this engine exists to refuse.
+      const usageFromMeter = !!meters[0] && meters[0].score >= METER_STRONG && !metric
+        && !namedTypes.includes('usage') && (intent.intent === 'aggregate' || intent.intent === 'compare');
+      const types = usageFromMeter ? [...namedTypes, 'usage'] : namedTypes;
+      if (usageFromMeter) {
+        reasoning.push(`"${meters[0].mention}" is ${meters[0].entity.label}, a meter in ${workspace.name}, and the question names no sales metric — so this is a question about metered usage.`);
+      }
+
       /* 4. which metric and grouping */
       if (metric) reasoning.push(`Metric: ${metric.metric.label} (matched "${metric.matched}", score ${metric.score})${metric.alternatives.length ? `, over ${metric.alternatives.map((a) => a.id).join(', ')}` : ''}.`);
       if (groupBy !== 'none') reasoning.push(`Grouping requested: by ${groupBy}.`);
@@ -396,7 +491,15 @@ export function builtinEngine(): AiProvider {
       // A pronoun with nothing behind it is not a question about the workspace.
       // Widening "how much have they spent" to every account in the book is how
       // a follow-up gets answered confidently about the wrong thing.
-      const danglingReference: Refusal | null = deictic && !entities.length && !carried
+      // A pronoun the sentence answers itself is not a dangling reference. The
+      // antecedent is named four words earlier, and refusing to read it turned
+      // "how many open deals do we have and what are they worth" into an
+      // apology about an unpinned conversation.
+      const boundHere = deictic ? pronounBoundInSentence(question, deictic) : null;
+      if (boundHere) {
+        reasoning.push(`"${deictic}" is bound inside the question by "${boundHere}", so it is not an unresolved reference and nothing needs to be carried.`);
+      }
+      const danglingReference: Refusal | null = deictic && !boundHere && !entities.length && !carried
         ? {
             code: 'unresolved_reference',
             why: `"${deictic}" refers to nothing this conversation has established.`,
@@ -407,18 +510,12 @@ export function builtinEngine(): AiProvider {
             ].join(' '),
           }
         : null;
-      const refusal: Refusal | null = danglingReference ?? refusalFor({
+      const refusalOrNull: Refusal | null = danglingReference ?? refusalFor({
         question, workspace, intent, comprehension, metric, entities, types, windows, mentions,
         unresolved, reversedRange: backwards,
         metrics: metricIds().map((id) => metricById(id)?.label ?? id),
         countableTypes,
       });
-      if (refusal) {
-        reasoning.push(`Refused (${refusal.code}): ${refusal.why}`);
-        runtime?.note(call, 'plan', 'refuse_to_answer', `${refusal.code}: ${refusal.why}`);
-      } else if (comprehension.unknown.length) {
-        reasoning.push(`Unrecognised terms carried through: ${comprehension.unknown.slice(0, 5).map((w) => `"${w}"`).join(', ')} — answered anyway because ${metric ? `the metric "${metric.metric.label}"` : entities.filter(isUsableEntity).length ? 'a record' : 'an object type'} resolved.`);
-      }
 
       /* 6. plan */
       const budget = runtime?.budget(call) ?? { steps: 6, timeMs: 10_000, callsPerMinute: 600 };
@@ -438,17 +535,62 @@ export function builtinEngine(): AiProvider {
         // A CRM company and its billing customer are two rows with two ids, and
         // every ledger tool takes the second one.
         subjectCustomerIds: linkedCustomerIds(ctx, orgId, subject),
+        meter: meter?.entity.id ?? null,
+        // The price the meter is billed on, so "how much would 50 million
+        // telemetry events cost" reaches the price book rather than coming back
+        // with a usage volume close enough to be mistaken for an answer.
+        meterPrice: meterPriceKey(ctx, orgId, meter?.entity.id ?? null),
+        // Two meters matched the same word and neither is decisive. Picking one
+        // would answer a different question half the time; the catalogue is not
+        // an answer either. Both are measured and the answer says why.
+        meterCandidates: rivalMeters.filter((m) => m.score >= METER_STRONG).map((m) => m.entity.id),
+        quantity: quantityIn(question),
       };
+      // A phrase that is a capability's own title is not an unreadable question.
+      // "Show me the recovery queue" was refused with a sentence asserting that
+      // "recovery" and "queue" match nothing in this workspace, while
+      // `payments.recovery_queue` sat in the live catalogue.
+      const rescued = refusalOrNull && intent.intent !== 'act' ? namedCapability(planInput) : null;
+      const refusal: Refusal | null = rescued ? null : refusalOrNull;
+      if (rescued && refusalOrNull) {
+        reasoning.push(`The measure did not resolve (${refusalOrNull.code}), but "${question.trim()}" names \`${rescued.tool}\` — a capability this workspace publishes — so that answers it.`);
+      }
+      if (refusal) {
+        reasoning.push(`Refused (${refusal.code}): ${refusal.why}`);
+        runtime?.note(call, 'plan', 'refuse_to_answer', `${refusal.code}: ${refusal.why}`);
+      } else if (comprehension.unknown.length) {
+        reasoning.push(`Unrecognised terms carried through: ${comprehension.unknown.slice(0, 5).map((w) => `"${w}"`).join(', ')} — answered anyway because ${metric ? `the metric "${metric.metric.label}"` : entities.filter(isUsableEntity).length ? 'a record' : 'an object type'} resolved.`);
+      }
       const attempted = intent.intent === 'act' ? planWrite(planInput) : null;
       const writeBlocked = isWriteBlocked(attempted) ? attempted : null;
       if (writeBlocked) {
         reasoning.push(`No write prepared: the request looks like ${writeBlocked.wanted}, but ${writeBlocked.reason}`);
       }
-      const planned = refusal ? { steps: [] as PlannedStep[], skipped: [] as SkippedTool[] } : planTools(planInput);
+      const planned = refusal
+        ? { steps: [] as PlannedStep[], skipped: [] as SkippedTool[], blocked: [] as BlockedCapability[] }
+        : planTools(planInput);
       const plan = planned.steps;
+      // A capability the question asked for and the run could not arm is
+      // reported with the values it was missing, using the workspace's own
+      // names for them: "name a meter" is only actionable next to the meters.
+      const meterOptions = (rivalMeters.length ? rivalMeters.map((m) => m.entity) : index.entities.filter((e) => e.type === 'meter'))
+        .slice(0, 8)
+        // The event name is what tells two similarly-named meters apart, which
+        // is the whole job of this list.
+        .map((entity) => ({ label: entity.label, detail: entity.aliases[0] ? `\`${entity.aliases[0]}\`` : entity.sublabel }));
+      const blocked: BlockedCapability[] = planned.blocked.map((entry) => entry.missing.includes('meter')
+        ? { ...entry, options: meterOptions, ambiguous: rivalMeters.length > 0, matched: rivalMeters.length ? sharedWords(rivalMeters[0].mention, rivalMeters.map((m) => m.entity.label)) : undefined }
+        : entry);
+      const blockedTools = new Set(blocked.map((b) => b.tool).filter((name): name is string => !!name));
+      if (blocked.length) {
+        reasoning.push(`Refused to substitute: ${blocked.map((b) => `${b.objectType} (${b.reason.replace(/_/g, ' ')}${b.missing.length ? `: ${b.missing.join(', ')}` : ''})`).join('; ')}. No CRM fallback was planned — a confident answer to another question is worse than none.`);
+        runtime?.note(call, 'plan', 'refuse_substitution', blocked.map((b) => `${b.objectType}: ${b.tool ?? 'no capability'}${b.missing.length ? ` needs ${b.missing.join(', ')}` : ''}`).join(' | '));
+      }
       // A tool the question wanted but could not arm is reported, not run with
       // the sentence in its parameters. The trace and the answer both say so.
-      const skipped = planned.skipped.filter((s) => askedFor(s.tool, question)).slice(0, 2);
+      const skipped = planned.skipped
+        .filter((s) => askedFor(s.tool, question) && !blockedTools.has(s.tool))
+        .slice(0, 2);
       if (planned.skipped.length) {
         reasoning.push(`Not planned: ${planned.skipped.map((s) => `${s.tool} (no value for ${s.missing.join(', ')})`).join('; ')}.`);
       }
@@ -526,15 +668,21 @@ export function builtinEngine(): AiProvider {
       }
 
       const synthesis = refusal
-        ? { content: refusal.content, citations: [] }
+        ? { content: refusal.content, citations: [], rendering: [] as ResultOutcome[] }
         : synthesise({
             question, intent, workspace, window, windows, comparison, ranking, subject, entities, steps, metric, draft,
+            stages: planInput.stages,
             pendingApprovals: (call.pendingApprovals ?? []) as PendingApproval[],
             writeBlocked,
             scopedTools,
             // A tool the second pass managed to arm is not a tool that was skipped.
             skippedTools: skipped.filter((s) => !steps.some((step) => step.tool === s.tool && step.ok)),
+            blocked,
             carriedSubject: carried ? { label: carried.entity.label, pinned: call.subjectId === carried.entity.id } : null,
+            // What this thread has already been told. A profile paragraph
+            // reprinted on turns two, three and four is four paragraphs the
+            // reader has read, in front of the sentence they asked for.
+            priorAnswers: req.messages.filter((m) => m.role === 'assistant').map((m) => m.content),
           });
 
       // A plan that died entirely on the run's budget did not answer the
@@ -551,8 +699,8 @@ export function builtinEngine(): AiProvider {
           ].join(' ')
         : synthesis.content;
       if (req.responseSchema) {
-        const metricResult = executed.map((e) => e.result).find((r) => !!r && typeof r === 'object' && 'formatted' in (r as object)) as { value?: number; formatted?: string } | undefined;
-        const extraction = extractStructured(req.responseSchema, {
+        const metricResult = executed.map((e) => e.result).find((r) => !!r && typeof r === 'object' && 'formatted' in (r as object)) as { value?: number; formatted?: string; books?: { currency: string }[]; mixedCurrency?: boolean } | undefined;
+        const extraction = extractStructured(normaliseResponseSchema(req.responseSchema), {
           question,
           answer: synthesis.content,
           workspace,
@@ -561,6 +709,11 @@ export function builtinEngine(): AiProvider {
           results: executed,
           metricValue: metricResult?.value ?? null,
           metricFormatted: metricResult?.formatted ?? null,
+          // A measurement question is about its metric; every other question
+          // merely mentions one, and pasting it into that question's `amount`
+          // writes the workspace's total onto one record.
+          metricIsSubject: !!metric && (intent.intent === 'aggregate' || intent.intent === 'compare'),
+          metricCurrencies: (metricResult?.books ?? []).map((b) => b.currency),
           confidence: intent.confidence,
         });
         content = JSON.stringify(extraction.value, null, 2);
@@ -602,6 +755,8 @@ export function builtinEngine(): AiProvider {
         draftKind,
         plan: plan.map((s) => ({ tool: s.tool, why: s.why, args: s.args })),
         skipped: planned.skipped,
+        blocked,
+        results: synthesis.rendering,
         carriedSubject: asSubject(carried ?? undefined),
         steps: traced,
         passes,

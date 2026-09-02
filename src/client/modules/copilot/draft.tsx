@@ -124,6 +124,35 @@ export function DraftDialog({
   // A combobox hands back the id it was given; the label it was chosen by has to
   // be remembered, or the button that commits the write names a primary key.
   const names = useRef(new Map<string, string>());
+  /**
+   * Where the caret goes when the dialog opens, and where it goes when the
+   * draft lands.
+   *
+   * The focus trap otherwise takes the first focusable node it finds, which is
+   * the header's close button: typing a search straight into the dialog sent
+   * the first Space to Close and threw the whole thing away. And when the draft
+   * arrives the form it replaces is unmounted, so the caret fell to `<body>`
+   * with an editable subject, body and two actions on screen — 25 Tab stops
+   * from the sidebar. The first field takes it on open; Subject takes it when
+   * there is something to edit.
+   */
+  const firstField = useRef<HTMLElement | null>(null);
+  const subjectField = useRef<HTMLInputElement>(null);
+  const captureFirstField = (node: HTMLDivElement | null) => {
+    firstField.current = node?.querySelector<HTMLElement>('input, select, textarea') ?? null;
+  };
+
+  /**
+   * The form that had focus is gone once the draft lands, so the caret follows
+   * the draft rather than falling to the document.
+   *
+   * This used to be one `requestAnimationFrame` inside the mutation's success
+   * handler, which is a race it lost about one time in five: React had not
+   * necessarily committed the draft by the next frame, so `subjectField` was
+   * still null and the focus call did nothing. An effect runs after the commit
+   * that mounts the field, which is exactly when it can be focused.
+   */
+  useEffect(() => { if (draft) subjectField.current?.focus(); }, [draft]);
 
   useEffect(() => {
     if (!open) return;
@@ -206,6 +235,7 @@ export function DraftDialog({
       open={open}
       onClose={onClose}
       size="lg"
+      initialFocus={firstField}
       title="Draft with the copilot"
       description="Composed from this record's own facts — the agreed next step, the contact, your signature. Nothing is sent."
       footer={
@@ -238,7 +268,7 @@ export function DraftDialog({
         )
       }
     >
-      <div className="pl-form">
+      <div className="pl-form" ref={captureFirstField}>
         {write.error && !write.error.body.param && (
           <Banner tone="danger" title="Nothing was drafted">{write.error.body.message}</Banner>
         )}
@@ -361,7 +391,12 @@ export function DraftDialog({
             )}
 
             <Field label="Subject" hint="Edit anything before it lands on the record.">
-              <Input value={editSubject} onChange={(e) => setEditSubject(e.target.value)} aria-label="Subject" />
+              <Input
+                ref={subjectField}
+                value={editSubject}
+                onChange={(e) => setEditSubject(e.target.value)}
+                aria-label="Subject"
+              />
             </Field>
 
             <Field label="Body">

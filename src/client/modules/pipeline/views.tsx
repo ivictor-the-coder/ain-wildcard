@@ -13,7 +13,7 @@
  * these controls cannot express, the menu says so rather than applying half of
  * it and pretending that is the view.
  */
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { api, useMutation, type ApiClientError } from '@/client/kernel/api';
 import { useSession } from '@/client/kernel/session';
 import {
@@ -62,6 +62,7 @@ export function ViewBar({
   const views = useDealViews();
   const [draft, setDraft] = useState<Draft | null>(null);
   const [deleting, setDeleting] = useState<DealView | null>(null);
+  const nameField = useRef<HTMLInputElement>(null);
 
   const rows = views.data?.data ?? [];
   const active = rows.find((row) => row.id === activeId) ?? null;
@@ -212,10 +213,15 @@ export function ViewBar({
         </Button>
       )}
 
+      {/* `initialFocus` is not decoration: the trap otherwise lands on the
+          header's close button — the first focusable node in the dialog — and
+          the first Space of the name you type activates it, throwing away the
+          dialog and everything typed into it. */}
       <Modal
         open={!!draft}
         onClose={() => setDraft(null)}
         size="sm"
+        initialFocus={nameField}
         title={draft?.view ? `Edit “${draft.view.name}”` : 'Save this board as a view'}
         description={
           draft?.keepFilter
@@ -247,10 +253,10 @@ export function ViewBar({
             )}
             <Field label="Name" required error={errorFor(save.error, 'name')} hint="What a teammate will see in the menu.">
               <Input
+                ref={nameField}
                 value={draft.name}
                 onChange={(e) => setDraft({ ...draft, name: e.target.value })}
                 maxLength={80}
-                autoFocus
                 placeholder="Commit deals closing this quarter"
                 aria-label="View name"
               />

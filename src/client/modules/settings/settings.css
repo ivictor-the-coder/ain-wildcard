@@ -1,0 +1,312 @@
+/**
+ * The settings surface. Only tokens — no raw colours, no raw font sizes — so
+ * both themes and both densities come out of the design system unchanged.
+ */
+
+/* -------------------------------- the frame ------------------------------- */
+
+.st-frame {
+  display: grid;
+  grid-template-columns: 208px minmax(0, 1fr);
+  gap: var(--space-9);
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .st-frame { grid-template-columns: minmax(0, 1fr); gap: var(--space-6); }
+  .st-rail { position: static; }
+}
+
+.st-body { min-width: 0; }
+
+.st-rail {
+  position: sticky;
+  top: var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-7);
+}
+
+.st-rail__group { display: flex; flex-direction: column; gap: var(--space-1); }
+
+.st-rail__grouplabel {
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  padding: 0 var(--space-4) var(--space-2);
+}
+
+.st-rail__item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+  border: 1px solid transparent;
+  transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+
+.st-rail__item:hover { background: var(--bg-hover); color: var(--text-primary); }
+.st-rail__item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+.st-rail__item.is-active {
+  background: var(--accent-subtle);
+  border-color: var(--border-brand);
+  color: var(--text-brand);
+}
+
+.st-rail__item svg { flex: none; }
+.st-rail__item.is-locked { color: var(--text-tertiary); }
+.st-rail__item.is-locked svg:last-child { margin-left: auto; }
+
+/* ------------------------------- small parts ------------------------------ */
+
+.st-loading {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-8) var(--space-4);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.st-listfail { margin-bottom: var(--space-5); }
+
+.st-mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.st-hint {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  line-height: var(--leading-normal);
+}
+
+.st-sub {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  line-height: var(--leading-normal);
+}
+
+/* --------------------------------- payload -------------------------------- */
+
+.st-json {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--bg-code);
+}
+
+.st-json__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-2) var(--space-3) var(--space-2) var(--space-5);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+}
+
+.st-json__label {
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.st-json__code {
+  margin: 0;
+  padding: var(--space-5);
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-relaxed);
+  color: var(--text-primary);
+  white-space: pre;
+}
+
+.st-json__code:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+/* ------------------------------- field rows ------------------------------- */
+
+.st-rows { display: flex; flex-direction: column; }
+
+.st-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-6);
+  padding: var(--space-5) 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.st-row:last-child { border-bottom: none; }
+.st-row__main { min-width: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.st-row__title { font-size: var(--text-sm); font-weight: var(--weight-medium); color: var(--text-primary); }
+.st-row__sub { font-size: var(--text-xs); color: var(--text-secondary); line-height: var(--leading-normal); }
+.st-row__aside { flex: none; display: flex; align-items: center; gap: var(--space-4); }
+
+/* --------------------------------- grids ---------------------------------- */
+
+.st-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--space-6);
+  align-items: start;
+}
+
+@media (max-width: 1100px) { .st-cols { grid-template-columns: minmax(0, 1fr); } }
+
+.st-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--space-5);
+}
+
+/* -------------------------------- the clock ------------------------------- */
+
+.st-clock__value {
+  font-family: var(--font-display);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.st-jumps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: var(--space-4);
+}
+
+.st-jump {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: flex-start;
+  text-align: left;
+  padding: var(--space-5);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+}
+
+.st-jump:hover:not(:disabled) { border-color: var(--border-brand); background: var(--accent-subtle); }
+.st-jump:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.st-jump:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.st-jump__title { font-size: var(--text-sm); font-weight: var(--weight-semibold); }
+.st-jump__desc { font-size: var(--text-xs); color: var(--text-secondary); line-height: var(--leading-normal); }
+.st-jump__when { font-size: var(--text-xs); color: var(--text-brand); font-weight: var(--weight-medium); }
+
+/* ------------------------------- the secret ------------------------------- */
+
+.st-secret {
+  padding: var(--space-6);
+  border: 1px solid var(--border-warning);
+  border-radius: var(--radius-lg);
+  background: var(--surface-warning);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* -------------------------------- swatches -------------------------------- */
+
+.st-swatch {
+  width: 34px;
+  height: 34px;
+  flex: none;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  padding: 0;
+  cursor: pointer;
+}
+
+.st-swatch:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+/* ------------------------------ event stream ------------------------------ */
+
+.st-stream { display: flex; flex-direction: column; }
+
+.st-event {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-2) var(--space-5);
+  width: 100%;
+  text-align: left;
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid transparent;
+  border-bottom: 1px solid var(--border-subtle);
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+.st-event:hover { background: var(--bg-hover); }
+.st-event:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
+.st-event.is-selected { background: var(--bg-selected); border-color: var(--border-brand); border-radius: var(--radius-sm); }
+.st-event__type { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--text-primary); font-weight: var(--weight-medium); }
+.st-event__when { font-size: var(--text-xs); color: var(--text-tertiary); white-space: nowrap; }
+.st-event__sub { grid-column: 1 / -1; font-size: var(--text-xs); color: var(--text-secondary); }
+
+/* --------------------------------- diffs ---------------------------------- */
+
+.st-diff { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--space-5); }
+@media (max-width: 800px) { .st-diff { grid-template-columns: minmax(0, 1fr); } }
+
+.st-diffrow {
+  display: grid;
+  grid-template-columns: minmax(120px, 30%) minmax(0, 1fr);
+  gap: var(--space-4);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--text-xs);
+}
+
+.st-diffrow:last-child { border-bottom: none; }
+.st-diffrow__key { color: var(--text-tertiary); font-family: var(--font-mono); word-break: break-all; }
+.st-diffrow__was { color: var(--text-secondary); text-decoration: line-through; }
+.st-diffrow__now { color: var(--text-primary); font-weight: var(--weight-medium); word-break: break-word; }
+
+/* ------------------------------ entitlements ------------------------------ */
+
+.st-ent {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5) 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.st-ent:last-child { border-bottom: none; }
+.st-ent__head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-5); flex-wrap: wrap; }
+.st-ent__name { font-size: var(--text-sm); font-weight: var(--weight-semibold); color: var(--text-primary); }
+.st-ent__why { font-size: var(--text-xs); color: var(--text-secondary); line-height: var(--leading-normal); }
+.st-ent__value { font-size: var(--text-sm); font-weight: var(--weight-semibold); font-variant-numeric: tabular-nums; }
+
+/* ------------------------- states inside a table -------------------------- */
+
+/**
+ * `td` in a DataTable is `white-space: nowrap` so a cell truncates rather than
+ * growing the row, and the empty and error states are rendered in a `td` that
+ * spans the grid. They inherited the nowrap: the audit log's first-run copy
+ * came out as one 1,227px line clipped at the card edge, with 72% of the
+ * sentence unreachable and its own `max-width: 46ch` defeated. Prose in a state
+ * cell wraps.
+ */
+.st-body .ain-table__state { white-space: normal; }

@@ -5,16 +5,19 @@
   grid-template-columns: 268px minmax(0, 1fr);
   gap: var(--space-6);
   align-items: stretch;
-  height: calc(100vh - 208px);
+  /* `--cp-shell-top` is measured by the page: the chrome above this is not a
+     fixed height — the subtitle grows a line the moment a write is waiting for
+     approval — and subtracting a guess pushed the composer off the bottom of a
+     short window. The fallback is the old guess, for the frame before the
+     measurement lands. */
+  height: calc(100vh - var(--cp-shell-top, 208px) - var(--space-8));
   min-height: 440px;
 }
-/* A short window used to push the composer off the bottom of the page: the
-   floor was taller than the space left under the header, so the page scrolled
-   instead of the transcript. Below that height the shell takes whatever room
-   there is and the stream — the only scroller in the column — absorbs it, which
-   keeps the box you type in on screen at any height. */
+/* Below this the shell takes whatever room there is and the stream — the only
+   scroller in the column — absorbs it, which keeps the box you type in on
+   screen at any height. */
 @media (max-height: 760px) {
-  .cp-shell { min-height: 0; height: calc(100vh - 168px); }
+  .cp-shell { min-height: 0; }
 }
 @media (max-width: 1080px) {
   .cp-shell { grid-template-columns: 1fr; height: auto; min-height: 0; }
@@ -422,6 +425,11 @@
 }
 .cp-details[open] > summary::before { content: '▾'; }
 .cp-details > summary:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
+
+.cp-echo { margin-top: var(--space-3); }
+.cp-echo__body { display: grid; gap: var(--space-4); padding: var(--space-3) 0 var(--space-1); }
+.cp-echo__body ul { margin: var(--space-2) 0 0; padding-left: var(--space-6); }
+.cp-echo__body li { font-size: var(--text-sm); color: var(--text-secondary); }
 
 /* --------------------------- approval aftermath --------------------------- */
 

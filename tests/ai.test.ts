@@ -52,6 +52,28 @@ const callContext = (over: Partial<AiCallContext> = {}): AiCallContext => ({
 
 const money = (amount: number) => formatMoney({ amount, currency: 'usd' }, { locale: 'en-US', trimZeroFraction: true });
 
+/**
+ * Every account that streamed into a meter over a window — the same enumeration
+ * `/v1/meters/:id/customers` publishes, read from the meter's own pre-aggregate
+ * rather than from the billing book, which has no row for some of them.
+ */
+/** Call a registered capability directly, as the ground truth for what it holds. */
+const runTool = async (name: string, args: Record<string, unknown> = {}): Promise<any> => {
+  const execution = await aiRuntime(app.ctx).execute(name, args, callContext());
+  assert.ok(execution.ok, `${name} failed: ${JSON.stringify(execution.error)}`);
+  return execution.result;
+};
+
+const meterCustomerIds = (meterId: string, start: number, end: number): string[] => {
+  const HOUR_MS = 3_600_000;
+  return app.ctx.db.all<{ customer_id: string }>(
+    `SELECT customer_id FROM meter_event_summaries
+     WHERE org_id = ? AND meter_id = ? AND hour_start >= ? AND hour_start < ?
+     GROUP BY customer_id`,
+    ORG, meterId, Math.floor(start / HOUR_MS) * HOUR_MS, Math.ceil(end / HOUR_MS) * HOUR_MS,
+  ).map((r) => r.customer_id);
+};
+
 before(async () => {
   app = await createApp({ db: 'memory', config: { env: 'test' } });
   // The runtime holds an org-level bucket; make sure every suite starts fresh.
@@ -1551,11 +1573,24 @@ describe('the question a revenue leader actually asks is answered with a ranking
     assert.deepEqual(positions, [...positions].sort((a, b) => a - b), 'the rows are in descending order');
   });
 
-  test('"top 5" shows five, and says how many it left out', async () => {
+  test('"top 5" shows five per book, and says how many it left out', async () => {
     const answer = await ask('Top 5 customers by revenue in 2025');
-    const rows = answer.content.split('\n').filter((line: string) => /^\d+\. /.test(line));
-    assert.equal(rows.length, 5, `asked for five, got ${rows.length}:\n${answer.content}`);
-    assert.match(answer.content, /other accounts? had revenue in 2025/);
+    // Northwind bills in three currencies and holds no exchange rates, so the
+    // ranking is one book per currency. "Top 5" is five inside each book: a
+    // sixth row would only be there because a euro number happened to be
+    // larger than a dollar one.
+    const sections = answer.content.split(/\n(?=[A-Z]{3} — )/).slice(1);
+    assert.ok(sections.length >= 2, `expected one section per currency, got:\n${answer.content}`);
+    for (const section of sections) {
+      const rows = section.split('\n').filter((line: string) => /^\d+\. /.test(line));
+      assert.ok(rows.length <= 5, `asked for five, got ${rows.length} in one book:\n${section}`);
+      assert.ok(rows.length >= 1, `a book with a total must name at least one account:\n${section}`);
+    }
+    assert.match(answer.content, /other accounts? had revenue in 2025 in [A-Z]{3}/);
+    // Every book is stated; none is quietly folded into another.
+    for (const currency of ['USD', 'EUR', 'GBP']) {
+      assert.ok(answer.content.includes(`${currency} — `), `the ${currency} book is missing:\n${answer.content}`);
+    }
   });
 });
 
@@ -1859,27 +1894,56 @@ describe('the ledger answers, instead of being found and thrown away', () => {
     assert.ok(answer.citations.length > 0, 'the rows the answer read are cited');
   });
 
-  test('MRR and ARR agree with /v1/subscriptions/overview to the cent', async () => {
+  test('MRR and ARR agree with /v1/subscriptions/overview, one book per currency', async () => {
     const book = await overview();
     assert.ok(book.mrr > 0, 'the demo workspace bills recurring revenue');
+    // `overview.mrr` is every currency's minor units added together — the
+    // overview says so itself in `mrr_note` and returns `mrr_display: null`.
+    // The copilot must never quote that scalar: it reconciles against
+    // `by_currency`, which is the figure that is in a currency.
+    assert.equal(book.mixed_currency, true, 'the demo workspace bills in more than one currency');
+    const byCurrency = new Map<string, { mrr: number; arr: number }>(
+      (book.by_currency as { currency: string; mrr: number; arr: number }[]).map((row) => [row.currency, row]),
+    );
 
-    const mrr = await runtime().execute('business_metric', { metric: 'mrr' }, callContext());
-    assert.equal((mrr.result as { value: number }).value, book.mrr,
-      'the copilot and the subscriptions overview compute MRR from the same ledger');
-    const arr = await runtime().execute('business_metric', { metric: 'arr' }, callContext());
-    assert.equal((arr.result as { value: number }).value, book.arr);
+    const mrr = (await runtime().execute('business_metric', { metric: 'mrr' }, callContext())).result as
+      { value: number; mixedCurrency: boolean; books: { currency: string; value: number; formatted: string }[] };
+    assert.equal(mrr.mixedCurrency, true, 'a book in three currencies is reported as three books');
+    assert.notEqual(mrr.value, book.mrr, 'the copilot never reports the cross-currency sum as a figure');
+    for (const row of mrr.books) {
+      assert.equal(row.value, byCurrency.get(row.currency)?.mrr,
+        `${row.currency.toUpperCase()} MRR disagrees with the subscriptions overview`);
+    }
+    assert.equal(mrr.books.length, byCurrency.size, 'every currency the ledger bills in has its own book');
 
+    const arr = (await runtime().execute('business_metric', { metric: 'arr' }, callContext())).result as
+      { books: { currency: string; value: number }[] };
+    for (const row of arr.books) assert.equal(row.value, byCurrency.get(row.currency)?.arr);
+
+    // The answer trims a zero fraction the way every sentence in this engine
+    // does, so the amount is re-formatted here rather than compared against the
+    // ledger's own two-decimal display string.
+    const spoken = (amount: number, currency: string) =>
+      formatMoney({ amount, currency }, { locale: 'en-US', trimZeroFraction: true });
     const answer = await ask('What is our MRR?');
     assert.equal(answer.analysis.metric.id, 'mrr');
-    assert.ok(answer.content.includes(money(book.mrr)),
-      `expected ${money(book.mrr)} in:\n${answer.content}`);
+    for (const row of book.by_currency as { currency: string; mrr: number }[]) {
+      assert.ok(answer.content.includes(spoken(row.mrr, row.currency)),
+        `expected ${spoken(row.mrr, row.currency)} in:\n${answer.content}`);
+    }
+    assert.ok(!answer.content.includes(money(book.mrr)),
+      `the cross-currency sum ${money(book.mrr)} must never be printed as a dollar figure:\n${answer.content}`);
     assert.ok(!/not installed here/.test(answer.content),
       'the subscription ledger is installed, so the answer may never say it is not');
     assert.ok(!/no monthly recurring revenue/i.test(answer.content));
 
     const annual = await ask('What is our ARR?');
     assert.equal(annual.analysis.metric.id, 'arr', 'ARR is its own metric, not MRR under another label');
-    assert.ok(annual.content.includes(money(book.arr)), `expected ${money(book.arr)} in:\n${annual.content}`);
+    for (const row of book.by_currency as { currency: string; arr: number }[]) {
+      assert.ok(annual.content.includes(spoken(row.arr, row.currency)),
+        `expected ${spoken(row.arr, row.currency)} in:\n${annual.content}`);
+    }
+    assert.ok(!annual.content.includes(money(book.arr)), 'the cross-currency ARR sum is never printed either');
   });
 
   test('"which invoices are overdue" lists the overdue ones, not the whole book', async () => {
@@ -2135,23 +2199,37 @@ describe('the read-only, allowlist and approval gates cover every tool, register
 describe('the receivables question is answered with the receivables number', () => {
   const overview = () => expectOk('GET', '/v1/subscriptions/overview');
 
-  /** Every open invoice in the ledger, straight from SQL, as the arbiter. */
-  const openInvoices = () => app.ctx.db.get<{ n: number; total: number }>(
-    `SELECT COUNT(*) AS n, COALESCE(SUM(total), 0) AS total FROM billing_invoices
-     WHERE org_id = ? AND status IN ('open', 'past_due', 'unpaid', 'uncollectible')`, ORG)!;
+  /**
+   * Every open invoice in the ledger, straight from SQL, as the arbiter — one
+   * row per currency, because euros and dollars in one `SUM` is a number in no
+   * currency and there is no exchange-rate table anywhere in this platform.
+   */
+  const openInvoices = () => app.ctx.db.all<{ currency: string; n: number; total: number }>(
+    `SELECT currency, COUNT(*) AS n, COALESCE(SUM(total), 0) AS total FROM billing_invoices
+     WHERE org_id = ? AND status IN ('open', 'past_due', 'unpaid', 'uncollectible')
+     GROUP BY currency ORDER BY currency`, ORG);
 
-  test('the outstanding metric equals the billing overview, to the cent', async () => {
-    const owed = (await overview()).invoices.outstanding;
+  test('the outstanding metric equals the ledger, one book per currency', async () => {
     const rows = openInvoices();
-    assert.ok(rows.n > 0 && owed > 0, 'the demo workspace carries an unpaid book to measure');
-    assert.equal(rows.total, owed, 'SQL and the billing overview agree before the engine is asked');
+    assert.ok(rows.length > 1, 'the demo workspace carries an unpaid book in more than one currency');
+    const sql = new Map(rows.map((r) => [r.currency, r]));
 
     const metric = businessMetric(app.ctx, ORG, {
       metric: 'outstanding', start: 0, end: app.ctx.now(), window_label: 'all time',
     });
     assert.ok(!('error' in metric));
-    assert.equal(metric.value, owed, `the copilot must not contradict its own billing screen`);
-    assert.equal(metric.count, rows.n);
+    assert.equal(metric.mixedCurrency, true, 'a book in three currencies is reported as three books');
+    assert.equal(metric.books.length, rows.length, 'every currency owed has its own book');
+    for (const book of metric.books) {
+      assert.equal(book.value, sql.get(book.currency)?.total,
+        `${book.currency.toUpperCase()} outstanding disagrees with the ledger`);
+      assert.equal(book.count, sql.get(book.currency)?.n);
+    }
+    assert.equal(metric.count, rows.reduce((a, r) => a + r.n, 0), 'the row count still covers every open invoice');
+    const crossCurrencySum = rows.reduce((a, r) => a + r.total, 0);
+    assert.notEqual(metric.value, crossCurrencySum,
+      'the copilot never reports minor units added across currencies as a figure');
+    assert.equal(metric.value, sql.get('usd')?.total, 'the scalar, where one is read at all, is the home book');
   });
 
   test('every open invoice is unpaid, so a payment-dated window would match none of them', () => {
@@ -2161,11 +2239,16 @@ describe('the receivables question is answered with the receivables number', () 
       'this is the shape of the bug: filtering the outstanding book on paid_at can only ever return zero');
   });
 
-  test('"what are we owed" answers the real number, in words', async () => {
-    const owed = (await overview()).invoices.outstanding;
+  test('"what are we owed" answers the real number, in words, in every currency', async () => {
+    const rows = openInvoices();
     const answer = await ask('What is our outstanding balance all time?');
-    assert.ok(answer.content.includes(money(owed)),
-      `expected ${money(owed)} in:\n${answer.content.slice(0, 300)}`);
+    for (const row of rows) {
+      const shown = formatMoney({ amount: row.total, currency: row.currency }, { locale: 'en-US', trimZeroFraction: true });
+      assert.ok(answer.content.includes(shown), `expected ${shown} in:\n${answer.content.slice(0, 400)}`);
+    }
+    const crossCurrencySum = rows.reduce((a, r) => a + r.total, 0);
+    assert.ok(!answer.content.includes(money(crossCurrencySum)),
+      `the cross-currency sum ${money(crossCurrencySum)} must never appear as a dollar figure:\n${answer.content}`);
     assert.ok(!/no outstanding balance/i.test(answer.content),
       `the answer must not report zero against a book that is not zero:\n${answer.content.slice(0, 300)}`);
   });
@@ -2173,9 +2256,12 @@ describe('the receivables question is answered with the receivables number', () 
   test('outstanding is a snapshot: the period in the question does not move it', async () => {
     const allTime = await ask('What is our outstanding balance all time?');
     const quarter = await ask('What is our outstanding balance this quarter?');
-    const owed = (await overview()).invoices.outstanding;
+    const rows = openInvoices();
     for (const answer of [allTime, quarter]) {
-      assert.ok(answer.content.includes(money(owed)), `both windows report the same book:\n${answer.content.slice(0, 200)}`);
+      for (const row of rows) {
+        const shown = formatMoney({ amount: row.total, currency: row.currency }, { locale: 'en-US', trimZeroFraction: true });
+        assert.ok(answer.content.includes(shown), `both windows report the same book:\n${answer.content.slice(0, 300)}`);
+      }
     }
     assert.equal(quarter.analysis.metric.id, 'outstanding');
     assert.match(quarter.content, /ignores the reporting period/,
@@ -2195,14 +2281,21 @@ describe('the receivables question is answered with the receivables number', () 
   test('cash collected is still dated by when it was paid, not by when it was raised', async () => {
     const start = Date.UTC(2026, 0, 1);
     const end = Date.UTC(2026, 3, 1);
-    const paid = app.ctx.db.get<{ n: number; total: number }>(
-      `SELECT COUNT(*) AS n, COALESCE(SUM(amount_paid), 0) AS total FROM billing_invoices
-       WHERE org_id = ? AND status = 'paid' AND paid_at >= ? AND paid_at < ?`, ORG, start, end)!;
-    assert.ok(paid.n > 0, 'the workspace collected money in Q1 2026');
+    const paid = app.ctx.db.all<{ currency: string; n: number; total: number }>(
+      `SELECT currency, COUNT(*) AS n, COALESCE(SUM(amount_paid), 0) AS total FROM billing_invoices
+       WHERE org_id = ? AND status = 'paid' AND paid_at >= ? AND paid_at < ?
+       GROUP BY currency ORDER BY currency`, ORG, start, end);
+    assert.ok(paid.length && paid.every((r) => r.n > 0), 'the workspace collected money in Q1 2026');
     const metric = businessMetric(app.ctx, ORG, { metric: 'revenue', start, end, window_label: 'Q1 2026' });
     assert.ok(!('error' in metric));
-    assert.equal(metric.value, paid.total, 'revenue is what landed in the window, on the payment date');
-    assert.equal(metric.count, paid.n);
+    const sql = new Map(paid.map((r) => [r.currency, r]));
+    for (const book of metric.books) {
+      assert.equal(book.value, sql.get(book.currency)?.total,
+        `${book.currency.toUpperCase()} revenue is what landed in the window, on the payment date`);
+      assert.equal(book.count, sql.get(book.currency)?.n);
+    }
+    assert.equal(metric.books.length, paid.length);
+    assert.equal(metric.count, paid.reduce((a, r) => a + r.n, 0));
   });
 });
 
@@ -2348,7 +2441,9 @@ describe('a question about usage is never answered with a sales number', () => {
        WHERE c.org_id = ? AND EXISTS (
          SELECT 1 FROM meter_events e WHERE e.org_id = c.org_id AND e.customer_id = c.id) LIMIT 1`, ORG)!;
     const answer = await ask(`How many telemetry events did ${customer.name} use last month?`);
-    const step = answer.trace.find((s: { name: string }) => s.name === 'metering.usage_for_period');
+    // Either usage capability answers this — what matters is that the meter and
+    // the account reached it, not which of the two the planner picked.
+    const step = answer.trace.find((s: { name: string }) => s.name === 'metering.usage_for_period' || s.name === 'metered_usage');
     assert.ok(step, `plan was ${answer.trace.map((s: { name: string }) => s.name).join(', ')}`);
     assert.equal(step.args.customer, customer.id);
     assert.ok(!/closed-won|bookings/i.test(answer.content),
@@ -2820,5 +2915,1198 @@ describe('one approval is one write, at the end the queue is filled from', () =>
       app.ctx.db.count(`SELECT COUNT(*) FROM ai_approvals WHERE org_id = ? AND run_id = ?`, ORG, context.runId!), 1,
       'one write asked for twice must not ask a person twice',
     );
+  });
+});
+
+/* ------ a metered workspace answers usage questions from its meters ------- */
+
+describe('a question about metered usage reaches the meter, or says why it did not', () => {
+  /** The account with the most events on a meter — a real fixture, not a name. */
+  const busiestOn = (meterId: string): { id: string; name: string } => {
+    const top = app.ctx.db.get<{ customer: string }>(
+      `SELECT customer_id AS customer FROM meter_events WHERE org_id = ? AND meter_id = ?
+       GROUP BY customer_id ORDER BY COUNT(*) DESC LIMIT 1`, ORG, meterId)!;
+    return app.ctx.db.get<{ id: string; name: string }>(
+      `SELECT id, name FROM billing_customers WHERE org_id = ? AND id = ?`, ORG, top.customer)!;
+  };
+
+  test('a meter named in the question is measured, and the number is the meter’s own', async () => {
+    const customer = busiestOn('mtr_nw_alerts');
+    const answer = await ask(`How many anomaly alerts did ${customer.name} raise last month?`);
+    const step = answer.analysis.plan.find((s: { tool: string }) => s.tool === 'metering.usage_for_period' || s.tool === 'metered_usage');
+    assert.ok(step, `no usage step; the plan was ${answer.analysis.plan.map((s: { tool: string }) => s.tool).join(', ') || 'empty'}`);
+    assert.equal(step.args.meter, 'mtr_nw_alerts', 'the meter the question named is the meter the tool received');
+    assert.equal(step.args.customer, customer.id);
+
+    const expected = app.ctx.svc.metering.usageForPeriod(ORG, 'mtr_nw_alerts', customer.id, step.args.start, step.args.end);
+    assert.ok(expected.value > 0, 'the fixture has alerts in the window the engine chose');
+    assert.ok(answer.content.includes(expected.value.toLocaleString('en-US')),
+      `the answer states the metered total ${expected.value}:\n${answer.content.slice(0, 400)}`);
+    assert.match(answer.content, /Anomaly alerts raised/);
+    assert.ok(!/closed-won|booked|bookings/i.test(answer.content),
+      `a usage question must never be answered with a sales number:\n${answer.content.slice(0, 400)}`);
+  });
+
+  test('the meter is matched on its event name as well as its display name', async () => {
+    const customer = busiestOn('mtr_nw_telemetry');
+    const answer = await ask(`How many telemetry_events did ${customer.name} send last month?`);
+    const step = answer.analysis.plan.find((s: { tool: string }) => s.tool === 'metering.usage_for_period' || s.tool === 'metered_usage');
+    assert.ok(step, `no usage step; the plan was ${answer.analysis.plan.map((s: { tool: string }) => s.tool).join(', ') || 'empty'}`);
+    assert.equal(step.args.meter, 'mtr_nw_telemetry');
+    const expected = app.ctx.svc.metering.usageForPeriod(ORG, 'mtr_nw_telemetry', customer.id, step.args.start, step.args.end);
+    assert.ok(answer.content.includes(expected.value.toLocaleString('en-US')),
+      `the answer states the metered total ${expected.value}:\n${answer.content.slice(0, 400)}`);
+  });
+
+  test('a word that fits two meters measures both and says so, guessing at neither', async () => {
+    const customer = busiestOn('mtr_nw_telemetry');
+    const answer = await ask(`How much telemetry did ${customer.name} send last month?`);
+    // Guessing which meter was meant is wrong half the time and the catalogue
+    // is not an answer, so both readings are measured and the ambiguity is
+    // stated before either number arrives.
+    const steps = answer.analysis.plan.filter((s: { tool: string }) => /usage/.test(s.tool));
+    assert.equal(steps.length, 2, `both meters are measured; the plan was ${answer.analysis.plan.map((s: { tool: string }) => s.tool).join(', ') || 'empty'}`);
+    assert.deepEqual(
+      [...new Set(steps.map((s: { args: Record<string, unknown> }) => String(s.args.meter)))].sort(),
+      ['mtr_nw_storage', 'mtr_nw_telemetry'],
+      'the two meters the word fits are the two that are measured',
+    );
+    for (const step of steps) assert.equal(step.args.customer, customer.id, 'both are scoped to the account named');
+    assert.match(answer.content, /matches Stored telemetry and Telemetry events equally well/);
+    assert.match(answer.content, /Telemetry events/);
+    assert.match(answer.content, /Stored telemetry/);
+    const expected = app.ctx.svc.metering.usageForPeriod(
+      ORG, 'mtr_nw_telemetry', customer.id, Number(steps[0].args.start), Number(steps[0].args.end));
+    assert.ok(answer.content.includes(expected.value.toLocaleString('en-US')),
+      `the meter's own total is in the answer:\n${answer.content.slice(0, 500)}`);
+    assert.ok(!/closed-won|booked|bookings/i.test(answer.content),
+      `an ambiguous meter is never a sales number:\n${answer.content.slice(0, 400)}`);
+  });
+});
+
+/* ---- a ledger question is refused out loud, never quietly substituted ---- */
+
+describe('a ledger question the engine cannot arm is refused, and the refusal leads', () => {
+  test('a usage question with no meter names the missing argument first', async () => {
+    const answer = await ask('How much usage did Sableworks Robotics have last month?');
+    assert.deepEqual(answer.analysis.plan, [], 'no CRM fallback is planned underneath the refusal');
+    const blocked = answer.analysis.blocked[0];
+    assert.equal(blocked.object_type, 'usage');
+    assert.equal(blocked.reason, 'missing_arguments');
+    assert.deepEqual(blocked.missing, ['meter']);
+
+    const first = answer.content.split('\n\n')[0];
+    assert.match(first, /^I have not answered that from metered usage/,
+      `the refusal is the first thing said, not a footnote:\n${answer.content.slice(0, 400)}`);
+    assert.match(first, /`meter`/, 'the first sentence names the argument that was missing');
+    // Every meter in the workspace, so the next question can succeed.
+    assert.match(answer.content, /Telemetry events/);
+    // Bookings may only appear in the sentence that refuses them.
+    const claims = answer.content.split('\n\n').filter((block: string) => !/^I have not/.test(block));
+    assert.ok(!claims.some((block: string) => /closed-won|booked|bookings|open pipeline/i.test(block)),
+      `nothing may stand in for the answer:\n${answer.content.slice(0, 400)}`);
+  });
+
+  test('a ledger read that only works per account says so, and searches no CRM', async () => {
+    const answer = await ask('What credits are left across the workspace?');
+    assert.deepEqual(answer.analysis.plan, []);
+    const blocked = answer.analysis.blocked[0];
+    assert.equal(blocked.object_type, 'credit');
+    assert.equal(blocked.reason, 'no_capability');
+    assert.equal(blocked.other_scope.tool, 'credits.balance');
+    assert.ok(!/No credit records match/.test(answer.content),
+      `the CRM has never held a credit row; searching it is not an answer:\n${answer.content.slice(0, 300)}`);
+    assert.match(answer.content, /one account at a time/);
+  });
+
+  test('the same question with an account named is answered from the ledger', async () => {
+    const answer = await ask('How much credit does Kestrel Aerospace Components have left?');
+    assert.deepEqual(answer.analysis.blocked, [], 'nothing is refused when the ledger can be armed');
+    const step = answer.analysis.plan.find((s: { tool: string }) => s.tool === 'credits.balance');
+    assert.ok(step, `the credit balance was read; the plan was ${answer.analysis.plan.map((s: { tool: string }) => s.tool).join(', ')}`);
+    const balance = app.ctx.svc.credits.balance(ORG, step.args.customer);
+    for (const pot of balance.totals_by_currency.filter((t: { monetary_available: number }) => t.monetary_available > 0)) {
+      assert.ok(answer.content.includes(formatMoney({ amount: pot.monetary_available, currency: pot.currency }, { locale: 'en-US' })),
+        `the answer states the ${pot.currency} balance:\n${answer.content.slice(0, 300)}`);
+    }
+  });
+});
+
+/* ------- a result that came back is read out, or named as discarded ------- */
+
+describe('a tool result is rendered, empty, or named with the reason it was dropped', () => {
+  const runTool = async (name: string, args: Record<string, unknown> = {}) => {
+    const tool = aiRuntime(app.ctx).tool(name)!;
+    assert.ok(tool, `${name} is registered`);
+    return await tool.run(tool.input.parse(args), app.ctx, { orgId: ORG }) as any;
+  };
+
+  test('the revenue summary reaches the reader, one book per currency', async () => {
+    const report = await runTool('revenue_summary');
+    const answer = await ask('How is the business doing this quarter?');
+    assert.ok(answer.trace.some((s: { name: string }) => s.name === 'revenue_summary'), 'the revenue report ran');
+    for (const row of report.by_currency) {
+      assert.ok(answer.content.includes(row.mrr_display),
+        `${row.currency.toUpperCase()} MRR ${row.mrr_display} never reached the answer:\n${answer.content.slice(-600)}`);
+    }
+    assert.equal(answer.analysis.results.find((r: { tool: string }) => r.tool === 'revenue_summary').outcome, 'rendered');
+  });
+
+  test('collections answers with the ageing and the DSO, not with a warning about currencies', async () => {
+    const report = await runTool('revenue_collections');
+    const answer = await ask('What is our DSO and how old are our receivables?');
+    assert.ok(answer.trace.some((s: { name: string }) => s.name === 'revenue_collections'));
+    for (const row of report.by_currency) {
+      assert.ok(answer.content.includes(row.outstanding_display),
+        `${row.currency.toUpperCase()} outstanding ${row.outstanding_display} is missing:\n${answer.content.slice(0, 600)}`);
+      assert.ok(answer.content.includes(row.dso_days), `${row.currency.toUpperCase()} DSO ${row.dso_days} is missing`);
+    }
+    const buckets = report.ageing.filter((b: { invoices: number }) => b.invoices > 0);
+    assert.ok(buckets.length, 'the fixture has receivables to age');
+    for (const bucket of buckets) assert.ok(answer.content.includes(bucket.bucket), `ageing bucket "${bucket.bucket}" is missing`);
+  });
+
+  test('every result a plan produces is accounted for, and every discard is said out loud', async () => {
+    const QUESTIONS = [
+      'How is the business doing this quarter?',
+      'What is our DSO and how old are our receivables?',
+      'How many telemetry events did Kestrel Aerospace Components use last month?',
+      'What entitlements does Ironwood Packaging Group have?',
+      'Where does Rheinwerk Antriebstechnik stand?',
+      'What is the credit burn order?',
+      'Which customers are past due?',
+      'Why did bookings drop last quarter?',
+    ];
+    for (const question of QUESTIONS) {
+      const answer = await ask(question);
+      const succeeded = answer.analysis.steps.filter((s: { ok: boolean }) => s.ok).map((s: { tool: string }) => s.tool);
+      const accounted = answer.analysis.results.map((r: { tool: string }) => r.tool);
+      assert.deepEqual(accounted, succeeded, `"${question}" left a successful step out of the account`);
+      for (const result of answer.analysis.results) {
+        assert.ok(['rendered', 'empty', 'discarded'].includes(result.outcome), `"${question}" invented an outcome`);
+        if (result.outcome !== 'discarded') continue;
+        assert.ok(result.why, `"${question}" discarded ${result.tool} without a reason`);
+        assert.ok(answer.content.includes(result.tool),
+          `"${question}" dropped ${result.tool} from the answer without telling anyone:\n${answer.content.slice(-400)}`);
+      }
+    }
+  });
+});
+
+/* -------- a grouping that cannot be applied is announced, not dropped ----- */
+
+describe('a metric says what it cannot break down', () => {
+  test('win rate by owner is recomputed inside each owner, and says the rows do not sum', async () => {
+    const answer = await ask('What is our win rate by owner this year?');
+    const step = answer.analysis.plan.find((s: { tool: string }) => s.tool === 'business_metric');
+    assert.equal(step.args.group_by, 'owner');
+
+    const stages = stageSets(app.ctx, ORG);
+    const decided = await expectOk('POST', '/v1/records/deal/search', {
+      filter: { property: 'deal_stage', operator: 'in', values: [...stages.won, ...stages.lost] },
+      limit: 200,
+    });
+    assert.equal(decided.has_more, false, 'every decided deal fits in one page');
+    const window = answer.analysis.window;
+    const tally = new Map<string, { won: number; decided: number }>();
+    for (const deal of decided.data as { owner_id: string | null; properties: Record<string, unknown> }[]) {
+      const close = Number(deal.properties.close_date ?? 0);
+      if (!close || close < window.start || close >= window.end) continue;
+      const key = deal.owner_id ?? 'unassigned';
+      const row = tally.get(key) ?? { won: 0, decided: 0 };
+      row.decided += 1;
+      if (stages.won.includes(String(deal.properties.deal_stage ?? ''))) row.won += 1;
+      tally.set(key, row);
+    }
+    const people = workspaceProfile(app.ctx, ORG).people;
+    const rows = [...tally.entries()]
+      .map(([id, row]) => ({
+        name: people.find((p) => p.id === id)?.name ?? 'Unassigned',
+        rate: Number(((row.won / row.decided) * 100).toFixed(1)),
+      }))
+      .sort((a, b) => b.rate - a.rate);
+    assert.ok(rows.length >= 2, 'the fixture has decided deals under more than one owner');
+    for (const row of rows.slice(0, 3)) {
+      assert.ok(answer.content.includes(`${row.name} ${row.rate}%`),
+        `"${row.name} ${row.rate}%" is missing from the breakdown:\n${answer.content.slice(0, 600)}`);
+    }
+    assert.match(answer.content, /rows do not sum/, 'a ratio that is grouped says the rows are not summable');
+  });
+
+  test('a grouping a ratio cannot take is refused in the answer, not dropped in silence', async () => {
+    const answer = await ask('What is our win rate by industry this year?');
+    assert.match(answer.content, /cannot be broken down by industry/);
+    assert.match(answer.content, /property of the company/);
+    assert.match(answer.content, /\d+(\.\d+)?% of the deals it decided/, 'the workspace figure is still given');
+  });
+
+  test('any metric that ignores a grouping says so, whichever metric it is', async () => {
+    const answer = await ask('What is our average deal size by owner this year?');
+    assert.equal(answer.analysis.group_by, 'owner');
+    assert.match(answer.content, /does not break down by owner/);
+  });
+});
+
+/* ================================================================================
+   The question that was asked is the question that gets answered.
+
+   Every test below reproduces a defect an external critic found by using the
+   copilot as a person does, and every one of them fails on the code as it stood
+   before the fix beside it.
+   ============================================================================= */
+
+describe('money keeps its currency, and three books are never added together', () => {
+  const subscriptionBooks = () => app.ctx.db.all<{ currency: string; n: number }>(
+    `SELECT currency, COUNT(*) AS n FROM billing_subscriptions WHERE org_id = ? GROUP BY currency ORDER BY currency`, ORG);
+
+  const spoken = (amount: number, currency: string) =>
+    formatMoney({ amount, currency }, { locale: 'en-US', trimZeroFraction: true });
+
+  test('a money metric returns one book per currency and refuses to sum them', () => {
+    assert.ok(subscriptionBooks().length > 1, 'the demo workspace bills in more than one currency');
+    for (const id of ['mrr', 'arr', 'invoiced', 'revenue', 'outstanding'] as const) {
+      const metric = businessMetric(app.ctx, ORG, { metric: id, start: 0, end: app.ctx.now(), window_label: 'all time' });
+      assert.ok(!('error' in metric), `${id} errored`);
+      assert.ok(metric.books.length > 0, `${id} came back with no books at all`);
+      const sum = metric.books.reduce((a, b) => a + b.value, 0);
+      if (metric.books.length > 1) {
+        assert.equal(metric.mixedCurrency, true, `${id} holds ${metric.books.length} books and did not say so`);
+        assert.notEqual(metric.value, sum, `${id} reported the cross-currency sum as its figure`);
+        assert.equal(metric.currency, null, `${id} stamped one currency on a figure that is in several`);
+        // Every book, and nothing but the books, in the sentence the answer uses.
+        for (const book of metric.books) {
+          assert.ok(metric.formatted.includes(book.formatted),
+            `${id} did not state its ${book.currency.toUpperCase()} book: ${metric.formatted}`);
+        }
+        assert.ok(!metric.formatted.includes(spoken(sum, 'usd')), `${id} printed the sum with a dollar sign`);
+      }
+    }
+  });
+
+  test('MRR in the answer equals the ledger, per currency, and never the sum', async () => {
+    const answer = await ask('What is our MRR?');
+    const live = app.ctx.svc.billing.subscriptions(ORG, { status: 'all', limit: 500 });
+    const books = new Map<string, number>();
+    for (const sub of live) {
+      const monthly = app.ctx.svc.billing.mrr(ORG, sub);
+      if (monthly <= 0) continue;
+      books.set(sub.currency, (books.get(sub.currency) ?? 0) + monthly);
+    }
+    assert.ok(books.size > 1, 'the fixture has more than one book');
+    for (const [currency, amount] of books) {
+      assert.ok(answer.content.includes(spoken(amount, currency)),
+        `the ${currency.toUpperCase()} book ${spoken(amount, currency)} is missing:\n${answer.content}`);
+    }
+    const sum = [...books.values()].reduce((a, b) => a + b, 0);
+    assert.ok(!answer.content.includes(spoken(sum, 'usd')),
+      `${spoken(sum, 'usd')} is EUR + GBP + USD wearing a dollar sign:\n${answer.content}`);
+    assert.match(answer.content, /no exchange rates/, 'and the answer says why there is no single figure');
+  });
+
+  test('a euro account is never ranked or printed in dollars', async () => {
+    const answer = await ask('Who is our biggest customer by revenue?');
+    const paid = app.ctx.db.all<{ name: string; currency: string; total: number }>(
+      `SELECT c.name AS name, i.currency AS currency, SUM(i.amount_paid) AS total
+       FROM billing_invoices i JOIN billing_customers c ON c.id = i.customer_id AND c.org_id = i.org_id
+       WHERE i.org_id = ? AND i.status = 'paid' GROUP BY c.id, i.currency ORDER BY total DESC`, ORG);
+    const byCurrency = new Map<string, { name: string; total: number }>();
+    for (const row of paid) if (!byCurrency.has(row.currency)) byCurrency.set(row.currency, row);
+    assert.ok(byCurrency.size > 1, 'the fixture has paying accounts in more than one currency');
+    for (const [currency, leader] of byCurrency) {
+      assert.ok(answer.content.includes(`${leader.name} — ${spoken(leader.total, currency)}`),
+        `${currency.toUpperCase()}'s biggest account is ${leader.name} at ${spoken(leader.total, currency)}:\n${answer.content}`);
+      // The same amount with the workspace's symbol on it is the defect.
+      if (currency !== 'usd') {
+        assert.ok(!answer.content.includes(`${leader.name} — ${spoken(leader.total, 'usd')}`),
+          `${leader.name} bills in ${currency.toUpperCase()} and was printed in dollars`);
+      }
+    }
+    assert.match(answer.content, /no exchange rates/, 'one ranking across three currencies is refused out loud');
+  });
+
+  test('a question that names one currency gets one figure, in that currency', async () => {
+    const usd = app.ctx.svc.billing.subscriptions(ORG, { status: 'all', limit: 500 })
+      .filter((s) => s.currency === 'usd')
+      .reduce((sum, s) => sum + app.ctx.svc.billing.mrr(ORG, s), 0);
+    assert.ok(usd > 0, 'the fixture has a USD book');
+    const answer = await ask('What is our MRR in USD only?');
+    assert.ok(answer.content.includes(spoken(usd, 'usd')), `expected ${spoken(usd, 'usd')} in:\n${answer.content}`);
+    assert.ok(!/€|£/.test(answer.content), `a question scoped to USD came back with other books:\n${answer.content}`);
+  });
+});
+
+describe('a snapshot is never compared against itself and called unchanged', () => {
+  for (const question of [
+    'How did MRR change compared to last quarter?',
+    'Compare MRR in Q1 2026 to MRR in Q3 2026',
+  ]) {
+    test(`"${question}" answers from the movement report, not from the snapshot`, async () => {
+      const answer = await ask(question);
+      assert.ok(!/held the same/i.test(answer.content),
+        `a snapshot compared with itself is not "no change":\n${answer.content}`);
+      assert.ok(!/\bin both periods\b/i.test(answer.content),
+        `nothing was measured "in both periods":\n${answer.content}`);
+      assert.match(answer.content, /Recurring revenue moved/,
+        `the movement report holds this history and must answer it:\n${answer.content}`);
+      assert.ok(!/no .*history is kept/i.test(answer.content),
+        `the workspace does keep this history — saying otherwise is a false claim about the database:\n${answer.content}`);
+    });
+  }
+
+  test('a windowed metric still compares two periods normally', async () => {
+    const answer = await ask('Compare closed-won bookings in Q1 2026 and Q2 2026');
+    assert.ok(!/point-in-time/.test(answer.content), 'bookings are a period figure, not a snapshot');
+    assert.match(answer.content, /Q1 2026/);
+    assert.match(answer.content, /Q2 2026/);
+  });
+
+  test('a growth question about a snapshot is answered from the movement it does hold', async () => {
+    const answer = await ask('Did MRR grow this year?');
+    assert.match(answer.content, /Recurring revenue moved/);
+    assert.ok(!/keeps no history/i.test(answer.content),
+      `the movement report is in the catalogue, so "keeps no history" is false:\n${answer.content}`);
+  });
+});
+
+describe('a question is not a command', () => {
+  const septemberDeals = () => {
+    const start = Date.UTC(2026, 8, 1);
+    const end = Date.UTC(2026, 9, 1);
+    return app.ctx.db.all<{ properties: string }>(
+      `SELECT properties FROM crm_records
+       WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL`, ORG)
+      .map((row) => JSON.parse(row.properties) as { deal_stage?: string; close_date?: number; amount?: number })
+      .filter((p) => Number(p.close_date ?? 0) >= start && Number(p.close_date ?? 0) < end);
+  };
+
+  for (const question of ['Which deals close this month?', 'Which deals are closing this month?']) {
+    test(`"${question}" is answered with the deals, not with "I changed nothing"`, async () => {
+      const answer = await ask(question);
+      assert.notEqual(answer.analysis.intent.intent, 'act', `"${question}" was classified as a write`);
+      assert.ok(!/I changed nothing/.test(answer.content), `refused as a write:\n${answer.content}`);
+      const expected = septemberDeals();
+      assert.ok(expected.length >= 3, 'the fixture has deals closing in September 2026');
+      assert.ok(answer.content.includes(`${expected.length} deals close in Sep 2026`),
+        `the count sentence must carry the filter that produced it:\n${answer.content.slice(0, 300)}`);
+    });
+  }
+
+  test('an actual instruction is still a write', () => {
+    for (const instruction of ['Create a task to call the plant manager', 'Move the Rheinwerk OEE deal to Negotiation']) {
+      assert.equal(classifyIntent(instruction).intent, 'act', `"${instruction}" stopped being a write`);
+    }
+  });
+
+  test('a polite command inside a question is still a write', () => {
+    assert.equal(classifyIntent('Can you move the Rheinwerk OEE deal to Negotiation?').intent, 'act');
+  });
+});
+
+describe('a period the question named is the period that gets measured', () => {
+  test('"what did we invoice in August 2026" measures August, not the whole book', async () => {
+    const start = Date.UTC(2026, 7, 1);
+    const end = Date.UTC(2026, 8, 1);
+    const books = app.ctx.db.all<{ currency: string; total: number; n: number }>(
+      `SELECT currency, SUM(total) AS total, COUNT(*) AS n FROM billing_invoices
+       WHERE org_id = ? AND status NOT IN ('draft', 'void', 'deleted') AND finalized_at >= ? AND finalized_at < ?
+       GROUP BY currency ORDER BY currency`, ORG, start, end);
+    assert.ok(books.length > 0, 'the fixture invoiced something in August 2026');
+    const answer = await ask('What did we invoice in August 2026?');
+    for (const book of books) {
+      const shown = formatMoney({ amount: book.total, currency: book.currency }, { locale: 'en-US', trimZeroFraction: true });
+      assert.ok(answer.content.includes(shown), `expected ${book.currency.toUpperCase()} ${shown} in:\n${answer.content}`);
+    }
+    const whole = app.ctx.db.count(`SELECT COUNT(*) FROM billing_invoices WHERE org_id = ?`, ORG);
+    assert.ok(!answer.content.includes(`${whole} invoices`),
+      `the named month was dropped and the whole ${whole}-invoice book was answered over:\n${answer.content}`);
+    // Nothing in the plan may read the ledger without the period it was told about.
+    for (const step of answer.analysis.plan as { tool: string; args: Record<string, unknown> }[]) {
+      if (step.tool !== 'billing_list_invoices') continue;
+      assert.fail(`billing_list_invoices takes no period and was planned anyway: ${JSON.stringify(step.args)}`);
+    }
+  });
+
+  test('an invoice list says how many of the rows it totalled are actually open', async () => {
+    const answer = await ask('Which invoices are overdue?');
+    const open = app.ctx.db.all<{ number: string; total: number; currency: string }>(
+      `SELECT number, total, currency FROM billing_invoices
+       WHERE org_id = ? AND status IN ('open', 'past_due') AND due_date IS NOT NULL AND due_date < ?`, ORG, app.ctx.now());
+    assert.ok(open.length > 0, 'the fixture carries an overdue invoice');
+    for (const row of open) assert.ok(answer.content.includes(row.number), `${row.number} is missing`);
+    assert.ok(!/\d+ of them carry/.test(answer.content),
+      `the subtotal must cover the open rows, and say so:\n${answer.content}`);
+  });
+});
+
+describe('a value question is answered with a value', () => {
+  const openPipeline = () => {
+    const stages = stageSets(app.ctx, ORG);
+    return app.ctx.db.all<{ properties: string }>(
+      `SELECT properties FROM crm_records WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL`, ORG)
+      .map((r) => JSON.parse(r.properties) as { deal_stage?: string; amount?: number })
+      .filter((p) => stages.open.includes(String(p.deal_stage)))
+      .reduce((sum, p) => sum + Number(p.amount ?? 0), 0);
+  };
+
+  test('"what are our open deals worth" states the total', async () => {
+    const total = openPipeline();
+    assert.ok(total > 0);
+    const answer = await ask('What are our open deals worth?');
+    assert.ok(answer.content.includes(money(total)),
+      `the total ${money(total)} is the answer, and it was missing:\n${answer.content.slice(0, 400)}`);
+  });
+
+  test('a pronoun bound inside the sentence is not an unresolved reference', async () => {
+    const answer = await ask('How many open deals do we have and what are they worth?');
+    assert.equal(answer.analysis.refusal, null, `refused as a dangling pronoun:\n${answer.content}`);
+    assert.ok(!/I do not know what "they" refers to/.test(answer.content));
+    const stages = stageSets(app.ctx, ORG);
+    const open = app.ctx.db.all<{ properties: string }>(
+      `SELECT properties FROM crm_records WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL`, ORG)
+      .map((r) => JSON.parse(r.properties) as { deal_stage?: string })
+      .filter((p) => stages.open.includes(String(p.deal_stage))).length;
+    assert.ok(answer.content.includes(`${open} open deals`), `the count is missing:\n${answer.content}`);
+    assert.ok(answer.content.includes(money(openPipeline())), `the value is missing:\n${answer.content}`);
+  });
+
+  test('a pronoun with nothing behind it is still refused', async () => {
+    const answer = await ask('How much have they spent?');
+    assert.equal(answer.analysis.refusal.code, 'unresolved_reference');
+  });
+});
+
+describe('a colloquial name for a metric reaches the metric', () => {
+  test('"how much did <account> pay us" is customer spend', async () => {
+    const account = app.ctx.db.get<{ name: string }>(
+      `SELECT display_name AS name FROM crm_records WHERE org_id = ? AND object_type = 'company' AND display_name = 'Meridian Forge Systems'`, ORG)!;
+    const answer = await ask(`How much did ${account.name} pay us last year?`);
+    assert.equal(answer.analysis.refusal, null, `refused a phrase the refusal itself offers:\n${answer.content}`);
+    assert.equal(answer.analysis.metric.id, 'spend');
+    assert.equal(answer.analysis.subject.label, account.name);
+  });
+});
+
+describe('a follow-up in a thread answers the follow-up', () => {
+  const thread = async (opening: string, ...rest: string[]) => {
+    const start = await expectOk('POST', '/v1/ai/threads', { message: opening });
+    const answers = [start.messages[start.messages.length - 1].content as string];
+    for (const text of rest) {
+      // Both routes take the same field, either spelling.
+      const reply = await expectOk('POST', `/v1/ai/threads/${start.id}/messages`, { message: text });
+      answers.push(reply.message.content as string);
+    }
+    return answers;
+  };
+
+  test('a field question is answered with the field, not with the account card again', async () => {
+    const account = 'Meridian Forge Systems';
+    const [profile, deals, cfo] = await thread(
+      `Tell me about ${account}`, 'What deals are open there?', 'Who is the CFO?');
+    assert.notEqual(deals, profile, 'the second turn replayed the first turn byte for byte');
+    assert.notEqual(cfo, profile, 'the third turn replayed the first turn byte for byte');
+
+    const company = app.ctx.db.get<{ id: string }>(
+      `SELECT id FROM crm_records WHERE org_id = ? AND object_type = 'company' AND display_name = ?`, ORG, account)!;
+    const finance = app.ctx.db.all<{ name: string; properties: string }>(
+      `SELECT DISTINCT r.display_name AS name, r.properties FROM crm_records r
+       JOIN crm_associations a ON a.org_id = r.org_id AND (a.from_id = r.id OR a.to_id = r.id)
+       WHERE r.org_id = ? AND (a.to_id = ? OR a.from_id = ?) AND r.object_type = 'contact'`, ORG, company.id, company.id)
+      .map((row) => ({ name: row.name, title: String((JSON.parse(row.properties) as { job_title?: string }).job_title ?? '') }))
+      .filter((row) => /chief financial officer/i.test(row.title));
+    assert.equal(finance.length, 1, 'the fixture has exactly one CFO on this account');
+    assert.ok(cfo.startsWith(finance[0].name),
+      `the answer must lead with the CFO's name, not bury it in a committee list:\n${cfo.slice(0, 200)}`);
+  });
+
+  test('"who owns this account" leads with the owner', async () => {
+    // Read the account out of the workspace rather than naming one: earlier
+    // suites in this file write to records, and a fixture pinned by name is a
+    // test that fails for a reason that has nothing to do with the answer.
+    const row = app.ctx.db.get<{ name: string; owner: string }>(
+      `SELECT r.display_name AS name, u.name AS owner FROM crm_records r JOIN users u ON u.id = r.owner_id
+       WHERE r.org_id = ? AND r.object_type = 'company' AND r.archived = 0 AND r.merged_into IS NULL
+       ORDER BY r.display_name LIMIT 1`, ORG)!;
+    assert.ok(row?.owner, 'the fixture has an owned account');
+    const [, owner] = await thread(`Tell me about ${row.name}`, 'Who owns the account?');
+    assert.ok(owner.startsWith(`${row.name} is owned by ${row.owner}`),
+      `the answer leads with the owner:\n${owner.slice(0, 200)}`);
+  });
+
+  test('both thread routes accept both field names', async () => {
+    const start = await expectOk('POST', '/v1/ai/threads', { content: 'What is our open pipeline?' });
+    assert.equal(start.messages.length, 2, '`content` starts the conversation the same way `message` does');
+    const viaContent = await call('POST', `/v1/ai/threads/${start.id}/messages`, { content: 'And how many open deals?' });
+    assert.equal(viaContent.status, 201);
+    const viaMessage = await call('POST', `/v1/ai/threads/${start.id}/messages`, { message: 'And how many open tickets?' });
+    assert.equal(viaMessage.status, 201, 'the reply route takes `message` as well');
+    const neither = await call('POST', `/v1/ai/threads/${start.id}/messages`, {});
+    assert.equal(neither.status, 400);
+    assert.match(String(neither.body.error.message), /`content`.*`message`/);
+  });
+});
+
+describe('no answer prints an internal tool name or a raw payload at the reader', () => {
+  const QUESTIONS = [
+    'How did MRR change compared to last quarter?',
+    'Which deals close this month?',
+    'List deals with a close date in September 2026',
+    'What did we invoice in August 2026?',
+    'What is our open pipeline?',
+    'Which accounts have gone quiet?',
+  ];
+  for (const question of QUESTIONS) {
+    test(`"${question}" leaks no tool name`, async () => {
+      const answer = await ask(question);
+      assert.ok(!/also returned:/.test(answer.content), `an unrendered payload was dumped:\n${answer.content}`);
+      for (const step of answer.analysis.steps as { tool: string }[]) {
+        assert.ok(!answer.content.includes(`\`${step.tool}\``),
+          `\`${step.tool}\` is an internal name and it reached the reader:\n${answer.content}`);
+      }
+      // Every result is still accounted for on the run record, with a reason.
+      for (const result of answer.analysis.results as { tool: string; outcome: string; why: string | null }[]) {
+        assert.ok(['rendered', 'empty', 'discarded'].includes(result.outcome));
+        if (result.outcome === 'discarded') assert.ok(result.why, `${result.tool} was discarded with no reason recorded`);
+      }
+    });
+  }
+});
+
+describe('a count sentence carries the filter that produced it', () => {
+  test('a filtered deal list does not claim to be the whole workspace', async () => {
+    const answer = await ask('List deals with a close date in September 2026');
+    const all = app.ctx.db.count(
+      `SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL`, ORG);
+    assert.ok(!answer.content.includes(`${all} deal records in the workspace`),
+      `the September subset was described as the whole book of ${all} deals:\n${answer.content.slice(0, 200)}`);
+    assert.match(answer.content, /deals? close in Sep(?:tember)? 2026/);
+  });
+
+  test('a record count is a sentence, not a measure id and an object type', async () => {
+    const contacts = app.ctx.db.count(
+      `SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'contact' AND archived = 0 AND merged_into IS NULL`, ORG);
+    const answer = await ask('How many contacts do we have?');
+    assert.ok(!/count of records/.test(answer.content), `machine-generated non-English:\n${answer.content}`);
+    assert.ok(answer.content.startsWith(`Northwind Robotics has ${contacts} contacts`),
+      `expected a real sentence with ${contacts} in it:\n${answer.content}`);
+  });
+});
+
+describe('accounts that have gone quiet are found by how quiet they are', () => {
+  test('"which accounts have gone quiet" is ordered by last touch, not by recency of creation', async () => {
+    const answer = await ask('Which accounts have gone quiet?');
+    const cutoff = app.ctx.now() - 45 * 86_400_000;
+    const quiet = app.ctx.db.all<{ name: string; last: number | null }>(
+      `SELECT r.display_name AS name, (
+         SELECT v.value_date FROM crm_record_values v
+         WHERE v.org_id = r.org_id AND v.record_id = r.id AND v.property = 'last_activity_at') AS last
+       FROM crm_records r
+       WHERE r.org_id = ? AND r.object_type = 'company' AND r.archived = 0 AND r.merged_into IS NULL`, ORG)
+      .filter((row) => !row.last || row.last <= cutoff)
+      .sort((a, b) => (a.last ?? 0) - (b.last ?? 0));
+    assert.ok(quiet.length >= 3, 'the fixture has accounts nobody has touched in 45 days');
+    assert.ok(answer.content.includes(`${quiet.length} accounts`),
+      `expected ${quiet.length} quiet accounts:\n${answer.content.slice(0, 300)}`);
+    assert.ok(answer.content.includes(quiet[0].name),
+      `the quietest account ${quiet[0].name} must be named:\n${answer.content.slice(0, 300)}`);
+    assert.match(answer.content, /days since the last activity/);
+    // The defect was the exact opposite ordering: newest records first.
+    const newest = app.ctx.db.get<{ name: string }>(
+      `SELECT display_name AS name FROM crm_records WHERE org_id = ? AND object_type = 'company' AND archived = 0
+       ORDER BY created DESC LIMIT 1`, ORG)!;
+    if (!quiet.some((row) => row.name === newest.name)) {
+      assert.ok(!answer.content.includes(newest.name),
+        `${newest.name} is the most recently created account and is not quiet, so it does not belong in this answer`);
+    }
+  });
+
+  test('a threshold written into the question is the threshold used', async () => {
+    const answer = await ask('Which accounts have we not touched in 120 days?');
+    assert.match(answer.content, /more than 120 days/);
+  });
+});
+
+describe('a metered workspace answers a volume question with a volume', () => {
+  test('"how many telemetry events did we meter last month" states the metered total', async () => {
+    const answer = await ask('How many telemetry events did we meter last month?');
+    const step = (answer.analysis.plan as { tool: string; args: Record<string, unknown> }[])
+      .find((s) => s.tool === 'metered_usage');
+    assert.ok(step, `the plan was ${(answer.analysis.plan as { tool: string }[]).map((s) => s.tool).join(', ') || 'empty'}`);
+    assert.equal(step.args.meter, 'mtr_nw_telemetry');
+
+    // Ground truth is every account that streamed into the meter, which is what
+    // the metering module's own /v1/meters/:id/customers enumerates — not the
+    // billing book, which holds no row for two of the three biggest consumers.
+    const expected = meterCustomerIds('mtr_nw_telemetry', Number(step.args.start), Number(step.args.end))
+      .map((id) => app.ctx.svc.metering.usageForPeriod(ORG, 'mtr_nw_telemetry', id, Number(step.args.start), Number(step.args.end)))
+      .filter((usage) => usage.event_count > 0)
+      .reduce((sum, usage) => sum + usage.value, 0);
+    assert.ok(expected > 0, 'the fixture metered telemetry last month');
+    assert.ok(answer.content.includes(expected.toLocaleString('en-US')),
+      `expected the metered total ${expected.toLocaleString('en-US')} in:\n${answer.content}`);
+    // The catalogue is not an answer to a question that named a meter.
+    assert.ok(!/Stored telemetry —/.test(answer.content),
+      `the meter catalogue was returned instead of a number:\n${answer.content}`);
+  });
+
+  test('a meter question with no meter named still gets the catalogue', async () => {
+    const answer = await ask('What do we meter?');
+    assert.match(answer.content, /meters in Northwind Robotics/);
+  });
+});
+
+describe('churn and retention are measures this workspace can name', () => {
+  test('"what is our churn rate" answers with the revenue ledger\'s own logo churn', async () => {
+    const answer = await ask('What is our churn rate?');
+    assert.equal(answer.analysis.refusal, null, `refused as ambiguous:\n${answer.content}`);
+    assert.equal(answer.analysis.metric.id, 'churn');
+    const report = app.ctx.svc.revenue.churn(ORG, {
+      from: answer.analysis.window.start, to: answer.analysis.window.end,
+    });
+    const rate = Number((report.totals.logo_churn.bps / 100).toFixed(1));
+    assert.ok(answer.content.includes(`${rate}%`), `expected ${rate}% in:\n${answer.content.slice(0, 300)}`);
+  });
+
+  test('net revenue retention is reported per currency, never averaged into one', async () => {
+    const answer = await ask('What is our net revenue retention this year?');
+    const report = app.ctx.svc.revenue.churn(ORG, {
+      from: answer.analysis.window.start, to: answer.analysis.window.end,
+    });
+    const perCurrency = report.by_currency
+      .map((row: { currency: string; totals: { net_revenue_retention: { percent: string; undefined_rate: boolean } } }) => row)
+      .filter((row) => !row.totals.net_revenue_retention.undefined_rate);
+    assert.ok(perCurrency.length > 1, 'the fixture retains revenue in more than one currency');
+    for (const row of perCurrency) {
+      assert.ok(answer.content.includes(row.totals.net_revenue_retention.percent),
+        `${row.currency.toUpperCase()} NRR ${row.totals.net_revenue_retention.percent} is missing:\n${answer.content}`);
+    }
+    assert.ok(!/\b0% net revenue retention\b/.test(answer.content),
+      `an undefined workspace-wide rate must never be printed as 0%:\n${answer.content}`);
+  });
+});
+
+describe('a citation names the row it cites', () => {
+  test('subscription evidence is cited by account, not by primary key', async () => {
+    const answer = await ask('What is our MRR?');
+    assert.ok(answer.citations.length > 0, 'the rows behind the number are cited');
+    for (const citation of answer.citations as { id: string; label: string }[]) {
+      assert.notEqual(citation.label, citation.id, `${citation.id} is its own label, which identifies nothing`);
+      assert.ok(!/^(sub|cus|in)_/.test(citation.label), `a raw id reached a citation label: ${citation.label}`);
+      const sub = app.ctx.svc.billing.subscription(ORG, citation.id);
+      if (!sub) continue;
+      const name = app.ctx.svc.billing.customer(ORG, sub.customer)?.name;
+      assert.ok(name && citation.label.startsWith(name), `${citation.id} should be cited as ${name}`);
+    }
+  });
+
+  test('an aggregate cites the records it counted, by name', async () => {
+    const answer = await ask('How many contacts do we have?');
+    assert.ok(answer.citations.length > 0);
+    for (const citation of answer.citations as { id: string; label: string }[]) {
+      assert.notEqual(citation.label, 'matched record', 'a citation a reader cannot identify is not a citation');
+      const record = app.ctx.db.get<{ name: string }>(
+        `SELECT display_name AS name FROM crm_records WHERE org_id = ? AND id = ?`, ORG, citation.id);
+      if (record) assert.equal(citation.label, record.name);
+    }
+  });
+});
+
+describe('a structured extraction never fills a business field with router confidence', () => {
+  test('an expansion-risk score comes back null rather than as the intent confidence', async () => {
+    const answer = await ask('Score Meridian Forge Systems for expansion risk', {
+      response_schema: { type: 'object', fields: { risk: { type: 'string' }, score: { type: 'number' }, reason: { type: 'string' } } },
+    });
+    const value = JSON.parse(answer.content) as { risk: string | null; score: number | null; reason: string | null };
+    assert.equal(value.score, null, 'nothing in the workspace scores expansion risk, so the field stays null');
+    assert.ok(!answer.analysis.plan.some((s: { tool: string }) => s.tool === 'nonexistent'));
+  });
+
+  test('a field the schema documents as engine confidence is still filled', async () => {
+    const answer = await ask('What is our open pipeline?', {
+      response_schema: {
+        type: 'object',
+        fields: {
+          total: { type: 'number' },
+          confidence: { type: 'number', description: 'How sure the engine is about the intent it classified.' },
+        },
+      },
+    });
+    const value = JSON.parse(answer.content) as { total: number | null; confidence: number | null };
+    assert.ok(typeof value.confidence === 'number' && value.confidence > 0, 'the documented field is filled');
+  });
+});
+
+describe('copy a person reads', () => {
+  test('an urgent draft with no contact still opens with a greeting', async () => {
+    const answer = await ask('Draft an urgent email about the outage');
+    assert.ok(!/^there,/m.test(answer.content), `a message that opens "there," is not a greeting:\n${answer.content}`);
+  });
+
+  test('a workspace with no name of its own is still a sentence subject', async () => {
+    const answer = await expectOk('POST', '/v1/ai/complete', { prompt: 'How is the business doing?' }, OTHER_ORG);
+    assert.ok(!/\[object Object\]/.test(answer.content), `an object was interpolated into the answer:\n${answer.content}`);
+    assert.ok(!/(^|\n)this workspace /.test(answer.content),
+      `a sentence opens with a lowercase workspace name:\n${answer.content}`);
+  });
+});
+
+/* ==========================================================================
+ * The answer is about the question that was asked
+ *
+ * Every test below was written against a defect a reader hit in the product,
+ * and every one of them fails on the code that shipped it. The common shape is
+ * always the same: a confident, well-written paragraph about a different
+ * question, in the same register as the answers that are exactly right.
+ * ======================================================================== */
+
+describe('a metered volume counts every account that meters, not every account that is invoiced', () => {
+  /** The meter's own customer list, exactly as `/v1/meters/:id/customers` builds it. */
+  const meterTotal = (meterId: string, start: number, end: number) =>
+    meterCustomerIds(meterId, start, end)
+      .map((id) => app.ctx.svc.metering.usageForPeriod(ORG, meterId, id, start, end))
+      .reduce((sum, usage) => sum + usage.value, 0);
+
+  test('the workspace total is the meter’s total, not the billing book’s share of it', async () => {
+    const answer = await ask('How many telemetry events did we meter last month?');
+    const step = (answer.analysis.plan as { tool: string; args: Record<string, unknown> }[])
+      .find((s) => s.tool === 'metered_usage')!;
+    assert.ok(step, 'the usage capability answers a usage question');
+    const start = Number(step.args.start);
+    const end = Number(step.args.end);
+
+    const billingOnly = app.ctx.svc.billing.customers(ORG, { limit: 500 })
+      .map((c) => app.ctx.svc.metering.usageForPeriod(ORG, 'mtr_nw_telemetry', c.id, start, end))
+      .reduce((sum, usage) => sum + usage.value, 0);
+    const everyone = meterTotal('mtr_nw_telemetry', start, end);
+    assert.ok(everyone > billingOnly,
+      'the fixture meters accounts that have no billing customer row — otherwise this proves nothing');
+
+    assert.ok(answer.content.includes(everyone.toLocaleString('en-US')),
+      `the answer states the meter's own total ${everyone.toLocaleString('en-US')}:\n${answer.content}`);
+    assert.ok(!answer.content.includes(billingOnly.toLocaleString('en-US')),
+      `the billing book's share is not the workspace total:\n${answer.content}`);
+  });
+
+  test('an account that meters without an invoicing record is named among the biggest consumers', async () => {
+    const answer = await ask('How many telemetry events did we meter last month?');
+    const step = (answer.analysis.plan as { tool: string; args: Record<string, unknown> }[])
+      .find((s) => s.tool === 'metered_usage')!;
+    const unbilled = meterCustomerIds('mtr_nw_telemetry', Number(step.args.start), Number(step.args.end))
+      .filter((id) => !app.ctx.svc.billing.customer(ORG, id));
+    assert.ok(unbilled.length, 'the fixture has metering-only accounts');
+    for (const id of unbilled) {
+      const usage = app.ctx.svc.metering.usageForPeriod(ORG, 'mtr_nw_telemetry', id, Number(step.args.start), Number(step.args.end));
+      assert.ok(answer.content.includes(usage.value.toLocaleString('en-US')),
+        `${id} metered ${usage.value} and is missing from the answer:\n${answer.content}`);
+    }
+    // And named as a company, not as a primary key.
+    assert.ok(!/cus_nw_/.test(answer.content), `a customer id leaked into the prose:\n${answer.content}`);
+  });
+
+  test('a metered volume for one account is that account’s number, not the meter catalogue', async () => {
+    const answer = await ask('How much telemetry did Pemberton Auto Systems meter in August 2026?');
+    const start = Date.UTC(2026, 7, 1);
+    const end = Date.UTC(2026, 8, 1);
+    const usage = app.ctx.svc.metering.usageForPeriod(ORG, 'mtr_nw_telemetry', 'cus_nw_pemberton', start, end);
+    assert.ok(usage.value > 0, 'Pemberton metered telemetry in August 2026');
+    assert.ok(answer.content.includes(usage.value.toLocaleString('en-US')),
+      `the account's own metered total is the answer:\n${answer.content}`);
+    assert.ok(!/Anomaly alerts raised — count/.test(answer.content),
+      `the six-meter catalogue is not an answer to a question with a number in it:\n${answer.content}`);
+  });
+});
+
+describe('recurring revenue movement is answered from the movement the workspace keeps', () => {
+  for (const question of [
+    'Show me MRR movement over the last six months',
+    'How much new MRR did we add last quarter?',
+    'Did MRR grow this year?',
+  ]) {
+    test(`"${question}" reads the movement report rather than denying it exists`, async () => {
+      const answer = await ask(question);
+      assert.ok(!/keeps no history|no .*history is kept/i.test(answer.content),
+        `the movement report is in the live catalogue, so this is a false claim about the database:\n${answer.content}`);
+      assert.match(answer.content, /Recurring revenue moved/);
+      assert.match(answer.content, /new business|expansion|contraction|churn|flat at/);
+      const plan = answer.analysis.plan as { tool: string }[];
+      assert.ok(plan.some((s) => s.tool === 'revenue_movement'), `the plan was ${plan.map((s) => s.tool).join(', ') || 'empty'}`);
+    });
+  }
+
+  test('the figures are the movement report’s own, per currency, and reconcile', async () => {
+    const answer = await ask('Show me MRR movement over the last six months');
+    const report = await runTool('revenue_movement', { months: 6 });
+    const usd = (report.by_currency as { currency: string; opening: string; closing: string }[])
+      .find((row) => row.currency === 'usd')!;
+    assert.ok(answer.content.includes(usd.opening), `the USD opening ${usd.opening} is in the answer:\n${answer.content}`);
+    assert.ok(answer.content.includes(usd.closing), `the USD closing ${usd.closing} is in the answer:\n${answer.content}`);
+    assert.match(answer.content, /reconcile to the subscription ledger/);
+  });
+
+  test('a movement answer scoped to a named quarter shows that quarter, not the default span', async () => {
+    const answer = await ask('How much new MRR did we add last quarter?');
+    assert.match(answer.content, /Q2 2026/);
+    assert.ok(!/Sep 2026 —/.test(answer.content),
+      `a quarter that ended in June does not contain September:\n${answer.content}`);
+  });
+});
+
+describe('one metric gets one source, and no answer states two figures for it', () => {
+  test('net revenue retention is stated once per currency, from the windowed measure', async () => {
+    const answer = await ask('What is our net revenue retention?');
+    const summary = await runTool('revenue_summary');
+    const gbp = (summary.by_currency as { currency: string; net_revenue_retention: string | null }[])
+      .find((row) => row.currency === 'gbp');
+    assert.ok(gbp?.net_revenue_retention, 'the trailing report also has a GBP retention figure');
+    assert.ok(!answer.content.includes(gbp!.net_revenue_retention!),
+      `the trailing figure ${gbp!.net_revenue_retention} is a second, unlabelled answer to the same question:\n${answer.content}`);
+    // Exactly one retention figure per currency in the whole answer.
+    const percents = answer.content.match(/\d+\.\d\d%/g) ?? [];
+    assert.ok(percents.length > 0 && percents.length <= 6,
+      `one figure per currency, not two sets of them: ${percents.join(', ')}\n${answer.content}`);
+    assert.ok(!/safe to quote/.test(answer.content),
+      `a blanket endorsement over two contradictory figures is the worst half of the defect:\n${answer.content}`);
+  });
+});
+
+describe('a filter the question names is a filter the search runs', () => {
+  const sql = (where: string, ...params: unknown[]) => app.ctx.db.count(
+    `SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL AND ${where}`,
+    ORG, ...params as string[]);
+
+  test('a money threshold in the question becomes a condition on amount', async () => {
+    const answer = await ask('Which open deals are worth more than $500,000?');
+    const step = (answer.analysis.plan as { tool: string; args: Record<string, unknown> }[])
+      .find((s) => s.tool === 'record_search')!;
+    assert.ok(step, 'a list question runs a search');
+    const conditions = step.args.conditions as { property: string; op: string; value?: number }[];
+    const threshold = conditions.find((c) => c.property === 'amount');
+    assert.ok(threshold, `the threshold reached the search: ${JSON.stringify(conditions)}`);
+    assert.equal(threshold!.op, 'gt');
+    assert.equal(threshold!.value, 50_000_000);
+
+    const expected = sql(`json_extract(properties, '$.amount') > 50000000 AND json_extract(properties, '$.deal_status') = 'open'`);
+    assert.ok(expected > 0 && expected < 8, 'the fixture has a handful of deals above the threshold');
+    assert.match(answer.content, new RegExp(`${expected} open deals worth more than \\$500,000`));
+    // Not one row below the number the reader typed.
+    for (const [, amount] of answer.content.matchAll(/—\s\$([\d,]+)\s·/g)) {
+      assert.ok(Number(amount.replace(/,/g, '')) > 500_000, `${amount} is below the stated threshold:\n${answer.content}`);
+    }
+  });
+
+  test('a rep named in the question scopes the count to that rep', async () => {
+    const priya = app.ctx.db.get<{ id: string }>(
+      `SELECT u.id FROM users u JOIN memberships m ON m.user_id = u.id WHERE m.org_id = ? AND u.name = 'Priya Raman'`, ORG)!;
+    const expected = app.ctx.db.count(
+      `SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL
+         AND owner_id = ? AND json_extract(properties, '$.deal_status') = 'open'`, ORG, priya.id);
+    const workspace = app.ctx.db.count(
+      `SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL
+         AND json_extract(properties, '$.deal_status') = 'open'`, ORG);
+    assert.ok(expected > 0 && expected < workspace, 'Priya owns some but not all of the open deals');
+
+    const answer = await ask('How many open deals does Priya Raman have?');
+    assert.match(answer.content, new RegExp(`Priya Raman has ${expected} open deals`));
+    assert.ok(!answer.content.includes(`${workspace} open deals`),
+      `the workspace figure answers a different question:\n${answer.content}`);
+  });
+
+  test('"which rep has the most pipeline" is answered per rep, not with a list of deals', async () => {
+    const answer = await ask('Which rep has the most pipeline?');
+    const owners = app.ctx.db.all<{ owner: string; total: number }>(
+      `SELECT owner_id AS owner, SUM(json_extract(properties, '$.amount')) AS total FROM crm_records
+       WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL
+         AND json_extract(properties, '$.deal_status') = 'open'
+       GROUP BY owner_id ORDER BY total DESC`, ORG);
+    const top = app.ctx.db.get<{ name: string }>(`SELECT name FROM users WHERE id = ?`, owners[0].owner)!;
+    assert.match(answer.content, new RegExp(`${top.name} is the biggest`));
+    assert.ok(answer.content.includes(money(owners[0].total)),
+      `that rep's own pipeline total is the answer:\n${answer.content}`);
+  });
+
+  test('a headline describes the filters that ran, never the whole population', async () => {
+    const total = sql('1 = 1');
+    for (const question of ['Show me deals over $500,000', 'Which deals have no next step?']) {
+      const answer = await ask(question);
+      assert.ok(!answer.content.includes(`${total} deal records in the workspace`),
+        `"${question}" was answered under a headline naming all ${total} deals:\n${answer.content.slice(0, 200)}`);
+    }
+  });
+
+  test('"the deals we lost this year" says they closed, not that they close', async () => {
+    const answer = await ask('List the deals we lost this year');
+    assert.match(answer.content, /closed-lost deals closed in 2026/);
+  });
+});
+
+describe('a price question is answered with a price', () => {
+  test('"how much would 50 million telemetry events cost" quotes the meter’s own price', async () => {
+    const answer = await ask('How much would 50 million telemetry events cost?');
+    const plan = answer.analysis.plan as { tool: string; args: Record<string, unknown> }[];
+    const step = plan.find((s) => s.tool === 'catalog_quote_price');
+    assert.ok(step, `a price question runs the price book; the plan was ${plan.map((s) => s.tool).join(', ') || 'empty'}`);
+    assert.equal(step!.args.quantity, 50_000_000);
+    assert.match(answer.content, /costs \$/);
+    assert.match(answer.content, /a unit/);
+    assert.ok(!/metered .* events on Telemetry events/.test(answer.content),
+      `a usage volume is not a price:\n${answer.content}`);
+  });
+});
+
+describe('a structured response is machine-safe or explicitly empty', () => {
+  test('a JSON-Schema `properties` object is accepted, not answered with null', async () => {
+    const answer = await ask('Is Meridian Forge Systems a churn risk?', {
+      response_schema: { type: 'object', properties: { risk: { type: 'string' }, score: { type: 'number' }, reason: { type: 'string' } } },
+    });
+    assert.notEqual(answer.content.trim(), 'null', `a silent null is indistinguishable from "nothing extracted":\n${answer.content}`);
+    const value = JSON.parse(answer.content) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(value).sort(), ['reason', 'risk', 'score']);
+  });
+
+  test('an object schema naming no members is rejected with the shape spelled out', async () => {
+    const res = await call('POST', '/v1/ai/complete', { prompt: 'What is our MRR?', response_schema: { type: 'object' } });
+    assert.equal(res.status, 400);
+    assert.equal((res.body as { error: { code: string } }).error.code, 'response_schema_invalid');
+    assert.match((res.body as { error: { message: string } }).error.message, /properties/);
+  });
+
+  test('a deal’s `amount` is that deal’s amount, never the whole pipeline', async () => {
+    const answer = await ask('Summarise the largest open deal', {
+      response_schema: {
+        type: 'object',
+        fields: { deal_name: { type: 'string' }, amount: { type: 'number' }, stage: { type: 'string' }, owner: { type: 'string' } },
+      },
+    });
+    const value = JSON.parse(answer.content) as { deal_name: string | null; amount: number | null };
+    const biggest = app.ctx.db.get<{ name: string; amount: number }>(
+      `SELECT display_name AS name, json_extract(properties, '$.amount') AS amount FROM crm_records
+       WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL
+         AND json_extract(properties, '$.deal_status') = 'open'
+       ORDER BY amount DESC LIMIT 1`, ORG)!;
+    const pipeline = app.ctx.db.count(
+      `SELECT COALESCE(SUM(json_extract(properties, '$.amount')), 0) FROM crm_records
+       WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL
+         AND json_extract(properties, '$.deal_status') = 'open'`, ORG);
+    assert.notEqual(value.amount, pipeline, `the workspace pipeline was written into one deal's amount:\n${answer.content}`);
+    assert.equal(value.amount, biggest.amount);
+    assert.equal(value.deal_name, biggest.name);
+  });
+
+  test('a multi-currency metric leaves a single `amount` null rather than picking a book', async () => {
+    const answer = await ask('What is our MRR?', {
+      response_schema: { type: 'object', fields: { amount: { type: 'number' }, currency: { type: 'string' }, summary: { type: 'string' } } },
+    });
+    const value = JSON.parse(answer.content) as { amount: number | null; currency: string | null; summary: string | null };
+    const books = (await runTool('revenue_summary')).by_currency as { currency: string }[];
+    assert.ok(books.length > 1, 'the demo workspace bills in more than one currency');
+    assert.equal(value.amount, null, `there is no single MRR figure, so there is no number to give:\n${answer.content}`);
+    assert.equal(value.currency, null);
+    assert.ok((answer.reasoning as string[]).some((line) => /left .*amount.* null/.test(line)),
+      `the omission is reported, not silent: ${(answer.reasoning as string[]).join(' | ')}`);
+  });
+});
+
+describe('a capability the workspace publishes is reachable by its own name', () => {
+  test('"show me the recovery queue" reads the recovery queue', async () => {
+    const answer = await ask('Show me the recovery queue');
+    assert.ok(!/match no record, metric, property or period/.test(answer.content),
+      `the capability is in the live catalogue, so this refusal is false:\n${answer.content}`);
+    const queue = await runTool('payments.recovery_queue');
+    const first = (queue.campaigns as { customer: string; at_risk: string }[])[0];
+    assert.ok(first, 'the fixture has an account in recovery');
+    assert.ok(answer.content.includes(first.customer), `the account in recovery is named:\n${answer.content}`);
+    assert.ok(answer.content.includes(first.at_risk), `the amount at risk is stated:\n${answer.content}`);
+  });
+
+  test('"what is our forecast" is the weighted pipeline, not a refusal that offers it by name', async () => {
+    const answer = await ask('What is our forecast for this quarter?');
+    assert.equal(answer.analysis.refusal, null, `refused while naming the measure it could have used:\n${answer.content}`);
+    const weighted = app.ctx.db.count(
+      `SELECT COALESCE(SUM(json_extract(properties, '$.weighted_amount')), 0) FROM crm_records
+       WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL
+         AND json_extract(properties, '$.deal_status') = 'open'`, ORG);
+    assert.ok(answer.content.includes(money(weighted)), `the weighted pipeline is the answer:\n${answer.content}`);
+  });
+
+  test('"what are the properties on a deal" lists the properties, not the deals', async () => {
+    const answer = await ask('What are the properties on a deal?');
+    const rows = await runTool('list_properties', { object_type: 'deal' }) as { label: string; name: string }[];
+    assert.match(answer.content, new RegExp(`${rows.length} properties on a deal`));
+    assert.ok(answer.content.includes('`amount`'), `the machine names are usable:\n${answer.content}`);
+    assert.ok(!/closes Sep|Qualification ·/.test(answer.content), `deal records are not properties:\n${answer.content}`);
+  });
+
+  test('the suggested pipeline question ends without a false apology about a tool', async () => {
+    const answer = await ask('What is our open pipeline by stage?');
+    assert.ok(!/could not read anything back from list pipelines/.test(answer.content),
+      `every field of that payload is nameable:\n${answer.content}`);
+    assert.match(answer.content, /pipelines in this workspace/);
+  });
+});
+
+describe('the ledger answers first, and it answers about the account named', () => {
+  test('a credit question about a metering-only account reaches the credit ledger', async () => {
+    const answer = await ask('What credit does Aldergate Semiconductor have left?');
+    assert.ok(!/`credits\.balance`/.test(answer.content), `an internal tool id was printed to the reader:\n${answer.content}`);
+    const balance = await runTool('credits.balance', { customer: 'cus_nw_aldergate' });
+    const grant = (balance.scheduled as { balance: number; currency: string; name: string }[])[0];
+    assert.ok(grant, 'Aldergate holds a scheduled grant in the fixture');
+    const shown = formatMoney({ amount: grant.balance, currency: grant.currency }, { locale: 'en-US' });
+    assert.ok(answer.content.includes(shown), `the grant of ${shown} is in the answer:\n${answer.content}`);
+    assert.ok(answer.content.indexOf('credit') < answer.content.indexOf('Buying committee'),
+      `the credit answer leads; the account card is context under it:\n${answer.content}`);
+  });
+
+  test('"which customers are past due" answers from the customer ledger', async () => {
+    const answer = await ask('Which customers are past due?');
+    const plan = answer.analysis.plan as { tool: string }[];
+    assert.ok(plan.some((s) => s.tool === 'delinquent_customers'),
+      `subscription status is a different table about a different thing; the plan was ${plan.map((s) => s.tool).join(', ')}`);
+    assert.match(answer.content, /past due on the customer ledger/);
+    const delinquent = app.ctx.svc.billing.customers(ORG, { delinquent: true, limit: 50 });
+    assert.ok(delinquent.length, 'the fixture has delinquent customers');
+    for (const customer of delinquent) {
+      assert.ok(answer.content.includes(customer.name), `${customer.name} owes and is missing:\n${answer.content}`);
+    }
+  });
+
+  test('"what happened on an account" is that account’s history, not the workspace’s losses', async () => {
+    const answer = await ask('What happened on the Meridian Forge Systems account recently?');
+    assert.ok(!/Losses in the period group by/.test(answer.content),
+      `a workspace-wide loss breakdown under an account-scoped sentence reads as that account's:\n${answer.content}`);
+    const plan = answer.analysis.plan as { tool: string }[];
+    assert.ok(plan.some((s) => s.tool === 'record_timeline'), `the timeline is the obvious tool; the plan was ${plan.map((s) => s.tool).join(', ')}`);
+    const others = ['Puebla Autopartes', 'Redstone Energy Services', 'Kilbride Dairy Systems'];
+    for (const name of others) {
+      assert.ok(!answer.content.includes(name), `${name} is a different company:\n${answer.content}`);
+    }
+  });
+});
+
+describe('a question with no capability behind it is refused, not filled with a record dump', () => {
+  for (const question of ['Who should I call today?', 'Which accounts are at risk of churning?']) {
+    test(`"${question}" says so rather than listing the most recent records`, async () => {
+      const answer = await ask(question);
+      assert.ok(!/records in the workspace\. The \d+ most recent/.test(answer.content),
+        `a recency-ordered dump reads as an answer to the question asked:\n${answer.content}`);
+      assert.match(answer.content, /Nothing I hold answers that/);
+      assert.match(answer.content, /which accounts have gone quiet/);
+    });
+  }
+
+  test('a record that is not an account can still be the subject of a summary', async () => {
+    const ticket = app.ctx.db.get<{ id: string; name: string }>(
+      `SELECT id, display_name AS name FROM crm_records
+       WHERE org_id = ? AND object_type = 'ticket' AND archived = 0 AND merged_into IS NULL
+       ORDER BY updated DESC LIMIT 1`, ORG)!;
+    const answer = await ask(`Summarise the ${ticket.name} ticket`);
+    assert.ok(!/booked \$|Biggest open deals/.test(answer.content),
+      `the workspace's quarter is not a summary of one ticket:\n${answer.content}`);
+    assert.match(answer.content, new RegExp(`Ticket "${ticket.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`));
+    // Two tickets can carry the same subject; what matters is that the record
+    // read is the one the question named, by name.
+    const plan = answer.analysis.plan as { tool: string; args: Record<string, unknown> }[];
+    const read = plan.map((step) => String(step.args.id ?? step.args.record_id ?? ''))
+      .filter(Boolean)
+      .map((id) => app.ctx.db.get<{ name: string }>(`SELECT display_name AS name FROM crm_records WHERE org_id = ? AND id = ?`, ORG, id)?.name);
+    assert.ok(read.length && read.every((name) => name === ticket.name),
+      `the ticket the question named is the record that was read: ${JSON.stringify(plan)}`);
+  });
+
+  test('a question that really does ask for a listing still gets one', async () => {
+    const answer = await ask('List our deals');
+    assert.match(answer.content, /deal/);
+    assert.ok((answer.analysis.plan as { tool: string }[]).some((s) => s.tool === 'record_search'));
+  });
+
+  test('a question that asks for the state of the business still gets the overview', async () => {
+    const answer = await ask('How are we doing?');
+    assert.ok((answer.analysis.plan as { tool: string }[]).length >= 2, 'the overview is several readings');
+    assert.match(answer.content, /open tickets|open pipeline|booked/);
+  });
+});
+
+describe('the answer says only what it can stand behind', () => {
+  test('an enumeration names every row it counted', async () => {
+    const answer = await ask('Which accounts have gone quiet?');
+    const claim = answer.content.match(/(\d+) of those carr(?:y|ies) open pipeline — ([^\n]+?) — which/);
+    assert.ok(claim, `the exposure sentence is there:\n${answer.content}`);
+    const named = claim![2].split(/,\s|\sand\s/).filter(Boolean).length;
+    assert.equal(named, Number(claim![1]), `${claim![1]} claimed, ${named} named:\n${claim![0]}`);
+  });
+
+  test('a contact list renders a job title and an email, not our own rep', async () => {
+    const answer = await ask('Give me a list of contacts at Rheinwerk Antriebstechnik');
+    const line = answer.content.split('\n').find((l: string) => l.startsWith('• Katrin Pfeiffer'));
+    assert.ok(line, `the contact is listed:\n${answer.content}`);
+    assert.match(line!, /Chief Financial Officer/);
+    assert.match(line!, /@rheinwerk\.de/);
+    const reps = app.ctx.db.all<{ name: string }>(
+      `SELECT u.name FROM users u JOIN memberships m ON m.user_id = u.id WHERE m.org_id = ?`, ORG);
+    for (const rep of reps) {
+      assert.ok(!line!.includes(rep.name), `"${rep.name}" is our rep, and reads as this contact's title:\n${line}`);
+    }
+  });
+
+  test('two periods with the same figure are described in English', async () => {
+    const answer = await ask('Compare invoiced in USD in July 2026 and August 2026');
+    assert.ok(!/the same invoiced in both periods/.test(answer.content),
+      `the metric label was substituted where the noun belongs:\n${answer.content}`);
+    assert.match(answer.content, /was unchanged across the two/);
+  });
+
+  test('a deal-type split is a sentence', async () => {
+    const answer = await ask('What did we close last quarter and why?');
+    assert.ok(!/What did close splits by/.test(answer.content), `that sentence has no verb:\n${answer.content}`);
+    assert.match(answer.content, /What closed, by deal type/);
+  });
+});
+
+describe('a thread does not repeat itself, and an unknown thread is an error', () => {
+  test('an unknown thread_id is a 404, matching every other thread route', async () => {
+    const res = await call('POST', '/v1/ai/complete', { prompt: 'What is our MRR?', thread_id: 'thr_does_not_exist' });
+    assert.equal(res.status, 404, 'a reply attached to no thread is not a success');
+  });
+
+  test('the account profile is given once in a thread, not on every turn', async () => {
+    const thread = await expectOk('POST', '/v1/ai/threads', { title: 'Meridian' });
+    const turn = async (message: string) =>
+      (await expectOk('POST', `/v1/ai/threads/${thread.id}/messages`, { message })).message.content as string;
+
+    const first = await turn('Tell me about Meridian Forge Systems');
+    assert.match(first, /Buying committee/, 'turn one gives the profile');
+    const second = await turn('How much have they spent?');
+    const third = await turn('What are their open tickets?');
+    for (const [n, content] of [[2, second], [3, third]] as [number, string][]) {
+      assert.ok(!/Buying committee/.test(content), `turn ${n} reprints the profile from turn one:\n${content}`);
+    }
+    assert.match(second, /spent/);
+    assert.match(third, /ticket/);
+  });
+});
+
+describe('a draft carries the numbers the recipient needs to act', () => {
+  test('a dunning note names the invoices, the amounts and the dates', async () => {
+    const meridian = app.ctx.svc.billing.customerByCrmRecord(ORG, 'cmp_nw_01')!;
+    const open = app.ctx.svc.billing.invoices(ORG, { customer: meridian.id, status: 'open_like', limit: 20 })
+      .filter((invoice) => invoice.amount_due > 0);
+    assert.ok(open.length, 'Meridian has unpaid invoices in the fixture');
+
+    const draft = await expectOk('POST', '/v1/ai/draft', {
+      kind: 'dunning', record_id: 'cmp_nw_01', instruction: 'Chase the outstanding invoice',
+    });
+    for (const invoice of open) {
+      assert.ok(draft.body.includes(invoice.number), `${invoice.number} is not in the note:\n${draft.body}`);
+      const shown = formatMoney({ amount: invoice.amount_due, currency: invoice.currency }, { locale: 'en-US' });
+      assert.ok(draft.body.includes(shown), `${shown} is not in the note:\n${draft.body}`);
+    }
+  });
+
+  test('an escalation update has content where its heading promises content', async () => {
+    const draft = await expectOk('POST', '/v1/ai/draft', {
+      kind: 'escalation_update', record_id: 'cmp_nw_01', instruction: 'Update them on the escalation',
+    });
+    assert.ok(!/Here is where it stands and what happens next\./.test(draft.body),
+      `a heading for a paragraph that was never written:\n${draft.body}`);
+    assert.match(draft.body, /Where it stands: /);
   });
 });

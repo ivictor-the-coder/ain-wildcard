@@ -25,6 +25,16 @@ export interface ExtractionContext {
   results: { tool: string; result: unknown }[];
   metricValue: number | null;
   metricFormatted: string | null;
+  /**
+   * True when the question was about the metric itself.
+   *
+   * "What is our MRR?" makes the metric the subject of the run; "summarise the
+   * largest open deal" does not, and pasting the run's metric into that deal's
+   * `amount` is how a record ends up written with the workspace's total in it.
+   */
+  metricIsSubject: boolean;
+  /** The currencies the metric came back in — more than one means no single figure. */
+  metricCurrencies?: string[];
   confidence: number;
 }
 
@@ -32,6 +42,43 @@ export interface ExtractionOutcome {
   value: unknown;
   filled: string[];
   missing: string[];
+}
+
+/**
+ * A response schema, in whichever spelling the caller wrote it.
+ *
+ * This engine's own schema nodes name an object's members `fields`; every other
+ * JSON-Schema tool on earth names them `properties`, and a schema written that
+ * way used to come back as the JSON literal `null` with a 200 — indistinguishable
+ * from "nothing could be extracted". Both spellings are accepted, and an object
+ * schema carrying neither is rejected by the caller with the shape named.
+ */
+export function normaliseResponseSchema(node: unknown): SchemaNode {
+  if (!node || typeof node !== 'object') return { type: 'string' };
+  const raw = node as Record<string, unknown>;
+  const type = typeof raw.type === 'string' ? raw.type : Array.isArray(raw.properties ?? raw.fields) ? 'array' : raw.properties || raw.fields ? 'object' : 'string';
+  const out: SchemaNode = { ...(raw as unknown as SchemaNode), type };
+  const members = (raw.fields ?? raw.properties) as Record<string, unknown> | undefined;
+  if (members && typeof members === 'object') {
+    out.fields = Object.fromEntries(Object.entries(members).map(([key, child]) => [key, normaliseResponseSchema(child)]));
+  }
+  // JSON Schema spells an array's element type `items`.
+  const element = (raw.of ?? raw.items) as unknown;
+  if (element && typeof element === 'object') out.of = normaliseResponseSchema(element);
+  const loose = out as unknown as Record<string, unknown>;
+  delete loose.properties;
+  delete loose.items;
+  delete loose.required;
+  return out;
+}
+
+/** True when an object schema names no members at all, in either spelling. */
+export function schemaNamesNoFields(node: unknown): boolean {
+  if (!node || typeof node !== 'object') return false;
+  const raw = node as Record<string, unknown>;
+  if (raw.type !== 'object') return false;
+  const members = (raw.fields ?? raw.properties) as Record<string, unknown> | undefined;
+  return !members || typeof members !== 'object' || !Object.keys(members).length;
 }
 
 const POSITIVE = ['happy', 'great', 'excellent', 'pleased', 'thanks', 'love', 'win', 'won', 'resolved', 'smooth', 'good', 'positive', 'excited'];
@@ -145,6 +192,24 @@ function coerce(node: SchemaNode, raw: unknown, context: ExtractionContext): unk
   }
 }
 
+/**
+ * The record a run actually returned of one type, when the question named none.
+ *
+ * "Summarise the largest open deal" resolves no deal entity — the deal is
+ * whatever the search came back with — so `deal_name` had nothing to fill it
+ * and came back null beside a correct amount and stage.
+ */
+function topRecord(context: ExtractionContext, objectType: string): { id?: string; name?: string } | undefined {
+  for (const { result } of context.results) {
+    if (!result || typeof result !== 'object') continue;
+    const list = result as { object_type?: string; records?: { id?: string; name?: string }[] };
+    if (list.object_type === objectType && Array.isArray(list.records) && list.records.length) return list.records[0];
+    const profile = result as { object_type?: string; id?: string; name?: string };
+    if (profile.object_type === objectType && typeof profile.name === 'string') return profile;
+  }
+  return undefined;
+}
+
 function conventionalValue(name: string, node: SchemaNode, context: ExtractionContext): unknown {
   const key = normalise(name).replace(/\s+/g, '_');
   const company = context.entities.find((e) => e.entity.type === 'company' || e.entity.type === 'customer');
@@ -153,21 +218,37 @@ function conventionalValue(name: string, node: SchemaNode, context: ExtractionCo
 
   if (/^(summary|answer|response|description|text|body|explanation|rationale|analysis)$/.test(key)) return context.answer;
   if (/^(headline|title|subject)$/.test(key)) return sentences(context.answer)[0] ?? context.answer.slice(0, 120);
-  if (/^(company|account|organisation|organization|customer|company_name|account_name)$/.test(key)) return company?.entity.label;
-  if (/^(company_id|account_id|customer_id|record_id)$/.test(key)) return company?.entity.id;
-  if (/^(contact|person|contact_name|full_name)$/.test(key)) return contact?.entity.label;
-  if (/^(contact_id|person_id)$/.test(key)) return contact?.entity.id;
-  if (/^(deal|opportunity|deal_name)$/.test(key)) return deal?.entity.label;
-  if (/^(deal_id|opportunity_id)$/.test(key)) return deal?.entity.id;
+  if (/^(company|account|organisation|organization|customer|company_name|account_name)$/.test(key)) return company?.entity.label ?? topRecord(context, 'company')?.name;
+  if (/^(company_id|account_id|customer_id|record_id)$/.test(key)) return company?.entity.id ?? topRecord(context, 'company')?.id;
+  if (/^(contact|person|contact_name|full_name)$/.test(key)) return contact?.entity.label ?? topRecord(context, 'contact')?.name;
+  if (/^(contact_id|person_id)$/.test(key)) return contact?.entity.id ?? topRecord(context, 'contact')?.id;
+  if (/^(deal|opportunity|deal_name)$/.test(key)) return deal?.entity.label ?? topRecord(context, 'deal')?.name;
+  if (/^(deal_id|opportunity_id)$/.test(key)) return deal?.entity.id ?? topRecord(context, 'deal')?.id;
+  if (/^(ticket|ticket_subject|issue)$/.test(key)) return topRecord(context, 'ticket')?.name;
   if (/^(email|email_address)$/.test(key)) {
     const inMessage = context.question.match(EMAIL_PATTERN)?.[0];
     return inMessage ?? contact?.entity.aliases.find((a) => a.includes('@')) ?? company?.entity.aliases.find((a) => a.includes('@'));
   }
   if (/^(amount|value|total|revenue|spend|price|cost|sum)$/.test(key)) {
+    // The run's metric is only this field's value when the run was ABOUT the
+    // metric. Asked to summarise the largest open deal, this returned the whole
+    // $9,010,960 pipeline as that deal's `amount` — twelve times its real value,
+    // with nothing in `missing` to warn the automation persisting it.
+    if (!context.metricIsSubject) {
+      return findInResults(name, context.results) ?? moneyInText(context.answer, context.workspace.currency)
+        ?? moneyInText(context.question, context.workspace.currency);
+    }
+    // Several books, no exchange rates, one `amount` field: filling it with the
+    // largest one under-reported recurring revenue by a third and flagged
+    // nothing. There is no honest single number, so there is no number.
+    if (context.metricCurrencies && context.metricCurrencies.length > 1) return undefined;
     return context.metricValue ?? moneyInText(context.question, context.workspace.currency);
   }
-  if (/^(currency)$/.test(key)) return context.workspace.currency;
-  if (/^(count|quantity|number|records?)$/.test(key)) return context.metricValue;
+  if (/^(currency)$/.test(key)) {
+    if (context.metricCurrencies && context.metricCurrencies.length > 1) return undefined;
+    return context.metricCurrencies?.[0] ?? context.workspace.currency;
+  }
+  if (/^(count|quantity|number|records?)$/.test(key)) return context.metricIsSubject ? context.metricValue : undefined;
   if (/^(period|window|timeframe|period_label)$/.test(key)) return context.window.label;
   if (/^(start|start_date|period_start|from)$/.test(key)) return context.window.start;
   if (/^(end|end_date|period_end|to)$/.test(key)) return context.window.end;
@@ -179,7 +260,15 @@ function conventionalValue(name: string, node: SchemaNode, context: ExtractionCo
     if (/\b(low|minor|whenever)\b/.test(text)) return 'low';
     return 'medium';
   }
-  if (/^(confidence|score|certainty)$/.test(key)) return node.type === 'string' ? String(context.confidence) : context.confidence;
+  // Only a field literally named `confidence`, and only when its description
+  // says whose confidence it is. `score` was being filled with the intent
+  // router's own certainty: asked for an expansion-risk score on an account,
+  // the engine answered 0.3 — how sure it was about the intent — with `risk`
+  // and `reason` null beside it. An automation scoring accounts nightly would
+  // have persisted router confidence as a business number.
+  if (key === 'confidence' && /\b(engine|model|classif|intent|router|answer)\b/i.test(node.description ?? '')) {
+    return node.type === 'string' ? String(context.confidence) : context.confidence;
+  }
   if (/^(next_steps?|actions?|recommendations?|todos?)$/.test(key)) {
     const bullets = context.answer.split('\n').filter((line) => line.trim().startsWith('•')).map((line) => line.replace(/^[\s•]+/, '').trim());
     return bullets.length ? bullets : sentences(context.answer).slice(-2);

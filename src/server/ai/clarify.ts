@@ -78,6 +78,39 @@ export function comprehend(question: string, vocabulary: Set<string>): Comprehen
   };
 }
 
+/**
+ * Whether a pronoun is already answered by the sentence it sits in.
+ *
+ * "How many open deals do we have and what are they worth?" binds "they" four
+ * words earlier, in its own first clause. Refusing it as an unresolved
+ * reference — "I do not know what 'they' refers to" — is a refusal to read the
+ * sentence, and splitting the question in two made the first half answer
+ * correctly, which is the proof the data path was never the problem.
+ *
+ * The test is deliberately narrow: a plural pronoun needs a plural noun phrase
+ * before it, a singular one needs a noun before it, and the noun has to be a
+ * thing this platform holds — an object type or a business noun — rather than
+ * any word at all. "How much have they spent?" still has nothing to bind to
+ * and is still refused.
+ */
+const ANTECEDENT_NOUNS =
+  /\b(deals?|opportunit(?:y|ies)|companies|company|accounts?|customers?|contacts?|people|tickets?|cases?|invoices?|bills?|subscriptions?|plans?|products?|meters?|credits?|entitlements?|renewals?|payments?|records?|logos?|leads?|reps?|owners?|meetings?|calls?|emails?|notes?|tasks?|quotes?|orders?)\b/gi;
+
+const PLURAL_PRONOUN = /^(they|them|their|theirs|these|those)$/i;
+
+export function pronounBoundInSentence(question: string, pronoun: string): string | null {
+  const at = question.toLowerCase().indexOf(pronoun.toLowerCase());
+  if (at <= 0) return null;
+  const before = question.slice(0, at);
+  const nouns = [...before.matchAll(ANTECEDENT_NOUNS)].map((m) => m[0]);
+  if (!nouns.length) return null;
+  const last = nouns[nouns.length - 1];
+  const plural = /(?:s|people)$/i.test(last) && !/\bstatus$/i.test(last);
+  // "they" cannot point at "the deal"; "it" cannot point at "the deals".
+  if (PLURAL_PRONOUN.test(pronoun) !== plural) return null;
+  return last;
+}
+
 export type RefusalCode = 'unreadable' | 'injection' | 'unknown_terms' | 'no_measure' | 'period_unresolved' | 'unresolved_reference';
 
 export interface Refusal {

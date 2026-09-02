@@ -2,22 +2,18 @@
  * The deal surface: a kanban board that moves real deals, a table view of the
  * same set, and the deal record.
  */
-import { useMemo } from 'react';
 import type { CommandDef, NavItem, RouteDef, WidgetDef } from '@/client/kernel/registry-types';
-import { useQuery } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import {
-  Badge, Button, Card, ChevronRightIcon, EmptyState, ErrorState, Icons, SkeletonText
+  Badge, Button, Card, ChevronRightIcon, EmptyState, ErrorState, SkeletonText,
 } from '@/client/design';
 import { DealsPage } from './deals';
 import { DealRecordPage } from './record';
 import {
-  accountOf, dealAmount, dealCloseDate, recordHref, str, useDealFormat,
-  type DealListEnvelope, type DealRecord,
+  ALL_PIPELINES, SIX_WEEK_DAYS, accountOf, dealAmount, dealCloseDate, recordHref, useDealFormat,
+  useDealSearch, type DealSearchBody,
 } from './api';
 import './pipeline.css';
-
-const DAY_MS = 86_400_000;
 
 const DealRecordRoute = () => {
   const { params } = useRouter();
@@ -26,45 +22,84 @@ const DealRecordRoute = () => {
 
 /* --------------------------------- widget --------------------------------- */
 
-/** The open deals whose close date is inside the next six weeks, soonest first. */
+const SHOWN = 6;
+
+/**
+ * Where the card sends you, and it is the same set the card counted.
+ *
+ * The filter behind these numbers names no pipeline, so it counts across all of
+ * them; the board it linked to could only ever draw one, and a card reading
+ * "14 deals" opened a board headed "7 deals on New business". The board can now
+ * hold every pipeline, so the link says so.
+ */
+const boardHref = (horizon: string) => `/deals?pipeline=${ALL_PIPELINES}&horizon=${horizon}`;
+
+/** The filter the card counts, run by the server so the total is the whole set. */
+const commitWindow: DealSearchBody = {
+  filter: {
+    op: 'and',
+    filters: [
+      { property: 'deal_status', operator: 'eq', value: 'open' },
+      { property: 'close_date', operator: 'between', values: ['today', `+${SIX_WEEK_DAYS}d`] },
+    ],
+  },
+  sort: [{ property: 'close_date', direction: 'asc' }],
+  expand: ['associations'],
+};
+
+/** Open deals whose close date has already gone by — commit that is not commit. */
+const pastDue: DealSearchBody = {
+  filter: {
+    op: 'and',
+    filters: [
+      { property: 'deal_status', operator: 'eq', value: 'open' },
+      { property: 'close_date', operator: 'before', value: 'today' },
+    ],
+  },
+  sort: [{ property: 'close_date', direction: 'asc' }],
+};
+
+/**
+ * The open deals closing inside the next six weeks, soonest first.
+ *
+ * The money and the count are properties of the whole matching set, not of the
+ * six rows there is room to draw: the card used to total its own render cap and
+ * caption the result as the six-week number, which understated a live workspace
+ * by 61%. Overdue deals are counted on their own line rather than folded in —
+ * a deal whose close date went by in March is not next-six-weeks commit.
+ */
 function ClosingSoon() {
   const f = useDealFormat();
   const { navigate } = useRouter();
-  const today = f.calendarToday();
-  const { data, error, loading, refetch } = useQuery<DealListEnvelope>('/v1/records/deal', {
-    sort: 'close_date', order: 'asc', limit: 60, expand: 'associations',
-  });
+  const commit = useDealSearch(commitWindow);
+  const overdue = useDealSearch(pastDue);
 
-  const rows = useMemo(() => {
-    const horizon = today + 42 * DAY_MS;
-    return (data?.data ?? [])
-      .filter((deal: DealRecord) => str(deal.properties.deal_status) === 'open')
-      .filter((deal) => {
-        const close = dealCloseDate(deal);
-        return close !== null && close <= horizon;
-      })
-      .slice(0, 6);
-  }, [data, today]);
-
-  const committed = rows.reduce((sum, deal) => sum + dealAmount(deal), 0);
+  const rows = commit.deals.slice(0, SHOWN);
+  const caption = commit.amount === null
+    ? `${f.plural(commit.total, 'deal')} — more than this card can total`
+    : `${f.money(commit.amount)} across ${f.plural(commit.total, 'deal')}${commit.total > rows.length ? ` · showing ${rows.length}` : ''}`;
 
   return (
     <Card
       title="Closing in the next six weeks"
-      description={rows.length ? `${f.money(committed)} across ${f.plural(rows.length, 'deal')}` : 'Open deals by close date'}
-      actions={<Button size="sm" variant="ghost" onClick={() => navigate('/deals?horizon=quarter')}>Open the board</Button>}
+      description={commit.total ? caption : 'Open deals by close date'}
+      actions={
+        <Button size="sm" variant="ghost" onClick={() => navigate(boardHref('42'))}>
+          Open the board
+        </Button>
+      }
     >
-      {error && (
+      {commit.error && (
         <ErrorState
           title="The deal list did not answer"
-          message={error.body.message}
-          code={`${error.status} /v1/records/deal`}
-          requestId={error.body.request_id ?? null}
-          action={<Button size="sm" variant="primary" onClick={refetch}>Try again</Button>}
+          message={commit.error.body.message}
+          code={`${commit.error.status} /v1/records/deal/search`}
+          requestId={commit.error.body.request_id ?? null}
+          action={<Button size="sm" variant="primary" onClick={commit.refetch}>Try again</Button>}
         />
       )}
-      {!error && loading && <SkeletonText lines={5} />}
-      {!error && !loading && rows.length === 0 && (
+      {!commit.error && commit.loading && <SkeletonText lines={5} />}
+      {!commit.error && !commit.loading && rows.length === 0 && (
         <EmptyState
           size="sm"
           inline
@@ -74,9 +109,8 @@ function ClosingSoon() {
           action={<Button size="sm" variant="primary" onClick={() => navigate('/deals?new=1')}>New deal</Button>}
         />
       )}
-      {!error && rows.map((deal) => {
+      {!commit.error && rows.map((deal) => {
         const close = dealCloseDate(deal);
-        const overdue = close !== null && close < today;
         return (
           <button
             key={deal.id}
@@ -91,11 +125,33 @@ function ClosingSoon() {
               </span>
             </span>
             <span className="pl-widgetrow__amount">{f.money(dealAmount(deal))}</span>
-            {overdue && <Badge tone="warning" size="sm">overdue</Badge>}
             <ChevronRightIcon size={14} />
           </button>
         );
       })}
+      {!commit.error && !commit.loading && commit.total > rows.length && (
+        <button
+          type="button"
+          className="pl-widgetmore"
+          onClick={() => navigate(boardHref('42'))}
+        >
+          {f.plural(commit.total - rows.length, 'more deal')} in this window
+          <ChevronRightIcon size={13} />
+        </button>
+      )}
+      {!overdue.error && !overdue.loading && overdue.total > 0 && (
+        <button
+          type="button"
+          className="pl-widgetmore pl-widgetmore--warn"
+          onClick={() => navigate(boardHref('overdue'))}
+        >
+          <Badge tone="warning" size="sm">overdue</Badge>
+          {overdue.amount === null
+            ? `${f.plural(overdue.total, 'open deal')} are already past their close date`
+            : `${f.plural(overdue.total, 'open deal')} worth ${f.money(overdue.amount)} are already past their close date`}
+          <ChevronRightIcon size={13} />
+        </button>
+      )}
     </Card>
   );
 }
@@ -115,11 +171,20 @@ export const commands: CommandDef[] = [
   {
     id: 'pipeline.board',
     title: 'Deal board',
-    subtitle: 'Every pipeline, by stage, with the weighted forecast',
+    subtitle: 'Your default pipeline, by stage, with the weighted forecast',
     group: 'Go to',
     keywords: ['deals', 'pipeline', 'kanban', 'forecast', 'opportunities'],
     icon: 'deals',
     run: (go) => go('/deals'),
+  },
+  {
+    id: 'pipeline.all',
+    title: 'Every pipeline on one board',
+    subtitle: 'Every pipeline stacked, each with its own stages and totals',
+    group: 'Go to',
+    keywords: ['deals', 'pipeline', 'all', 'kanban', 'forecast', 'everything'],
+    icon: 'layers',
+    run: (go) => go(`/deals?pipeline=${ALL_PIPELINES}`),
   },
   {
     id: 'pipeline.table',
@@ -146,7 +211,7 @@ export const commands: CommandDef[] = [
     group: 'Go to',
     keywords: ['forecast', 'quarter', 'close'],
     icon: 'calendar-check',
-    run: (go) => go('/deals?horizon=quarter'),
+    run: (go) => go(boardHref('quarter')),
   },
 ];
 

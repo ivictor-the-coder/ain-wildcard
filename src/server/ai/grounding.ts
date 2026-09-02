@@ -234,7 +234,10 @@ export function workspaceProfile(ctx: Ctx, orgId: string): WorkspaceProfile {
      JOIN memberships m ON m.user_id = u.id WHERE m.org_id = ? ORDER BY u.name`, orgId);
   return {
     orgId,
-    name: org?.name ?? 'this workspace',
+    // Every sentence in the engine starts with this name, so its fallback has
+    // to be capitalised the way a name is: "this workspace is running at..."
+    // was the first thing a brand-new workspace read.
+    name: org?.name ?? 'This workspace',
     domain: org?.domain ?? null,
     currency: org?.default_currency ?? 'usd',
     locale: org?.locale ?? 'en-US',
