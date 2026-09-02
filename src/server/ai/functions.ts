@@ -20,7 +20,7 @@ import {
 } from './metrics';
 import { aggregate, associatedRecords, fetchRecords, getRecord, propertyMap, type Condition, type RecordSummary } from './query';
 import { defaultWindow, previousWindow, type TimeWindow } from './dates';
-import { humanise, truncate } from './text';
+import { humanise, listPhrase, truncate } from './text';
 
 export interface SearchHit {
   id: string;
@@ -310,6 +310,28 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
     limit: args.limit,
   };
   const computed = definition.compute(input);
+  // A currency book the metric never read is a scope the answer would claim and
+  // not hold.
+  //
+  // "How much of our pipeline is in GBP?" came back as "Northwind Robotics is
+  // carrying $9,010,960 in open pipeline, from 38 open deals. Scoped to the GBP
+  // book, which is the currency you named" — the whole open book, in dollars,
+  // under a sentence asserting a narrowing that does not exist. Deals carry no
+  // currency here, so there is no GBP pipeline; the ledger metrics do, and they
+  // answer for the books they actually hold. The test is the figure that came
+  // back rather than a list of which metrics are supposed to support it.
+  if (args.currency) {
+    const asked = args.currency.toLowerCase();
+    const held = computed.books.map((book) => book.currency.toLowerCase());
+    if (definition.unit === 'money' && !held.includes(asked) && (computed.currency ?? '').toLowerCase() !== asked) {
+      return {
+        error: held.length
+          ? `"${definition.label}" is held in ${listPhrase(held.map((code) => code.toUpperCase()))} here, and there is no ${asked.toUpperCase()} book in it — the unscoped figure is a different number, not a smaller version of the one you asked for.`
+          : `"${definition.label}" is measured from records that carry no currency book in this workspace, so it cannot be narrowed to ${asked.toUpperCase()}: the figure I hold is the whole of it, in ${(computed.currency ?? workspace.currency).toUpperCase()}.`,
+        available: metricIds().filter((id) => metricById(id)?.unit === 'money'),
+      };
+    }
+  }
   // "Who has the least pipeline?" is "who has the most" with one word changed,
   // and every metric here ranks its groups largest first. Reversing the rows —
   // once, here, rather than in each metric — is what makes the smaller end of a
@@ -819,6 +841,17 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
   });
 
   const definition = args.property ? properties.get(args.property) : undefined;
+  // An average over no rows is not zero — it does not exist. `aggregate`
+  // returns 0 for it, and "$0 in average deal size across 0 closed-won deals"
+  // is a figure a reader will quote. The catalogue's own averages refuse this
+  // case by name; the row-level path has to refuse it too, or the same measure
+  // answers differently depending on which capability the plan reached for.
+  if ((measure === 'avg' || measure === 'min' || measure === 'max') && result.count === 0) {
+    return {
+      error: `No ${args.object_type} rows match that, so there is no ${measure === 'avg' ? 'average' : measure} `
+        + `${definition?.label.toLowerCase() ?? args.property} to report — a zero would say the rows measured nothing, and there are no rows.`,
+    };
+  }
   const isMoney = definition?.type === 'currency';
   const format = (value: number) => (isMoney
     ? formatMoney({ amount: Math.round(value), currency: workspace.currency }, { locale: workspace.locale, trimZeroFraction: true })

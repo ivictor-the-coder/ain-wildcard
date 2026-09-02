@@ -48,6 +48,10 @@ export interface ExtractionContext {
    */
   rowCount?: number | null;
   rowType?: string | null;
+  /** The unit the measure is denominated in, so a count word never takes money. */
+  metricUnit?: string | null;
+  /** The question, tokenised, so a field name may only add words the reader wrote. */
+  askedWords?: Set<string>;
   /** The rep the run was scoped to, when a name in the question put it there. */
   owner?: string | null;
   /**
@@ -177,6 +181,12 @@ function coerce(node: SchemaNode, raw: unknown, context: ExtractionContext): unk
   switch (node.type) {
     case 'integer':
     case 'number': {
+      // A collection is not a number. `String([{…},{…}])` is "[object
+      // Object],[object Object]", which strips to the empty string, and
+      // `Number('')` is 0 — so `{"subscriptions": {"type": "number"}}` came
+      // back as a confident `0` in the same run whose prose said 31. There is
+      // no honest number in a list of rows, so there is no number.
+      if (typeof raw === 'object') return null;
       const value = typeof raw === 'number' ? raw : Number(String(raw).replace(/[^0-9.-]/g, ''));
       if (!Number.isFinite(value)) return null;
       return node.type === 'integer' ? Math.round(value) : value;
@@ -332,7 +342,81 @@ function rowValue(name: string, bound: BoundRows, family: string | null): unknow
   return row ? valueIn(name, row) : undefined;
 }
 
-function conventionalValue(name: string, node: SchemaNode, context: ExtractionContext): unknown {
+/* ------------------------- counting the rows once ------------------------- */
+
+/** The counting words a schema field name is allowed to spend on its own. */
+const COUNT_WORDS = new Set([
+  'count', 'counts', 'number', 'numbers', 'num', 'no', 'qty', 'quantity', 'quantities',
+  'total', 'totals', 'sum', 'records', 'record', 'rows', 'row', 'results', 'result',
+  'of', 'the', 'all', 'and', 'in',
+]);
+
+/** Singular and plural of one noun, so `subscriptions` answers to `subscription`. */
+const forms = (noun: string): string[] => {
+  const bare = noun.replace(/s$/, '');
+  return [bare, `${bare}s`, `${bare}es`, bare.endsWith('y') ? `${bare.slice(0, -1)}ies` : `${bare}s`];
+};
+
+/**
+ * Whether a schema field asks for the number of rows this run counted.
+ *
+ * The old test was a pair of regexes over `<type>_count` and `num_<type>`, and
+ * every other way a caller writes the same field came back null next to prose
+ * stating the figure: `subscriptions` (a confident `0`, from a stringified
+ * list), `count`, `number_of_subscriptions`, `active_subscriptions`. The rule
+ * here is about the words rather than the shapes: a field counts rows when the
+ * words in its name are counting words, the row type this run counted, or words
+ * the reader themselves wrote — and nothing else. A `ticket_count` over a deal
+ * aggregate still returns null, because "ticket" is neither.
+ */
+function countsRows(name: string, context: ExtractionContext): boolean {
+  if (typeof context.rowCount !== 'number') return false;
+  const words = normalise(name).split(' ').filter(Boolean);
+  if (!words.length) return false;
+  const type = normalise(context.rowType ?? '');
+  const typeForms = new Set(type ? forms(type) : []);
+  let counting = false;
+  let named = false;
+  for (const word of words) {
+    if (typeForms.has(word)) { named = true; continue; }
+    if (COUNT_WORDS.has(word)) { counting = true; continue; }
+    // A word the reader wrote is a scope this run already applied — "active"
+    // in `active_subscriptions` is the status the question named. A word they
+    // did not write would be a narrowing nobody asked for, and filling the
+    // field would report it as applied.
+    if (context.askedWords?.has(word) || context.askedWords?.has(stem(word))) continue;
+    return false;
+  }
+  return counting || named;
+}
+
+/**
+ * The rows a list capability returned, and what it counted them of.
+ *
+ * `business_metric` carries `count`/`matched_records`; every ledger list
+ * carries `total` beside the rows themselves. Without reading the second kind,
+ * a question answered in prose as "31 subscriptions are at status active" filled
+ * no count field at all.
+ */
+export function countedRows(results: { tool: string; result: unknown }[]): { count: number; type: string | null } | null {
+  for (const { tool, result } of results) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) continue;
+    const payload = result as Record<string, unknown>;
+    const count = ['matched_records', 'total', 'count'].map((key) => payload[key])
+      .find((value): value is number => typeof value === 'number' && Number.isFinite(value));
+    if (count === undefined) continue;
+    const typed = typeof payload.object_type === 'string' ? payload.object_type : null;
+    // A list names the rows it holds in the key that holds them: `subscriptions`,
+    // `invoices`, `customers`. That noun is what the count is a count of.
+    const collection = Object.entries(payload)
+      .find(([key, value]) => Array.isArray(value) && key !== 'books' && key !== 'groups' && /s$/.test(key))?.[0] ?? null;
+    const type = typed ?? (collection ? collection.replace(/s$/, '') : tool.split(/[._]/).pop()?.replace(/s$/, '') ?? null);
+    return { count, type };
+  }
+  return null;
+}
+
+function conventionalValue(name: string, node: SchemaNode, context: ExtractionContext, recordless = false): unknown {
   const key = normalise(name).replace(/\s+/g, '_');
   const company = context.entities.find((e) => e.entity.type === 'company' || e.entity.type === 'customer');
   const contact = context.entities.find((e) => e.entity.type === 'contact');
@@ -357,6 +441,11 @@ function conventionalValue(name: string, node: SchemaNode, context: ExtractionCo
     // $9,010,960 pipeline as that deal's `amount` — twelve times its real value,
     // with nothing in `missing` to warn the automation persisting it.
     if (!context.metricIsSubject) {
+      // …and when the object names a record this run never returned, there is
+      // no row for the money to belong to. Hunting one out of the results gave
+      // "who are our biggest customers?" a lone `amount` of $583,200 — one
+      // unrelated deal — beside a null company and a null deal name.
+      if (recordless) return undefined;
       return findInResults(name, context.results) ?? moneyInText(context.answer, context.workspace.currency)
         ?? moneyInText(context.question, context.workspace.currency);
     }
@@ -397,19 +486,20 @@ function conventionalValue(name: string, node: SchemaNode, context: ExtractionCo
       return node.type === 'string' ? context.metricFormatted ?? context.metricValue : context.metricValue;
     }
   }
-  // A count field takes the row count the aggregate carries, not the metric's
-  // money value. `<type>_count` only counts when the aggregate counted that
-  // type — a `ticket_count` filled from a deal aggregate is a wrong number in
-  // the right shape.
-  const countHit = key.match(/^(?:(\w+)_)?(?:count|records?|rows?)$/) ?? key.match(/^(?:num|no)_(\w+)s?$/);
-  if (countHit) {
-    const family = countHit[1] ?? '';
-    const type = normalise(context.rowType ?? '');
-    const generic = !family || /^(record|records|row|rows|result|results|total)$/.test(family);
-    if ((generic || (type && (family === type || family === `${type}s` || `${family}s` === type)))
-      && typeof context.rowCount === 'number') return context.rowCount;
+  // A count field takes the row count the run carries, not the metric's money
+  // value and never a stringified list. `{"subscriptions": {"type":"number"}}`
+  // came back `0` beside prose saying 31, and `count`, `subscription_count`
+  // and `number_of_subscriptions` came back null in the same run — one figure,
+  // four field names, four different wrong answers.
+  if (countsRows(name, context)) return context.rowCount;
+  // A bare counting word is the count of rows, and only falls through to the
+  // measure when the measure is itself a count. `{"quantity": …}` over "how
+  // many invoices are outstanding?" was filled with $133,400 in minor units —
+  // money in a field named for a number of rows.
+  if (/^(count|quantity|number|records?|rows?)$/.test(key)) {
+    if (typeof context.rowCount === 'number') return context.rowCount;
+    return context.metricIsSubject && context.metricUnit !== 'money' ? context.metricValue : undefined;
   }
-  if (/^(count|quantity|number|records?)$/.test(key)) return context.metricIsSubject ? context.metricValue : undefined;
   if (/^(period|window|timeframe|period_label)$/.test(key)) return context.window.label;
   if (/^(start|start_date|period_start|from)$/.test(key)) return context.window.start;
   if (/^(end|end_date|period_end|to)$/.test(key)) return context.window.end;
@@ -502,6 +592,11 @@ export function extractStructured(schema: SchemaNode, context: ExtractionContext
   const filled: string[] = [];
   const missing: string[] = [];
   const bound = bindRows(context, schema);
+  // The schema is about a record — it names one — and this run returned none of
+  // that kind. Nothing in the results is that record, so nothing in the results
+  // may fill its fields.
+  const recordless = !bound.primary
+    && Object.keys(schema.fields ?? {}).some((key) => fieldFamily(key) !== null);
 
   const build = (node: SchemaNode, name: string, path: string, row?: Record<string, unknown>): unknown => {
     if (node.type === 'object' && node.fields) {
@@ -523,10 +618,22 @@ export function extractStructured(schema: SchemaNode, context: ExtractionContext
     // that deal's amount, each of them separately true.
     const family = fieldFamily(name);
     const source = row ?? bound.rows[family ?? bound.primary ?? ''];
+    // An object about a record, with no record behind it, is nulls.
+    //
+    // "Who are our biggest customers?" filled `{"company": null, "deal_name":
+    // null, "amount": 58320000}` — the amount of one unrelated deal, in an
+    // object that names no record at all. Every field of that object was
+    // separately findable somewhere in the results and the object as a whole
+    // was a fabrication, which is the same defect as mixing two rows.
+    // A number is also read only from the step that answered the question:
+    // `{"total": …}` over "how many invoices are outstanding?" came back as 2,
+    // the row count of the *delinquent customers* step the plan also ran.
+    const rummage = source || recordless ? undefined
+      : findInResults(name, node.type === 'number' || node.type === 'integer' ? context.results.slice(0, 1) : context.results);
     const candidates = [
       row ? valueIn(name, row) : rowValue(name, bound, family),
-      conventionalValue(name, node, context),
-      source ? undefined : findInResults(name, context.results),
+      conventionalValue(name, node, context, recordless),
+      rummage,
       findInMessage(name, context.question),
       node.default,
     ];

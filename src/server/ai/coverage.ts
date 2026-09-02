@@ -112,6 +112,19 @@ export interface CoverageReport {
  * A domain noun must never be added — "security", "escalated" and "past due"
  * all read as furniture to a careless eye and each of them is a filter.
  */
+/**
+ * The negations, which are operators rather than furniture.
+ *
+ * A negation selects rows by their absence, so it narrows a question exactly as
+ * a threshold does. Two of them are two characters long and one is a determiner,
+ * which is how they were being dropped twice over — once by the furniture list
+ * and once by the short-token rule — and "how many companies have never had a
+ * deal?" came back as the count of every company in the book.
+ */
+export const NEGATIONS = new Set<string>([
+  'no', 'not', 'never', 'without', 'neither', 'nor', 'except', 'excluding', 'none', 'nothing',
+]);
+
 const FURNITURE = new Set<string>([
   ...STOPWORDS,
   // question words and their contractions, already normalised
@@ -122,7 +135,10 @@ const FURNITURE = new Set<string>([
   'might', 'must', 'got', 'get', 'gets', 'getting',
   // determiners, quantifiers and degree
   'a', 'an', 'the', 'this', 'that', 'these', 'those', 'some', 'any', 'all', 'both', 'each',
-  'every', 'no', 'none', 'much', 'many', 'more', 'most', 'few', 'fewer', 'less', 'least',
+  // "no" and "none" are determiners and they are also the negation: "companies
+  // with no deals" selects rows by their absence. They are claimed by the
+  // operator that carries them, like every other negation, and never dropped.
+  'every', 'much', 'many', 'more', 'most', 'few', 'fewer', 'less', 'least',
   'very', 'quite', 'really', 'just', 'only', 'even', 'still', 'yet', 'already', 'ever',
   'right', 'now', 'currently', 'exactly', 'roughly', 'about', 'around',
   // pronouns and possessives
@@ -131,7 +147,7 @@ const FURNITURE = new Set<string>([
   // prepositions and conjunctions
   'of', 'for', 'to', 'in', 'on', 'at', 'by', 'with', 'from', 'into', 'onto', 'off', 'out',
   'and', 'or', 'but', 'if', 'so', 'as', 'than', 'then', 'because', 'while', 'per', 'via',
-  'up', 'down', 'across', 'between', 'against', 'within', 'without', 'per',
+  'up', 'down', 'across', 'between', 'against', 'within', 'per',
   // identity and possession: closed class, and never a filter on their own.
   // A possession verb points at an owner slot; the *name* in that slot is what
   // narrows the question, and an unresolvable name is refused on its own.
@@ -140,8 +156,11 @@ const FURNITURE = new Set<string>([
   'assigned', 'assign', 'manages', 'managed', 'managing',
   'carry', 'carries', 'carrying', 'carried', 'hold', 'holds', 'holding', 'held',
   'sit', 'sits', 'sitting', 'sat', 'stand', 'stands', 'standing', 'stood',
-  // temporal deixis: which period, never which rows
-  'last', 'next', 'previous', 'prior', 'coming', 'upcoming', 'past', 'recent', 'recently',
+  // temporal deixis: which period, never which rows.
+  // "past" is not here: "in the past 30 days" is a period, and a period claims
+  // it, but "past their close date" is a comparison on a column and dropping it
+  // answered a question about four slipped deals with the whole open book.
+  'last', 'next', 'previous', 'prior', 'coming', 'upcoming', 'recent', 'recently',
   'current', 'latest', 'today', 'yesterday', 'tomorrow', 'ago', 'since', 'until', 'till',
   'ongoing', 'far', 'date', 'dates', 'time', 'times', 'period', 'periods', 'window',
   // the platform's own word for the whole book, which narrows nothing
@@ -151,8 +170,14 @@ const FURNITURE = new Set<string>([
   'increase', 'increased', 'decrease', 'decreased', 'change', 'changed', 'changing',
   'rise', 'rose', 'risen', 'fall', 'fell', 'fallen', 'drop', 'dropped', 'improve', 'improved',
   'move', 'moved', 'moving', 'trend', 'trending', 'trended',
-  // negation and its scope words: closed class, and never a filter on their own
-  'not', 'never', 'nor', 'neither', 'without', 'except', 'excluding', 'other',
+  // Negation is NOT here, and the omission is the point. "How many companies
+  // have never had a deal?" was answered "Northwind Robotics has 48 companies"
+  // — every company in the book — because "never" read as furniture and the
+  // rest of the sentence resolved. A negation is an operator: it is accounted
+  // for when the plan carries one (`is_not_set`, `not_in`, `neq`) or when the
+  // capability that ran publishes itself in those words, and it is a gap
+  // otherwise. Only "other", which selects nothing on its own, stays.
+  'other',
   // comparison and framing verbs that set up a question rather than narrow it
   'compare', 'compared', 'comparing', 'comparison', 'versus', 'vs', 'against',
   'break', 'broken', 'split', 'splits', 'grouped', 'group', 'bucketed', 'segmented', 'sliced',
@@ -442,7 +467,9 @@ export function auditCoverage(input: CoverageInput): CoverageReport {
     if (by[at]) { accounted.push({ token, by: by[at]! }); continue; }
     if (/^\d/.test(token) || numericClaimed.has(token)) { ignored.push(token); continue; }
 
-    if (FURNITURE.has(token) || token.length <= 2) { ignored.push(token); continue; }
+    // A negation is never furniture and never too short to matter: "no" is two
+    // characters and it is the whole of the filter in "companies with no deals".
+    if ((FURNITURE.has(token) || token.length <= 2) && !NEGATIONS.has(token)) { ignored.push(token); continue; }
     if (workspaceWords.has(token)) { ignored.push(token); continue; }
     if (seen.has(token)) continue;
     seen.add(token);

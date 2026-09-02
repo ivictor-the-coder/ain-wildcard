@@ -42,7 +42,7 @@ import {
 } from './dimensions';
 import { propertyMap } from './query';
 import {
-  auditCoverage, carriesComparison, coverageRefusal, numbersIn,
+  auditCoverage, carriesComparison, coverageRefusal, numbersIn, NEGATIONS as NEGATION_WORDS,
   type CoverageClaim, type CoverageNumeric,
 } from './coverage';
 import {
@@ -50,7 +50,7 @@ import {
   type AccountProfileResult, type TimelineItem,
 } from './functions';
 import { composeDraft, detectDraftKind, detectTone, type DraftKind, type DraftResult, type Tone } from './draft';
-import { extractStructured, normaliseResponseSchema } from './extract';
+import { countedRows, extractStructured, normaliseResponseSchema } from './extract';
 import { synthesise, type ResultOutcome, type StepResult } from './synth';
 import { accountUsage, estimateTokens, messageTokens, toolTokens } from './usage';
 import { EMAIL_PATTERN, ID_PATTERN, QUOTED_PATTERN, acronymOf, contentWords, humanise, listPhrase, normalise, stem, truncate } from './text';
@@ -760,6 +760,10 @@ const COVERED_INTENTS = new Set<TaskIntent>(['aggregate', 'compare', 'lookup']);
 const PERIOD_WORDS = [
   'year', 'years', 'quarter', 'quarters', 'month', 'months', 'week', 'weeks', 'day', 'days',
   'hour', 'hours', 'fortnight', 'half', 'halves', 'season', 'ytd', 'qtd', 'mtd', 'trailing',
+  // "in the past 30 days" spends "past" on the window it resolved to. Nothing
+  // spends it when no window resolved, which is what makes "past their close
+  // date" a comparison this plan has to carry or refuse.
+  'past',
   'rolling', 'over', 'through', 'across', 'ending', 'ended', 'starting', 'started', 'between',
   'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven',
   'twelve', 'twenty', 'thirty', 'sixty', 'ninety',
@@ -783,6 +787,21 @@ const USAGE_VERBS = [
   'emit', 'emitted', 'upload', 'uploaded', 'store', 'stored', 'storing', 'meter',
   'metered', 'metering', 'use', 'used', 'usage', 'peak', 'peaked', 'draw', 'drew', 'drawn',
 ];
+
+/**
+ * The operators that mean "not this", and the words a reader writes them with.
+ *
+ * A negation is the only kind of qualifier that narrows a question by removing
+ * rows, and it used to be furniture: "never", "no" and "without" were dropped
+ * in silence, so a question about the companies with no deals was answered with
+ * every company. The words are accounted for exactly when the plan carries one
+ * of these operators — or when the capability that ran is itself published in
+ * those words, which is how `stale_accounts` ("no logged activity", "what have
+ * we not touched") spends them.
+ */
+const NEGATING_OPS = new Set(['is_not_set', 'not_in', 'neq', 'ne', 'not_contains', 'is_null', '!=', '<>']);
+
+const NEGATIONS = [...NEGATION_WORDS];
 
 /** The words that put a name in an owner slot. */
 const OWNERSHIP = [
@@ -1025,10 +1044,29 @@ export function coverageClaims(input: {
   // `payments_recovery_queue`; "which accounts have gone quiet" runs the
   // capability whose own description is about accounts that have gone quiet.
   // Those words are read, by the tool, and reading them is what the plan is.
+  const negation = new Set(NEGATIONS);
+  const askedWords = new Set(normalise(input.question).split(' ').filter(Boolean).map(stem));
   for (const capability of input.capabilities) {
     claims.push({ text: capability.name.replace(/[._]/g, ' '), by: `\`${capability.name}\`` });
     for (const word of capability.name.split(/[._]/)) claims.push({ text: word, by: `\`${capability.name}\`` });
-    for (const word of contentWords(capability.description)) claims.push({ text: word, by: `\`${capability.name}\`` });
+    const described = contentWords(capability.description);
+    for (const word of described) {
+      // A negation is the one word a description may not spend on its own.
+      // `record_search` publishes its operator list — "eq, neq, in, not_in …" —
+      // so every plan that touched it claimed the reader's "no" and "not", and
+      // "how many companies have no open deals?" came back as $9,010,960 of
+      // open pipeline. A capability spends a negation only where it is talking
+      // about the same absence the reader is: the words beside it in the
+      // description have to be words the question itself uses, which is how
+      // `stale_accounts` ("what have we not touched") answers for "which
+      // accounts have not been touched in 90 days".
+      if (!negation.has(word)) { claims.push({ text: word, by: `\`${capability.name}\`` }); continue; }
+      const at = described.indexOf(word);
+      const nearby = described.slice(Math.max(0, at - 3), at + 4).filter((near) => !negation.has(near));
+      if (nearby.some((near) => askedWords.has(stem(near)))) {
+        claims.push({ text: word, by: `\`${capability.name}\`` });
+      }
+    }
   }
   // The names of the arguments a step was actually given. `stale_accounts` is
   // called with `days: 120`, so the reader's word "days" is the parameter this
@@ -1052,6 +1090,15 @@ export function coverageClaims(input: {
       const property = (condition as { property?: unknown } | null)?.property;
       if (typeof property !== 'string') continue;
       for (const word of property.split('_')) claims.push({ text: word, by: `the ${property.replace(/_/g, ' ')} filter` });
+      // A negation in the question is an operator, and this is the operator.
+      // "Which deals have no next step?" runs `next_step is_not_set`, and that
+      // is what spends the reader's "no"; a plan with no negation in it spends
+      // nothing, so "how many companies have never had a deal?" is a gap rather
+      // than a count of every company.
+      const op = String((condition as { op?: unknown } | null)?.op ?? '');
+      if (NEGATING_OPS.has(op)) {
+        for (const word of NEGATIONS) claims.push({ text: word, by: `the \`${property} ${op.replace(/_/g, ' ')}\` filter` });
+      }
     }
   }
   // The vocabulary of every measure in the catalogue, once one of them bound.
@@ -2114,6 +2161,10 @@ export function builtinEngine(): AiProvider {
         // either. `{"win_rate": 0}` came back beside prose saying there is no
         // rate to report — the two halves of the same run contradicting each
         // other, and only the JSON reaches an automation.
+        // Every list capability carries its own row count — `billing_list_subscriptions`
+        // returns `{ total: 31, subscriptions: [...] }` — and without reading it
+        // a run whose prose said "31 subscriptions" filled no count field at all.
+        const listed = countedRows(executed);
         const measureUndefined = !!metricResult && metricResult.count === 0
           && metricUndefinedWhenEmpty(metricResult.metric ?? metric?.metric.id ?? null);
         const extraction = extractStructured(normaliseResponseSchema(req.responseSchema), {
@@ -2134,8 +2185,13 @@ export function builtinEngine(): AiProvider {
           metricLabel: metric?.metric.label ?? null,
           // The row count the same aggregate carries, so a `deal_count` field
           // is not null next to an `open_pipeline` it filled.
-          rowCount: metricResult?.matched_records ?? metricResult?.count ?? null,
-          rowType: countedNoun,
+          rowCount: metricResult?.matched_records ?? metricResult?.count ?? listed?.count ?? null,
+          rowType: countedNoun ?? listed?.type ?? null,
+          metricUnit: metric?.metric.unit ?? null,
+          // The words the reader actually wrote, so a field name that adds one
+          // of its own — `churned_subscriptions` over a question about active
+          // ones — is left null rather than filled with the wrong population.
+          askedWords: new Set(normalise(question).split(' ').filter(Boolean).flatMap((word) => [word, stem(word)])),
           owner: qualifiers.label('owner'),
           // Every dimension this run really bound, under the names a schema
           // gives it — so a field named for a scope is filled from the scope

@@ -323,7 +323,31 @@ function AssistantMessage({
    * that names what it actually measured rather than sitting in the answer slot.
    */
   const quarantined = scope.invented.length > 0 && scope.answering.length > 0;
-  const { shown, done } = useReveal(body, newest && !quarantined);
+
+  /**
+   * Nothing is printed until the workspace vocabulary that corrects it is in.
+   *
+   * Three of the engine's sentences are replaced here rather than rebutted —
+   * the denial that a pipeline this workspace has exists, the currency claim
+   * over a figure printed in another book, the refusal that asks a sales lead
+   * for an API parameter — and every one of them needs `/v1/pipelines/deal`,
+   * `/v1/pipelines/ticket` and the metric catalogue to have answered. They
+   * answer *after* the turn does.
+   *
+   * On a measured answer the scope row at least drew a "reading this
+   * workspace…" chip while that gap was open. A refused turn measures nothing,
+   * so the row renders nothing, and "No deal pipeline in this workspace is
+   * called “Support”" sat on screen in the engine's confident voice, beside a
+   * Support pipeline holding 35 tickets, for as long as the read took. A
+   * correction that arrives after the reader has read the sentence is not a
+   * correction, so the sentence waits for it.
+   */
+  // Latched, so a later refetch of the pipelines or the metric catalogue — a
+  // mutation elsewhere on the screen invalidates them — cannot blank an answer
+  // that has already been read.
+  const [checked, setChecked] = useState(!vocabLoading);
+  useEffect(() => { if (!vocabLoading) setChecked(true); }, [vocabLoading]);
+  const { shown, done } = useReveal(body, newest && !quarantined && checked);
 
   // The prose was composed when the engine stopped: it says "Nothing has been
   // written" and always will. Once a decision has been made it is history, not
@@ -458,25 +482,45 @@ function AssistantMessage({
           </Banner>
         )}
 
-        {inherited?.subject && (
+        {/* A record and a measure are both carried in silently, and only the
+            record was ever drawn. "And by owner?" names no measure of its own:
+            the engine answers it with Open pipeline because the question before
+            it did, and the reader of the breakdown had nothing on the card
+            saying which number it is a breakdown of. Only the record narrows
+            the answer, so only the record offers to come off — taking a
+            carried measure off "And by owner?" leaves nothing to ask. */}
+        {(inherited?.subject || inherited?.measure) && (
           <div className="cp-carried">
             <span className="cp-carried__label">Carried into this question</span>
-            <span className="cp-carried__chip">
-              <Icons.link size={11} />
-              <span className="u-truncate">{inherited.subject}</span>
-              <span className="cp-carried__from">
-                {inherited.pinned ? 'this conversation’s record' : 'the question before it'}
+            {inherited.subject && (
+              <span className="cp-carried__chip">
+                <Icons.link size={11} />
+                <span className="u-truncate">{inherited.subject}</span>
+                <span className="cp-carried__from">
+                  {inherited.pinned ? 'this conversation’s record' : 'the question before it'}
+                </span>
               </span>
-            </span>
-            <button
-              type="button"
-              className="cp-carried__drop"
-              onClick={() => onAskFresh(question)}
-              title={`Ask “${question}” in a new conversation, where nothing is carried in`}
-            >
-              <Icons.x size={11} />
-              Ask it without {inherited.subject}
-            </button>
+            )}
+            {inherited.measure && (
+              <span className="cp-carried__chip">
+                <Icons.gauge size={11} />
+                <span className="u-truncate">{inherited.measure}</span>
+                <span className="cp-carried__from">
+                  {inherited.from ? `from “${inherited.from}”` : 'the question before it'}
+                </span>
+              </span>
+            )}
+            {inherited.subject && (
+              <button
+                type="button"
+                className="cp-carried__drop"
+                onClick={() => onAskFresh(question)}
+                title={`Ask “${question}” in a new conversation, where nothing is carried in`}
+              >
+                <Icons.x size={11} />
+                Ask it without {inherited.subject}
+              </button>
+            )}
           </div>
         )}
 
@@ -519,14 +563,20 @@ function AssistantMessage({
           rephrase={rephrase && !refusal ? { question: rephrase, onAsk } : null}
         />
 
-        {vocabUnread && scope.answering.length > 0 && (
+        {/* Both of these used to be gated on the answer having measured
+            something, which is exactly the turn that needs them least: a
+            refusal measures nothing, draws no scope row, and had no way at all
+            to say that the reads its corrections depend on had failed. A read
+            that failed never lands, so waiting for it is not the fix — the
+            prose is shown, and the card says what was not checked. */}
+        {vocabUnread && checked && (
           <Banner tone="warning" compact title="The scope of this answer was not checked">
             The pipelines, teammates and metric catalogue this workspace defines could not be read, so
             nothing below has been compared against what the question asked for.
           </Banner>
         )}
 
-        {!vocabUnread && vocabPartial.length > 0 && scope.answering.length > 0 && (
+        {!vocabUnread && vocabPartial.length > 0 && checked && (
           <Banner tone="warning" compact title="Part of this workspace’s vocabulary could not be read">
             {f.list(vocabPartial)} did not answer, so a question naming one of those was not checked
             against it. Everything else below was.
@@ -554,7 +604,15 @@ function AssistantMessage({
 
         <ScopeBar report={scope} vocab={vocab} loading={vocabLoading} unread={vocabUnread} />
 
-        {quarantined ? (
+        {!checked ? (
+          <div className="cp-answer__waiting" role="status" aria-live="polite">
+            <SkeletonText lines={3} />
+            <p className="cp-note">
+              Reading this workspace’s own pipelines, teammates and measures before this answer is
+              shown — some of what the engine wrote is checked against them.
+            </p>
+          </div>
+        ) : quarantined ? (
           <details className="cp-details cp-quarantine">
             <summary>Show the figure the engine returned, and what it measured instead</summary>
             <div className={superseded ? 'cp-superseded' : undefined}>
@@ -567,9 +625,9 @@ function AssistantMessage({
           </div>
         )}
 
-        {done && !quarantined && breakdown && <BreakdownPanel report={breakdown.report} pipeline={breakdown.pipeline} />}
+        {checked && done && !quarantined && breakdown && <BreakdownPanel report={breakdown.report} pipeline={breakdown.pipeline} />}
 
-        {done && <ToolEchoes echoes={echoes} notes={notes} />}
+        {checked && done && <ToolEchoes echoes={echoes} notes={notes} />}
 
         <CitationChips citations={citations} />
 

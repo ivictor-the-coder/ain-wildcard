@@ -217,6 +217,14 @@
 }
 .cp-answer__body p { margin: 0; white-space: pre-wrap; }
 .cp-answer__body ul { margin: 0; padding-left: var(--space-7); display: flex; flex-direction: column; gap: var(--space-2); }
+/* The gap between the answer landing and the workspace vocabulary that
+   corrects it landing. Nothing of the engine's prose is drawn here: a sentence
+   this surface is about to replace must not be read first. */
+.cp-answer__waiting {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
 .cp-answer__caret {
   display: inline-block;
   width: 2px;

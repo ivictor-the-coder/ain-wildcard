@@ -7,8 +7,8 @@
  * navigate, steps that open to their exact arguments and result, and the
  * approval card that shows a write before it happens.
  */
-import { useState } from 'react';
-import { api, useMutation, useQuery } from '@/client/kernel/api';
+import { useRef, useState } from 'react';
+import { api, invalidate, useMutation, useQuery } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import {
   AlertTriangleIcon,
@@ -358,6 +358,60 @@ export function ApprovalCard({ approval, question, onDecided }: {
     && (!!dealRead.error || !!vocabulary.error || (!dealRead.loading && !vocabulary.loading && !consequences));
   const mustAcknowledge = needsAcknowledgement(consequences, consequencesUnread);
 
+  /**
+   * The way back from the write with the largest blast radius in this product.
+   *
+   * A card dropped into the wrong column on the board lands with "Undo" in its
+   * notification, and pressing it restores the stage, the probability, the
+   * forecast category and the close date the server stamped. The identical
+   * write approved here — the one that reopens a closed-lost deal and puts
+   * $223,440 back into the forecast — landed with "Written to the workspace"
+   * and nothing else, and the only way back was to go and find the deal.
+   *
+   * The snapshot is taken from the record as this card read it, before the
+   * write, so the notification already knows where the deal came from. Only
+   * `deal_stage` and `close_date` are put back: the probability, the forecast
+   * category and the status are stamped from the stage, and the server refuses
+   * a write to them.
+   */
+  const undoTo = useRef<{ id: string; name: string; stage: string; closeDate: number | null; label: string } | null>(null);
+  const captureUndo = () => {
+    const row = dealRead.data;
+    const stage = row ? textOf(row.properties.deal_stage) : null;
+    undoTo.current = stageWrite && row && stage
+      ? {
+        id: row.id,
+        name: row.display_name,
+        stage,
+        closeDate: numberOf(row.properties.close_date),
+        label: consequences?.from?.label ?? humanize(stage),
+      }
+      : null;
+  };
+
+  const undo = useMutation<void, DealRow>(
+    () => {
+      const back = undoTo.current;
+      if (!back) throw new Error('nothing to undo');
+      return api.patch<DealRow>(`/v1/records/deal/${encodeURIComponent(back.id)}`, {
+        properties: { deal_stage: back.stage, close_date: back.closeDate },
+      });
+    },
+    {
+      invalidates: ['/v1/records', '/v1/pipelines', '/v1/crm/overview', '/v1/events', '/v1/ai/runs'],
+      onSuccess: (row) => {
+        invalidate(`/v1/records/deal/${row.id}`);
+        const status = textOf(row.properties.deal_status);
+        toast.success(
+          `Back in ${undoTo.current?.label ?? 'its old stage'}`,
+          `${row.display_name} is ${status ?? 'where it was'} again, at the probability and forecast category that stage carries.`,
+        );
+        undoTo.current = null;
+      },
+      onError: (e) => toast.error('The write was not undone', e.body.message),
+    },
+  );
+
   const decide = useMutation<'approve' | 'decline', { executed?: boolean; status: string; outcome: string | null }>(
     (decision) => api.post(`/v1/ai/approvals/${encodeURIComponent(approval.id)}`, { decision }),
     {
@@ -371,6 +425,10 @@ export function ApprovalCard({ approval, question, onDecided }: {
           const { text } = outcomeSummary(decided);
           if (approvalOutcome(decided) === 'failed') {
             toast.error('Approved — and the write failed', `${text} Nothing changed.`, { duration: 0 });
+          } else if (undoTo.current) {
+            toast.success('Written to the workspace', text, {
+              action: { label: 'Undo', onClick: () => { void undo.run().catch(() => undefined); } },
+            });
           } else {
             toast.success('Written to the workspace', text);
           }
@@ -501,7 +559,10 @@ export function ApprovalCard({ approval, question, onDecided }: {
                   ? `${blocked} Confirm it above first.`
                   : undefined}
                 iconLeft={<Icons.check size={13} />}
-                onClick={() => { void decide.run('approve').catch(() => undefined); }}
+                onClick={() => {
+                  captureUndo();
+                  void decide.run('approve').catch(() => undefined);
+                }}
               >
                 {mismatch || mustAcknowledge ? 'Approve anyway' : 'Approve and run'}
               </Button>

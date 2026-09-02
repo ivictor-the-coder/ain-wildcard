@@ -3271,3 +3271,363 @@ test('an answer measured with a filter nobody asked for is not shown as an answe
   await expect(quarantine).not.toHaveAttribute('open', '');
   await expect(answer.locator('.cp-answer__caret')).toHaveCount(0);
 });
+
+/**
+ * A correction that has not been read yet is not a correction.
+ *
+ * "How many tickets are in the Support pipeline?" is refused, and the refusal
+ * prose says "No deal pipeline in this workspace is called 'Support'" and then
+ * lists three pipelines as though they were all of them. There is a Support
+ * pipeline; it holds 35 tickets. The surface replaces that sentence — but only
+ * once `/v1/pipelines/ticket` has answered, and the answer arrives first.
+ *
+ * A refused turn measures nothing, so the scope row renders nothing, so there
+ * was not even a "reading this workspace…" chip to say the check had not run:
+ * the falsehood sat on screen in the engine's own voice, for as long as the
+ * read took. Under a full suite that is seconds, and it is what made this the
+ * one test in this file that failed on load and passed on its own.
+ */
+test('a refusal is not printed before the workspace vocabulary that corrects it is read', async ({ page, request }) => {
+  const tickets = await getJson<{ data: PipelineDef[] }>(request, '/api/v1/pipelines/ticket');
+  test.skip(tickets.data.length === 0, 'this workspace has no ticket pipeline');
+  const support = tickets.data[0];
+
+  await page.route('**/api/v1/pipelines/ticket**', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+    await route.continue();
+  });
+
+  await page.goto('/copilot?new=1', { waitUntil: 'domcontentloaded' });
+  const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
+  await composer.fill(`How many tickets are in the ${support.label} pipeline?`);
+  await composer.press('Enter');
+  const answer = page.locator('.cp-answer').last();
+  await expect(answer).toBeVisible({ timeout: 40_000 });
+
+  // Sampled across the whole gap rather than once after it: the denial was on
+  // screen for exactly as long as the ticket-pipeline read took.
+  const seen: string[] = [];
+  for (let i = 0; i < 24; i += 1) {
+    seen.push(...await answer.locator('.cp-answer__body').allInnerTexts());
+    await page.waitForTimeout(150);
+  }
+  expect(
+    seen.filter((body) => /No deal pipeline in this workspace is called/i.test(body)),
+    'the uncorrected denial was shown while the pipelines that disprove it were still being read',
+  ).toEqual([]);
+
+  // And once the read lands the answer says the true thing.
+  await expect(answer.locator('.cp-answer__body')).toContainText(
+    `is a ticket pipeline in this workspace`,
+    { timeout: 20_000 },
+  );
+});
+
+/**
+ * The same read, failed rather than slow.
+ *
+ * A failed read never lands, so waiting is not the fix — the prose has to be
+ * shown, and the card has to say that the workspace vocabulary behind its
+ * corrections could not be read. Both disclosures were gated on the answer
+ * having measured something, and a refusal measures nothing, so a refused turn
+ * whose vocabulary failed said nothing at all.
+ */
+test('a refusal whose workspace vocabulary could not be read says so', async ({ page }) => {
+  await page.route('**/api/v1/pipelines/ticket**', (route) => route.abort());
+
+  await page.goto('/copilot?new=1', { waitUntil: 'domcontentloaded' });
+  const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
+  await composer.fill('How many tickets are in the Support pipeline?');
+  await composer.press('Enter');
+  const answer = page.locator('.cp-answer').last();
+  await expect(answer.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
+
+  await expect(
+    answer.locator('.ain-banner', { hasText: 'could not be read' }).first(),
+  ).toContainText('pipelines that hold tickets', { timeout: 20_000 });
+});
+
+/**
+ * A measure inherited from the question before it is a carried scope too.
+ *
+ * "What is our open pipeline?" → "And by owner?" is answered by carrying Open
+ * pipeline forward, which the engine records in its notes and the card threw
+ * away: the chip only ever drew a carried *record*. A reader looking at "And
+ * by owner?" has no way to tell which measure the breakdown under it is of.
+ */
+test('a measure carried from the question before it is named on the answer', async ({ page, request }) => {
+  // Whether this engine carries a measure between turns is the engine
+  // builder's business, so it is asked through the API first and the surface
+  // claim below is only made when it does.
+  const thread = await postJson<{ id: string }>(request, '/api/v1/ai/threads', { title: 'carried measure' });
+  await postJson(request, `/api/v1/ai/threads/${thread.id}/messages`, { content: 'What is our open pipeline?' });
+  const second = await postJson<{ reasoning: string[] }>(
+    request, `/api/v1/ai/threads/${thread.id}/messages`, { content: 'And by owner?' },
+  );
+  test.skip(
+    !(second.reasoning ?? []).some((line) => /names no measure of its own; carried /.test(line)),
+    'this engine carried no measure between the turns',
+  );
+
+  await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+  const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
+  for (const question of ['What is our open pipeline?', 'And by owner?']) {
+    await composer.fill(question);
+    await composer.press('Enter');
+    await expect(page.locator('.cp-answer').last().locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
+    await expect(page.locator('.cp-answer').last().locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+  }
+
+  const answer = page.locator('.cp-answer').last();
+  const carried = answer.locator('.cp-carried').first();
+  await expect(carried).toContainText('Open pipeline');
+  await expect(carried).toContainText('What is our open pipeline?');
+  await expect(carried).toContainText('Carried into this question');
+
+  // A carried record narrows the answer and offers to come off. A carried
+  // measure is the subject of the question — taking it off "And by owner?"
+  // leaves nothing to ask — so it is stated and not offered as removable.
+  await expect(carried.getByRole('button', { name: /Ask it without/ })).toHaveCount(0);
+});
+
+/**
+ * "The copilot cannot set the amount on a deal" is a claim about the engine,
+ * not about the run — and the run it was printed over had never asked it to.
+ *
+ * With "Let it prepare writes" off, the engine stops before its write extractor
+ * and says so: "this run is read-only… turn on the switch and it will be
+ * prepared for your approval". The surface read that as the extractor failing,
+ * and put a red banner above it reading "The copilot cannot set the amount on a
+ * deal — it reads a stage change and nothing else", pointing the reader at the
+ * deal record to do it by hand. The card carried the claim and its refutation,
+ * three lines apart, and the loud half was the wrong one: flip the switch and
+ * the write really is prepared.
+ *
+ * The capability is real, so the banner is right with the switch on and wrong
+ * with it off, and this pins both.
+ */
+test('a write blocked by the writes switch is not reported as something the copilot cannot do', async ({ page, request }) => {
+  // An account with exactly one deal, so the handoff link has one record to
+  // name rather than two siblings it must refuse to choose between.
+  const deals = await getJson<DealList>(request, '/api/v1/records/deal?limit=200');
+  const byAccount = new Map<string, DealRecord[]>();
+  for (const row of deals.data) {
+    const account = row.display_name.split(' — ')[0];
+    byAccount.set(account, [...(byAccount.get(account) ?? []), row]);
+  }
+  const solo = [...byAccount.values()].find((rows) => rows.length === 1)?.[0];
+  test.skip(!solo, 'every account in this workspace carries more than one deal');
+  const question = `Set the amount on the ${solo!.display_name} deal to $2,000,000`;
+
+  await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+  const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
+  await composer.fill(question);
+  await composer.press('Enter');
+  const readOnly = page.locator('.cp-answer').last();
+  await expect(readOnly.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
+  await expect(readOnly.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+
+  // The engine's own sentence is the true one, and it is the only one.
+  await expect(readOnly.locator('.cp-answer__body')).toContainText('Let it prepare writes');
+  await expect(
+    readOnly.getByText('The copilot cannot set the amount on a deal'),
+    'a read-only run was reported as a capability this product does not have',
+  ).toHaveCount(0);
+
+  // With the switch on the engine reaches its extractor, and the limit is real.
+  await page.getByRole('switch', { name: /Let it prepare writes/i }).click();
+  await composer.fill(question);
+  await composer.press('Enter');
+  const allowed = page.locator('.cp-answer').last();
+  await expect(allowed.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
+  await expect(allowed.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+  await expect(allowed.getByText('The copilot cannot set the amount on a deal')).toBeVisible();
+  await expect(allowed.getByRole('link', { name: new RegExp(`Set the amount on ${solo!.display_name.split(' — ')[0]}`) }))
+    .toBeVisible();
+});
+
+/**
+ * Every question this workspace offers is a promise it will be answered.
+ *
+ * Two of the five starters this engine ships are refused: "Which support
+ * tickets need attention today?" on the word "today", and "How did bookings
+ * last quarter compare with the quarter before?" on the word "before" — both
+ * over data the workspace has and answers happily one word shorter. Whether the
+ * engine binds them is the engine builder's problem; whether pressing a
+ * suggested prompt is a dead end is this surface's, and a dead end is what it
+ * was.
+ *
+ * So: every suggestion either answers, or says on the card that a suggested
+ * question did not answer and hands back a rephrasing that does.
+ */
+test('every question this workspace suggests either answers or hands back one that does', async ({ page, request }) => {
+  const offered = await getJson<{ data: { question: string }[] }>(request, '/api/v1/ai/suggestions');
+  test.skip(offered.data.length === 0, 'this workspace suggests nothing');
+
+  for (const { question } of offered.data) {
+    await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+    const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
+    await composer.fill(question);
+    await composer.press('Enter');
+    const answer = page.locator('.cp-answer').last();
+    await expect(answer.locator('.cp-answer__body'), question).not.toBeEmpty({ timeout: 40_000 });
+    await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+
+    const broken = answer.locator('.ain-banner', { hasText: 'one of the suggested questions' });
+    if (await broken.count() === 0) continue;
+
+    // A refused promise is repaired where it broke: the same sentence without
+    // the part the engine could not place, one press away.
+    const rephrase = broken.getByRole('button', { name: /^Ask it as/ }).first();
+    await expect(rephrase, `“${question}” was refused with no way out`).toBeVisible();
+    await rephrase.click();
+
+    const second = page.locator('.cp-answer').last();
+    await expect(second.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
+    await expect(second.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+    await expect(
+      second.locator('.ain-banner', { hasText: 'refused' }),
+      `the rephrasing offered for “${question}” was refused too`,
+    ).toHaveCount(0);
+  }
+});
+
+/**
+ * A chase drafted from a deal is a claim about the account's ledger.
+ *
+ * `POST /v1/ai/draft` reads outstanding invoices for the record it is handed,
+ * and only a *billing* account has any. Handed a deal id — the only kind this
+ * dialog ever sent — it found no customer, found no invoices, and wrote the
+ * honest sentence for that state: "the billing ledger shows no invoice with an
+ * amount still due on that account". Brightline Foods owes $127,840 on
+ * NR-000032, 56 days late. Every chase this dialog produced told the customer
+ * who owed it the opposite, over a real signature.
+ *
+ * So it is drafted from the account, and read back against the same ledger this
+ * browser can see: the invoice number and the amount are in the letter, or
+ * there is no letter.
+ */
+test('a payment chase drafted from a deal names the invoice the account really owes', async ({ page, request }) => {
+  const owed = await getJson<{ data: { number: string; amount_due: number; customer: string }[] }>(
+    request, '/api/v1/invoices?status=open_like&limit=100',
+  );
+  const bill = owed.data.filter((row) => row.amount_due > 0).sort((a, b) => b.amount_due - a.amount_due)[0];
+  test.skip(!bill, 'nothing is outstanding on this workspace, so there is nothing to chase');
+
+  const customer = await getJson<{ name: string; crm_record_id: string | null }>(
+    request, `/api/v1/customers/${bill.customer}`,
+  );
+  test.skip(!customer.crm_record_id, 'the account that owes is not linked to a CRM company');
+  const onAccount = await getJson<DealList>(
+    request, `/api/v1/records/deal?q=${encodeURIComponent(customer.name)}&limit=10`,
+  );
+  const subject = onAccount.data.find((row) => row.display_name.startsWith(customer.name));
+  test.skip(!subject, 'the account that owes carries no deal to draft from');
+
+  await visit(page, `/deals/${subject!.id}`, '.ain-card');
+  await page.getByRole('button', { name: 'Move stage' }).click();
+  await page.getByRole('menuitem', { name: 'Draft a follow-up' }).click();
+  await page.getByLabel('Kind').selectOption('dunning');
+  await page.getByRole('button', { name: 'Write the draft' }).click();
+
+  const body = page.getByRole('textbox', { name: 'Body' });
+  await expect(body).toBeVisible({ timeout: 30_000 });
+  const letter = `${await page.getByRole('textbox', { name: 'Subject' }).inputValue()}\n${await body.inputValue()}`;
+
+  expect(letter, 'the chase does not name the invoice the ledger says is due').toContain(bill.number);
+  expect(letter, 'the chase tells a delinquent account it owes nothing')
+    .not.toMatch(/no unpaid invoice|no invoice with an amount still due|every issued invoice is paid|nothing to chase/i);
+  // The amount, formatted the way this workspace formats money.
+  expect(letter).toContain((bill.amount_due / 100).toLocaleString('en-US', { minimumFractionDigits: 2 }));
+
+  // And it is logged where the invoices are: on the account, not the deal.
+  await expect(page.getByRole('button', { name: new RegExp(`Log on ${customer.name.split(' ')[0]}`) })).toBeVisible();
+  await page.keyboard.press('Escape');
+});
+
+/**
+ * The write with the largest blast radius in this product is the only one with
+ * no way back.
+ *
+ * Drop a card into the wrong column and the notification it lands with says
+ * "Undo", and pressing it restores the stage, the probability, the forecast
+ * category and the close date the server stamped. Approve the identical write
+ * through the copilot — the one this file exists over, the one that reopens a
+ * closed-lost deal and moves $223,440 back into the forecast — and the
+ * notification says "Written to the workspace" and nothing else. The operator
+ * who reads the consequence one second too late has to go and find the deal.
+ */
+test('a stage change approved through the copilot can be undone from its notification', async ({ page, request }) => {
+  const defs = await getJson<{ data: PipelineDef[] }>(request, '/api/v1/pipelines/deal');
+  const deals = await getJson<DealList>(request, '/api/v1/records/deal?limit=200');
+  const lost = deals.data.find((row) => row.properties.deal_status === 'lost');
+  test.skip(!lost, 'nothing is closed lost on this workspace');
+  const home = defs.data.find((p) => p.name === lost!.properties.pipeline);
+  const reopenTo = home?.stages.find((s) => !s.is_closed && s.probability > 0);
+  test.skip(!reopenTo, 'that pipeline has no open stage to reopen into');
+  const before = await deal(request, lost!.id);
+
+  await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+  await page.getByRole('switch', { name: 'Let it prepare writes' }).click();
+  await page.getByRole('textbox', { name: 'Ask the copilot' })
+    .fill(`Move the ${lost!.display_name} deal to ${reopenTo!.label}`);
+  await page.getByRole('button', { name: 'Ask', exact: true }).click();
+  await expect(page.getByText('Waiting for your approval').first()).toBeVisible({ timeout: 40_000 });
+
+  const card = page.locator('.ain-card', { hasText: 'Waiting for your approval' }).first();
+  const preview = await card.locator('.cp-approval__preview').innerText();
+  test.skip(!preview.includes(lost!.display_name), 'the engine prepared this against a different record');
+
+  await card.locator('.ain-check__input').check();
+  await card.getByRole('button', { name: /^Approve/ }).click();
+
+  // It landed, and the deal really is open again.
+  await expect.poll(async () => (await deal(request, lost!.id)).properties.deal_status).toBe('open');
+
+  // The notification that announced it takes it back.
+  const undo = page.getByRole('button', { name: 'Undo' }).first();
+  await expect(undo, 'the write that reopens a closed deal landed with no way back').toBeVisible({ timeout: 20_000 });
+  await undo.click();
+
+  await expect.poll(async () => (await deal(request, lost!.id)).properties.deal_stage)
+    .toBe(before.properties.deal_stage);
+  const restored = await deal(request, lost!.id);
+  expect(restored.properties.deal_status, 'undoing the reopen left the deal open').toBe('lost');
+  expect(restored.properties.close_date, 'the close date the reopen cleared was not put back')
+    .toBe(before.properties.close_date);
+});
+
+/**
+ * The other half of the same rule: figures that cannot be read are not written
+ * around.
+ *
+ * A dunning letter is a claim about money made to a customer, so "probably
+ * right" is not the bar. If this screen cannot read the account's ledger it
+ * does not draft the chase at all — the sentence the engine writes for an
+ * empty read is "every issued invoice is paid", and sending that to somebody
+ * who owes six figures is worse than sending nothing.
+ */
+test('a payment chase is refused outright when the ledger cannot be read', async ({ page, request }) => {
+  const owed = await getJson<{ data: { customer: string; amount_due: number }[] }>(
+    request, '/api/v1/invoices?status=open_like&limit=100',
+  );
+  const bill = owed.data.filter((row) => row.amount_due > 0)[0];
+  test.skip(!bill, 'nothing is outstanding on this workspace');
+  const customer = await getJson<{ name: string }>(request, `/api/v1/customers/${bill.customer}`);
+  const onAccount = await getJson<DealList>(
+    request, `/api/v1/records/deal?q=${encodeURIComponent(customer.name)}&limit=10`,
+  );
+  const subject = onAccount.data.find((row) => row.display_name.startsWith(customer.name));
+  test.skip(!subject, 'the account that owes carries no deal to draft from');
+
+  await page.route('**/api/v1/invoices?**', (route) => route.abort());
+  await visit(page, `/deals/${subject!.id}`, '.ain-card');
+  await page.getByRole('button', { name: 'Move stage' }).click();
+  await page.getByRole('menuitem', { name: 'Draft a follow-up' }).click();
+  await page.getByLabel('Kind').selectOption('dunning');
+
+  await expect(page.getByRole('dialog').locator('.ain-banner--danger'))
+    .toContainText('No chase can be written for this record');
+  await expect(page.getByRole('button', { name: 'Write the draft' })).toBeDisabled();
+  await page.keyboard.press('Escape');
+});

@@ -399,7 +399,7 @@ export function inferConditions(
  */
 const MONEY_METRIC_SHAPE: Record<string, {
   objectType: string;
-  measure: 'sum' | 'count';
+  measure: 'sum' | 'count' | 'avg';
   property?: string;
   dateProperty?: string;
   conditions: (stages: StageSets) => InferredCondition[];
@@ -409,7 +409,16 @@ const MONEY_METRIC_SHAPE: Record<string, {
   closed_won: { objectType: 'deal', measure: 'sum', property: 'amount', dateProperty: 'close_date', conditions: (s) => [{ property: 'deal_stage', op: 'in', values: s.won }] },
   closed_lost: { objectType: 'deal', measure: 'sum', property: 'amount', dateProperty: 'close_date', conditions: (s) => [{ property: 'deal_stage', op: 'in', values: s.lost }] },
   deal_count: { objectType: 'deal', measure: 'count', conditions: (s) => [{ property: 'deal_stage', op: 'in', values: s.open }] },
-  avg_deal_size: { objectType: 'deal', measure: 'sum', property: 'amount', dateProperty: 'close_date', conditions: (s) => [{ property: 'deal_stage', op: 'in', values: s.won }] },
+  // An average is an average. This shape said `sum`, so "what is Priya Raman's
+  // average deal size?" ran a total over her closed-won book and printed it as
+  // "$0 in average deal size" — the measure's own name over a different
+  // function, which is the substitution in its purest form.
+  avg_deal_size: { objectType: 'deal', measure: 'avg', property: 'amount', dateProperty: 'close_date', conditions: (s) => [{ property: 'deal_stage', op: 'in', values: s.won }] },
+  sales_cycle: { objectType: 'deal', measure: 'avg', property: 'days_to_close', dateProperty: 'close_date', conditions: (s) => [{ property: 'deal_stage', op: 'in', values: s.won }] },
+  // "What is the average CSAT on closed tickets?" came back as "28 tickets
+  // status Closed" — the right rows, counted instead of averaged, under a
+  // question that named the average in its first four words.
+  csat: { objectType: 'ticket', measure: 'avg', property: 'satisfaction_score', dateProperty: 'resolved_at', conditions: () => [{ property: 'satisfaction_score', op: 'is_set' }] },
   // A rep with no tickets has zero tickets. `business_metric` counts the
   // workspace's backlog and takes no owner, so "how many open tickets does Nina
   // Kowalski have?" was refused rather than answered — and the answer is 0.

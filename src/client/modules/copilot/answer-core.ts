@@ -197,10 +197,25 @@ export function contradictsCarried(question: string, carried: CarriedScope | nul
  */
 const NO_WRITE = /^No write prepared: the request looks like ([a-z_]+), but (.+)$/;
 
+/**
+ * The other reason no write was prepared: nobody asked for one.
+ *
+ * With "Let it prepare writes" off the engine stops before its write extractor
+ * — "this run is read-only. Send `allow_writes: true` and I will prepare it for
+ * your approval" — and writes that in the same sentence shape as the extractor
+ * giving up. Read as the second, the card printed "The copilot cannot set the
+ * amount on a deal — it reads a stage change and nothing else" over prose
+ * saying the write *will* be prepared once the switch is on. Both cannot be
+ * true, and on that run the loud one was the false one: the limit is real, and
+ * this run never reached it.
+ */
+const RUN_IS_READ_ONLY = /^this run is read-only\b/i;
+
 export function noWritePrepared(run: { reasoning?: string[] } | undefined | null): { tool: string; why: string } | null {
   for (const line of run?.reasoning ?? []) {
     const match = NO_WRITE.exec(line.trim());
-    if (match) return { tool: match[1].replace(/\s+/g, '_'), why: match[2] };
+    if (!match) continue;
+    return RUN_IS_READ_ONLY.test(match[2].trim()) ? null : { tool: match[1].replace(/\s+/g, '_'), why: match[2] };
   }
   return null;
 }
