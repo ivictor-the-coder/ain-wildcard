@@ -275,20 +275,45 @@ export function composeDraft(input: DraftInput): DraftResult {
     }
     case 'dunning': {
       const bills = input.outstanding ?? [];
+      // A chase is an assertion about a specific bill. With no unpaid invoice
+      // on the ledger there is nothing to assert, and "our records show an
+      // invoice on your account is still outstanding" is a sentence about an
+      // invoice that does not exist — sent to a customer, over a real
+      // signature. The draft says what the ledger says instead.
+      if (!bills.length) {
+        return {
+          channel: 'email',
+          kind: 'dunning',
+          tone,
+          subject: account
+            ? `No unpaid invoice on ${name} — nothing to chase`
+            : 'No account named, so no invoice to chase',
+          body: account
+            ? [
+                `I have not drafted a chase for ${name}: the billing ledger shows no invoice with an amount still due on that account`,
+                `— every issued invoice is paid, void or draft.`,
+                `Naming a bill that does not exist is worse than sending nothing, so there is no letter here.`,
+                `If you are chasing a specific invoice, give me its number and I will write the note around it.`,
+              ].join(' ')
+            : [
+                `I have not drafted a chase, because this instruction names no account I could resolve to a billing customer,`,
+                `and a dunning letter that asserts an invoice I have not read is a claim about money made to a customer.`,
+                `Name the account — or pass \`record_id\` — and I will read its open invoices and write the note around the real numbers.`,
+              ].join(' '),
+          personalisation: [],
+          recipient: null,
+        };
+      }
       subject = bills.length === 1
         ? `Invoice ${bills[0].number} for ${name} — ${bills[0].amount_due_formatted} outstanding`
         : `Invoice for ${name} — payment outstanding`;
       const overdue = bills.filter((b) => (b.days_overdue ?? 0) > 0);
-      paragraphs.push(bills.length
-        ? [
-            tone === 'apologetic' ? 'Apologies for the chase —' : '',
-            bills.length === 1
-              ? `invoice ${bills[0].number} for ${bills[0].amount_due_formatted} is still outstanding${bills[0].due_at ? `, due ${calendarDay(workspace, bills[0].due_at)}` : ''}${(bills[0].days_overdue ?? 0) > 0 ? ` — ${bills[0].days_overdue} days ago` : ''}.`
-              : `${bills.length} invoices on your account are still outstanding.`,
-          ].filter(Boolean).join(' ').replace(/^—\s*/, '').replace(/^(\w)/, (m) => (tone === 'apologetic' ? m : m.toUpperCase()))
-        : tone === 'apologetic'
-          ? 'Apologies for the chase — our records show an invoice on your account is still outstanding.'
-          : 'Our records show an invoice on your account is still outstanding.');
+      paragraphs.push([
+        tone === 'apologetic' ? 'Apologies for the chase —' : '',
+        bills.length === 1
+          ? `invoice ${bills[0].number} for ${bills[0].amount_due_formatted} is still outstanding${bills[0].due_at ? `, due ${calendarDay(workspace, bills[0].due_at)}` : ''}${(bills[0].days_overdue ?? 0) > 0 ? ` — ${bills[0].days_overdue} days ago` : ''}.`
+          : `${bills.length} invoices on your account are still outstanding.`,
+      ].filter(Boolean).join(' ').replace(/^—\s*/, '').replace(/^(\w)/, (m) => (tone === 'apologetic' ? m : m.toUpperCase())));
       if (bills.length > 1) {
         paragraphs.push(bills.slice(0, 6).map((b) =>
           `• ${b.number} — ${b.amount_due_formatted}${b.due_at ? `, due ${calendarDay(workspace, b.due_at)}` : ''}${(b.days_overdue ?? 0) > 0 ? ` (${b.days_overdue} days past due)` : ''}`).join('\n'));

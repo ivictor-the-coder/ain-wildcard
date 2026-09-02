@@ -88,6 +88,21 @@ export const COMMON_WORDS = new Set([
   'deal', 'deals', 'opportunity', 'opportunities', 'stage', 'stages', 'won', 'win', 'wins', 'lost',
   'loss', 'losses', 'rate', 'rates', 'conversion', 'velocity', 'cycle', 'size', 'average', 'median',
   'total', 'sum', 'count', 'number', 'numbers', 'top', 'bottom', 'biggest', 'largest', 'smallest',
+  // Words a revenue desk uses for where money is and which row it means.
+  // Naming one of these back as something the workspace does not hold —
+  // 'I do not hold anything called "sitting"', 'called "one"' — reads as a
+  // denial that a real stage or the row just listed exists.
+  'sitting', 'sits', 'sat', 'stuck', 'parked', 'held', 'carrying', 'carries', 'one', 'ones',
+  // Quantifiers and comparatives modify a measure grammatically rather than
+  // narrowing it to a segment: "the most pipeline", "the upcoming invoice",
+  // "our whole book" name no product line, so none of them is an unknown
+  // qualifier the answer has to refuse.
+  'most', 'least', 'more', 'less', 'fewer', 'whole', 'entire', 'full', 'overall', 'current',
+  'currently', 'upcoming', 'coming', 'remaining', 'actual', 'real', 'true', 'only', 'other',
+  'another', 'same', 'old', 'previous', 'prior', 'recent', 'latest', 'big', 'large', 'small',
+  'high', 'low', 'good', 'bad', 'still', 'already', 'yet', 'approximate', 'exact', 'precise',
+  'raw', 'mean', 'typical', 'usual', 'normal', 'standard', 'live', 'ongoing', 'combined',
+  'aggregate', 'overall',
   'highest', 'lowest', 'best', 'worst', 'growth', 'growing', 'decline', 'declined', 'drop', 'dropped',
   'fell', 'fall', 'rise', 'rose', 'up', 'down', 'flat', 'trend', 'trending', 'share', 'percent',
   'percentage', 'ratio', 'value', 'amount', 'target', 'goal', 'performance', 'health', 'state',

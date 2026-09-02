@@ -14,7 +14,8 @@ import {
   aiRuntime, maskSecrets, type AiCallContext, type AiTraceSink, type AinCompletion, type PendingApproval,
 } from '../../ai/runtime';
 import { accountUsage, describeUsage } from '../../ai/usage';
-import { workspaceProfile } from '../../ai/grounding';
+import { entityIndex, workspaceProfile } from '../../ai/grounding';
+import { resolveEntities } from '../../ai/resolve';
 import { stageSets } from '../../ai/metrics';
 import { invalidateIndex } from '../../ai/grounding';
 import { accountProfile, recordSearch, recordTimeline, type AccountProfileResult } from '../../ai/functions';
@@ -274,6 +275,18 @@ function describeAnalysis(completion: AinCompletion) {
       ambiguous: !!entry.ambiguous,
       matched: entry.matched ?? null,
     })),
+    // Every qualifier the question named and what became of it. A caller can
+    // read this and see, field by field, which words of their own sentence
+    // reached the query — the one field that makes a silent substitution
+    // impossible to ship unnoticed.
+    qualifiers: analysis.qualifiers.map((entry) => ({
+      kind: entry.kind,
+      text: entry.text,
+      state: entry.state,
+      resolved: entry.resolved ? { value: entry.resolved.value, label: entry.resolved.label } : null,
+      bound_to: entry.binding ? { tool: entry.binding.tool, note: entry.binding.note ?? null } : null,
+      detail: entry.detail,
+    })),
     results: analysis.results,
     carried_subject: analysis.carriedSubject,
     steps: analysis.steps,
@@ -470,7 +483,16 @@ export default defineModule({
 
       draft(orgId, instruction, opts = {}) {
         const workspace = workspaceProfile(ctx, orgId);
-        const profile = opts.recordId ? accountProfile(ctx, orgId, { id: opts.recordId }) : null;
+        // A draft that cites a record has to cite a real one. With no
+        // `record_id` the account is resolved from the instruction itself and
+        // the draft is built on that row's own facts — a dunning letter used
+        // to be written for "your team" with no ledger behind it, asserting an
+        // outstanding invoice nobody had read.
+        const named = opts.recordId
+          ? opts.recordId
+          : resolveEntities(instruction, entityIndex(ctx, orgId), { prefer: ['company', 'customer', 'contact'], limit: 3, dedupe: true })
+            .find((hit) => hit.score >= 0.7 && ['company', 'customer', 'contact'].includes(hit.entity.type))?.entity.id ?? null;
+        const profile = named ? accountProfile(ctx, orgId, { id: named }) : null;
         const account = profile && !('error' in profile) ? profile : null;
         const timeline = account ? recordTimeline(ctx, orgId, { record_id: account.id, limit: 8 }).items : [];
         const sender = workspace.people.find((p) => p.id === opts.actorId) ?? workspace.people[0] ?? null;
@@ -682,6 +704,13 @@ export default defineModule({
         model: body.model,
       });
 
+      // A completion attached to a thread is a turn of that conversation, and a
+      // turn that is not written down is not there for the next one. This route
+      // used to answer, keep the answer to itself, and leave the thread with a
+      // hole where the subject had been named — so the follow-up (on either
+      // route) refused with "nothing before it named one" while the sentence
+      // that named Priya Raman had been answered a second earlier. Both routes
+      // append through `reply` now, which is the only path that writes a turn.
       const completion = body.messages?.length
         ? await svc().complete(req.auth.orgId, {
             messages: body.messages as AiMessage[],
@@ -689,7 +718,9 @@ export default defineModule({
             responseSchema,
             model: body.model,
           }, opts)
-        : (await svc().ask(req.auth.orgId, body.prompt!, opts)).completion;
+        : body.thread_id
+          ? (await svc().reply(req.auth.orgId, body.thread_id, body.prompt!, opts)).completion
+          : (await svc().ask(req.auth.orgId, body.prompt!, opts)).completion;
 
       const run = store.run(req.auth.orgId, completion.runId);
       return {

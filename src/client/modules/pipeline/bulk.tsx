@@ -138,6 +138,7 @@ export function BulkStageDialog({
 
   const missing = required.filter((property) => emptyValue(draft[property.name]));
 
+  const firstControl = useFirstControl();
   const offerUndo = useUndoBulkMove();
   // Each deal goes back to its *own* stage, not to one shared origin: a bulk
   // move that swept four columns into Negotiation has four ways home.
@@ -194,6 +195,7 @@ export function BulkStageDialog({
       open={open}
       onClose={onClose}
       size="md"
+      initialFocus={firstControl.initialFocus}
       title={`Move ${f.plural(moving.length, 'deal')} to ${stage.label}`}
       description={`Every one of them takes ${stage.label}’s ${stage.probability}% probability${stage.is_closed ? ' and closes' : ''}.`}
       footer={
@@ -210,7 +212,7 @@ export function BulkStageDialog({
         </>
       }
     >
-      <div className="pl-form">
+      <div className="pl-form" ref={firstControl.body} tabIndex={-1}>
         {unboundError(move.error, ['deal_stage', 'close_date', ...required.map((p) => p.name)]) && (
           <Banner tone="danger" title="Nothing was moved">{move.error?.body.message}</Banner>
         )}
@@ -397,7 +399,7 @@ export function BulkOwnerDialog({
         </>
       }
     >
-      <div className="pl-form" ref={firstControl.body}>
+      <div className="pl-form" ref={firstControl.body} tabIndex={-1}>
         {unboundError(assign.error, ['owner_id']) && (
           <Banner tone="danger" title="Nothing was reassigned">{assign.error?.body.message}</Banner>
         )}

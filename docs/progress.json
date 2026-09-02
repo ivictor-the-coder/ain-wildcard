@@ -1,12 +1,11 @@
 {
-  "updated": "2026-09-01T22:02:49.026630",
-  "headline": "The pivot worked. Seven client modules and 40 screens where there were four routes a day ago \u2014 and the revenue board answers the audit\u2019s worst finding by refusing to do the wrong thing: it will not convert or sum across currencies, it makes you pick a book.",
+  "updated": "2026-09-02T07:31:11.312687",
+  "headline": "Settings is the first piece through the new gate \u2014 93% operable, and a critic called it more honest about its own permission model than either reference product. The two that failed both failed the same way, which turned nine reported bugs into one: a qualifier the question named, dropped, and the unqualified answer stated confidently.",
   "stats": {
     "server modules": 10,
+    "client modules": 8,
     "api routes": 228,
-    "screens": 40,
-    "tests passing": 1079,
-    "lines of code": "140,154"
+    "lines of code": "152,873"
   },
   "waves": [
     {
@@ -208,19 +207,20 @@
         {
           "id": "pipeline-copilot",
           "title": "Deals board & copilot",
-          "status": "building",
-          "rounds": 1,
-          "operability": 0.5,
-          "debt": 9,
-          "note": "A kanban that moves the deal, and a copilot whose every claim carries citations and every tool call is an inspectable step."
+          "status": "rework",
+          "rounds": 4,
+          "operability": 0.81,
+          "debt": 54,
+          "note": "A deal board a critic said they would happily use daily.",
+          "verdict": "Welded to a copilot that answers the question it wishes you had asked: six phrasings of \"what is the Renewal pipeline worth\" all return the $9.0M workspace total for a $1.46M pipeline."
         },
         {
           "id": "revenue-screens",
           "title": "Revenue, usage, credits & dunning",
-          "status": "critique",
+          "status": "done",
           "rounds": 1,
           "note": "Per-currency books with an honest banner explaining that nothing is converted or added across them, an MRR movement waterfall carrying its reconciliation status, NRR, GRR, DSO, deferred balance, and a Who-moved panel naming the churned account.",
-          "operability": 0.8,
+          "operability": 0.9,
           "debt": 4
         }
       ]
@@ -271,6 +271,32 @@
           "rounds": 1,
           "debt": 33,
           "note": "A readonly session could write through the copilot; the time machine was process-global across tenants; one failed fetch blanked the whole app."
+        }
+      ]
+    },
+    {
+      "name": "Wave 4 \u00b7 Reach",
+      "status": "active",
+      "note": "The surfaces that were still unreachable, and the last falsehood-class defect in the engine.",
+      "pieces": [
+        {
+          "id": "settings",
+          "title": "Settings & administration",
+          "status": "done",
+          "rounds": 2,
+          "operability": 0.93,
+          "debt": 10,
+          "note": "Team and roles, API keys with the secret shown exactly once, the audit trail, the event stream, the job queue, tax rates, entitlements \u2014 and the time machine as a screen rather than an API call."
+        },
+        {
+          "id": "qualifier-invariant",
+          "title": "One invariant for every qualifier",
+          "status": "building",
+          "rounds": 3,
+          "operability": 0.65,
+          "debt": 83,
+          "note": "Every qualifier a question names must be bound to the query, refused out loud, or waived by name in the first sentence. No fourth state.",
+          "verdict": "Nine reported defects across two independent critics are one defect: a parsed qualifier that cannot be bound is dropped, and the unqualified result is stated as the answer. plan.ts already says this is wrong, in two comments \u2014 but it guards one qualifier at a time, so every type nobody wrote a guard for leaks."
         }
       ]
     }

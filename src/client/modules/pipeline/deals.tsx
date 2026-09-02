@@ -90,7 +90,12 @@ function DealCard({
   const account = accountOf(deal);
   const entered = dealEnteredStage(deal);
   const daysInStage = entered ? Math.floor((now - entered) / DAY_MS) : null;
-  const stalledAfter = velocity?.stalled_after_days ?? null;
+  // A deal parked in Closed won has not stalled, it has finished — however long
+  // it has sat there. The column header already refuses to count those; the card
+  // did not, so a board whose closed stages have ever been left (a deal reopened,
+  // a stage corrected) badged every finished deal "stalls after 3 days" while the
+  // header above it reported none.
+  const stalledAfter = currentStage?.is_closed ? null : velocity?.stalled_after_days ?? null;
   const stalled = daysInStage !== null && stalledAfter !== null && daysInStage > stalledAfter;
   const close = dealCloseDate(deal);
   // A close date is a calendar day: "overdue" is measured against the day the

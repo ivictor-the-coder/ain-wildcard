@@ -17,7 +17,7 @@ import { bucketGrain, type TimeWindow } from './dates';
 import { humanise, listPhrase, normalise } from './text';
 
 export type MetricUnit = 'money' | 'count' | 'percent' | 'days' | 'hours' | 'score';
-export type GroupBy = 'time' | 'owner' | 'stage' | 'industry' | 'account' | 'status' | 'priority' | 'source' | 'none';
+export type GroupBy = 'time' | 'owner' | 'stage' | 'pipeline' | 'industry' | 'account' | 'status' | 'priority' | 'source' | 'none';
 
 export interface MetricSubject {
   id: string;
@@ -38,6 +38,17 @@ export interface MetricInput {
    * as much a non-answer as adding them together was a wrong one.
    */
   currency?: string | null;
+  /**
+   * The deal pipeline the question named, as a filter on the rows measured.
+   *
+   * "What is the Renewal pipeline worth?" is a question about six deals worth
+   * $1.46M. Answering it with the workspace's $9.0M open pipeline is a precise
+   * answer to a question nobody asked, so a metric built on deals takes the
+   * pipeline as an argument and a metric built on anything else refuses it.
+   */
+  pipeline?: string | null;
+  /** The one deal stage the question named, same rule as `pipeline`. */
+  stage?: string | null;
 }
 
 export interface MetricGroup {
@@ -103,8 +114,32 @@ export interface MetricDefinition {
   unit: MetricUnit;
   /** Phrases that select this metric, strongest first. */
   patterns: RegExp[];
+  /**
+   * The exact names people write for this measure.
+   *
+   * Checked before the pattern scorer and longest-first, because scoring made
+   * "weighted pipeline" tie with "pipeline" and hand the question to whichever
+   * definition came first in this array — which answered a forecast question
+   * with the unweighted book, roughly twice the real figure.
+   */
+  phrases?: string[];
   keywords: string[];
   supportsSubject: boolean;
+  /**
+   * The rows this metric measures, when a pipeline filter can apply. A metric
+   * with no `scope` cannot be narrowed that way and says so rather than
+   * ignoring the qualifier.
+   */
+  scope?: 'deal';
+  /**
+   * Whether one named stage can replace this metric's own stage set.
+   *
+   * True for the snapshot measures over open deals. False for closed-won,
+   * closed-lost, win rate and the averages, whose stage set *is* their
+   * definition — "closed-won bookings in Negotiation" is not a narrower
+   * question, it is an empty one, and the honest answer is to refuse it.
+   */
+  stageFilter?: boolean;
   /** A snapshot metric ignores the window and reports "as of now". */
   snapshot?: boolean;
   compute(input: MetricInput): MetricResult;
@@ -228,6 +263,35 @@ function subjectScope(input: MetricInput): { associatedTo?: string } {
   return {};
 }
 
+/**
+ * The pipeline and stage filters the question named, as CRM conditions.
+ *
+ * A deal-sourced metric is measured over the rows that survive these. A metric
+ * that is not deal-sourced never reaches this function — `businessMetric`
+ * refuses the qualifier before computing anything, because narrowing invoiced
+ * revenue by a deal stage is not a narrower answer, it is a different one.
+ */
+export function dealScopeConditions(input: MetricInput): Condition[] {
+  const out: Condition[] = [];
+  if (input.pipeline) out.push({ property: 'pipeline', op: 'eq', value: input.pipeline });
+  if (input.stage) out.push({ property: 'deal_stage', op: 'eq', value: input.stage });
+  return out;
+}
+
+/**
+ * A stage the question named replaces the metric's own stage set.
+ *
+ * "How many deals are in Negotiation?" is not "how many open deals, of which
+ * some are in Negotiation" — the named stage *is* the filter, so the metric's
+ * open/won/lost condition is dropped in favour of it.
+ */
+function withDealScope(input: MetricInput, base: Condition[]): Condition[] {
+  const scoped = dealScopeConditions(input);
+  if (!scoped.length) return base;
+  const kept = input.stage ? base.filter((c) => c.property !== 'deal_stage') : base;
+  return [...kept, ...scoped];
+}
+
 function ownerLabeller(input: MetricInput): (key: string) => string {
   const byId = new Map(input.workspace.people.map((p) => [p.id, p.name]));
   return (key) => byId.get(key) ?? humanise(key);
@@ -262,6 +326,7 @@ function groupSpec(input: MetricInput, dateProperty: string): Partial<Parameters
     case 'time': return { groupByDate: { property: dateProperty, grain: bucketGrain(input.window) } };
     case 'owner': return {};
     case 'stage': return { groupBy: 'deal_stage' };
+    case 'pipeline': return { groupBy: 'pipeline' };
     case 'industry': return { groupBy: 'industry' };
     case 'status': return { groupBy: 'status' };
     case 'priority': return { groupBy: 'priority' };
@@ -625,6 +690,7 @@ function ratioGroups(
   const keyOf = (row: RecordSummary): string | null => {
     if (groupBy === 'owner') return row.owner_id ?? 'unassigned';
     if (groupBy === 'source') return String(row.properties.lead_source ?? '—');
+    if (groupBy === 'pipeline') return String(row.properties.pipeline ?? '—');
     const closed = Number(row.properties.close_date ?? 0);
     return closed ? bucketKey(closed) : null;
   };
@@ -836,7 +902,16 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'pipeline', label: 'Open pipeline', unit: 'money', supportsSubject: true, snapshot: true,
+    scope: 'deal', stageFilter: true,
+    phrases: ['open pipeline', 'pipeline', 'open deals', 'open deal value', 'pipeline value'],
     patterns: [/\bpipelines?\b/i, /\bopen\s+deals?\b/i, /\bcoverage\b/i, /\bin\s+flight\b/i,
+      // "The Renewal book" is the noun: a book of business is the open value
+      // of the deals in it, which is this measure and not closed-won bookings.
+      /\b(?:the|our|their|its|this|whole|entire|full)\s+(?:[a-z-]+\s+)?book\b/i,
+      // "How much is sitting in Proposal sent?" is the open value at a stage.
+      // With no measure behind it the question was refused as unreadable, in a
+      // sentence that denied two words of a stage this workspace lists.
+      /\b(?:sitting|sits|sat|stuck|parked)\s+in\b/i,
       // "What are our open deals worth?" is the pipeline number. It used to
       // fall through to a list of eight deals with no total under it. Bare
       // "worth" is deliberately not here: "how much is <account> worth" names
@@ -846,7 +921,8 @@ const DEFS: MetricDefinition[] = [
     keywords: ['pipeline', 'open deals', 'worth'],
     compute: (input) => {
       const scope = subjectScope(input);
-      const conditions: Condition[] = [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).open }];
+      const conditions: Condition[] = withDealScope(input,
+        [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).open }]);
       const agg = aggregate(input.ctx, input.workspace.orgId, {
         objectType: 'deal', conditions, measure: { property: 'amount', fn: 'sum' }, sampleIds: 8, ...scope,
         ...(input.groupBy === 'time' ? { groupByDate: { property: 'close_date', grain: bucketGrain(input.window) } } : groupSpec(input, 'close_date')),
@@ -863,6 +939,8 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'weighted_pipeline', label: 'Weighted pipeline', unit: 'money', supportsSubject: true, snapshot: true,
+    scope: 'deal', stageFilter: true,
+    phrases: ['weighted pipeline', 'weighted pipeline value', 'pipeline forecast', 'forecast', 'expected value', 'probability weighted pipeline'],
     // "What is our forecast for this quarter?" is the question a sales leader
     // asks most often. It was refused as an unrecognised measure — in a
     // sentence that offered "weighted pipeline" by name two lines below.
@@ -872,7 +950,7 @@ const DEFS: MetricDefinition[] = [
       const scope = subjectScope(input);
       const agg = aggregate(input.ctx, input.workspace.orgId, {
         objectType: 'deal',
-        conditions: [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).open }],
+        conditions: withDealScope(input, [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).open }]),
         measure: { property: 'weighted_amount', fn: 'sum' }, sampleIds: 8, ...scope, ...groupSpec(input, 'close_date'),
       });
       return result(input, { snapshot: true, id: 'weighted_pipeline', label: 'Weighted pipeline', unit: 'money' }, {
@@ -884,12 +962,26 @@ const DEFS: MetricDefinition[] = [
     },
   },
   {
-    id: 'closed_won', label: 'Closed-won bookings', unit: 'money', supportsSubject: true,
-    patterns: [/\bclosed[\s-]?won\b/i, /\bbookings?\b/i, /\bwon\s+deals?\b/i, /\bnew\s+business\s+closed\b/i, /\b(?:did\s+\w+\s+)?book(?:ed)?\b/i],
+    id: 'closed_won', label: 'Closed-won bookings', unit: 'money', supportsSubject: true, scope: 'deal',
+    phrases: ['closed won', 'closed-won bookings', 'bookings', 'won deals', 'new business closed'],
+    // "Book" is a verb here and a noun three lines down: "how much did we
+    // book" is closed-won bookings, "the Renewal book" is a pipeline's open
+    // value. Matching the bare token either way scored 0.72 on "how much is
+    // the Renewal book worth?", flipped the measure to bookings and dropped
+    // the scope — so the verb has to have a subject in front of it.
+    patterns: [/\bclosed[\s-]?won\b/i, /\bbookings?\b/i, /\bwon\s+deals?\b/i, /\bnew\s+business\s+closed\b/i,
+      /\bbooked\b/i, /\b(?:did|do|does|will|can|should|we|they|i|you|he|she|who)\s+(?:\w+\s+)?book\b/i,
+      // "How much did we win in Q2 2026?" is this measure. The status extractor
+      // already maps win → closed_won for a count question, and the money half
+      // of the same verb was refused with the answer sitting in the catalogue
+      // list the refusal printed.
+      /\bhow\s+much\s+(?:\w+\s+){0,3}?\b(?:win|won)\b/i,
+      /\b(?:did|do|does|have|has|we|they|you|i)\s+(?:\w+\s+){0,2}?(?:win|won)\b/i],
     keywords: ['closed won', 'bookings', 'won'],
     compute: (input) => {
       const scope = subjectScope(input);
-      const conditions: Condition[] = [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).won }];
+      const conditions: Condition[] = withDealScope(input,
+        [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).won }]);
       const window = { property: 'close_date', start: input.window.start, end: input.window.end };
       const agg = aggregate(input.ctx, input.workspace.orgId, {
         objectType: 'deal', conditions, window, measure: { property: 'amount', fn: 'sum' }, sampleIds: 8, ...scope, ...groupSpec(input, 'close_date'),
@@ -904,13 +996,18 @@ const DEFS: MetricDefinition[] = [
     },
   },
   {
-    id: 'closed_lost', label: 'Closed-lost value', unit: 'money', supportsSubject: true,
-    patterns: [/\bclosed[\s-]?lost\b/i, /\blost\s+(?:deals?|revenue|business)\b/i, /\blosses\b/i],
+    id: 'closed_lost', label: 'Closed-lost value', unit: 'money', supportsSubject: true, scope: 'deal',
+    phrases: ['closed lost', 'closed-lost value', 'lost deals', 'lost revenue', 'lost business'],
+    patterns: [/\bclosed[\s-]?lost\b/i, /\blost\s+(?:deals?|revenue|business)\b/i, /\blosses\b/i,
+      // The mirror of the win verb: "how much did we lose in Q2 2026?" was
+      // refused with 'I do not hold anything called "lose"'.
+      /\bhow\s+much\s+(?:\w+\s+){0,3}?\b(?:lose|lost)\b/i,
+      /\b(?:did|do|does|have|has|we|they|you|i)\s+(?:\w+\s+){0,2}?(?:lose|lost)\b/i],
     keywords: ['lost'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
         objectType: 'deal',
-        conditions: [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).lost }],
+        conditions: withDealScope(input, [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).lost }]),
         window: { property: 'close_date', start: input.window.start, end: input.window.end },
         measure: { property: 'amount', fn: 'sum' }, sampleIds: 8, ...subjectScope(input),
         ...(input.groupBy === 'stage' ? { groupBy: 'close_reason' } : groupSpec(input, 'close_date')),
@@ -923,15 +1020,16 @@ const DEFS: MetricDefinition[] = [
     },
   },
   {
-    id: 'win_rate', label: 'Win rate', unit: 'percent', supportsSubject: true,
+    id: 'win_rate', label: 'Win rate', unit: 'percent', supportsSubject: true, scope: 'deal',
+    phrases: ['win rate', 'close rate', 'conversion rate', 'hit rate'],
     patterns: [/\bwin\s+rate\b/i, /\bclose\s+rate\b/i, /\bconversion\s+rate\b/i, /\bhit\s+rate\b/i],
     keywords: ['win rate'],
     compute: (input) => {
       const window = { property: 'close_date', start: input.window.start, end: input.window.end };
       const scope = subjectScope(input);
       const stages = stageSets(input.ctx, input.workspace.orgId);
-      const won = aggregate(input.ctx, input.workspace.orgId, { objectType: 'deal', conditions: [{ property: 'deal_stage', op: 'in', values: stages.won }], window, sampleIds: 5, ...scope });
-      const lost = aggregate(input.ctx, input.workspace.orgId, { objectType: 'deal', conditions: [{ property: 'deal_stage', op: 'in', values: stages.lost }], window, ...scope });
+      const won = aggregate(input.ctx, input.workspace.orgId, { objectType: 'deal', conditions: withDealScope(input, [{ property: 'deal_stage', op: 'in', values: stages.won }]), window, sampleIds: 5, ...scope });
+      const lost = aggregate(input.ctx, input.workspace.orgId, { objectType: 'deal', conditions: withDealScope(input, [{ property: 'deal_stage', op: 'in', values: stages.lost }]), window, ...scope });
       const decided = won.count + lost.count;
       const grouped = ratioGroups(input, stages, window, scope);
       return result(input, { id: 'win_rate', label: 'Win rate', unit: 'percent' }, {
@@ -944,13 +1042,14 @@ const DEFS: MetricDefinition[] = [
     },
   },
   {
-    id: 'avg_deal_size', label: 'Average deal size', unit: 'money', supportsSubject: true,
+    id: 'avg_deal_size', label: 'Average deal size', unit: 'money', supportsSubject: true, scope: 'deal',
+    phrases: ['average deal size', 'deal size', 'acv', 'average contract value'],
     patterns: [/\b(average|avg|mean|typical)\s+(?:deal|contract|acv|order)\b/i, /\bdeal\s+size\b/i, /\bacv\b/i],
     keywords: ['average deal', 'deal size'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
         objectType: 'deal',
-        conditions: [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).won }],
+        conditions: withDealScope(input, [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).won }]),
         window: { property: 'close_date', start: input.window.start, end: input.window.end },
         measure: { property: 'amount', fn: 'avg' }, sampleIds: 6, ...subjectScope(input),
       });
@@ -961,13 +1060,14 @@ const DEFS: MetricDefinition[] = [
     },
   },
   {
-    id: 'sales_cycle', label: 'Average sales cycle', unit: 'days', supportsSubject: true,
+    id: 'sales_cycle', label: 'Average sales cycle', unit: 'days', supportsSubject: true, scope: 'deal',
+    phrases: ['sales cycle', 'average sales cycle', 'days to close', 'time to close'],
     patterns: [/\bsales\s+cycle\b/i, /\bdays?\s+to\s+close\b/i, /\btime\s+to\s+close\b/i],
     keywords: ['sales cycle'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
         objectType: 'deal',
-        conditions: [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).won }],
+        conditions: withDealScope(input, [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).won }]),
         window: { property: 'close_date', start: input.window.start, end: input.window.end },
         measure: { property: 'days_to_close', fn: 'avg' }, sampleIds: 5, ...subjectScope(input),
       });
@@ -979,11 +1079,16 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'deal_count', label: 'Deals', unit: 'count', supportsSubject: true, snapshot: true,
+    scope: 'deal', stageFilter: true,
+    // "How many open deals does Priya have" names this metric, not open
+    // pipeline: the longest phrase written wins, so the count beats the money.
+    phrases: ['deal count', 'number of open deals', 'number of deals', 'how many open deals', 'how many deals'],
     patterns: [/\bhow\s+many\s+(?:open\s+)?deals?\b/i, /\bnumber\s+of\s+deals?\b/i, /\bdeal\s+count\b/i],
     keywords: ['deals'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
-        objectType: 'deal', conditions: [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).open }],
+        objectType: 'deal',
+        conditions: withDealScope(input, [{ property: 'deal_stage', op: 'in', values: stageSets(input.ctx, input.workspace.orgId).open }]),
         sampleIds: 8, ...subjectScope(input), ...groupSpec(input, 'close_date'),
       });
       return result(input, { snapshot: true, id: 'deal_count', label: 'Deals', unit: 'count' }, {
@@ -1191,6 +1296,45 @@ const DEFS: MetricDefinition[] = [
   },
 ];
 
+/**
+ * Measures that are *undefined* over no rows rather than zero.
+ *
+ * A sum over nothing is zero: nothing was booked, and saying so is true. An
+ * average over nothing is not zero — "Northwind has no average deal size in the
+ * Expansion pipeline, so the honest answer is zero" says every deal in that
+ * book is worth nothing, about a book carrying $3,162,060. A ratio with an
+ * empty denominator is the same shape of falsehood, and the win rate already
+ * refused it; every average has to refuse it too.
+ */
+const UNDEFINED_AT_ZERO = new Set([
+  'win_rate', 'avg_deal_size', 'sales_cycle', 'resolution_time', 'csat',
+  'churn', 'net_revenue_retention', 'gross_revenue_retention',
+]);
+
+export const metricUndefinedWhenEmpty = (id: string | null | undefined): boolean =>
+  !!id && UNDEFINED_AT_ZERO.has(id);
+
+/**
+ * Every word the measure catalogue answers to.
+ *
+ * A modifier in front of a measure is only unknown when nothing in the
+ * catalogue knows it either: "recurring revenue" is MRR by another name, and
+ * refusing it as an unresolvable narrowing of Revenue would be its own wrong
+ * answer.
+ */
+let MEASURE_WORDS: Set<string> | null = null;
+export function measureWords(): Set<string> {
+  if (MEASURE_WORDS) return MEASURE_WORDS;
+  const out = new Set<string>();
+  for (const def of DEFS) {
+    for (const phrase of [def.label, ...(def.phrases ?? []), ...(def.keywords ?? [])]) {
+      for (const token of normalise(phrase).split(' ')) if (token.length > 1) out.add(token);
+    }
+  }
+  MEASURE_WORDS = out;
+  return out;
+}
+
 export const METRICS: MetricDefinition[] = DEFS;
 export const metricById = (id: string): MetricDefinition | undefined => DEFS.find((d) => d.id === id);
 export const metricIds = (): string[] => DEFS.map((d) => d.id);
@@ -1202,8 +1346,97 @@ export interface MetricDetection {
   alternatives: { id: string; score: number }[];
 }
 
+/**
+ * Every measure name in the catalogue, longest first.
+ *
+ * The pattern scorer weighs a regex hit by its length and its position in the
+ * definition's list, which made "weighted pipeline" score exactly what
+ * "pipeline" scores — a tie broken by array order, so a forecast question was
+ * answered with the unweighted book. An exact phrase is not a score: if the
+ * question writes a measure's name, that is the measure, and the longest name
+ * written wins so "weighted pipeline" beats the "pipeline" inside it.
+ */
+const PHRASE_INDEX: { phrase: string; def: MetricDefinition }[] = [];
+
+function phraseIndex(): { phrase: string; def: MetricDefinition }[] {
+  if (PHRASE_INDEX.length) return PHRASE_INDEX;
+  for (const def of DEFS) {
+    for (const phrase of new Set(def.phrases ?? [])) {
+      const normalised = normalise(phrase);
+      if (normalised) PHRASE_INDEX.push({ phrase: normalised, def });
+    }
+  }
+  PHRASE_INDEX.sort((a, b) => b.phrase.length - a.phrase.length);
+  return PHRASE_INDEX;
+}
+
+/** A whole-word phrase hit, so "arr" never matches inside "arrears". */
+function phraseHit(haystack: string, needle: string): boolean {
+  const at = haystack.indexOf(needle);
+  if (at < 0) return false;
+  const before = at === 0 ? ' ' : haystack[at - 1];
+  const after = at + needle.length >= haystack.length ? ' ' : haystack[at + needle.length];
+  return before === ' ' && after === ' ';
+}
+
+/** The words the reader actually wrote, so an answer quotes them back. */
+function surfaceOf(message: string, phrase: string): string {
+  const pattern = new RegExp(`\\b${phrase.split(' ').map((w) => w.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')).join('[\\s-]+')}\\b`, 'i');
+  return message.match(pattern)?.[0] ?? phrase;
+}
+
+/**
+ * Measures people ask for that this platform does not define.
+ *
+ * Naming one has to be a refusal that says what the catalogue holds. The
+ * failure it replaces is worse than an apology: "weighted pipeline" answered
+ * with open pipeline, "pipeline coverage" answered with the same, both stated
+ * as the figure the reader asked for.
+ */
+const UNKNOWN_MEASURES: [string, RegExp][] = [
+  ['customer acquisition cost', /\b(cac|customer\s+acquisition\s+costs?)\b/i],
+  ['lifetime value', /\b(ltv|cltv|lifetime\s+value)\b/i],
+  ['pipeline coverage', /\bpipeline\s+coverage\b|\bcoverage\s+ratio\b/i],
+  ['quota attainment', /\bquota\s+attainment\b|\battainment\s+against\s+quota\b/i],
+  ['burn rate', /\bburn\s+rate\b|\bcash\s+burn\b/i],
+  ['runway', /\b(?:cash\s+)?runway\b/i],
+  ['gross margin', /\bgross\s+margins?\b/i],
+  ['EBITDA', /\bebitda\b/i],
+  ['ARPU', /\b(arpu|arpa|average\s+revenue\s+per\s+(?:user|account))\b/i],
+  ['CAC payback', /\bpayback\s+period\b|\bcac\s+payback\b/i],
+  ['the magic number', /\bmagic\s+number\b/i],
+  ['NPS', /\b(nps|net\s+promoter\s+scores?)\b/i],
+  ['the Rule of 40', /\brule\s+of\s+40\b/i],
+];
+
+/**
+ * A measure the question named that the catalogue does not hold.
+ *
+ * Returned before the scorer gets a chance to land on a near neighbour, which
+ * is the substitution this file exists to refuse — "pipeline coverage" is not
+ * open pipeline, and answering it with open pipeline is worse than saying so.
+ */
+export function unknownMeasure(message: string): string | null {
+  for (const [label, pattern] of UNKNOWN_MEASURES) {
+    if (pattern.test(message)) return label;
+  }
+  return null;
+}
+
 /** Choose the metric a question is asking for, and say what matched. */
 export function detectMetric(message: string): MetricDetection | null {
+  const text = ` ${normalise(message)} `;
+  const named = phraseIndex().filter((row) => phraseHit(text, row.phrase));
+  if (named.length) {
+    const top = named[0];
+    return {
+      metric: top.def,
+      matched: surfaceOf(message, top.phrase),
+      score: 1,
+      alternatives: [...new Set(named.slice(1).map((row) => row.def.id))]
+        .filter((id) => id !== top.def.id).slice(0, 3).map((id) => ({ id, score: 0.9 })),
+    };
+  }
   const scored: { def: MetricDefinition; score: number; matched: string }[] = [];
   for (const def of DEFS) {
     let best = 0;
@@ -1228,16 +1461,43 @@ export function detectMetric(message: string): MetricDetection | null {
   };
 }
 
+/**
+ * The "by <dimension>" phrase a grouping instruction is written as.
+ *
+ * It has to come out of the sentence before the measure is read out of it:
+ * "break down bookings by pipeline" contains the measure name "pipeline" only
+ * because of the grouping, and scoring the whole sentence answered a bookings
+ * question with open pipeline.
+ */
+const GROUPING_PREFIX = /\b(?:split|splits|broken\s+(?:down|out)|break\s+(?:down|out)|grouped|group|bucketed|segmented|sliced)\s+(?:up\s+)?by\b/gi;
+const GROUPING_PHRASE =
+  /\b(?:by|per|each)\s+(?:pipelines?|stages?|owners?|reps?|sellers?|aes?|salespe(?:rson|ople)|teammates?|people|accounts?|customers?|companies|logos?|industr(?:y|ies)|verticals?|segments?|status(?:es)?|priorit(?:y|ies)|sources?|channels?|months?|quarters?|weeks?|days?|years?)\b/gi;
+
+export function withoutGroupingPhrase(message: string): string {
+  return message.replace(GROUPING_PREFIX, 'by').replace(GROUPING_PHRASE, ' ');
+}
+
 /** Which grouping the question asked for, if any. */
 export function detectGrouping(message: string): GroupBy {
-  const text = message.toLowerCase();
+  // "split by stage" and "broken out by stage" are "by stage". Only the last
+  // spelling was read, so the other two returned an ungrouped total with no
+  // sign that half the sentence had been dropped.
+  const text = message.toLowerCase()
+    .replace(/\b(?:split|splits|broken\s+(?:down|out)|break\s+(?:down|out)|grouped|group|bucketed|segmented|sliced)\s+(?:up\s+)?by\b/g, 'by');
   if (/\bby\s+(month|quarter|week|day|year)\b|\bover\s+time\b|\btrend(?:ed|ing|line)?\b|\bmonth\s+by\s+month\b/.test(text)) return 'time';
-  if (/\bby\s+(rep|owner|ae|seller|person|teammate)\b|\bper\s+rep\b|\bwho\s+(?:closed|sold|won)\b/.test(text)) return 'owner';
+  // "each rep" and "per rep" are the same instruction as "by rep". Reading only
+  // the third dropped the breakdown out of "how much open pipeline does each
+  // rep own in the Expansion pipeline?" and answered with one number.
+  if (/\bby\s+(rep|owner|ae|seller|person|teammate)\b|\b(?:per|each)\s+(rep|owner|ae|seller|person|teammate|salesperson|account\s+executive)\b|\bwho\s+(?:closed|sold|won)\b/.test(text)) return 'owner';
   if (/\b(top|biggest|largest|highest|best|worst|lowest)\s+\d*\s*(reps?|owners?|sellers?|aes?|salespeople|people)\b/.test(text)) return 'owner';
   // "Which rep has the most pipeline?" is a per-rep question. Without this it
   // fell through to a list of the eight biggest deals and no rep total at all.
   if (/\b(which|what|who)\s+(reps?|owners?|sellers?|aes?|salespe(?:rson|ople)|teammates?|account\s+executives?)\b/.test(text)) return 'owner';
   if (/\bby\s+stage\b|\bstage\s+by\s+stage\b|\bfunnel\b/.test(text)) return 'stage';
+  // "Break down open pipeline by pipeline" is a real question with three rows
+  // for an answer. Without this it fell through to a plan that had nothing to
+  // do with deals at all, and "split by pipeline" quietly returned one total.
+  if (/\bby\s+pipelines?\b|\bper\s+pipeline\b|\bpipeline\s+by\s+pipeline\b|\bacross\s+(?:the\s+)?pipelines\b/.test(text)) return 'pipeline';
   if (/\bby\s+industr(?:y|ies)\b|\bby\s+vertical\b|\bby\s+segment\b/.test(text)) return 'industry';
   if (/\bby\s+(account|customer|company|logo)\b/.test(text)) return 'account';
   if (/\b(top|biggest|largest|highest|best|worst|lowest)\s+\d*\s*(accounts?|customers?|companies|logos)\b/.test(text)) return 'account';

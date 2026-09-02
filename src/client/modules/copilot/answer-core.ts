@@ -88,3 +88,26 @@ export function parseBlocks(content: string): Block[] {
   }
   return blocks;
 }
+
+/* -------------------------------- refusals -------------------------------- */
+
+/**
+ * A refusal, in the engine's own words.
+ *
+ * The reasoning trail is where the engine records that it declined to measure
+ * something — `Refused (period_unresolved): …`. Surfacing it is the difference
+ * between an honest "I did not answer that" and a confident-looking paragraph
+ * that happens to contain no numbers.
+ */
+export function refusalOf(run: { reasoning: string[] } | undefined | null): { code: string; message: string } | null {
+  for (const line of run?.reasoning ?? []) {
+    // "Refused (period_unresolved): …" and "Refused after the run
+    // (qualifier_unbound): …" are both the engine declining to answer. Only the
+    // first shape was read, so a question refused *after* a tool ran — which is
+    // every refusal that needed the tool's own error to decide — rendered with
+    // no refusal banner at all, and the prose was left to carry it alone.
+    const match = /^Refused\b[^(]*\(([a-z_]+)\):\s*(.+)$/.exec(line);
+    if (match) return { code: match[1], message: match[2] };
+  }
+  return null;
+}

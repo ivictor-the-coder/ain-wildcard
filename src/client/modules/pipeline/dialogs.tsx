@@ -552,7 +552,7 @@ export function StageMoveDialog({
         </>
       }
     >
-      <div className="pl-form" ref={firstControl.body}>
+      <div className="pl-form" ref={firstControl.body} tabIndex={-1}>
         {banner && <Banner tone="danger" title="The stage did not change">{banner}</Banner>}
 
         <div className="pl-movesummary">
@@ -678,6 +678,7 @@ export function PipelineMoveDialog({
   );
   const missing = requirements.required.filter((property) => emptyValue(draft[property.name]));
 
+  const firstControl = useFirstControl();
   const offerUndo = useUndoMove();
   const undoSnapshot = useRef<MoveSnapshot | null>(null);
   const from = current?.stages.find((s) => s.name === str(deal?.properties.deal_stage));
@@ -711,6 +712,7 @@ export function PipelineMoveDialog({
       open={open}
       onClose={onClose}
       size="md"
+      initialFocus={firstControl.initialFocus}
       title="Move to another pipeline"
       description={deal?.display_name}
       footer={
@@ -727,7 +729,7 @@ export function PipelineMoveDialog({
         </>
       }
     >
-      <div className="pl-form">
+      <div className="pl-form" ref={firstControl.body} tabIndex={-1}>
         {banner && <Banner tone="danger" title="The pipeline did not change">{banner}</Banner>}
 
         {others.length === 0 && (
@@ -859,6 +861,7 @@ export function EditDealDialog({
     onError: (e) => { if (!e.body.param) toast.error('The deal was not saved', e.body.message); },
   });
 
+  const firstControl = useFirstControl();
   const dirty = Object.keys(draft).length > 0 || ownerId !== (deal?.owner_id ?? '');
   const banner = unboundError(save.error, [...editable.map((p) => p.name), 'owner_id']);
   const pipelineLabel = pipelines.find((p) => p.name === str(deal?.properties.pipeline))?.label;
@@ -868,6 +871,7 @@ export function EditDealDialog({
       open={open}
       onClose={onClose}
       size="lg"
+      initialFocus={firstControl.initialFocus}
       title="Edit deal"
       description={deal?.display_name}
       footer={
@@ -879,7 +883,7 @@ export function EditDealDialog({
         </>
       }
     >
-      <div className="pl-form">
+      <div className="pl-form" ref={firstControl.body} tabIndex={-1}>
         {banner && <Banner tone="danger" title="The deal was not saved">{banner}</Banner>}
         <Banner tone="neutral" compact>
           Stage and pipeline are changed from the board or the stage rail, so the forecast restamp is always shown first.
@@ -1026,6 +1030,13 @@ export function LogActivityDialog({
  * The returned ref reads live rather than holding a node, because `Modal` asks
  * for `initialFocus.current` in its own effect — after this body has mounted,
  * before anything has been focused.
+ *
+ * A dialog whose body has nothing to fill in — "Move 2 deals to Negotiation" is
+ * three read-only figures and a button — falls back to the body itself rather
+ * than to null, because null puts the trap straight back on the ×. Give the
+ * body `tabIndex={-1}` so it can take that focus: a screen reader reads the
+ * dialog's title and description from there, and Enter does nothing, which is
+ * the right thing for a keystroke aimed at a dialog that has just opened.
  */
 export function useFirstControl(): {
   body: RefObject<HTMLDivElement>;
@@ -1034,7 +1045,9 @@ export function useFirstControl(): {
   const body = useRef<HTMLDivElement>(null);
   const initialFocus = useMemo(() => ({
     get current(): HTMLElement | null {
-      return body.current ? focusableWithin(body.current)[0] ?? null : null;
+      const node = body.current;
+      if (!node) return null;
+      return focusableWithin(node)[0] ?? (node.hasAttribute('tabindex') ? node : null);
     },
   }), []);
   return { body, initialFocus };

@@ -13,6 +13,7 @@ import { entityIndex, workspaceProfile } from '../src/server/ai/grounding';
 import { resolveEntities } from '../src/server/ai/resolve';
 import { estimateTokens, accountUsage } from '../src/server/ai/usage';
 import { stageSets } from '../src/server/ai/metrics';
+import { QualifierLedger } from '../src/server/ai/qualifiers';
 import { businessMetric } from '../src/server/ai/functions';
 import { anthropicProvider, toWire, toWireTools } from '../src/server/ai/anthropic';
 import { formatMoney } from '../src/shared/money';
@@ -3936,10 +3937,32 @@ describe('a capability the workspace publishes is reachable by its own name', ()
   });
 
   test('the suggested pipeline question ends without a false apology about a tool', async () => {
-    const answer = await ask('What is our open pipeline by stage?');
+    const answer = await ask('Which pipelines do we have?');
     assert.ok(!/could not read anything back from list pipelines/.test(answer.content),
       `every field of that payload is nameable:\n${answer.content}`);
     assert.match(answer.content, /pipelines in this workspace/);
+  });
+
+  test('the pipeline catalogue is the answer to a catalogue question and to no other', async () => {
+    // The glossary used to be attached to any sentence containing the word.
+    // "Break down open pipeline by stage" is a question with a number in it,
+    // and three pipeline definitions printed under that number answer "what
+    // pipelines do we have" — a question the reader did not ask.
+    const asked = await ask('Which pipelines do we have?');
+    const pipelines = app.ctx.db.all<{ label: string }>(
+      `SELECT label FROM crm_pipelines WHERE org_id = ? AND object_type = 'deal' ORDER BY position`, ORG);
+    assert.ok(pipelines.length >= 3, 'the fixture has a pipeline catalogue');
+    for (const pipeline of pipelines) {
+      assert.ok(asked.content.includes(pipeline.label),
+        `"Which pipelines do we have?" must name ${pipeline.label}:\n${asked.content}`);
+    }
+    assert.ok(!/\$9,010,960/.test(asked.content),
+      `a question about the vocabulary is not answered with the workspace total:\n${asked.content}`);
+
+    const scoped = await ask('Break down open pipeline by stage');
+    assert.ok(!/pipelines in this workspace/.test(scoped.content),
+      `the catalogue is a glossary nobody asked for here:\n${scoped.content}`);
+    assert.match(scoped.content, /Breakdown:/);
   });
 });
 
@@ -4108,5 +4131,1044 @@ describe('a draft carries the numbers the recipient needs to act', () => {
     assert.ok(!/Here is where it stands and what happens next\./.test(draft.body),
       `a heading for a paragraph that was never written:\n${draft.body}`);
     assert.match(draft.body, /Where it stands: /);
+  });
+});
+
+/* ------------------ the qualifier ledger: one invariant ------------------- */
+
+/**
+ * The engine used to answer a different question than the one asked, at high
+ * confidence, whenever it could not bind a word that narrowed the query: the
+ * workspace total for a named pipeline, the open-deal count for a named stage,
+ * an unrelated company for a named owner, open pipeline for weighted pipeline.
+ * Every one of those was one bug — a qualifier parsed, resolved and then
+ * dropped on the way into the query.
+ *
+ * This suite is the invariant, not a list of the nine questions that exposed
+ * it. Every case names a qualifier type, carries an answer computed from the
+ * database by a path the engine does not use, and asserts that the engine
+ * either returns that answer or refuses. And every case asserts the structural
+ * rule underneath: no qualifier reaches an answer still `pending`.
+ */
+describe('every qualifier the question names is bound, refused or waived', () => {
+  const DEAL = `FROM crm_records WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL`;
+  const OPEN = `json_extract(properties, '$.deal_status') = 'open'`;
+
+  const dealSum = (where: string, ...params: unknown[]): number => app.ctx.db.count(
+    `SELECT COALESCE(SUM(json_extract(properties, '$.amount')), 0) ${DEAL} AND ${where}`, ORG, ...(params as string[]));
+  const dealWeighted = (where: string, ...params: unknown[]): number => app.ctx.db.count(
+    `SELECT COALESCE(SUM(json_extract(properties, '$.weighted_amount')), 0) ${DEAL} AND ${where}`, ORG, ...(params as string[]));
+  const dealCount = (where: string, ...params: unknown[]): number => app.ctx.db.count(
+    `SELECT COUNT(*) ${DEAL} AND ${where}`, ORG, ...(params as string[]));
+  const dealNames = (where: string, ...params: unknown[]): string[] => app.ctx.db
+    .all<{ display_name: string }>(`SELECT display_name ${DEAL} AND ${where}`, ORG, ...(params as string[]))
+    .map((row) => row.display_name);
+
+  const personId = (name: string): string => app.ctx.db.pluck<string>(
+    `SELECT id FROM users WHERE id IN (SELECT user_id FROM memberships WHERE org_id = ?) AND name = ?`, ORG, name)!;
+
+  const Q2_2026 = { start: Date.UTC(2026, 3, 1), end: Date.UTC(2026, 6, 1), label: 'Q2 2026' };
+  const AUGUST_2026 = { start: Date.UTC(2026, 7, 1), end: Date.UTC(2026, 8, 1), label: 'August 2026' };
+
+  interface Expectation {
+    /** Strings the answer has to contain when it answers at all. */
+    must?: string[];
+    /** Strings that would mean the qualifier was dropped and the wider query answered. */
+    mustNot?: string[];
+    /** True when refusing is the only correct outcome. */
+    refuseOnly?: boolean;
+    /** A last check with the whole completion in hand. */
+    also?: (answer: any) => void;
+  }
+
+  interface ScopedCase {
+    question: string;
+    /** The qualifier types the question names; each must appear in the ledger. */
+    names: string[];
+    expect: () => Expectation;
+  }
+
+  const cases: ScopedCase[] = [
+    /* ---- pipeline: six phrasings of one question, all previously unscoped --- */
+    ...[
+      'What is the Renewal pipeline worth?',
+      'How much is in the Renewal pipeline?',
+      'What is the value of the Renewal pipeline?',
+      'How big is the Renewal pipeline right now?',
+      'Give me the Renewal pipeline total.',
+      'Renewal pipeline value please.',
+    ].map((question): ScopedCase => ({
+      question,
+      names: ['pipeline'],
+      expect: () => ({
+        must: [money(dealSum(`${OPEN} AND json_extract(properties, '$.pipeline') = 'renewal'`))],
+        // The whole book, which is what every one of these six used to answer.
+        mustNot: [money(dealSum(OPEN))],
+      }),
+    })),
+
+    /* ------------------------- metric: the named one ------------------------ */
+    {
+      question: 'What is our weighted pipeline?',
+      names: ['metric'],
+      expect: () => ({
+        must: [money(dealWeighted(OPEN))],
+        mustNot: [money(dealSum(OPEN))],
+      }),
+    },
+    {
+      // A measure the catalogue does not hold is named back, never answered
+      // with the nearest neighbour that happens to share a word.
+      question: 'What is our pipeline coverage this quarter?',
+      names: ['metric'],
+      expect: () => ({ refuseOnly: true }),
+    },
+    {
+      question: 'What is our CAC?',
+      names: ['metric'],
+      expect: () => ({ refuseOnly: true }),
+    },
+
+    /* -------------------------------- stage -------------------------------- */
+    {
+      question: 'How many deals are in Negotiation?',
+      names: ['stage'],
+      expect: () => ({
+        must: [String(dealCount(`json_extract(properties, '$.deal_stage') = 'negotiation'`))],
+        mustNot: [`${dealCount(OPEN)} open deals`],
+      }),
+    },
+    {
+      question: 'How many deals are in Technical validation?',
+      names: ['stage'],
+      expect: () => ({
+        must: [String(dealCount(`json_extract(properties, '$.deal_stage') = 'technical_validation'`))],
+        mustNot: [`${dealCount(OPEN)} open deals`],
+      }),
+    },
+    {
+      question: 'Which deals are in Proposal sent?',
+      names: ['stage'],
+      expect: () => ({
+        also: (answer) => {
+          const named = dealNames(`json_extract(properties, '$.deal_stage') = 'proposal'`);
+          const others = dealNames(`json_extract(properties, '$.deal_stage') <> 'proposal'`);
+          assert.ok(named.some((name) => answer.content.includes(name)),
+            `no deal at the Proposal sent stage is named:\n${answer.content}`);
+          for (const other of others) {
+            assert.ok(!answer.content.includes(other),
+              `"${other}" is not at the Proposal sent stage:\n${answer.content}`);
+          }
+        },
+      }),
+    },
+    {
+      question: 'How many deals are in the Red lines stage?',
+      names: ['stage'],
+      expect: () => ({ refuseOnly: true }),
+    },
+    {
+      // A stage that exists, on a measure that cannot take one. The capability
+      // says exactly why; the answer used to be "nothing I hold answers that"
+      // with that explanation left in the trace.
+      question: 'How many tickets are in the Negotiation stage?',
+      names: ['stage'],
+      expect: () => ({ refuseOnly: true }),
+    },
+
+    /* -------------------------------- owner -------------------------------- */
+    {
+      question: 'How much pipeline does Marcus Ilori own?',
+      names: ['owner'],
+      expect: () => ({
+        must: [money(dealSum(`${OPEN} AND owner_id = ?`, personId('Marcus Ilori')))],
+        // The workspace total, and the company a weaker match on his first name
+        // used to hand the question to.
+        mustNot: [money(dealSum(OPEN)), 'Whitcombe Aerospace'],
+      }),
+    },
+    {
+      question: 'How many open deals does Priya Raman have?',
+      names: ['owner'],
+      expect: () => ({
+        must: [String(dealCount(`${OPEN} AND owner_id = ?`, personId('Priya Raman')))],
+      }),
+    },
+
+    /* -------------------------------- status ------------------------------- */
+    {
+      question: 'Which deals did we lose in Q2 2026?',
+      names: ['status', 'period'],
+      expect: () => ({
+        also: (answer) => {
+          const inWindow = `json_extract(properties, '$.close_date') >= ${Q2_2026.start} AND json_extract(properties, '$.close_date') < ${Q2_2026.end}`;
+          const lost = dealNames(`json_extract(properties, '$.deal_stage') = 'closed_lost' AND ${inWindow}`);
+          const notLost = dealNames(`json_extract(properties, '$.deal_stage') <> 'closed_lost'`);
+          assert.ok(lost.length, 'the fixture has deals lost in Q2 2026');
+          for (const name of lost) {
+            assert.ok(answer.content.includes(name), `"${name}" was lost in Q2 2026 and is missing:\n${answer.content}`);
+          }
+          for (const name of notLost) {
+            assert.ok(!answer.content.includes(name), `"${name}" was not lost, so it is not an answer:\n${answer.content}`);
+          }
+          assert.ok(!new RegExp(`${dealCount(OPEN)} open deals`).test(answer.content),
+            `the open-deal count is not an answer about losses:\n${answer.content}`);
+        },
+      }),
+    },
+
+    /* -------------------------------- period ------------------------------- */
+    {
+      question: 'What did we invoice in August 2026?',
+      names: ['period'],
+      expect: () => ({
+        must: ['August 2026'],
+        also: (answer) => {
+          // Every invoice this answer stands on was issued inside the month the
+          // question named. The failure this replaces cited July 2025 and July
+          // 2026 under an August heading.
+          for (const citation of answer.citations as { id: string }[]) {
+            if (!citation.id.startsWith('in_')) continue;
+            const issued = app.ctx.db.pluck<number>(
+              `SELECT COALESCE(finalized_at, created) FROM billing_invoices WHERE org_id = ? AND id = ?`, ORG, citation.id);
+            assert.ok(issued !== undefined && issued >= AUGUST_2026.start && issued < AUGUST_2026.end,
+              `cited ${citation.id}, issued ${issued ? new Date(issued).toISOString().slice(0, 10) : 'never'}, under a question about August 2026`);
+          }
+        },
+      }),
+    },
+    {
+      question: 'How much did we book in Q2 2026?',
+      names: ['period'],
+      expect: () => ({
+        must: [money(dealSum(
+          `json_extract(properties, '$.deal_stage') = 'closed_won'`
+          + ` AND json_extract(properties, '$.close_date') >= ${Q2_2026.start}`
+          + ` AND json_extract(properties, '$.close_date') < ${Q2_2026.end}`))],
+      }),
+    },
+    {
+      // A period the parser cannot resolve is refused rather than swapped for
+      // the default quarter, forwards or backwards.
+      question: 'How much did we book in the month before last?',
+      names: ['period'],
+      expect: () => ({ refuseOnly: true }),
+    },
+
+    /* ------------------------ pipeline plus a stage ------------------------- */
+    {
+      question: 'What is the New business pipeline worth at the Negotiation stage?',
+      names: ['pipeline', 'stage'],
+      expect: () => ({
+        must: [money(dealSum(
+          `json_extract(properties, '$.pipeline') = 'new_business' AND json_extract(properties, '$.deal_stage') = 'negotiation'`))],
+        mustNot: [money(dealSum(OPEN))],
+      }),
+    },
+
+    /* -------------------------------- account ------------------------------ */
+    {
+      question: 'What is Meridian Forge Systems carrying in open pipeline?',
+      names: ['account'],
+      expect: () => ({
+        must: ['Meridian Forge Systems'],
+        mustNot: [money(dealSum(OPEN))],
+      }),
+    },
+
+    /* ------------------------------- currency ------------------------------ */
+    {
+      // A currency the listing cannot be told about. Nothing in the plan takes
+      // one, so the entry never binds — and an unbound qualifier is a refusal,
+      // not a list of every deal at that stage under the reader's own "in EUR".
+      question: 'Which deals are in Negotiation in EUR?',
+      names: ['currency', 'stage'],
+      expect: () => ({ refuseOnly: true }),
+    },
+    {
+      question: 'What did we invoice in August 2026 in USD?',
+      names: ['currency', 'period'],
+      expect: () => ({
+        must: ['August 2026'],
+        // One book was named, so the other two are not part of the answer.
+        mustNot: ['€', '£'],
+      }),
+    },
+
+    /* -------------------------------- limit -------------------------------- */
+    {
+      question: 'Who are our top 3 customers by revenue in 2025?',
+      names: ['limit', 'period'],
+      expect: () => ({
+        also: (answer) => {
+          const bullets = answer.content.split('\n').filter((line: string) => line.trim().startsWith('•'));
+          assert.ok(bullets.length <= 3,
+            `the question asked for three and the answer lists ${bullets.length}:\n${answer.content}`);
+        },
+      }),
+    },
+
+    /* --------------------------------- unit -------------------------------- */
+    {
+      question: 'What credit does Meridian Forge Systems have left?',
+      names: ['account'],
+      expect: () => ({
+        also: (answer) => {
+          // A unit grant is a count of meter units. The failure this replaces
+          // ran a 6,000,000-event pack through the money formatter and printed
+          // "$60,000.00" — and reported a live event pot as "$0.00 available".
+          const grants = app.ctx.db.all<{ name: string; amount_micro: number; unit_label: string }>(
+            `SELECT g.name, g.amount_micro, g.unit_label FROM credit_grants g
+             JOIN billing_customers c ON c.id = g.customer_id AND c.org_id = g.org_id
+             WHERE g.org_id = ? AND c.name = 'Meridian Forge Systems' AND g.kind = 'unit'`, ORG);
+          assert.ok(grants.length, 'Meridian holds unit-denominated credit in the fixture');
+          for (const grant of grants) {
+            const asMoney = money(grant.amount_micro / 1_000_000);
+            assert.ok(!answer.content.includes(asMoney),
+              `${grant.name} is ${grant.unit_label}s, and "${asMoney}" states it as money:\n${answer.content}`);
+          }
+          assert.ok(!/\$0\.00 available/.test(answer.content),
+            `a live unit pot is not $0.00:\n${answer.content}`);
+          assert.match(answer.content, /events? available|events? \(/,
+            `the pot is stated in its own unit:\n${answer.content}`);
+        },
+      }),
+    },
+  ];
+
+  for (const scoped of cases) {
+    test(`"${scoped.question}"`, async () => {
+      const answer = await ask(scoped.question);
+      const ledger = answer.analysis.qualifiers as {
+        kind: string; text: string; state: string; detail: string | null;
+      }[];
+
+      // 1. The question's qualifiers reached the ledger at all.
+      for (const kind of scoped.names) {
+        assert.ok(ledger.some((entry) => entry.kind === kind),
+          `no ${kind} qualifier was parsed out of "${scoped.question}"; ledger held ${JSON.stringify(ledger)}`);
+      }
+
+      // 2. The invariant. There is no fourth state, and `pending` is the
+      //    silent drop this whole mechanism exists to make impossible.
+      const pending = ledger.filter((entry) => entry.state === 'pending');
+      assert.equal(pending.length, 0,
+        `${pending.map((entry) => `${entry.kind} "${entry.text}"`).join(', ')} reached the answer unsettled:\n${answer.content}`);
+      for (const entry of ledger) {
+        assert.ok(['bound', 'refused', 'waived'].includes(entry.state), `unknown qualifier state ${entry.state}`);
+        if (entry.state === 'waived') {
+          assert.ok(entry.detail, `${entry.kind} "${entry.text}" was waived with no reason given`);
+        }
+      }
+
+      // 3. Either the answer the database says, or a refusal. Never a third
+      //    thing that reads like the first.
+      const expectation = scoped.expect();
+      const refused = !!answer.analysis.refusal;
+      if (expectation.refuseOnly) {
+        assert.ok(refused, `"${scoped.question}" has no honest answer and must be refused:\n${answer.content}`);
+        assert.ok(ledger.some((entry) => entry.state === 'refused'),
+          `the refusal has to come from a qualifier this run could not bind:\n${JSON.stringify(ledger)}`);
+        return;
+      }
+      if (refused) return;
+
+      // 4. A qualifier the answer ignored is named in the answer's own words,
+      //    in the first sentence — never in a footnote and never nowhere.
+      for (const entry of ledger.filter((row) => row.state === 'waived')) {
+        assert.ok(answer.content.includes(entry.text),
+          `"${entry.text}" was waived and the answer never says so:\n${answer.content}`);
+      }
+      for (const fragment of expectation.must ?? []) {
+        assert.ok(answer.content.includes(fragment),
+          `"${fragment}" is the figure the database holds and the answer does not state it:\n${answer.content}`);
+      }
+      for (const fragment of expectation.mustNot ?? []) {
+        assert.ok(!answer.content.includes(fragment),
+          `"${fragment}" is the unscoped answer to a scoped question:\n${answer.content}`);
+      }
+      expectation.also?.(answer);
+    });
+  }
+
+  test('a qualifier the plan claims but does not carry is caught, not trusted', () => {
+    // The ledger does not take the planner's word for a binding. A branch that
+    // says "the owner is on this step" and passes no `owner_id` is the exact
+    // failure this replaces, and it has to be loud rather than plausible.
+    const ledger = new QualifierLedger([
+      {
+        kind: 'owner', text: 'Marcus Ilori', state: 'bound', detail: null,
+        resolved: { kind: 'owner', value: 'usr_seed02', label: 'Marcus Ilori' },
+        binding: { tool: 'record_aggregate', args: { owner_id: 'usr_seed02' } },
+      },
+    ]);
+    const honest = ledger.verify([{ tool: 'record_aggregate', args: { owner_id: 'usr_seed02', object_type: 'deal' } }]);
+    assert.equal(honest.length, 0, 'a binding the step really carries is not a violation');
+
+    const lying = ledger.verify([{ tool: 'record_aggregate', args: { object_type: 'deal' } }]);
+    assert.deepEqual(lying.map((v) => v.reason), ['argument_missing']);
+
+    const absent = ledger.verify([{ tool: 'business_metric', args: { metric: 'pipeline' } }]);
+    assert.deepEqual(absent.map((v) => v.reason), ['step_missing']);
+  });
+
+  test('a qualifier of the wrong type never binds a slot', () => {
+    // "Marcus Ilori" is an owner. A company that resolved from the same words
+    // is not a weaker owner — it is a different question.
+    const ledger = new QualifierLedger([
+      {
+        kind: 'owner', text: 'Marcus Ilori', state: 'bound', detail: null,
+        resolved: { kind: 'account', value: 'cmp_nw_09', label: 'Whitcombe Aerospace' },
+        binding: { tool: 'account_profile', args: { id: 'cmp_nw_09' } },
+      },
+    ]);
+    const violations = ledger.verify([{ tool: 'account_profile', args: { id: 'cmp_nw_09' } }]);
+    assert.deepEqual(violations.map((v) => v.reason), ['type_mismatch']);
+  });
+
+  test('an unsettled qualifier is a violation even when everything else went right', () => {
+    const ledger = new QualifierLedger([
+      {
+        kind: 'stage', text: 'Negotiation', state: 'pending', detail: null,
+        resolved: { kind: 'stage', value: 'negotiation', label: 'Negotiation', property: 'deal_stage' },
+        binding: null,
+      },
+    ]);
+    assert.deepEqual(ledger.verify([{ tool: 'business_metric', args: { metric: 'deal_count' } }]).map((v) => v.reason),
+      ['unsettled']);
+    ledger.settleAgainst([{ tool: 'business_metric', args: { metric: 'deal_count', stage: 'negotiation' } }]);
+    assert.equal(ledger.verify([{ tool: 'business_metric', args: { metric: 'deal_count', stage: 'negotiation' } }]).length, 0);
+    assert.equal(ledger.first('stage')!.state, 'bound');
+  });
+});
+
+/* ---------------- structured extraction binds to one record --------------- */
+
+describe('an extraction is a record that exists, or it is nulls', () => {
+  test('an array schema returns the rows the run found, not one all-null object', async () => {
+    const answer = await ask('Which deals are in Proposal sent?', {
+      response_schema: { type: 'array', items: { type: 'object', fields: { name: { type: 'string' }, amount: { type: 'number' } } } },
+    });
+    const rows = JSON.parse(answer.content) as { name: string | null; amount: number | null }[];
+    assert.ok(rows.length >= 1, `an array schema returned nothing:\n${answer.content}`);
+    assert.ok(!(rows.length === 1 && rows[0].name === null && rows[0].amount === null),
+      `one all-null row is a shape, not an answer:\n${answer.content}`);
+    for (const row of rows) {
+      assert.ok(row.name, `every row names its record:\n${answer.content}`);
+      const held = app.ctx.db.pluck<number>(
+        `SELECT json_extract(properties, '$.amount') FROM crm_records
+         WHERE org_id = ? AND object_type = 'deal' AND display_name = ?`, ORG, row.name);
+      assert.equal(row.amount, held, `${row.name}'s amount is the row's own`);
+    }
+  });
+
+  test('every field of one object comes from one row', async () => {
+    const answer = await ask('Where does Meridian Forge Systems stand?', {
+      response_schema: {
+        type: 'object',
+        fields: {
+          deal_name: { type: 'string' }, amount: { type: 'number' },
+          stage: { type: 'string' }, owner: { type: 'string' },
+        },
+      },
+    });
+    const extracted = JSON.parse(answer.content) as { deal_name: string | null; amount: number | null; owner: string | null };
+    if (!extracted.deal_name) return;
+    const row = app.ctx.db.get<{ amount: number; owner_id: string }>(
+      `SELECT json_extract(properties, '$.amount') AS amount, owner_id FROM crm_records
+       WHERE org_id = ? AND object_type = 'deal' AND display_name = ?`, ORG, extracted.deal_name)!;
+    assert.equal(extracted.amount, row.amount, 'the amount belongs to the deal that was named');
+    const ownerName = app.ctx.db.pluck<string>(`SELECT name FROM users WHERE id = ?`, row.owner_id);
+    assert.equal(extracted.owner, ownerName,
+      'the owner is that deal’s owner, not the account’s — one object, one row');
+  });
+
+  test('a field named after the metric the run computed is filled with it', async () => {
+    for (const [prompt, field] of [['What is our MRR in USD?', 'mrr'], ['What is our open pipeline?', 'open_pipeline']] as const) {
+      const answer = await ask(prompt, { response_schema: { type: 'object', fields: { [field]: { type: 'number' } } } });
+      const extracted = JSON.parse(answer.content) as Record<string, number | null>;
+      assert.ok(extracted[field] !== null && Number.isFinite(extracted[field]),
+        `"${prompt}" left \`${field}\` null while the engine held the figure:\n${answer.content}\n${answer.reasoning?.join('\n')}`);
+    }
+  });
+
+  test('a metric measured in three books fills no single-number field, and says so', async () => {
+    // The other half of the same rule: `mrr` is filled when there is one
+    // figure, and left null when there are three. Filling it with the largest
+    // book under-reported recurring revenue by a third and flagged nothing.
+    const answer = await ask('What is our MRR?', {
+      response_schema: { type: 'object', fields: { mrr: { type: 'number' } } },
+    });
+    assert.equal((JSON.parse(answer.content) as { mrr: number | null }).mrr, null);
+    assert.ok((answer.reasoning as string[]).some((line) => /left mrr null rather than guessing/.test(line)),
+      `the caller is told which field was left null and why:\n${(answer.reasoning as string[]).join('\n')}`);
+  });
+});
+
+/* -------------- a draft cites a record, or it cites nothing --------------- */
+
+describe('a draft never asserts a record that does not exist', () => {
+  /** An account with no unpaid invoice — the case that used to be invented. */
+  const accountWithNothingDue = (): string | null => {
+    for (const row of app.ctx.db.all<{ id: string; name: string }>(
+      `SELECT id, display_name AS name FROM crm_records WHERE org_id = ? AND object_type = 'company' AND archived = 0`, ORG)) {
+      const customer = app.ctx.svc.billing.customerByCrmRecord(ORG, row.id);
+      if (!customer) return row.id;
+      const open = app.ctx.svc.billing.invoices(ORG, { customer: customer.id, status: 'open_like', limit: 5 })
+        .filter((invoice) => invoice.amount_due > 0);
+      if (!open.length) return row.id;
+    }
+    return null;
+  };
+
+  test('a dunning note for an account with nothing outstanding says so instead of inventing a bill', async () => {
+    const id = accountWithNothingDue();
+    assert.ok(id, 'the fixture has an account with no unpaid invoice');
+    const draft = await expectOk('POST', '/v1/ai/draft', {
+      kind: 'dunning', record_id: id, instruction: 'Chase the outstanding invoice',
+    });
+    assert.ok(!/an invoice on your account is still outstanding/i.test(draft.body),
+      `there is no such invoice on this account:\n${draft.body}`);
+    assert.match(draft.body, /no invoice|nothing to chase|no unpaid/i);
+  });
+
+  test('a dunning note with no account named refuses rather than chasing "your team"', async () => {
+    const draft = await expectOk('POST', '/v1/ai/draft', {
+      kind: 'dunning', instruction: 'Write a dunning letter about the overdue invoice.',
+    });
+    assert.ok(!/an invoice on your account is still outstanding/i.test(draft.body),
+      `no account was named, so no invoice was read:\n${draft.body}`);
+    assert.match(draft.body, /names no account|Name the account/i);
+  });
+
+  test('a dunning note that names its account in the instruction reads that account’s ledger', async () => {
+    const meridian = app.ctx.svc.billing.customerByCrmRecord(ORG, 'cmp_nw_01')!;
+    const open = app.ctx.svc.billing.invoices(ORG, { customer: meridian.id, status: 'open_like', limit: 20 })
+      .filter((invoice) => invoice.amount_due > 0);
+    assert.ok(open.length, 'Meridian has unpaid invoices in the fixture');
+    const draft = await expectOk('POST', '/v1/ai/draft', {
+      instruction: 'Write a dunning letter to Meridian Forge Systems about their overdue invoice.',
+    });
+    assert.ok(open.some((invoice) => draft.body.includes(invoice.number)),
+      `the account was named in the instruction and its real invoice is not cited:\n${draft.body}`);
+  });
+});
+
+/* ----------------- a period in the future is still a period --------------- */
+
+describe('forward-looking periods resolve, like backward ones', () => {
+  test('"the next 30 days" is a date range, not an unparseable phrase', () => {
+    const now = app.ctx.now();
+    const [forward] = resolveWindows('which subscriptions renew in the next 30 days', now, 3);
+    assert.ok(forward, '"the next 30 days" resolved to nothing');
+    assert.equal(forward.start, now);
+    assert.equal(forward.end, now + 30 * 86_400_000);
+    assert.equal(unresolvedPeriods('which subscriptions renew in the next 30 days', now).length, 0);
+  });
+
+  test('a forward-looking question is answered, not refused for its period', async () => {
+    const answer = await ask('Which deals are closing in the next 60 days?');
+    assert.notEqual(answer.analysis.refusal?.code, 'period_unresolved',
+      `a forward period is as resolvable as a backward one:\n${answer.content}`);
+  });
+});
+
+/* ==========================================================================
+ * The qualifier invariant — one table, every qualifier type
+ *
+ * Two critics, on different surfaces, found the same defect: the engine parses
+ * a qualifier out of the question — a pipeline, a stage, an owner, an account,
+ * a period, a status, a measure, a meter, a unit, a ranking cut-off — and, when
+ * it cannot bind that qualifier to the query it is about to run, runs the
+ * unqualified query anyway and states the result as the answer.
+ *
+ * Every row below is a scoped question whose correct answer is computed here,
+ * from the database, without going near the engine. The engine must return that
+ * answer or refuse. Nothing else counts, and "the workspace total under the
+ * reader's own scoped sentence" is asserted against by name.
+ * ======================================================================== */
+
+interface DealFact {
+  id: string; name: string; owner: string | null; created: number;
+  pipeline: string; stage: string; amount: number; close: number;
+}
+
+const dealFacts = (): DealFact[] => app.ctx.db.all<{
+  id: string; display_name: string; owner_id: string | null; created: number; properties: string;
+}>(
+  `SELECT id, display_name, owner_id, created, properties FROM crm_records
+   WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL`, ORG,
+).map((row) => {
+  const p = JSON.parse(row.properties) as Record<string, unknown>;
+  return {
+    id: row.id,
+    name: row.display_name,
+    owner: row.owner_id,
+    created: row.created,
+    pipeline: String(p.pipeline ?? ''),
+    stage: String(p.deal_stage ?? ''),
+    amount: Number(p.amount ?? 0),
+    close: Number(p.close_date ?? 0),
+  };
+});
+
+const sumAmount = (rows: DealFact[]): number => rows.reduce((total, row) => total + row.amount, 0);
+const openFacts = (): DealFact[] => {
+  const open = stageSets(app.ctx, ORG).open;
+  return dealFacts().filter((row) => open.includes(row.stage));
+};
+const personId = (name: string): string =>
+  app.ctx.db.get<{ id: string }>(`SELECT id FROM users WHERE name = ?`, name)!.id;
+
+const OPEN_TICKET = ['new', 'waiting_on_us', 'waiting_on_customer', 'escalated'];
+const openTicketsOwnedBy = (name: string): number => app.ctx.db.all<{ owner_id: string | null; properties: string }>(
+  `SELECT owner_id, properties FROM crm_records WHERE org_id = ? AND object_type = 'ticket' AND archived = 0`, ORG,
+).filter((row) => row.owner_id === personId(name)
+  && OPEN_TICKET.includes(String((JSON.parse(row.properties) as { status?: unknown }).status ?? ''))).length;
+
+/** The live, unit-denominated credit an account can actually spend, from the grants. */
+const unitCreditLeft = (companyId: string): { units: number; unit: string } | null => {
+  const customer = app.ctx.svc.billing.customerByCrmRecord(ORG, companyId);
+  if (!customer) return null;
+  const now = app.ctx.now();
+  const grants = app.ctx.db.all<{ id: string; unit_label: string | null; amount_micro: number; effective_at: number; expires_at: number | null }>(
+    `SELECT id, unit_label, amount_micro, effective_at, expires_at FROM credit_grants
+     WHERE org_id = ? AND customer_id = ? AND kind = 'unit'`, ORG, customer.id);
+  let micro = 0;
+  let unit = '';
+  for (const grant of grants) {
+    if (grant.effective_at > now || (grant.expires_at !== null && grant.expires_at <= now)) continue;
+    const last = app.ctx.db.get<{ balance_after_micro: number }>(
+      `SELECT balance_after_micro FROM credit_ledger WHERE org_id = ? AND grant_id = ? ORDER BY seq DESC LIMIT 1`, ORG, grant.id);
+    micro += last ? last.balance_after_micro : grant.amount_micro;
+    unit = grant.unit_label ?? unit;
+  }
+  return { units: micro / 1_000_000, unit };
+};
+
+interface QualifierCase {
+  /** Which qualifier type this row pins down. */
+  kind: string;
+  q: string;
+  /** Substrings the answer must contain, computed from the database. */
+  must?: () => (string | RegExp)[];
+  /** The answer to a question nobody asked — must appear nowhere. */
+  never?: () => (string | RegExp)[];
+  /** Or: the engine must refuse, and the refusal must read like this. */
+  refuse?: RegExp;
+}
+
+const workspaceOpen = () => money(sumAmount(openFacts()));
+
+const QUALIFIER_CASES: QualifierCase[] = [
+  /* --- pipeline ------------------------------------------------------- */
+  {
+    kind: 'pipeline (bound)',
+    q: 'What is the Renewal pipeline worth?',
+    must: () => {
+      const rows = openFacts().filter((d) => d.pipeline === 'renewal');
+      return [money(sumAmount(rows)), String(rows.length)];
+    },
+    never: () => [workspaceOpen()],
+  },
+  {
+    kind: 'pipeline (named without the word)',
+    q: 'How many deals are in Expansion?',
+    must: () => [String(openFacts().filter((d) => d.pipeline === 'expansion').length)],
+    never: () => [String(openFacts().length)],
+  },
+  {
+    kind: 'pipeline (prepositional)',
+    q: 'How much is the pipeline for new business worth?',
+    must: () => [money(sumAmount(openFacts().filter((d) => d.pipeline === 'new_business')))],
+    never: () => [workspaceOpen()],
+  },
+  {
+    kind: 'pipeline (no such pipeline)',
+    q: 'What is the Partner pipeline worth?',
+    refuse: /No deal pipeline in this workspace is called "Partner"/,
+    never: () => [workspaceOpen()],
+  },
+  /* --- metric --------------------------------------------------------- */
+  {
+    kind: 'metric (not a near neighbour)',
+    q: 'What is our weighted pipeline?',
+    must: () => [/weighted/i],
+    never: () => [workspaceOpen()],
+  },
+  {
+    kind: 'metric (not in the catalogue)',
+    q: 'What is our pipeline coverage?',
+    refuse: /not a measure this platform defines/,
+    never: () => [workspaceOpen()],
+  },
+  {
+    kind: 'metric (a pipeline scope does not become the measure)',
+    q: 'How much did we book in the New business pipeline in Q2 2026?',
+    must: () => {
+      const q2 = { start: Date.UTC(2026, 3, 1), end: Date.UTC(2026, 6, 1) };
+      const won = stageSets(app.ctx, ORG).won;
+      const rows = dealFacts().filter((d) => won.includes(d.stage) && d.pipeline === 'new_business'
+        && d.close >= q2.start && d.close < q2.end);
+      return [money(sumAmount(rows))];
+    },
+    never: () => [money(sumAmount(openFacts().filter((d) => d.pipeline === 'new_business'))), workspaceOpen()],
+  },
+  /* --- stage ---------------------------------------------------------- */
+  {
+    kind: 'stage (bound)',
+    q: 'How many deals are in Negotiation?',
+    must: () => [String(openFacts().filter((d) => d.stage === 'negotiation').length)],
+    never: () => [String(openFacts().length)],
+  },
+  {
+    kind: 'stage (a real stage is never denied)',
+    q: 'Which deals are in the Technical validation stage?',
+    must: () => [String(openFacts().filter((d) => d.stage === 'technical_validation').length)],
+    never: () => [/do not hold anything called/i, /no deal stage in this workspace is called/i],
+  },
+  {
+    kind: 'stage (a real stage is never denied)',
+    q: 'Which deals are in the Proposal sent stage?',
+    must: () => [String(openFacts().filter((d) => d.stage === 'proposal').length)],
+    never: () => [/no deal stage in this workspace is called/i],
+  },
+  {
+    kind: 'stage (no such stage)',
+    q: 'How many deals are in the Contract review stage?',
+    refuse: /No deal stage in this workspace is called "Contract review"/,
+    never: () => [String(openFacts().length)],
+  },
+  /* --- owner ---------------------------------------------------------- */
+  {
+    kind: 'owner (bound)',
+    q: 'How much pipeline does Marcus Ilori own?',
+    must: () => {
+      const rows = openFacts().filter((d) => d.owner === personId('Marcus Ilori'));
+      return [money(sumAmount(rows)), String(rows.length)];
+    },
+    never: () => [workspaceOpen()],
+  },
+  {
+    kind: 'owner (a first name a contact also carries)',
+    q: 'How much pipeline does Marcus own?',
+    must: () => [money(sumAmount(openFacts().filter((d) => d.owner === personId('Marcus Ilori'))))],
+    never: () => [/Whitcombe Aerospace/, workspaceOpen()],
+  },
+  {
+    kind: 'owner (one name, two kinds of record, is a question back)',
+    q: 'How many deals does Marcus have?',
+    refuse: /Marcus Ilori \(a teammate\) and Marcus Barnes \(an account\)/,
+    never: () => [/Whitcombe Aerospace/],
+  },
+  {
+    kind: 'owner (no such teammate)',
+    q: 'How much pipeline does Jordan Fairweather own?',
+    refuse: /No teammate in this workspace is called "Jordan Fairweather"/,
+    never: () => [workspaceOpen()],
+  },
+  {
+    kind: 'owner (no such teammate, list form)',
+    q: 'List the open deals owned by Fiona Blackwood',
+    refuse: /Fiona Blackwood/,
+    never: () => [String(openFacts().length)],
+  },
+  {
+    kind: 'owner (no such teammate, stage-scoped)',
+    q: 'How many deals does Fiona Blackwood have in the Negotiation stage?',
+    refuse: /Fiona Blackwood/,
+    never: () => [String(openFacts().filter((d) => d.stage === 'negotiation').length)],
+  },
+  {
+    kind: 'owner (tickets nobody owns is zero, not a refusal)',
+    q: 'How many open tickets does Nina Kowalski have?',
+    must: () => [String(openTicketsOwnedBy('Nina Kowalski'))],
+    never: () => [/could not/i],
+  },
+  /* --- account -------------------------------------------------------- */
+  {
+    kind: 'account (bound)',
+    q: 'What is Meridian Forge Systems carrying in open pipeline?',
+    must: () => [money(sumAmount(openFacts().filter((d) => d.name.startsWith('Meridian Forge Systems'))))],
+    never: () => [workspaceOpen()],
+  },
+  {
+    kind: 'account (a near miss is offered, never substituted)',
+    q: 'What is Bayside Logistics carrying in open pipeline?',
+    refuse: /Bayside Logistics/,
+    never: () => [workspaceOpen()],
+  },
+  {
+    kind: 'account (no such account)',
+    q: 'What is Zorblax Industries carrying in open pipeline?',
+    refuse: /No company, contact or customer in this workspace is called "Zorblax Industries"/,
+    never: () => [workspaceOpen()],
+  },
+  {
+    kind: 'account (no such account, revenue)',
+    q: 'How much revenue did Zorblax Industries generate in 2025?',
+    refuse: /Zorblax Industries/,
+  },
+  {
+    kind: 'account (a typo-tolerant match names the substitution first)',
+    q: 'How many open tickets for nortgate chemical?',
+    must: () => [/^You wrote "nortgate chemical"; the closest account this workspace holds is Northgate Chemical Works/],
+  },
+  /* --- period --------------------------------------------------------- */
+  {
+    kind: 'period (the column the question named)',
+    q: 'Which deals were created last month?',
+    must: () => {
+      const from = Date.UTC(2026, 7, 1);
+      const to = Date.UTC(2026, 8, 1);
+      const created = dealFacts().filter((d) => d.created >= from && d.created < to);
+      return created.length ? [String(created.length)] : [/^No deals were created in Aug 2026\./m];
+    },
+    never: () => dealFacts()
+      .filter((d) => d.close >= Date.UTC(2026, 7, 1) && d.close < Date.UTC(2026, 8, 1))
+      .map((d) => d.name),
+  },
+  {
+    kind: 'period (forward-looking, on a snapshot measure)',
+    q: 'How much pipeline is closing in the next 30 days?',
+    must: () => {
+      const now = app.ctx.now();
+      const rows = openFacts().filter((d) => d.close >= now && d.close < now + 30 * 86_400_000);
+      return [money(sumAmount(rows)), String(rows.length)];
+    },
+    never: () => [workspaceOpen(), /cannot be applied to it/i],
+  },
+  {
+    kind: 'period (a month is the month, not a neighbouring year)',
+    q: 'What did we invoice in August 2026?',
+    must: () => [/August 2026/],
+  },
+  /* --- status --------------------------------------------------------- */
+  {
+    kind: 'status (won, scoped to a rep and a period)',
+    q: 'How many deals did Dana Whitfield win in Q2 2026?',
+    must: () => {
+      const won = stageSets(app.ctx, ORG).won;
+      const rows = dealFacts().filter((d) => won.includes(d.stage) && d.owner === personId('Dana Whitfield')
+        && d.close >= Date.UTC(2026, 3, 1) && d.close < Date.UTC(2026, 6, 1));
+      return [String(rows.length)];
+    },
+    never: () => [/could not apply/i],
+  },
+  {
+    kind: 'status (lost, scoped to a pipeline, matching nothing)',
+    q: 'Which deals did we lose in the Expansion pipeline?',
+    must: () => [/No closed-lost deals in the Expansion pipeline/],
+    never: () => [/A plant Northwind has never instrumented/],
+  },
+  {
+    kind: 'status (lost, over a period)',
+    q: 'Which deals did we lose last quarter?',
+    must: () => {
+      const lost = stageSets(app.ctx, ORG).lost;
+      const rows = dealFacts().filter((d) => lost.includes(d.stage)
+        && d.close >= Date.UTC(2026, 3, 1) && d.close < Date.UTC(2026, 6, 1));
+      return [String(rows.length), ...rows.slice(0, 1).map((d) => d.name)];
+    },
+    never: () => [`${openFacts().length} open deals`],
+  },
+  {
+    kind: 'status (a win rate scoped to a pipeline with nothing decided in it)',
+    q: 'What is our win rate in the Expansion pipeline?',
+    must: () => ['no win rate in the Expansion pipeline', /no rate to report/],
+    never: () => [/66\.7%/, /the honest answer is zero/],
+  },
+  /* --- unit and meter -------------------------------------------------- */
+  {
+    kind: 'unit (a balance question is not a consumption question)',
+    q: 'How many telemetry events does Meridian Forge Systems have left?',
+    must: () => {
+      const left = unitCreditLeft('cmp_nw_01')!;
+      return [left.units.toLocaleString('en-US', { maximumFractionDigits: 2 }), /events/];
+    },
+    never: () => [/metered [\d,]{9,}/, /\$0\.00/],
+  },
+  {
+    kind: 'unit (an empty pot is still denominated in the unit)',
+    q: "What is Ironwood Packaging Group's remaining event credit?",
+    must: () => [/no spendable credit|nothing left|spent, expired/i],
+    never: () => [/Nothing this run measured is denominated in events/],
+  },
+  {
+    kind: 'unit (a unit balance is never rendered as money)',
+    q: 'What credit does Meridian Forge Systems have left?',
+    must: () => {
+      const left = unitCreditLeft('cmp_nw_01')!;
+      return [left.units.toLocaleString('en-US', { maximumFractionDigits: 2 }), /events/];
+    },
+    never: () => [/\$0\.00/],
+  },
+  {
+    kind: 'unit (a unit grant is not a money grant)',
+    q: 'What credit grants does Meridian Forge Systems have?',
+    must: () => [/6,000,000 events/],
+    never: () => [/\$60,000\.00/],
+  },
+  /* --- meter ------------------------------------------------------------ */
+  {
+    kind: 'meter (a consumption question stays on the meter it names)',
+    q: 'How many telemetry events did Meridian Forge Systems meter in Q3 2026?',
+    must: () => {
+      const q3 = { start: Date.UTC(2026, 6, 1), end: Date.UTC(2026, 9, 1) };
+      const meter = app.ctx.db.get<{ id: string }>(
+        `SELECT id FROM meters WHERE org_id = ? AND name = 'Telemetry events'`, ORG)!;
+      const customer = app.ctx.svc.billing.customerByCrmRecord(ORG, 'cmp_nw_01')!;
+      const HOUR = 3_600_000;
+      const total = app.ctx.db.get<{ micro: number }>(
+        `SELECT COALESCE(SUM(sum_micro), 0) AS micro FROM meter_event_summaries
+         WHERE org_id = ? AND meter_id = ? AND customer_id = ? AND hour_start >= ? AND hour_start < ?`,
+        ORG, meter.id, customer.id, Math.floor(q3.start / HOUR) * HOUR, Math.ceil(q3.end / HOUR) * HOUR)!;
+      return [Math.round(total.micro / 1_000_000).toLocaleString('en-US'), 'Telemetry events'];
+    },
+    // The pot is a different quantity from the consumption, and neither may
+    // stand in for the other.
+    never: () => ['9,131.22'],
+  },
+  /* --- ranking cut-off -------------------------------------------------- */
+  {
+    kind: 'limit (written before the noun)',
+    q: 'Show me the 3 largest open deals owned by Marcus Ilori',
+    must: () => {
+      const rows = openFacts().filter((d) => d.owner === personId('Marcus Ilori'))
+        .sort((a, b) => b.amount - a.amount).slice(0, 3);
+      return rows.map((d) => d.name);
+    },
+    never: () => openFacts().filter((d) => d.owner === personId('Marcus Ilori'))
+      .sort((a, b) => b.amount - a.amount).slice(3).map((d) => d.name),
+  },
+  /* --- how a bound qualifier reads back --------------------------------- */
+  {
+    kind: 'stage (read back in the workspace\'s own words)',
+    q: 'How many deals does Priya Raman have in the Negotiation stage?',
+    must: () => {
+      const rows = openFacts().filter((d) => d.owner === personId('Priya Raman') && d.stage === 'negotiation');
+      return [String(rows.length), 'at the Negotiation stage'];
+    },
+    never: () => ['deal stage Negotiation'],
+  },
+  {
+    kind: 'pipeline (read back in the workspace\'s own words)',
+    q: 'What is the Renewal pipeline worth for Priya Raman?',
+    must: () => {
+      const rows = openFacts().filter((d) => d.owner === personId('Priya Raman') && d.pipeline === 'renewal');
+      return [money(sumAmount(rows)), 'in the Renewal pipeline'];
+    },
+    never: () => ['pipeline Renewal', workspaceOpen()],
+  },
+  /* --- currency --------------------------------------------------------- */
+  {
+    kind: 'currency (one book, named)',
+    q: 'How much revenue did we book in EUR in 2025?',
+    must: () => [/€/, /EUR/],
+    never: () => [/^\$/m],
+  },
+];
+
+const contains = (haystack: string, needle: string | RegExp): boolean =>
+  typeof needle === 'string' ? haystack.includes(needle) : needle.test(haystack);
+
+/**
+ * There is no fourth state.
+ *
+ * Every qualifier the question named has to be bound, refused or explicitly
+ * waived by the time an answer exists, and a `bound` entry has to name a step
+ * that actually ran. A `pending` entry in a finished run is the silent drop
+ * this whole mechanism exists to make impossible.
+ */
+function assertLedgerSettled(answer: { content: string; analysis: any }): void {
+  const ran = new Set<string>([
+    ...(answer.analysis.plan ?? []).map((s: { tool: string }) => s.tool),
+    ...(answer.analysis.steps ?? []).map((s: { tool: string }) => s.tool),
+  ]);
+  for (const entry of answer.analysis.qualifiers ?? []) {
+    assert.notEqual(entry.state, 'pending',
+      `${entry.kind} "${entry.text}" reached the answer neither bound, refused nor waived:\n${answer.content}`);
+    if (entry.state === 'waived') {
+      assert.ok(entry.detail, `${entry.kind} "${entry.text}" was waived with no reason given — a silent drop wearing a different word.`);
+    }
+    if (entry.state === 'bound') {
+      assert.ok(entry.bound_to?.tool, `${entry.kind} "${entry.text}" is bound to nothing.`);
+      assert.ok(ran.has(entry.bound_to.tool),
+        `${entry.kind} "${entry.text}" claims to be bound to ${entry.bound_to.tool}, which never ran.`);
+    }
+    if (entry.resolved) {
+      assert.ok(entry.state !== 'bound' || entry.kind !== 'owner' || String(entry.resolved.value).startsWith('usr_'),
+        `an owner slot resolved to ${entry.resolved.value}, which is not a teammate.`);
+    }
+  }
+}
+
+describe('the qualifier invariant: a scoped question is answered in its own scope or refused', () => {
+  for (const scenario of QUALIFIER_CASES) {
+    test(`${scenario.kind} — "${scenario.q}"`, async () => {
+      const answer = await ask(scenario.q);
+      assertLedgerSettled(answer);
+      if (scenario.refuse) {
+        assert.ok(answer.analysis.refusal,
+          `"${scenario.q}" names something this workspace does not have, so it must refuse rather than answer:\n${answer.content}`);
+        assert.match(answer.content, scenario.refuse);
+      } else {
+        assert.equal(answer.analysis.refusal, null,
+          `"${scenario.q}" is answerable and was refused:\n${answer.content}`);
+        for (const want of scenario.must?.() ?? []) {
+          assert.ok(contains(answer.content, want),
+            `"${scenario.q}" must state ${want} — the figure computed from the database:\n${answer.content}`);
+        }
+      }
+      for (const banned of scenario.never?.() ?? []) {
+        assert.ok(!contains(answer.content, banned),
+          `"${scenario.q}" answered with ${banned}, which is the answer to a question nobody asked:\n${answer.content}`);
+      }
+    });
+  }
+
+  test('a follow-up inside a thread keeps the subject of the turn before it', async () => {
+    const opened = await expectOk('POST', '/v1/ai/threads', { message: 'How many open deals does Priya Raman have?' });
+    const priya = openFacts().filter((d) => d.owner === personId('Priya Raman'));
+    assert.ok(opened.messages.some((m: { role: string; content: string }) =>
+      m.role === 'assistant' && m.content.includes(String(priya.length))), JSON.stringify(opened.messages));
+    const reply = await expectOk('POST', `/v1/ai/threads/${opened.id}/messages`, { content: 'And how many of those are in Negotiation?' });
+    const negotiating = priya.filter((d) => d.stage === 'negotiation');
+    assert.ok(reply.message.content.includes(String(negotiating.length)),
+      `the follow-up lost the rep, the measure or the stage:\n${reply.message.content}`);
+    assert.ok(!/do not hold anything called/i.test(reply.message.content),
+      `the reply denies a stage this workspace lists by name:\n${reply.message.content}`);
+  });
+
+  test('every company this workspace holds is answerable by its own name', async () => {
+    // The refusal that stops "Bayside Logistics" becoming Oranmore Logistics
+    // must never fire on a name the workspace does have. Accents, hyphens and
+    // a capitalised verb at the head of the sentence all cut the proper-noun
+    // span short, and a truncated span is not evidence of anything.
+    const companies = app.ctx.db.all<{ id: string; display_name: string }>(
+      `SELECT id, display_name FROM crm_records WHERE org_id = ? AND object_type = 'company' AND archived = 0`, ORG);
+    assert.ok(companies.length > 20, 'the fixture has a book of business');
+    const refused: string[] = [];
+    for (const company of companies) {
+      const answer = await ask(`What is ${company.display_name} carrying in open pipeline?`);
+      const wrongly = (answer.analysis.qualifiers as { kind: string; state: string; text: string }[])
+        .find((entry) => entry.kind === 'account' && entry.state === 'refused');
+      if (wrongly) refused.push(`${company.display_name} → refused as "${wrongly.text}"`);
+    }
+    assert.deepEqual(refused, [], `these accounts exist and were refused:\n${refused.join('\n')}`);
+  });
+
+  test('a summarised scope fills the schema fields the run actually holds', async () => {
+    const priya = openFacts().filter((d) => d.owner === personId('Priya Raman'));
+    const answer = await ask('Summarise the open pipeline for Priya Raman', {
+      response_schema: {
+        type: 'object',
+        properties: { owner: { type: 'string' }, open_pipeline: { type: 'number' }, deal_count: { type: 'integer' } },
+      },
+    });
+    const row = JSON.parse(answer.content) as { owner: string | null; open_pipeline: number | null; deal_count: number | null };
+    assert.equal(row.owner, 'Priya Raman');
+    assert.equal(row.open_pipeline, sumAmount(priya));
+    assert.equal(row.deal_count, priya.length);
   });
 });

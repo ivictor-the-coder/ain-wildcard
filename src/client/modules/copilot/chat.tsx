@@ -20,14 +20,16 @@ import {
   humanize, useFormat, usePrefersReducedMotion, useToast, type MenuSection, type SelectOption,
 } from '@/client/design';
 import {
-  parseBlocks, refusalOf, splitToolEcho, useAiStatus, useAllApprovals, useSuggestions, useThread,
-  useThreads, useTools, useRun,
+  boardHref, carriedThrough, parseBlocks, parseBreakdown, reconcileBreakdown, reconcileScope,
+  refusalOf, splitToolEcho, useAiStatus, useAllApprovals, useSuggestions, useThread, useThreads,
+  useTools, useRun, useVocabulary, withoutBreakdown,
   type AiApproval, type AiMessage, type AiReply, type AiRun, type AiThread, type ThreadDetail,
-  type StepNote, type ToolEcho,
+  type StepNote, type ToolEcho, type Vocabulary,
 } from './api';
 import {
   ApprovalCard, ApprovalResolution, CitationChips, ConfidenceBadge, ReasoningList, TraceSteps,
 } from './trace';
+import { BoardLink, BreakdownPanel, ScopeBar, ScopeWarning } from './scope';
 import { DraftDialog } from './draft';
 
 /* ------------------------------- typewriter ------------------------------- */
@@ -145,12 +147,19 @@ function TracePanel({ runId }: { runId: string }) {
 }
 
 function AssistantMessage({
-  message, run, approvals, newest, onDecided, onOpenRun,
+  message, run, approvals, newest, question, vocab, vocabUnread, vocabLoading, onDecided, onOpenRun,
 }: {
   message: AiMessage;
   run: AiRun | undefined;
   approvals: AiApproval[];
   newest: boolean;
+  /** The question this answer answers, as the run recorded it. */
+  question: string;
+  vocab: Vocabulary;
+  /** True when the pipelines, teammates or metrics could not be read. */
+  vocabUnread: boolean;
+  /** True while they are still being read, so nothing is named yet. */
+  vocabLoading: boolean;
   onDecided: () => void;
   onOpenRun: (id: string) => void;
 }) {
@@ -159,9 +168,59 @@ function AssistantMessage({
   // The tool echo is not prose and is not typed out as prose: the answer is
   // what gets revealed, and what the tools returned beyond it sits under it.
   const { prose, echoes, notes } = useMemo(() => splitToolEcho(message.content), [message.content]);
-  const { shown, done } = useReveal(prose, newest);
   const refusal = refusalOf(run);
   const lowConfidence = !!run && run.confidence !== null && run.confidence < 0.55 && !refusal;
+
+  const citations = useMemo(
+    () => (message.citations.length ? message.citations : run?.citations ?? []),
+    [message.citations, run?.citations],
+  );
+
+  /**
+   * What this answer was measured over, against what the question asked for.
+   *
+   * Everything it reads was published by the engine with the answer — the
+   * arguments of each tool call, the figures the reasoning trail says those
+   * calls returned, and the question itself — so no extra request is made per
+   * message and nothing is inferred about a number.
+   */
+  const scope = useMemo(() => reconcileScope({
+    question,
+    prose,
+    toolCalls: message.tool_calls ?? [],
+    reasoning: run?.reasoning ?? [],
+    vocab,
+    resolveId: (id) => citations.find((c) => c.id === id)?.label
+      ?? vocab.people.find((person) => person.id === id)?.name
+      ?? null,
+  }), [question, prose, message.tool_calls, run?.reasoning, vocab, citations]);
+
+  // Terms the engine itself recorded as read-and-dropped, kept only where this
+  // workspace knows them as a stage or a teammate — the rest of that list is
+  // filler like "worth" and "own". A run whose qualifier ledger already accounts
+  // for that dimension has said something more precise, so this stays quiet.
+  const carried = useMemo(
+    () => carriedThrough(run?.reasoning ?? [], vocab)
+      .filter((term) => !scope.verdicts.some((verdict) => verdict.kind === term.kind)),
+    [run?.reasoning, vocab, scope.verdicts],
+  );
+
+  // Where the same question can be answered when this one could not be: the
+  // board narrows by pipeline and by owner, and draws the per-stage medians and
+  // the column totals the engine refuses or widens.
+  const board = useMemo(() => boardHref(question, vocab), [question, vocab]);
+
+  const breakdown = useMemo(() => {
+    const parsed = parseBreakdown(prose);
+    if (!parsed) return null;
+    const pipeline = scope.answering[0]?.scope.pipeline ?? null;
+    return { report: reconcileBreakdown(parsed.buckets, vocab, pipeline), pipeline };
+  }, [prose, vocab, scope.answering]);
+
+  // The breakdown sentence is lifted out of the prose so it can be reconciled
+  // against the board rather than read as a settled list of stage figures.
+  const body = breakdown ? withoutBreakdown(prose) : prose;
+  const { shown, done } = useReveal(body, newest);
 
   // The prose was composed when the engine stopped: it says "Nothing has been
   // written" and always will. Once a decision has been made it is history, not
@@ -172,7 +231,7 @@ function AssistantMessage({
 
   return (
     <div className="cp-msg cp-msg--assistant">
-      <div className="cp-answer">
+      <div className={`cp-answer${scope.unscoped.length ? ' is-unscoped' : ''}`}>
         <div className="cp-answer__head">
           <Badge tone="brand" size="sm" icon={<Icons.sparkles size={11} />}>
             {run ? run.model : 'Copilot'}
@@ -202,6 +261,24 @@ function AssistantMessage({
             {refusal.message}
             {' '}
             <span className="cp-mono">({refusal.code})</span>
+            {board && <BoardLink board={board} />}
+          </Banner>
+        )}
+
+        <ScopeWarning report={scope} board={board} />
+
+        {vocabUnread && scope.answering.length > 0 && (
+          <Banner tone="warning" compact title="The scope of this answer was not checked">
+            The pipelines, teammates and metric catalogue this workspace defines could not be read, so
+            nothing below has been compared against what the question asked for.
+          </Banner>
+        )}
+
+        {carried.length > 0 && scope.answering.length > 0 && (
+          <Banner tone="warning" title="The engine dropped part of the question" bar>
+            It recorded reading {f.list(carried.map((term) => `“${term.label}”`))} in what you asked and then
+            answering without {carried.length === 1 ? 'it' : 'them'}. The figure below is not narrowed to{' '}
+            {carried.length === 1 ? 'that' : 'those'}.
           </Banner>
         )}
 
@@ -216,13 +293,17 @@ function AssistantMessage({
           <Banner tone="danger" title="This run failed">{run.error}</Banner>
         )}
 
+        <ScopeBar report={scope} vocab={vocab} loading={vocabLoading} />
+
         <div className={superseded ? 'cp-superseded' : undefined}>
           <AnswerBody content={shown} revealing={!done} />
         </div>
 
+        {done && breakdown && <BreakdownPanel report={breakdown.report} pipeline={breakdown.pipeline} />}
+
         {done && <ToolEchoes echoes={echoes} notes={notes} />}
 
-        <CitationChips citations={message.citations.length ? message.citations : run?.citations ?? []} />
+        <CitationChips citations={citations} />
 
         {waiting.map((approval) => (
           <ApprovalCard key={approval.id} approval={approval} onDecided={onDecided} />
@@ -282,6 +363,9 @@ export function CopilotPage() {
   const approvals = useAllApprovals();
   const ai = useAiStatus();
   const tools = useTools();
+  // The pipelines, the teammates and the metric catalogue: what an answer's
+  // scope has to be checked against before it can be shown as a scoped answer.
+  const vocabulary = useVocabulary();
 
   const [draft, setDraft] = useState(location.query.ask ?? '');
   const [allowWrites, setAllowWrites] = useState(false);
@@ -323,6 +407,22 @@ export function CopilotPage() {
     [thread.data],
   );
 
+  /**
+   * The question an answer answers.
+   *
+   * The run records it, which is the reliable source — a follow-up rewritten by
+   * the engine ("it" resolved to a deal) is still stored as what was typed. The
+   * message before it is the fallback for an answer whose run has aged out.
+   */
+  const questionFor = useCallback((message: AiMessage, index: number): string => {
+    const run = message.run_id ? runsById.get(message.run_id) : undefined;
+    if (run?.question) return run.question;
+    for (let i = index - 1; i >= 0; i -= 1) {
+      if (messages[i].role === 'user') return messages[i].content;
+    }
+    return '';
+  }, [messages, runsById]);
+
   useEffect(() => {
     const node = streamRef.current;
     if (node) node.scrollTop = node.scrollHeight;
@@ -352,6 +452,7 @@ export function CopilotPage() {
 
   // On mount, and again each time an answer lands.
   useEffect(landFocus, [landFocus, newestMessage]);
+
 
   const visibleThreads = useMemo(() => {
     const needle = filter.trim().toLowerCase();
@@ -742,6 +843,10 @@ export function CopilotPage() {
                   run={message.run_id ? runsById.get(message.run_id) : undefined}
                   approvals={approvalsFor(message.run_id)}
                   newest={message.id === newestMessage && index === messages.length - 1}
+                  question={questionFor(message, index)}
+                  vocab={vocabulary.vocab}
+                  vocabUnread={!!vocabulary.error}
+                  vocabLoading={vocabulary.loading}
                   onDecided={() => { if (selected) refreshAfterAnswer(selected); }}
                   onOpenRun={(id) => navigate(`/copilot/runs/${id}`)}
                 />

@@ -216,6 +216,80 @@
 .cp-chip:hover { border-color: var(--border-brand); color: var(--text-brand); background: var(--accent-subtle); }
 .cp-chip:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 .cp-chip[disabled] { cursor: default; opacity: 0.8; }
+a.cp-chip { text-decoration: none; }
+/* A cited record with no screen: still reachable, visibly not a way out. */
+.cp-chip--flat { cursor: default; border-style: dashed; color: var(--text-tertiary); }
+.cp-chip--flat:hover { border-color: var(--border-default); color: var(--text-tertiary); background: var(--bg-surface); }
+
+/* ------------------------------- answer scope ----------------------------- */
+
+.cp-scope { display: flex; flex-direction: column; gap: var(--space-2); }
+.cp-scope__row { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
+.cp-scope__label {
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-tertiary);
+  margin-right: var(--space-2);
+}
+.cp-scope__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 320px;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+.cp-scope__key {
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-tertiary);
+}
+/* The dimension the question named and the query left wide open. */
+.cp-scope__chip.is-wide {
+  border-color: var(--border-danger-subtle);
+  background: var(--surface-danger);
+  color: var(--text-danger);
+}
+.cp-scope__chip.is-wide .cp-scope__key { color: var(--text-danger); }
+/* A dimension drawn from a tool argument that nothing in the answer confirms. */
+.cp-scope__chip.is-unchecked {
+  border-style: dashed;
+  border-color: var(--border-warning);
+  background: var(--bg-surface);
+  color: var(--text-tertiary);
+}
+.cp-scope__unchecked {
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-warning);
+}
+.cp-scope__reasons { margin: var(--space-2) 0 0; padding-left: var(--space-6); display: grid; gap: var(--space-2); list-style: disc; }
+.cp-scope__reasons > li { display: list-item; }
+.cp-answer.is-unscoped { border-color: var(--border-danger); }
+
+/* ------------------------------- breakdown -------------------------------- */
+
+.cp-breakdown { display: grid; gap: var(--space-2); }
+.cp-breakdown__list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-1); }
+.cp-breakdown__list--plain li { grid-template-columns: minmax(0, 1fr) auto; }
+.cp-breakdown__list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: var(--space-3);
+  align-items: center;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  font-size: var(--text-sm);
+}
+.cp-breakdown__figure { font-variant-numeric: tabular-nums; font-weight: var(--weight-medium); }
 .cp-chip__type {
   font-size: var(--text-2xs);
   color: var(--text-tertiary);

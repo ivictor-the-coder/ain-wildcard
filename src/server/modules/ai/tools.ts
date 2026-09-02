@@ -27,7 +27,7 @@ const conditionInput = v.array(v.object({
   values: v.optional(v.array(v.any(), { max: 40 })),
 }), { max: 10 });
 
-const GROUP_BY = ['time', 'owner', 'stage', 'industry', 'account', 'status', 'priority', 'source', 'none'] as const;
+const GROUP_BY = ['time', 'owner', 'stage', 'pipeline', 'industry', 'account', 'status', 'priority', 'source', 'none'] as const;
 
 export function aiTools(ctx: Ctx): AiToolDef[] {
   return [
@@ -72,6 +72,9 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
         group_by: v.optional(v.enum(GROUP_BY)),
         compare: v.optional(v.boolean()),
         currency: v.optional(v.string({ min: 3, max: 3, description: 'Restrict a money metric to one book, e.g. usd. Omit to get one figure per currency.' })),
+        pipeline: v.optional(v.string({ max: 60, description: 'Narrow a deal-sourced metric to one pipeline, by machine name (new_business, expansion, renewal). Errors rather than widening when the metric cannot take one.' })),
+        stage: v.optional(v.string({ max: 60, description: 'Narrow open pipeline, weighted pipeline or the deal count to one stage, by machine name (negotiation, proposal, technical_validation).' })),
+        limit: v.optional(v.int({ min: 1, max: 25, description: 'How many groups a ranked breakdown returns. Defaults to 5.' })),
       }),
       run: (args: Parameters<typeof businessMetric>[2], _c, meta) => businessMetric(ctx, meta.orgId, args),
     },

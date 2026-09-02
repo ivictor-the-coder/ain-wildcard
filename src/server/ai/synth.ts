@@ -12,15 +12,17 @@ import { DAY, formatDate, formatRelative } from '../../shared/time';
 import type { WorkspaceProfile } from './grounding';
 import type { IntentResult } from './intent';
 import type { TimeWindow } from './dates';
-import { describeWindow } from './dates';
+import { describeWindow, labelIsPrepositional } from './dates';
 import type { MetricDetection, MetricSubject, StageSets } from './metrics';
-import { isValueQuestion } from './metrics';
+import { isValueQuestion, metricUndefinedWhenEmpty } from './metrics';
 import type { AccountProfileResult, MeteredUsageResult, MetricToolResult, RecordSearchResult, StaleAccountsResult, TimelineItem, WorkspaceSearchResult, RecordAggregateResult } from './functions';
+import { formatUnits } from './functions';
 import type { ResolvedEntity } from './resolve';
 import type { BlockedCapability, WindowPair } from './plan';
 import { askedFor } from './plan';
 import type { DraftResult } from './draft';
 import type { PendingApproval } from './runtime';
+import type { QualifierVocabulary } from './qualifiers';
 import { acronymOf, countOf, formatSignedPercent, humanise, listPhrase, normalise, sentenceJoin, truncate } from './text';
 
 export interface StepResult {
@@ -67,6 +69,15 @@ export interface SynthesisInput {
    * the word "open" is the pipeline definition the workspace publishes.
    */
   stages?: StageSets;
+  /**
+   * The pipelines and stages this workspace publishes, with their labels.
+   *
+   * A filter has to be read back in the words the workspace uses for it.
+   * Concatenating the property name and the stored value produced "2 deals deal
+   * stage Negotiation" and "3 open deals pipeline Renewal" — the parser talking
+   * where a sentence belongs.
+   */
+  vocabulary?: QualifierVocabulary;
   /**
    * Ledger capabilities the question asked for and the run could not use.
    *
@@ -286,12 +297,16 @@ export function describeWrite(
 /** How each metric reads in a sentence — a total is not always "booked". */
 function headline(metric: MetricToolResult, who: string, period: string, hasSubject: boolean): string {
   const value = metric.formatted;
+  // A stage the question named replaces the metric's own stage set, so the
+  // noun has to follow: "8 open deals at the Closed won stage" is a sentence
+  // that contradicts itself.
+  const dealNoun = metric.scope?.stage ? 'deal' : 'open deal';
   switch (metric.metric) {
     case 'spend': return `${who} spent ${value} in ${period}`;
     case 'revenue': return `${who} collected ${value} in ${period}`;
     case 'invoiced': return hasSubject ? `${who} was invoiced ${value} in ${period}` : `${who} invoiced ${value} in ${period}`;
     case 'outstanding': return `${who} has ${value} outstanding`;
-    case 'pipeline': return `${who} is carrying ${value} in open pipeline`;
+    case 'pipeline': return `${who} is carrying ${value} in ${metric.scope?.stage ? 'pipeline' : 'open pipeline'}`;
     case 'weighted_pipeline': return `${who} has ${value} of weighted pipeline`;
     case 'closed_won': return `${who} booked ${value} in ${period}`;
     case 'closed_lost': return `${who} lost ${value} of business in ${period}`;
@@ -310,7 +325,7 @@ function headline(metric: MetricToolResult, who: string, period: string, hasSubj
     // A count needs a noun that agrees with it. "1 open tickets" is the kind of
     // sentence that makes a reader distrust the number in front of it.
     case 'open_tickets': return `${who} has ${countOf(metric.value, 'open ticket')} right now`;
-    case 'deal_count': return `${who} has ${countOf(metric.value, 'open deal')} right now`;
+    case 'deal_count': return `${who} has ${countOf(metric.value, dealNoun)} right now`;
     case 'customers': return `${who} has ${countOf(metric.value, 'customer')} on the books`;
     case 'new_customers': return `${who} added ${countOf(metric.value, 'new customer')} in ${period}`;
     case 'tickets_created': return `${who} logged ${countOf(metric.value, 'ticket')} in ${period}`;
@@ -351,15 +366,36 @@ function metricSentence(metric: MetricToolResult, input: SynthesisInput, facts: 
   const period = metric.window.label || describeWindow(input.window, input.workspace.locale);
 
   if (metric.count === 0 && metric.value === 0) {
+    // The scope the question named belongs in the empty sentence too. "No win
+    // rate recorded for Q3 2026 to date" under a question about the Expansion
+    // pipeline reads as a statement about the whole book.
+    const emptyScope = metric.scope?.label ? ` ${metric.scope.label}` : '';
+    // A rate with nothing in its denominator is not zero, it is undefined: no
+    // deal was decided, so there is no proportion to report either way. The
+    // same is true of every average — "no average deal size, so the honest
+    // answer is zero" says each of ten open deals is worth nothing — and the
+    // basis the measure imposed is named, because the reader did not ask for
+    // it: the average is over closed-won deals, and this book has none.
+    const basis = metric.source.replace(/^0\s+/, '').replace(/\bdeals\b/, 'deals');
+    const because = metric.unit === 'percent'
+      ? `no deal in it reached a decision, so there is no rate to report; a zero would say every one of them was lost`
+      : metricUndefinedWhenEmpty(metric.metric)
+        ? `it is an average over ${basis} and there are none, so there is no average to report; a zero would say the rows there are measured nothing`
+        : 'the query matched no rows, so the honest answer is zero rather than a number';
     lines.push(metric.snapshot
       // A snapshot was never measured over the period, so blaming the period
       // for the zero is a second wrong statement on top of the first.
-      ? `${who} has no ${metric.label.toLowerCase()} right now — the query matched no rows, so the honest answer is zero rather than a number.`
-      : `${who} has no ${metric.label.toLowerCase()} recorded for ${period} — the query matched no rows, so the honest answer is zero rather than a number.`);
+      ? `${who} has no ${metric.label.toLowerCase()}${emptyScope} right now — ${because}.`
+      : `${who} has no ${metric.label.toLowerCase()}${emptyScope} recorded for ${period} — ${because}.`);
   } else {
     // The supporting-row clause is dropped when it would just repeat the number.
     const redundant = metric.unit === 'count' && Math.round(metric.value) === metric.count;
-    lines.push(`${headline(metric, who, period, !!metric.subject)}${redundant ? '' : `, from ${metric.source}`}.`);
+    // The pipeline or stage the question named goes in the sentence with the
+    // number, not in a note under it. A scoped figure printed under an unscoped
+    // sentence reads as the workspace total, which is how a $1.46M renewal book
+    // was reported as $9.0M.
+    const scoped = metric.scope?.label ? ` ${metric.scope.label}` : '';
+    lines.push(`${headline(metric, who, period, !!metric.subject)}${scoped}${redundant ? '' : `, from ${metric.source}`}.`);
   }
 
   if (metric.change && metric.count > 0) {
@@ -423,7 +459,10 @@ function rankedAnswer(metric: MetricToolResult, input: SynthesisInput): string[]
       key: a.id, label: a.label, formatted: a.formatted, value: 0, count: 0, currency: a.currency ?? null,
     }));
   const rows = grouped.filter((row) => !looksLikeId(row.label));
-  const period = metric.snapshot ? 'right now' : metric.window.label === 'all time' ? 'across all time' : `in ${metric.window.label}`;
+  const period = metric.snapshot ? 'right now'
+    : metric.window.label === 'all time' ? 'across all time'
+      : labelIsPrepositional(metric.window.label) ? metric.window.label
+        : `in ${metric.window.label}`;
   const noun = metric.label.toLowerCase();
   if (!rows.length) {
     return grouped.length
@@ -502,6 +541,26 @@ function rankedAnswer(metric: MetricToolResult, input: SynthesisInput): string[]
  * count was right and the sentence around it was false, which is the worse
  * half: a reader takes the sentence.
  */
+/** The same dates as a scope clause rather than as a verb phrase. */
+const DATE_SCOPE: Record<string, string> = {
+  close_date: 'closing in',
+  created: 'created in',
+  updated: 'last updated in',
+  occurred_at: 'that happened in',
+  resolved_at: 'resolved in',
+  became_customer_at: 'that became customers in',
+  last_activity_at: 'last touched in',
+};
+
+/** The CRM property each catalogue money measure is a sum of. */
+const MEASURE_PROPERTY: Record<string, string> = {
+  pipeline: 'amount', weighted_pipeline: 'weighted_amount',
+  closed_won: 'amount', closed_lost: 'amount', avg_deal_size: 'amount',
+};
+
+/** "Who owns the biggest deal?" — a question whose answer is a person's name. */
+const OWNER_QUESTION = /\bwho\s+(?:owns?|has|have|holds?|is\s+(?:the\s+)?(?:owner|rep|ae))\b/i;
+
 const DATE_VERB: Record<string, string> = {
   close_date: 'close',
   created: 'were created',
@@ -519,6 +578,14 @@ const DATE_VERB: Record<string, string> = {
  * plain English name once the pipeline definition is in hand.
  */
 const OPEN_TICKET_STATUSES = ['new', 'waiting_on_us', 'waiting_on_customer', 'escalated'];
+
+/**
+ * Object types the CRM actually stores, so an empty search of one is a fact.
+ *
+ * An empty `record_search` for an invoice means the CRM does not hold invoices,
+ * not that the workspace has none — the ledger answers that one.
+ */
+const CRM_LIST_TYPES = new Set(['company', 'contact', 'deal', 'ticket', 'task', 'note', 'call', 'meeting', 'email']);
 
 function conditionPhrase(
   conditions: { property?: string; value?: unknown; values?: unknown[] }[],
@@ -557,13 +624,31 @@ function conditionClauses(
   conditions: { property?: string; op?: string; value?: unknown; values?: unknown[] }[],
   facts: Facts,
   adjective: string | null,
+  vocabulary?: QualifierVocabulary,
 ): string[] {
   const clauses: string[] = [];
+  const labelFor = (list: { value: string; label: string }[] | undefined, value: string): string =>
+    list?.find((row) => row.value === value)?.label ?? humanise(value);
   for (const condition of conditions) {
     const property = String(condition.property ?? '');
     const op = String(condition.op ?? 'eq');
     // The stage or status filter is already carried by the adjective.
     if (adjective && (property === 'deal_stage' || property === 'status')) continue;
+    // A stage and a pipeline have names people use out loud. "deal stage
+    // Negotiation" is the column and the stored value with a space between
+    // them, which is how the parser would say it.
+    if (property === 'deal_stage' || property === 'pipeline') {
+      const raw = (Array.isArray(condition.values) ? condition.values : condition.value === undefined ? [] : [condition.value]).map(String);
+      if (raw.length && raw.length <= 3) {
+        const names = raw.map((value) => property === 'pipeline'
+          ? labelFor(vocabulary?.pipelines, value)
+          : labelFor(vocabulary?.stages, value));
+        clauses.push(property === 'pipeline'
+          ? `in the ${listPhrase(names)} pipeline${names.length > 1 ? 's' : ''}`
+          : `at the ${listPhrase(names)} stage${names.length > 1 ? 's' : ''}`);
+        continue;
+      }
+    }
     if (op === 'is_not_set') { clauses.push(`with no ${humanise(property).toLowerCase()}`); continue; }
     if (op === 'is_set') { clauses.push(`with a ${humanise(property).toLowerCase()}`); continue; }
     if (OP_PHRASE[op] && typeof condition.value === 'number') {
@@ -599,22 +684,30 @@ function listLead(list: RecordSearchResult, args: Record<string, unknown>, input
   const conditions = Array.isArray(args.conditions) ? (args.conditions as { property?: string; op?: string; value?: unknown; values?: unknown[] }[]) : [];
   const qualifier = conditionPhrase(conditions, input.stages);
   const facts = new Facts(input.workspace);
-  clauses.push(...conditionClauses(conditions, facts, qualifier));
+  clauses.push(...conditionClauses(conditions, facts, qualifier, input.vocabulary));
   const filtered = conditions.length > 0;
-  const qualified = qualifier
-    ? `${list.total} ${qualifier} ${list.object_type}${list.total === 1 ? '' : 's'}`
-    : noun;
+  // Zero rows is an answer, and "0 closed-lost deals" is a table cell. The
+  // sentence a reader needs says no.
+  const qualified = list.total === 0
+    ? `No ${qualifier ? `${qualifier} ` : ''}${list.object_type}s`
+    : qualifier
+      ? `${list.total} ${qualifier} ${list.object_type}${list.total === 1 ? '' : 's'}`
+      : noun;
   if (period) {
     // A deal that is already closed did not "close in 2026" in the future
     // tense the present verb reads as — it closed.
     const verb = qualifier?.startsWith('closed') && dateProperty === 'close_date'
       ? 'closed'
-      : DATE_VERB[dateProperty as string] ?? `fall in`;
+      : DATE_VERB[dateProperty as string] ?? 'fall';
     // A close date runs to the end of the period whether or not the period has
     // finished, so "Sep 2026 to date" would describe a range these rows are not
     // in: three of them close after today.
     const label = dateProperty === 'close_date' ? period.replace(/\s+to date$/i, '') : period;
-    return `${qualified}${clauses.length ? ` ${listPhrase(clauses)}` : ''} ${verb} in ${label}.`;
+    // "close in after December 2026" — a comparator label brings its own
+    // preposition, and pasting a second one in front of it garbles the only
+    // sentence that says which side of the date the answer is on.
+    const into = labelIsPrepositional(label) ? '' : 'in ';
+    return `${qualified}${clauses.length ? ` ${listPhrase(clauses)}` : ''} ${verb} ${into}${label}.`;
   }
   // "4 open deals worth more than $500,000" already says what was counted;
   // "match" after it is the parser talking. It is only needed when the filters
@@ -641,7 +734,7 @@ function aggregateSentence(agg: RecordAggregateResult, input: SynthesisInput, le
   const conditions = Array.isArray(args.conditions) ? (args.conditions as { property?: string; op?: string; value?: unknown; values?: unknown[] }[]) : [];
   const facts = new Facts(input.workspace);
   const qualifier = conditionPhrase(conditions, input.stages);
-  const scope: string[] = [...conditionClauses(conditions, facts, qualifier)];
+  const scope: string[] = [...conditionClauses(conditions, facts, qualifier, input.vocabulary)];
   // A rep named in the question is the answer's scope, and an answer that
   // never mentions them gives the reader no signal the filter was applied.
   const owner = typeof args.owner_id === 'string'
@@ -649,6 +742,23 @@ function aggregateSentence(agg: RecordAggregateResult, input: SynthesisInput, le
     : undefined;
   if (owner) scope.push(`owned by ${owner.name}`);
   if (input.subject && args.associated_to === input.subject.id) scope.push(`on ${input.subject.label}`);
+  // A window the aggregate actually filtered on belongs in the sentence: "3
+  // closed-won deals" and "3 closed-won deals in Q2 2026" are different claims,
+  // and the second is the one the plan computed.
+  const start = Number(args.start ?? NaN);
+  const end = Number(args.end ?? NaN);
+  const dateProperty = typeof args.date_property === 'string' ? args.date_property : null;
+  const period = dateProperty && Number.isFinite(start) && Number.isFinite(end)
+    ? (input.windows ?? []).find((w) => w.start === start && w.end === end)?.label
+      ?? (input.window.start === start && input.window.end === end ? input.window.label : null)
+    : null;
+  if (period) {
+    const label = dateProperty === 'close_date' ? period.replace(/\s+to date$/i, '') : period;
+    const preposition = dateProperty === 'close_date'
+      ? (qualifier?.startsWith('closed') ? 'closed in' : 'closing in')
+      : DATE_SCOPE[dateProperty as string] ?? 'in';
+    scope.push(`${preposition} ${label}`);
+  }
   const where = scope.length ? ` ${scope.join(', ')}` : '';
   // `measure` arrives as the tool's own label — "count of records", "sum of
   // Amount" — which is a column heading, not a clause in a sentence.
@@ -656,11 +766,24 @@ function aggregateSentence(agg: RecordAggregateResult, input: SynthesisInput, le
   const subject = qualifier
     ? `${agg.matched_records.toLocaleString(input.workspace.locale)} ${qualifier} ${agg.object_type}${agg.matched_records === 1 ? '' : 's'}`
     : countOf(agg.matched_records, agg.object_type);
+  // `record_aggregate` reports its measure as a column heading — "sum of
+  // amount", "sum of weighted amount" — and those are raw CRM property keys.
+  // The metric path phrases the identical figure as "open pipeline"; one run
+  // must not speak two vocabularies about the same number.
+  const property = typeof args.property === 'string' ? args.property : null;
+  const measured = !counting && input.metric && property
+    && MEASURE_PROPERTY[input.metric.metric.id] === property
+    ? input.metric.metric.label.toLowerCase()
+    : null;
   const lines = [counting
     ? owner
       ? `${owner.name} has ${subject}${where.replace(`, owned by ${owner.name}`, '').replace(` owned by ${owner.name}`, '')}.`
       : `${input.workspace.name} has ${subject}${where}.`
-    : `${agg.formatted} is the ${agg.measure.toLowerCase()} across ${subject}${where}.`];
+    : measured
+      ? `${agg.formatted} in ${measured} across ${subject}${where}.`
+      // No catalogue measure behind it, so the property's own name is the best
+      // available — but as English, not as a column key.
+      : `${agg.formatted} is the ${agg.measure.toLowerCase().replace(/^sum of /, 'total ').replace(/^avg of /, 'average ').replace(/_/g, ' ')} across ${subject}${where}.`];
   if (agg.groups.length) {
     lines.push(`Breakdown: ${agg.groups.slice(0, 8).map((g) => `${g.label} ${g.value.toLocaleString(input.workspace.locale)}`).join(' · ')}.`);
   }
@@ -976,8 +1099,25 @@ interface CreditBurnOrder {
 interface CreditBalancePayload {
   object: 'credit_balance';
   totals_by_currency: { currency: string; monetary_available: number; unit_pots: number; next_expiry: number | null }[];
+  /**
+   * The pots themselves, each with its own denomination.
+   *
+   * `totals_by_currency` counts the unit pots and cannot say what is in them,
+   * which is how an account holding 9,131 live telemetry events was reported
+   * as "$0.00 available and 1 unit pot".
+   */
+  balances?: {
+    currency: string;
+    kind?: 'monetary' | 'unit';
+    unit_label?: string | null;
+    available?: number;
+    next_expiry?: { at: number } | null;
+  }[];
   /** Grants that exist but have not started yet — credit the account will have. */
-  scheduled?: { name?: string; currency?: string; balance?: number; effective_at?: number | null; category?: string }[];
+  scheduled?: {
+    name?: string; currency?: string; balance?: number; effective_at?: number | null; category?: string;
+    kind?: 'monetary' | 'unit'; unit_label?: string | null;
+  }[];
   burn_order: string[];
 }
 
@@ -1448,32 +1588,72 @@ function entitlementBlocks(set: EntitlementSetPayload, workspace: WorkspaceProfi
   ];
 }
 
-function creditBlocks(balance: CreditBalancePayload, facts: Facts, workspace: WorkspaceProfile, who: string | null): string[] {
-  const pots = balance.totals_by_currency.filter((t) => t.monetary_available > 0 || t.unit_pots > 0);
+/**
+ * A credit amount in the denomination the grant is actually written in.
+ *
+ * A unit grant is a count of meter units and a monetary grant is money. They
+ * are different types and they do not share a formatter — running a
+ * 6,000,000-event pack through `formatMoney` printed "$60,000.00", a figure
+ * that is wrong by construction and indistinguishable from a real one.
+ */
+function creditAmount(
+  amount: number,
+  denomination: { kind?: 'monetary' | 'unit'; unit_label?: string | null; currency?: string },
+  workspace: WorkspaceProfile,
+): string {
+  return denomination.kind === 'unit'
+    ? formatUnits(amount, denomination.unit_label ?? 'unit', workspace.locale)
+    : formatMoney({ amount, currency: denomination.currency ?? workspace.currency }, { locale: workspace.locale });
+}
+
+function creditBlocks(
+  balance: CreditBalancePayload, facts: Facts, workspace: WorkspaceProfile, who: string | null,
+  explainBurnOrder = false,
+): string[] {
+  // The pots themselves, each stated in its own denomination. The per-currency
+  // roll-up cannot do this: it counts unit pots without saying what is in them.
+  const buckets = (balance.balances ?? []).filter((b) => (b.available ?? 0) > 0);
+  const totals = balance.totals_by_currency.filter((t) => t.monetary_available > 0 || t.unit_pots > 0);
   // A grant that starts next month is not "no credit". Saying so and stopping
   // is how a renewal conversation happens without the goodwill already agreed.
   const scheduled = (balance.scheduled ?? []).filter((g) => (g.balance ?? 0) > 0);
   const scheduledLine = scheduled.length
     ? `${scheduled.length === 1 ? 'One grant is' : `${scheduled.length} grants are`} agreed but not yet in force: `
-      + `${scheduled.slice(0, 4).map((g) => `${formatMoney({ amount: g.balance ?? 0, currency: g.currency ?? workspace.currency }, { locale: workspace.locale })}${g.name ? ` (${g.name})` : ''}${g.effective_at ? `, effective ${facts.day(g.effective_at)}` : ''}`).join(' · ')}.`
+      + `${scheduled.slice(0, 4).map((g) => `${creditAmount(g.balance ?? 0, g, workspace)}${g.name ? ` (${g.name})` : ''}${g.effective_at ? `, effective ${facts.day(g.effective_at)}` : ''}`).join(' · ')}.`
     : null;
-  if (!pots.length) {
+  if (!buckets.length && !totals.length) {
     return [
-      `${who ?? 'That account'} holds no spendable credit right now — every grant is spent, expired or not yet started.`,
+      // True whether every grant is spent and expired or the account never held
+      // one: the earlier wording implied grants exist, on an account with none.
+      `${who ?? 'That account'} holds no spendable credit right now — nothing in its credit ledger is in force with a balance left.`,
       ...(scheduledLine ? [scheduledLine] : []),
     ];
   }
-  return [
-    `${who ?? 'That account'} is holding credit:`,
-    pots.map((t) => bullet(
+  const rows = buckets.length
+    ? buckets.map((bucket) => bullet(
+      `${creditAmount(bucket.available ?? 0, bucket, workspace)} available`
+      + `${bucket.kind === 'unit' ? ` on the ${bucket.unit_label ?? 'unit'} pot` : ''}`
+      + `${bucket.next_expiry?.at ? `, expiring ${facts.day(bucket.next_expiry.at)}` : ''}`,
+    ))
+    : totals.map((t) => bullet(
       `${formatMoney({ amount: t.monetary_available, currency: t.currency }, { locale: workspace.locale })} available`
       + `${t.unit_pots ? ` and ${countOf(t.unit_pots, 'unit pot')}` : ''}`
       + `${t.next_expiry ? `, the next expiry ${facts.day(t.next_expiry)}` : ''}`,
-    )).join('\n'),
+    ));
+  return [
+    `${who ?? 'That account'} is holding credit:`,
+    rows.join('\n'),
     ...(scheduledLine ? [scheduledLine] : []),
-    ...burnOrderBlocks(balance.burn_order.map((step) => step.replace(/_/g, ' '))),
+    // The drawdown policy is an answer to "which grant is spent first", and to
+    // nothing else. Appended to every balance it tripled the reply and buried
+    // the one number the reader asked for.
+    ...(explainBurnOrder ? burnOrderBlocks(balance.burn_order.map((step) => step.replace(/_/g, ' '))) : []),
   ].filter(Boolean);
 }
+
+/** "Which credit is spent first?" — a question about the policy, not the pot. */
+const BURN_ORDER_ASKED =
+  /\b(?:burn\s+order|draw[\s-]?down|drawn\s+down|drawdown|spent\s+first|used\s+first|applied\s+first|consumed\s+first|which\s+(?:grant|credit)s?\s+(?:is|are|gets?|get)\s+(?:spent|used|applied)|what\s+order|in\s+what\s+order|which\s+order|priority\s+order|how\s+(?:is|are|does|do)\s+(?:the\s+)?credits?\b)/i;
 
 /**
  * The burn order is a policy, and a policy reads as a list.
@@ -1607,6 +1787,7 @@ function movementWindow(input: SynthesisInput): TimeWindow | null {
 function revenueAnswer(
   steps: StepResult[], facts: Facts, workspace: WorkspaceProfile, who: string | null, ledger: Ledger,
   namedWindow: TimeWindow | null = null,
+  question = '',
 ): string[] {
   const blocks: string[] = [];
   // The question named a word more than one meter answers to. Both were
@@ -1626,7 +1807,7 @@ function revenueAnswer(
     else if (isMeterList(value)) blocks.push(...meterBlocks(value as MeterRow[], workspace));
     else if (isMeterUsage(value)) blocks.push(...usageBlocks(value as MeterUsage, facts, workspace, who));
     else if (isEntitlementSet(value)) blocks.push(...entitlementBlocks(value as EntitlementSetPayload, workspace, who));
-    else if (isCreditBalance(value)) blocks.push(...creditBlocks(value as CreditBalancePayload, facts, workspace, who));
+    else if (isCreditBalance(value)) blocks.push(...creditBlocks(value as CreditBalancePayload, facts, workspace, who, BURN_ORDER_ASKED.test(question)));
     else if (isPriceQuote(value)) blocks.push(...quoteBlocks(value as PriceQuote, workspace));
     else if (isProductList(value)) blocks.push(...productBlocks(value as CatalogProduct[]));
     else if (isBurnOrder(value)) blocks.push(...burnOrderBlocks((value as CreditBurnOrder).order));
@@ -1990,7 +2171,13 @@ function overview(input: SynthesisInput, facts: Facts, found: Gathered, ledger: 
 
   const deals = found.lists.find((l) => l.object_type === 'deal' && l.records.length);
   if (deals) {
-    blocks.push(`The largest of the ${deals.total} deals still open:`);
+    // "The largest of the 38 deals still open:" over five bullets counts one
+    // row and shows five. A cut-off the reader wrote — "the 5 biggest" — has
+    // to be the number in this sentence, or the sentence contradicts the list.
+    const shown = Math.min(5, deals.records.length);
+    blocks.push(shown === 1
+      ? `The largest of the ${deals.total} deals still open:`
+      : `The ${shown} largest of the ${deals.total} deals still open:`);
     blocks.push(...recordLines(deals, facts, input.workspace, ledger, 5));
   } else if (found.lists.length && found.lists[0].records.length) {
     blocks.push(...recordLines(found.lists[0], facts, input.workspace, ledger, 5));
@@ -2137,7 +2324,7 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
   const billingBlocks = billingAnswer(billing, facts, input.workspace, ledger);
   const revenueBlocks = revenueAnswer(
     input.steps, facts, input.workspace, input.subject ? namedOrNull(input.subject.label) : null, ledger,
-    movementWindow(input),
+    movementWindow(input), input.question,
   );
   // The nouns that make a question a ledger question rather than a CRM one.
   const ledgerLeads = (billingBlocks.length + revenueBlocks.length) > 0 && LEDGER_QUESTION.test(input.question);
@@ -2271,7 +2458,7 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
         const gap = Math.abs(a.value - b.value);
         const gapText = unitDelta(gap, a.unit, facts, input.workspace.locale, a.currency);
         const percent = trailer.value !== 0 ? `, ${((gap / Math.abs(trailer.value)) * 100).toFixed(0)}% ahead` : '';
-        const scope = a.snapshot ? 'right now' : `in ${a.window.label}`;
+        const scope = a.snapshot ? 'right now' : labelIsPrepositional(a.window.label) ? a.window.label : `in ${a.window.label}`;
         blocks.push(gap === 0
           ? `${sideOf(leader)} and ${sideOf(trailer)} are level on ${a.label.toLowerCase()} ${scope}, both at ${leader.formatted}.`
           : `On ${a.label.toLowerCase()} ${scope}, ${sideOf(leader)} leads with ${leader.formatted} against ${sideOf(trailer)} at ${trailer.formatted} — a gap of ${gapText}${percent}.`);
@@ -2386,6 +2573,18 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
       } else if (lists.length && (!metrics.length || isValueQuestion(input.question))) {
         for (const list of lists.slice(0, 2)) {
           if (!list.records.length) {
+            const emptyArgs = input.steps.find((s) => s.result === list)?.args ?? {};
+            const asked = (Array.isArray(emptyArgs.conditions) ? emptyArgs.conditions.length > 0 : false)
+              || typeof emptyArgs.owner_id === 'string'
+              || (typeof emptyArgs.date_property === 'string' && Number.isFinite(Number(emptyArgs.start)));
+            // A filtered search that matched nothing *is* the answer: "no
+            // Expansion deals have been lost". Skipping it because another step
+            // returned rows left the reader with a pipeline glossary and no
+            // mention of deals, losses or zero.
+            if (CRM_LIST_TYPES.has(list.object_type) && asked) {
+              blocks.push(listLead(list, emptyArgs, input));
+              continue;
+            }
             // The CRM has no such object type — but another tool in this run may
             // have the rows, and it answers rather than this sentence.
             if (rows > 0) continue;
@@ -2408,7 +2607,17 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
           const limit = 8;
           const shown = Math.min(limit, list.records.length);
           const ranked = args.order_by === 'amount' ? 'largest' : 'most recent';
-          const order = shown < list.total ? `The ${shown} ${ranked} of them:` : `The ${ranked}:`;
+          const order = shown < list.total
+            ? shown === 1 ? `The ${ranked} of them:` : `The ${shown} ${ranked} of them:`
+            : `The ${ranked}:`;
+          // "Who owns the biggest open deal?" is answered by a name. It used to
+          // come back as eight rows with the cut-off ignored and no sentence
+          // naming Priya Raman anywhere in it — the reader had to read the
+          // answer out of a table.
+          const single = shown === 1 ? list.records[0] : null;
+          if (single?.owner && OWNER_QUESTION.test(input.question)) {
+            blocks.push(`${single.owner} owns it: ${single.name}.`);
+          }
           // When a metric above already said how many rows there are and what
           // they are worth, repeating "38 deals match" underneath it is the
           // same fact twice with less in it.
@@ -2438,8 +2647,16 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
         blocks.push(...timelineLines(timelines[0], 6, facts, ledger));
       } else {
         if (metrics.length) blocks.push(...metricSentence(metrics[0], input, facts, ledger));
+        // A summary scoped to a rep is computed by `record_aggregate`, not by
+        // the catalogue metric, and dropping its sentence left the summary with
+        // a list of deals and no total over it.
+        else if (aggregates.length) blocks.push(...aggregateSentence(aggregates[0], input, ledger));
         if (lists.length) {
-          blocks.push(`Biggest open deals right now:`);
+          const listArgs = input.steps.find((step) => step.result === lists[0])?.args ?? {};
+          const listOwner = typeof listArgs.owner_id === 'string'
+            ? input.workspace.people.find((person) => person.id === listArgs.owner_id)
+            : undefined;
+          blocks.push(listOwner ? `${listOwner.name}'s biggest open deals:` : `Biggest open deals right now:`);
           blocks.push(...recordLines(lists[0], facts, input.workspace, ledger, 5));
         }
       }

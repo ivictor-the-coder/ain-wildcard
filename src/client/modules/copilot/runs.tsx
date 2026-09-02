@@ -16,11 +16,12 @@ import {
   type DataTableColumn, type SelectOption,
 } from '@/client/design';
 import {
-  OUTCOME_LABEL, OUTCOME_TONE, refusalOf, runOutcome, useAllApprovals, useApprovals,
-  useFeatureCatalogue, useRun,
+  OUTCOME_LABEL, OUTCOME_TONE, boardHref, reconcileScope, refusalOf, runOutcome, useAllApprovals, useApprovals,
+  useFeatureCatalogue, useRun, useVocabulary,
   type AiRun, type RunDetail, type RunOutcome,
 } from './api';
 import { ApprovalQueue, CitationChips, ReasoningList, RunFacts, TraceSteps } from './trace';
+import { ScopeBar, ScopeWarning } from './scope';
 
 /** How many runs one read of the log brings back, and how far each “show more” goes. */
 const PAGE = 100;
@@ -408,6 +409,7 @@ export function RunDetailPage({ id }: { id: string }) {
   const f = useFormat();
   const { navigate } = useRouter();
   const run = useRun(id);
+  const vocabulary = useVocabulary();
   const [showAnswer, setShowAnswer] = useState(true);
 
   if (run.error) {
@@ -442,6 +444,24 @@ export function RunDetailPage({ id }: { id: string }) {
   // read `span_count`, which is stamped when the run finishes and never sees the
   // step a post-approval execution appends.
   const steps = detail.trace.length;
+
+  /**
+   * The scope this run measured at, from the trace rather than the message.
+   *
+   * A run's own page has the spans, so the arguments each tool really ran with
+   * are first-hand here — the same reconciliation the conversation does, from a
+   * better source.
+   */
+  const scope = reconcileScope({
+    question: detail.question,
+    prose: detail.answer ?? '',
+    toolCalls: detail.trace.filter((span) => span.kind === 'tool').map((span) => ({ name: span.name, arguments: span.args })),
+    reasoning: detail.reasoning,
+    vocab: vocabulary.vocab,
+    resolveId: (recordId) => detail.citations.find((c) => c.id === recordId)?.label
+      ?? vocabulary.vocab.people.find((person) => person.id === recordId)?.name
+      ?? null,
+  });
 
   return (
     <Page
@@ -502,6 +522,8 @@ export function RunDetailPage({ id }: { id: string }) {
           </Button>
         }
       >
+        <ScopeWarning report={scope} board={boardHref(detail.question, vocabulary.vocab)} />
+        <ScopeBar report={scope} vocab={vocabulary.vocab} loading={vocabulary.loading} />
         {showAnswer && (
           detail.answer
             ? <pre className="cp-code" style={{ whiteSpace: 'pre-wrap' }}>{detail.answer}</pre>

@@ -123,7 +123,11 @@ const SIGNALS: SignalDef[] = [
   S('act.send', 'act', 2.0, /\b(send|deliver|dispatch|fire\s+off)\b/i),
 
   // ------------------------------------------------------ troubleshoot
-  S('ts.problem', 'troubleshoot', 3.4, /\b(error|failing|failed|broken|bug|crash|outage|down|degraded|timeout|timed\s+out|stuck|blocked|not\s+working|doesn'?t\s+work|won'?t\s+\w+)\b/i),
+  // "Break down open pipeline by pipeline" is a reporting instruction, not an
+  // outage: the bare word "down" scored 3.4 for troubleshoot and the question
+  // came back as a list of open support tickets. "Down" only reads as a
+  // problem when nothing in front of it makes it a verb particle.
+  S('ts.problem', 'troubleshoot', 3.4, /\b(error|failing|failed|broken|bug|crash|outage|degraded|timeout|timed\s+out|stuck|blocked|not\s+working|doesn'?t\s+work|won'?t\s+\w+)\b|(?<!\b(?:break|breaks|breaking|broke|broken|drill|drills|drilling|drilled|narrow|slice|split|cut|dig|scroll|write|wrote|written|note|draw|draws|drew|drawn|paid|pay|mark|marked|settle|settled|wind|winds|ramp|ramped|scale|scaled|shut|step|stepped|lock|locked|top|slow|slowed)\s)\bdown\b(?!\s*(?:to|into|by)\b)/i),
   S('ts.support', 'troubleshoot', 2.4, /\b(ticket|incident|escalat(?:ed|ion)|sla\s+breach|complain(?:t|ing)|angry|frustrated|churn\s+risk)\b/i),
   S('ts.billing', 'troubleshoot', 2.2, /\b(payment\s+failed|declined|past\s+due|overdue|dunning|unpaid|chargeback|dispute|double\s+charged|wrong\s+amount)\b/i),
   S('ts.diagnose', 'troubleshoot', 2.0, /\b(diagnose|debug|investigate|look\s+into|troubleshoot|what'?s\s+wrong)\b/i),

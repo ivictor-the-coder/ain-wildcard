@@ -245,8 +245,45 @@ export function DealRecordPage({ id }: { id: string }) {
   const focusStageRail = () => {
     const rail = document.querySelector<HTMLElement>('.pl-rail');
     rail?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    rail?.querySelector<HTMLButtonElement>('.pl-rail__step:not([disabled])')?.focus();
+    rail?.querySelector<HTMLButtonElement>('.pl-rail__step:not([aria-disabled])')?.focus();
   };
+
+  /**
+   * Put the keyboard back on the stage it was moved to.
+   *
+   * `Modal` restores focus to whatever opened it, but a move invalidates
+   * `/v1/records/deal/:id`, which empties the cache, which renders this page as
+   * a skeleton — so the rail the dialog would restore to is detached by the
+   * time it tries, and the caret lands on `<body>`, 31 Tab stops from the deal.
+   * Moving deals one after another is the most repeated thing on this screen,
+   * so the rail is re-found once the record has come back with its new stage.
+   */
+  const landedOn = useRef<string | null>(null);
+  /** Open the confirmation, remembering where the keyboard should come back to. */
+  const requestMove = (to: PipelineStage) => { landedOn.current = to.name; setMove(to); };
+  const currentStage = deal ? dealStage(deal) : null;
+  useEffect(() => {
+    const wanted = landedOn.current;
+    if (!wanted || wanted !== currentStage) return;
+    landedOn.current = null;
+    // The move invalidates `/v1/pipelines` as well as the record, so the rail
+    // is briefly gone from the DOM entirely — and a single frame of waiting
+    // lands on whichever side of that gap the two refetches happen to fall.
+    // The caret is put back for as long as the reload takes, and only ever when
+    // it has been lost: a person who clicked elsewhere keeps their focus.
+    const until = Date.now() + 1400;
+    let timer = 0;
+    let cancelled = false;
+    const land = () => {
+      if (cancelled) return;
+      const lost = !document.activeElement || document.activeElement === document.body;
+      const step = document.querySelector<HTMLElement>(`.pl-rail__step[data-stage="${wanted.replace(/["\\]/g, '')}"]`);
+      if (lost && step) { step.focus(); return; }
+      if (Date.now() < until) timer = window.setTimeout(land, 60);
+    };
+    timer = window.setTimeout(land, 0);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [currentStage]);
 
   /* ------------------------------- failure -------------------------------- */
 
@@ -315,7 +352,7 @@ export function DealRecordPage({ id }: { id: string }) {
           id: s.name,
           label: s.label,
           description: `${s.probability}% · ${f.money(Math.round((amount * s.probability) / 100))} weighted`,
-          onSelect: () => setMove(s),
+          onSelect: () => requestMove(s),
         })),
     },
     {
@@ -387,7 +424,12 @@ export function DealRecordPage({ id }: { id: string }) {
     },
   ];
 
-  const stalled = !!(stageVelocity && daysInStage !== null && stageVelocity.stalled_after_days > 0 && daysInStage > stageVelocity.stalled_after_days);
+  // Same rule as the board: a closed stage has no stall threshold, because a
+  // deal that has closed is finished rather than stuck.
+  const stalled = !!(
+    stageVelocity && !stage?.is_closed && daysInStage !== null
+    && stageVelocity.stalled_after_days > 0 && daysInStage > stageVelocity.stalled_after_days
+  );
 
   return (
     <Page
@@ -450,11 +492,17 @@ export function DealRecordPage({ id }: { id: string }) {
                 <button
                   key={s.name}
                   type="button"
+                  data-stage={s.name}
                   className={`pl-rail__step${current ? ' is-current' : ''}${done ? ' is-done' : ''}`}
                   aria-current={current ? 'step' : undefined}
-                  onClick={() => (current ? undefined : setMove(s))}
-                  disabled={current}
-                  title={s.description ?? s.label}
+                  // The stage the deal is in is not a control, but it must stay
+                  // in the Tab order: `disabled` takes it out, and the browser
+                  // drops focus the moment a move makes the step the caret is
+                  // on the current one — which is how the keyboard ended up on
+                  // `<body>` after every stage move made from this rail.
+                  aria-disabled={current || undefined}
+                  onClick={() => (current ? undefined : requestMove(s))}
+                  title={current ? `${s.label} — the stage this deal is in` : (s.description ?? s.label)}
                 >
                   <span className="pl-rail__label">{s.label}</span>
                   <span className="pl-rail__sub">{s.probability}% · {f.money(Math.round((amount * s.probability) / 100))}</span>

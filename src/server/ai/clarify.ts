@@ -111,7 +111,17 @@ export function pronounBoundInSentence(question: string, pronoun: string): strin
   return last;
 }
 
-export type RefusalCode = 'unreadable' | 'injection' | 'unknown_terms' | 'no_measure' | 'period_unresolved' | 'unresolved_reference';
+export type RefusalCode =
+  | 'unreadable' | 'injection' | 'unknown_terms' | 'no_measure' | 'period_unresolved' | 'unresolved_reference'
+  // A qualifier the question named that could not be applied to the query. The
+  // whole point of the code is that it is one code for every qualifier type:
+  // owner, stage, pipeline, period, status, measure, meter, currency, unit and
+  // ranking cut-off all fail the same way and are refused the same way.
+  | 'qualifier_unbound'
+  // One mention that binds two qualifiers of different kinds. "Marcus" is a
+  // teammate and a contact, and which one the question means is not something
+  // the engine gets to decide for the reader.
+  | 'ambiguous_reference';
 
 export interface Refusal {
   code: RefusalCode;

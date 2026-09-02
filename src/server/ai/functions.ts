@@ -12,6 +12,7 @@ import type { Ctx } from '../kernel/context';
 import { DAY, formatDate, formatRelative } from '../../shared/time';
 import { formatMoney } from '../../shared/money';
 import { billingSources, entityIndex, hasTable, workspaceProfile, type WorkspaceProfile } from './grounding';
+import { crmVocabulary } from './qualifiers';
 import { resolveEntities, type ResolvedEntity } from './resolve';
 import {
   accountSnapshot, detectGrouping, metricById, metricIds, stageSets, topAccounts,
@@ -167,6 +168,12 @@ export function accountProfile(ctx: Ctx, orgId: string, args: { id: string }): A
 
 export interface MetricToolResult extends Omit<MetricResult, 'window'> {
   window: { label: string; start: number; end: number; partial: boolean };
+  /**
+   * The pipeline and stage this figure was narrowed to, when the question
+   * named one. Rendered into the headline, because a scoped number under an
+   * unscoped sentence is the substitution that made this field necessary.
+   */
+  scope: { pipeline: string | null; stage: string | null; label: string } | null;
   change: { previous: number; previous_formatted: string; delta: number; percent: number | null } | null;
   top_accounts: { id: string; label: string; formatted: string; currency: string | null }[];
   /** The rows behind the number, named — an answer can cite them by name. */
@@ -233,11 +240,45 @@ function labelIds(ctx: Ctx, orgId: string, ids: string[], fallbackType: string):
 /** Compute one metric, with the previous period for context when it exists. */
 export function businessMetric(ctx: Ctx, orgId: string, args: {
   metric: string; start?: number; end?: number; window_label?: string; subject_id?: string; group_by?: GroupBy; compare?: boolean;
-  currency?: string;
+  currency?: string; pipeline?: string; stage?: string; limit?: number;
 }): MetricToolResult | { error: string; available: string[] } {
   const definition = metricById(args.metric);
   if (!definition) return { error: `Unknown metric "${args.metric}".`, available: metricIds() };
   const workspace = workspaceProfile(ctx, orgId);
+
+  // A pipeline or a stage this metric cannot be narrowed by is an error, never
+  // a silently unfiltered figure. "What did we invoice on the Renewal
+  // pipeline" has no answer; the workspace's invoiced total is not a smaller
+  // version of it, it is a different number about a different thing.
+  const vocabulary = crmVocabulary(ctx, orgId);
+  if (args.pipeline) {
+    if (!definition.scope) {
+      return {
+        error: `"${definition.label}" is not measured from deals, so it cannot be narrowed to the "${args.pipeline}" pipeline.`,
+        available: metricIds().filter((id) => metricById(id)?.scope === 'deal'),
+      };
+    }
+    if (vocabulary.pipelines.length && !vocabulary.pipelines.some((p) => p.value === args.pipeline)) {
+      return {
+        error: `No deal pipeline named "${args.pipeline}" in this workspace.`,
+        available: vocabulary.pipelines.map((p) => p.value),
+      };
+    }
+  }
+  if (args.stage) {
+    if (!definition.stageFilter) {
+      return {
+        error: `"${definition.label}" is defined by its own stage set, so it cannot also be narrowed to the "${args.stage}" stage.`,
+        available: metricIds().filter((id) => metricById(id)?.stageFilter),
+      };
+    }
+    if (vocabulary.stages.length && !vocabulary.stages.some((st) => st.value === args.stage)) {
+      return {
+        error: `No deal stage named "${args.stage}" in this workspace.`,
+        available: vocabulary.stages.map((st) => st.value),
+      };
+    }
+  }
   // `start: 0` is a real window — "all time" begins at the epoch — so this
   // guard tests for a number rather than for truthiness. Reading it as "no
   // window given" is what made a ranking over all time report this quarter.
@@ -264,6 +305,9 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
   const input = {
     ctx, workspace, window, subject, groupBy: args.group_by ?? 'none',
     currency: args.currency ? args.currency.toLowerCase() : null,
+    pipeline: args.pipeline ?? null,
+    stage: args.stage ?? null,
+    limit: args.limit,
   };
   const result = definition.compute(input);
   // A delta needs two numbers in one currency. When the metric came back as
@@ -283,7 +327,11 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
       })()
     : null;
 
-  const accounts = args.group_by === 'account' && !result.groups.length ? topAccounts(input, definition, 5) : [];
+  // A ranking cut-off the question wrote is a filter on the answer. "Top three
+  // accounts" answered with five is the same class of drop as an ignored
+  // pipeline, one row further down the page.
+  const ranking = Math.min(Math.max(args.limit ?? 5, 1), 25);
+  const accounts = args.group_by === 'account' && !result.groups.length ? topAccounts(input, definition, ranking) : [];
 
   // A grouping that was asked for and never applied has to be said out loud.
   // "What is our win rate by owner" answered with one workspace-wide number is
@@ -300,9 +348,23 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
       ].filter(Boolean).join(' ')
     : result.note;
 
+  const pipelineLabel = args.pipeline ? vocabulary.pipelines.find((p) => p.value === args.pipeline)?.label ?? args.pipeline : null;
+  const stageLabel = args.stage ? vocabulary.stages.find((st) => st.value === args.stage)?.label ?? args.stage : null;
+  const scope = pipelineLabel || stageLabel
+    ? {
+        pipeline: args.pipeline ?? null,
+        stage: args.stage ?? null,
+        label: [
+          pipelineLabel ? `in the ${pipelineLabel} pipeline` : '',
+          stageLabel ? `at the ${stageLabel} stage` : '',
+        ].filter(Boolean).join(' '),
+      }
+    : null;
+
   return {
     ...result,
     note,
+    scope,
     window: { label: window.label, start: window.start, end: window.end, partial: window.partial },
     change,
     top_accounts: accounts.map((a) => ({ id: a.key, label: a.label, formatted: a.formatted, currency: a.currency })),
@@ -328,7 +390,15 @@ export interface MeteredUsageResult {
   note: string | null;
 }
 
-const UNIT_FORMAT = (value: number, unit: string | null, locale: string): string => {
+/**
+ * A count of units, which is not money.
+ *
+ * `formatMoney` and this function take different types on purpose. A grant of
+ * 6,000,000 events rendered as "$60,000.00" is not a formatting slip — it is a
+ * currency amount stated where a unit count belongs, and a reader has no way
+ * to tell it apart from a real dollar figure.
+ */
+export const formatUnits = (value: number, unit: string | null, locale: string): string => {
   const number = Number.isInteger(value) ? value.toLocaleString(locale) : Number(value.toFixed(2)).toLocaleString(locale);
   // "49,716,642 event" is the kind of sentence that makes a reader distrust the
   // number in front of it. The meter's unit label is singular by convention.
@@ -427,7 +497,7 @@ export function meteredUsage(ctx: Ctx, orgId: string, args: {
       id: customerId,
       label: named ?? customerId,
       value: usage.value,
-      formatted: UNIT_FORMAT(usage.value, meter.unit_label, workspace.locale),
+      formatted: formatUnits(usage.value, meter.unit_label, workspace.locale),
       event_count: usage.event_count,
     });
   }
@@ -460,7 +530,7 @@ export function meteredUsage(ctx: Ctx, orgId: string, args: {
       : null,
     window,
     value,
-    formatted: UNIT_FORMAT(value, meter.unit_label, workspace.locale),
+    formatted: formatUnits(value, meter.unit_label, workspace.locale),
     event_count: events,
     accounts: rows.length,
     by_account: rows.slice(0, 8),
@@ -634,15 +704,30 @@ export interface RecordSearchResult {
   }[];
 }
 
+/**
+ * The date window a step was given, if it really has one.
+ *
+ * Written once because both readers had the same bug: `args.start && args.end`
+ * treats the epoch as "no window", which is exactly the bound an open-ended
+ * comparator produces.
+ */
+function datedWindow(args: { start?: number; end?: number; date_property?: string }):
+  { property: string; start: number; end: number } | undefined {
+  if (!args.date_property || !Number.isFinite(args.start) || !Number.isFinite(args.end)) return undefined;
+  return { property: args.date_property, start: args.start as number, end: args.end as number };
+}
+
 /** Filtered list of records of one object type — the generic "show me" tool. */
 export function recordSearch(ctx: Ctx, orgId: string, args: {
   object_type: string; conditions?: Condition[]; start?: number; end?: number; date_property?: string;
   associated_to?: string; owner_id?: string; limit?: number; order_by?: string;
 }): RecordSearchResult {
   const workspace = workspaceProfile(ctx, orgId);
-  const window = args.start && args.end && args.date_property
-    ? { property: args.date_property, start: args.start, end: args.end }
-    : undefined;
+  // `start: 0` is a real bound — "before March 2026" and "all time" both begin
+  // at the epoch — and testing it for truthiness dropped the window silently,
+  // so "which open deals close before March 2026" listed the whole open book
+  // with the period quoted back in the sentence above it.
+  const window = datedWindow(args);
   const spec = {
     objectType: args.object_type,
     conditions: args.conditions ?? [],
@@ -700,7 +785,7 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
   const result = aggregate(ctx, orgId, {
     objectType: args.object_type,
     conditions: args.conditions ?? [],
-    window: args.start && args.end && args.date_property ? { property: args.date_property, start: args.start, end: args.end } : undefined,
+    window: datedWindow(args),
     measure: measure === 'count' ? undefined : { property: args.property!, fn: measure },
     groupBy: args.group_by,
     associatedTo: args.associated_to,

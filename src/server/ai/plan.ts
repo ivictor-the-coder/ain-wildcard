@@ -19,7 +19,8 @@ import { resolveDueDate } from './dates';
 import { DAY } from '../../shared/time';
 import type { WorkspaceProfile } from './grounding';
 import { isLedgerType } from './resolve';
-import { capitalise, contentWords, normalise, stem, trigramSimilarity, truncate } from './text';
+import { capitalise, contentWords, listPhrase, normalise, stem, trigramSimilarity, truncate } from './text';
+import type { QualifierLedger } from './qualifiers';
 
 export type BuiltinTool =
   | 'workspace_search' | 'account_profile' | 'business_metric'
@@ -111,6 +112,19 @@ export interface PlanInput {
    * not an answer at all.
    */
   meterCandidates?: string[];
+  /**
+   * Every qualifier the question named — pipeline, stage, owner, account,
+   * period, status, metric, meter, currency, unit, ranking cut-off.
+   *
+   * The planner reads it to scope the query and writes to it when a binding is
+   * not visible in the arguments (a metric computed as a shaped aggregate, for
+   * instance). Whatever it does, the engine verifies every entry against the
+   * plan that actually ran before an answer is composed, so a branch that
+   * forgets a qualifier refuses rather than answering the wider question.
+   */
+  qualifiers?: QualifierLedger | null;
+  /** The record date the question named — `created`, `updated` or a close date. */
+  dateProperty?: string | null;
 }
 
 /**
@@ -234,7 +248,12 @@ const MISSING_PROPERTY: Record<string, string> = {
  * "Which tickets need attention" is not a request for every ticket ever filed.
  * Qualifiers in the question become real conditions, most specific first.
  */
-export function inferConditions(question: string, objectType: string, stages: StageSets): InferredCondition[] {
+export function inferConditions(
+  question: string,
+  objectType: string,
+  stages: StageSets,
+  qualifiers?: QualifierLedger | null,
+): InferredCondition[] {
   const text = normalise(question);
   const out: InferredCondition[] = [];
   const has = (re: RegExp) => re.test(text);
@@ -249,11 +268,21 @@ export function inferConditions(question: string, objectType: string, stages: St
     }
   }
   if (objectType === 'deal') {
-    for (const stage of ['negotiation', 'proposal', 'discovery', 'qualification']) {
-      if (has(new RegExp(`\\b${stage}\\b`))) out.push({ property: 'deal_stage', op: 'eq', value: stage === 'proposal' ? 'proposal' : stage });
+    // The pipeline, the stage and the outcome all come from the one typed
+    // parse rather than from a regex per stage name. The old list held four
+    // stage words and this workspace has ten, which is how "Technical
+    // validation" and "Proposal sent" fell through to the unfiltered listing.
+    const pipeline = qualifiers?.first('pipeline')?.resolved;
+    const stage = qualifiers?.first('stage')?.resolved;
+    const status = qualifiers?.first('status')?.resolved;
+    if (pipeline) out.push({ property: 'pipeline', op: 'eq', value: String(pipeline.value) });
+    if (stage) out.push({ property: 'deal_stage', op: 'eq', value: String(stage.value) });
+    else if (status?.values?.length) out.push({ property: 'deal_stage', op: 'in', values: status.values.map(String) });
+    else if (!qualifiers) {
+      // No ledger — a direct caller of this helper, not the engine's own plan.
+      if (has(/\bwon\b/)) out.push({ property: 'deal_stage', op: 'in', values: stages.won });
+      if (has(/\blost\b/)) out.push({ property: 'deal_stage', op: 'in', values: stages.lost });
     }
-    if (has(/\bwon\b/)) out.push({ property: 'deal_stage', op: 'in', values: stages.won });
-    if (has(/\blost\b/)) out.push({ property: 'deal_stage', op: 'in', values: stages.lost });
     if (has(/\b(open|active|live|in flight|pipeline|slipping|stalled)\b/)) out.push({ property: 'deal_stage', op: 'in', values: stages.open });
   }
   if (objectType === 'company') {
@@ -313,6 +342,10 @@ const MONEY_METRIC_SHAPE: Record<string, {
   closed_lost: { objectType: 'deal', measure: 'sum', property: 'amount', dateProperty: 'close_date', conditions: (s) => [{ property: 'deal_stage', op: 'in', values: s.lost }] },
   deal_count: { objectType: 'deal', measure: 'count', conditions: (s) => [{ property: 'deal_stage', op: 'in', values: s.open }] },
   avg_deal_size: { objectType: 'deal', measure: 'sum', property: 'amount', dateProperty: 'close_date', conditions: (s) => [{ property: 'deal_stage', op: 'in', values: s.won }] },
+  // A rep with no tickets has zero tickets. `business_metric` counts the
+  // workspace's backlog and takes no owner, so "how many open tickets does Nina
+  // Kowalski have?" was refused rather than answered — and the answer is 0.
+  open_tickets: { objectType: 'ticket', measure: 'count', conditions: () => [{ property: 'status', op: 'in', values: OPEN_TICKET_STATUSES }] },
 };
 
 /**
@@ -758,6 +791,15 @@ function movementPlan(input: PlanInput): PlannedStep | null {
   const tool = movementTool(input.tools);
   if (!tool || (input.allowedTools && !input.allowedTools.has(tool.name))) return null;
   const currency = detectCurrency(input.question);
+  // The movement report answers the measure the question named and takes no
+  // `metric` argument, so the ledger is told which step carries it. The claim
+  // is checked against the plan like every other, so it cannot be a way to
+  // look bound without being bound.
+  input.qualifiers?.bind('metric', {
+    tool: tool.name,
+    args: { months: movementMonths(input) },
+    note: `${input.metric.metric.label} is read from ${tool.name}, the movement report this workspace keeps.`,
+  });
   return {
     tool: tool.name,
     args: { months: movementMonths(input), ...(currency ? { currency } : {}) },
@@ -790,6 +832,10 @@ function quotePlan(input: PlanInput): PlannedStep | null {
   const tool = quoteTool(input.tools);
   if (!tool || (input.allowedTools && !input.allowedTools.has(tool.name))) return null;
   const currency = detectCurrency(input.question);
+  // The quote is evaluated on the meter's own price, so the meter the question
+  // named is what chose the price — an argument the tool does not take by that
+  // name, and a binding the ledger still verifies against this step.
+  input.qualifiers?.bind('meter', { tool: tool.name, args: { price }, note: `The price \`${price}\` is the one this meter is billed on.` });
   return {
     tool: tool.name,
     args: { price, quantity, ...(currency ? { currency } : {}) },
@@ -799,9 +845,253 @@ function quotePlan(input: PlanInput): PlannedStep | null {
   };
 }
 
+/**
+ * The number of rows a question asked for.
+ *
+ * "The 3 largest open deals" is an instruction, not a flourish: eight rows
+ * under it is the same silent widening as an ignored pipeline, one page down.
+ * A cut-off the question wrote wins over the plan's default; a plan default
+ * never widens past it.
+ */
+/**
+ * A snapshot measure with a close-date window on it.
+ *
+ * "How much pipeline is closing in the next 30 days?" names a snapshot metric
+ * and a period, and the two are not in conflict: the period is a filter on
+ * `close_date` over the open book, which `record_aggregate` takes exactly.
+ */
+const SNAPSHOT_DATE_COLUMNS = new Set(['close_date', 'created']);
+
+function closesInWindow(input: PlanInput): boolean {
+  return !!input.metric?.metric.snapshot && input.windows.length > 0
+    && !!input.dateProperty && SNAPSHOT_DATE_COLUMNS.has(input.dateProperty);
+}
+
+/**
+ * An outcome the question named that the metric's own stage set contradicts.
+ *
+ * "How many deals did Dana Whitfield win in Q2 2026?" reads as the Deals
+ * measure — whose definition is the *open* book — plus the word "win". The two
+ * cannot both be honoured by `business_metric`, which counts one stage set, so
+ * the question was refused. `record_aggregate` takes the stage set as an
+ * argument, and the answer is three deals worth $151,240.
+ */
+const OPEN_BOOK_METRICS = new Set(['pipeline', 'weighted_pipeline', 'deal_count']);
+
+/**
+ * The money a record type carries, for a question that asks what a set is worth.
+ *
+ * Only types whose rows really hold an amount appear here: a value question
+ * about a type with no money on it is a count, and inventing a property to sum
+ * would be a number about nothing.
+ */
+const MONEY_PROPERTY_OF: Record<string, string | undefined> = { deal: 'amount' };
+
+/**
+ * The stage set a named outcome puts in place of the metric's own.
+ *
+ * Exported because the answer's first sentence turns on it too: a period on a
+ * won-or-lost question *is* applied — as a `close_date` filter — so waiving it
+ * with "this measure is a snapshot" would be a false statement about a filter
+ * the plan carries.
+ */
+export function outcomeStages(metricId: string | null, qualifiers: QualifierLedger | null | undefined): string[] {
+  if (!metricId || !OPEN_BOOK_METRICS.has(metricId)) return [];
+  const entry = qualifiers?.first('status');
+  const outcome = entry?.resolved?.value;
+  if (outcome !== 'won' && outcome !== 'lost') return [];
+  return (entry?.resolved?.values ?? []).map(String);
+}
+
+const outcomeOverride = (input: PlanInput): string[] =>
+  outcomeStages(input.metric?.metric.id ?? null, input.qualifiers);
+
+/**
+ * Whether the pipeline definitions are the answer or the scenery.
+ *
+ * "How much pipeline does Marcus own?" is a question with a number in it, and
+ * three pipeline definitions printed under that number answer "what pipelines
+ * do we have" instead — six of the questions a critic asked ended in the same
+ * glossary, tripling the reply and burying the sentence. The catalogue is
+ * planned when the question asks about pipelines as objects, and not when it
+ * uses one as a scope.
+ */
+/**
+ * A question about the workspace's own vocabulary rather than about its numbers.
+ *
+ * "Which pipelines do we have?" is answered by naming them — the engine prints
+ * that exact list inside the refusal for a pipeline this workspace does not
+ * have — and it came back as "$9,010,960 in open pipeline, from 38 open deals"
+ * instead. Every form here is plural and asks for existence, so "what is our
+ * pipeline?" and "break down open pipeline by stage" stay questions about
+ * money: the earlier test was any sentence containing the word, which is why
+ * the three pipeline definitions were appended to a stage breakdown nobody had
+ * asked to have explained.
+ */
+const VOCABULARY_ASKED: RegExp[] = [
+  /\b(?:which|what)\s+(?:deal\s+|sales\s+)?pipelines\b\s*(?:do|does|are|is|exist)/i,
+  /\bwhat\s+are\s+(?:our|the|my)\s+(?:deal\s+|sales\s+)?pipelines\b/i,
+  /\blist\s+(?:the\s+|our\s+|all\s+(?:the\s+|our\s+)?)?(?:deal\s+|sales\s+)?pipelines\b/i,
+  /\bhow\s+many\s+pipelines\b/i,
+  /\b(?:which|what)\s+(?:deal\s+)?stages\b\s*(?:do|does|are|is|exist)/i,
+  /\bwhat\s+are\s+(?:our|the|my)\s+(?:deal\s+)?stages\b/i,
+  /\blist\s+(?:the\s+|our\s+|all\s+(?:the\s+|our\s+)?)?(?:deal\s+)?stages\b/i,
+];
+
+function pipelineCatalogueAsked(input: PlanInput): boolean {
+  if (!VOCABULARY_ASKED.some((pattern) => pattern.test(input.question))) return false;
+  return !namedOwner(input) && !input.subject;
+}
+
+/** The step that answers a vocabulary question: the catalogue itself. */
+function vocabularyPlan(input: PlanInput): PlannedStep | null {
+  if (!pipelineCatalogueAsked(input)) return null;
+  const tool = input.tools.find((t) => t.readOnly && /(^|[._])list_pipelines$/.test(t.name));
+  if (!tool || (input.allowedTools && !input.allowedTools.has(tool.name))) return null;
+  return {
+    tool: tool.name,
+    args: { object_type: 'deal' },
+    why: 'The question asks which pipelines and stages this workspace has — its vocabulary, not a total over the deals inside them.',
+    builtin: null,
+    relevance: 1,
+  };
+}
+
+function rowLimit(input: PlanInput, fallback: number): number {
+  const named = input.qualifiers?.value('limit');
+  const value = typeof named === 'number' ? named : named === null || named === undefined ? null : Number(named);
+  return value && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * A catalogue measure computed over the rows themselves, so a scope can be a
+ * filter on it.
+ *
+ * `business_metric` measures the workspace over a window and takes neither a
+ * rep nor a close-date filter nor a stage set. Every question that names one of
+ * those was either refused or answered with the workspace figure under the
+ * reader's own scoped sentence. `record_aggregate` takes all three, over the
+ * same rows, to the cent.
+ */
+function scopedAggregate(
+  input: PlanInput,
+  metric: NonNullable<PlanInput['metric']>,
+  shape: (typeof MONEY_METRIC_SHAPE)[string],
+  ownerOverride?: ResolvedEntity | null,
+): PlannedStep {
+  const owner = ownerOverride ?? namedOwner(input);
+  const closing = closesInWindow(input);
+  const named = input.qualifiers;
+  const stageValue = named?.value('stage');
+  const pipelineValue = named?.value('pipeline');
+  // The stage set the metric implies is a default, not a fact about the
+  // question: a named stage replaces it, and so does a named outcome.
+  const outcome = outcomeOverride(input);
+  const base = shape.conditions(input.stages);
+  const conditions: InferredCondition[] = [
+    ...(stageValue || outcome.length ? base.filter((c) => c.property !== 'deal_stage') : base),
+    ...(!stageValue && outcome.length ? [{ property: 'deal_stage', op: 'in' as const, values: outcome }] : []),
+    ...(pipelineValue ? [{ property: 'pipeline', op: 'eq' as const, value: String(pipelineValue) }] : []),
+    ...(stageValue ? [{ property: 'deal_stage', op: 'eq' as const, value: String(stageValue) }] : []),
+  ];
+  // A decided deal is dated by when it closed, so a period on a won or lost
+  // question is a `close_date` filter — not a window the measure cannot take.
+  // The column is the one the question named. "How much pipeline was created in
+  // Q2 2026?" was answered with the workspace total under a paragraph claiming
+  // a snapshot cannot take a period — while the list path answers the same
+  // question by filtering `created`, which is the column the sentence wrote.
+  const dateProperty = closing
+    ? input.dateProperty
+    : shape.dateProperty ?? (outcome.length && input.windows.length ? 'close_date' : null);
+  const step = builtin('record_aggregate', {
+    object_type: shape.objectType,
+    measure: shape.measure,
+    ...(shape.property ? { property: shape.property } : {}),
+    conditions,
+    ...(owner ? { owner_id: owner.entity.id } : {}),
+    ...(dateProperty ? { date_property: dateProperty, start: input.window.start, end: input.window.end } : {}),
+  }, [
+    owner
+      ? `"${owner.mention}" is ${owner.entity.label}, so ${metric.metric.label} is computed over the rows they own rather than over the workspace.`
+      : `${metric.metric.label} is computed over the rows directly so the scope the question named can be a filter on it.`,
+    closing ? `Scoped to deals whose \`${input.dateProperty}\` falls in ${input.window.label} — the window the question named, applied to the column it named rather than waived.` : '',
+    outcome.length
+      ? `The question names an outcome, so the stage set is ${listPhrase(outcome)} rather than the open book ${metric.metric.label} is defined over.`
+      : '',
+  ].filter(Boolean).join(' '));
+  // The measure is real but it is not an argument called `metric`, so the
+  // ledger is told which step carries it. The claim is checked against the plan
+  // like any other, so it cannot become a way to look bound.
+  named?.bind('metric', {
+    tool: 'record_aggregate',
+    args: { object_type: shape.objectType, measure: shape.measure },
+    note: `${metric.metric.label} is computed as a ${shape.measure} of ${shape.property ?? 'rows'} over ${shape.objectType} records.`,
+  });
+  return step;
+}
+
+/**
+ * The N largest *records* of a type, as a list of N rows.
+ *
+ * A ranking over groups — "the top 3 reps" — is the grouped metric and stays
+ * there. A ranking over records is a list, and there is no total that answers
+ * it: the reader asked which rows, and a workspace scalar names none of them.
+ */
+const RECORD_RANKING_NOUN = '(?:deals?|opportunit(?:y|ies)|invoices?|tickets?)';
+const RECORD_RANKING_QUALIFIER = '(?:open\\s+|closed\\s+|won\\s+|lost\\s+|active\\s+|outstanding\\s+|unpaid\\s+|overdue\\s+)*';
+const RECORD_RANKING = new RegExp(
+  `\\b(?:top|biggest|largest|highest|best|worst|lowest|smallest)\\s+(?:\\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten)?\\s*${RECORD_RANKING_QUALIFIER}${RECORD_RANKING_NOUN}\\b`
+  + `|\\b(?:\\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten)\\s+(?:biggest|largest|highest|best|worst|lowest|smallest)\\s+${RECORD_RANKING_QUALIFIER}${RECORD_RANKING_NOUN}\\b`
+  // "What is the largest one?" in a thread ranks the rows the turn before it
+  // listed. It came back as an unknown-measure refusal naming the pronoun.
+  + `|\\b(?:top|biggest|largest|highest|best|worst|lowest|smallest)\\s+ones?\\b`, 'i');
+
+const RANKED_ORDER: Record<string, string> = { deal: 'amount', invoice: 'total', ticket: 'created' };
+
+function rankedRecordsPlan(input: PlanInput): PlannedStep | null {
+  const limit = input.qualifiers?.value('limit');
+  if (typeof limit !== 'number' || input.groupBy !== 'none') return null;
+  if (!RECORD_RANKING.test(input.question)) return null;
+  const objectType = input.types.find((t) => t in RANKED_ORDER);
+  if (!objectType || objectType !== 'deal') return null;
+  const scope = input.subject ? { associated_to: input.subject.id } : {};
+  const conditions = inferConditions(input.question, objectType, input.stages, input.qualifiers);
+  const owner = namedOwner(input);
+  const dated = input.windows.length > 0;
+  // "Open deals" named the measure and the rows are open deals ordered by
+  // amount, so the measure is in this query — as the ordering and the stage
+  // filter rather than as a `metric` argument. Without saying so the ledger
+  // refused the question this step answers exactly.
+  if (input.metric && MONEY_METRIC_SHAPE[input.metric.metric.id]?.objectType === objectType) {
+    input.qualifiers?.bind('metric', {
+      tool: 'record_search',
+      args: { object_type: objectType, order_by: RANKED_ORDER[objectType] },
+      note: `${input.metric.metric.label} is the ordering of these rows — \`${RANKED_ORDER[objectType]}\` descending over ${objectType} records — rather than a total over them.`,
+    });
+  }
+  return builtin('record_search', {
+    object_type: objectType,
+    ...(conditions.length ? { conditions } : {}),
+    ...(owner ? { owner_id: owner.entity.id } : {}),
+    ...scope,
+    order_by: RANKED_ORDER[objectType],
+    ...(dated ? { date_property: input.dateProperty ?? 'close_date', start: input.window.start, end: input.window.end } : {}),
+    limit,
+  }, `The question asks for the ${limit === 1 ? 'single largest' : `${limit} largest`} ${objectType}${limit === 1 ? '' : 's'}, which is ${limit === 1 ? 'one row' : `${limit} rows`} ordered by \`${RANKED_ORDER[objectType]}\` — a workspace total takes no cut-off and names none of them.`);
+}
+
 function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedStep[] {
   const steps: PlannedStep[] = [];
-  const { subject, window, metric, groupBy, intent, entities } = input;
+  const { subject, window, metric, groupBy, entities } = input;
+  // A plan has to answer the question's own object types. "Break down open
+  // pipeline by pipeline" read as a problem report on the word "down" and came
+  // back as a list of seven open support tickets under a deal-money question —
+  // not a weaker answer, an answer to something nobody asked. A measure plus a
+  // named object type that is not a ticket is not a support request, whatever
+  // vocabulary the sentence borrows.
+  const misrouted = input.intent === 'troubleshoot' && !!metric
+    && input.types.length > 0 && !input.types.includes('ticket');
+  const intent: TaskIntent = misrouted ? 'aggregate' : input.intent;
 
   // A price question is not a volume question. "How much would 50 million
   // telemetry events cost?" was answered with 52.1 million events metered — a
@@ -810,6 +1100,20 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
   if (intent !== 'act' && intent !== 'draft') {
     const quote = quotePlan(input);
     if (quote) return [quote];
+  }
+
+  if (intent !== 'act' && intent !== 'draft') {
+    const vocabulary = vocabularyPlan(input);
+    if (vocabulary) return [vocabulary];
+  }
+
+  // A ranking cut-off over records is a request for rows, and `business_metric`
+  // returns one number whatever `limit` it is handed. "List the 5 biggest open
+  // deals" came back as "$9,010,960 in open pipeline, from 38 open deals" with
+  // the cut-off reported bound to a scalar call it could not narrow.
+  if (intent === 'aggregate' || intent === 'lookup') {
+    const ranked = rankedRecordsPlan(input);
+    if (ranked) return [ranked];
   }
 
   // Movement first: "how did MRR change" is not a smaller version of "what is
@@ -824,6 +1128,15 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
   ).slice(0, 3);
 
   const currency = detectCurrency(input.question);
+  // Whatever the metric is, it is measured over the pipeline, the stage and the
+  // ranking cut-off the question named — or `business_metric` errors, which is
+  // the point. The one thing it must never do is compute the workspace figure
+  // and print it under the reader's own scoped sentence.
+  const scopeArgs = {
+    ...(input.qualifiers?.value('pipeline') ? { pipeline: String(input.qualifiers.value('pipeline')) } : {}),
+    ...(input.qualifiers?.value('stage') ? { stage: String(input.qualifiers.value('stage')) } : {}),
+    ...(input.qualifiers?.value('limit') ? { limit: Number(input.qualifiers.value('limit')) } : {}),
+  };
   const metricStep = (subjectId: string | undefined, label: string, over: TimeWindow = window, compare = true) =>
     builtin('business_metric', {
       metric: metric?.metric.id ?? 'closed_won',
@@ -832,6 +1145,7 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
       window_label: over.label,
       ...(subjectId ? { subject_id: subjectId } : {}),
       ...(currency ? { currency } : {}),
+      ...scopeArgs,
       group_by: groupBy,
       compare,
     }, label);
@@ -847,6 +1161,7 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
       end: window.end,
       window_label: window.label,
       ...(detectCurrency(input.question) ? { currency: detectCurrency(input.question)! } : {}),
+      ...scopeArgs,
       group_by: groupBy,
       compare: window.grain !== 'range' || window.start > 0,
     }, `The question asks which ${groupBy === 'account' ? 'accounts are' : `${groupBy} is`} biggest, so ${metric?.metric.label ?? 'closed-won bookings'} is computed for ${window.label} and grouped by ${groupBy} to rank them.`);
@@ -922,31 +1237,23 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
         return steps;
       } else if (!metric && namedType && !isLedgerType(namedType)) {
         // "How many X" with no metric behind it is a count of X, not a guess.
-        const conditions = inferConditions(input.question, namedType, input.stages);
+        const conditions = inferConditions(input.question, namedType, input.stages, input.qualifiers);
         const owner = namedOwner(input);
+        // "What is the total value of expansion deals?" is a sum, not a count.
+        // Counting it answered a money question with "10 deals" — the right
+        // rows measured by the wrong function, which reads as an answer.
+        const valued = isValueQuestion(input.question) ? MONEY_PROPERTY_OF[namedType] : undefined;
         steps.push(builtin('record_aggregate', {
           object_type: namedType,
-          measure: 'count',
+          measure: valued ? 'sum' : 'count',
+          ...(valued ? { property: valued } : {}),
           ...(conditions.length ? { conditions } : {}),
           ...(subject ? { associated_to: subject.id } : {}),
           ...(owner ? { owner_id: owner.entity.id } : {}),
-        }, `The question counts ${namedType} records${conditions.length ? ` qualified by ${conditions.map((c) => c.property).join(' and ')}` : ''}${owner ? ` and owned by ${owner.entity.label}` : ''}.`));
-      } else if (namedOwner(input) && metric && MONEY_METRIC_SHAPE[metric.metric.id]) {
-        // A metric with a rep's name next to it is that rep's number. The
-        // metric catalogue measures the workspace, so the same figure is
-        // computed over the same rows with the owner as a filter — which is
-        // exact, rather than answering with everybody's total and never
-        // mentioning the person the question named.
-        const owner = namedOwner(input)!;
-        const shape = MONEY_METRIC_SHAPE[metric.metric.id];
-        steps.push(builtin('record_aggregate', {
-          object_type: shape.objectType,
-          measure: shape.measure,
-          ...(shape.property ? { property: shape.property } : {}),
-          conditions: shape.conditions(input.stages),
-          owner_id: owner.entity.id,
-          ...(shape.dateProperty ? { date_property: shape.dateProperty, start: window.start, end: window.end } : {}),
-        }, `"${owner.mention}" is ${owner.entity.label}, so ${metric.metric.label} is computed over the rows they own rather than over the workspace.`));
+        }, `The question ${valued ? `sums \`${valued}\` over` : 'counts'} ${namedType} records${conditions.length ? ` qualified by ${conditions.map((c) => c.property).join(' and ')}` : ''}${owner ? ` and owned by ${owner.entity.label}` : ''}.`));
+      } else if (metric && MONEY_METRIC_SHAPE[metric.metric.id]
+        && (namedOwner(input) || closesInWindow(input) || outcomeOverride(input).length > 0)) {
+        steps.push(scopedAggregate(input, metric, MONEY_METRIC_SHAPE[metric.metric.id])!);
       } else {
         steps.push(metricStep(subject?.id, metric
           ? `"${metric.matched}" is the ${metric.metric.label} metric${subject ? ` for ${subject.label}` : ''} over ${window.label}.`
@@ -1049,19 +1356,26 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
       }
       const person = entities.find((e) => e.entity.type === 'user');
       if (person && !subject) {
+        // A period the question named is a filter on this list too. Listing a
+        // rep's whole open book under "closing in March" is the same silent
+        // widening as an ignored pipeline, wearing an owner.
+        const dated = input.windows.length > 0;
         steps.push(builtin('record_search', {
           object_type: 'deal',
           conditions: [{ property: 'deal_stage', op: 'in', values: input.stages.open }],
           owner_id: person.entity.id,
           order_by: 'amount',
-          limit: 8,
-        }, `"${person.mention}" is ${person.entity.label}; show the open deals they own.`));
-        steps.push(builtin('record_search', {
-          object_type: 'ticket',
-          conditions: [{ property: 'status', op: 'in', values: OPEN_TICKET_STATUSES }],
-          owner_id: person.entity.id,
-          limit: 5,
-        }, `And the tickets assigned to ${person.entity.label}.`, 0.8));
+          ...(dated ? { date_property: input.dateProperty ?? 'close_date', start: window.start, end: window.end } : {}),
+          limit: rowLimit(input, 8),
+        }, `"${person.mention}" is ${person.entity.label}; show the open deals they own${dated ? ` whose \`${input.dateProperty ?? 'close_date'}\` falls in ${window.label}` : ''}.`));
+        if (!dated) {
+          steps.push(builtin('record_search', {
+            object_type: 'ticket',
+            conditions: [{ property: 'status', op: 'in', values: OPEN_TICKET_STATUSES }],
+            owner_id: person.entity.id,
+            limit: 5,
+          }, `And the tickets assigned to ${person.entity.label}.`, 0.8));
+        }
         break;
       }
       if (subject) {
@@ -1092,13 +1406,13 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
             return [];
           }
         } else if (scopedType) {
-          const conditions = inferConditions(input.question, scopedType, input.stages);
+          const conditions = inferConditions(input.question, scopedType, input.stages, input.qualifiers);
           steps.push(builtin('record_search', {
             object_type: scopedType,
             ...(conditions.length ? { conditions } : {}),
             associated_to: subject.id,
             ...(scopedType === 'deal' ? { order_by: 'amount' } : {}),
-            limit: 10,
+            limit: rowLimit(input, 10),
           }, `The question asks for ${scopedType} records on ${subject.label}${conditions.length ? `, qualified by ${conditions.map((c) => c.property).join(' and ')}` : ''}.`, 0.9));
         }
       } else if (input.namedSomething && !input.types.length) {
@@ -1170,7 +1484,7 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
         // time, and a zero next to the real list is noise at best.
         if (ledger.ok) { steps.push(ledger.step); break; }
         if (ledgerOnlyType(named) && suppresses(ledger)) { blocked.push(ledger.blocked); return []; }
-        const conditions = inferConditions(input.question, objectType, input.stages);
+        const conditions = inferConditions(input.question, objectType, input.stages, input.qualifiers);
         // "which deals are slipping this quarter" is about the deals due to
         // close in that quarter, not about every open deal on the book.
         const dated = objectType === 'deal' && input.windows.length > 0;
@@ -1187,13 +1501,15 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
           ...(conditions.length ? { conditions } : {}),
           ...(listOwner ? { owner_id: listOwner.entity.id } : {}),
           ...(objectType === 'deal' ? { order_by: 'amount' } : {}),
-          ...(dated ? { date_property: 'close_date', start: window.start, end: window.end } : {}),
-          limit: 10,
+          ...(dated ? { date_property: input.dateProperty ?? 'close_date', start: window.start, end: window.end } : {}),
+          limit: rowLimit(input, 10),
         }, [
           conditions.length
             ? `The question asks for ${objectType} records qualified by ${conditions.map((c) => c.property).join(' and ')}.`
             : `The question names ${objectType} records; list the most recent ones.`,
-          dated ? `Scoped to deals closing in ${window.label}, the period the question named.` : '',
+          dated
+            ? `Scoped to deals whose \`${input.dateProperty ?? 'close_date'}\` falls in ${window.label}, the period and the date the question named.`
+            : '',
         ].filter(Boolean).join(' '), 0.7));
       }
       break;
@@ -1220,13 +1536,27 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
             relevance: 0.95,
           });
         }
+      } else if (namedOwner(input)) {
+        // "Summarise the open pipeline for Priya Raman" is an aggregate with a
+        // softer verb on the front. Summarising the workspace under it drops
+        // the rep the sentence names — and the ledger, correctly, refuses it.
+        const owner = namedOwner(input)!;
+        const shape = metric ? MONEY_METRIC_SHAPE[metric.metric.id] : undefined;
+        if (shape && metric) steps.push(scopedAggregate(input, metric, shape, owner));
+        steps.push(builtin('record_search', {
+          object_type: 'deal',
+          conditions: [{ property: 'deal_stage', op: 'in', values: input.stages.open }],
+          owner_id: owner.entity.id,
+          order_by: 'amount',
+          limit: rowLimit(input, 8),
+        }, `List ${owner.entity.label}'s largest open deals so the summary names names.`, 0.9));
       } else {
         steps.push(metricStep(undefined, `Summarise ${window.label} with the headline number first.`));
         steps.push(builtin('record_search', {
           object_type: 'deal',
           conditions: [{ property: 'deal_stage', op: 'in', values: input.stages.open }],
           order_by: 'amount',
-          limit: 8,
+          limit: rowLimit(input, 8),
         }, 'List the largest open deals so the summary names names.', 0.9));
       }
       break;
@@ -1240,7 +1570,7 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
           object_type: 'deal',
           conditions: [{ property: 'deal_stage', op: 'in', values: input.stages.open }],
           order_by: 'amount',
-          limit: 10,
+          limit: rowLimit(input, 10),
         }, 'Prioritise against the open pipeline, largest first.'));
         steps.push(metricStep(undefined, `Anchor the plan on ${metric?.metric.label ?? 'bookings'} for ${window.label}.`, ));
       }
@@ -1312,7 +1642,7 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
       object_type: 'deal',
       conditions: [{ property: 'deal_stage', op: 'in', values: input.stages.open }],
       order_by: 'amount',
-      limit: 5,
+      limit: rowLimit(input, 5),
     }, 'Name the biggest open deals so the picture is concrete.', 0.8));
     steps.push(builtin('record_aggregate', {
       object_type: 'ticket',
@@ -1710,6 +2040,10 @@ export function planTools(input: PlanInput): PlanResult {
     // The meter catalogue is an answer to "what do we meter", never a
     // consolation prize under a question that named a meter and a number.
     (/(^|[._])list_meters$/.test(name) && !!input.meter) ||
+    // Same for the pipeline catalogue: "how much pipeline does Marcus own" is
+    // a question with a number in it, and three pipeline definitions printed
+    // under that number answer "what pipelines do we have" instead.
+    (/(^|[._])list_pipelines$/.test(name) && !pipelineCatalogueAsked(input)) ||
     // Movement is planned by a movement question or not at all. The generic
     // matcher put twelve months of book movement under "which accounts are at
     // risk of churning" because the tool's description contains "churn".

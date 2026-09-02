@@ -22,6 +22,17 @@ import {
 
 /* ------------------------------- citations -------------------------------- */
 
+/**
+ * The records an answer was read from, as things a keyboard can get to.
+ *
+ * A chip whose record has no screen used to be a `disabled` button: skipped by
+ * Tab, unannounced, with the only explanation in a `title` tooltip that appears
+ * on hover and nowhere else. Most of them had a screen all along — the engine
+ * cites logged calls, notes, emails and tasks constantly, and every one of
+ * those is a record `/records/:type/:id` renders — so they are links now. What
+ * genuinely has nowhere to go stays in the tab order as a labelled note,
+ * carrying the reason in its accessible name instead of a tooltip.
+ */
 export function CitationChips({ citations, label = 'Sources' }: { citations: Citation[]; label?: string }) {
   const { navigate } = useRouter();
   if (!citations.length) return null;
@@ -31,23 +42,72 @@ export function CitationChips({ citations, label = 'Sources' }: { citations: Cit
       {citations.map((citation) => {
         const href = citationHref(citation);
         const Glyph = iconByName(CITATION_ICON[citation.type] ?? 'link');
-        return (
-          <button
-            key={`${citation.type}:${citation.id}`}
-            type="button"
-            className="cp-chip"
-            disabled={!href}
-            title={href ? `Open ${citation.label} (${citation.id})` : `${citation.label} — ${citation.id} has no screen in this workspace`}
-            onClick={() => { if (href) navigate(href); }}
-          >
+        const body = (
+          <>
             <Glyph size={12} />
             <span className="u-truncate">{citation.label}</span>
             <span className="cp-chip__type">{humanize(citation.type)}</span>
-          </button>
+          </>
+        );
+        if (!href) {
+          return (
+            <span
+              key={`${citation.type}:${citation.id}`}
+              className="cp-chip cp-chip--flat"
+              tabIndex={0}
+              role="note"
+              aria-label={`${citation.label} — ${humanize(citation.type)} ${citation.id}. No screen in this workspace opens it.`}
+              title={`${citation.label} — ${citation.id} has no screen in this workspace`}
+            >
+              {body}
+            </span>
+          );
+        }
+        return (
+          <a
+            key={`${citation.type}:${citation.id}`}
+            className="cp-chip"
+            href={href}
+            title={`Open ${citation.label} (${citation.id})`}
+            onClick={(e) => {
+              if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+              e.preventDefault();
+              navigate(href);
+            }}
+          >
+            {body}
+          </a>
         );
       })}
     </div>
   );
+}
+
+/**
+ * Where the keyboard goes when a decision destroys the button that made it.
+ *
+ * "Approve and run" removes itself: the card becomes the record of what
+ * happened, and the browser drops focus to `<body>` — the top of the shell,
+ * with no announcement that anything was written. The outcome only exists once
+ * the approvals and the thread have both come back, so this watches for it
+ * rather than guessing at a frame count, and never takes focus from anywhere a
+ * person has since put it.
+ */
+export function restoreFocusAfterDecision(): void {
+  if (typeof document === 'undefined') return;
+  let frames = 0;
+  const settle = () => {
+    const active = document.activeElement as HTMLElement | null;
+    const adrift = !active || active === document.body || !active.isConnected;
+    if (adrift) {
+      const target = document.querySelector<HTMLElement>('.cp-approval__actions button')
+        ?? [...document.querySelectorAll<HTMLElement>('.cp-resolution')].pop()
+        ?? document.querySelector<HTMLElement>('textarea[aria-label="Ask the copilot"]');
+      if (target?.isConnected) { target.focus({ preventScroll: true }); return; }
+    }
+    if (frames++ < 60) requestAnimationFrame(settle);
+  };
+  requestAnimationFrame(settle);
 }
 
 /* ---------------------------------- trace --------------------------------- */
@@ -178,6 +238,7 @@ export function ApprovalCard({ approval, onDecided }: { approval: AiApproval; on
           toast.info('Declined', `${humanTool(approval.tool)} was not run. Nothing changed.`);
         }
         onDecided?.();
+        restoreFocusAfterDecision();
       },
       onError: (e) => toast.error('The decision was refused', e.body.message),
     },
@@ -276,19 +337,38 @@ export function WrittenTo({ approval }: { approval: AiApproval }) {
         const name = targets.length === 1
           ? / on (.+)$/.exec(approval.preview[0] ?? '')?.[1] ?? id
           : id;
-        return (
-          <button
-            key={id}
-            type="button"
-            className="cp-chip"
-            disabled={!link}
-            title={link ? `Open ${name}` : `${id} has no screen in this workspace`}
-            onClick={() => { if (link) navigate(link.href); }}
-          >
+        const body = (
+          <>
             <Glyph size={12} />
             <span className="u-truncate">{name}</span>
             <span className="cp-chip__type">{humanize(link?.type ?? 'record')}</span>
-          </button>
+          </>
+        );
+        return link ? (
+          <a
+            key={id}
+            className="cp-chip"
+            href={link.href}
+            title={`Open ${name}`}
+            onClick={(e) => {
+              if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+              e.preventDefault();
+              navigate(link.href);
+            }}
+          >
+            {body}
+          </a>
+        ) : (
+          <span
+            key={id}
+            className="cp-chip cp-chip--flat"
+            tabIndex={0}
+            role="note"
+            aria-label={`${name} — no screen in this workspace opens it.`}
+            title={`${id} has no screen in this workspace`}
+          >
+            {body}
+          </span>
         );
       })}
     </div>
@@ -309,7 +389,13 @@ export function ApprovalResolution({ approval }: { approval: AiApproval }) {
   const written = approval.status === 'approved';
   const summary = outcomeSummary(approval);
   return (
-    <div className={`cp-resolution${written ? ' is-written' : ''}`} data-approval={approval.id}>
+    <div
+      className={`cp-resolution${written ? ' is-written' : ''}`}
+      data-approval={approval.id}
+      tabIndex={-1}
+      role="status"
+      aria-label={`${written ? 'Approved and written' : 'Declined'}: ${summary.text}`}
+    >
       <div className="cp-resolution__head">
         <Badge tone={written ? 'success' : 'neutral'} size="sm" icon={written ? <Icons.check size={11} /> : <Icons.shield size={11} />}>
           {written ? 'Approved and written' : 'Declined'}

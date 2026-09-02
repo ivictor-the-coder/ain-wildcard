@@ -35,6 +35,31 @@ export interface ExtractionContext {
   metricIsSubject: boolean;
   /** The currencies the metric came back in — more than one means no single figure. */
   metricCurrencies?: string[];
+  /** The metric this run computed, so a field named after it can be filled. */
+  metricId?: string | null;
+  metricLabel?: string | null;
+  /**
+   * How many rows the figure was computed over, and of what type.
+   *
+   * A schema field called `deal_count` came back null next to an `open_pipeline`
+   * the same aggregate had filled — the count sat in the same object, one key
+   * away, because only a field whose name matched the metric's id was looked
+   * for.
+   */
+  rowCount?: number | null;
+  rowType?: string | null;
+  /** The rep the run was scoped to, when a name in the question put it there. */
+  owner?: string | null;
+  /**
+   * The dimensions this run was scoped to, keyed by the names a schema gives
+   * them — `pipeline`, `pipeline_name`, `stage`, `owner`, `account`.
+   *
+   * A field named for a dimension takes the dimension's value and never the
+   * measure's. "pipeline" is the name of a scope and the id of a measure at the
+   * same time here, so `{"pipeline": {"type": "string"}}` came back holding
+   * "$3,162,060" — money in a field named for a book.
+   */
+  scope?: Record<string, string>;
   confidence: number;
 }
 
@@ -210,6 +235,103 @@ function topRecord(context: ExtractionContext, objectType: string): { id?: strin
   return undefined;
 }
 
+/* ------------------------- one record, not several ------------------------ */
+
+/**
+ * The record family a field name belongs to.
+ *
+ * An extraction that fills `deal_name` from one deal and `amount` from another
+ * returns a record that never existed — every field individually true, the
+ * object as a whole a fabrication. Fields are grouped by the record they
+ * describe, and each group is filled from one row.
+ */
+const FIELD_FAMILY: [RegExp, string][] = [
+  [/^(company|account|organisation|organization|customer|company_name|account_name|company_id|account_id|customer_id)$/, 'company'],
+  [/^(contact|person|contact_name|full_name|contact_id|person_id|job_title)$/, 'contact'],
+  [/^(deal|opportunity|deal_name|deal_id|opportunity_id)$/, 'deal'],
+  [/^(ticket|ticket_subject|issue|ticket_id)$/, 'ticket'],
+];
+
+/** Most specific first: a schema naming a deal and a company is about the deal. */
+const FAMILY_ORDER = ['deal', 'ticket', 'contact', 'company'];
+
+export function fieldFamily(name: string): string | null {
+  const key = normalise(name).replace(/\s+/g, '_');
+  return FIELD_FAMILY.find(([pattern]) => pattern.test(key))?.[1] ?? null;
+}
+
+export interface BoundRows {
+  /** One row per record type the run returned, each a real row from the database. */
+  rows: Record<string, Record<string, unknown>>;
+  /** The record every un-typed field is filled from. */
+  primary: string | null;
+}
+
+/** Flatten a record row so `properties.amount` answers to `amount`. */
+function flatten(row: Record<string, unknown>): Record<string, unknown> {
+  const properties = row.properties;
+  return properties && typeof properties === 'object' && !Array.isArray(properties)
+    ? { ...(properties as Record<string, unknown>), ...row }
+    : row;
+}
+
+/**
+ * The one row per record type this run actually returned.
+ *
+ * Read from the account profile and from any typed search, so an extraction
+ * has a row to bind to rather than a haystack to rummage through.
+ */
+export function bindRows(context: ExtractionContext, schema: SchemaNode): BoundRows {
+  const rows: Record<string, Record<string, unknown>> = {};
+  const keep = (type: string, row: unknown) => {
+    if (!rows[type] && row && typeof row === 'object') rows[type] = flatten(row as Record<string, unknown>);
+  };
+  for (const { result } of context.results) {
+    if (!result || typeof result !== 'object') continue;
+    const payload = result as Record<string, unknown>;
+    if (typeof payload.object_type === 'string' && Array.isArray(payload.records)) {
+      keep(payload.object_type, (payload.records as unknown[])[0]);
+      continue;
+    }
+    if (typeof payload.object_type === 'string' && typeof payload.name === 'string') {
+      keep(payload.object_type, payload);
+      // The profile carries the account's own largest deal, first contact and
+      // first open ticket. They are real rows on that account, so a schema that
+      // names one is filled from it rather than from whatever the run also saw.
+      keep('deal', (payload.open_deals as unknown[] | undefined)?.[0]);
+      keep('contact', (payload.contacts as unknown[] | undefined)?.[0]);
+      keep('ticket', (payload.open_tickets as unknown[] | undefined)?.[0]);
+    }
+  }
+  const named = new Set(Object.keys(schema.fields ?? {}).map(fieldFamily).filter((f): f is string => !!f));
+  const primary = FAMILY_ORDER.find((family) => named.has(family) && rows[family])
+    ?? FAMILY_ORDER.find((family) => rows[family])
+    ?? null;
+  return { rows, primary };
+}
+
+/** One field, read off one row — by its own name or the row's name for it. */
+export function valueIn(name: string, row: Record<string, unknown>): unknown {
+  const key = normalise(name).replace(/\s+/g, '_');
+  for (const [candidate, value] of Object.entries(row)) {
+    if (normalise(candidate).replace(/\s+/g, '_') === key) return value;
+  }
+  // `deal_name` on a deal row is `name`; `ticket_subject` is `subject`.
+  const stripped = key.replace(/^(deal|ticket|company|account|contact|customer|opportunity)_/, '');
+  if (stripped !== key) {
+    for (const [candidate, value] of Object.entries(row)) {
+      if (normalise(candidate).replace(/\s+/g, '_') === stripped) return value;
+    }
+  }
+  return undefined;
+}
+
+/** A field's value from the row it is bound to, and from nowhere else. */
+function rowValue(name: string, bound: BoundRows, family: string | null): unknown {
+  const row = bound.rows[family ?? bound.primary ?? ''];
+  return row ? valueIn(name, row) : undefined;
+}
+
 function conventionalValue(name: string, node: SchemaNode, context: ExtractionContext): unknown {
   const key = normalise(name).replace(/\s+/g, '_');
   const company = context.entities.find((e) => e.entity.type === 'company' || e.entity.type === 'customer');
@@ -248,6 +370,37 @@ function conventionalValue(name: string, node: SchemaNode, context: ExtractionCo
     if (context.metricCurrencies && context.metricCurrencies.length > 1) return undefined;
     return context.metricCurrencies?.[0] ?? context.workspace.currency;
   }
+  // A field named after the measure this run computed. `mrr`, `open_pipeline`
+  // and `net_revenue_retention` are not conventions this file can enumerate —
+  // they are the catalogue's own ids and labels — and each came back null while
+  // the engine held the figure two objects away.
+  // A field named exactly after the measure this run computed is unambiguous,
+  // whatever the verb on the front of the question was: `open_pipeline` can
+  // only mean open pipeline. Gating it on the intent left it null under
+  // "summarise the open pipeline for Priya Raman" while the engine held it.
+  // A field named for a dimension takes the dimension, never the measure that
+  // happens to share its id.
+  const scoped = context.scope?.[key];
+  if (scoped !== undefined) return scoped;
+  if (context.metricId) {
+    const ids = new Set([normalise(context.metricId), normalise(context.metricLabel ?? '')].filter(Boolean));
+    if (ids.has(normalise(name))) {
+      if (context.metricCurrencies && context.metricCurrencies.length > 1) return undefined;
+      return node.type === 'string' ? context.metricFormatted ?? context.metricValue : context.metricValue;
+    }
+  }
+  // A count field takes the row count the aggregate carries, not the metric's
+  // money value. `<type>_count` only counts when the aggregate counted that
+  // type — a `ticket_count` filled from a deal aggregate is a wrong number in
+  // the right shape.
+  const countHit = key.match(/^(?:(\w+)_)?(?:count|records?|rows?)$/) ?? key.match(/^(?:num|no)_(\w+)s?$/);
+  if (countHit) {
+    const family = countHit[1] ?? '';
+    const type = normalise(context.rowType ?? '');
+    const generic = !family || /^(record|records|row|rows|result|results|total)$/.test(family);
+    if ((generic || (type && (family === type || family === `${type}s` || `${family}s` === type)))
+      && typeof context.rowCount === 'number') return context.rowCount;
+  }
   if (/^(count|quantity|number|records?)$/.test(key)) return context.metricIsSubject ? context.metricValue : undefined;
   if (/^(period|window|timeframe|period_label)$/.test(key)) return context.window.label;
   if (/^(start|start_date|period_start|from)$/.test(key)) return context.window.start;
@@ -276,27 +429,96 @@ function conventionalValue(name: string, node: SchemaNode, context: ExtractionCo
   if (/^(tags|keywords|topics)$/.test(key)) return [...new Set(contentWords(context.question))].slice(0, 6);
   if (/^(owner|assignee|rep|owner_name)$/.test(key)) {
     const profile = context.results.map((r) => r.result).find((r) => r && typeof r === 'object' && 'owner' in (r as object));
-    return (profile as { owner?: string } | undefined)?.owner;
+    // A run scoped to a rep by name has no account profile to read the owner
+    // off; the name in the question is the owner.
+    return (profile as { owner?: string } | undefined)?.owner ?? context.owner ?? undefined;
   }
   return undefined;
+}
+
+/**
+ * The list a run returned, when the caller asked for an array of them.
+ *
+ * An array schema is a request for rows. Building one element out of run-level
+ * facts produced exactly one object with every field null — a shape that
+ * validates, means nothing, and looks to an automation like "there is one
+ * result and we know nothing about it".
+ */
+export function listRows(context: ExtractionContext): { rows: Record<string, unknown>[]; tool: string } | null {
+  for (const { tool, result } of context.results) {
+    if (!result || typeof result !== 'object') continue;
+    const payload = result as Record<string, unknown>;
+    for (const key of ['records', 'invoices', 'subscriptions', 'items', 'accounts', 'by_account', 'top_accounts', 'groups', 'matches']) {
+      const rows = payload[key];
+      if (Array.isArray(rows) && rows.length && rows.every((row) => !!row && typeof row === 'object')) {
+        return { rows: (rows as Record<string, unknown>[]).map(flatten), tool };
+      }
+    }
+    if (Array.isArray(result) && result.length && result.every((row) => !!row && typeof row === 'object')) {
+      return { rows: (result as Record<string, unknown>[]).map(flatten), tool };
+    }
+  }
+  return null;
+}
+
+/**
+ * The rows a run returned, named, for an array of scalars.
+ *
+ * `{"deals": {"type": "array", "items": {"type": "string"}}}` over a question
+ * that listed five real deals came back as `[]` — the row list was right there
+ * in the results and only an array *of objects* was ever read from it. An empty
+ * array is indistinguishable from "there are none", which was not the answer.
+ */
+function rowLabels(name: string, context: ExtractionContext): string[] | null {
+  const key = normalise(name).replace(/\s+/g, '_');
+  const generic = /^(records?|rows?|results?|items?|matches|list)$/.test(key);
+  for (const { result } of context.results) {
+    if (!result || typeof result !== 'object') continue;
+    const payload = result as { object_type?: string; records?: { name?: string }[]; groups?: { label?: string }[] };
+    if (Array.isArray(payload.records) && payload.records.length) {
+      const type = normalise(payload.object_type ?? '');
+      if (!generic && key !== type && key !== `${type}s`) continue;
+      const labels = payload.records.map((r) => r.name).filter((n): n is string => typeof n === 'string');
+      if (labels.length) return labels;
+    }
+    if (Array.isArray(payload.groups) && payload.groups.length && generic) {
+      const labels = payload.groups.map((g) => g.label).filter((n): n is string => typeof n === 'string');
+      if (labels.length) return labels;
+    }
+  }
+  return null;
 }
 
 /** Fill a schema from everything the engine learned during the run. */
 export function extractStructured(schema: SchemaNode, context: ExtractionContext): ExtractionOutcome {
   const filled: string[] = [];
   const missing: string[] = [];
+  const bound = bindRows(context, schema);
 
-  const build = (node: SchemaNode, name: string, path: string): unknown => {
+  const build = (node: SchemaNode, name: string, path: string, row?: Record<string, unknown>): unknown => {
     if (node.type === 'object' && node.fields) {
       const out: Record<string, unknown> = {};
       for (const [key, child] of Object.entries(node.fields)) {
-        out[key] = build(child, key, path ? `${path}.${key}` : key);
+        out[key] = build(child, key, path ? `${path}.${key}` : key, row);
       }
       return out;
     }
+    // An array of objects is one object per row of a list the run returned.
+    if (node.type === 'array' && node.of?.type === 'object' && node.of.fields && !row) {
+      const list = listRows(context);
+      if (!list) { missing.push(path || name); return []; }
+      filled.push(path || name);
+      return list.rows.slice(0, node.max ?? 25).map((one) => build(node.of!, name, path, one));
+    }
+    // Every field of one object comes from one row. Mixing rows is how an
+    // extraction returns a record that never existed: this deal's name beside
+    // that deal's amount, each of them separately true.
+    const family = fieldFamily(name);
+    const source = row ?? bound.rows[family ?? bound.primary ?? ''];
     const candidates = [
+      row ? valueIn(name, row) : rowValue(name, bound, family),
       conventionalValue(name, node, context),
-      findInResults(name, context.results),
+      source ? undefined : findInResults(name, context.results),
       findInMessage(name, context.question),
       node.default,
     ];
@@ -306,6 +528,17 @@ export function extractStructured(schema: SchemaNode, context: ExtractionContext
       if (value !== null && !(Array.isArray(value) && !value.length)) {
         filled.push(path || name);
         return value;
+      }
+    }
+    // An array the conventions could not fill is still a request for the rows
+    // this run returned, whatever the element type.
+    if (node.type === 'array' && !row) {
+      const labels = rowLabels(name, context);
+      if (labels?.length) {
+        filled.push(path || name);
+        return labels.slice(0, node.max ?? 25)
+          .map((label) => (node.of ? coerce(node.of, label, context) : label))
+          .filter((v) => v !== null);
       }
     }
     missing.push(path || name);

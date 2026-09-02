@@ -7,8 +7,11 @@
  */
 import { useMemo } from 'react';
 import { useQuery, type ApiClientError, type ListEnvelope, type QueryResult } from '@/client/kernel/api';
+import type { Vocabulary } from './scope-core';
+import type { Citation } from './citations';
 
-export interface Citation { id: string; label: string; type: string }
+export { CITATION_ICON, citationHref, recordLink, writeTargets } from './citations';
+export type { Citation } from './citations';
 
 export interface ToolCall { id: string; name: string; arguments: Record<string, unknown> }
 
@@ -258,26 +261,6 @@ export function runOutcome(run: { status: string }, approvals: AiApproval[] | un
 
 /* ------------------------- what a write actually did ---------------------- */
 
-const ID_PREFIX: Record<string, string> = { cmp: 'company', con: 'contact', deal: 'deal', tkt: 'ticket' };
-
-/** The records a queued write names, so the conversation can link to them. */
-export function writeTargets(args: Record<string, unknown>): string[] {
-  const out: string[] = [];
-  const push = (value: unknown) => { if (typeof value === 'string' && value) out.push(value); };
-  for (const key of ['record_id', 'id', 'contact_id', 'company_id']) push(args[key]);
-  for (const key of ['record_ids', 'associate_to']) {
-    const value = args[key];
-    if (Array.isArray(value)) for (const entry of value) push(entry);
-  }
-  return [...new Set(out)].filter((id) => ID_PREFIX[id.split('_')[0]]);
-}
-
-export function recordLink(id: string): { type: string; href: string } | null {
-  const type = ID_PREFIX[id.split('_')[0]];
-  if (!type) return null;
-  return { type, href: citationHref({ id, label: id, type }) ?? `/records/${type}/${encodeURIComponent(id)}` };
-}
-
 /** `object=record id=note_x display_name=A note` → the pairs, or null for prose. */
 export function keyValues(text: string): Record<string, string> | null {
   if (!/^[a-z_]+=/.test(text.trim())) return null;
@@ -338,56 +321,72 @@ export const useFeatureCatalogue = (days = 365): QueryResult<AiUsageReport> =>
 
 export const useTools = (): QueryResult<ListEnvelope<AiTool>> => useQuery<ListEnvelope<AiTool>>('/v1/ai/tools');
 
-/* -------------------------------- helpers -------------------------------- */
+/* ------------------------------ the vocabulary ---------------------------- */
 
-/** Where a cited record lives in this product, or null when nothing shows it. */
-export function citationHref(citation: Citation): string | null {
-  switch (citation.type) {
-    case 'deal': return `/deals/${encodeURIComponent(citation.id)}`;
-    case 'company':
-    case 'customer_company': return `/companies/${encodeURIComponent(citation.id)}`;
-    case 'contact': return `/contacts/${encodeURIComponent(citation.id)}`;
-    case 'ticket': return `/records/ticket/${encodeURIComponent(citation.id)}`;
-    case 'customer': return `/customers/${encodeURIComponent(citation.id)}`;
-    case 'invoice': return `/invoices/${encodeURIComponent(citation.id)}`;
-    case 'subscription': return `/subscriptions/${encodeURIComponent(citation.id)}`;
-    default: return citation.id.startsWith('cmp_') ? `/companies/${encodeURIComponent(citation.id)}` : null;
-  }
+interface PipelinePayload {
+  name: string;
+  label: string;
+  stages: { name: string; label: string; is_closed: boolean; is_won: boolean }[];
 }
-
-export const CITATION_ICON: Record<string, string> = {
-  deal: 'deals',
-  company: 'building',
-  contact: 'user',
-  ticket: 'tickets',
-  customer: 'wallet',
-  invoice: 'invoice',
-  subscription: 'repeat',
-  meter: 'gauge',
-  price: 'tag',
-  product: 'tag',
-};
+interface UserPayload { id: string; name: string }
+interface MetricPayload { id: string; label: string; unit: string; keywords: string[]; snapshot: boolean }
 
 /**
- * A refusal, in the engine's own words.
+ * The words this workspace uses for the things a question can narrow to.
  *
- * The reasoning trail is where the engine records that it declined to measure
- * something — `Refused (period_unresolved): …`. Surfacing it is the difference
- * between an honest "I did not answer that" and a confident-looking paragraph
- * that happens to contain no numbers.
+ * Three reads the copilot did not make before — the deal pipelines with their
+ * stages, the teammates, and the platform's own metric catalogue — because
+ * checking that an answer was measured over what was asked for is impossible
+ * without knowing what "Renewal", "Negotiation", "Marcus Ilori" and "weighted
+ * pipeline" name here. All three are small, cached by the query layer and
+ * shared with the board, so the conversation pays for them once.
  */
-export function refusalOf(run: AiRun | undefined | null): { code: string; message: string } | null {
-  for (const line of run?.reasoning ?? []) {
-    const match = /^Refused \(([a-z_]+)\):\s*(.+)$/.exec(line);
-    if (match) return { code: match[1], message: match[2] };
-  }
-  return null;
+export function useVocabulary(): { vocab: Vocabulary; loading: boolean; error: ApiClientError | null } {
+  const pipelines = useQuery<ListEnvelope<PipelinePayload>>('/v1/pipelines/deal');
+  const users = useQuery<ListEnvelope<UserPayload>>('/v1/users', { limit: 100 });
+  const metrics = useQuery<ListEnvelope<MetricPayload>>('/v1/ai/metrics');
+  const loading = pipelines.loading || users.loading || metrics.loading;
+  const error = pipelines.error ?? users.error ?? metrics.error;
+  const vocab = useMemo<Vocabulary>(() => ({
+    pipelines: (pipelines.data?.data ?? []).map((pipeline) => ({
+      name: pipeline.name,
+      label: pipeline.label,
+      stages: (pipeline.stages ?? []).map((stage) => ({
+        pipeline: pipeline.name,
+        pipelineLabel: pipeline.label,
+        name: stage.name,
+        label: stage.label,
+        isClosed: stage.is_closed,
+        isWon: stage.is_won,
+      })),
+    })),
+    people: (users.data?.data ?? []).map((user) => ({ id: user.id, name: user.name })),
+    metrics: (metrics.data?.data ?? []).map((metric) => ({
+      id: metric.id, label: metric.label, unit: metric.unit, keywords: metric.keywords ?? [], snapshot: !!metric.snapshot,
+    })),
+  }), [pipelines.data, users.data, metrics.data]);
+  return { vocab, loading, error };
 }
 
+/* -------------------------------- helpers -------------------------------- */
+
+
 export {
-  confidenceBand, parseBlocks, splitToolEcho,
+  confidenceBand, parseBlocks, refusalOf, splitToolEcho,
 } from './answer-core';
 export type { Block, ConfidenceBand, StepNote, ToolEcho } from './answer-core';
+
+export {
+  EMPTY_VOCABULARY, boardHref, boundScopeOf, carriedThrough, currencyAsked, currencyOfFigure,
+  groupAsked, humanizeName, labelOfPipeline, labelOfStage, measurementsOf, metricAsked,
+  namedQualifiers, openStagesOf, parseBreakdown, reconcileBreakdown, reconcileScope, scopeChips,
+  unknownMeasure, withoutBreakdown,
+} from './scope-core';
+export type {
+  BoundScope, BreakdownBucket, BreakdownReport, BucketVerdict, Measurement, NamedQualifier,
+  QualifierKind, QualifierState, QualifierVerdict, ScopeChip, ScopeReport, VocabMetric,
+  VocabPipeline, VocabStage, Vocabulary,
+} from './scope-core';
 
 export const SPAN_TONE: Record<AiSpan['kind'], 'brand' | 'info' | 'teal' | 'purple' | 'neutral'> = {
   plan: 'purple',

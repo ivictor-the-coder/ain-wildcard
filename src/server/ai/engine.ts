@@ -20,12 +20,20 @@ import {
 import { entityIndex, workspaceProfile, type EntityIndex, type WorkspaceProfile } from './grounding';
 import { CRM_OBJECT_TYPES, extractMentions, mentionedTypes, resolveEntities, type ResolvedEntity } from './resolve';
 import {
-  detectGrouping, detectMetric, isRankingQuestion, linkedCustomerIds, metricById, metricIds, stageSets,
+  detectCurrency, detectGrouping, detectMetric, isRankingQuestion, linkedCustomerIds, metricById, metricIds,
+  measureWords, metricUndefinedWhenEmpty, stageSets, unknownMeasure, withoutGroupingPhrase,
   type GroupBy, type MetricDetection, type MetricSubject,
 } from './metrics';
 import { comprehend, isUsableEntity, pronounBoundInSentence, refusalFor, workspaceVocabulary, type Refusal } from './clarify';
 import {
-  askedFor, ledgerToolFor, namedCapability, planTools, planWrite, replan, isWriteBlocked,
+  QualifierLedger, creditUnitsFor, crmVocabulary, dateNounIn, isBalanceQuestion, parseQualifiers, pipelineIn, qualifierRefusal,
+  rankingLimit, readableWords, resolveOwnerSlots, settleUnitAgainstResults, stepCarries, unitIn, unitVocabulary,
+  unknownModifier, waiverSentence,
+  withoutPipelinePhrase,
+  type Qualifier,
+} from './qualifiers';
+import {
+  acceptsWindow, askedFor, ledgerToolFor, namedCapability, outcomeStages, planTools, planWrite, replan, isWriteBlocked,
   type BlockedCapability, type BuiltinTool, type PlannedStep, type SkippedTool, type WindowPair, type WriteBlocked,
 } from './plan';
 import { propertyMap } from './query';
@@ -37,7 +45,7 @@ import { composeDraft, detectDraftKind, detectTone, type DraftKind, type DraftRe
 import { extractStructured, normaliseResponseSchema } from './extract';
 import { synthesise, type ResultOutcome, type StepResult } from './synth';
 import { accountUsage, estimateTokens, messageTokens, toolTokens } from './usage';
-import { EMAIL_PATTERN, ID_PATTERN, QUOTED_PATTERN, normalise, truncate } from './text';
+import { EMAIL_PATTERN, ID_PATTERN, QUOTED_PATTERN, listPhrase, normalise, truncate } from './text';
 
 export const ENGINE_MODEL = 'ain-engine-1';
 
@@ -69,6 +77,12 @@ export interface EngineAnalysis {
   skipped: SkippedTool[];
   /** Ledger capabilities the question asked for and this run refused to fake. */
   blocked: BlockedCapability[];
+  /**
+   * Every qualifier the question named and the state it ended in — bound,
+   * refused or explicitly waived. A caller can read this field and see, in one
+   * place, exactly which words of their question reached the query.
+   */
+  qualifiers: Qualifier[];
   /** Every successful step, and whether the answer rendered its result or said why not. */
   results: ResultOutcome[];
   /** The record carried in from the conversation when this turn named none. */
@@ -211,6 +225,70 @@ export function carryConversation(input: {
   return { entities: input.history, carried: input.history.length ? null : carried };
 }
 
+/**
+ * A name is one kind of thing.
+ *
+ * "How much pipeline does Marcus Ilori own?" resolved Marcus Ilori the
+ * teammate, and *also* Marcus Barnes, Marcus Brennan and Marcus Vandermeer —
+ * three contacts who share his first name. The first of those became the
+ * subject, and the answer came back about Whitcombe Aerospace: a real company,
+ * a real figure, and nothing to do with the question.
+ *
+ * An owner slot takes an owner. A weaker match of a different type on the same
+ * person's name is not a fallback for one — it is a different question — so it
+ * is dropped here rather than allowed to become the subject downstream.
+ */
+export function dropTypeConfusion(entities: ResolvedEntity[]): ResolvedEntity[] {
+  const owners = entities.filter((e) => e.entity.type === 'user' && e.score >= 0.62);
+  if (!owners.length) return entities;
+  const best = Math.max(...owners.map((o) => o.score));
+  const ownerTokens = new Set<string>();
+  for (const owner of owners) {
+    for (const token of normalise(owner.entity.label).split(' ')) if (token.length > 2) ownerTokens.add(token);
+  }
+  return entities.filter((entity) => {
+    if (entity.entity.type === 'user') return true;
+    const shares = normalise(entity.entity.label).split(' ').some((token) => ownerTokens.has(token));
+    return !shares || entity.score > best;
+  });
+}
+
+/**
+ * A word the question spent on a period is not a name.
+ *
+ * "Which open deals close before March 2026?" resolved "March" onto Marcus
+ * Ilori — a 0.55 trigram on four shared letters — and the plan then listed that
+ * rep's open deals with the period dropped entirely. A month is a period. A
+ * resolution of the wrong kind is a different question, not a weaker match for
+ * this one, so only an exact hit on the record's own name survives inside a
+ * period phrase.
+ */
+export function dropPeriodWords(entities: ResolvedEntity[], question: string): ResolvedEntity[] {
+  const spans = periodMentions(question).map((m) => ` ${normalise(m.text)} `);
+  if (!spans.length) return entities;
+  const exact = new Set(['id', 'email', 'domain', 'name_exact', 'alias_exact', 'core_exact']);
+  return entities.filter((entity) => exact.has(entity.rule)
+    || !spans.some((span) => span.includes(` ${normalise(entity.mention)} `)));
+}
+
+/**
+ * The dimensions a run bound, keyed by the field names a caller writes for them.
+ *
+ * Structured mode fills from the same ledger the prose is scoped by, so a field
+ * called `pipeline` holds the pipeline rather than the measure that shares its
+ * id.
+ */
+function scopeFields(ledger: QualifierLedger): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const entry of ledger.bound()) {
+    if (!entry.resolved || entry.kind === 'metric' || entry.kind === 'limit') continue;
+    for (const alias of [entry.kind, `${entry.kind}_name`, `${entry.kind}_label`]) {
+      if (out[alias] === undefined) out[alias] = entry.resolved.label;
+    }
+  }
+  return out;
+}
+
 function dedupeEntities(entities: ResolvedEntity[]): ResolvedEntity[] {
   const seen = new Set<string>();
   const out: ResolvedEntity[] = [];
@@ -339,6 +417,23 @@ const CARRY_TURNS = 6;
  * turn four means that one, so the most recent naming turn is listed first and
  * the carry picks it.
  */
+/**
+ * A follow-up carries the question it follows.
+ *
+ * "And how many of those are in Negotiation?" names no measure and no object
+ * type on its own, and reading it alone refused it — with a sentence denying
+ * the workspace holds a stage it lists by name elsewhere. The subject of the
+ * conversation is the last question a person asked, not the sentence in
+ * isolation.
+ */
+const FOLLOW_UP = /^\s*(and|also|what\s+about|how\s+about|ok|okay|then|now|plus)\b|\b(of\s+(?:those|them|these)|those|them|the\s+same)\b|\b(?:largest|biggest|smallest|highest|lowest|best|worst|first|last|next|other|same|which)\s+ones?\b/i;
+
+function priorQuestion(req: AiCompletionRequest): string | null {
+  const turns = req.messages.filter((m) => m.role === 'user');
+  const prior = turns.slice(0, -1).reverse().find((m) => m.content.trim().length > 0);
+  return prior?.content ?? null;
+}
+
 function priorEntities(req: AiCompletionRequest, index: EntityIndex, options: Parameters<typeof resolveEntities>[2]): ResolvedEntity[] {
   const turns = req.messages.filter((m) => m.role === 'user').slice(0, -1).slice(-CARRY_TURNS).reverse();
   const out: ResolvedEntity[] = [];
@@ -393,7 +488,35 @@ export function builtinEngine(): AiProvider {
       /* 2. what period — every one the question names, in the order it names them */
       // The metric is detected here rather than in step 3 because whether a
       // period even applies depends on it: a snapshot metric has no window.
-      const metric = detectMetric(question);
+      const vocabulary = crmVocabulary(ctx, orgId);
+      // A pipeline the question scopes to has already spent the word
+      // "pipeline"; scoring a measure over it too turned "how much did we book
+      // in the New business pipeline" into $4,385,460 of open pipeline, with
+      // the metric qualifier reported bound to a question nobody asked. The
+      // measure is read from the sentence with the scope taken out of it, and
+      // only falls back to the whole sentence when that leaves no measure at
+      // all — "what is the Renewal pipeline worth" names its metric there.
+      const namedPipeline = pipelineIn(question, vocabulary);
+      // The grouping dimension comes out too, for the same reason: "break down
+      // bookings by pipeline" writes the word "pipeline" only because of the
+      // grouping, and scoring the measure over it answered a bookings question
+      // with open pipeline.
+      const scoped = namedPipeline ? withoutPipelinePhrase(question, namedPipeline.text) : question;
+      const measureText = withoutGroupingPhrase(scoped);
+      const ownMetric = (measureText !== question ? detectMetric(measureText) : null) ?? detectMetric(question);
+      // A follow-up inherits the measure of the turn it follows. Without this
+      // the second turn of every thread reads as a question with no measure in
+      // it and is refused, having just been answered.
+      const carriedQuestion = priorQuestion(req);
+      const followsOn = !ownMetric && !!carriedQuestion && FOLLOW_UP.test(question);
+      const inheritedMetric = followsOn ? detectMetric(carriedQuestion!) : null;
+      const metric = ownMetric ?? inheritedMetric;
+      if (inheritedMetric) {
+        reasoning.push(`"${question.trim()}" names no measure of its own; carried ${inheritedMetric.metric.label} forward from "${truncate(carriedQuestion!, 60)}", the question it follows.`);
+      }
+      if (namedPipeline && measureText !== question) {
+        reasoning.push(`"${namedPipeline.text}" is a pipeline in this workspace, so the measure is read from "${measureText.replace(/\s+/g, ' ').trim()}" — the sentence with the scope taken out of it${metric ? `, which names ${metric.metric.label}` : ''}.`);
+      }
       const windows = resolveWindows(question, workspace.now, 6);
       const mentions = periodMentions(question);
       const unresolved = unresolvedPeriods(question, workspace.now);
@@ -423,7 +546,10 @@ export function builtinEngine(): AiProvider {
       }
 
       /* 3. which records — this turn's, and the ones the thread is already about */
-      const namedTypes = mentionedTypes(question);
+      const ownTypes = mentionedTypes(question);
+      // The object type comes forward with the measure: "how many of those" is
+      // a question about the same rows as the turn before it.
+      const namedTypes = ownTypes.length || !followsOn ? ownTypes : mentionedTypes(carriedQuestion!);
       const prefer = metric?.metric.supportsSubject ? ['company', 'customer', 'contact'] : namedTypes;
       const index = entityIndex(ctx, orgId);
       const options = { prefer, limit: 6, dedupe: true };
@@ -434,8 +560,16 @@ export function builtinEngine(): AiProvider {
         pinned: pinnedSubject(call, index),
         deictic,
       });
-      const entities = carriedFrom.entities;
+      // A name the sentence wrote into an owner slot is an owner. The contact
+      // who shares a rep's first name is not a weaker match for one — it is a
+      // different record, and letting it stay in the list is how a question
+      // about Marcus Ilori's pipeline was answered about Whitcombe Aerospace.
+      const entities = resolveOwnerSlots(question, dropPeriodWords(dropTypeConfusion(carriedFrom.entities), question));
       const carried = carriedFrom.carried;
+      if (entities.length < carriedFrom.entities.length) {
+        const dropped = carriedFrom.entities.filter((e) => !entities.includes(e));
+        reasoning.push(`Dropped ${dropped.length} weaker ${dropped.length === 1 ? 'match' : 'matches'} on a teammate's own name (${dropped.map((e) => `${e.entity.label} — ${e.entity.type}`).join(', ')}): a person named in an owner slot is an owner, and a lower-scoring record of another type is a different question, not a fallback.`);
+      }
       const subject = asSubject(entities.find((e) => SUBJECT_TYPES.includes(e.entity.type)));
       reasoning.push(entities.length
         ? `Resolved ${entities.length} ${entities.length === 1 ? 'record' : 'records'}: ${entities.slice(0, 3).map((e) => `${e.entity.label} (${e.entity.type}, ${e.score.toFixed(2)}, ${e.rule})`).join('; ')}.`
@@ -449,7 +583,17 @@ export function builtinEngine(): AiProvider {
       }
 
       /* 3b. which meter — a workspace that sells metered usage names its meters */
-      const meters = resolveEntities(question, index, { only: ['meter'], limit: 3, minScore: METER_MIN });
+      // A meter matched on words that belong to an account's own name is not a
+      // meter. "Is Fairhaven Dairy Co-operative at its seat limit?" resolved
+      // "Active operator seats" out of "operative at its seat" — half the
+      // company's name and half the question's furniture — and then refused the
+      // whole question because nothing in the plan takes a meter.
+      const subjectWords = new Set(entities
+        .filter((e) => SUBJECT_TYPES.includes(e.entity.type))
+        .flatMap((e) => normalise(e.entity.label).split(' ').filter((word) => word.length > 3)));
+      const meters = resolveEntities(question, index, { only: ['meter'], limit: 3, minScore: METER_MIN })
+        .filter((m) => ['id', 'name_exact', 'alias_exact', 'core_exact'].includes(m.rule)
+          || !normalise(m.mention).split(' ').some((word) => subjectWords.has(word)));
       const decisive = meters.length === 1 || (meters.length > 1 && meters[0].score - meters[1].score >= METER_MARGIN);
       const meter = decisive ? meters[0] : null;
       // Two meters matched and neither is clearly the one meant. Picking the
@@ -467,9 +611,20 @@ export function builtinEngine(): AiProvider {
       // the substitution this engine exists to refuse.
       const usageFromMeter = !!meters[0] && meters[0].score >= METER_STRONG && !metric
         && !namedTypes.includes('usage') && (intent.intent === 'aggregate' || intent.intent === 'compare');
-      const types = usageFromMeter ? [...namedTypes, 'usage'] : namedTypes;
+      const meterTypes = usageFromMeter ? [...namedTypes, 'usage'] : namedTypes;
       if (usageFromMeter) {
         reasoning.push(`"${meters[0].mention}" is ${meters[0].entity.label}, a meter in ${workspace.name}, and the question names no sales metric — so this is a question about metered usage.`);
+      }
+      // "How many telemetry events does Meridian have left?" measures in a
+      // meter and asks about a pot. Consumption is not an answer to it — it is
+      // a different number, 3,700 times larger on this book — so the credit
+      // ledger takes the question and the meter stays a denomination.
+      const balanceQuestion = isBalanceQuestion(question, meterTypes);
+      const types = balanceQuestion
+        ? ['credit', ...meterTypes.filter((t) => t !== 'usage' && t !== 'credit')]
+        : meterTypes;
+      if (balanceQuestion) {
+        reasoning.push(`"${question.match(/\b(left|remaining|remain|remains|unused|drawn\s+down|balance)\b/i)?.[0]}" asks what is left, which is a balance on the credit ledger — metered consumption is a different quantity and cannot settle it.`);
       }
 
       /* 4. which metric and grouping */
@@ -477,8 +632,56 @@ export function builtinEngine(): AiProvider {
       if (groupBy !== 'none') reasoning.push(`Grouping requested: by ${groupBy}.`);
       if (ranking) reasoning.push(`The question asks for a ranking, so the answer leads with the ordered groups rather than a list of records.`);
 
+      /* 4b. every qualifier the question named, in one typed ledger */
+      // One invariant instead of a guard per qualifier: whatever narrows the
+      // question — a pipeline, a stage, an owner, a period, a status, a measure,
+      // a meter, a currency, a unit, a ranking cut-off — is parsed here once and
+      // has to be bound, refused or explicitly waived before an answer exists.
+      const unknownMetric = unknownMeasure(question);
+      const asking = intent.intent !== 'act' && intent.intent !== 'draft';
+      const qualifiers = asking
+        ? parseQualifiers({
+            question,
+            intent: intent.intent,
+            vocabulary,
+            entities,
+            windows,
+            unresolvedPeriods: unresolved,
+            metric,
+            unknownMetric,
+            // A meter in a balance question names the denomination of the pot,
+            // not a filter on it: the pot is read from the grant. The `unit`
+            // entry carries that denomination and settles against the figure
+            // the credit ledger actually returns.
+            meter: balanceQuestion ? null : meter,
+            currency: detectCurrency(question),
+            limit: rankingLimit(question),
+            unit: unitIn(question, unitVocabulary(ctx, orgId)),
+            stages: stageSets(ctx, orgId),
+            workspaceName: workspace.name,
+          })
+        : new QualifierLedger();
+      if (qualifiers.entries.length) reasoning.push(qualifiers.describe());
+
       /* 5. can this be answered at all, or must it be refused */
-      const comprehension = comprehend(question, workspaceVocabulary(index));
+      // The comprehension check reads record names and aliases; a stage label,
+      // a pipeline label and anything a qualifier already resolved are names
+      // this workspace holds too. Without them "How much is sitting in Proposal
+      // sent?" was refused with a sentence denying two words of a stage the
+      // same engine lists by name.
+      const comprehension = comprehend(question, readableWords(vocabulary, qualifiers, workspaceVocabulary(index), measureWords()));
+      // A content word adjacent to a bound measure modifies it. One that
+      // resolved to nothing is a different measure, not decoration: "flurbo
+      // revenue" was answered with revenue, and the word appeared nowhere in
+      // the run.
+      const modifier = metric && asking ? unknownModifier(question, metric.matched, comprehension.unknown) : null;
+      if (modifier) {
+        qualifiers.add({
+          kind: 'metric', text: modifier, resolved: null, state: 'refused', binding: null,
+          detail: `"${modifier}" narrows ${metric!.metric.label} to something this workspace does not hold — it is not a product line, a segment, a book or a pipeline here, and I will not answer the unnarrowed measure under your wording.`,
+        });
+        reasoning.push(`"${modifier}" sits directly in front of "${metric!.matched}" and resolves to nothing, so it is a refused qualifier rather than a word dropped in silence.`);
+      }
       // A type is countable when something in this workspace can actually count
       // it: the CRM for its own object types, and a registered ledger tool for
       // the revenue half. Anything else names no measure, and a question that
@@ -510,12 +713,24 @@ export function builtinEngine(): AiProvider {
             ].join(' '),
           }
         : null;
+      // A qualifier that named something this workspace does not have is
+      // refused before anything runs. "Pipeline coverage" is not open pipeline
+      // and "Technical validation" is not a deal whose name contains the word.
+      const parseTimeRefusal = qualifierRefusal(qualifiers.refused(), workspace.name, {
+        stages: vocabulary.stages.map((st) => st.label),
+        pipelines: vocabulary.pipelines.map((pl) => pl.label),
+        metrics: metricIds().map((id) => metricById(id)?.label ?? id),
+        owners: workspace.people.map((p) => p.name),
+      });
+      const qualifierParseRefusal: Refusal | null = parseTimeRefusal
+        ? { code: 'qualifier_unbound', why: parseTimeRefusal.why, content: parseTimeRefusal.content }
+        : null;
       const refusalOrNull: Refusal | null = danglingReference ?? refusalFor({
         question, workspace, intent, comprehension, metric, entities, types, windows, mentions,
         unresolved, reversedRange: backwards,
         metrics: metricIds().map((id) => metricById(id)?.label ?? id),
         countableTypes,
-      });
+      }) ?? qualifierParseRefusal;
 
       /* 6. plan */
       const budget = runtime?.budget(call) ?? { steps: 6, timeMs: 10_000, callsPerMinute: 600 };
@@ -545,6 +760,10 @@ export function builtinEngine(): AiProvider {
         // an answer either. Both are measured and the answer says why.
         meterCandidates: rivalMeters.filter((m) => m.score >= METER_STRONG).map((m) => m.entity.id),
         quantity: quantityIn(question),
+        // "Created last month" and "closing next month" name the same period
+        // and two different columns; the noun in the question picks which.
+        dateProperty: dateNounIn(question)?.property ?? null,
+        qualifiers,
       };
       // A phrase that is a capability's own title is not an unreadable question.
       // "Show me the recovery queue" was refused with a sentence asserting that
@@ -597,6 +816,137 @@ export function builtinEngine(): AiProvider {
       if (scopedTools) {
         reasoning.push(`Run scoped to ${scopedTools.length ? scopedTools.map((t) => `"${t}"`).join(', ') : 'no tools'}; the plan is filtered against that list, not just the tools offered to the model.`);
       }
+      /* 6b. settle every qualifier against the plan that is about to run */
+      // A snapshot has no reporting period to be measured over, and a count has
+      // no currency book. Neither is a dropped qualifier — the measure cannot
+      // take it at all — so each is waived by name and the answer says so in
+      // its first sentence rather than in a note under the number.
+      // …unless the window is a close-date filter over the open book, which
+      // `record_aggregate` applies exactly. Waiving it there states something
+      // false about what this engine can do.
+      // A creation date is as much a filter on the open book as a close date is:
+      // "how much pipeline was created in Q2 2026?" is answered by
+      // `record_aggregate` on `created`, and waiving it with "a snapshot cannot
+      // take a period" stated something false about a query this engine runs.
+      const datedColumn = dateNounIn(question)?.property ?? null;
+      const closeWindow = !!metric?.metric.snapshot && windows.length > 0
+        && (datedColumn === 'close_date' || datedColumn === 'created'
+          || outcomeStages(metric?.metric.id ?? null, qualifiers).length > 0);
+      if (metric?.metric.snapshot && windows.length && qualifiers.first('period') && !closeWindow) {
+        qualifiers.waive('period', `${metric.metric.label} is a snapshot of the book as it stands today, so ${listPhrase(windows.map((w) => w.label))} cannot be applied to it — this is the figure right now, not for that period.`);
+      }
+      if (metric && metric.metric.unit !== 'money' && qualifiers.first('currency')) {
+        qualifiers.waive('currency', `${metric.metric.label} is not a money measure, so restricting it to one currency book would change nothing.`);
+      }
+      // A comparison measures exactly two periods, and which two is decided
+      // before the plan: "the same period last year" is one phrase and one
+      // instruction, and the year it names is measured as the shifted quarter
+      // rather than on its own. Any further period the question named is
+      // waived by name — the answer already says which two it compared.
+      const measuredWindows = comparison ? [comparison.a, comparison.b] : windows;
+      if (comparison) {
+        for (const entry of qualifiers.pending()) {
+          if (entry.kind !== 'period') continue;
+          if (measuredWindows.some((w) => w.label === entry.resolved?.value)) continue;
+          const folded = comparison.source === 'year_over_year';
+          qualifiers.mark(entry, folded ? 'bound' : 'waived',
+            folded
+              ? `"${entry.text}" is the instruction to compare like for like, so it is measured as ${comparison.b.label} rather than as a period of its own.`
+              : `A comparison is between two periods; ${comparison.a.label} and ${comparison.b.label} are the two, so "${entry.text}" is not measured here — ask about it on its own.`);
+          if (folded) entry.binding = null;
+        }
+      }
+      const planArgs = plan.map((step) => ({ tool: step.tool, args: step.args }));
+      qualifiers.settleAgainst(planArgs, measuredWindows);
+      // A period nothing in the plan can be told about is waived, with the
+      // capability named. Silently listing the whole book under the month's
+      // name is the failure this replaces.
+      if (plan.length && qualifiers.pending().some((q) => q.kind === 'period')) {
+        const blind = plan.filter((step) => {
+          const definition = toolIndex.get(step.tool);
+          return definition ? !acceptsWindow(definition) : false;
+        });
+        if (blind.length === plan.length) {
+          qualifiers.waive('period', `${listPhrase(blind.map((b) => `\`${b.tool}\``))} ${blind.length === 1 ? 'takes' : 'take'} no reporting period, so this is the position as it stands today rather than a figure for ${listPhrase(windows.map((w) => w.label))}.`);
+        }
+      }
+      // A ranking cut-off nothing in the plan can take is waived the same way.
+      if (plan.length && qualifiers.pending().some((q) => q.kind === 'limit')) {
+        qualifiers.waive('limit', `Nothing in this plan takes a row limit, so the answer is not cut to the number you named.`);
+      }
+      // Nothing ran, so nothing was substituted. A question with no capability
+      // behind it, or one whose capability this run refused to fake, already
+      // says so in its own words — a second refusal about a qualifier would be
+      // an apology for not narrowing an answer that does not exist.
+      if (!plan.length) {
+        for (const entry of qualifiers.pending()) {
+          qualifiers.mark(entry, 'waived', 'nothing was measured for this question, so nothing was narrowed to it.');
+        }
+      }
+
+      // A run the caller scoped to a tool list is not a run that dropped the
+      // reader's qualifier — the caller removed the capability that would have
+      // taken it, and the answer says the run was scoped. Waiving names both.
+      if (scopedTools) {
+        for (const entry of qualifiers.pending()) {
+          qualifiers.mark(entry, 'waived',
+            `this run was scoped to ${scopedTools.length ? listPhrase(scopedTools.map((t) => `\`${t}\``)) : 'no tools at all'}, and nothing in that list takes ${entry.kind === 'period' ? 'a reporting period' : `a ${entry.kind}`}.`);
+        }
+      }
+
+      // Everything still pending is a qualifier the plan quietly dropped, and
+      // everything the plan claims to carry is checked against the plan itself.
+      const violations = qualifiers.verify(planArgs);
+      const blockingQualifiers = qualifiers.pending().filter((q) => q.kind !== 'unit');
+      const unbound = qualifierRefusal(blockingQualifiers, workspace.name, {
+        stages: vocabulary.stages.map((st) => st.label),
+        pipelines: vocabulary.pipelines.map((pl) => pl.label),
+        metrics: metricIds().map((id) => metricById(id)?.label ?? id),
+        owners: workspace.people.map((p) => p.name),
+      });
+      // The entries that caused the refusal are settled as refused, so what the
+      // caller reads back has three states and not four. A `pending` entry in a
+      // finished run is the state this whole mechanism says cannot exist.
+      if (unbound) {
+        for (const entry of blockingQualifiers) {
+          qualifiers.mark(entry, 'refused', entry.detail
+            ?? `Nothing in this plan takes a ${entry.kind}, so the answer is not narrowed to "${entry.text}".`);
+        }
+      }
+      const violated = violations.filter((violation) => violation.reason !== 'unsettled');
+      // A name that binds two kinds at once is not an unproven scope, it is an
+      // ambiguous question, and the answer is the question back.
+      const ambiguous = violated.filter((violation) => violation.reason === 'type_mismatch');
+      const qualifierRefused: Refusal | null = ambiguous.length
+        ? {
+            code: 'ambiguous_reference',
+            why: `One mention binds two kinds: ${ambiguous.map((violation) => `${violation.kind} "${violation.text}"`).join('; ')}.`,
+            content: [
+              ambiguous.map((violation) => violation.detail).join(' '),
+              `I have not picked one for you — a confident answer about the wrong record is worse than a question. Say which you mean.`,
+            ].join(' '),
+          }
+        : violated.length
+        ? {
+            code: 'qualifier_unbound',
+            why: `Qualifier ledger violated: ${violated.map((violation) => `${violation.kind} "${violation.text}" (${violation.reason})`).join('; ')}.`,
+            content: [
+              `I could not prove that this answer was scoped to ${listPhrase(violated.map((violation) => `the ${violation.kind} "${violation.text}"`))} you named,`,
+              `so I have not given you the wider figure with your own words on top of it.`,
+              violated.map((violation) => violation.detail).join(' '),
+            ].join(' '),
+          }
+        : unbound
+          ? { code: 'qualifier_unbound', why: unbound.why, content: unbound.content }
+          : null;
+      if (qualifierRefused) {
+        reasoning.push(`Refused (qualifier_unbound): ${qualifierRefused.why}`);
+        runtime?.note(call, 'plan', 'qualifier_unbound', qualifierRefused.why);
+      } else if (qualifiers.entries.length) {
+        reasoning.push(`Qualifier ledger settled: ${qualifiers.entries.map((q) => `${q.kind} "${q.text}" ${q.state}${q.binding ? ` → ${q.binding.tool}` : ''}`).join('; ')}.`);
+      }
+      const runnable = qualifierRefused ? [] : plan;
+
       reasoning.push(plan.length
         ? `Plan (${plan.length} ${plan.length === 1 ? 'step' : 'steps'}, budget ${budget.steps}): ${plan.map((s) => s.tool).join(' → ')}.`
         : refusal
@@ -609,9 +959,9 @@ export function builtinEngine(): AiProvider {
       const steps: StepResult[] = [];
       const executed: { tool: string; result: unknown }[] = [];
       const traced: EngineAnalysis['steps'] = [];
-      let passes = plan.length ? 1 : 0;
+      let passes = runnable.length ? 1 : 0;
 
-      for (const step of plan) {
+      for (const step of runnable) {
         const before = process.hrtime.bigint();
         const outcome = await executeStep(call, step, toolIndex);
         const ms = Number((process.hrtime.bigint() - before) / 1_000_000n);
@@ -627,7 +977,7 @@ export function builtinEngine(): AiProvider {
       }
 
       const remaining = Math.max(0, budget.steps - (call.steps ?? steps.length));
-      const second = refusal ? [] : replan(planInput, executed, Math.min(remaining, 2), planned.skipped);
+      const second = refusal || qualifierRefused ? [] : replan(planInput, executed, Math.min(remaining, 2), planned.skipped);
       if (second.length) {
         passes += 1;
         reasoning.push(`Second pass: ${second.map((s) => `${s.tool} — ${s.why}`).join(' ')}`);
@@ -646,9 +996,57 @@ export function builtinEngine(): AiProvider {
         }
       }
 
+      // A unit is settled against the figure rather than against the query: it
+      // is bound when the answer actually holds a count in that unit. A credit
+      // pot in events reported as "$0.00 available" is not a rounding problem,
+      // it is the wrong quantity in the wrong type.
+      settleUnitAgainstResults(qualifiers, executed, creditUnitsFor(ctx, orgId, planInput.subjectCustomerIds));
+      // A qualifier that was an argument of a step which then errored is not
+      // bound: the query never ran. The alternative — which shipped — is a
+      // scoped question answered with "nothing I hold answers that", while the
+      // capability's own explanation of why sits in the trace where nobody
+      // reads it.
+      // A capability that returns `{ error }` did not fail the call, but it did
+      // not answer either — `business_metric` reports an impossible narrowing
+      // that way rather than throwing.
+      const refusedByTool = (step: StepResult): string | null => {
+        const payload = step.result as { error?: unknown } | null;
+        return payload && typeof payload === 'object' && typeof payload.error === 'string' ? payload.error : null;
+      };
+      const succeeded = steps
+        .filter((step) => step.ok && !refusedByTool(step))
+        .map((step) => ({ tool: step.tool, args: step.args }));
+      const lost: Qualifier[] = [];
+      for (const entry of qualifiers.bound()) {
+        const binding = entry.binding;
+        if (!binding) continue;
+        if (succeeded.some((step) => step.tool === binding.tool && stepCarries(step, binding) === null)) continue;
+        const failure = steps.find((step) => step.tool === binding.tool && (!step.ok || refusedByTool(step)));
+        qualifiers.unbind(entry, (failure ? refusedByTool(failure) ?? failure.error?.message : null)
+          ?? `The step that was to carry "${entry.text}" never returned, so nothing was narrowed to it.`);
+        lost.push(entry);
+      }
+      const unitPending = qualifiers.pending().filter((q) => q.kind === 'unit');
+      if (unitPending.length) {
+        qualifiers.refuse('unit', `Nothing this run measured is denominated in ${listPhrase(unitPending.map((q) => `${q.text}s`))}.`);
+        lost.push(...unitPending);
+      }
+      const afterRun = lost.length ? qualifierRefusal(lost, workspace.name, {
+        stages: vocabulary.stages.map((st) => st.label),
+        pipelines: vocabulary.pipelines.map((pl) => pl.label),
+        metrics: metricIds().map((id) => metricById(id)?.label ?? id),
+        owners: workspace.people.map((p) => p.name),
+      }) : null;
+      if (afterRun) {
+        reasoning.push(`Refused after the run (qualifier_unbound): ${afterRun.why}`);
+        runtime?.note(call, 'plan', 'qualifier_unbound', afterRun.why);
+      }
+      const answerRefusal: Refusal | null = refusal ?? qualifierRefused
+        ?? (afterRun ? { code: 'qualifier_unbound' as const, why: afterRun.why, content: afterRun.content } : null);
+
       /* 8. draft, extract or answer */
       const tone = detectTone(question);
-      const draftKind = !refusal && intent.intent === 'draft' ? detectDraftKind(question) : null;
+      const draftKind = !answerRefusal && intent.intent === 'draft' ? detectDraftKind(question) : null;
       let draft: DraftResult | null = null;
       if (draftKind) {
         const profile = steps.map((s) => s.result).find((r) => !!r && typeof r === 'object' && 'totals' in (r as object)) as AccountProfileResult | undefined;
@@ -667,11 +1065,12 @@ export function builtinEngine(): AiProvider {
         reasoning.push(`Drafted a ${draftKind.replace(/_/g, ' ')} in a ${tone} tone from ${draft.personalisation.length} verified ${draft.personalisation.length === 1 ? 'fact' : 'facts'}.`);
       }
 
-      const synthesis = refusal
-        ? { content: refusal.content, citations: [], rendering: [] as ResultOutcome[] }
+      const synthesis = answerRefusal
+        ? { content: answerRefusal.content, citations: [], rendering: [] as ResultOutcome[] }
         : synthesise({
             question, intent, workspace, window, windows, comparison, ranking, subject, entities, steps, metric, draft,
             stages: planInput.stages,
+            vocabulary,
             pendingApprovals: (call.pendingApprovals ?? []) as PendingApproval[],
             writeBlocked,
             scopedTools,
@@ -692,14 +1091,37 @@ export function builtinEngine(): AiProvider {
         && steps.every((step) => !step.ok)
         && steps.some((step) => step.error?.code === 'time_budget_exhausted' || step.error?.code === 'step_budget_exhausted');
 
+      // A waived qualifier earns the first sentence, not a footnote. The reader
+      // has to know which word of their question this answer does not apply
+      // before they read the number, not after they have quoted it.
+      const waiver = answerRefusal || !plan.length || blocked.length ? null : waiverSentence(qualifiers);
+      // A name matched through a typo is a name the reader did not write. The
+      // answer is about the record this workspace holds, and the first sentence
+      // says which — a fuzzy hop stated silently is the same substitution as a
+      // dropped qualifier, one letter at a time.
+      const boundAccount = subject ? entities.find((e) => e.entity.id === subject.id) : undefined;
+      const renamed = boundAccount && ['trigram', 'edit_distance'].includes(boundAccount.rule)
+        && normalise(boundAccount.mention) !== normalise(boundAccount.entity.label) && !answerRefusal
+        ? `You wrote "${boundAccount.mention}"; the closest account this workspace holds is ${boundAccount.entity.label}, and this answer is about ${boundAccount.entity.label}.`
+        : null;
+      const lead = [renamed, waiver].filter(Boolean).join(' ') || null;
       let content = budgetExhausted
         ? [
             `I ran out of this run's ${budget.timeMs.toLocaleString('en-US')}ms / ${budget.steps}-step budget before ${plan.length === 1 ? 'the planned step' : 'any planned step'} returned, so I have no answer for you rather than a partial one.`,
             `Planned: ${plan.map((s) => s.tool).join(' → ')}. Ask again with a shorter prompt, or raise \`max_steps\`.`,
           ].join(' ')
-        : synthesis.content;
+        : lead ? `${lead}\n\n${synthesis.content}` : synthesis.content;
       if (req.responseSchema) {
-        const metricResult = executed.map((e) => e.result).find((r) => !!r && typeof r === 'object' && 'formatted' in (r as object)) as { value?: number; formatted?: string; books?: { currency: string }[]; mixedCurrency?: boolean } | undefined;
+        const metricResult = executed.map((e) => e.result).find((r) => !!r && typeof r === 'object' && 'formatted' in (r as object)) as {
+          metric?: string; value?: number; formatted?: string; books?: { currency: string }[]; mixedCurrency?: boolean;
+          count?: number; matched_records?: number; object_type?: string;
+        } | undefined;
+        // A measure the prose declines to state has no value for a schema field
+        // either. `{"win_rate": 0}` came back beside prose saying there is no
+        // rate to report — the two halves of the same run contradicting each
+        // other, and only the JSON reaches an automation.
+        const measureUndefined = !!metricResult && metricResult.count === 0
+          && metricUndefinedWhenEmpty(metricResult.metric ?? metric?.metric.id ?? null);
         const extraction = extractStructured(normaliseResponseSchema(req.responseSchema), {
           question,
           answer: synthesis.content,
@@ -707,13 +1129,24 @@ export function builtinEngine(): AiProvider {
           entities,
           window,
           results: executed,
-          metricValue: metricResult?.value ?? null,
-          metricFormatted: metricResult?.formatted ?? null,
+          metricValue: measureUndefined ? null : metricResult?.value ?? null,
+          metricFormatted: measureUndefined ? null : metricResult?.formatted ?? null,
           // A measurement question is about its metric; every other question
           // merely mentions one, and pasting it into that question's `amount`
           // writes the workspace's total onto one record.
           metricIsSubject: !!metric && (intent.intent === 'aggregate' || intent.intent === 'compare'),
           metricCurrencies: (metricResult?.books ?? []).map((b) => b.currency),
+          metricId: metric?.metric.id ?? null,
+          metricLabel: metric?.metric.label ?? null,
+          // The row count the same aggregate carries, so a `deal_count` field
+          // is not null next to an `open_pipeline` it filled.
+          rowCount: metricResult?.matched_records ?? metricResult?.count ?? null,
+          rowType: metricResult?.object_type ?? null,
+          owner: qualifiers.label('owner'),
+          // Every dimension this run really bound, under the names a schema
+          // gives it — so a field named for a scope is filled from the scope
+          // and not from whatever number the run also produced.
+          scope: scopeFields(qualifiers),
           confidence: intent.confidence,
         });
         content = JSON.stringify(extraction.value, null, 2);
@@ -739,13 +1172,14 @@ export function builtinEngine(): AiProvider {
         window,
         windows,
         comparison,
-        refusal: refusal ? { code: refusal.code, why: refusal.why } : null,
+        refusal: answerRefusal ? { code: answerRefusal.code, why: answerRefusal.why } : null,
         writeBlocked,
         scopedTools,
         budgetExhausted,
         // A refused period is never "from the question": the caller has to be
         // able to see, in one field, that nothing they named was measured.
-        windowFromQuestion: !!explicit && refusal?.code !== 'period_unresolved',
+        windowFromQuestion: !!explicit && answerRefusal?.code !== 'period_unresolved'
+          && !qualifiers.waived().some((q) => q.kind === 'period'),
         entities: entities.map((e) => ({ id: e.entity.id, label: e.entity.label, type: e.entity.type, score: e.score, rule: e.rule, mention: e.mention })),
         subject,
         metric: metric ? { id: metric.metric.id, label: metric.metric.label, matched: metric.matched, score: metric.score } : null,
@@ -756,6 +1190,7 @@ export function builtinEngine(): AiProvider {
         plan: plan.map((s) => ({ tool: s.tool, why: s.why, args: s.args })),
         skipped: planned.skipped,
         blocked,
+        qualifiers: [...qualifiers.entries] as Qualifier[],
         results: synthesis.rendering,
         carriedSubject: asSubject(carried ?? undefined),
         steps: traced,

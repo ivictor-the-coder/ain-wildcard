@@ -165,7 +165,7 @@ export function LinkRecordDialog({
         </>
       }
     >
-      <div className="pl-form" ref={firstControl.body}>
+      <div className="pl-form" ref={firstControl.body} tabIndex={-1}>
         {link.error && <Banner tone="danger" title="Nothing was linked">{link.error.body.message}</Banner>}
         {added.length > 0 && (
           <Banner tone="success" compact>

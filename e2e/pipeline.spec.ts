@@ -20,7 +20,7 @@ interface DealRecord {
 }
 interface DealList { data: DealRecord[]; total_count: number }
 interface StageDef { name: string; label: string; probability: number; is_closed: boolean; is_won: boolean }
-interface PipelineDef { name: string; label: string; is_default: boolean; stages: StageDef[] }
+interface PipelineDef { name: string; label: string; is_default: boolean; open_amount?: number; stages: StageDef[] }
 
 /**
  * Both jars have to hold a session: the browser context drives the screens, and
@@ -1021,6 +1021,47 @@ test('the keyboard keeps its place after a stage move from a card menu', async (
   }, id), { timeout: 10_000 }).toBe(true);
 });
 
+/**
+ * The rail is where a deal is moved one stage at a time, and the keyboard has
+ * to survive the move.
+ *
+ * A move invalidates `/v1/records/deal`, and the stage the deal lands in used
+ * to be drawn as a `disabled` button — so the browser dropped focus the instant
+ * the record came back, and the caret fell to `<body>`, 31 Tab stops from this
+ * deal. Moving deals one after another is the most repeated action on this
+ * screen, so this is not a nicety.
+ */
+test('the keyboard lands on the destination stage after a move from the record rail', async ({ page, request }) => {
+  const list = (await getJson(request, '/api/v1/records/deal?limit=40')) as DealList;
+  const all = await pipelines(request);
+  const row = list.data.find((deal) => {
+    const own = all.find((p) => p.name === deal.properties.pipeline);
+    return !!own && own.stages.some((s) => !s.is_closed && s.name !== deal.properties.deal_stage);
+  })!;
+  const startStage = row.properties.deal_stage as string;
+  const own = all.find((p) => p.name === row.properties.pipeline)!;
+  const target = own.stages.find((s) => !s.is_closed && s.name !== startStage)!;
+
+  await page.goto(`/deals/${row.id}`, { waitUntil: 'networkidle' });
+  const step = page.locator('.pl-rail__step', { hasText: target.label }).first();
+  await step.focus();
+  await page.keyboard.press('Enter');
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole('button', { name: `Move to ${target.label}` }).click();
+
+  await expect.poll(async () => (await deal(request, row.id)).properties.deal_stage, { timeout: 10_000 }).toBe(target.name);
+  // The stage it landed in is still a Tab stop, and the caret is on it — not on
+  // `<body>`, which is where a `disabled` destination used to leave it.
+  await expect.poll(async () => page.evaluate((label) => {
+    const active = document.activeElement as HTMLElement | null;
+    if (!active || !active.classList.contains('pl-rail__step')) return active?.tagName ?? 'nothing';
+    return (active.textContent ?? '').includes(label) ? 'the destination stage' : 'another stage';
+  }, target.label), { timeout: 10_000 }).toBe('the destination stage');
+
+  await request.patch(`/api/v1/records/deal/${row.id}`, { data: { properties: { deal_stage: startStage } } });
+});
+
 /* =========================== copilot aftermath ============================ */
 
 /**
@@ -1452,6 +1493,57 @@ test('the run list counts the same steps the run’s own trace lists', async ({ 
 
 /* ========================= what the board measures ========================= */
 
+interface Velocity {
+  stalled_records: number;
+  stages: { stage: string; is_closed: boolean; stalled_records: number; stalled_after_days: number | null; current_records: number }[];
+}
+
+/**
+ * Give a closed stage a stall threshold, which a fresh workspace does not have.
+ *
+ * `stalled_after_days` is twice the stage's own *median completed spell*, and a
+ * spell in Closed won is only completed when a deal leaves it — which nothing
+ * in the seed ever does. So on a freshly seeded workspace every closed stage
+ * reports `stalled_after_days: null` and `stalled_records: 0`, and a test that
+ * asserts a closed stage has stalled deals is asserting something only a
+ * previously-mutated database happens to satisfy. That is worse than no test:
+ * it passed here for weeks and could not be run from `--fresh`.
+ *
+ * So the condition is seeded rather than assumed. One deal already sitting in a
+ * closed stage is bounced through the pipeline's other closed stage and back,
+ * which leaves it exactly where it started and gives both closed stages a
+ * completed spell — and therefore a threshold that the deals parked in them
+ * have long since passed. Nothing else about the workspace changes: no deal is
+ * created, no deal ends anywhere new, and no open stage gains a resident.
+ */
+const seedClosedStall = async (request: APIRequestContext, def: PipelineDef): Promise<Velocity> => {
+  const closed = def.stages.filter((s) => s.is_closed);
+  expect(closed.length, `${def.label} needs two closed stages to bounce a deal between`).toBeGreaterThan(1);
+
+  const already = (await getJson<Velocity>(request, `/api/v1/pipelines/deal/${def.name}/velocity`))
+    .stages.filter((s) => s.is_closed).reduce((n, s) => n + s.stalled_records, 0);
+  if (already > 0) return getJson<Velocity>(request, `/api/v1/pipelines/deal/${def.name}/velocity`);
+
+  const deals = await getJson<DealList>(request, `/api/v1/records/deal?limit=200`);
+  const home = closed.find((stage) => deals.data.some(
+    (row) => row.properties.pipeline === def.name && row.properties.deal_stage === stage.name));
+  expect(home, `no deal sits in a closed stage of ${def.label}`).toBeTruthy();
+  const victim = deals.data.find((row) => row.properties.pipeline === def.name && row.properties.deal_stage === home!.name)!;
+  const away = closed.find((stage) => stage.name !== home!.name)!;
+
+  const move = async (to: string) => {
+    const response = await request.patch(`/api/v1/records/deal/${victim.id}`, { data: { properties: { deal_stage: to } } });
+    expect(response.ok(), `${response.status()} moving ${victim.id} to ${to}`).toBe(true);
+  };
+  await move(away.name);
+  await move(home!.name);
+
+  const after = await getJson<Velocity>(request, `/api/v1/pipelines/deal/${def.name}/velocity`);
+  const stage = after.stages.find((s) => s.stage === away.name);
+  expect(stage?.stalled_after_days, `${away.label} still has no stall threshold after the bounce`).toBeGreaterThan(0);
+  return after;
+};
+
 /**
  * A deal parked in Closed won has not stalled — it has finished.
  *
@@ -1460,19 +1552,20 @@ test('the run list counts the same steps the run’s own trace lists', async ({ 
  * any other. The tile quoted that number whole, so the board reported more
  * stalled deals than it had open deals, and the moment any filter was applied
  * it dropped to the open-stage figure — the same tile answering two questions.
+ *
+ * The cards had the same bug and kept it after the tile was fixed: every card
+ * in Closed won read "72 days in stage · stalls after 3" under a column header
+ * that reported no stalled deals at all.
  */
-test('the stalled tile counts only the deals that can still stall', async ({ page, request }) => {
+test('the stalled tile and cards count only the deals that can still stall', async ({ page, request }) => {
   const defs = await pipelines(request);
   const def = defs.find((p) => p.is_default) ?? defs[0];
-  const velocity = (await getJson(request, `/api/v1/pipelines/deal/${def.name}/velocity`)) as {
-    stalled_records: number;
-    stages: { is_closed: boolean; stalled_records: number }[];
-  };
+  const velocity = await seedClosedStall(request, def);
+
   const openStalled = velocity.stages.filter((s) => !s.is_closed).reduce((n, s) => n + s.stalled_records, 0);
   const closedStalled = velocity.stages.filter((s) => s.is_closed).reduce((n, s) => n + s.stalled_records, 0);
-  // The gap between the two is what this test exists to catch. If the demo
-  // workspace ever stops parking finished deals in a closed stage, this fails
-  // loudly rather than passing without measuring anything.
+  // The gap between the two is what this test exists to catch, and it is now
+  // seeded rather than hoped for.
   expect(closedStalled).toBeGreaterThan(0);
 
   await board(page, `?pipeline=${def.name}`);
@@ -1487,10 +1580,20 @@ test('the stalled tile counts only the deals that can still stall', async ({ pag
     return shown;
   }, { timeout: 30_000 }).toBe(String(openStalled));
 
-  // And the closed columns never claim a stalled deal of their own.
+  // And the closed columns never claim a stalled deal of their own — neither in
+  // the header nor on any card standing in them.
   await board(page, `?pipeline=${def.name}&closed=1`);
   for (const stage of def.stages.filter((s) => s.is_closed)) {
-    await expect(page.locator(`.pl-col[data-stage="${stage.name}"]`)).not.toContainText('stalled');
+    const column = page.locator(`.pl-col[data-stage="${stage.name}"]`);
+    await expect(column).not.toContainText('stalled');
+    await expect(column).not.toContainText('stalls after');
+  }
+
+  // The open columns still badge theirs, so this is not passing by showing
+  // nothing anywhere.
+  const stalledStage = velocity.stages.find((s) => !s.is_closed && s.stalled_records > 0);
+  if (stalledStage) {
+    await expect(page.locator(`.pl-col[data-stage="${stalledStage.stage}"]`)).toContainText('stalls after');
   }
 });
 
@@ -2082,7 +2185,13 @@ test('an answer reads as an answer, not as a console dump under one', async ({ p
 
   const answer = page.locator('.cp-answer').last();
   await expect(answer).toContainText('open pipeline', { timeout: 30_000 });
-  await expect(answer.locator('.cp-answer__body')).toContainText('Breakdown:');
+  // The by-stage figures no longer stand in the prose at all: they are lifted
+  // out and checked against the board's own columns, so what is on screen is
+  // either a reconciled list or the disagreement. Either way the answer has
+  // more than a single sentence in it.
+  await expect(
+    answer.locator('.cp-breakdown__list, .ain-banner--warning').first(),
+  ).toBeVisible({ timeout: 30_000 });
   // The answer is typed out; nothing about the prose can be judged until the
   // caret that marks the reveal in progress is gone.
   await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 30_000 });
@@ -2229,4 +2338,264 @@ test('the copilot puts the caret where you type, on arrival and after an answer'
   await expect.poll(async () => page.evaluate(() => (
     !document.activeElement || document.activeElement === document.body ? 'body' : 'somewhere'
   )), { timeout: 15_000 }).toBe('somewhere');
+});
+
+/* ===================== the scope an answer was measured at ================= */
+
+/** Ask the copilot one question in a fresh thread and wait for the answer. */
+/** Ask, and return as soon as there is prose — before the scope row settles. */
+const askCopilotUnchecked = async (page: Page, question: string) => {
+  // Not `networkidle`: this one exists to watch the gap between the answer and
+  // the reads it is captioned with, and waiting for the network to go quiet
+  // waits out the very gap under test.
+  await page.goto('/copilot?new=1', { waitUntil: 'domcontentloaded' });
+  const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
+  await composer.fill(question);
+  await composer.press('Enter');
+  const answer = page.locator('.cp-answer').last();
+  await expect(answer.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
+  return answer;
+};
+
+const askCopilot = async (page: Page, question: string) => {
+  await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+  const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
+  await composer.fill(question);
+  await composer.press('Enter');
+  const answer = page.locator('.cp-answer').last();
+  await expect(answer.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
+  // The scope row names nothing until the pipelines, teammates and metric
+  // catalogue have been read — an owner id is `usr_seed01` until then — so a
+  // test that samples the chips once has to wait for that read to land.
+  await expect(answer.locator('.cp-scope__chip', { hasText: 'reading this workspace' })).toHaveCount(0, { timeout: 20_000 });
+  return answer;
+};
+
+/**
+ * A pipeline question is either answered for that pipeline or labelled as not.
+ *
+ * The engine has answered "What is the Renewal pipeline worth?" with the
+ * $9,010,960 workspace total — six times the $1,463,440 that pipeline is worth
+ * — in a confident sentence with no qualification anywhere on it, because
+ * `business_metric` has no pipeline argument and the question's qualifier was
+ * dropped on the way in. Whether the engine binds it or not, the surface may
+ * never present the wider figure as the narrower one: either the scope says
+ * Renewal, or the answer says out loud that it does not.
+ */
+test('a pipeline question answered over every pipeline says so above the figure', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const renewal = defs.find((p) => /renew/i.test(p.name)) ?? defs.find((p) => !p.is_default) ?? defs[0];
+  const answer = await askCopilot(page, `What is the ${renewal.label} pipeline worth?`);
+
+  // The engine writes whole-dollar figures for these, so the grouped integer is
+  // what to look for: "1,463,440" against "9,010,960".
+  const grouped = (minor: number) => Math.round(minor / 100).toLocaleString('en-US');
+  const total = defs.reduce((sum, def) => sum + (def.open_amount ?? 0), 0);
+  const scopedChip = answer.locator('.cp-scope__chip', { hasText: renewal.label });
+  if (await scopedChip.count() > 0) {
+    // Scoped means scoped: the workspace figure must not be the one on screen.
+    await expect(answer.locator('.cp-answer__body')).toContainText(grouped(renewal.open_amount ?? 0));
+    await expect(answer.locator('.cp-answer__body')).not.toContainText(grouped(total));
+  } else {
+    const warning = answer.locator('.ain-banner--danger').first();
+    await expect(warning).toBeVisible();
+    await expect(warning).toContainText(renewal.label);
+    // Above the number, not under it: a reader who has already taken
+    // "$9,010,960 in open pipeline" as the answer has already been misled.
+    const order = await answer.evaluate((node) => {
+      const banner = node.querySelector('.ain-banner--danger');
+      const body = node.querySelector('.cp-answer__body');
+      if (!banner || !body) return 'missing';
+      return banner.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING ? 'before' : 'after';
+    });
+    expect(order).toBe('before');
+    // And the widened dimension is on the scope row as well as in the banner.
+    await expect(answer.locator('.cp-scope__chip.is-wide')).toContainText('every pipeline');
+  }
+});
+
+/**
+ * The scope row is read through this workspace's vocabulary, so it says nothing
+ * until that vocabulary is in.
+ *
+ * `/v1/users`, `/v1/pipelines/deal` and `/v1/ai/metrics` are three separate
+ * reads, and the answer arrives before them. Rendered against a half-read
+ * vocabulary the row states `OWNER usr_seed01` — a database id shown to a
+ * person — and lists the eight open stage names as eight stage chips, when
+ * together they are exactly "open deals" and narrow to nothing.
+ */
+test('the scope row never names a record by its database id', async ({ page }) => {
+  for (const read of ['**/api/v1/users**', '**/api/v1/pipelines/deal**', '**/api/v1/ai/metrics**']) {
+    await page.route(read, async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 4_000));
+      await route.continue();
+    });
+  }
+  const answer = await askCopilotUnchecked(page, 'How much pipeline does Dana Whitfield own?');
+
+  // Sampled across the whole gap, not once after it: the id was on screen for
+  // as long as the slowest of the three reads took.
+  const seen: string[] = [];
+  for (let i = 0; i < 20; i += 1) {
+    seen.push(...await answer.locator('.cp-scope__chip').allInnerTexts());
+    await page.waitForTimeout(150);
+  }
+  expect(seen.filter((chip) => /usr_|cmp_|con_/.test(chip)), 'the scope row showed a record id').toEqual([]);
+
+  // And once the vocabulary is in, the owner is named.
+  await expect(answer.locator('.cp-scope__chip', { hasText: 'Dana Whitfield' })).toBeVisible({ timeout: 20_000 });
+});
+
+/**
+ * An owner question answered about a company is a substitution, not a widening.
+ *
+ * "How much pipeline does Marcus Ilori own?" has come back "Whitcombe Aerospace
+ * is carrying $315,900 in open pipeline" — a real figure, for the wrong subject,
+ * with the teammate's name nowhere in it.
+ */
+test('an owner question answered for some other record names the record it used', async ({ page, request }) => {
+  const users = await getJson<{ data: { id: string; name: string }[] }>(request, '/api/v1/users?limit=20');
+  const owner = users.data.find((u) => u.name.split(' ').length > 1) ?? users.data[0];
+  const answer = await askCopilot(page, `How much pipeline does ${owner.name} own?`);
+
+  const ownerChip = answer.locator('.cp-scope__chip', { hasText: owner.name });
+  if (await ownerChip.count() === 0) {
+    const warning = answer.locator('.ain-banner--danger').first();
+    await expect(warning).toBeVisible();
+    await expect(warning).toContainText(owner.name);
+  }
+});
+
+/**
+ * A by-stage breakdown either agrees with the board's columns or is withheld.
+ *
+ * The board draws thirteen open columns across three pipelines; the engine
+ * groups on the bare stage name and returns eight buckets, four of them sums
+ * across pipelines under a caption that belongs to one of them ("Qualification"
+ * over New business *and* Expansion's "Expansion identified") or to none
+ * ("Usage review" for a column called "Usage & value review"). Every figure
+ * adds up and every caption is wrong, which is the worst way to be wrong.
+ */
+test('a by-stage breakdown that does not match the board is shown as a disagreement', async ({ page, request }) => {
+  const answer = await askCopilot(page, 'Break the open pipeline down by stage');
+  const runs = await getJson<{ data: { answer: string | null }[] }>(request, '/api/v1/ai/runs?limit=1');
+  const prose = runs.data[0]?.answer ?? '';
+  test.skip(!/Breakdown:/.test(prose), 'the engine returned no by-stage breakdown for this question');
+
+  // Whatever happens, the merged figures never stand as prose in the answer.
+  await expect(answer.locator('.cp-answer__body')).not.toContainText('Breakdown:');
+
+  const reconciled = await answer.locator('.cp-breakdown__list').count();
+  if (reconciled === 0) {
+    const warning = answer.locator('.ain-banner--warning', { hasText: 'does not line up with the board' });
+    await expect(warning).toBeVisible();
+    const defs = await pipelines(request);
+    const columns = defs.flatMap((p) => p.stages.filter((s) => !s.is_closed)).length;
+    await expect(warning).toContainText(String(columns));
+  }
+});
+
+/* ============================ keyboard and focus =========================== */
+
+const focusedTag = (page: Page) => page.evaluate(() => {
+  const el = document.activeElement as HTMLElement | null;
+  if (!el || el === document.body) return 'body';
+  return `${el.tagName.toLowerCase()}.${el.className}`;
+});
+
+/**
+ * A dialog that opens on its own dismiss button is a dialog the first keystroke
+ * throws away.
+ *
+ * `Modal` focuses the first focusable node it contains, and that node is the ×
+ * in the header. Three dialogs never named a control of their own, so Enter —
+ * the most likely first key on a dialog you just opened — closed them.
+ */
+test('every deal dialog opens on something Enter will not destroy', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const def = defs.find((p) => p.is_default) ?? defs[0];
+  await board(page, `?pipeline=${def.name}`);
+  const open = await stageWithACard(page, def.stages.filter((s) => !s.is_closed));
+  const id = await cardsIn(page, open.name).first().getAttribute('data-deal');
+
+  for (const trigger of ['Move to another pipeline', 'Edit deal information']) {
+    await visit(page, `/deals/${id}`, '.ain-page__title');
+    await page.getByRole('button', { name: trigger }).click();
+    const dialog = page.locator('[role=dialog]');
+    await expect(dialog).toBeVisible();
+    expect(await focusedTag(page), `${trigger} opened on its own close button`).not.toContain('ain-modal__close');
+    await page.keyboard.press('Enter');
+    await expect(dialog, `${trigger} was dismissed by its first keystroke`).toBeVisible();
+    // Not Escape: Enter on a native <select> opens its dropdown, and Escape
+    // would then close that rather than the dialog.
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    await expect(dialog).toHaveCount(0);
+  }
+
+  // And the bulk move, which has no field of its own to land on at all.
+  await table(page, `&pipeline=${def.name}`);
+  await page.locator('tbody tr td input[type=checkbox]').first().check();
+  await page.getByRole('button', { name: 'Move stage' }).click();
+  await page.locator('[role=menuitem]').first().click();
+  const bulk = page.locator('[role=dialog]');
+  await expect(bulk).toBeVisible();
+  expect(await focusedTag(page), 'the bulk move dialog opened on its own close button').not.toContain('ain-modal__close');
+  await page.keyboard.press('Enter');
+  await expect(bulk, 'the bulk move dialog was dismissed by its first keystroke').toBeVisible();
+  await bulk.getByRole('button', { name: 'Cancel' }).click();
+  await expect(bulk).toHaveCount(0);
+});
+
+/**
+ * Approving a write destroys the button that approved it.
+ *
+ * Focus went to `<body>` — the top of the shell, 49 Tab presses from the answer
+ * — with nothing announcing that anything had been written.
+ */
+test('the keyboard lands on the outcome after a copilot write is approved', async ({ page, request }) => {
+  const company = (await getJson<{ data: { display_name: string }[] }>(
+    request, '/api/v1/records/company?limit=1')).data[0];
+  await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+  await page.getByRole('switch', { name: 'Let it prepare writes' }).click();
+  await page.getByLabel('Ask the copilot').fill(`Log a note on ${company.display_name} saying Keyboard probe`);
+  await page.getByRole('button', { name: 'Ask', exact: true }).click();
+  await expect(page.getByText('Waiting for your approval').first()).toBeVisible({ timeout: 40_000 });
+  await page.getByRole('button', { name: 'Approve and run' }).first().click();
+  await expect(page.locator('.cp-answer').last().locator('.cp-resolution'))
+    .toContainText('Approved and written', { timeout: 20_000 });
+
+  await expect.poll(() => focusedTag(page), { timeout: 10_000 }).not.toBe('body');
+});
+
+/**
+ * A cited record you cannot Tab to is a citation only a mouse can follow.
+ *
+ * Chips whose record had no screen were `disabled` buttons — out of the tab
+ * order, unannounced, with the reason in a hover tooltip. Most of them had a
+ * screen all along: the engine cites logged calls, notes, emails and tasks, and
+ * `/records/:type/:id` renders every one.
+ */
+test('every citation chip is reachable and activatable from the keyboard', async ({ page, request }) => {
+  const company = (await getJson<{ data: { display_name: string }[] }>(
+    request, '/api/v1/records/company?limit=1')).data[0];
+  const answer = await askCopilot(page, `Summarise the activity on ${company.display_name}`);
+  await expect(answer.locator('.cp-chip').first()).toBeVisible({ timeout: 20_000 });
+
+  const chips = await answer.locator('.cp-chip').evaluateAll((nodes) => nodes.map((node) => ({
+    text: (node as HTMLElement).innerText.replace(/\s+/g, ' ').trim(),
+    reachable: (node as HTMLElement).tabIndex >= 0 && !(node as HTMLButtonElement).disabled,
+    href: node.getAttribute('href'),
+  })));
+  expect(chips.length).toBeGreaterThan(0);
+  for (const chip of chips) {
+    expect(chip.reachable, `“${chip.text}” cannot be reached with Tab`).toBe(true);
+  }
+
+  // And one that links actually opens its record on Enter.
+  const link = answer.locator('a.cp-chip').first();
+  expect(await link.count()).toBeGreaterThan(0);
+  const target = await link.getAttribute('href');
+  await link.focus();
+  await page.keyboard.press('Enter');
+  await expect.poll(() => new URL(page.url()).pathname, { timeout: 10_000 }).toBe(target);
 });

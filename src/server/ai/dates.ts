@@ -68,6 +68,10 @@ function makeWindow(start: number, end: number, label: string, grain: WindowGrai
 /** Format a window the way a finance analyst writes a period. */
 export function describeWindow(w: TimeWindow, locale = 'en-US'): string {
   if (w.grain === 'quarter' || w.grain === 'year' || w.grain === 'month') return w.label;
+  // An open-ended range has no second date to print: "after December 2026" is
+  // not "Jan 1, 2027 – Dec 31, 2199", and printing a horizon the workspace
+  // does not have reads as a bound the reader never asked for.
+  if (w.start === 0 || w.end === OPEN_ENDED) return w.label;
   const from = formatDate(w.start, { locale, timeZone: 'UTC' });
   const to = formatDate(w.end - 1, { locale, timeZone: 'UTC' });
   return `${from} – ${to}`;
@@ -115,6 +119,25 @@ const RULES: Rule[] = [
       else if (unit === 'quarter') start = addInterval(end, interval('month', -3 * count));
       else start = addInterval(end, interval('year', -count));
       const label = `the last ${count} ${count === 1 ? unit : `${unit}s`}`;
+      return makeWindow(start, end, label, 'range', m[0], now);
+    },
+  },
+  {
+    // The forward twin of "the last 30 days". Its absence refused "which
+    // subscriptions renew in the next 30 days" — a question about the future
+    // that this platform answers from rows it already holds — with an apology
+    // about an unparseable period, while the backward phrasing worked.
+    re: /\b(?:the\s+)?(?:next|coming|following|upcoming)\s+(\d{1,3})\s*(day|days|week|weeks|month|months|quarter|quarters|year|years)\b/i,
+    build(m, now) {
+      const count = Number(m[1]);
+      const unit = m[2].toLowerCase().replace(/s$/, '');
+      const start = now;
+      let end: number;
+      if (unit === 'day' || unit === 'week') end = start + count * UNIT_MS[unit];
+      else if (unit === 'month') end = addInterval(start, interval('month', count));
+      else if (unit === 'quarter') end = addInterval(start, interval('month', 3 * count));
+      else end = addInterval(start, interval('year', count));
+      const label = `the next ${count} ${count === 1 ? unit : `${unit}s`}`;
       return makeWindow(start, end, label, 'range', m[0], now);
     },
   },
@@ -231,7 +254,12 @@ const RULES: Rule[] = [
     // The trailing guard stops "in 2026-02-30" being read as the year 2026:
     // half of a date is not a period, and a half-parsed date is exactly how an
     // answer ends up about a range nobody asked for.
-    re: /\b(?:in|during|for|of)\s+((?:19|20)\d{2})\b(?!-\d)/i,
+    // The comparators are here rather than only in front of the phrase because
+    // a bare year needs a preposition to read as a period at all, and
+    // "created before 2026" was refused as an unresolvable year in the same
+    // sentence that offered to resolve bare years. The direction is read back
+    // off the matched span by `comparatorOf`.
+    re: /\b(?:in|during|for|of|before|after|since|through|until|till|prior\s+to|up\s+to|earlier\s+than|later\s+than|no\s+later\s+than|on\s+or\s+(?:before|after))\s+((?:19|20)\d{2})\b(?!-\d)/i,
     build(m, now) {
       const year = Number(m[1]);
       return makeWindow(Date.UTC(year, 0, 1), Date.UTC(year + 1, 0, 1), String(year), 'year', m[0], now);
@@ -289,6 +317,75 @@ const RULES: Rule[] = [
  * first. Overlapping matches are resolved leftmost-longest — "in March 2025"
  * is one period, not a month and a year.
  */
+/**
+ * A period bounded by a comparator instead of entered.
+ *
+ * "Which open deals close after December 2026?" names December 2026 and then
+ * says the answer lies outside it. Reading the token and discarding the word in
+ * front of it re-rendered the question as "close in December 2026" and stated
+ * three deals — every one of them inside the range the reader had excluded, and
+ * the true answer is none. A comparator is part of the period, so it becomes an
+ * open-ended range here rather than being dropped on the way in.
+ */
+const OPEN_ENDED = Date.UTC(2200, 0, 1);
+
+export type PeriodComparator = 'after' | 'before' | 'since' | 'through';
+
+/** Comparators, longest first so "no later than" beats "later than". */
+const COMPARATORS: [PeriodComparator, string][] = [
+  ['through', 'no later than'], ['before', 'on or before'], ['after', 'on or after'],
+  ['before', 'prior to'], ['before', 'earlier than'], ['before', 'ahead of'], ['before', 'up to'],
+  ['after', 'later than'],
+  ['before', 'before'], ['before', 'until'], ['before', 'till'],
+  ['after', 'after'], ['since', 'since'], ['through', 'through'],
+];
+
+const COMPARATOR_ALTERNATION = COMPARATORS.map(([, word]) => word.replace(/ /g, '\\s+')).join('|');
+const COMPARATOR_LEADS = new RegExp(`\\b(${COMPARATOR_ALTERNATION})\\s+(?:the\\s+)?$`, 'i');
+const COMPARATOR_OWNED = new RegExp(`^(${COMPARATOR_ALTERNATION})\\s+`, 'i');
+
+const comparatorKind = (word: string): PeriodComparator =>
+  COMPARATORS.find(([, w]) => w === word.toLowerCase().replace(/\s+/g, ' '))?.[0] ?? 'after';
+
+/**
+ * The comparator in front of a resolved period, whether the rule swallowed it
+ * ("before 2026") or left it in the sentence ("close after December 2026").
+ */
+function comparatorOf(text: string, at: number, matched: string): { kind: PeriodComparator; word: string } | null {
+  const owned = matched.match(COMPARATOR_OWNED);
+  if (owned) return { kind: comparatorKind(owned[1]), word: owned[1] };
+  const lead = text.slice(0, at).match(COMPARATOR_LEADS);
+  if (lead) return { kind: comparatorKind(lead[1]), word: lead[1] };
+  return null;
+}
+
+/** The open-ended range a comparator turns a period into. */
+function boundedWindow(w: TimeWindow, kind: PeriodComparator, word: string, now: number): TimeWindow {
+  const inner = w.label.replace(new RegExp(`^${word.replace(/\s+/g, '\\s+')}\\s+`, 'i'), '');
+  const label = `${word.toLowerCase().replace(/\s+/g, ' ')} ${inner}`;
+  const matched = COMPARATOR_OWNED.test(w.matched) ? w.matched : `${word} ${w.matched}`;
+  switch (kind) {
+    // "after December 2026" starts where December ends, so a deal closing
+    // inside December is not in it.
+    case 'after': return makeWindow(w.end, OPEN_ENDED, label, 'range', matched, now);
+    case 'before': return makeWindow(0, w.start, label, 'range', matched, now);
+    case 'through': return makeWindow(0, w.end, label, 'range', matched, now);
+    case 'since': return makeWindow(w.start, Math.max(now, w.end), label, 'range', matched, now);
+  }
+}
+
+/**
+ * Whether a window label already carries its own preposition.
+ *
+ * "3 open deals close in after December 2026" is what happens when the prose
+ * pastes "in" in front of every label; a comparator label supplies the word.
+ */
+export const labelIsPrepositional = (label: string): boolean =>
+  /^\s*(?:after|before|since|through|until|till|up\s+to|prior\s+to|earlier\s+than|later\s+than|no\s+later\s+than|on\s+or\s+(?:before|after)|ahead\s+of)\b/i.test(label);
+
+/** Whether a window runs off one end of the calendar rather than between dates. */
+export const isOpenEnded = (w: TimeWindow): boolean => w.start === 0 || w.end === OPEN_ENDED;
+
 export interface WindowSpan {
   window: TimeWindow;
   /** Where in the question the phrase that produced this window sits. */
@@ -318,7 +415,11 @@ export function resolveWindowSpans(text: string, now: number, limit = 3): Window
     const key = `${candidate.window.start}:${candidate.window.end}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ window: candidate.window, at: candidate.at, to: candidate.to });
+    const comparator = comparatorOf(text, candidate.at, candidate.window.matched);
+    const window = comparator
+      ? boundedWindow(candidate.window, comparator.kind, comparator.word, now)
+      : candidate.window;
+    out.push({ window, at: candidate.at, to: candidate.to });
     if (out.length >= limit) break;
   }
   return out;
