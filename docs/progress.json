@@ -1,11 +1,11 @@
 {
-  "updated": "2026-09-02T07:31:11.312687",
-  "headline": "Settings is the first piece through the new gate \u2014 93% operable, and a critic called it more honest about its own permission model than either reference product. The two that failed both failed the same way, which turned nine reported bugs into one: a qualifier the question named, dropped, and the unqualified answer stated confidently.",
+  "updated": "2026-09-02T12:24:11.689122",
+  "headline": "One change closed all four reported substitutions at once. Nine defects across two independent critics were one defect \u2014 a qualifier the question named, dropped, and the unqualified answer stated confidently. It is now structurally impossible: every qualifier must be bound, refused, or waived by name.",
   "stats": {
     "server modules": 10,
     "client modules": 8,
-    "api routes": 228,
-    "lines of code": "152,873"
+    "tests passing": 1420,
+    "lines of code": "159,978"
   },
   "waves": [
     {
@@ -291,12 +291,12 @@
         {
           "id": "qualifier-invariant",
           "title": "One invariant for every qualifier",
-          "status": "building",
-          "rounds": 3,
-          "operability": 0.65,
-          "debt": 83,
-          "note": "Every qualifier a question names must be bound to the query, refused out loud, or waived by name in the first sentence. No fourth state.",
-          "verdict": "Nine reported defects across two independent critics are one defect: a parsed qualifier that cannot be bound is dropped, and the unqualified result is stated as the answer. plan.ts already says this is wrong, in two comments \u2014 but it guards one qualifier at a time, so every type nobody wrote a guard for leaks."
+          "status": "critique",
+          "rounds": 4,
+          "operability": 0.9,
+          "debt": 20,
+          "note": "A ledger carried through the plan: bound to the query that ran, refused out loud, or waived by name in the first sentence. No fourth state.",
+          "verdict": "Verified against the database rather than the engine\u2019s own prose \u2014 \"What is the Renewal pipeline worth?\" now answers $1,463,440 across 6 deals, matching the CRM exactly, where it used to return the $9.0M workspace total. Remaining: structured extraction fusing several records into one, and unit credits rendered as dollars."
         }
       ]
     }
