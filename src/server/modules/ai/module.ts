@@ -283,7 +283,19 @@ function describeAnalysis(completion: AinCompletion) {
       kind: entry.kind,
       text: entry.text,
       state: entry.state,
-      resolved: entry.resolved ? { value: entry.resolved.value, label: entry.resolved.label } : null,
+      resolved: entry.resolved ? {
+        value: entry.resolved.value,
+        label: entry.resolved.label,
+        // The column the value narrows, and the table it narrows. One ledger
+        // kind covers every record filter — a ticket's status, a deal's
+        // competitor, a company's industry — so a caller checking that a scope
+        // reached the query needs the property rather than a map from kinds to
+        // columns, which is the per-qualifier guard in a different file.
+        property: entry.resolved.property ?? null,
+        object_type: entry.resolved.objectType ?? null,
+        values: entry.resolved.values ?? null,
+        op: entry.resolved.op ?? null,
+      } : null,
       bound_to: entry.binding ? { tool: entry.binding.tool, note: entry.binding.note ?? null } : null,
       detail: entry.detail,
     })),

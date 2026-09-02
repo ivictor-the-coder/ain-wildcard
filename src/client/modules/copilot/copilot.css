@@ -133,12 +133,51 @@
   padding-right: var(--space-3);
   scrollbar-width: thin;
 }
-/* A short conversation belongs against the composer, not stranded at the top of
-   a tall empty column. `margin-top: auto` on the first message does that and
-   still scrolls correctly once the thread outgrows the box — which
-   `justify-content: flex-end` does not, because it pushes the overflow out of
-   reach above the scroll origin. The starter state keeps its own centring. */
-.cp-stream--messages > :first-child { margin-top: auto; }
+/* A short conversation sits at the top of the column, where reading starts.
+   It used to be pushed against the composer with `margin-top: auto` on the
+   first message, which on a 1000px column left roughly 300px of nothing above
+   a two-message thread — and put the question a person had just asked in the
+   middle of the screen rather than at the top of it. A thread that outgrows
+   the box is still scrolled to its newest message by the stream's own effect,
+   which is the behaviour the anchor was standing in for. */
+
+/* --------------------------- getting to the box --------------------------- */
+
+/* Tabbing from the top of this screen passed 26 shell stops, the toolbar, the
+   status select, the filter box and then two focusable controls for every
+   conversation in the rail before reaching the composer — a tunnel that grows
+   without bound as threads accumulate. This is one key over all of it, and it
+   is the first focusable thing on the page. */
+.cp-skip {
+  /* Clipped rather than parked above itself: the shell's own skip link is
+     `position: fixed`, so translating it upwards takes it off the viewport.
+     This one sits inside the page, where the same trick leaves it legible over
+     the subtitle. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.cp-skip:focus {
+  width: auto;
+  height: auto;
+  padding: var(--space-3) var(--space-5);
+  overflow: visible;
+  clip-path: none;
+  z-index: var(--z-popover);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-raised);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+  box-shadow: var(--shadow-lg), var(--focus-ring);
+}
 
 .cp-msg { display: flex; flex-direction: column; gap: var(--space-3); }
 .cp-msg--user { align-items: flex-end; }

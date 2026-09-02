@@ -159,10 +159,16 @@ function scoreMention(mention: Mention, entity: EntityRef, idf: Map<string, numb
   const meanIdf = informative.reduce((a, t) => a + (idf.get(t) ?? 2.5), 0) / informative.length;
   const idfFactor = Math.min(1, 0.45 + meanIdf / 4);
 
-  if (mention.shouty && keys.acronym && keys.acronym.length >= 2 && value.replace(/\s/g, '') === keys.acronym) {
+  // Three letters, not two. "GB" is the unit label of two live meters in this
+  // workspace and the initials of three contacts, and reading it as a name
+  // turned "how many GB did we store in August 2026?" into a refusal offering
+  // to measure Garrett Bellamy, Gonzalo Bermúdez and Gunnar Baumgartner. Two
+  // capitals are a unit, a country, a currency or a state as often as they are
+  // anybody's initials, and the cost of the wrong reading is a wrong answer.
+  if (mention.shouty && keys.acronym && keys.acronym.length >= 3 && value.replace(/\s/g, '') === keys.acronym) {
     return { score: 0.86, rule: 'acronym', detail: `acronym of "${entity.label}"` };
   }
-  if (mention.shouty && informative.length > 1) {
+  if (mention.shouty && informative.length > 2) {
     const initials = informative.map((t) => t[0]).join('');
     if (keys.acronym && initials === keys.acronym) {
       return { score: 0.8, rule: 'acronym', detail: `initials match "${entity.label}"` };
@@ -293,7 +299,11 @@ export const isLedgerType = (type: string): boolean => !CRM_OBJECT_TYPES.has(typ
 export function mentionedTypes(message: string): string[] {
   const text = normalise(message);
   const map: [RegExp, string][] = [
-    [/\b(compan(?:y|ies)|accounts?|logos?)\b/, 'company'],
+    // A prospect is a company here — the relationship is a property of the
+    // company row. Without the cue "how much open pipeline is with prospects?"
+    // read as a question about nothing in particular and was answered with the
+    // whole book.
+    [/\b(compan(?:y|ies)|accounts?|logos?|prospects?)\b/, 'company'],
     [/\b(contacts?|people|persons?|leads?|champions?|buyers?)\b/, 'contact'],
     [/\b(deals?|opportunit(?:y|ies)|pipeline)\b/, 'deal'],
     [/\b(tickets?|cases?|issues?|escalations?)\b/, 'ticket'],
@@ -311,9 +321,17 @@ export function mentionedTypes(message: string): string[] {
     [/\b(entitlements?|allowances?|quotas?|seats?|feature\s+limits?|seat\s+limits?)\b/, 'entitlement'],
     [/\b(credits?|credit\s+grants?|credit\s+balance)\b/, 'credit'],
   ];
-  const out: string[] = [];
-  for (const [re, type] of map) if (re.test(text)) out.push(type);
-  return [...new Set(out)];
+  // In the order the sentence names them, not in the order this list happens to
+  // be written. "Which open deals are with aerospace companies?" names both,
+  // and a fixed order put companies first — so the rows came back as companies
+  // and the word "open" had no deal to narrow, which refused a question this
+  // engine can answer exactly.
+  const out: { type: string; at: number }[] = [];
+  for (const [re, type] of map) {
+    const at = text.search(re);
+    if (at >= 0) out.push({ type, at });
+  }
+  return [...new Set(out.sort((a, b) => a.at - b.at).map((one) => one.type))];
 }
 
 /** Whether naive `LIKE %needle%` would have found this entity — used in tests. */

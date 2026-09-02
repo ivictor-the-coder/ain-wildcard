@@ -534,3 +534,45 @@
 
 .pl-inline--derived .pl-inline__text,
 .pl-inline--linked .pl-inline__text { color: var(--text-primary); }
+
+/* Keyboard-only, a fresh /deals load put the first deal card 36 Tab presses
+   away: 16 through the sidebar, 9 through the top bar, 10 through the view
+   toggle, the filters and the search box. The copilot has had one of these
+   since its own tunnel was measured; this is the screen people live on. It is
+   the first focusable thing on the page, and it lands on the card the grid's
+   arrow keys start from — not on a container that announces nothing. */
+.pl-skip {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.pl-skip:focus {
+  width: auto;
+  height: auto;
+  padding: var(--space-3) var(--space-5);
+  overflow: visible;
+  clip-path: none;
+  z-index: var(--z-popover);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-raised);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+  box-shadow: var(--shadow-lg), var(--focus-ring);
+}
+
+.pl-boardregion { display: flex; flex-direction: column; gap: var(--space-7); min-width: 0; }
+
+.pl-boardregion:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--radius-lg);
+}

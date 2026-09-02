@@ -1502,6 +1502,17 @@ export function detectGrouping(message: string): GroupBy {
   if (/\bby\s+(account|customer|company|logo)\b/.test(text)) return 'account';
   if (/\b(top|biggest|largest|highest|best|worst|lowest)\s+\d*\s*(accounts?|customers?|companies|logos)\b/.test(text)) return 'account';
   if (/\bwhich\s+(accounts?|customers?|companies)\b/.test(text)) return 'account';
+  // "Who has the most pipeline?" is a question about people. It came back as
+  // "38 open deals. The 8 largest of them:" with no rep named anywhere in it,
+  // while "which rep closed the most" — the same question, spelt out — was
+  // answered with a ranked list of reps. A superlative over a record type is
+  // still about the records ("who owns the biggest open deal"), so the noun
+  // after the superlative decides, and the account rules above run first.
+  if (/\bwho\b/.test(text)
+    && /\b(?:most|least|biggest|largest|highest|lowest|smallest|fewest|best|worst)\b/.test(text)
+    && !/\b(?:most|least|biggest|largest|highest|lowest|smallest|fewest|best|worst)\s+(?:\d+\s+)?(?:open\s+|closed\s+|won\s+|lost\s+|active\s+)*(?:deals?|opportunit(?:y|ies)|invoices?|tickets?|accounts?|customers?|companies|logos?|contacts?)\b/.test(text)) {
+    return 'owner';
+  }
   if (/\bby\s+status\b/.test(text)) return 'status';
   if (/\bby\s+priorit(?:y|ies)\b/.test(text)) return 'priority';
   if (/\bby\s+source\b|\bby\s+channel\b/.test(text)) return 'source';
@@ -1526,9 +1537,32 @@ const CURRENCY_WORDS: [string, RegExp][] = [
   ['sek', /\b(sek|swedish\s+krona|kronor)\b/i],
 ];
 
-export function detectCurrency(message: string): string | null {
-  const hits = CURRENCY_WORDS.filter(([, re]) => re.test(message)).map(([code]) => code);
+/** The currency a question names, with the words that named it. */
+export function currencyMention(message: string): { code: string; matched: string } | null {
+  const hits = CURRENCY_WORDS
+    .map(([code, re]) => ({ code, matched: message.match(re)?.[0] ?? '' }))
+    .filter((hit) => hit.matched);
   return hits.length === 1 ? hits[0] : null;
+}
+
+export function detectCurrency(message: string): string | null {
+  return currencyMention(message)?.code ?? null;
+}
+
+/**
+ * Whether a currency word is written as a currency rather than as a name.
+ *
+ * "How much pipeline does Sterling own?" traced `currency "gbp" → pending` off
+ * a word that is three companies in this workspace. Nothing leaked, because the
+ * owner refused first — but a question that also bound an owner would have
+ * carried a GBP scope nobody asked for. A code, a symbol or an explicit "in
+ * <currency>" is a currency; a capitalised name in a subject slot is a name.
+ */
+export function currencyShaped(message: string, matched: string): boolean {
+  if (/^[a-z]{3}$/i.test(matched)) return true;
+  const word = matched.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+  return new RegExp(`\\b(?:in|into|to|denominated\\s+in|book|books|of)\\s+(?:the\\s+)?${word}\\b`, 'i').test(message)
+    || new RegExp(`\\b${word}\\s+(?:book|books|only|terms|denominated|revenue|invoices?)\\b`, 'i').test(message);
 }
 
 /**
@@ -1560,9 +1594,12 @@ export function isRankingQuestion(message: string): boolean {
   return (
     // Bounded to eight words so a later sentence in a long prompt cannot turn
     // an unrelated "which" into a ranking request.
-    /\b(?:which|what|who)\b(?:\s+[a-z0-9]+){0,8}?\s+(?:most|biggest|largest|highest|best|top|greatest)\b/.test(text)
+    // Both ends of the ranking. "Who has the least pipeline?" is the same
+    // question as "who has the most" with one word changed, and reading only
+    // the "most" half answered it with the largest rows and the word "biggest".
+    /\b(?:which|what|who)\b(?:\s+[a-z0-9]+){0,8}?\s+(?:most|biggest|largest|highest|best|top|greatest|least|fewest|lowest|smallest|worst)\b/.test(text)
     || /\btop\s+\d{1,3}\b/.test(text)
-    || /\b(?:top|biggest|largest|highest|best)\s+\d*\s*(?:accounts?|customers?|companies|logos?|deals?|reps?|owners?)\b/.test(text)
+    || /\b(?:top|biggest|largest|highest|best|bottom|lowest|smallest|worst|fewest)\s+\d*\s*(?:accounts?|customers?|companies|logos?|deals?|reps?|owners?)\b/.test(text)
     || /\b(?:rank(?:ed)?|order(?:ed)?|sort(?:ed)?)\s+(?:by|on)\b/.test(text)
     || /\bwho\s+(?:is|are|was|were)\s+(?:my|our|the)\s+(?:biggest|largest|best|top)\b/.test(text)
   );

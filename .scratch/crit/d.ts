@@ -1,0 +1,11 @@
+import { createApp } from '../../src/server/app';
+const app = await createApp({ db: 'memory' });
+const login = await app.handle({ method: 'POST', path: '/v1/auth/demo' });
+const cookie = String(login.headers['set-cookie'] || '').split(';')[0];
+const call = (m: string, p: string, b?: unknown) => app.handle({ method: m, path: p, body: b, headers: { cookie } });
+const d: any = await call('POST','/v1/ai/draft',{kind:'renewal', instruction:'Follow up with Meridian Forge Systems about the renewal', record_id:'cmp_nw_01'});
+console.log('draft', d.status, JSON.stringify(d.body).slice(0,700));
+await call('POST','/v1/ai/complete',{prompt:'How much open pipeline does Priya Raman own?'});
+const r: any = await call('GET','/v1/ai/runs');
+console.log('runs', r.status, JSON.stringify(r.body).slice(0,300));
+app.close();

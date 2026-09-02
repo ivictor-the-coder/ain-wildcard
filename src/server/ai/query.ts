@@ -34,6 +34,16 @@ export interface AggregateSpec {
   groupByDate?: { property: string; grain: WindowGrain };
   /** Only records associated with this record id (any association type). */
   associatedTo?: string;
+  /**
+   * Only records associated with *one of* these record ids.
+   *
+   * A dimension can narrow a table the answer does not measure: "how much open
+   * pipeline is with pharmaceutical companies" filters companies and sums
+   * deals. Without a set-shaped association filter the industry could only be
+   * waived, and it was dropped in silence instead — $308,880 stated for a set
+   * worth $849,660.
+   */
+  associatedToAny?: string[];
   /** Only records owned by this teammate. */
   ownerId?: string;
   groupLimit?: number;
@@ -137,6 +147,11 @@ export function aggregate(ctx: Ctx, orgId: string, spec: AggregateSpec): Aggrega
     where.push(`EXISTS (SELECT 1 FROM crm_associations a WHERE a.org_id = ? AND ((a.from_id = ? AND a.to_id = r.id) OR (a.to_id = ? AND a.from_id = r.id)))`);
     params.push(orgId, spec.associatedTo, spec.associatedTo);
   }
+  if (spec.associatedToAny?.length) {
+    const holes = spec.associatedToAny.map(() => '?').join(', ');
+    where.push(`EXISTS (SELECT 1 FROM crm_associations a WHERE a.org_id = ? AND ((a.to_id = r.id AND a.from_id IN (${holes})) OR (a.from_id = r.id AND a.to_id IN (${holes}))))`);
+    params.push(orgId, ...spec.associatedToAny, ...spec.associatedToAny);
+  }
   if (spec.ownerId) { where.push(`r.owner_id = ?`); params.push(spec.ownerId); }
 
   const joins: string[] = [];
@@ -207,7 +222,11 @@ export interface RecordSummary {
 }
 
 /** Fetch records matching a spec, newest first — the evidence behind a number. */
-export function fetchRecords(ctx: Ctx, orgId: string, spec: AggregateSpec & { limit?: number; orderBy?: string }): RecordSummary[] {
+export function fetchRecords(
+  ctx: Ctx,
+  orgId: string,
+  spec: AggregateSpec & { limit?: number; orderBy?: string; direction?: 'asc' | 'desc' },
+): RecordSummary[] {
   if (!hasTable(ctx.db, 'crm_records')) return [];
   const where: string[] = [`r.org_id = ?`, `r.object_type = ?`, `r.archived = 0`, `r.merged_into IS NULL`];
   const params: unknown[] = [orgId, spec.objectType];
@@ -225,11 +244,20 @@ export function fetchRecords(ctx: Ctx, orgId: string, spec: AggregateSpec & { li
     where.push(`EXISTS (SELECT 1 FROM crm_associations a WHERE a.org_id = ? AND ((a.from_id = ? AND a.to_id = r.id) OR (a.to_id = ? AND a.from_id = r.id)))`);
     params.push(orgId, spec.associatedTo, spec.associatedTo);
   }
+  if (spec.associatedToAny?.length) {
+    const holes = spec.associatedToAny.map(() => '?').join(', ');
+    where.push(`EXISTS (SELECT 1 FROM crm_associations a WHERE a.org_id = ? AND ((a.to_id = r.id AND a.from_id IN (${holes})) OR (a.from_id = r.id AND a.to_id IN (${holes}))))`);
+    params.push(orgId, ...spec.associatedToAny, ...spec.associatedToAny);
+  }
   if (spec.ownerId) { where.push(`r.owner_id = ?`); params.push(spec.ownerId); }
   let order = 'r.updated DESC';
   const orderParams: unknown[] = [];
   if (spec.orderBy) {
-    order = `(SELECT COALESCE(o.value_number, o.value_date) FROM crm_record_values o WHERE o.record_id = r.id AND o.property = ?) DESC NULLS LAST`;
+    // NULLS LAST on both directions: a deal with no amount is not the smallest
+    // one, and floating the rows that hold nothing to the top of an ascending
+    // list is the same wrong answer as ignoring the direction outright.
+    const sense = spec.direction === 'asc' ? 'ASC NULLS LAST' : 'DESC NULLS LAST';
+    order = `(SELECT COALESCE(o.value_number, o.value_date) FROM crm_record_values o WHERE o.record_id = r.id AND o.property = ?) ${sense}`;
     orderParams.push(spec.orderBy);
   }
   const rows = ctx.db.all<{

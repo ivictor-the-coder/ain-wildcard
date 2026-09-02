@@ -7,10 +7,12 @@
  */
 import { useMemo } from 'react';
 import { useQuery, type ApiClientError, type ListEnvelope, type QueryResult } from '@/client/kernel/api';
+import { refusalOf } from './answer-core';
+import { propertyVocabulary } from './scope-core';
 import type { Vocabulary } from './scope-core';
 import type { Citation } from './citations';
 
-export { CITATION_ICON, citationHref, recordLink, writeTargets } from './citations';
+export { CITATION_ICON, citationHref, dedupeCitations, recordLink, writeTargetLabel, writeTargets } from './citations';
 export type { Citation } from './citations';
 
 export interface ToolCall { id: string; name: string; arguments: Record<string, unknown> }
@@ -226,7 +228,8 @@ export function useAllApprovals(): ApprovalIndex {
  * waiting — and the "Needs approval" filter, which is exactly the queue a person
  * scans for work, never drains. The approvals themselves know the answer.
  */
-export type RunOutcome = 'succeeded' | 'failed' | 'running' | 'needs_approval' | 'written' | 'declined';
+export type RunOutcome =
+  'succeeded' | 'failed' | 'running' | 'needs_approval' | 'written' | 'declined' | 'refused';
 
 export const OUTCOME_LABEL: Record<RunOutcome, string> = {
   succeeded: 'Succeeded',
@@ -235,6 +238,7 @@ export const OUTCOME_LABEL: Record<RunOutcome, string> = {
   needs_approval: 'Needs approval',
   written: 'Approved and written',
   declined: 'Declined',
+  refused: 'Refused',
 };
 
 export const OUTCOME_TONE: Record<RunOutcome, 'success' | 'danger' | 'warning' | 'info' | 'neutral'> = {
@@ -244,17 +248,55 @@ export const OUTCOME_TONE: Record<RunOutcome, 'success' | 'danger' | 'warning' |
   needs_approval: 'warning',
   written: 'success',
   declined: 'neutral',
+  refused: 'warning',
 };
 
-export function runOutcome(run: { status: string }, approvals: AiApproval[] | undefined): RunOutcome {
+/** What became of one approved write. */
+export type WriteOutcome = 'pending' | 'declined' | 'written' | 'failed';
+
+const FAILED_OUTCOME = /^\s*(?:failed|error)\b/i;
+
+/**
+ * Whether an approved write actually landed.
+ *
+ * The first wrong-target attempt in the critic's run — `commercial_terms` on a
+ * New business deal — came back `Failed: "commercial_terms" belongs to the
+ * Renewal pipeline`, and the card carried a green "Approved and written" badge
+ * and a "WRITTEN TO deal_nw_15" link above that sentence. Nothing was written.
+ * `status` records the decision a person made; `outcome` records what the tool
+ * did with it, and only the second one can say whether the workspace changed.
+ */
+export function approvalOutcome(approval: Pick<AiApproval, 'status' | 'outcome'>): WriteOutcome {
+  if (approval.status === 'pending') return 'pending';
+  if (approval.status !== 'approved') return 'declined';
+  if (!approval.outcome) return 'written';
+  // A landed write hands back its own row — `object=record id=note_… …`. A
+  // failure hands back a sentence, and it starts by saying so.
+  return keyValues(approval.outcome) ? 'written' : (FAILED_OUTCOME.test(approval.outcome) ? 'failed' : 'written');
+}
+
+export function runOutcome(
+  run: { status: string; reasoning?: string[] },
+  approvals: AiApproval[] | undefined,
+): RunOutcome {
   const rows = approvals ?? [];
   if (rows.some((a) => a.status === 'pending')) return 'needs_approval';
   // The engine resolves a run to `succeeded` once an approved write executes,
   // but leaves a declined one on `needs_approval` for ever. Either way the
   // approvals are the record of what a person actually decided.
+  // An approved write whose tool refused it is not a written run, whatever the
+  // run's own status says: the workspace did not change.
+  if (rows.some((a) => approvalOutcome(a) === 'failed')) return 'failed';
   if (rows.some((a) => a.status === 'approved')) return run.status === 'failed' ? 'failed' : 'written';
   if (rows.length && run.status === 'needs_approval') return 'declined';
-  return (['succeeded', 'failed', 'running', 'needs_approval'] as const).includes(run.status as never)
+  if (run.status === 'failed' || run.status === 'running') return run.status;
+  // A run that answered nothing is stamped `succeeded` all the same. The engine
+  // writes `Refused (qualifier_unbound): …` into its own reasoning trail and
+  // the conversation renders it as a refusal — but the run log counted it as a
+  // success, so the one number that says whether this engine is answering
+  // questions could not be read off the surface built to report on it.
+  if (refusalOf(run)) return 'refused';
+  return (['succeeded', 'needs_approval'] as const).includes(run.status as never)
     ? (run.status as RunOutcome)
     : 'succeeded';
 }
@@ -330,6 +372,12 @@ interface PipelinePayload {
 }
 interface UserPayload { id: string; name: string }
 interface MetricPayload { id: string; label: string; unit: string; keywords: string[]; snapshot: boolean }
+interface PropertyPayload {
+  name: string;
+  label: string;
+  type: string;
+  options: { value: string; label: string }[] | null;
+}
 
 /**
  * The words this workspace uses for the things a question can narrow to.
@@ -341,14 +389,42 @@ interface MetricPayload { id: string; label: string; unit: string; keywords: str
  * pipeline" name here. All three are small, cached by the query layer and
  * shared with the board, so the conversation pays for them once.
  */
-export function useVocabulary(): { vocab: Vocabulary; loading: boolean; error: ApiClientError | null } {
+export interface VocabularyRead {
+  vocab: Vocabulary;
+  loading: boolean;
+  /** The reads every chip depends on failed: nothing below is checked. */
+  error: ApiClientError | null;
+  /** A narrower read failed: the dimensions it carries were not checked. */
+  partial: string[];
+}
+
+export function useVocabulary(): VocabularyRead {
   const pipelines = useQuery<ListEnvelope<PipelinePayload>>('/v1/pipelines/deal');
   const users = useQuery<ListEnvelope<UserPayload>>('/v1/users', { limit: 100 });
   const metrics = useQuery<ListEnvelope<MetricPayload>>('/v1/ai/metrics');
-  const loading = pipelines.loading || users.loading || metrics.loading;
+  // The pipelines this engine cannot measure over, so an answer that says one
+  // of them does not exist can be contradicted with the workspace's own data.
+  const tickets = useQuery<ListEnvelope<PipelinePayload>>('/v1/pipelines/ticket');
+  // The CRM's own enumerated properties — lead source, deal type, competitor,
+  // forecast category. Without them a question can name a dimension the
+  // qualifier ledger has no slot for, and "How many open deals came from a
+  // trade show?" is answered 38 against a true 7 with the words "trade show"
+  // appearing nowhere on the card.
+  const properties = useQuery<ListEnvelope<PropertyPayload>>('/v1/objects/deal/properties');
+  // Every read, for the wait. A check that has not run is not a check, and the
+  // ticket pipelines and the enumerated properties are what let this surface
+  // contradict "no pipeline is called Support" and "38 open deals" over a
+  // question about a trade show. Waiting for them costs a moment.
+  const loading = pipelines.loading || users.loading || metrics.loading
+    || tickets.loading || properties.loading;
+  // Only the three the whole scope row is drawn from, for the failure. Without
+  // pipelines, teammates or measures there is nothing true to say about any
+  // answer; without the ticket pipelines there is nothing true to say about one
+  // narrow class of question, and blanking every chip on the card over that
+  // would be a second, wider, silence.
   const error = pipelines.error ?? users.error ?? metrics.error;
-  const vocab = useMemo<Vocabulary>(() => ({
-    pipelines: (pipelines.data?.data ?? []).map((pipeline) => ({
+  const vocab = useMemo<Vocabulary>(() => {
+    const deal = (pipelines.data?.data ?? []).map((pipeline) => ({
       name: pipeline.name,
       label: pipeline.label,
       stages: (pipeline.stages ?? []).map((stage) => ({
@@ -359,33 +435,58 @@ export function useVocabulary(): { vocab: Vocabulary; loading: boolean; error: A
         isClosed: stage.is_closed,
         isWon: stage.is_won,
       })),
-    })),
-    people: (users.data?.data ?? []).map((user) => ({ id: user.id, name: user.name })),
-    metrics: (metrics.data?.data ?? []).map((metric) => ({
+    }));
+    const catalogue = (metrics.data?.data ?? []).map((metric) => ({
       id: metric.id, label: metric.label, unit: metric.unit, keywords: metric.keywords ?? [], snapshot: !!metric.snapshot,
-    })),
-  }), [pipelines.data, users.data, metrics.data]);
-  return { vocab, loading, error };
+    }));
+    return {
+      pipelines: deal,
+      people: (users.data?.data ?? []).map((user) => ({ id: user.id, name: user.name })),
+      metrics: catalogue,
+      otherPipelines: (tickets.data?.data ?? []).map((pipeline) => ({
+        name: pipeline.name, label: pipeline.label, objectType: 'ticket',
+      })),
+      properties: propertyVocabulary(
+        (properties.data?.data ?? [])
+          .filter((property) => property.type === 'enum')
+          .map((property) => ({ name: property.name, label: property.label, options: property.options ?? [] })),
+        deal,
+        catalogue,
+      ),
+    };
+  }, [pipelines.data, users.data, metrics.data, tickets.data, properties.data]);
+  const partial = useMemo(() => [
+    ...(tickets.error ? ['the pipelines that hold tickets'] : []),
+    ...(properties.error ? ['this workspace’s own record properties'] : []),
+  ], [tickets.error, properties.error]);
+  return { vocab, loading, error, partial };
 }
 
 /* -------------------------------- helpers -------------------------------- */
 
 
 export {
-  confidenceBand, parseBlocks, refusalOf, splitToolEcho,
+  confidenceBand, confidenceChip, parseBlocks, refusalOf, splitToolEcho,
 } from './answer-core';
 export type { Block, ConfidenceBand, StepNote, ToolEcho } from './answer-core';
 
 export {
-  EMPTY_VOCABULARY, boardHref, boundScopeOf, carriedThrough, currencyAsked, currencyOfFigure,
-  groupAsked, humanizeName, labelOfPipeline, labelOfStage, measurementsOf, metricAsked,
-  namedQualifiers, openStagesOf, parseBreakdown, reconcileBreakdown, reconcileScope, scopeChips,
-  unknownMeasure, withoutBreakdown,
+  EMPTY_VOCABULARY, MONEY_TOTAL, QUALIFIER_KINDS, UNMEASURED, agreeWithTheCount, boardHref, boundScopeOf,
+  carriedThrough, correctPipelineDenial, correctedProse,
+  countedObject, currencyAsked, currencyOfFigure, figureSpeaks, figureUnits, groupAsked, humanizeName,
+  isWiderName, labelOfPipeline, labelOfStage, lastInstantOf, looksLikeRecordId, measurementsOf,
+  metricAsked, misreadRefusal, namedQualifiers, openStagesOf, parseBreakdown, parseLedger,
+  propertyVocabulary, reconcileBreakdown,
+  deniedPipeline, reconcileScope, recordPhraseMismatch, rephraseAsBreakdown, scopeChips, unknownMeasure,
+  warningSentence, windowText, withoutCurrencyClaim, withoutWriteParameter,
+  withoutBreakdown,
 } from './scope-core';
 export type {
-  BoundScope, BreakdownBucket, BreakdownReport, BucketVerdict, Measurement, NamedQualifier,
-  QualifierKind, QualifierState, QualifierVerdict, ScopeChip, ScopeReport, VocabMetric,
-  VocabPipeline, VocabStage, Vocabulary,
+  BoundScope, BreakdownBucket, BreakdownReport, BucketVerdict, Evidence, LedgerEntry, Measurement,
+  MisreadRefusal,
+  NamedQualifier, QualifierKind, QualifierState, QualifierVerdict, RecordMismatch, ScopeChip,
+  ScopeReport, VocabMetric, VocabOtherPipeline, VocabPipeline, VocabPropertyDef, VocabPropertyValue,
+  VocabStage, Vocabulary, WindowFormat,
 } from './scope-core';
 
 export const SPAN_TONE: Record<AiSpan['kind'], 'brand' | 'info' | 'teal' | 'purple' | 'neutral'> = {

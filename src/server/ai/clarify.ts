@@ -215,7 +215,12 @@ export function refusalFor(input: RefusalInput): Refusal | null {
   // comparison on one period, and it is worse, because a single figure with no
   // caveat reads as authoritative and gets quoted. Nothing is measured; the
   // phrase that did not parse is named back to the caller.
-  if (input.unresolved.length) {
+  // ...for a *question*. In an instruction the same characters are a value:
+  // "set the close date on <deal> to 2026-12-01" names no reporting period at
+  // all, and refusing it as one made every date-valued write unreachable, with
+  // a paragraph about quarters and months in front of a mutation. The write
+  // path parses the date itself and says so when it cannot.
+  if (input.unresolved.length && intent.intent !== 'act') {
     const named = input.mentions.map((m) => m.text);
     const missed = input.unresolved.map((m) => m.text);
     const resolved = input.windows.map((w) => w.label);

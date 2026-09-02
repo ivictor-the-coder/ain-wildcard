@@ -14,9 +14,8 @@
 import { Badge, Banner, Icons, useFormat } from '@/client/design';
 import { useRouter } from '@/client/kernel/router';
 import {
-  WIDE_SCOPE, scopeChips,
-  type BreakdownReport, type QualifierKind, type QualifierVerdict,
-  type ScopeReport, type Vocabulary,
+  WIDE_SCOPE, scopeChips, warningSentence, windowText,
+  type BreakdownReport, type QualifierKind, type ScopeChip, type ScopeReport, type Vocabulary,
 } from './scope-core';
 
 /* -------------------------------- the chips ------------------------------- */
@@ -28,48 +27,87 @@ const KIND_ICON: Record<QualifierKind, keyof typeof Icons> = {
   period: 'calendar',
   status: 'check',
   metric: 'gauge',
+  limit: 'list',
   account: 'building',
   currency: 'coins',
   unit: 'hash',
   meter: 'activity',
   object: 'database',
   group: 'layers',
+  property: 'tag',
 };
 
-export function ScopeBar({ report, vocab, loading }: { report: ScopeReport; vocab: Vocabulary; loading?: boolean }) {
+export function ScopeBar({ report, vocab, loading, unread }: {
+  report: ScopeReport;
+  vocab: Vocabulary;
+  loading?: boolean;
+  /** The vocabulary reads failed, so no chip below can be trusted or drawn. */
+  unread?: boolean;
+}) {
   const f = useFormat();
   if (!report.answering.length) return null;
   // Every chip below is read through this workspace's own vocabulary: without
   // it an owner id renders as `usr_seed01`, and the eight open stage names that
   // together mean "open deals" render as eight stage chips over an answer that
   // narrowed to nothing. Until it has been read there is nothing true to say.
-  if (loading || (!vocab.pipelines.length && !vocab.people.length && !vocab.metrics.length)) {
+  const empty = !vocab.pipelines.length && !vocab.people.length && !vocab.metrics.length;
+  if (loading || empty) {
+    // "…reading…" over a read that already failed is the surface making the
+    // same kind of claim it exists to refuse. A failed read is a finished one.
+    const failed = unread || (empty && !loading);
     return (
       <div className="cp-scope">
         <div className="cp-scope__row">
           <span className="cp-scope__label">Measured over</span>
           <span className="cp-scope__chip is-unchecked">
             <Icons.clock size={11} />
-            <span className="u-truncate">reading this workspace’s pipelines, teammates and measures…</span>
+            <span className="u-truncate">
+              {failed
+                ? 'this workspace’s pipelines, teammates and measures could not be read — nothing below is checked'
+                : 'reading this workspace’s pipelines, teammates and measures…'}
+            </span>
           </span>
         </div>
       </div>
     );
   }
   const name = (id: string) => report.resolve(id) ?? id;
+  // The engine's windows are UTC calendar boundaries and half-open: Q4 2026 is
+  // `2026-10-01T00:00Z` up to `2027-01-01T00:00Z`. Rendered as two inclusive
+  // dates in the viewer's timezone that reads "Sep 30, 2026 – Dec 31, 2026" —
+  // a period that is neither the one asked for nor the one measured.
   const window = (w: { start: number | null; end: number | null; label: string | null }) =>
-    w.label ?? (w.start !== null && w.end !== null ? f.dateRange(w.start, w.end) : w.start !== null ? `from ${f.date(w.start)}` : `to ${f.date(w.end ?? 0)}`);
+    windowText(w, {
+      dateRange: (start, end) => f.dateRange(start, end, { timeZone: 'UTC' }),
+      date: (ts) => f.date(ts, { timeZone: 'UTC' }),
+    });
+
+  // A row per figure, because a scope is only readable next to the number it
+  // scopes. Steps that answered in prose rather than in one number — a credit
+  // balance and the profile that names its account — have no figure to stand
+  // beside and share one row: two of them is one answer read twice, and
+  // labelling them apart would put `credits.balance` on screen as if that were
+  // a thing a reader asked for.
+  const rows = report.answering.some((m) => m.figure)
+    ? report.answering.map((measurement, index) => ({
+        key: `${measurement.tool}-${index}`,
+        label: report.answering.length > 1 ? `${measurement.figure} measured over` : 'Measured over',
+        chips: scopeChips(measurement, vocab, index === 0 ? report.verdicts : [], { window, name }),
+      }))
+    : [{
+        key: 'measured',
+        label: 'Measured over',
+        chips: dedupeChips(report.answering.flatMap((measurement, index) =>
+          scopeChips(measurement, vocab, index === 0 ? report.verdicts : [], { window, name }))),
+      }];
 
   return (
     <div className="cp-scope">
-      {report.answering.map((measurement, index) => {
-        const chips = scopeChips(measurement, vocab, index === 0 ? report.verdicts : [], { window, name });
+      {rows.map(({ key, label, chips }) => {
         if (!chips.length) return null;
         return (
-          <div className="cp-scope__row" key={`${measurement.tool}-${index}`}>
-            <span className="cp-scope__label">
-              {report.answering.length > 1 ? `${measurement.figure ?? measurement.tool} measured over` : 'Measured over'}
-            </span>
+          <div className="cp-scope__row" key={key}>
+            <span className="cp-scope__label">{label}</span>
             {chips.map((chip) => (
               <span
                 className={`cp-scope__chip${chip.wide ? ' is-wide' : ''}${chip.unchecked ? ' is-unchecked' : ''}`}
@@ -91,45 +129,22 @@ export function ScopeBar({ report, vocab, loading }: { report: ScopeReport; voca
   );
 }
 
+const dedupeChips = (chips: ScopeChip[]): ScopeChip[] => {
+  const seen = new Set<string>();
+  return chips.filter((chip) => {
+    const key = `${chip.kind}:${chip.label}:${chip.value}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
 const iconFor = (kind: QualifierKind) => {
   const Glyph = Icons[KIND_ICON[kind]] ?? Icons.tag;
   return <Glyph size={11} />;
 };
 
 /* ------------------------------- the warning ------------------------------ */
-
-const SENTENCE: Record<QualifierKind, (v: QualifierVerdict) => string> = {
-  pipeline: (v) => v.state === 'substituted'
-    ? `You asked about the ${v.asked} pipeline. This figure was measured over ${v.used} instead.`
-    : `You asked about the ${v.asked} pipeline. This figure was measured over ${v.used} — every deal in the workspace, not ${v.asked}’s.`,
-  stage: (v) => v.state === 'substituted'
-    ? `You asked about ${v.asked}. This figure was measured over ${v.used} instead.`
-    : `You asked about ${v.asked}. This figure counts ${v.used} — it is not the ${v.asked} figure.`,
-  owner: (v) => v.state === 'substituted'
-    ? `You asked about ${v.asked}. This figure was measured for ${v.used} — a different record, not ${v.asked}’s book.`
-    : `You asked about ${v.asked}. This figure covers ${v.used}, not the records ${v.asked} owns.`,
-  period: (v) => v.state === 'bound'
-    ? `You named ${v.asked}. This figure was measured over ${v.used}.`
-    : `You named ${v.asked}. This figure was measured ${v.used}, not over ${v.asked}.`,
-  status: (v) => `You asked about ${v.asked.toLowerCase()}. This figure counts ${v.used}.`,
-  metric: (v) => (v.state === 'substituted'
-    ? `You asked for ${v.asked}. This figure is ${v.used}, which is a different measure.`
-    : `You asked for ${v.asked}. Nothing in this workspace’s metric catalogue is that measure, and the figure below is ${v.used}.`),
-  currency: (v) => (v.state === 'substituted'
-    ? `You asked for the ${v.asked} book. This figure is in ${v.used} — it is not the ${v.asked} figure.`
-    : `You asked for the ${v.asked} book. This figure was not scoped to a currency: it is ${v.used}.`),
-  account: (v) => (v.state === 'substituted'
-    ? `You asked about ${v.asked}. This figure was measured for ${v.used}.`
-    : `You asked about ${v.asked}. This figure covers ${v.used}.`),
-  unit: (v) => `You named ${v.asked}. This figure was not scoped to it — it counts ${v.used}.`,
-  meter: (v) => `You named the ${v.asked} meter. This figure was not scoped to it — it counts ${v.used}.`,
-  object: (v) => (v.state === 'substituted'
-    ? `You asked about deals. This figure counts ${v.used}, which are not deals.`
-    : `You asked about deals. This figure was measured over ${v.used}.`),
-  group: (v) => (v.state === 'substituted'
-    ? `You asked for this broken down by ${v.asked}. It came back broken down by ${v.used} instead.`
-    : `You asked for this broken down by ${v.asked}. It came back as ${v.used} — nothing here ranks the ${v.asked}s.`),
-};
 
 /**
  * What the answer did not narrow to, before the answer.
@@ -138,7 +153,19 @@ const SENTENCE: Record<QualifierKind, (v: QualifierVerdict) => string> = {
  * under the number is a footnote, and a reader who has already read
  * "$9,010,960 in open pipeline" has already taken it as the Renewal answer.
  */
-export function ScopeWarning({ report, board }: { report: ScopeReport; board?: { href: string; label: string } | null }) {
+export function ScopeWarning({ report, board, rephrase }: {
+  report: ScopeReport;
+  board?: { href: string; label: string } | null;
+  /**
+   * The same question in the words this engine ranks in.
+   *
+   * "Which stage has the most open pipeline?" is answered with a top-10 list of
+   * individual deals — honestly flagged, and still not the ranking a sales
+   * leader asked for. "Open pipeline by stage" returns it. A warning that ends
+   * in a full stop is as much a dead end as a refusal that does.
+   */
+  rephrase?: { question: string; onAsk: (question: string) => void } | null;
+}) {
   if (!report.unscoped.length) return null;
   const substituted = report.unscoped.some((v) => v.state === 'substituted');
   // `waived` is the engine's own word for a qualifier it parsed and then did
@@ -152,8 +179,10 @@ export function ScopeWarning({ report, board }: { report: ScopeReport; board?: {
   const widened = report.unscoped.filter((v) => v.state !== 'substituted' && v.used === WIDE_SCOPE[v.kind]);
   // A dimension nothing was grouped by is not a missing filter, and telling a
   // person to "ask again naming the record" is advice about a different defect.
+  // Nor is a row cut-off: "the query carried no limit filter at all — ask again
+  // naming the record" is three wrong words about a top-2 that was not cut.
   const grouped = widened.filter((v) => v.kind === 'group');
-  const filters = widened.filter((v) => v.kind !== 'group' && v.kind !== 'object');
+  const filters = widened.filter((v) => !['group', 'object', 'limit'].includes(v.kind));
 
   return (
     <Banner
@@ -168,7 +197,7 @@ export function ScopeWarning({ report, board }: { report: ScopeReport; board?: {
       <ul className="cp-scope__reasons">
         {report.unscoped.map((verdict) => (
           <li key={`${verdict.kind}:${verdict.asked}`}>
-            {SENTENCE[verdict.kind](verdict)}
+            {warningSentence(verdict)}
           </li>
         ))}
       </ul>
@@ -179,6 +208,7 @@ export function ScopeWarning({ report, board }: { report: ScopeReport; board?: {
           read the figure on the board, where the filter exists.
         </p>
       )}
+      {rephrase && <RephraseLink question={rephrase.question} onAsk={rephrase.onAsk} />}
       {board && <BoardLink board={board} />}
       {grouped.length > 0 && (
         <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
@@ -188,6 +218,25 @@ export function ScopeWarning({ report, board }: { report: ScopeReport; board?: {
         </p>
       )}
     </Banner>
+  );
+}
+
+/**
+ * The way out of a refusal: the same question in words this engine answers.
+ *
+ * "Which owner has the most open pipeline?" is refused with a reason that is
+ * not true — that measure is computed constantly — and "Open pipeline by
+ * owner" returns the correct breakdown. One press, rather than a reader
+ * guessing at the phrasing.
+ */
+export function RephraseLink({ question, onAsk }: { question: string; onAsk: (q: string) => void }) {
+  return (
+    <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
+      <button type="button" className="cp-chip" onClick={() => onAsk(question)}>
+        <Icons.sparkles size={12} />
+        <span className="u-truncate">Ask it as “{question}”</span>
+      </button>
+    </p>
   );
 }
 

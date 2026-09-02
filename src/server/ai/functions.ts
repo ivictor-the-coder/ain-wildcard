@@ -12,7 +12,7 @@ import type { Ctx } from '../kernel/context';
 import { DAY, formatDate, formatRelative } from '../../shared/time';
 import { formatMoney } from '../../shared/money';
 import { billingSources, entityIndex, hasTable, workspaceProfile, type WorkspaceProfile } from './grounding';
-import { crmVocabulary } from './qualifiers';
+import { crmVocabulary, stageLabelIn } from './qualifiers';
 import { resolveEntities, type ResolvedEntity } from './resolve';
 import {
   accountSnapshot, detectGrouping, metricById, metricIds, stageSets, topAccounts,
@@ -240,7 +240,7 @@ function labelIds(ctx: Ctx, orgId: string, ids: string[], fallbackType: string):
 /** Compute one metric, with the previous period for context when it exists. */
 export function businessMetric(ctx: Ctx, orgId: string, args: {
   metric: string; start?: number; end?: number; window_label?: string; subject_id?: string; group_by?: GroupBy; compare?: boolean;
-  currency?: string; pipeline?: string; stage?: string; limit?: number;
+  currency?: string; pipeline?: string; stage?: string; limit?: number; direction?: 'asc' | 'desc';
 }): MetricToolResult | { error: string; available: string[] } {
   const definition = metricById(args.metric);
   if (!definition) return { error: `Unknown metric "${args.metric}".`, available: metricIds() };
@@ -309,7 +309,18 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
     stage: args.stage ?? null,
     limit: args.limit,
   };
-  const result = definition.compute(input);
+  const computed = definition.compute(input);
+  // "Who has the least pipeline?" is "who has the most" with one word changed,
+  // and every metric here ranks its groups largest first. Reversing the rows —
+  // once, here, rather than in each metric — is what makes the smaller end of a
+  // breakdown reachable at all; without it the two questions returned the same
+  // rows in the same order, and the answer named the top of the list either way.
+  // A time series is a sequence, not a ranking: reversing it would be a
+  // different chart, not a different question.
+  const ascending = args.direction === 'asc' && (args.group_by ?? 'none') !== 'time';
+  const result = ascending && computed.groups.length
+    ? { ...computed, groups: [...computed.groups].reverse() }
+    : computed;
   // A delta needs two numbers in one currency. When the metric came back as
   // several books there is no single figure to subtract, and quoting one
   // anyway is how a 45%-inflated sum got a growth rate attached to it.
@@ -331,7 +342,9 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
   // accounts" answered with five is the same class of drop as an ignored
   // pipeline, one row further down the page.
   const ranking = Math.min(Math.max(args.limit ?? 5, 1), 25);
-  const accounts = args.group_by === 'account' && !result.groups.length ? topAccounts(input, definition, ranking) : [];
+  const accounts = args.group_by === 'account' && !result.groups.length
+    ? (ascending ? [...topAccounts(input, definition, 1000)].reverse().slice(0, ranking) : topAccounts(input, definition, ranking))
+    : [];
 
   // A grouping that was asked for and never applied has to be said out loud.
   // "What is our win rate by owner" answered with one workspace-wide number is
@@ -349,7 +362,10 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
     : result.note;
 
   const pipelineLabel = args.pipeline ? vocabulary.pipelines.find((p) => p.value === args.pipeline)?.label ?? args.pipeline : null;
-  const stageLabel = args.stage ? vocabulary.stages.find((st) => st.value === args.stage)?.label ?? args.stage : null;
+  // Read the stage back by the name the scoped pipeline gives it: `discovery`
+  // is "Scoping" in Expansion and "Discovery" in New business, and answering
+  // one under the other's name misdescribes the rows that were counted.
+  const stageLabel = args.stage ? stageLabelIn(vocabulary, args.stage, args.pipeline ?? null) ?? args.stage : null;
   const scope = pipelineLabel || stageLabel
     ? {
         pipeline: args.pipeline ?? null,
@@ -720,7 +736,7 @@ function datedWindow(args: { start?: number; end?: number; date_property?: strin
 /** Filtered list of records of one object type — the generic "show me" tool. */
 export function recordSearch(ctx: Ctx, orgId: string, args: {
   object_type: string; conditions?: Condition[]; start?: number; end?: number; date_property?: string;
-  associated_to?: string; owner_id?: string; limit?: number; order_by?: string;
+  associated_to?: string; associated_to_any?: string[]; owner_id?: string; limit?: number; order_by?: string; direction?: 'asc' | 'desc';
 }): RecordSearchResult {
   const workspace = workspaceProfile(ctx, orgId);
   // `start: 0` is a real bound — "before March 2026" and "all time" both begin
@@ -733,9 +749,15 @@ export function recordSearch(ctx: Ctx, orgId: string, args: {
     conditions: args.conditions ?? [],
     window,
     associatedTo: args.associated_to,
+    associatedToAny: args.associated_to_any,
     ownerId: args.owner_id,
     limit: Math.min(args.limit ?? 10, 50),
     orderBy: args.order_by,
+    // "The smallest open deal" and "the largest open deal" are one query with
+    // one word different, and the word was not read: descending was the only
+    // order this engine had, so half the ranking questions it answered were
+    // answered with their own inverse.
+    direction: (args.direction === 'asc' ? 'asc' : 'desc') as 'asc' | 'desc',
   };
   const rows = fetchRecords(ctx, orgId, spec);
   const total = aggregate(ctx, orgId, spec).count;
@@ -768,7 +790,7 @@ export interface RecordAggregateResult {
 export function recordAggregate(ctx: Ctx, orgId: string, args: {
   object_type: string; measure?: 'count' | 'sum' | 'avg' | 'min' | 'max'; property?: string;
   conditions?: Condition[]; group_by?: string; start?: number; end?: number; date_property?: string;
-  associated_to?: string; owner_id?: string;
+  associated_to?: string; associated_to_any?: string[]; owner_id?: string;
 }): RecordAggregateResult | { error: string } {
   const workspace = workspaceProfile(ctx, orgId);
   const properties = propertyMap(ctx, orgId, args.object_type);
@@ -789,6 +811,7 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
     measure: measure === 'count' ? undefined : { property: args.property!, fn: measure },
     groupBy: args.group_by,
     associatedTo: args.associated_to,
+    associatedToAny: args.associated_to_any,
     // A rep named in the question is a filter on the count. Without it "how
     // many open deals does Priya have" answered with the workspace's 38.
     ownerId: args.owner_id,

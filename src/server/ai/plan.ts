@@ -19,8 +19,8 @@ import { resolveDueDate } from './dates';
 import { DAY } from '../../shared/time';
 import type { WorkspaceProfile } from './grounding';
 import { isLedgerType } from './resolve';
-import { capitalise, contentWords, listPhrase, normalise, stem, trigramSimilarity, truncate } from './text';
-import type { QualifierLedger } from './qualifiers';
+import { STOPWORDS, capitalise, contentWords, listPhrase, normalise, stem, trigramSimilarity, truncate } from './text';
+import { recordFilter, stepNarrowsTo, type Qualifier, type QualifierLedger, type RankingOrder } from './qualifiers';
 
 export type BuiltinTool =
   | 'workspace_search' | 'account_profile' | 'business_metric'
@@ -125,6 +125,30 @@ export interface PlanInput {
   qualifiers?: QualifierLedger | null;
   /** The record date the question named — `created`, `updated` or a close date. */
   dateProperty?: string | null;
+  /**
+   * The currency book the question restricted itself to, as the ledger admitted
+   * it — `undefined` when the caller did not decide and this file should read
+   * the sentence itself.
+   *
+   * It is passed in rather than re-read here because a word can be a currency
+   * and a company at once: "Sterling" is three accounts in this workspace, and
+   * a planner that reads the sentence on its own puts a GBP scope on an answer
+   * the ledger never admitted a currency for.
+   */
+  currency?: string | null;
+  /**
+   * The order the question asked its rows to be in, when it is not the default.
+   *
+   * "The 3 smallest open deals" and "the 3 largest" differ by one word, and
+   * descending was the only order this planner could emit — so half of those
+   * questions were answered with their own inverse, under the word "largest".
+   */
+  order?: RankingOrder | null;
+}
+
+/** The currency book a plan runs in: what the ledger admitted, or the sentence. */
+function plannedCurrency(input: PlanInput): string | null {
+  return input.currency !== undefined ? input.currency : detectCurrency(input.question);
 }
 
 /**
@@ -182,6 +206,16 @@ export interface InferredCondition {
   op: 'eq' | 'in' | 'gt' | 'gte' | 'lt' | 'lte' | 'is_set' | 'is_not_set';
   value?: string | number;
   values?: string[];
+  /**
+   * The words in the question that produced this filter.
+   *
+   * A condition inferred here is a qualifier the reader wrote, and the ledger
+   * needs the surface text to say so. Without it "how many tickets are
+   * escalated" answered with the quarter's ticket intake — a different number
+   * about a different question — with nothing in the run naming the word the
+   * reader had typed.
+   */
+  matched?: string;
 }
 
 /**
@@ -257,14 +291,26 @@ export function inferConditions(
   const text = normalise(question);
   const out: InferredCondition[] = [];
   const has = (re: RegExp) => re.test(text);
+  // The words that produced a filter, in the reader's own spelling where the
+  // sentence still has it, so the ledger can name the qualifier it bound.
+  const said = (re: RegExp): string => question.match(new RegExp(re.source, `${re.flags.replace('g', '')}i`))?.[0]
+    ?? text.match(re)?.[0] ?? '';
 
   if (objectType === 'ticket') {
-    if (has(/\bescalated\b/)) out.push({ property: 'status', op: 'eq', value: 'escalated' });
-    if (has(/\b(urgent|critical|p1|on fire)\b/)) out.push({ property: 'priority', op: 'in', values: ['urgent', 'high'] });
-    if (has(/\bhigh priority\b/)) out.push({ property: 'priority', op: 'in', values: ['urgent', 'high'] });
-    if (has(/\bclosed\b/)) out.push({ property: 'status', op: 'eq', value: 'closed' });
+    if (has(/\bescalated\b/)) out.push({ property: 'status', op: 'eq', value: 'escalated', matched: said(/\bescalated\b/) });
+    // A named priority band is that band. Widening "urgent" to urgent-and-high
+    // answered "how many open tickets are urgent?" with 3 against a true 1, and
+    // gave the identical sentence to "how many are high priority?" — two
+    // different questions, one wrong number, no hedge on either.
+    if (has(/\b(urgent|critical|p1|on fire)\b/)) out.push({ property: 'priority', op: 'eq', value: 'urgent', matched: said(/\b(urgent|critical|p1|on fire)\b/) });
+    else if (has(/\bhigh(?:est)?[- ]priority\b/)) out.push({ property: 'priority', op: 'eq', value: 'high', matched: said(/\bhigh(?:est)?[- ]priority\b/) });
+    else if (has(/\blow[- ]priority\b/)) out.push({ property: 'priority', op: 'eq', value: 'low', matched: said(/\blow[- ]priority\b/) });
+    if (has(/\bclosed\b/)) out.push({ property: 'status', op: 'eq', value: 'closed', matched: said(/\bclosed\b/) });
     if (has(/\b(open|unresolved|outstanding|attention|backlog|active|pending|waiting|stuck|broken|failing)\b/)) {
-      out.push({ property: 'status', op: 'in', values: OPEN_TICKET_STATUSES });
+      out.push({
+        property: 'status', op: 'in', values: OPEN_TICKET_STATUSES,
+        matched: said(/\b(open|unresolved|outstanding|attention|backlog|active|pending|waiting|stuck|broken|failing)\b/),
+      });
     }
   }
   if (objectType === 'deal') {
@@ -286,14 +332,36 @@ export function inferConditions(
     if (has(/\b(open|active|live|in flight|pipeline|slipping|stalled)\b/)) out.push({ property: 'deal_stage', op: 'in', values: stages.open });
   }
   if (objectType === 'company') {
-    if (has(/\bcustomers?\b/)) out.push({ property: 'type', op: 'eq', value: 'customer' });
-    else if (has(/\bprospects?\b/)) out.push({ property: 'type', op: 'eq', value: 'prospect' });
-    else if (has(/\bpartners?\b/)) out.push({ property: 'type', op: 'eq', value: 'partner' });
-    if (has(/\bkey accounts?\b/)) out.push({ property: 'is_key_account', op: 'eq', value: 'true' });
+    if (has(/\bcustomers?\b/)) out.push({ property: 'type', op: 'eq', value: 'customer', matched: said(/\bcustomers?\b/) });
+    else if (has(/\bprospects?\b/)) out.push({ property: 'type', op: 'eq', value: 'prospect', matched: said(/\bprospects?\b/) });
+    else if (has(/\bpartners?\b/)) out.push({ property: 'type', op: 'eq', value: 'partner', matched: said(/\bpartners?\b/) });
+    if (has(/\bkey accounts?\b/)) out.push({ property: 'is_key_account', op: 'eq', value: 'true', matched: said(/\bkey accounts?\b/) });
   }
   if (objectType === 'contact') {
-    if (has(/\bchampions?\b/)) out.push({ property: 'buying_role', op: 'eq', value: 'champion' });
-    else if (has(/\b(economic buyers?|decision makers?)\b/)) out.push({ property: 'buying_role', op: 'eq', value: 'economic_buyer' });
+    if (has(/\bchampions?\b/)) out.push({ property: 'buying_role', op: 'eq', value: 'champion', matched: said(/\bchampions?\b/) });
+    else if (has(/\b(economic buyers?|decision makers?)\b/)) {
+      out.push({ property: 'buying_role', op: 'eq', value: 'economic_buyer', matched: said(/\b(economic buyers?|decision makers?)\b/) });
+    }
+  }
+
+  // A typed record filter the ledger holds is the filter, and it replaces the
+  // looser one the patterns above would have inferred for the same column: the
+  // reader who wrote "waiting on us" asked about one status, not about every
+  // ticket that is not closed.
+  for (const entry of qualifiers?.all('status') ?? []) {
+    const resolved = entry.resolved;
+    if (!resolved?.property || resolved.objectType !== objectType) continue;
+    const replacement: InferredCondition = resolved.values?.length
+      ? { property: resolved.property, op: 'in', values: resolved.values.map(String), matched: entry.text }
+      : {
+        property: resolved.property,
+        op: resolved.op ?? 'eq',
+        value: resolved.op && resolved.op !== 'eq' && resolved.op !== 'in' ? Number(resolved.value) : String(resolved.value),
+        matched: entry.text,
+      };
+    const at = out.findIndex((condition) => condition.property === resolved.property);
+    if (at >= 0) out[at] = replacement;
+    else out.push(replacement);
   }
 
   // A number the question names is a filter, not decoration. Without this the
@@ -366,8 +434,91 @@ export function namedOwner(input: PlanInput): ResolvedEntity | null {
   return person ?? null;
 }
 
+/** The surface text a condition was read from belongs to the ledger, not to the query. */
+const withoutMatched = (args: Record<string, unknown>): Record<string, unknown> => {
+  if (!Array.isArray(args.conditions)) return args;
+  return {
+    ...args,
+    conditions: (args.conditions as InferredCondition[]).map(({ matched, ...rest }) => rest),
+  };
+};
+
 const builtin = (tool: BuiltinTool, args: Record<string, unknown>, why: string, relevance = 1): PlannedStep =>
-  ({ tool, args, why, builtin: tool, relevance });
+  ({ tool, args: withoutMatched(args), why, builtin: tool, relevance });
+
+/**
+ * A filter the question named on records the catalogue measure cannot narrow.
+ *
+ * `business_metric` counts the workspace's ticket intake over a window; it
+ * takes no status. "How many tickets are escalated?" was answered with that
+ * intake — 14 raised this quarter, against 2 actually escalated — because
+ * nothing checked whether the measure could carry the word the reader wrote.
+ */
+export function unbindableRecordFilter(input: PlanInput, objectType: string): boolean {
+  return (input.qualifiers?.all('status') ?? []).some((entry) =>
+    entry.state === 'pending' && entry.resolved?.objectType === objectType);
+}
+
+/**
+ * The record filters the ledger holds for one table, as conditions on it.
+ *
+ * A deal's outcome is a `deal_stage` filter and has its own path through
+ * `outcomeOverride`; everything else the question qualified the rows by — a
+ * lead source, a competitor, a forecast category, a ticket's priority — is a
+ * plain condition, and it is here so that every capability picks it up rather
+ * than each one remembering to.
+ */
+export function ledgerFilters(input: PlanInput, objectType: string): InferredCondition[] {
+  const out: InferredCondition[] = [];
+  for (const entry of input.qualifiers?.all('status') ?? []) {
+    const resolved = entry.resolved;
+    if (!resolved?.property || resolved.property === 'deal_stage') continue;
+    if ((resolved.objectType ?? 'deal') !== objectType) continue;
+    out.push(resolved.values?.length
+      ? { property: resolved.property, op: 'in', values: resolved.values.map(String), matched: entry.text }
+      : {
+        property: resolved.property,
+        op: resolved.op ?? 'eq',
+        // A threshold is compared as a number; a picklist value as text. The
+        // column the query reads depends on which, so the type is not
+        // decoration.
+        value: resolved.op && resolved.op !== 'eq' && resolved.op !== 'in' ? Number(resolved.value) : String(resolved.value),
+        matched: entry.text,
+      });
+  }
+  return out;
+}
+
+/**
+ * A filter the question named on a *different* table from the one measured.
+ *
+ * "How much open pipeline is with pharmaceutical companies?" narrows companies
+ * and sums deals. The industry is not a deal property, so no condition can
+ * carry it — but the three accounts it picks out can, through the association
+ * table. The alternative that shipped was to drop the word and state
+ * $9,010,960, or to fuzzy-match "pharmaceutical" onto the one account whose
+ * name contains it and state $308,880 for a set worth $849,660.
+ */
+export function crossScopeArgs(input: PlanInput, objectType: string, tool: string): Record<string, unknown> {
+  const cross = crossScopeFilter(input, objectType);
+  if (!cross) return {};
+  input.qualifiers?.bindEntry(cross.entry, {
+    tool,
+    args: { associated_to_any: cross.ids },
+    note: `${cross.entry.resolved?.label ?? cross.entry.text} is the ${cross.ids.length} ${cross.entry.resolved?.objectType ?? 'company'} rows these ${objectType} records are read against.`,
+  });
+  return { associated_to_any: cross.ids };
+}
+
+export function crossScopeFilter(input: PlanInput, objectType: string): { entry: Qualifier; ids: string[] } | null {
+  for (const entry of input.qualifiers?.all('status') ?? []) {
+    const resolved = entry.resolved;
+    if (!resolved?.property || !resolved.ids?.length) continue;
+    if ((resolved.objectType ?? 'deal') === objectType) continue;
+    return { entry, ids: resolved.ids };
+  }
+  return null;
+}
 
 /**
  * A ledger capability the question asked for and this run could not use.
@@ -562,6 +713,54 @@ const WRITE_SHAPES: { wanted: string; re: RegExp }[] = [
 ];
 
 /**
+ * The record an instruction names, chosen by how much of its name the
+ * instruction actually wrote.
+ *
+ * The resolver ranks a deal by how well the question matches it overall, and
+ * two deals at one account both match the account's name — so "move the
+ * Meridian Forge Systems *predictive maintenance add-on* deal to Proposal
+ * sent" prepared, and on approval performed, an update to "Meridian Forge
+ * Systems — OEE programme phase 2": a closed-won deal worth $330,480 reopened,
+ * and its bookings reclassified, on a sentence naming a different deal.
+ *
+ * The descriptive fragment is a qualifier and it has to be bound to the id the
+ * write lands on. Coverage does that: the record whose own name the sentence
+ * wrote most of wins, and a tie between two records is ambiguity — which is
+ * refused with both names, not resolved by rank.
+ */
+export function namedWriteTarget(
+  question: string,
+  candidates: ResolvedEntity[],
+  spent: string[],
+): { record: ResolvedEntity } | { ambiguous: ResolvedEntity[] } | null {
+  if (candidates.length <= 1) return candidates.length ? { record: candidates[0] } : null;
+  const ignore = new Set<string>([
+    ...spent.flatMap((phrase) => normalise(phrase).split(' ')),
+    ...['deal', 'deals', 'ticket', 'record', 'stage', 'move', 'set', 'update', 'change', 'close', 'date', 'to', 'the', 'on'],
+  ]);
+  const asked = normalise(question).split(' ')
+    .filter((word) => word.length > 2 && !ignore.has(word) && !STOPWORDS.has(word));
+  const scored = candidates.map((candidate) => {
+    const label = new Set(normalise(candidate.entity.label).split(' '));
+    return { candidate, covered: asked.filter((word) => label.has(word)).length };
+  }).sort((a, b) => b.covered - a.covered);
+  const top = scored[0];
+  const rivals = scored.filter((row) => row.covered === top.covered);
+  // Two records the sentence describes equally well is a question, not a
+  // ranking. Writing to the higher-scoring one is a coin toss with the
+  // reader's data on it.
+  if (rivals.length > 1) return { ambiguous: rivals.map((row) => row.candidate) };
+  return { record: top.candidate };
+}
+
+/** The date properties an instruction can set by name. */
+const DATE_PROPERTY_WORDS: { re: RegExp; property: string; label: string }[] = [
+  { re: /\bclose\s+date\b/i, property: 'close_date', label: 'Close date' },
+  { re: /\brenewal\s+date\b/i, property: 'renewal_date', label: 'Renewal date' },
+  { re: /\bdue\s+date\b/i, property: 'due_at', label: 'Due date' },
+];
+
+/**
  * Choose the one write this instruction asks for and fill it from resolved
  * records. Returns the action, or what was wanted and why it could not be
  * prepared — never a read tool dressed up as a write.
@@ -642,17 +841,48 @@ export function planWrite(input: PlanInput): WriteAction | WriteBlocked | null {
 
   if (wanted === 'update_record') {
     if (!available('update_record')) return noTool();
-    const deal = input.entities.find((e) => e.entity.type === 'deal');
     const stage = stageFrom(question, input.dealStages);
-    if (!stage || !/\b(stage|move|advance|push|to\s+negotiation|to\s+proposal|closed)\b/i.test(question)) {
+    const dated = DATE_PROPERTY_WORDS.find((one) => one.re.test(question));
+    const stageAsked = !!stage && /\b(stage|move|advance|push|to\s+negotiation|to\s+proposal|closed)\b/i.test(question);
+    if (!stageAsked && !dated) {
       return { wanted, reason: 'I could not tell which property to set — name the property and the value, e.g. "move <deal> to Negotiation".' };
     }
-    if (!deal) return noRecord('Changing a deal stage');
+    // The stage words are spent naming the value, so they are not part of the
+    // record's name; without that, "to Proposal sent" made every deal whose
+    // name contains "proposal" look like a better match for itself.
+    const chosen = namedWriteTarget(
+      question,
+      input.entities.filter((e) => e.entity.type === 'deal'),
+      [stage?.label ?? '', stage?.value ?? '', dated?.label ?? ''],
+    );
+    if (!chosen) return noRecord(stageAsked ? 'Changing a deal stage' : `Setting a ${dated!.label.toLowerCase()}`);
+    if ('ambiguous' in chosen) {
+      return {
+        wanted,
+        reason: `"${question.trim()}" names ${chosen.ambiguous.length} deals equally well — ${listPhrase(chosen.ambiguous.map((one) => `"${one.entity.label}"`))}. `
+          + 'I will not pick one for you on a write; quote the full deal name and I will prepare it.',
+      };
+    }
+    const deal = chosen.record;
+    if (stageAsked) {
+      return {
+        tool: 'update_record',
+        args: { object_type: 'deal', id: deal.entity.id, properties: { deal_stage: stage!.value } },
+        why: `Set ${deal.entity.label} to the ${stage!.label} stage; probability and forecast category restamp from the pipeline.`,
+        preview: [`${deal.entity.label}`, `deal_stage → ${stage!.label} (${stage!.value})`],
+      };
+    }
+    // A date in an instruction is a value. It was read as a reporting period
+    // and refused, which made every date-valued write unreachable.
+    const when = resolveDueDate(question, input.workspace.now);
+    if (!when) {
+      return { wanted, reason: `I could not read a date out of that — say when, e.g. "to 2026-12-01", "to next Tuesday" or "in 30 days".` };
+    }
     return {
       tool: 'update_record',
-      args: { object_type: 'deal', id: deal.entity.id, properties: { deal_stage: stage.value } },
-      why: `Set ${deal.entity.label} to the ${stage.label} stage; probability and forecast category restamp from the pipeline.`,
-      preview: [`${deal.entity.label}`, `deal_stage → ${stage.label} (${stage.value})`],
+      args: { object_type: 'deal', id: deal.entity.id, properties: { [dated!.property]: when.at } },
+      why: `Set ${deal.entity.label}'s ${dated!.label.toLowerCase()} to ${when.label}.`,
+      preview: [`${deal.entity.label}`, `${dated!.property} → ${when.label}`],
     };
   }
 
@@ -790,7 +1020,7 @@ function movementPlan(input: PlanInput): PlannedStep | null {
   if (!MOVEMENT_QUESTION.test(residue) && !NEW_RECURRING.test(input.question)) return null;
   const tool = movementTool(input.tools);
   if (!tool || (input.allowedTools && !input.allowedTools.has(tool.name))) return null;
-  const currency = detectCurrency(input.question);
+  const currency = plannedCurrency(input);
   // The movement report answers the measure the question named and takes no
   // `metric` argument, so the ledger is told which step carries it. The claim
   // is checked against the plan like every other, so it cannot be a way to
@@ -831,7 +1061,7 @@ function quotePlan(input: PlanInput): PlannedStep | null {
   if (!price || quantity === null) return null;
   const tool = quoteTool(input.tools);
   if (!tool || (input.allowedTools && !input.allowedTools.has(tool.name))) return null;
-  const currency = detectCurrency(input.question);
+  const currency = plannedCurrency(input);
   // The quote is evaluated on the meter's own price, so the meter the question
   // named is what chose the price — an argument the tool does not take by that
   // name, and a binding the ledger still verifies against this step.
@@ -987,13 +1217,22 @@ function scopedAggregate(
   // The stage set the metric implies is a default, not a fact about the
   // question: a named stage replaces it, and so does a named outcome.
   const outcome = outcomeOverride(input);
-  const base = shape.conditions(input.stages);
+  // A dimension filter on the same column replaces the measure's own default:
+  // "open tickets waiting on the customer" is one status, not the open set and
+  // that status at once, and the reader asked about the narrower one.
+  const dimensions = ledgerFilters(input, shape.objectType);
+  const base = shape.conditions(input.stages).filter((c) => !dimensions.some((d) => d.property === c.property));
   const conditions: InferredCondition[] = [
     ...(stageValue || outcome.length ? base.filter((c) => c.property !== 'deal_stage') : base),
     ...(!stageValue && outcome.length ? [{ property: 'deal_stage', op: 'in' as const, values: outcome }] : []),
     ...(pipelineValue ? [{ property: 'pipeline', op: 'eq' as const, value: String(pipelineValue) }] : []),
     ...(stageValue ? [{ property: 'deal_stage', op: 'eq' as const, value: String(stageValue) }] : []),
+    // Every other dimension the question narrowed the rows on. A measure that
+    // takes stage, pipeline and owner and silently drops the lead source is
+    // still answering a wider question than the one asked.
+    ...dimensions,
   ];
+  const cross = crossScopeFilter(input, shape.objectType);
   // A decided deal is dated by when it closed, so a period on a won or lost
   // question is a `close_date` filter — not a window the measure cannot take.
   // The column is the one the question named. "How much pipeline was created in
@@ -1009,12 +1248,16 @@ function scopedAggregate(
     ...(shape.property ? { property: shape.property } : {}),
     conditions,
     ...(owner ? { owner_id: owner.entity.id } : {}),
+    ...(cross ? { associated_to_any: cross.ids } : {}),
     ...(dateProperty ? { date_property: dateProperty, start: input.window.start, end: input.window.end } : {}),
   }, [
     owner
       ? `"${owner.mention}" is ${owner.entity.label}, so ${metric.metric.label} is computed over the rows they own rather than over the workspace.`
       : `${metric.metric.label} is computed over the rows directly so the scope the question named can be a filter on it.`,
     closing ? `Scoped to deals whose \`${input.dateProperty}\` falls in ${input.window.label} — the window the question named, applied to the column it named rather than waived.` : '',
+    cross
+      ? `"${cross.entry.text}" is a ${(cross.entry.resolved?.noun ?? 'property').toLowerCase()} on ${cross.entry.resolved?.objectType ?? 'company'} records, not on ${shape.objectType} records — so the measure is scoped to the ${cross.ids.length} ${cross.entry.resolved?.objectType ?? 'company'} rows it picks out rather than dropped.`
+      : '',
     outcome.length
       ? `The question names an outcome, so the stage set is ${listPhrase(outcome)} rather than the open book ${metric.metric.label} is defined over.`
       : '',
@@ -1027,6 +1270,13 @@ function scopedAggregate(
     args: { object_type: shape.objectType, measure: shape.measure },
     note: `${metric.metric.label} is computed as a ${shape.measure} of ${shape.property ?? 'rows'} over ${shape.objectType} records.`,
   });
+  if (cross) {
+    named?.bindEntry(cross.entry, {
+      tool: 'record_aggregate',
+      args: { associated_to_any: cross.ids },
+      note: `${cross.entry.resolved?.label ?? cross.entry.text} is the ${cross.ids.length} ${cross.entry.resolved?.objectType ?? 'company'} rows this measure is associated to.`,
+    });
+  }
   return step;
 }
 
@@ -1038,9 +1288,12 @@ function scopedAggregate(
  * it: the reader asked which rows, and a workspace scalar names none of them.
  */
 const RECORD_RANKING_NOUN = '(?:deals?|opportunit(?:y|ies)|invoices?|tickets?)';
-const RECORD_RANKING_QUALIFIER = '(?:open\\s+|closed\\s+|won\\s+|lost\\s+|active\\s+|outstanding\\s+|unpaid\\s+|overdue\\s+)*';
+const RECORD_RANKING_QUALIFIER = '(?:(?:open|closed|won|lost|active|outstanding|unpaid|overdue|value|valued|valuable|worth|priced)[-\\s]+)*';
 const RECORD_RANKING = new RegExp(
-  `\\b(?:top|biggest|largest|highest|best|worst|lowest|smallest)\\s+(?:\\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten)?\\s*${RECORD_RANKING_QUALIFIER}${RECORD_RANKING_NOUN}\\b`
+  // The separator is a hyphen as often as a space: "the lowest-value deals in
+  // the Expansion pipeline" was refused outright while "the lowest value
+  // deals" answered, on one character.
+  `\\b(?:top|biggest|largest|highest|best|worst|lowest|smallest|least|most|cheapest)[-\\s]+(?:\\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten)?[-\\s]*${RECORD_RANKING_QUALIFIER}${RECORD_RANKING_NOUN}\\b`
   + `|\\b(?:\\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten)\\s+(?:biggest|largest|highest|best|worst|lowest|smallest)\\s+${RECORD_RANKING_QUALIFIER}${RECORD_RANKING_NOUN}\\b`
   // "What is the largest one?" in a thread ranks the rows the turn before it
   // listed. It came back as an unknown-measure refusal naming the pronoun.
@@ -1048,9 +1301,56 @@ const RECORD_RANKING = new RegExp(
 
 const RANKED_ORDER: Record<string, string> = { deal: 'amount', invoice: 'total', ticket: 'created' };
 
+/**
+ * The properties a list of each type can honestly be ordered by.
+ *
+ * A sort key the type does not carry sorts on nulls, which is not a ranking at
+ * all — it is the same rows in an arbitrary order under a sentence claiming
+ * they are the smallest. When the question names one of those, this returns
+ * nothing and the ranking qualifier goes unbound, which is a refusal.
+ */
+const ORDERABLE: Record<string, string[]> = {
+  deal: ['amount', 'close_date', 'created', 'updated'],
+  invoice: ['total', 'amount_due', 'created', 'updated'],
+  ticket: ['created', 'updated'],
+};
+
+/**
+ * The `order_by` and `direction` a row list runs with.
+ *
+ * Both halves are always emitted, so the ledger can prove the order the answer
+ * describes is the order the query ran in.
+ */
+function orderArgs(input: PlanInput, objectType: string): { order_by: string; direction: 'asc' | 'desc' } | Record<string, never> {
+  const fallback = RANKED_ORDER[objectType];
+  const named = input.order ?? null;
+  if (!named) return fallback ? { order_by: fallback, direction: 'desc' } : {};
+  const property = named.property ?? fallback;
+  if (!property || !(ORDERABLE[objectType] ?? []).includes(property)) return fallback ? { order_by: fallback, direction: 'desc' } : {};
+  return { order_by: property, direction: named.direction };
+}
+
+/**
+ * "What are the biggest deals owned by Marcus Ilori?" — a superlative in a
+ * question that asks *what they are*.
+ *
+ * It is a list intent with no number on it. Read as an aggregate it came back
+ * as "Marcus Ilori has 25 deals" — a correct count, no ranking and no rows —
+ * and the Negotiation/Renewal version came back as a $165,600 sum. Both are
+ * answers to a question with different words in it.
+ */
+const SUPERLATIVE_LIST =
+  /\b(?:what|which|who)\s+(?:are|were|is|was)\b[^?]*\b(?:biggest|largest|highest|best|worst|lowest|smallest|top|cheapest|least|most)\b/i;
+
 function rankedRecordsPlan(input: PlanInput): PlannedStep | null {
-  const limit = input.qualifiers?.value('limit');
-  if (typeof limit !== 'number' || input.groupBy !== 'none') return null;
+  const cut = input.qualifiers?.value('limit');
+  // A named order is a request for rows even with no cut-off on it: "which are
+  // the lowest value open deals in the New business pipeline?" was answered
+  // with the pipeline's $4,385,460 total and no row at all — the aggregate of
+  // the set the reader asked to see the bottom of.
+  const limit = typeof cut === 'number' ? cut
+    : input.order || SUPERLATIVE_LIST.test(input.question) ? 8 : null;
+  if (limit === null || input.groupBy !== 'none') return null;
   if (!RECORD_RANKING.test(input.question)) return null;
   const objectType = input.types.find((t) => t in RANKED_ORDER);
   if (!objectType || objectType !== 'deal') return null;
@@ -1065,19 +1365,51 @@ function rankedRecordsPlan(input: PlanInput): PlannedStep | null {
   if (input.metric && MONEY_METRIC_SHAPE[input.metric.metric.id]?.objectType === objectType) {
     input.qualifiers?.bind('metric', {
       tool: 'record_search',
-      args: { object_type: objectType, order_by: RANKED_ORDER[objectType] },
-      note: `${input.metric.metric.label} is the ordering of these rows — \`${RANKED_ORDER[objectType]}\` descending over ${objectType} records — rather than a total over them.`,
+      args: { object_type: objectType, order_by: orderArgs(input, objectType).order_by ?? RANKED_ORDER[objectType] },
+      note: `${input.metric.metric.label} is the ordering of these rows — \`${orderArgs(input, objectType).order_by ?? RANKED_ORDER[objectType]}\` over ${objectType} records — rather than a total over them.`,
     });
   }
   return builtin('record_search', {
     object_type: objectType,
     ...(conditions.length ? { conditions } : {}),
     ...(owner ? { owner_id: owner.entity.id } : {}),
+    ...crossScopeArgs(input, objectType, 'record_search'),
     ...scope,
-    order_by: RANKED_ORDER[objectType],
+    ...orderArgs(input, objectType),
     ...(dated ? { date_property: input.dateProperty ?? 'close_date', start: input.window.start, end: input.window.end } : {}),
     limit,
-  }, `The question asks for the ${limit === 1 ? 'single largest' : `${limit} largest`} ${objectType}${limit === 1 ? '' : 's'}, which is ${limit === 1 ? 'one row' : `${limit} rows`} ordered by \`${RANKED_ORDER[objectType]}\` — a workspace total takes no cut-off and names none of them.`);
+  }, `The question asks for the ${limit === 1 ? 'single ' : `${limit} `}${input.order?.word ?? 'largest'} ${objectType}${limit === 1 ? '' : 's'}, which is ${limit === 1 ? 'one row' : `${limit} rows`} ordered by \`${orderArgs(input, objectType).order_by ?? RANKED_ORDER[objectType]}\` — a workspace total takes no cut-off and names none of them.`);
+}
+
+/**
+ * The stage filter a deal list starts from.
+ *
+ * "Open" is the right default for a list of deals and the wrong one for a list
+ * the question already narrowed: "which deals did Marcus Ilori lose last
+ * quarter?" was refused outright, because the branch that lists a rep's deals
+ * hardcoded the open book and a closed-lost filter cannot be intersected with
+ * it. The count form of the same question — which reads the outcome off the
+ * ledger — answered it correctly all along.
+ *
+ * With an outcome named, this returns nothing and the scope pass puts the named
+ * one on instead, so the two never contradict.
+ */
+/** Two condition lists as one, the named filter winning on a property both set. */
+function mergeConditions<T extends { property?: string }>(base: T[], extra: T[]): T[] {
+  const out = [...base];
+  for (const condition of extra) {
+    const at = out.findIndex((held) => held.property === condition.property);
+    if (at < 0) out.push(condition);
+    else out[at] = condition;
+  }
+  return out;
+}
+
+function openStageCondition(input: PlanInput): InferredCondition[] {
+  const named = input.qualifiers?.entries.some((held) =>
+    (held.kind === 'status' || held.kind === 'stage') && held.resolved?.property === 'deal_stage'
+    && held.state !== 'refused');
+  return named ? [] : [{ property: 'deal_stage', op: 'in' as const, values: input.stages.open }];
 }
 
 function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedStep[] {
@@ -1127,7 +1459,7 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
     entities.filter((e) => ['company', 'contact', 'customer'].includes(e.entity.type)),
   ).slice(0, 3);
 
-  const currency = detectCurrency(input.question);
+  const currency = plannedCurrency(input);
   // Whatever the metric is, it is measured over the pipeline, the stage and the
   // ranking cut-off the question named — or `business_metric` errors, which is
   // the point. The one thing it must never do is compute the workspace figure
@@ -1160,11 +1492,16 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
       start: window.start,
       end: window.end,
       window_label: window.label,
-      ...(detectCurrency(input.question) ? { currency: detectCurrency(input.question)! } : {}),
+      ...(plannedCurrency(input) ? { currency: plannedCurrency(input)! } : {}),
       ...scopeArgs,
       group_by: groupBy,
+      // Which end of the ranking the question asked for. Without it "who has
+      // the least pipeline" returned the same rows in the same order as "who
+      // has the most", and the answer named the top of the list either way.
+      ...(input.order ? { direction: input.order.direction } : {}),
+      ...(input.qualifiers?.value('limit') ? { limit: input.qualifiers.value('limit') as number } : {}),
       compare: window.grain !== 'range' || window.start > 0,
-    }, `The question asks which ${groupBy === 'account' ? 'accounts are' : `${groupBy} is`} biggest, so ${metric?.metric.label ?? 'closed-won bookings'} is computed for ${window.label} and grouped by ${groupBy} to rank them.`);
+    }, `The question asks which ${groupBy === 'account' ? 'accounts are' : `${groupBy} is`} ${input.order?.direction === 'asc' ? input.order.word : 'biggest'}, so ${metric?.metric.label ?? 'closed-won bookings'} is computed for ${window.label} and grouped by ${groupBy} to rank them.`);
     return [ranked];
   }
 
@@ -1249,11 +1586,40 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
           ...(valued ? { property: valued } : {}),
           ...(conditions.length ? { conditions } : {}),
           ...(subject ? { associated_to: subject.id } : {}),
+          ...crossScopeArgs(input, namedType, 'record_aggregate'),
           ...(owner ? { owner_id: owner.entity.id } : {}),
         }, `The question ${valued ? `sums \`${valued}\` over` : 'counts'} ${namedType} records${conditions.length ? ` qualified by ${conditions.map((c) => c.property).join(' and ')}` : ''}${owner ? ` and owned by ${owner.entity.label}` : ''}.`));
       } else if (metric && MONEY_METRIC_SHAPE[metric.metric.id]
-        && (namedOwner(input) || closesInWindow(input) || outcomeOverride(input).length > 0)) {
+        && (namedOwner(input) || closesInWindow(input) || outcomeOverride(input).length > 0
+          || ledgerFilters(input, MONEY_METRIC_SHAPE[metric.metric.id].objectType).length > 0
+          || crossScopeFilter(input, MONEY_METRIC_SHAPE[metric.metric.id].objectType))) {
+        // The catalogue measure takes no lead source, no competitor and no
+        // industry. Running it anyway is how "how much open pipeline came from
+        // partner referrals" — $690,260 across 3 deals — was answered with the
+        // $9,010,960 workspace total, in the reader's own scoped sentence.
         steps.push(scopedAggregate(input, metric, MONEY_METRIC_SHAPE[metric.metric.id])!);
+      } else if (metric && namedType && !isLedgerType(namedType) && unbindableRecordFilter(input, namedType)) {
+        // The question qualifies the rows by a property the measure cannot
+        // take. Counting the rows themselves answers it exactly; running the
+        // measure answers a question with the same nouns and a different
+        // subject, and states the result with no hedge.
+        const conditions = inferConditions(input.question, namedType, input.stages, input.qualifiers);
+        const owner = namedOwner(input);
+        const valued = isValueQuestion(input.question) ? MONEY_PROPERTY_OF[namedType] : undefined;
+        input.qualifiers?.bind('metric', {
+          tool: 'record_aggregate',
+          args: { object_type: namedType, measure: valued ? 'sum' : 'count' },
+          note: `${metric.metric.label} is counted over the ${namedType} rows the question qualified — ${listPhrase(conditions.map((c) => `\`${c.property}\``))} — rather than as an intake figure the measure takes no such filter on.`,
+        });
+        steps.push(builtin('record_aggregate', {
+          object_type: namedType,
+          measure: valued ? 'sum' : 'count',
+          ...(valued ? { property: valued } : {}),
+          ...(conditions.length ? { conditions } : {}),
+          ...(subject ? { associated_to: subject.id } : {}),
+          ...crossScopeArgs(input, namedType, 'record_aggregate'),
+          ...(owner ? { owner_id: owner.entity.id } : {}),
+        }, `"${metric.matched}" names ${metric.metric.label}, which takes no ${listPhrase([...new Set(conditions.map((c) => c.property))])} filter — so the question is answered by counting the ${namedType} rows it qualified.`));
       } else {
         steps.push(metricStep(subject?.id, metric
           ? `"${metric.matched}" is the ${metric.metric.label} metric${subject ? ` for ${subject.label}` : ''} over ${window.label}.`
@@ -1277,7 +1643,24 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
       break;
     }
 
-    case 'compare':
+    case 'compare': {
+      // Two teammates is a comparison exactly as two accounts is. It used to
+      // be neither: `business_metric` takes no owner, so both names went
+      // unbound and "compare open pipeline for Dana Whitfield and Priya Raman"
+      // was refused with a sentence that then listed both of them as valid
+      // owners. The shaped aggregate takes an owner, so each rep is measured.
+      const rivals = (input.qualifiers?.all('owner') ?? [])
+        .filter((entry) => entry.resolved && entry.state === 'pending');
+      const shape = metric ? MONEY_METRIC_SHAPE[metric.metric.id] : undefined;
+      if (rivals.length >= 2 && shape && metric) {
+        for (const rival of rivals.slice(0, 2)) {
+          const person = input.entities.find((e) => e.entity.id === rival.resolved!.value);
+          if (!person) continue;
+          steps.push(scopedAggregate(input, metric, shape, person));
+        }
+        if (steps.length >= 2) break;
+        steps.length = 0;
+      }
       if (comparisonSubjects.length >= 2) {
         for (const candidate of comparisonSubjects.slice(0, 2)) {
           steps.push(metricStep(candidate.entity.id, `Compute ${metric?.metric.label ?? 'bookings'} for ${candidate.entity.label}.`));
@@ -1292,6 +1675,7 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
         steps.push(metricStep(subject?.id, `Compute ${metric?.metric.label ?? 'bookings'} for ${window.label} and the period before it.`));
       }
       break;
+    }
 
     case 'explain': {
       if (ledgerRecord && !subject) break;
@@ -1360,15 +1744,27 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
         // rep's whole open book under "closing in March" is the same silent
         // widening as an ignored pipeline, wearing an owner.
         const dated = input.windows.length > 0;
+        // Every filter the sentence carries, not just the rep: "open deals over
+        // $500,000 owned by Priya" came back as all 17 of her open deals, the
+        // threshold dropped on the way in while the same question without a
+        // name applied it exactly.
+        const owned = mergeConditions(openStageCondition(input), inferConditions(input.question, 'deal', input.stages, input.qualifiers));
         steps.push(builtin('record_search', {
           object_type: 'deal',
-          conditions: [{ property: 'deal_stage', op: 'in', values: input.stages.open }],
+          conditions: owned,
           owner_id: person.entity.id,
-          order_by: 'amount',
+          ...orderArgs(input, 'deal'),
           ...(dated ? { date_property: input.dateProperty ?? 'close_date', start: window.start, end: window.end } : {}),
           limit: rowLimit(input, 8),
         }, `"${person.mention}" is ${person.entity.label}; show the open deals they own${dated ? ` whose \`${input.dateProperty ?? 'close_date'}\` falls in ${window.label}` : ''}.`));
-        if (!dated) {
+        // A rep's ticket queue belongs in an answer about the rep, not in an
+        // answer about their deals. "Show me the open deals owned by Marcus
+        // Ilori in the Renewal pipeline" came back with the two right rows and
+        // "No open tickets owned by Marcus Ilori." underneath — a true
+        // sentence about a question nobody asked, in a scope the question had
+        // narrowed twice.
+        const dealsOnly = input.types.length > 0 && input.types.every((t) => t === 'deal');
+        if (!dated && !dealsOnly) {
           steps.push(builtin('record_search', {
             object_type: 'ticket',
             conditions: [{ property: 'status', op: 'in', values: OPEN_TICKET_STATUSES }],
@@ -1411,7 +1807,7 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
             object_type: scopedType,
             ...(conditions.length ? { conditions } : {}),
             associated_to: subject.id,
-            ...(scopedType === 'deal' ? { order_by: 'amount' } : {}),
+            ...(scopedType === 'deal' ? orderArgs(input, 'deal') : {}),
             limit: rowLimit(input, 10),
           }, `The question asks for ${scopedType} records on ${subject.label}${conditions.length ? `, qualified by ${conditions.map((c) => c.property).join(' and ')}` : ''}.`, 0.9));
         }
@@ -1495,12 +1891,15 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
         // and "which accounts are at risk of churning?" as the 8 most recently
         // created companies — both in the same confident register as a real
         // answer, neither saying the question had not been understood.
-        if (!conditions.length && !dated && !listOwner && !LIST_REQUEST.test(input.question)) break;
+        const listCross = crossScopeArgs(input, objectType, 'record_search');
+        if (!conditions.length && !dated && !listOwner && Object.keys(listCross).length === 0
+          && !LIST_REQUEST.test(input.question)) break;
         steps.push(builtin('record_search', {
           object_type: objectType,
           ...(conditions.length ? { conditions } : {}),
           ...(listOwner ? { owner_id: listOwner.entity.id } : {}),
-          ...(objectType === 'deal' ? { order_by: 'amount' } : {}),
+          ...listCross,
+          ...(objectType === 'deal' ? orderArgs(input, 'deal') : {}),
           ...(dated ? { date_property: input.dateProperty ?? 'close_date', start: window.start, end: window.end } : {}),
           limit: rowLimit(input, 10),
         }, [
@@ -1545,19 +1944,19 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
         if (shape && metric) steps.push(scopedAggregate(input, metric, shape, owner));
         steps.push(builtin('record_search', {
           object_type: 'deal',
-          conditions: [{ property: 'deal_stage', op: 'in', values: input.stages.open }],
+          conditions: openStageCondition(input),
           owner_id: owner.entity.id,
-          order_by: 'amount',
+          ...orderArgs(input, 'deal'),
           limit: rowLimit(input, 8),
-        }, `List ${owner.entity.label}'s largest open deals so the summary names names.`, 0.9));
+        }, `List ${owner.entity.label}'s ${input.order?.word ?? 'largest'} open deals so the summary names names.`, 0.9));
       } else {
         steps.push(metricStep(undefined, `Summarise ${window.label} with the headline number first.`));
         steps.push(builtin('record_search', {
           object_type: 'deal',
-          conditions: [{ property: 'deal_stage', op: 'in', values: input.stages.open }],
-          order_by: 'amount',
+          conditions: openStageCondition(input),
+          ...orderArgs(input, 'deal'),
           limit: rowLimit(input, 8),
-        }, 'List the largest open deals so the summary names names.', 0.9));
+        }, `List the ${input.order?.word ?? 'largest'} open deals so the summary names names.`, 0.9));
       }
       break;
 
@@ -1568,8 +1967,8 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
       } else {
         steps.push(builtin('record_search', {
           object_type: 'deal',
-          conditions: [{ property: 'deal_stage', op: 'in', values: input.stages.open }],
-          order_by: 'amount',
+          conditions: openStageCondition(input),
+          ...orderArgs(input, 'deal'),
           limit: rowLimit(input, 10),
         }, 'Prioritise against the open pipeline, largest first.'));
         steps.push(metricStep(undefined, `Anchor the plan on ${metric?.metric.label ?? 'bookings'} for ${window.label}.`, ));
@@ -1640,8 +2039,8 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
     steps.push(metricStep(undefined, `Nothing specific was named, so the answer opens with ${metric?.metric.label ?? 'bookings'} for ${window.label}.`));
     steps.push(builtin('record_search', {
       object_type: 'deal',
-      conditions: [{ property: 'deal_stage', op: 'in', values: input.stages.open }],
-      order_by: 'amount',
+      conditions: openStageCondition(input),
+      ...orderArgs(input, 'deal'),
       limit: rowLimit(input, 5),
     }, 'Name the biggest open deals so the picture is concrete.', 0.8));
     steps.push(builtin('record_aggregate', {
@@ -2120,7 +2519,7 @@ export function planTools(input: PlanInput): PlanResult {
   // The refusal stands only if nothing the question named by its own words could
   // be armed. When something could, that is the answer, and the ledger note
   // would be a caveat about a capability the reader never asked after.
-  if (refusing) return { steps: steps.slice(0, input.maxSteps), skipped: [], blocked: steps.length ? [] : blocked };
+  if (refusing) return { steps: scopeRowSteps(input, steps.slice(0, input.maxSteps)), skipped: [], blocked: steps.length ? [] : blocked };
 
   // A capability the question asked for by name, needing a typed id the
   // question does not carry, gets a finder in front of it: list the records of
@@ -2145,7 +2544,101 @@ export function planTools(input: PlanInput): PlanResult {
     }
   }
 
-  return { steps: steps.slice(0, input.maxSteps), skipped, blocked };
+  return { steps: scopeRowSteps(input, steps.slice(0, input.maxSteps)), skipped, blocked };
+}
+
+/**
+ * Push every record filter the question named into every step that returns rows.
+ *
+ * A qualifier is a property of the *plan*, not of the one step that happened to
+ * take an argument for it. The planner used to bind `pipeline` to the metric
+ * and then list the workspace's biggest open deals underneath the scoped
+ * sentence — four of five rows from other pipelines, the top one bigger than
+ * the named pipeline's biggest deal. Nothing in the plan was wrong on its own;
+ * the answer was.
+ *
+ * So: a row step either carries every filter that applies to the records it
+ * reads, or it does not run. Two filters on one property are intersected — "how
+ * many open deals are in Negotiation" is one condition, not two contradictory
+ * ones — and a step whose own filter contradicts the question is dropped rather
+ * than rewritten into an answer about something else.
+ */
+const ROW_BUILTINS: BuiltinTool[] = ['record_search', 'record_aggregate'];
+
+function scopeRowSteps(input: PlanInput, steps: PlannedStep[]): PlannedStep[] {
+  const ledger = input.qualifiers;
+  if (!ledger) return steps;
+  const filters = ledger.entries
+    .filter((entry) => entry.state === 'pending' || entry.state === 'bound')
+    .map((entry) => ({ entry, filter: recordFilter(entry) }))
+    .filter((row): row is { entry: typeof row.entry; filter: NonNullable<typeof row.filter> } => !!row.filter);
+  if (!filters.length) return steps;
+
+  const rewritten: { step: PlannedStep; keep: boolean }[] = [];
+  const out: PlannedStep[] = [];
+  const keep = (step: PlannedStep) => { rewritten.push({ step, keep: true }); out.push(step); };
+  const drop = (step: PlannedStep) => rewritten.push({ step, keep: false });
+  for (const step of steps) {
+    if (!step.builtin || !ROW_BUILTINS.includes(step.builtin)) { keep(step); continue; }
+    const objectType = String(step.args.object_type ?? '');
+    const applies = filters.filter((row) => row.filter.objectType === '*' || row.filter.objectType === objectType);
+    if (!applies.length) {
+      // Rows of a type none of the question's filters can narrow. They are not
+      // this question's evidence, whatever else is true about them.
+      drop(step);
+      continue;
+    }
+    const conditions = (Array.isArray(step.args.conditions) ? [...step.args.conditions] : []) as {
+      property?: string; op?: string; value?: unknown; values?: unknown[];
+    }[];
+    const args: Record<string, unknown> = { ...step.args };
+    let contradicted = false;
+    for (const { filter } of applies) {
+      // An owner and an account are arguments; a pipeline, a stage and a status
+      // are conditions on the rows.
+      if (filter.property === 'owner_id') {
+        // A step already narrowed to one of the owners the question named is
+        // narrowed. Overwriting it with whichever owner the ledger holds last
+        // is how "compare open pipeline for Dana Whitfield and Priya Raman"
+        // measured Priya twice — one figure printed under both names.
+        const named = applies
+          .filter((row) => row.filter.property === 'owner_id')
+          .flatMap((row) => row.filter.values);
+        if (args.owner_id !== undefined && named.some((one) => String(one) === String(args.owner_id))) continue;
+        args.owner_id = filter.values[0];
+        continue;
+      }
+      const at = conditions.findIndex((condition) => condition.property === filter.property);
+      if (at < 0) {
+        conditions.push(filter.values.length === 1
+          ? { property: filter.property, op: 'eq', value: filter.values[0] }
+          : { property: filter.property, op: 'in', values: filter.values });
+        continue;
+      }
+      const held = conditions[at];
+      const heldValues = (Array.isArray(held.values) ? held.values : held.value === undefined ? [] : [held.value]).map((v) => v as string | number);
+      // The narrower of the two, which is their intersection: the step's own
+      // "every open stage" and the question's "Negotiation" are one filter.
+      const narrowed = heldValues.length
+        ? filter.values.filter((value) => heldValues.some((other) => String(other) === String(value)))
+        : filter.values;
+      if (!narrowed.length) { contradicted = true; break; }
+      conditions[at] = narrowed.length === 1
+        ? { property: filter.property, op: 'eq', value: narrowed[0] }
+        : { property: filter.property, op: 'in', values: narrowed };
+    }
+    if (contradicted) { drop(step); continue; }
+    if (conditions.length) args.conditions = conditions;
+    keep({ ...step, args });
+  }
+
+  // A step is only dropped when something else in the plan answers under the
+  // scope. Dropping the last one would leave the question with no plan and the
+  // reader with nothing — and the ledger already refuses a scope it cannot
+  // prove, which is the better failure of the two.
+  const proven = filters.every(({ filter }) =>
+    out.some((step) => stepNarrowsTo({ tool: step.tool, args: step.args }, filter)));
+  return proven ? out : rewritten.map((row) => row.step);
 }
 
 export const planSteps = (input: PlanInput): PlannedStep[] => planTools(input).steps;

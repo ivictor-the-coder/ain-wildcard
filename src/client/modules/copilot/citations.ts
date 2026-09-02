@@ -19,6 +19,23 @@ export interface Citation { id: string; label: string; type: string }
  */
 const RECORD_TYPES = new Set(['note', 'call', 'email', 'meeting', 'task', 'ticket', 'deal', 'company', 'contact']);
 
+/**
+ * The cited records, each named once.
+ *
+ * The engine cites the row it read, and a run that reads one row twice — once
+ * to count the open tickets and again to name the oldest — cites it twice.
+ * "Dashboard loads slowly with 900 assets selected" appearing twice under
+ * SOURCES reads as two tickets, which is a claim about the workspace.
+ */
+export function dedupeCitations(citations: Citation[]): Citation[] {
+  const seen = new Set<string>();
+  return citations.filter((citation) => {
+    if (seen.has(citation.id)) return false;
+    seen.add(citation.id);
+    return true;
+  });
+}
+
 /** Where a cited record lives in this product, or null when nothing shows it. */
 export function citationHref(citation: Citation): string | null {
   switch (citation.type) {
@@ -63,6 +80,42 @@ export function writeTargets(args: Record<string, unknown>): string[] {
     if (Array.isArray(value)) for (const entry of value) push(entry);
   }
   return [...new Set(out)].filter((id) => ID_PREFIX[id.split('_')[0]]);
+}
+
+/**
+ * The record a queued write would land on, as the approval card names it.
+ *
+ * The card's first preview line is the engine's own sentence for the target —
+ * `Deal Sakamoto Seiki — multi-site rollout`, `Note on Ferro Norte
+ * Siderurgia`, `Follow-up on Aldergate Logistics` — and the name inside it is
+ * the only thing on that card a person can check against the sentence they
+ * typed. It is read off the preview rather than the arguments because the
+ * arguments carry `deal_nw_59` and nothing else.
+ *
+ * `null` when the shape is one this cannot read, or when the engine itself
+ * could not name the target: a card that says "a record I can no longer name"
+ * has already said the loudest true thing about it.
+ */
+export function writeTargetLabel(
+  tool: string,
+  args: Record<string, unknown>,
+  preview: string[],
+): string | null {
+  const first = preview[0]?.trim();
+  if (!first || first.includes('a record I can no longer name')) return null;
+  const lead = /^(?:note on|follow-up on|linked to)\s+(.+)$/i.exec(first);
+  if (lead) {
+    const one = lead[1].split(',')[0].trim();
+    return one && one !== 'no record' ? one : null;
+  }
+  if (tool !== 'update_record') return null;
+  // `${humanise(object_type)} ${name}` — the type is dropped so what is left is
+  // the record's own display name and nothing else.
+  const type = typeof args.object_type === 'string' ? args.object_type.replace(/_/g, ' ') : '';
+  if (!type) return first || null;
+  const stripped = new RegExp(`^${type.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\s+`, 'i');
+  const name = stripped.test(first) ? first.replace(stripped, '').trim() : first;
+  return name || null;
 }
 
 export function recordLink(id: string): { type: string; href: string } | null {

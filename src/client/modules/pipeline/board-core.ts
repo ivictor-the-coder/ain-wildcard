@@ -233,3 +233,67 @@ export function describeBoardState(state: BoardState, o: {
   return parts.join(' · ');
 }
 
+
+/* ------------------------- moving around the board ------------------------ */
+
+/**
+ * The board as a grid of deal ids: one array per column, in the order the
+ * columns are drawn.
+ */
+export type BoardGrid = string[][];
+
+/** The keys that move the roving focus, so the handler can ignore everything else. */
+export const BOARD_KEYS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End'] as const;
+
+export type BoardKey = (typeof BOARD_KEYS)[number];
+
+export const isBoardKey = (key: string): key is BoardKey => (BOARD_KEYS as readonly string[]).includes(key);
+
+/**
+ * Where a key press moves the keyboard on the board, or null for nowhere.
+ *
+ * The columns are deliberately not tab stops and the cards used to be, which
+ * meant 36 Tab presses to reach the first card and then one press per card to
+ * leave the column you were in — on a 22-card board, the keyboard could not
+ * cross the board at all in any reasonable number of keystrokes. One card holds
+ * the tab stop and these keys move it, which is the grid pattern every other
+ * two-dimensional control uses.
+ *
+ * Left and right skip empty columns rather than stopping in them: a column with
+ * no cards has nothing to put the keyboard on, and stopping there would make
+ * crossing a sparse board take one press per empty stage.
+ */
+export function boardMove(grid: BoardGrid, from: string, key: BoardKey): string | null {
+  let column = -1;
+  let row = -1;
+  for (let c = 0; c < grid.length; c += 1) {
+    const at = grid[c].indexOf(from);
+    if (at >= 0) { column = c; row = at; break; }
+  }
+  if (column < 0) return grid.flat()[0] ?? null;
+  const here = grid[column];
+  if (key === 'ArrowDown') return here[row + 1] ?? null;
+  if (key === 'ArrowUp') return here[row - 1] ?? null;
+  if (key === 'Home') return here[0] !== from ? here[0] : null;
+  if (key === 'End') return here[here.length - 1] !== from ? here[here.length - 1] : null;
+  const step = key === 'ArrowRight' ? 1 : -1;
+  for (let c = column + step; c >= 0 && c < grid.length; c += step) {
+    const next = grid[c];
+    if (next.length) return next[Math.min(row, next.length - 1)];
+  }
+  return null;
+}
+
+/**
+ * The card that holds the board's single tab stop.
+ *
+ * The last card the keyboard was on, while it is still on the board — a card
+ * filtered away, moved to a hidden closed stage or dragged elsewhere takes the
+ * tab stop with it, and a board where no card carries `tabindex="0"` cannot be
+ * reached from the keyboard at all.
+ */
+export function boardTabStop(grid: BoardGrid, roving: string | null): string | null {
+  if (roving && grid.some((column) => column.includes(roving))) return roving;
+  for (const column of grid) if (column.length) return column[0];
+  return null;
+}

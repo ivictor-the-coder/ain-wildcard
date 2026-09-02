@@ -75,6 +75,8 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
         pipeline: v.optional(v.string({ max: 60, description: 'Narrow a deal-sourced metric to one pipeline, by machine name (new_business, expansion, renewal). Errors rather than widening when the metric cannot take one.' })),
         stage: v.optional(v.string({ max: 60, description: 'Narrow open pipeline, weighted pipeline or the deal count to one stage, by machine name (negotiation, proposal, technical_validation).' })),
         limit: v.optional(v.int({ min: 1, max: 25, description: 'How many groups a ranked breakdown returns. Defaults to 5.' })),
+        // Which end of a ranked breakdown: desc (the default) is the biggest, asc the smallest.
+        direction: v.optional(v.enum(['asc', 'desc'] as const)),
       }),
       run: (args: Parameters<typeof businessMetric>[2], _c, meta) => businessMetric(ctx, meta.orgId, args),
     },
@@ -89,14 +91,20 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
         object_type: v.string({ min: 2, max: 40, description: 'company, contact, deal, ticket, note, call, meeting, email or task.' }),
         conditions: v.optional(conditionInput),
         associated_to: v.optional(v.string({ max: 80, description: 'Only records linked to this record id.' })),
+        // A dimension can narrow a table this query does not read: the deals of
+        // every pharmaceutical company are a set of accounts, not a deal
+        // property. Without this the industry could only be dropped.
+        associated_to_any: v.optional(v.array(v.string({ max: 80 }), { max: 200 })),
         owner_id: v.optional(v.string({ max: 80, description: 'Only records owned by this teammate.' })),
         date_property: v.optional(v.string({ max: 60 })),
         start: v.optional(v.timestamp()),
         end: v.optional(v.timestamp()),
-        order_by: v.optional(v.string({ max: 60, description: 'Numeric or date property to sort by, highest first.' })),
+        order_by: v.optional(v.string({ max: 60, description: 'Numeric or date property to sort by. Pair it with direction; on its own it sorts highest first.' })),
+        // asc for the smallest, earliest or oldest first; desc (the default) for the largest or latest.
+        direction: v.optional(v.enum(['asc', 'desc'] as const)),
         limit: v.optional(v.int({ min: 1, max: 50 })),
       }),
-      run: (args: { object_type: string; conditions?: Condition[]; associated_to?: string; owner_id?: string; date_property?: string; start?: number; end?: number; order_by?: string; limit?: number }, _c, meta) =>
+      run: (args: { object_type: string; conditions?: Condition[]; associated_to?: string; owner_id?: string; date_property?: string; start?: number; end?: number; order_by?: string; direction?: 'asc' | 'desc'; limit?: number }, _c, meta) =>
         recordSearch(ctx, meta.orgId, args),
     },
     {
@@ -115,6 +123,7 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
         start: v.optional(v.timestamp()),
         end: v.optional(v.timestamp()),
         associated_to: v.optional(v.string({ max: 80 })),
+        associated_to_any: v.optional(v.array(v.string({ max: 80 }), { max: 200 })),
         owner_id: v.optional(v.string({ max: 80, description: 'Only records owned by this teammate.' })),
       }),
       run: (args: Parameters<typeof recordAggregate>[2], _c, meta) => recordAggregate(ctx, meta.orgId, args),

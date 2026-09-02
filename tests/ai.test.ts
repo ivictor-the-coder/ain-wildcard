@@ -13,7 +13,7 @@ import { entityIndex, workspaceProfile } from '../src/server/ai/grounding';
 import { resolveEntities } from '../src/server/ai/resolve';
 import { estimateTokens, accountUsage } from '../src/server/ai/usage';
 import { stageSets } from '../src/server/ai/metrics';
-import { QualifierLedger } from '../src/server/ai/qualifiers';
+import { QualifierLedger, crmVocabulary, stageIn, stageLabels, unitVocabulary, unitsNamed } from '../src/server/ai/qualifiers';
 import { businessMetric } from '../src/server/ai/functions';
 import { anthropicProvider, toWire, toWireTools } from '../src/server/ai/anthropic';
 import { formatMoney } from '../src/shared/money';
@@ -5067,7 +5067,348 @@ const QUALIFIER_CASES: QualifierCase[] = [
     must: () => [/€/, /EUR/],
     never: () => [/^\$/m],
   },
+  /* --- stage: a name only one pipeline uses ------------------------------ */
+  {
+    // `discovery` is "Discovery" in New business and "Scoping" in Expansion.
+    // Keeping one label per stage value threw the other away, so this question
+    // resolved no stage at all and answered with the whole open book — 38
+    // deals — with nothing in the run naming the word the reader typed.
+    kind: 'stage (a label only one pipeline uses)',
+    q: 'How many deals are in Scoping?',
+    must: () => [countOf(stageValueOf('Scoping'), pipelineOf('Scoping')), /Scoping/],
+    never: () => [new RegExp(`\\b${openFacts().length} (?:open )?deals\\b`), /Discovery/],
+  },
+  {
+    kind: 'stage (a label only one pipeline uses, written with the word)',
+    q: 'How many deals are in the Scoping stage?',
+    must: () => [countOf(stageValueOf('Scoping'), pipelineOf('Scoping')), /Scoping/],
+    never: () => [new RegExp(`\\b${openFacts().length} (?:open )?deals\\b`)],
+  },
+  {
+    // "Churned" is the Renewal pipeline's name for `closed_lost`. Answering it
+    // with the stage value alone reports every closed-lost deal in all three
+    // pipelines — a bigger number about a wider question.
+    kind: 'stage (a pipeline-specific label narrows the pipeline too)',
+    q: 'Which deals are in the Churned stage?',
+    must: () => [/Renewal/],
+    never: () => [String(dealFacts().filter((d) => d.stage === stageValueOf('Churned')).length)],
+  },
+  {
+    // The stored name is every pipeline's, so it narrows nothing — and it is
+    // the name the answer must read back. "6 deals at the Expansion identified
+    // stage" describes two of the six.
+    kind: 'stage (the stored name stays general, and is read back as written)',
+    q: 'How many deals are in the Qualification stage?',
+    must: () => [countOf('qualification', null), /Qualification stage/],
+    never: () => [/Expansion identified/],
+  },
+  {
+    // "Scoping" is Expansion's name for `discovery`; New business calls it
+    // "Discovery". Translating the reader's word into the other pipeline's and
+    // answering under it reported four deals at a stage that book has not got.
+    kind: 'stage (a name the named pipeline does not use is a refusal)',
+    q: 'What is the New business pipeline worth at the Scoping stage?',
+    refuse: /New business pipeline has no stage called "Scoping"/,
+    never: () => [money(sumAmount(openFacts().filter((d) => d.pipeline === 'new_business' && d.stage === 'discovery')))],
+  },
+  {
+    kind: 'stage (a list reads its stage back in the scoped pipeline\'s words)',
+    q: 'Which deals are in Scoping in the Expansion pipeline?',
+    must: () => [countOf(stageValueOf('Scoping'), 'expansion'), /Scoping stage/],
+    never: () => [/at the Discovery stage/],
+  },
+  /* --- status on a record that is not a deal ----------------------------- */
+  {
+    // `business_metric` counts the workspace's ticket intake over a window and
+    // takes no status. The word the reader wrote reached nothing, and the
+    // quarter's intake was stated as the answer.
+    kind: 'status (a ticket status the workspace defines)',
+    q: 'How many tickets are escalated?',
+    must: () => [new RegExp(`\\b${ticketsWithStatus('escalated')} tickets?\\b`), /Escalated/],
+    never: () => [new RegExp(`\\b${ticketsRaisedThisPeriod()} tickets\\b`)],
+  },
+  {
+    // A status this workspace spells in three words. Falling through to the
+    // general open-ticket set answers a wider question than the one asked.
+    kind: 'status (a multi-word ticket status is that status, not "open")',
+    q: 'How many tickets are waiting on us?',
+    must: () => [new RegExp(`\\b${ticketsWithStatus('waiting_on_us')} ticket\\b`), /Waiting on us/],
+    never: () => [new RegExp(`\\b${openTickets()} (?:open )?tickets\\b`)],
+  },
+  {
+    // "are decision" is a 47% trigram on "Ardennes Précision". The words that
+    // named a buying role this workspace defines are not the name of a company,
+    // and the answer used to be one account's single economic buyer.
+    kind: 'status (a role the workspace defines is never an account)',
+    q: 'How many contacts are decision makers?',
+    must: () => [new RegExp(`\\b${contactsWithRole('economic_buyer')} contacts\\b`), /Economic buyer/],
+    never: () => [/Ardennes/, /Précision/],
+  },
+  /* --- ranking: which end of the book the reader asked for -------------- */
+  {
+    // "The largest of the 12 deals still open: Pemberton — $582,120" was the
+    // answer to this, 15.8x the real one with the adjective inverted.
+    kind: 'ranking (smallest, scoped to an owner)',
+    q: 'What is the smallest open deal owned by Dana Whitfield?',
+    must: () => {
+      const mine = byAmount(openFacts().filter((d) => d.owner === personId('Dana Whitfield')));
+      return [mine[0].name, money(mine[0].amount)];
+    },
+    never: () => {
+      const mine = byAmount(openFacts().filter((d) => d.owner === personId('Dana Whitfield')));
+      return [money(mine[mine.length - 1].amount), /\blargest\b/i];
+    },
+  },
+  {
+    kind: 'ranking (a cut-off taken from the bottom)',
+    q: 'Show me the 3 smallest open deals',
+    must: () => byAmount(openFacts()).slice(0, 3).map((d) => d.name),
+    never: () => [byAmount(openFacts()).slice(-1)[0].name, /\blargest\b/i],
+  },
+  {
+    kind: 'ranking ("bottom N" is the same instruction)',
+    q: 'Show me the bottom 3 open deals by amount',
+    must: () => [/\b3 smallest\b/, ...byAmount(openFacts()).slice(0, 3).map((d) => d.name)],
+    never: () => [/8 largest/, byAmount(openFacts()).slice(-1)[0].name],
+  },
+  {
+    // A date order is a different sort key as well as a different direction:
+    // this came back as the eight largest deals by amount.
+    kind: 'ranking (soonest to close is a date order)',
+    q: 'Show me the 3 open deals closing soonest',
+    must: () => [...openFacts()].sort((a, b) => a.close - b.close).slice(0, 3).map((d) => d.name),
+    never: () => [byAmount(openFacts()).slice(-1)[0].name],
+  },
+  {
+    // Byte-identical to the answer for "who has the most pipeline?" — the same
+    // rows, the same order, the same name on top.
+    kind: 'ranking (the least of a per-owner measure)',
+    q: 'Who has the least pipeline?',
+    must: () => {
+      const least = ownerPipeline()[0];
+      return [new RegExp(`^${least.name} has the least`, 'm'), money(least.total), `1. ${least.name}`];
+    },
+    never: () => {
+      const ranked = ownerPipeline();
+      return [`${ranked[ranked.length - 1].name} is the biggest`, `1. ${ranked[ranked.length - 1].name}`];
+    },
+  },
+  {
+    kind: 'limit (a bare numeral in front of the noun)',
+    q: 'Show me 3 open deals',
+    must: () => [/\b3 largest\b/],
+    never: () => [/\b8 largest\b/],
+  },
+  /* --- one scope, every step of the plan -------------------------------- */
+  {
+    // The metric was scoped and the deal list under it was not: four of the
+    // five rows printed beneath this sentence were in other pipelines, and the
+    // top one was bigger than anything the named pipeline holds.
+    kind: 'pipeline (a summary is scoped in every step)',
+    q: 'Summarise the Renewal pipeline',
+    must: () => {
+      const rows = byAmount(openFacts().filter((d) => d.pipeline === 'renewal'));
+      return [money(sumAmount(rows)), String(rows.length), rows[rows.length - 1].name];
+    },
+    never: () => byAmount(openFacts().filter((d) => d.pipeline !== 'renewal')).slice(-4).map((d) => d.name),
+  },
+  {
+    kind: 'pipeline (an overview is scoped in every step)',
+    q: 'Give me an overview of the Renewal pipeline',
+    must: () => [money(sumAmount(openFacts().filter((d) => d.pipeline === 'renewal')))],
+    never: () => byAmount(openFacts().filter((d) => d.pipeline !== 'renewal')).slice(-4).map((d) => d.name),
+  },
+  {
+    kind: 'stage (a summary is scoped in every step)',
+    q: 'Summarise the pipeline at the Negotiation stage',
+    must: () => {
+      const rows = byAmount(openFacts().filter((d) => d.stage === 'negotiation'));
+      return [money(sumAmount(rows)), String(rows.length)];
+    },
+    never: () => byAmount(openFacts().filter((d) => d.stage !== 'negotiation')).slice(-4).map((d) => d.name),
+  },
+  {
+    kind: 'ranking (a scoped list restates its scope)',
+    q: 'Show me the 5 largest open deals in the Renewal pipeline',
+    must: () => [/in the Renewal pipeline/, String(openFacts().filter((d) => d.pipeline === 'renewal').length)],
+    never: () => [`${openFacts().length} deals still open`, `${openFacts().length} open deals.`],
+  },
+  {
+    // 77 is every deal on the book, 39 of them closed. The sentence over an
+    // unfiltered search said "still open".
+    kind: 'status (an unfiltered list never claims the rows are open)',
+    q: 'What is the biggest deal?',
+    must: () => [byAmount(dealFacts()).slice(-1)[0].name],
+    never: () => [/deals still open/],
+  },
+  /* --- two of a kind: bound, or refused by name ------------------------- */
+  {
+    kind: 'account (a second account is refused, never dropped)',
+    q: 'How much did Meridian Forge Systems and Ironwood Packaging Group spend in Q2 2026?',
+    refuse: /scope one answer to a single account/,
+    // A refusal that quotes a figure is half an answer, and the half it quotes
+    // is one of the two accounts — 48% of what was asked for.
+    never: () => [/\$[\d,]+/],
+  },
+  {
+    kind: 'stage (a second stage is refused, never dropped)',
+    q: 'How many deals are in Negotiation and Proposal sent?',
+    refuse: /scope one answer to a single deal stage/,
+    never: () => {
+      const open = openFacts();
+      return [
+        `${open.filter((d) => d.stage === 'proposal').length} deals right now`,
+        `${open.filter((d) => d.stage === 'negotiation').length} deals right now`,
+      ];
+    },
+  },
+  {
+    kind: 'pipeline (a second pipeline is refused, never dropped)',
+    q: 'What is the Renewal pipeline worth in the Expansion pipeline?',
+    refuse: /scope one answer to a single pipeline/,
+    never: () => [money(sumAmount(openFacts().filter((d) => d.pipeline === 'expansion')))],
+  },
+  {
+    kind: 'owner (a second owner is refused, never dropped)',
+    q: 'How much pipeline does Marcus Ilori own that Priya Raman owns?',
+    refuse: /scope one answer to a single (teammate|owner)/,
+    never: () => [money(sumAmount(openFacts().filter((d) => d.owner === personId('Marcus Ilori'))))],
+  },
+  /* --- an owner and an outcome in one list ------------------------------ */
+  {
+    // The count form of this question answered correctly all along; the list
+    // form was refused with 'I could not apply the status "lose"'.
+    kind: 'status (a list scoped to an owner and an outcome)',
+    q: 'Which deals did Marcus Ilori lose last quarter?',
+    must: () => {
+      const lost = stageSets(app.ctx, ORG).lost;
+      const rows = dealFacts().filter((d) => lost.includes(d.stage) && d.owner === personId('Marcus Ilori')
+        && d.close >= Date.UTC(2026, 3, 1) && d.close < Date.UTC(2026, 6, 1));
+      return [String(rows.length), ...rows.map((d) => d.name)];
+    },
+    never: () => [`${openFacts().length} open deals`],
+  },
+  {
+    kind: 'status (the win side of the same list)',
+    q: 'Which deals did Marcus Ilori win last quarter?',
+    must: () => {
+      const won = stageSets(app.ctx, ORG).won;
+      const rows = dealFacts().filter((d) => won.includes(d.stage) && d.owner === personId('Marcus Ilori')
+        && d.close >= Date.UTC(2026, 3, 1) && d.close < Date.UTC(2026, 6, 1));
+      return [String(rows.length), ...rows.map((d) => d.name)];
+    },
+    never: () => [`${openFacts().length} open deals`],
+  },
+  /* --- vocabulary this workspace does not have -------------------------- */
+  {
+    // The meter catalogue was served instead, with the word "widgets" nowhere
+    // in the answer and nothing saying it had not been understood.
+    kind: 'meter (a quantity nothing here meters)',
+    q: 'How many widgets did Meridian Forge Systems meter in August 2026?',
+    refuse: /meters widgets/i,
+    never: () => [/\d{3},\d{3}/],
+  },
+  {
+    kind: 'meter (the same, workspace-wide)',
+    q: 'How many sprockets did we meter in August 2026?',
+    refuse: /meters sprockets/i,
+    never: () => [/\d{3},\d{3}/],
+  },
+  {
+    // "$0.00 in the JPY book" reads as "we billed nothing in yen" — this
+    // workspace has no yen book to bill nothing in.
+    kind: 'currency (a book this workspace does not keep)',
+    q: 'How much did we invoice in JPY in 2026?',
+    refuse: /no JPY book/,
+    never: () => [/\$0/, /¥/],
+  },
+  {
+    // Every filter the sentence carries, not just the one the branch was
+    // written for: the threshold was dropped whenever a rep was named, and the
+    // same question without the name applied it exactly.
+    kind: 'threshold (a filter the sentence carries beside an owner)',
+    q: 'Show me open deals over $500,000 owned by Priya',
+    must: () => {
+      const rows = openFacts().filter((d) => d.owner === personId('Priya Raman') && d.amount > 50_000_000);
+      return [String(rows.length), /more than \$500,000/, ...rows.map((d) => d.name)];
+    },
+    never: () => [`${openFacts().filter((d) => d.owner === personId('Priya Raman')).length} open deals owned by Priya Raman.`],
+  },
+  {
+    kind: 'currency (a name that is also a currency word)',
+    q: 'How much pipeline does Sterling own?',
+    refuse: /No teammate in this workspace is called "Sterling"/,
+    never: () => [/GBP/, /£/],
+  },
 ];
+
+/** Deals ordered smallest first — the ordering half the questions here ask for. */
+const byAmount = (rows: DealFact[]): DealFact[] => [...rows].sort((a, b) => a.amount - b.amount || a.name.localeCompare(b.name));
+
+/** Open pipeline per teammate, least first — computed from the rows, not the engine. */
+function ownerPipeline(): { name: string; total: number }[] {
+  const totals = new Map<string, number>();
+  for (const deal of openFacts()) {
+    if (!deal.owner) continue;
+    totals.set(deal.owner, (totals.get(deal.owner) ?? 0) + deal.amount);
+  }
+  return [...totals]
+    .map(([id, total]) => ({ name: app.ctx.db.pluck<string>(`SELECT name FROM users WHERE id = ?`, id) ?? id, total }))
+    .sort((a, b) => a.total - b.total);
+}
+
+/* --- ground truth for the record filters a question can name -------------- */
+
+/** Every (stage value, label, pipeline) row this workspace actually stores. */
+const stageRows = (): { value: string; label: string; pipeline: string }[] =>
+  app.ctx.db.all<{ name: string; label: string; pipeline: string }>(
+    `SELECT name, label, pipeline FROM crm_pipeline_stages
+     WHERE org_id = ? AND object_type = 'deal' ORDER BY pipeline, position`, ORG,
+  ).map((row) => ({ value: row.name, label: row.label, pipeline: row.pipeline }));
+
+const stageValueOf = (label: string): string =>
+  stageRows().find((row) => row.label.toLowerCase() === label.toLowerCase())!.value;
+
+/** The pipeline that calls a stage by that name, when only one does. */
+const pipelineOf = (label: string): string | null => {
+  const pipelines = [...new Set(stageRows().filter((row) => row.label.toLowerCase() === label.toLowerCase()).map((r) => r.pipeline))];
+  return pipelines.length === 1 ? pipelines[0] : null;
+};
+
+/** The count of deals at a stage, in a pipeline or across all of them. */
+const countOf = (stage: string, pipeline: string | null): RegExp => {
+  const rows = dealFacts().filter((deal) => deal.stage === stage && (!pipeline || deal.pipeline === pipeline));
+  return new RegExp(`\\b${rows.length} deals?\\b`);
+};
+
+const ticketProperties = (): Record<string, unknown>[] => app.ctx.db.all<{ properties: string }>(
+  `SELECT properties FROM crm_records WHERE org_id = ? AND object_type = 'ticket' AND archived = 0`, ORG,
+).map((row) => JSON.parse(row.properties) as Record<string, unknown>);
+
+const ticketsWithStatus = (status: string): number =>
+  ticketProperties().filter((row) => String(row.status ?? '') === status).length;
+
+const openTickets = (): number =>
+  ticketProperties().filter((row) => OPEN_TICKET.includes(String(row.status ?? ''))).length;
+
+/** What `business_metric`'s ticket measure would have said instead. */
+const ticketsRaisedThisPeriod = (): number => {
+  const start = startOfQuarter(app.ctx.now());
+  return app.ctx.db.pluck<number>(
+    `SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = 'ticket' AND archived = 0 AND created >= ?`,
+    ORG, start,
+  ) ?? 0;
+};
+
+const propertyOptions = (objectType: string, property: string): { value: string; label: string }[] =>
+  JSON.parse(app.ctx.db.pluck<string>(
+    `SELECT options FROM crm_properties WHERE org_id = ? AND object_type = ? AND name = ?`,
+    ORG, objectType, property,
+  ) ?? '[]') as { value: string; label: string }[];
+
+const contactsWithRole = (role: string): number => app.ctx.db.all<{ properties: string }>(
+  `SELECT properties FROM crm_records WHERE org_id = ? AND object_type = 'contact' AND archived = 0`, ORG,
+).filter((row) => String((JSON.parse(row.properties) as { buying_role?: unknown }).buying_role ?? '') === role).length;
 
 const contains = (haystack: string, needle: string | RegExp): boolean =>
   typeof needle === 'string' ? haystack.includes(needle) : needle.test(haystack);
@@ -5101,6 +5442,86 @@ function assertLedgerSettled(answer: { content: string; analysis: any }): void {
         `an owner slot resolved to ${entry.resolved.value}, which is not a teammate.`);
     }
   }
+  assertScopeReachedEveryStep(answer);
+}
+
+/** The properties each record-filter qualifier narrows, as the row tools take them. */
+const FILTER_PROPERTY: Record<string, string> = { pipeline: 'pipeline', stage: 'deal_stage', status: 'deal_stage' };
+
+/**
+ * A binding is a property of the plan, not of one step in it.
+ *
+ * Every step that returns deal rows has to be narrowed by every deal filter the
+ * question bound, or the rows printed under the scoped sentence are a different
+ * question's answer. "Summarise the Renewal pipeline" bound the pipeline to the
+ * metric and listed the workspace's five biggest open deals underneath it —
+ * four of them in other pipelines, the top one bigger than the whole Renewal
+ * book's biggest deal, and every qualifier reported bound.
+ *
+ * This runs on every case in the table above, so a branch that adds an
+ * unscoped listing to a scoped plan fails here rather than shipping.
+ */
+function assertScopeReachedEveryStep(answer: { content: string; analysis: any }): void {
+  // The column an entry narrows comes from the entry, not from a map of kinds
+  // to columns: one ledger kind covers every record filter — a ticket's
+  // status, a deal's competitor, a company's industry — and a checker that
+  // knows only `deal_stage` reports a correctly scoped answer as unscoped,
+  // which is the same lie in the other direction.
+  const columnOf = (entry: any): string | null => entry.resolved?.property ?? FILTER_PROPERTY[entry.kind] ?? null;
+  // Only the kinds that narrow *which records* a step reads. A period is a
+  // window and a ranking is an order; both carry a column on the entry, and
+  // neither is a claim that the rows sit inside a set of values.
+  const RECORD_FILTER_KINDS = new Set(['pipeline', 'stage', 'status', 'owner', 'account']);
+  const bound = (answer.analysis.qualifiers ?? []).filter((entry: any) => {
+    if (entry.state !== 'bound' || !entry.resolved) return false;
+    if (!RECORD_FILTER_KINDS.has(entry.kind)) return false;
+    // A filter on another table reaches a deal query as a set of ids, and a
+    // threshold narrows without naming its members. Neither is a claim that
+    // the rows the step reads sit inside a set of values.
+    if ((entry.resolved.object_type ?? 'deal') !== 'deal') return false;
+    if (entry.resolved.op && entry.resolved.op !== 'eq' && entry.resolved.op !== 'in') return false;
+    return !!columnOf(entry);
+  });
+  if (!bound.length) return;
+  for (const step of answer.analysis.plan ?? []) {
+    if (step.tool !== 'record_search' && step.tool !== 'record_aggregate') continue;
+    if (step.args.object_type !== 'deal') continue;
+    const conditions: { property?: string; op?: string; value?: unknown; values?: unknown[] }[] =
+      Array.isArray(step.args.conditions) ? step.args.conditions : [];
+    for (const entry of bound) {
+      const property = columnOf(entry)!;
+      // An owner is an argument on the step, not a condition in it. A
+      // comparison runs the capability once per rep, so a step narrowed to
+      // *another* name the question wrote is answering the same question's
+      // other half rather than a wider one.
+      if (property === 'owner_id') {
+        const held = String(step.args.owner_id ?? '');
+        const rivals = bound.filter((other: any) => other !== entry && columnOf(other) === 'owner_id')
+          .map((other: any) => String(other.resolved.value));
+        if (rivals.includes(held)) continue;
+        assert.equal(held, String(entry.resolved.value),
+          `${step.tool} reads deal rows for ${step.args.owner_id ?? 'everybody'} under an answer scoped to ${entry.text}:
+${answer.content}`);
+        continue;
+      }
+      const held = conditions.find((c) => c.property === property);
+      assert.ok(held, `${step.tool} reads deal rows with no ${property} filter, under an answer scoped to ${entry.kind} "${entry.text}":
+${answer.content}`);
+      const values = (Array.isArray(held.values) ? held.values : held.value === undefined ? [] : [held.value]).map(String);
+      // A stage qualifier is one value; an outcome word is the set that word
+      // stands for; every other record filter carries its own set. Either way
+      // the rows the step reads must sit inside it.
+      const allowed = new Set<string>(
+        entry.resolved.values?.length ? entry.resolved.values.map(String)
+          : property === 'deal_stage' && stageSets(app.ctx, ORG)[String(entry.resolved.value) as 'open' | 'won' | 'lost']
+            ? stageSets(app.ctx, ORG)[String(entry.resolved.value) as 'open' | 'won' | 'lost']
+            : [String(entry.resolved.value)],
+      );
+      assert.ok(values.length && values.every((value) => allowed.has(value)),
+        `${step.tool} filters ${property} on ${JSON.stringify(values)}, which is wider than ${entry.kind} "${entry.text}":
+${answer.content}`);
+    }
+  }
 }
 
 describe('the qualifier invariant: a scoped question is answered in its own scope or refused', () => {
@@ -5126,6 +5547,59 @@ describe('the qualifier invariant: a scoped question is answered in its own scop
       }
     });
   }
+
+  /**
+   * Every name this workspace gives a stage is a name the engine answers to.
+   *
+   * Read straight off `crm_pipeline_stages`, so renaming a stage keeps this
+   * honest without editing the test. One label per stage value was kept and
+   * the rest thrown away, which denied "Scoping", "Churned" and "Renewed" —
+   * three stages this same engine prints by name in the very sentence that
+   * says it has never heard of them.
+   */
+  test('every stage label this workspace stores resolves to that stage', () => {
+    const vocabulary = crmVocabulary(app.ctx, ORG);
+    const menu = stageLabels(vocabulary);
+    for (const row of stageRows()) {
+      const hit = stageIn(`How many deals are in the ${row.label} stage?`, vocabulary);
+      assert.ok(hit, `"${row.label}" is this workspace's name for a stage in ${row.pipeline}, and it resolved to nothing.`);
+      assert.equal(hit!.term.value, row.value,
+        `"${row.label}" is ${row.value} in ${row.pipeline}; it resolved to ${hit!.term.value}.`);
+      assert.ok(menu.includes(row.label),
+        `a refusal offers the stages this workspace has and omits "${row.label}".`);
+    }
+  });
+
+  test('a refusal for a stage nobody has denies none of the stages this workspace does have', async () => {
+    const answer = await ask('How many deals are in the Contract review stage?');
+    assert.ok(answer.analysis.refusal, `"Contract review" is not a stage here, so this must refuse:\n${answer.content}`);
+    for (const label of new Set(stageRows().map((row) => row.label))) {
+      assert.ok(answer.content.includes(label),
+        `the refusal lists the stages ${'Northwind Robotics'} has and leaves out "${label}", which it holds:\n${answer.content}`);
+    }
+  });
+
+  /**
+   * Every status this workspace spells out is a status the engine counts.
+   *
+   * Read off `crm_properties`, so a workspace that adds a status is covered
+   * here without touching this file. Only the multi-word labels are asked
+   * about: a one-word status is English before it is a status, and "new",
+   * "open" and "closed" are read more widely on purpose.
+   */
+  test('every multi-word ticket status this workspace defines is counted as itself', async () => {
+    const options = propertyOptions('ticket', 'status').filter((option) => option.label.includes(' '));
+    assert.ok(options.length, 'the fixture spells at least one ticket status in more than one word');
+    for (const option of options) {
+      const answer = await ask(`How many tickets are ${option.label.toLowerCase()}?`);
+      assertLedgerSettled(answer);
+      const truth = ticketsWithStatus(option.value);
+      assert.match(answer.content, new RegExp(`\\b${truth} tickets?\\b`),
+        `"${option.label}" is a ticket status in this workspace and ${truth} tickets are at it:\n${answer.content}`);
+      assert.ok(!new RegExp(`\\b${ticketsRaisedThisPeriod()} tickets\\b`).test(answer.content),
+        `"${option.label}" was answered with the quarter's ticket intake, which is a different question:\n${answer.content}`);
+    }
+  });
 
   test('a follow-up inside a thread keeps the subject of the turn before it', async () => {
     const opened = await expectOk('POST', '/v1/ai/threads', { message: 'How many open deals does Priya Raman have?' });
@@ -5158,6 +5632,157 @@ describe('the qualifier invariant: a scoped question is answered in its own scop
     assert.deepEqual(refused, [], `these accounts exist and were refused:\n${refused.join('\n')}`);
   });
 
+  /**
+   * A scope is a property of the plan, proved rather than promised.
+   *
+   * The ledger used to ask whether *some* step of the bound tool carried the
+   * qualifier, so a plan whose metric was scoped and whose listing was not
+   * passed its own check — and printed workspace-wide rows under a scoped
+   * sentence. This is that plan, and it has to come back as a violation.
+   */
+  test('a plan that leaves one row step unscoped is a violation, not an answer', () => {
+    const ledger = new QualifierLedger([{
+      kind: 'pipeline',
+      text: 'Renewal',
+      resolved: { kind: 'pipeline', value: 'renewal', label: 'Renewal', property: 'pipeline' },
+      state: 'pending',
+      binding: null,
+      detail: null,
+    }]);
+    const steps = [
+      { tool: 'business_metric', args: { metric: 'pipeline', pipeline: 'renewal', group_by: 'none' } },
+      { tool: 'record_search', args: { object_type: 'deal', order_by: 'amount', conditions: [{ property: 'deal_stage', op: 'in', values: stageSets(app.ctx, ORG).open }] } },
+    ];
+    ledger.settleAgainst(steps);
+    assert.equal(ledger.first('pipeline')?.state, 'bound', 'the metric really does carry the pipeline');
+    const violations = ledger.verify(steps);
+    assert.ok(violations.some((v) => v.reason === 'unscoped_step'),
+      `the deal listing carries no pipeline filter and the ledger passed it: ${JSON.stringify(violations)}`);
+    // …and the same plan with the filter on every step is clean.
+    const scoped = [steps[0], {
+      tool: 'record_search',
+      args: { ...steps[1].args, conditions: [...(steps[1].args.conditions as unknown[]), { property: 'pipeline', op: 'eq', value: 'renewal' }] },
+    }];
+    assert.deepEqual(new QualifierLedger([{
+      kind: 'pipeline', text: 'Renewal', state: 'bound', detail: null,
+      resolved: { kind: 'pipeline', value: 'renewal', label: 'Renewal', property: 'pipeline' },
+      binding: { tool: 'business_metric', args: { pipeline: 'renewal' } },
+    }]).verify(scoped), []);
+  });
+
+  /**
+   * The one entry that settles later says so itself.
+   *
+   * A unit is a claim about the figure, not about the query, so it is still
+   * pending when the plan is checked. That used to be handled by an allowlist
+   * in the engine — `pending().filter(q => q.kind !== 'unit')` — which made the
+   * file's own headline ("there is no fourth state") true only by exception.
+   * The exception now lives on the entry, where `verify` can see it.
+   */
+  test('a deferred qualifier is marked on the entry, never exempted by its kind', () => {
+    const resolved = { kind: 'unit' as const, value: 'event', label: 'event' };
+    const deferred = new QualifierLedger([
+      { kind: 'unit', text: 'event', resolved, state: 'pending', binding: null, detail: null, settlesAfterRun: true },
+    ]);
+    assert.deepEqual(deferred.verify([]), [], 'an entry settled against the figure is not unsettled before the run');
+    const plain = new QualifierLedger([
+      { kind: 'unit', text: 'event', resolved, state: 'pending', binding: null, detail: null },
+    ]);
+    assert.ok(plain.verify([]).some((violation) => violation.reason === 'unsettled'),
+      'an unmarked pending entry is the silent drop this mechanism exists to catch');
+  });
+
+  /**
+   * Two units in one question, read in the order the reader wrote them.
+   *
+   * "How many GB of telemetry events did we meter" names a unit this workspace
+   * has no figure in and a unit it does. Reading whichever the database
+   * returned first answered it with an event count on one run and refused it on
+   * the next — the same sentence, two different answers, neither reproducible.
+   */
+  test('a question naming two units reads both, in its own order rather than the database\'s', async () => {
+    const question = 'How many GB of telemetry events did we meter in August 2026?';
+    for (const vocabulary of [['event', 'gb'], ['gb', 'event']]) {
+      assert.deepEqual(unitsNamed(question, vocabulary), ['gb', 'event'],
+        `the units were read in ${JSON.stringify(vocabulary)} order rather than the question's`);
+    }
+    assert.ok(unitVocabulary(app.ctx, ORG).includes('gb') && unitVocabulary(app.ctx, ORG).includes('event'),
+      'this workspace really does denominate things in both');
+    const answer = await ask(question);
+    assert.deepEqual((answer.analysis.qualifiers ?? []).filter((q: { kind: string }) => q.kind === 'unit').map((q: { text: string }) => q.text),
+      ['gb', 'event'],
+      `both units the question names have to reach the ledger:\n${JSON.stringify(answer.analysis.qualifiers)}`);
+    assert.ok(answer.analysis.refusal,
+      `nothing this workspace meters is denominated in GB, so this cannot come back as an event count:\n${answer.content}`);
+  });
+
+  /**
+   * A currency word that is also a name is not a currency scope.
+   *
+   * "Sterling" is three accounts in this workspace. The run for "how much
+   * pipeline does Sterling own?" traced `currency "gbp"` off the name, and the
+   * account question below — which binds — carried a GBP book into the
+   * measurement with the ledger reporting it bound, on a question that names no
+   * currency at all.
+   */
+  test('a company name that is also a currency word never becomes a currency scope', async () => {
+    for (const question of ['How much pipeline does Sterling own?', 'What is Sterling Heat Treating carrying in open pipeline?']) {
+      const answer = await ask(question);
+      const money = (answer.analysis.qualifiers ?? []).filter((entry: { kind: string }) => entry.kind === 'currency');
+      assert.deepEqual(money, [],
+        `"${question}" names no currency, and the run scoped itself to one: ${JSON.stringify(money)}`);
+      for (const step of answer.analysis.plan ?? []) {
+        assert.equal(step.args.currency, undefined,
+          `${step.tool} was handed a currency book nobody asked for: ${JSON.stringify(step.args)}`);
+      }
+    }
+    // The same word written as a currency still is one.
+    const real = await ask('How much revenue did we book in GBP in 2025?');
+    assert.ok((real.analysis.qualifiers ?? []).some((entry: { kind: string; state: string }) => entry.kind === 'currency' && entry.state === 'bound'),
+      `"in GBP" is a currency book and was not bound:\n${real.content}`);
+  });
+
+  test('a follow-up inside a thread keeps the scope of the turn before it', async () => {
+    const renewal = openFacts().filter((d) => d.pipeline === 'renewal');
+    const opened = await expectOk('POST', '/v1/ai/threads', { message: 'What is the Renewal pipeline worth?' });
+    assert.ok(opened.messages.some((m: { role: string; content: string }) =>
+      m.role === 'assistant' && m.content.includes(money(sumAmount(renewal)))),
+      `the first turn did not answer in the pipeline it names:\n${JSON.stringify(opened.messages)}`);
+    const reply = await expectOk('POST', `/v1/ai/threads/${opened.id}/messages`, { content: 'And the smallest deal in it?' });
+    const smallest = byAmount(renewal)[0];
+    assert.ok(reply.message.content.includes(smallest.name),
+      `"it" is the Renewal pipeline, whose smallest deal is ${smallest.name}:\n${reply.message.content}`);
+    for (const other of byAmount(openFacts().filter((d) => d.pipeline !== 'renewal')).slice(-3)) {
+      assert.ok(!reply.message.content.includes(other.name),
+        `the follow-up widened back out to the workspace and returned ${other.name}:\n${reply.message.content}`);
+    }
+    assert.ok(!/\bdeals still open\b/.test(reply.message.content),
+      `the reply describes rows it did not filter as "still open":\n${reply.message.content}`);
+  });
+
+  test('a scoped summary fills a schema from its own scope', async () => {
+    const renewal = openFacts().filter((d) => d.pipeline === 'renewal');
+    const answer = await ask('Summarise the Renewal pipeline', {
+      response_schema: {
+        type: 'object',
+        properties: {
+          total: { type: 'number' },
+          deals: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, amount: { type: 'number' } } } },
+        },
+      },
+    });
+    const row = JSON.parse(answer.content) as { total: number | null; deals: { name: string; amount: number }[] | null };
+    assert.equal(row.total, renewal.length,
+      `the schema field came back with the workspace figure rather than the scoped one: ${answer.content}`);
+    assert.notEqual(row.total, openFacts().length, 'that is the unscoped open-deal count');
+    assert.ok(Array.isArray(row.deals) && row.deals.length > 1,
+      `an array schema came back with ${JSON.stringify(row.deals)}`);
+    for (const deal of row.deals ?? []) {
+      assert.ok(renewal.some((d) => d.name === deal.name),
+        `${deal.name} is not in the Renewal pipeline: ${answer.content}`);
+    }
+  });
+
   test('a summarised scope fills the schema fields the run actually holds', async () => {
     const priya = openFacts().filter((d) => d.owner === personId('Priya Raman'));
     const answer = await ask('Summarise the open pipeline for Priya Raman', {
@@ -5171,4 +5796,668 @@ describe('the qualifier invariant: a scoped question is answered in its own scop
     assert.equal(row.open_pipeline, sumAmount(priya));
     assert.equal(row.deal_count, priya.length);
   });
+});
+
+/* ========================================================================== *
+ * The qualifier invariant, over every dimension this workspace enumerates.
+ *
+ * The suite above covers the eleven narrowings someone had written a parser
+ * for. This one covers the rest — a lead source, a competitor, a forecast
+ * category, a deal type, an industry, a contract term, an age in a stage — and
+ * every one of them was, when this was written, silently dropped: the question
+ * was answered with the $9,010,960 workspace total or the 38-deal open book,
+ * stated at full confidence under the reader's own scoped sentence.
+ *
+ * Every expectation here is computed from `crm_records` in this file, in
+ * JavaScript, without going near the engine. A case passes when the engine
+ * either states that figure or refuses; it fails when the engine states the
+ * *unqualified* figure, which is the substitution the whole mechanism exists
+ * to make impossible.
+ * ========================================================================== */
+
+interface FullDeal extends DealFact {
+  competitor: string;
+  leadSource: string;
+  forecast: string;
+  dealType: string;
+  termMonths: number | null;
+  enteredStage: number | null;
+}
+
+const fullDeals = (): FullDeal[] => app.ctx.db.all<{
+  id: string; display_name: string; owner_id: string | null; created: number; properties: string;
+}>(
+  `SELECT id, display_name, owner_id, created, properties FROM crm_records
+   WHERE org_id = ? AND object_type = 'deal' AND archived = 0 AND merged_into IS NULL`, ORG,
+).map((row) => {
+  const p = JSON.parse(row.properties) as Record<string, unknown>;
+  return {
+    id: row.id,
+    name: row.display_name,
+    owner: row.owner_id,
+    created: row.created,
+    pipeline: String(p.pipeline ?? ''),
+    stage: String(p.deal_stage ?? ''),
+    amount: Number(p.amount ?? 0),
+    close: Number(p.close_date ?? 0),
+    competitor: String(p.competitor ?? ''),
+    leadSource: String(p.lead_source ?? ''),
+    forecast: String(p.forecast_category ?? ''),
+    dealType: String(p.deal_type ?? ''),
+    termMonths: p.contract_term_months === undefined ? null : Number(p.contract_term_months),
+    enteredStage: p.stage_entered_at === undefined ? null : Number(p.stage_entered_at),
+  };
+});
+
+const openDeals = (): FullDeal[] => {
+  const open = stageSets(app.ctx, ORG).open;
+  return fullDeals().filter((row) => open.includes(row.stage));
+};
+
+const total = (rows: { amount: number }[]): number => rows.reduce((sum, row) => sum + row.amount, 0);
+
+/** The workspace's own formatter, so an expectation is the string the reader sees. */
+const cash = (cents: number): string => {
+  const profile = workspaceProfile(app.ctx, ORG);
+  return formatMoney({ amount: cents, currency: profile.currency }, { locale: profile.locale, trimZeroFraction: true });
+};
+
+/** The two figures every dropped qualifier collapses to on this book. */
+const WORKSPACE_PIPELINE = (): string => cash(total(openDeals()));
+const WORKSPACE_OPEN_COUNT = (): string => `${openDeals().length} open deals`;
+
+/** Companies of one industry, and the open deals associated with them. */
+const companiesInIndustry = (industry: string): string[] => app.ctx.db.all<{ id: string; properties: string }>(
+  `SELECT id, properties FROM crm_records WHERE org_id = ? AND object_type = 'company' AND archived = 0 AND merged_into IS NULL`, ORG,
+).filter((row) => String((JSON.parse(row.properties) as { industry?: unknown }).industry ?? '') === industry).map((row) => row.id);
+
+const dealCompany = (): Map<string, string> => {
+  const out = new Map<string, string>();
+  for (const row of app.ctx.db.all<{ from_id: string; to_id: string; from_type: string; to_type: string }>(
+    `SELECT from_id, to_id, from_type, to_type FROM crm_associations WHERE org_id = ?`, ORG)) {
+    if (row.from_type === 'deal' && row.to_type === 'company') out.set(row.from_id, row.to_id);
+    if (row.to_type === 'deal' && row.from_type === 'company') out.set(row.to_id, row.from_id);
+  }
+  return out;
+};
+
+const openDealsInIndustry = (industry: string): FullDeal[] => {
+  const companies = new Set(companiesInIndustry(industry));
+  const link = dealCompany();
+  return openDeals().filter((deal) => companies.has(link.get(deal.id) ?? ''));
+};
+
+/** Open tickets, by the properties the workspace stores on them. */
+const openTicketRows = (): Record<string, unknown>[] =>
+  ticketProperties().filter((row) => OPEN_TICKET.includes(String(row.status ?? '')));
+
+interface DimensionCase {
+  /** The dimension the question narrows on — for the test name. */
+  kind: string;
+  q: string;
+  /** Strings the answer has to contain when it answers. */
+  must?: () => (string | RegExp)[];
+  /** True when a refusal is the only honest outcome, with the sentence it must carry. */
+  refuse?: RegExp;
+  /** Strings whose presence means the qualifier was dropped and a wider set answered. */
+  never?: () => (string | RegExp)[];
+}
+
+const DIMENSION_CASES: DimensionCase[] = [
+  /* --- an enumerated property of a deal ---------------------------------- */
+  {
+    // $690,260 across 3 open deals, answered with $9,010,960 across 38.
+    kind: 'lead source',
+    q: 'How much open pipeline came from partner referrals?',
+    must: () => {
+      const rows = openDeals().filter((d) => d.leadSource === 'partner_referral');
+      return [cash(total(rows)), new RegExp(`\\b${rows.length}\\b`), /Partner referral/i];
+    },
+    never: () => [WORKSPACE_PIPELINE(), WORKSPACE_OPEN_COUNT()],
+  },
+  {
+    kind: 'lead source (a second value of the same dimension)',
+    q: 'How much open pipeline came from trade shows?',
+    must: () => {
+      const rows = openDeals().filter((d) => d.leadSource === 'trade_show');
+      return [cash(total(rows)), new RegExp(`\\b${rows.length}\\b`), /Trade show/i];
+    },
+    never: () => [WORKSPACE_PIPELINE(), WORKSPACE_OPEN_COUNT()],
+  },
+  {
+    // "Commit" is also a verb and "Pipeline" is also a forecast category, so
+    // the value only counts beside the dimension's own name — and the longest
+    // match in the sentence used to win, which read "open pipeline" as the
+    // category and answered for a different 14 deals.
+    kind: 'forecast category',
+    q: 'How much open pipeline is in the Commit forecast category?',
+    must: () => {
+      const rows = openDeals().filter((d) => d.forecast === 'commit');
+      return [cash(total(rows)), new RegExp(`\\b${rows.length}\\b`), /Commit/];
+    },
+    never: () => [WORKSPACE_PIPELINE(), cash(total(openDeals().filter((d) => d.forecast === 'pipeline')))],
+  },
+  {
+    kind: 'forecast category (a two-word value)',
+    q: 'How much open pipeline is in the Best case forecast category?',
+    must: () => {
+      const rows = openDeals().filter((d) => d.forecast === 'best_case');
+      return [cash(total(rows)), /Best case/];
+    },
+    never: () => [WORKSPACE_PIPELINE()],
+  },
+  {
+    kind: 'contract term (a number with a unit in its own column name)',
+    q: 'How many deals have a 36-month contract term?',
+    must: () => [new RegExp(`\\b${openDeals().filter((d) => d.termMonths === 36).length}\\b`), /36-month/],
+    never: () => [WORKSPACE_OPEN_COUNT(), `${openDeals().length} open deals right now`],
+  },
+  /* --- a competitor, including one this workspace has never faced -------- */
+  {
+    kind: 'competitor',
+    q: 'How many deals did we lose to Cognite?',
+    must: () => {
+      const lost = stageSets(app.ctx, ORG).lost;
+      const rows = fullDeals().filter((d) => lost.includes(d.stage) && d.competitor === 'cognite');
+      return [new RegExp(`\\b${rows.length}\\b`), /Cognite/];
+    },
+    never: () => {
+      const lost = stageSets(app.ctx, ORG).lost;
+      return [`${fullDeals().filter((d) => lost.includes(d.stage)).length} closed-lost deals`];
+    },
+  },
+  {
+    // Siemens appears on zero deals in this workspace. The answer was "14
+    // closed-lost deals" — every deal Northwind has ever lost, for a
+    // competitor it has never met.
+    kind: 'competitor (one this workspace has never faced)',
+    q: 'How many open deals are we losing to Siemens?',
+    refuse: /no competitor called "Siemens"/i,
+    never: () => {
+      const lost = stageSets(app.ctx, ORG).lost;
+      return [`${fullDeals().filter((d) => lost.includes(d.stage)).length} closed-lost deals`, WORKSPACE_OPEN_COUNT()];
+    },
+  },
+  /* --- an industry, which narrows a table the answer does not measure ---- */
+  {
+    // Three pharmaceutical accounts carry $849,660 across 5 open deals. The
+    // answer named one of them — the only company whose name contains the word
+    // — and stated $308,880 as the figure.
+    kind: 'industry (a filter on companies, measured over deals)',
+    q: 'How much open pipeline is with pharmaceutical companies?',
+    must: () => {
+      const rows = openDealsInIndustry('pharma');
+      return [cash(total(rows)), new RegExp(`\\b${rows.length}\\b`), /Pharmaceuticals/i];
+    },
+    never: () => [WORKSPACE_PIPELINE(), 'Wexler Pharmaceutical is carrying'],
+  },
+  {
+    kind: 'industry (an ampersand label written out in full)',
+    q: 'How much open pipeline is with metals and mining accounts?',
+    must: () => [cash(total(openDealsInIndustry('metals')))],
+    never: () => [WORKSPACE_PIPELINE()],
+  },
+  {
+    kind: 'industry (a list, not a figure)',
+    q: 'Which open deals are with aerospace companies?',
+    must: () => {
+      const rows = openDealsInIndustry('aerospace');
+      return [new RegExp(`\\b${rows.length}\\b`), ...rows.map((row) => row.name)];
+    },
+    never: () => [WORKSPACE_OPEN_COUNT()],
+  },
+  {
+    // The question names no company noun at all, so the account's own
+    // dimensions were never read and the answer was the workspace's 38.
+    kind: 'sales region (an account property, on a question about deals)',
+    q: 'How many open deals are in the EMEA region?',
+    must: () => {
+      const region = new Set(app.ctx.db.all<{ id: string; properties: string }>(
+        `SELECT id, properties FROM crm_records WHERE org_id = ? AND object_type = 'company' AND archived = 0`, ORG,
+      ).filter((row) => String((JSON.parse(row.properties) as { region?: unknown }).region ?? '') === 'emea').map((row) => row.id));
+      const link = dealCompany();
+      const rows = openDeals().filter((deal) => region.has(link.get(deal.id) ?? ''));
+      return [new RegExp(`\\b${rows.length} open deals\\b`), /EMEA/];
+    },
+    never: () => [`${openDeals().length} open deals right now`],
+  },
+  {
+    kind: 'relationship (prospects, on a question about deals)',
+    q: 'How much open pipeline is with prospects?',
+    must: () => {
+      const prospects = new Set(app.ctx.db.all<{ id: string; properties: string }>(
+        `SELECT id, properties FROM crm_records WHERE org_id = ? AND object_type = 'company' AND archived = 0`, ORG,
+      ).filter((row) => String((JSON.parse(row.properties) as { type?: unknown }).type ?? '') === 'prospect').map((row) => row.id));
+      const link = dealCompany();
+      const rows = openDeals().filter((deal) => prospects.has(link.get(deal.id) ?? ''));
+      return [cash(total(rows)), /Prospect/];
+    },
+    never: () => [WORKSPACE_PIPELINE()],
+  },
+  /* --- an age in a state, which is a threshold on a date column ---------- */
+  {
+    // The eight Negotiation deals are 18–39 days old. The answer listed all
+    // eight under a headline naming the stage; the true answer is no rows.
+    kind: 'age in stage (a threshold nothing matches)',
+    q: 'Which deals are stuck in Negotiation for more than 60 days?',
+    must: () => [/^No deals/],
+    never: () => fullDeals().filter((d) => d.stage === 'negotiation').map((d) => d.name),
+  },
+  {
+    kind: 'age in stage (a threshold that does match)',
+    q: 'Which deals have been in Negotiation for more than 20 days?',
+    must: () => {
+      const now = app.ctx.now();
+      const rows = fullDeals().filter((d) => d.stage === 'negotiation'
+        && d.enteredStage !== null && now - d.enteredStage > 20 * 24 * 3600 * 1000);
+      return [new RegExp(`\\b${rows.length} deals\\b`), /in that stage for more than 20 days/];
+    },
+    never: () => [/worth less than 1,7\d\d,\d{3},\d{3},\d{3}/],
+  },
+  /* --- a ticket's status and priority ------------------------------------ */
+  {
+    // One article between two words of the stored label broke the match, and
+    // all seven open tickets were counted instead of the two in that column.
+    kind: 'ticket status (with an article inside the stored label)',
+    q: 'How many open tickets are waiting on the customer?',
+    must: () => [new RegExp(`\\b${ticketsWithStatus('waiting_on_customer')}\\b`), /Waiting on customer/i],
+    never: () => [`${openTickets()} open tickets`],
+  },
+  {
+    // "urgent" and "high priority" returned the identical sentence — three
+    // tickets, the union of two bands — for two different questions.
+    kind: 'ticket priority (a named band, not the union of two)',
+    q: 'How many open tickets are urgent?',
+    must: () => [new RegExp(`\\b${openTicketRows().filter((t) => t.priority === 'urgent').length}\\b`), /Urgent/],
+    never: () => [/Urgent and High/],
+  },
+  {
+    kind: 'ticket priority (the other band, which must differ)',
+    q: 'How many open tickets are high priority?',
+    must: () => [new RegExp(`\\b${openTicketRows().filter((t) => t.priority === 'high').length}\\b`), /High/],
+    never: () => [/Urgent and High/],
+  },
+];
+
+describe('the qualifier invariant, over every dimension this workspace enumerates', () => {
+  for (const scenario of DIMENSION_CASES) {
+    test(`${scenario.kind} — "${scenario.q}"`, async () => {
+      const answer = await ask(scenario.q);
+      assertLedgerSettled(answer);
+      if (scenario.refuse) {
+        assert.ok(answer.analysis.refusal,
+          `"${scenario.q}" names a value this workspace does not hold, so it must refuse rather than answer:\n${answer.content}`);
+        assert.match(answer.content, scenario.refuse);
+      } else {
+        assert.equal(answer.analysis.refusal, null,
+          `"${scenario.q}" is answerable from the rows in this database and was refused:\n${answer.content}`);
+        for (const want of scenario.must?.() ?? []) {
+          assert.ok(contains(answer.content, want),
+            `"${scenario.q}" must state ${want} — computed from crm_records, not from the engine:\n${answer.content}`);
+        }
+      }
+      for (const banned of scenario.never?.() ?? []) {
+        assert.ok(!contains(answer.content, banned),
+          `"${scenario.q}" answered with ${banned}, which is a wider set than the one the question named:\n${answer.content}`);
+      }
+    });
+  }
+
+  /**
+   * Every value of every enumerated dimension, asked about by name.
+   *
+   * Read from `crm_properties`, so a workspace that adds a picklist is covered
+   * here without touching this file. The assertion is the weakest one that
+   * still catches the defect: whatever the engine says, it may not be the
+   * workspace's own open-deal count — because that is the number every dropped
+   * qualifier collapses to.
+   */
+  test('no value of a deal dimension is answered with the unqualified open book', async () => {
+    const workspace = WORKSPACE_OPEN_COUNT();
+    for (const property of ['lead_source', 'forecast_category', 'competitor']) {
+      for (const option of propertyOptions('deal', property)) {
+        if (option.value === 'none') continue;
+        const rows = openDeals().filter((deal) => String(
+          property === 'lead_source' ? deal.leadSource : property === 'forecast_category' ? deal.forecast : deal.competitor,
+        ) === option.value);
+        // A value with no open deals behind it has no figure to check; the
+        // point is only that the workspace total is never the answer.
+        const answer = await ask(`How many open deals have the ${option.label} ${property.replace(/_/g, ' ')}?`);
+        assertLedgerSettled(answer);
+        assert.ok(!answer.content.includes(workspace),
+          `"${option.label}" (${property}) was answered with the workspace's open book:\n${answer.content}`);
+        if (!answer.analysis.refusal && rows.length) {
+          assert.match(answer.content, new RegExp(`\\b${rows.length}\\b`),
+            `"${option.label}" (${property}) covers ${rows.length} open deals:\n${answer.content}`);
+        }
+      }
+    }
+  });
+});
+
+/* ========================================================================== *
+ * The other half of the invariant: the qualifier that is not a scope.
+ *
+ * A ranking cut-off, a direction, a thread's standing scope, the record a
+ * write lands on, the denomination of a figure. Each of these was dropped in
+ * exactly the same way — silently, with a confident sentence over the wider
+ * answer — and each is checked here against a figure computed from the rows.
+ * ========================================================================== */
+
+/** A multi-turn conversation, so a scope set two turns ago can be checked. */
+async function thread(questions: string[]): Promise<any[]> {
+  const messages: { role: 'user' | 'assistant'; content: string }[] = [];
+  const answers: any[] = [];
+  for (const question of questions) {
+    messages.push({ role: 'user', content: question });
+    const answer = await expectOk('POST', '/v1/ai/complete', { messages: [...messages] });
+    answers.push(answer);
+    messages.push({ role: 'assistant', content: answer.content });
+  }
+  return answers;
+}
+
+describe('a ranking is a qualifier: the cut-off, the direction and the rows', () => {
+  test('a cardinal in front of the ranking word cuts the list to that many', async () => {
+    const answer = await ask('Give me the 4 largest accounts by revenue.');
+    assertLedgerSettled(answer);
+    // Ranked per currency book, so the check is per book: a fifth row in any
+    // of them is the reader's own number dropped.
+    for (const book of answer.content.split(/\n(?=[A-Z]{3} —)/)) {
+      const rows = book.match(/^\d+\. /gm) ?? [];
+      assert.ok(rows.length <= 4, `a book came back with ${rows.length} rows for a question that asked for 4:\n${answer.content}`);
+    }
+    assert.match(answer.content, /^1\. /m);
+  });
+
+  test('a hyphenated direction is the same instruction as the spaced one', async () => {
+    const answer = await ask('List the lowest-value deals in the Expansion pipeline.');
+    assertLedgerSettled(answer);
+    assert.equal(answer.analysis.refusal, null, `a phrasing this engine answers when spelt with a space:\n${answer.content}`);
+    const expansion = openDeals().filter((d) => d.pipeline === 'expansion').sort((a, b) => a.amount - b.amount);
+    assert.ok(answer.content.includes(expansion[0].name),
+      `the smallest deal in the Expansion pipeline is ${expansion[0].name}:\n${answer.content}`);
+    const largest = [...expansion].sort((a, b) => b.amount - a.amount)[0];
+    assert.ok(!answer.content.startsWith(`• ${largest.name}`), 'the list opened with the largest under a question asking for the lowest');
+  });
+
+  test('an adjectival direction is not read as a measure this workspace lacks', async () => {
+    const answer = await ask('What is the least valuable open deal?');
+    assertLedgerSettled(answer);
+    assert.equal(answer.analysis.refusal, null, `"valuable" is half a ranking, not a measure:\n${answer.content}`);
+    const smallest = [...openDeals()].sort((a, b) => a.amount - b.amount)[0];
+    const largest = [...openDeals()].sort((a, b) => b.amount - a.amount)[0];
+    assert.ok(answer.content.includes(smallest.name), `the smallest open deal is ${smallest.name}:\n${answer.content}`);
+    assert.ok(!answer.content.includes(largest.name), `the largest open deal was listed under "least valuable":\n${answer.content}`);
+  });
+
+  test('"what are the biggest…" is a list, not a count', async () => {
+    const answer = await ask('What are the biggest deals owned by Marcus Ilori?');
+    assertLedgerSettled(answer);
+    const owned = fullDeals().filter((d) => d.owner === personId('Marcus Ilori')).sort((a, b) => b.amount - a.amount);
+    assert.ok(answer.content.includes(owned[0].name),
+      `a superlative list has rows in it; ${owned[0].name} is the largest deal Marcus Ilori owns:\n${answer.content}`);
+  });
+
+  test('"what are the largest…" in a stage and a pipeline lists the rows in it', async () => {
+    const answer = await ask('What are the largest deals in the Negotiation stage of the Renewal pipeline?');
+    assertLedgerSettled(answer);
+    const rows = fullDeals().filter((d) => d.stage === 'negotiation' && d.pipeline === 'renewal');
+    for (const row of rows) {
+      assert.ok(answer.content.includes(row.name), `${row.name} is in that stage and that pipeline:\n${answer.content}`);
+    }
+  });
+});
+
+describe('a thread carries its scope forward, and a follow-up cannot widen it', () => {
+  test('a pronoun keeps the account when the follow-up names a meter', async () => {
+    const [, usage] = await thread([
+      'Give me an overview of Kestrel Aerospace Components.',
+      'How many telemetry events did they meter in August 2026?',
+    ]);
+    assertLedgerSettled(usage);
+    assert.match(usage.content, /Kestrel Aerospace Components metered/,
+      `"they" named Kestrel one turn earlier:\n${usage.content}`);
+    // The workspace-wide figure for the same meter and month, which is what
+    // the answer used to be — 18.6x the account's own.
+    const step = (usage.analysis.plan ?? []).find((s: any) => s.tool === 'metered_usage');
+    assert.ok(step?.args.customer, `metered_usage ran with no customer, so the thread's account was dropped:\n${JSON.stringify(step)}`);
+  });
+
+  test('an anaphoric ranking inherits every scope the chain established', async () => {
+    const answers = await thread([
+      'How much open pipeline does Priya Raman own?',
+      'And in the Renewal pipeline?',
+      'What about Marcus Ilori?',
+      'Show me the three smallest of those.',
+    ]);
+    const last = answers[3];
+    assertLedgerSettled(last);
+    const marcusRenewal = openDeals().filter((d) => d.owner === personId('Marcus Ilori') && d.pipeline === 'renewal');
+    for (const deal of marcusRenewal) {
+      assert.ok(last.content.includes(deal.name), `${deal.name} is in the set "those" names:\n${last.content}`);
+    }
+    for (const deal of openDeals().filter((d) => d.owner === personId('Marcus Ilori') && d.pipeline !== 'renewal')) {
+      assert.ok(!last.content.includes(deal.name),
+        `${deal.name} is in the ${deal.pipeline} pipeline, and the chain was scoped to Renewal two turns earlier:\n${last.content}`);
+    }
+  });
+});
+
+describe('a write lands on the record the instruction named, or on none', () => {
+  test('a descriptive fragment binds the write to the deal it describes', async () => {
+    const answer = await ask('Move the Meridian Forge Systems predictive maintenance add-on deal to Proposal sent.', { allow_writes: true });
+    const approvals: any[] = answer.pending_approvals ?? [];
+    assert.equal(approvals.length, 1, `one write, prepared not performed:\n${answer.content}`);
+    const target = String(approvals[0].args.id);
+    const named = app.ctx.db.get<{ display_name: string }>(
+      `SELECT display_name FROM crm_records WHERE org_id = ? AND id = ?`, ORG, target)!;
+    assert.match(named.display_name, /predictive maintenance add-on/,
+      `the write was prepared against "${named.display_name}", which is not the deal the sentence named.`);
+    // The deal it used to land on is closed-won and worth $330,480; reopening
+    // it reclassifies that as pipeline.
+    assert.doesNotMatch(named.display_name, /OEE programme phase 2/);
+  });
+
+  test('two deals at one account described equally well is a refusal, not a ranking', async () => {
+    const answer = await ask('Move the Meridian Forge Systems deal to Proposal sent.', { allow_writes: true });
+    assert.equal((answer.pending_approvals ?? []).length, 0,
+      `two deals match that sentence equally well; picking one is a coin toss with the reader's data:\n${answer.content}`);
+    assert.match(answer.content, /names 2 deals equally well/);
+    for (const deal of fullDeals().filter((d) => d.name.startsWith('Meridian Forge Systems'))) {
+      assert.ok(answer.content.includes(deal.name), `the refusal lists both candidates; ${deal.name} is missing:\n${answer.content}`);
+    }
+  });
+
+  test('a date in an instruction is a value, not a reporting period', async () => {
+    const answer = await ask(
+      'Set the close date on the Calder & Vance Manufacturing connected asset expansion deal to 2026-12-01.',
+      { allow_writes: true },
+    );
+    const approvals: any[] = answer.pending_approvals ?? [];
+    assert.equal(approvals.length, 1, `a date-valued write was refused as an unparsed reporting period:\n${answer.content}`);
+    assert.equal(approvals[0].args.properties.close_date, Date.UTC(2026, 11, 1, 9));
+    const named = app.ctx.db.get<{ display_name: string }>(
+      `SELECT display_name FROM crm_records WHERE org_id = ? AND id = ?`, ORG, String(approvals[0].args.id))!;
+    assert.match(named.display_name, /connected asset expansion/);
+  });
+});
+
+describe('the figure a schema field takes is the one the run computed', () => {
+  test('a field named for the measure is filled whatever unit the caller wrote into its name', async () => {
+    const renewal = openDeals().filter((d) => d.owner === personId('Marcus Ilori') && d.pipeline === 'renewal');
+    const answer = await ask('How much open pipeline does Marcus Ilori own in the Renewal pipeline?', {
+      response_schema: {
+        type: 'object',
+        properties: { owner: { type: 'string' }, open_pipeline_cents: { type: 'number' }, deal_count: { type: 'integer' } },
+      },
+    });
+    const row = JSON.parse(answer.content) as { owner: string | null; open_pipeline_cents: number | null; deal_count: number | null };
+    assert.equal(row.owner, 'Marcus Ilori');
+    assert.equal(row.open_pipeline_cents, total(renewal),
+      `the run holds this figure and filled the identical field called "amount"; the unit in the name is not part of the measure.`);
+    assert.equal(row.deal_count, renewal.length);
+  });
+
+  test('a count field named for the rows a catalogue measure counted is filled from them', async () => {
+    const answer = await ask('What did we invoice in GBP in Q2 2026?', {
+      response_schema: {
+        type: 'object',
+        properties: { amount: { type: 'number' }, currency: { type: 'string' }, invoice_count: { type: 'integer' } },
+      },
+    });
+    const row = JSON.parse(answer.content) as { amount: number | null; invoice_count: number | null };
+    assert.ok(typeof row.amount === 'number', `the prose states an amount: ${answer.content}`);
+    assert.ok(typeof row.invoice_count === 'number' && row.invoice_count > 0,
+      `the prose names the invoices behind the figure and the schema field came back null: ${answer.content}`);
+  });
+});
+
+describe('a zero says what it is a zero of', () => {
+  test('a currency-scoped zero names the book in the same sentence', async () => {
+    const answer = await ask("What is Brightline Foods' outstanding balance in EUR?");
+    assertLedgerSettled(answer);
+    const zero = answer.content.split('\n')[0];
+    assert.match(zero, /EUR/, `the unqualified sentence is false — this account is 56 days past due in USD:\n${zero}`);
+  });
+
+  test('a period that has not started is not a period with nothing in it', async () => {
+    const answer = await ask('How much will we invoice next quarter?');
+    assertLedgerSettled(answer);
+    assert.match(answer.content, /has not started/,
+      `a forward window on a historical measure is refused by name, not answered with a historical zero:\n${answer.content}`);
+  });
+
+  test('an empty meter reads as English', async () => {
+    const answer = await ask('How many telemetry events did Meridian Forge Systems meter in July 2026?');
+    assert.doesNotMatch(answer.content, /events was metered/, `subject and verb disagree:\n${answer.content}`);
+  });
+
+  test('a closed-won total is not labelled open pipeline', async () => {
+    const answer = await ask('What is the total value of deals we won in the Renewal pipeline last year?');
+    assertLedgerSettled(answer);
+    assert.ok(!/open pipeline/i.test(answer.content) || !/closed-won/i.test(answer.content),
+      `the metric noun and the set contradict each other in one clause:\n${answer.content}`);
+  });
+});
+
+describe('the first person is an owner', () => {
+  for (const question of ['How much pipeline do I own?', 'What is my open pipeline?', 'Which deals are assigned to me?']) {
+    test(`"${question}" is scoped to the person asking`, async () => {
+      const answer = await ask(question);
+      assertLedgerSettled(answer);
+      const mine = openDeals().filter((d) => d.owner === 'usr_seed01');
+      assert.ok(answer.content.includes('Dana Whitfield'),
+        `the session belongs to Dana Whitfield, and the answer names nobody:\n${answer.content}`);
+      assert.ok(!answer.content.includes(cash(total(openDeals()))),
+        `answered with the workspace's whole open book:\n${answer.content}`);
+      assert.ok(answer.content.includes(cash(total(mine))) || answer.content.includes(`${mine.length}`),
+        `Dana Whitfield owns ${mine.length} open deals worth ${cash(total(mine))}:\n${answer.content}`);
+    });
+  }
+});
+
+describe('the measure lexicon runs before the status lexicon', () => {
+  test('"open pipeline" is a measure, not the status "open"', async () => {
+    const answer = await ask('Summarise Kestrel Aerospace Components and tell me their open pipeline.');
+    assertLedgerSettled(answer);
+    assert.equal(answer.analysis.refusal, null,
+      `"open pipeline" was shredded into the status "open" and the whole question refused:\n${answer.content}`);
+    assert.doesNotMatch(answer.content, /the status "open/,
+      `the measure's own name was read back as a status:\n${answer.content}`);
+    assert.match(answer.content, /Kestrel Aerospace Components/);
+  });
+});
+
+describe('two teammates in one question is a comparison, not a refusal', () => {
+  test('both reps are measured, each over the rows they own', async () => {
+    const answer = await ask('Compare open pipeline for Dana Whitfield and Priya Raman.');
+    assertLedgerSettled(answer);
+    assert.equal(answer.analysis.refusal, null, `both names resolve to teammates this workspace has:\n${answer.content}`);
+    for (const name of ['Dana Whitfield', 'Priya Raman']) {
+      const owned = openDeals().filter((d) => d.owner === personId(name));
+      assert.ok(answer.content.includes(cash(total(owned))),
+        `${name} owns ${cash(total(owned))} of open pipeline and the answer does not state it:\n${answer.content}`);
+    }
+  });
+});
+
+/**
+ * The nine questions two critics found, verbatim.
+ *
+ * Every one of them was answered with a confident, precise figure about a
+ * different question. They are here as written so a regression cannot hide
+ * behind a rephrasing.
+ */
+describe('the substitutions this engine exists to refuse, in the words they were found in', () => {
+  const workspaceTotal = () => cash(total(openDeals()));
+
+  test('"What is the Renewal pipeline worth?"', async () => {
+    const answer = await ask('What is the Renewal pipeline worth?');
+    assertLedgerSettled(answer);
+    const renewal = openDeals().filter((d) => d.pipeline === 'renewal');
+    assert.ok(answer.content.includes(cash(total(renewal))), `the Renewal book is ${cash(total(renewal))}:\n${answer.content}`);
+    assert.ok(!answer.content.includes(workspaceTotal()), `answered with the workspace total:\n${answer.content}`);
+  });
+
+  test('"What is our weighted pipeline?"', async () => {
+    const answer = await ask('What is our weighted pipeline?');
+    assertLedgerSettled(answer);
+    const weighted = app.ctx.db.all<{ properties: string }>(
+      `SELECT properties FROM crm_records WHERE org_id = ? AND object_type = 'deal' AND archived = 0`, ORG,
+    ).map((row) => JSON.parse(row.properties) as Record<string, unknown>)
+      .filter((p) => stageSets(app.ctx, ORG).open.includes(String(p.deal_stage ?? '')))
+      .reduce((sum, p) => sum + Number(p.weighted_amount ?? 0), 0);
+    assert.ok(answer.content.includes(cash(weighted)), `weighted pipeline is ${cash(weighted)}:\n${answer.content}`);
+    assert.ok(!answer.content.includes(workspaceTotal()), `answered with open pipeline, which is a different measure:\n${answer.content}`);
+  });
+
+  test('"How many deals are in Negotiation?"', async () => {
+    const answer = await ask('How many deals are in Negotiation?');
+    assertLedgerSettled(answer);
+    const rows = fullDeals().filter((d) => d.stage === 'negotiation');
+    assert.match(answer.content, new RegExp(`\\b${rows.length}\\b`));
+    assert.ok(!answer.content.includes(`${openDeals().length} open deals right now`),
+      `answered with the whole open book:\n${answer.content}`);
+  });
+
+  test('"How much pipeline does Marcus Ilori own?"', async () => {
+    const answer = await ask('How much pipeline does Marcus Ilori own?');
+    assertLedgerSettled(answer);
+    const owned = openDeals().filter((d) => d.owner === personId('Marcus Ilori'));
+    assert.ok(answer.content.includes(cash(total(owned))), `Marcus owns ${cash(total(owned))}:\n${answer.content}`);
+    assert.ok(!/Whitcombe/.test(answer.content), `a contact's employer is not an owner:\n${answer.content}`);
+  });
+
+  test('"Which deals did we lose in Q2 2026?"', async () => {
+    const answer = await ask('Which deals did we lose in Q2 2026?');
+    assertLedgerSettled(answer);
+    const lost = stageSets(app.ctx, ORG).lost;
+    const rows = fullDeals().filter((d) => lost.includes(d.stage)
+      && d.close >= Date.UTC(2026, 3, 1) && d.close < Date.UTC(2026, 6, 1));
+    assert.match(answer.content, new RegExp(`\\b${rows.length} closed-lost deals?\\b`));
+    assert.ok(!answer.content.includes(WORKSPACE_OPEN_COUNT()), `answered with the open book:\n${answer.content}`);
+    for (const won of fullDeals().filter((d) => d.stage === 'closed_won'
+      && d.close >= Date.UTC(2026, 3, 1) && d.close < Date.UTC(2026, 6, 1))) {
+      assert.ok(!answer.content.includes(won.name), `${won.name} was won, not lost:\n${answer.content}`);
+    }
+  });
+
+  test('"What did we invoice in August 2026?"', async () => {
+    const answer = await ask('What did we invoice in August 2026?');
+    assertLedgerSettled(answer);
+    assert.match(answer.content, /August 2026/);
+    assert.doesNotMatch(answer.content, /July 2025|July 2026/, `invoices from another month:\n${answer.content}`);
+  });
+
+  for (const stage of ['Technical validation', 'Proposal sent']) {
+    test(`"${stage}" is a stage this workspace has, and is answered as one`, async () => {
+      const answer = await ask(`How many deals are in ${stage}?`);
+      assertLedgerSettled(answer);
+      assert.equal(answer.analysis.refusal, null,
+        `${stage} is a stage this workspace stores, and the refusal printed it by name:\n${answer.content}`);
+      const value = stageValueOf(stage);
+      assert.match(answer.content, new RegExp(`\\b${fullDeals().filter((d) => d.stage === value).length}\\b`));
+    });
+  }
 });

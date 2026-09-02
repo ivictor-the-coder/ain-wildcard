@@ -2357,6 +2357,40 @@ const askCopilotUnchecked = async (page: Page, question: string) => {
   return answer;
 };
 
+/**
+ * Whether the workspace vocabulary behind the scope row actually loaded.
+ *
+ * Every claim the scope row makes is read through the pipelines, teammates and
+ * metric catalogue. When those reads fail — the platform's rate limiter fires
+ * on a long suite — the card says so in its own words and checks nothing, and a
+ * test that then asserts a scope claim is asserting against a surface that has
+ * correctly declined to make one.
+ */
+const scopeIsChecked = async (answer: ReturnType<Page['locator']>): Promise<boolean> =>
+  (await answer.locator('.cp-scope__chip', { hasText: 'could not be read' }).count()) === 0
+  && (await answer.locator('.ain-banner', { hasText: 'The scope of this answer was not checked' }).count()) === 0;
+
+/**
+ * The same, having given the failed reads another go first.
+ *
+ * The platform's rate limiter is 600 requests a real minute and this suite runs
+ * close to it in one worker, so the four vocabulary reads behind the scope row
+ * are the ones that get refused. Reloading the thread asks again — the same
+ * thing the API helpers above do with `getJson` — and only a workspace that
+ * will not answer at all is a reason to skip.
+ */
+const scopeWasChecked = async (page: Page, answer: ReturnType<Page['locator']>): Promise<boolean> => {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (await scopeIsChecked(answer)) return true;
+    await page.waitForTimeout(3_000 * (attempt + 1));
+    await page.reload({ waitUntil: 'networkidle' });
+    await expect(answer.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
+    await expect(answer.locator('.cp-scope__chip', { hasText: 'reading this workspace' }))
+      .toHaveCount(0, { timeout: 20_000 });
+  }
+  return scopeIsChecked(answer);
+};
+
 const askCopilot = async (page: Page, question: string) => {
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
   const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
@@ -2440,7 +2474,12 @@ test('the scope row never names a record by its database id', async ({ page }) =
     seen.push(...await answer.locator('.cp-scope__chip').allInnerTexts());
     await page.waitForTimeout(150);
   }
-  expect(seen.filter((chip) => /usr_|cmp_|con_/.test(chip)), 'the scope row showed a record id').toEqual([]);
+  // Every prefix, not the three that were leaking when this was written: the
+  // list itself was the defect the next time round, when `credits.balance` put
+  // `ACCOUNT cus_dgqX6o9tM1BGxIWi` on a credit answer and this test watched it
+  // happen without a word.
+  expect(seen.filter((chip) => /\b[a-z]{2,6}_[A-Za-z0-9]{4,}/.test(chip)), 'the scope row showed a record id')
+    .toEqual([]);
 
   // And once the vocabulary is in, the owner is named.
   await expect(answer.locator('.cp-scope__chip', { hasText: 'Dana Whitfield' })).toBeVisible({ timeout: 20_000 });
@@ -2598,4 +2637,501 @@ test('every citation chip is reachable and activatable from the keyboard', async
   await link.focus();
   await page.keyboard.press('Enter');
   await expect.poll(() => new URL(page.url()).pathname, { timeout: 10_000 }).toBe(target);
+});
+
+/**
+ * A qualifier the engine says it dropped is on the screen, whatever its kind.
+ *
+ * "What is our top 2 pipeline by value?" is settled by the engine as `limit "2"
+ * waived` — its own words for a qualifier it read and did not use — and the
+ * client's own list of kinds did not have `limit` on it. So the $9,010,960
+ * workspace total arrived under a scope row with nothing red in it anywhere,
+ * with the engine's admission demoted to a line of prose above the figure. That
+ * is the same defect as the pipeline one, one kind to the left, which is why
+ * the list is now checked against the engine's own union at compile time.
+ */
+test('a row cut-off the engine waived is stated as loudly as any other qualifier', async ({ page }) => {
+  const answer = await askCopilot(page, 'What is our top 2 pipeline by value?');
+  const warning = answer.locator('.ain-banner--danger').first();
+  await expect(warning).toBeVisible();
+  await expect(warning).toContainText('top 2');
+
+  // Above the figure, not under it.
+  const order = await answer.evaluate((node) => {
+    const banner = node.querySelector('.ain-banner--danger');
+    const body = node.querySelector('.cp-answer__body');
+    if (!banner || !body) return 'missing';
+    return banner.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING ? 'before' : 'after';
+  });
+  expect(order).toBe('before');
+
+  // And on the scope row, in red: `limit: 2` really is in the arguments of the
+  // call that ran, so a chip read straight off the arguments would have said
+  // "Top 2" in the calm voice over a figure that was cut to nothing.
+  await expect(answer.locator('.cp-scope__chip.is-wide', { hasText: 'uncut' })).toBeVisible();
+  const cutChips = await answer.locator('.cp-scope__chip').allInnerTexts();
+  expect(cutChips.filter((chip) => /top\s*2\b/i.test(chip)), 'the inert cut-off was stated as a binding').toEqual([]);
+});
+
+/**
+ * A balance held in events is read back in events, or the difference is shouted.
+ *
+ * The billing screens rendered a 6,000,000-event grant as "$60,000.00" and a
+ * unit-credit balance with 9,131 events live as "$0.00 available". The copilot
+ * can be told the same lie: the engine settles these runs with `unit "event"
+ * pending` — the one kind its own refusal exempts — and the client dropped
+ * every ledger state that was not `waived` or `refused`, so nothing on screen
+ * would have contradicted a money figure. The check is the denomination the
+ * answer itself prints.
+ */
+test('a credit balance asked for in events states the unit it was answered in', async ({ page, request }) => {
+  interface Grant { id: string; customer: string; kind: string; meter: string | null }
+  interface Balance { balances: { kind: string; unit_label: string | null; available: number }[] }
+
+  // This test used to scan every unit grant in the workspace for one with a
+  // live balance and ask about whichever customer it landed on. Earlier tests
+  // in this same file spend that balance, so a first run passed, a second run
+  // against the same server failed on a customer whose events were gone, and
+  // running it alone passed in three seconds. A test that only passes on a
+  // database in one particular state is worse than no test, so it makes the
+  // state it needs: its own unit grant, on a named customer, with an expiry far
+  // enough out that nothing in the suite can lapse it.
+  const grants = await getJson<{ data: Grant[] }>(request, '/api/v1/credit-grants?limit=50');
+  const meter = grants.data.find((row) => row.kind === 'unit' && row.meter)?.meter ?? null;
+  test.skip(!meter, 'this workspace meters nothing, so no unit grant can be issued');
+  const customers = await getJson<{ data: { id: string; name: string }[] }>(request, '/api/v1/customers?limit=1');
+  const customer = customers.data[0];
+  expect(customer, 'the workspace has no billing customers').toBeTruthy();
+  const grant = await postJson<Grant>(request, '/api/v1/credit-grants', {
+    customer: customer.id,
+    name: 'Keyboard test — event credit',
+    kind: 'unit',
+    meter,
+    unit_label: 'event',
+    amount: 250_000,
+    category: 'promotional',
+  });
+  const balance = await getJson<Balance>(request, `/api/v1/customers/${customer.id}/credit-balance`);
+  expect(
+    balance.balances.some((row) => row.kind === 'unit' && row.available > 0),
+    `grant ${grant.id} left no live unit balance on ${customer.name}`,
+  ).toBe(true);
+
+  const answer = await askCopilot(page, `How many events of credit does ${customer.name} have left?`);
+  const body = answer.locator('.cp-answer__body');
+
+  if (await answer.locator('.ain-banner--danger').count() === 0) {
+    // No warning means the answer claims to be in events, so it has to be.
+    await expect(body).toContainText('events');
+  } else {
+    await expect(answer.locator('.ain-banner--danger').first()).toContainText('events');
+  }
+
+  // Either way the scope row names the account the balance was read for, and
+  // never by the billing customer id the tool was actually called with — the
+  // one chip on this answer read `ACCOUNT cus_dgqX6o9tM1BGxIWi` before.
+  const chips = await answer.locator('.cp-scope__chip').allInnerTexts();
+  expect(chips.filter((chip) => /\b[a-z]{2,6}_[A-Za-z0-9]{4,}/.test(chip)), 'the scope row showed a record id')
+    .toEqual([]);
+  await expect(answer.locator('.cp-scope__chip', { hasText: customer.name })).toBeVisible();
+});
+
+/**
+ * A ranking is not an accusation that the answer measured the wrong thing.
+ *
+ * "What are our top 3 accounts by spend?" was answered correctly — Customer
+ * spend, grouped by account, cut to three — and topped with a red banner
+ * saying the figure was Customer spend "which is a different measure", because
+ * the word "accounts" was still free for the metric catalogue to claim as the
+ * `customers` metric. A banner that cries wolf on a correct answer is how the
+ * banner over an incorrect one stops being read.
+ */
+test('a top-N ranking is not accused of measuring the dimension it ranked', async ({ page }) => {
+  const answer = await askCopilot(page, 'What are our top 3 accounts by spend?');
+  await expect(answer.locator('.ain-banner--danger')).toHaveCount(0);
+  const chips = await answer.locator('.cp-scope__chip').allInnerTexts();
+  expect(chips.some((chip) => /top\s*3/i.test(chip)), `no cut-off chip in ${JSON.stringify(chips)}`).toBe(true);
+  expect(chips.some((chip) => /Account/i.test(chip)), `no grouping chip in ${JSON.stringify(chips)}`).toBe(true);
+});
+
+/**
+ * A write is prepared against the record the question named, or it is stopped.
+ *
+ * "Move the Sakamoto Seiki — packaging line uplift deal to Negotiation" was
+ * prepared against *Sakamoto Seiki — multi-site rollout* — a closed-won deal —
+ * and the approval card showed the user's sentence and the wrong record's name
+ * three lines apart, with none of the reconciliation apparatus a read answer
+ * gets. Approving it moved $321,840 out of closed-won. The engine may resolve
+ * the mention correctly, in which case the card is a plain approval; what it
+ * may never do is present a sibling as the record that was named.
+ */
+test('a write prepared against a sibling of the deal that was named is stopped', async ({ page, request }) => {
+  // This test used to phrase the question with the deal's full em-dash display
+  // name — "Move the Pemberton Auto Systems — pilot expansion to 3 lines deal
+  // to Negotiation" — which is the one phrasing that resolves correctly, so it
+  // passed over a defect that was live the whole time. People write the name
+  // without the dash, and that is the phrasing swept here: on this workspace
+  // seven of the fourteen questions below land on a sibling, one of them on a
+  // *closed-lost* deal whose approval would have moved $223,440 back into open
+  // pipeline. Every account with two or more open deals is asked about, so the
+  // test cannot pass by picking a lucky one.
+  const all = await getJson<DealList>(request, '/api/v1/records/deal?limit=200');
+  const byAccount = new Map<string, DealRecord[]>();
+  for (const row of all.data) {
+    if (!row.display_name.includes('—')) continue;
+    const account = row.display_name.split('—')[0].trim();
+    byAccount.set(account, [...(byAccount.get(account) ?? []), row]);
+  }
+  const accounts = [...byAccount.entries()]
+    .filter(([, rows]) => rows.filter((r) => r.properties.deal_status === 'open').length > 1);
+  test.skip(accounts.length === 0, 'no account in this workspace carries two open deals');
+
+  let misTargeted = 0;
+  for (const [account, rows] of accounts) {
+    for (const named of rows.filter((r) => r.properties.deal_status === 'open')) {
+      const suffix = named.display_name.split('—').slice(1).join('—').trim();
+      const question = `Move the ${account} ${suffix} deal to Proposal`;
+
+      await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+      await page.getByRole('switch', { name: 'Let it prepare writes' }).click();
+      await page.getByRole('textbox', { name: 'Ask the copilot' }).fill(question);
+      await page.getByRole('button', { name: 'Ask', exact: true }).click();
+      await expect(page.getByText('Waiting for your approval').first()).toBeVisible({ timeout: 40_000 });
+
+      const card = page.locator('.ain-card', { hasText: 'Waiting for your approval' }).first();
+      const preview = (await card.locator('.cp-approval__preview').innerText()).trim();
+      const warned = await card.locator('.ain-banner--danger').count() > 0;
+
+      if (preview.includes(named.display_name)) {
+        // Resolved correctly: no warning, and the button says what it always says.
+        expect(warned, `the right deal was targeted and the card cried wolf:\n${question}\n${preview}`).toBe(false);
+        await expect(card.getByRole('button', { name: 'Approve and run' })).toBeEnabled();
+      } else {
+        misTargeted += 1;
+        // Resolved to something else: the card has to say so, above the
+        // preview, and approving has to take a deliberate second act.
+        expect(warned, `the card targeted "${preview}" for "${question}" and said nothing`).toBe(true);
+        await expect(card.locator('.ain-banner--danger').first()).toContainText(suffix.split(' ')[0]);
+        const approve = card.getByRole('button', { name: 'Approve anyway' });
+        await expect(approve).toBeDisabled();
+        await card.locator('.ain-check__input').check();
+        await expect(approve).toBeEnabled();
+        // Nothing was written: the run is left where it was found.
+        await card.getByRole('button', { name: 'Decline' }).click();
+      }
+    }
+  }
+  // Whether the engine still mis-resolves any of these is the engine's
+  // business and it changes underneath this file, so the count is recorded
+  // rather than required: what this test holds is the invariant either way —
+  // a mis-targeted write is gated and a correct one is not. The guard itself is
+  // held to the recorded sweep in `tests/copilot.test.ts`, where the fourteen
+  // questions and the record each one actually resolved to are frozen.
+  test.info().annotations.push({
+    type: 'sweep',
+    description: `${accounts.length} accounts, ${misTargeted} write(s) prepared against a sibling`,
+  });
+});
+
+/**
+ * "How many deals did we close in Q2 2026?" is answered with open deals.
+ *
+ * 0 against a true 8 worth $613,760, captioned "STATUS open only" — the status
+ * inverted to its exact opposite and asserted as the scope, at 88% confidence,
+ * logged as a success. The client cannot make the engine read the word; it can
+ * refuse to let "open only" stand as the scope of a question that said "close".
+ */
+test('a question about deals we closed is never captioned "open only" in silence', async ({ page, request }) => {
+  const deals = await getJson<DealList>(request, '/api/v1/records/deal?limit=200');
+  const start = Date.UTC(2026, 3, 1);
+  const end = Date.UTC(2026, 6, 1);
+  const closed = deals.data.filter((row) => {
+    const at = Number(row.properties.close_date ?? 0);
+    return ['won', 'lost'].includes(String(row.properties.deal_status)) && at >= start && at < end;
+  });
+  test.skip(closed.length === 0, 'nothing closed in Q2 2026 on this workspace');
+
+  const answer = await askCopilot(page, 'How many deals did we close in Q2 2026?');
+  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+  test.skip(!await scopeWasChecked(page, answer), 'the workspace vocabulary did not load, so nothing was checked');
+  const body = (await answer.locator('.cp-answer__body').innerText()).trim();
+  const status = answer.locator('.cp-scope__chip', { hasText: 'Status' });
+
+  // Either the answer really is about closed deals, or the card says out loud
+  // that it measured something else.
+  const openOnly = (await status.count()) > 0 && /open/.test(await status.first().innerText());
+  if (openOnly || new RegExp(`\\b0 open deals\\b`).test(body)) {
+    const banner = answer.locator('.ain-banner--danger');
+    await expect(banner.first()).toBeVisible();
+    await expect(banner.first()).toContainText('closed deals');
+    await expect(banner.first()).toContainText('open deals');
+  }
+});
+
+/**
+ * A record property the question named, dropped without a chip or a banner.
+ *
+ * "How many open deals came from a trade show?" is answered "38 open deals" —
+ * every open deal in the workspace — against a true 7 worth $2,634,940, with
+ * the words "trade show" appearing nowhere on the card. The qualifier
+ * vocabulary knew thirteen dimensions and record properties were not among
+ * them, so the question could name one and the ledger had no slot to refuse it.
+ */
+test('a lead source the question named is either filtered on or refused out loud', async ({ page, request }) => {
+  interface PropertyDef { name: string; label: string; type: string; options: { value: string; label: string }[] | null }
+  const props = await getJson<{ data: PropertyDef[] }>(request, '/api/v1/objects/deal/properties');
+  const source = props.data.find((row) => row.name === 'lead_source');
+  test.skip(!source?.options?.length, 'this workspace has no enumerated lead source');
+  const option = source!.options!.find((row) => row.label.toLowerCase().includes('trade')) ?? source!.options![0];
+
+  const deals = await getJson<DealList>(request, '/api/v1/records/deal?limit=200');
+  const truth = deals.data.filter((row) =>
+    row.properties.deal_status === 'open' && row.properties.lead_source === option.value).length;
+  const open = deals.data.filter((row) => row.properties.deal_status === 'open').length;
+  test.skip(truth === open, 'every open deal carries this source, so there is nothing to drop');
+
+  const answer = await askCopilot(page, `How many open deals came from a ${option.label.toLowerCase()}?`);
+  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+  test.skip(!await scopeWasChecked(page, answer), 'the workspace vocabulary did not load, so nothing was checked');
+  const body = (await answer.locator('.cp-answer__body').innerText()).trim();
+
+  // The unqualified count is the substitution. If the answer is that number,
+  // the card has to name the dimension it dropped — in the banner and on the
+  // scope row — rather than presenting it as the answer.
+  if (new RegExp(`\\b${open}\\b`).test(body) && !new RegExp(`\\b${truth}\\b`).test(body)) {
+    const banner = answer.locator('.ain-banner--danger');
+    await expect(banner.first()).toContainText(option.label);
+    await expect(banner.first()).toContainText(source!.label);
+    await expect(answer.locator('.cp-scope__chip.is-wide', { hasText: source!.label })).toHaveCount(1);
+  }
+});
+
+/**
+ * A pipeline this workspace has, reported not to exist.
+ *
+ * "How many tickets are in the Support pipeline?" answered "No deal pipeline in
+ * this workspace is called 'Support'. … The pipelines Northwind Robotics has
+ * are 'New business', 'Expansion' and 'Renewal'." `crm_pipelines` holds a
+ * `support` pipeline of tickets. A correcting banner above the paragraph was
+ * an improvement and still left the falsehood rendered verbatim underneath it.
+ */
+test('a ticket pipeline is not denied in the answer under a banner saying it exists', async ({ page, request }) => {
+  const tickets = await getJson<{ data: PipelineDef[] }>(request, '/api/v1/pipelines/ticket');
+  test.skip(tickets.data.length === 0, 'this workspace has no ticket pipeline');
+  const support = tickets.data[0];
+
+  const answer = await askCopilot(page, `How many tickets are in the ${support.label} pipeline?`);
+  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+  test.skip(!await scopeWasChecked(page, answer), 'the workspace vocabulary did not load, so nothing was checked');
+  const body = (await answer.locator('.cp-answer__body').innerText()).trim();
+  expect(body, 'the answer still denies a pipeline this workspace has').not.toMatch(/No deal pipeline in this workspace is called/i);
+  expect(body, 'the answer still lists the pipelines and leaves this one out').not.toMatch(/The pipelines .* has are/i);
+  // What is left says the true thing, and the banner above it still points at
+  // the screen where the tickets are.
+  expect(body).toContain(support.label);
+  await expect(answer.getByRole('link', { name: /Open the ticket/i })).toBeVisible();
+});
+
+/**
+ * A write the tool refused is not a write that landed.
+ *
+ * The first wrong-target attempt in the critic's run came back `Failed:
+ * "commercial_terms" belongs to the Renewal pipeline` and the card carried a
+ * green "Approved and written" badge and a "WRITTEN TO deal_nw_15" link,
+ * directly above the sentence saying nothing had been written.
+ */
+test('a write the tool refused is reported as a failure, not as written', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const home = defs.find((p) => p.is_default) ?? defs[0];
+  // A stage that belongs to some other pipeline, so the write is guaranteed to
+  // be refused by the CRM rather than by anything on this screen.
+  const foreign = defs
+    .filter((p) => p.name !== home.name)
+    .flatMap((p) => p.stages.filter((s) => !s.is_closed))
+    .find((s) => !home.stages.some((own) => own.name === s.name));
+  test.skip(!foreign, 'every stage in this workspace is legal on every pipeline');
+
+  const deals = await getJson<DealList>(request, '/api/v1/records/deal?limit=200');
+  const victim = deals.data.find((row) =>
+    row.properties.pipeline === home.name && row.properties.deal_status === 'open');
+  test.skip(!victim, 'no open deal on the default pipeline');
+
+  await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+  await page.getByRole('switch', { name: 'Let it prepare writes' }).click();
+  await page.getByRole('textbox', { name: 'Ask the copilot' })
+    .fill(`Move the ${victim!.display_name} deal to ${foreign!.label}`);
+  await page.getByRole('button', { name: 'Ask', exact: true }).click();
+  await expect(page.getByText('Waiting for your approval').first()).toBeVisible({ timeout: 40_000 });
+
+  const card = page.locator('.ain-card', { hasText: 'Waiting for your approval' }).first();
+  if (await card.locator('.ain-check__input').count()) await card.locator('.ain-check__input').check();
+  await card.getByRole('button', { name: /^Approve/ }).click();
+
+  const resolution = page.locator('.cp-resolution').last();
+  await expect(resolution).toBeVisible({ timeout: 30_000 });
+  const outcome = await resolution.getAttribute('data-outcome');
+  if (outcome === 'failed') {
+    await expect(resolution).toContainText('the write failed');
+    await expect(resolution).not.toContainText('Approved and written');
+    // …and it does not link to a record it never wrote to.
+    await expect(resolution.locator('.cp-chips', { hasText: 'Written to' })).toHaveCount(0);
+    // The deal is where it was.
+    const after = await deal(request, victim!.id);
+    expect(after.properties.deal_stage).toBe(victim!.properties.deal_stage);
+  }
+});
+
+/**
+ * The board is one key from the top of the page, like the copilot.
+ *
+ * Keyboard-only from a fresh /deals load, the first deal card was 36 Tab
+ * presses away: 16 through the sidebar, 9 through the top bar, 10 more through
+ * the view toggle, the filters and the search box.
+ */
+test('the deal board is reachable without tabbing through the whole toolbar', async ({ page }) => {
+  await board(page);
+  await page.evaluate(() => (document.querySelector('.shell-skip') as HTMLElement | null)?.focus());
+  await page.keyboard.press('Enter');
+
+  let presses = 0;
+  for (; presses < 40; presses += 1) {
+    await page.keyboard.press('Tab');
+    if (await page.evaluate(() => document.activeElement?.classList.contains('pl-skip'))) break;
+  }
+  expect(presses, 'the skip link to the board was not near the top of the page').toBeLessThan(8);
+  // Invisible until it has the keyboard, and it lands on the card the arrow
+  // keys start from — not on a container that announces nothing.
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.pl-card__name[tabindex="0"]')).toBeFocused();
+  // And the grid takes over from there.
+  await page.keyboard.press('ArrowRight');
+  await expect(page.locator('.pl-card__name[tabindex="0"]')).toHaveCount(1);
+});
+
+/**
+ * A question that counts records is answered with a count, or it says otherwise.
+ *
+ * "How many contacts are in the Expansion pipeline?" was answered "$3,162,060
+ * in open pipeline … from 10 open deals" — a dollar figure for a question about
+ * people — with no banner and no chip anywhere naming what had been counted.
+ */
+test('a question about how many records is never quietly answered in money', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const named = defs.find((p) => !p.is_default) ?? defs[0];
+  const answer = await askCopilot(page, `How many contacts are in the ${named.label} pipeline?`);
+  // The answer types itself in. Reading it while the caret is still moving
+  // reads a prefix — and a prefix of "$3,162,060 in open pipeline" has no
+  // money glyph in it yet, which is a test that passes by being early.
+  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+  const body = (await answer.locator('.cp-answer__body').innerText()).trim();
+  const banners = await answer.locator('.ain-banner--danger').count();
+  // A money glyph in the answer to a counting question is either flagged or
+  // the answer is wrong and silent.
+  if (/[$€£]/.test(body)) {
+    expect(banners, `answered in money with nothing said:\n${body}`).toBeGreaterThan(0);
+    await expect(answer.locator('.ain-banner--danger').first()).toContainText('contacts');
+  }
+});
+
+/**
+ * The run log can count the questions the engine did not answer.
+ *
+ * Refusals were logged as "Succeeded" — 93 runs, a Failed tile reading 0, and
+ * no way to filter for or count the single most important operational signal
+ * this engine has.
+ */
+test('a refused run is counted as refused in the run log', async ({ page }) => {
+  // A period nothing can resolve: the engine refuses this one by design.
+  await askCopilotUnchecked(page, 'How did we do tomorrow?');
+  await visit(page, '/copilot/runs', '.ain-table');
+  const tile = page.locator('.ain-stat', { hasText: 'Refused' }).first();
+  await expect(tile).toBeVisible();
+  await expect(tile.locator('.ain-stat__value')).not.toHaveText('0');
+  // …and the filter that finds them exists, and finds them.
+  await page.getByLabel('Run status').selectOption('refused');
+  await expect(page.locator('tbody tr').first()).toBeVisible();
+  const outcomes = await page.locator('tbody tr td:nth-child(4)').allInnerTexts();
+  expect(outcomes.length).toBeGreaterThan(0);
+  expect(outcomes.every((text) => text.includes('Refused')), `outcomes were ${JSON.stringify(outcomes)}`).toBe(true);
+});
+
+/**
+ * The board is one tab stop, and the arrow keys cross it.
+ *
+ * 36 Tab presses reached the first card, and then one press per card to leave
+ * the column you were in: on a 22-card board the keyboard could not cross the
+ * board in any reasonable number of keystrokes.
+ */
+test('the deal board is a grid the keyboard can cross', async ({ page }) => {
+  await board(page);
+  const cards = await page.locator('.pl-card').count();
+  expect(cards, 'no cards on the board to move between').toBeGreaterThan(2);
+  // Exactly one card is in the tab order, however many are drawn.
+  await expect(page.locator('.pl-card__name[tabindex="0"]')).toHaveCount(1);
+
+  const at = () => page.evaluate(() => document.activeElement?.closest?.('.pl-card')?.getAttribute('data-deal') ?? null);
+  await page.locator('.pl-card__name[tabindex="0"]').focus();
+  const first = await at();
+  expect(first).toBeTruthy();
+
+  await page.keyboard.press('ArrowDown');
+  const down = await at();
+  await page.keyboard.press('ArrowUp');
+  expect(await at(), 'ArrowUp did not undo ArrowDown').toBe(first);
+
+  // Right lands on a card in another column, and the tab stop moves with it.
+  await page.keyboard.press('ArrowRight');
+  const across = await at();
+  expect(across, 'ArrowRight moved nowhere').not.toBe(first);
+  const column = await page.evaluate((id) =>
+    document.querySelector(`.pl-card[data-deal="${id}"]`)?.closest('.pl-col')?.getAttribute('data-stage') ?? null, across);
+  const from = await page.evaluate((id) =>
+    document.querySelector(`.pl-card[data-deal="${id}"]`)?.closest('.pl-col')?.getAttribute('data-stage') ?? null, first);
+  expect(column, 'ArrowRight stayed inside the same column').not.toBe(from);
+  await expect(page.locator(`.pl-card[data-deal="${across}"] .pl-card__name[tabindex="0"]`)).toHaveCount(1);
+  await expect(page.locator('.pl-card__name[tabindex="0"]')).toHaveCount(1);
+  if (down && down !== first) expect(down).not.toBe(across);
+
+  // And Tab leaves the board rather than walking every card in the column.
+  let presses = 0;
+  for (; presses < 6; presses += 1) {
+    await page.keyboard.press('Tab');
+    if (!await page.evaluate(() => !!document.activeElement?.closest?.('.pl-board'))) break;
+  }
+  // Two: the focused card's own menu, then out. Not one per card, and not one
+  // per column either — a roving tabindex makes Chromium treat every column as
+  // a focusable scroll container unless it is told otherwise.
+  expect(presses, 'Tab walked the cards instead of leaving the board').toBeLessThan(3);
+});
+
+/**
+ * The composer is one key away, not thirty.
+ *
+ * Tabbing from the top of /copilot passed every nav item, the toolbar, the
+ * status select, the filter box and then two focusable controls per
+ * conversation before reaching the box you type in — a tunnel that grew without
+ * bound as threads accumulated.
+ */
+test('the copilot composer is reachable without tabbing through every conversation', async ({ page }) => {
+  await visit(page, '/copilot', '.cp-composer');
+  await page.evaluate(() => (document.querySelector('.shell-skip') as HTMLElement | null)?.focus());
+  await page.keyboard.press('Enter');
+
+  let presses = 0;
+  for (; presses < 40; presses += 1) {
+    await page.keyboard.press('Tab');
+    if (await page.evaluate(() => document.activeElement?.classList.contains('cp-skip'))) break;
+  }
+  expect(presses, 'the skip link to the message box was not near the top of the page').toBeLessThan(8);
+  // It is invisible until it has the keyboard, and it lands in the box.
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('textbox', { name: 'Ask the copilot' })).toBeFocused();
+
+  // And the documented shortcut does the same from anywhere on the screen.
+  await page.locator('.cp-thread').first().focus();
+  await page.keyboard.press('c');
+  await expect(page.getByRole('textbox', { name: 'Ask the copilot' })).toBeFocused();
+  // Typing a C into the box still types a C.
+  await page.keyboard.type('cost');
+  await expect(page.getByRole('textbox', { name: 'Ask the copilot' })).toHaveValue('cost');
 });

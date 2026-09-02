@@ -22,7 +22,7 @@ import type { BlockedCapability, WindowPair } from './plan';
 import { askedFor } from './plan';
 import type { DraftResult } from './draft';
 import type { PendingApproval } from './runtime';
-import type { QualifierVocabulary } from './qualifiers';
+import { orderWord, rankingLimit, stageLabelIn, type QualifierVocabulary } from './qualifiers';
 import { acronymOf, countOf, formatSignedPercent, humanise, listPhrase, normalise, sentenceJoin, truncate } from './text';
 
 export interface StepResult {
@@ -85,6 +85,17 @@ export interface SynthesisInput {
    * something else is not a refusal — the reader has already stopped.
    */
   blocked?: BlockedCapability[];
+  /**
+   * A scope the run applied through a set of associated records rather than
+   * through a column of its own.
+   *
+   * "How much open pipeline is with pharmaceutical companies?" filters
+   * companies and sums deals, so the industry reaches the query as three
+   * account ids. The sentence still has to name it, or the reader cannot tell
+   * a scoped figure from the workspace total — which is the whole substitution
+   * this engine exists to refuse, one step further down.
+   */
+  associationScopes?: { ids: string[]; label: string; noun: string; objectType: string }[];
   /** The record carried in from the conversation when this turn named none. */
   carriedSubject?: { label: string; pinned: boolean } | null;
   /**
@@ -278,7 +289,12 @@ export function describeWrite(
     const properties = (args.properties ?? {}) as Record<string, unknown>;
     return [
       `${humanise(value('object_type'))} ${named(value('id'))}`,
-      ...Object.entries(properties).map(([k, v]) => `${humanise(k)} → ${truncate(String(v), 120)}`),
+      // A date property reads back as a date. The approval card is the last
+      // thing a person sees before a write lands, and "Close date →
+      // 1796115600000" is not something anybody can approve.
+      ...Object.entries(properties).map(([k, v]) => `${humanise(k)} → ${/(_at|_date)$/.test(k) && typeof v === 'number'
+        ? formatDate(v, { timeZone: 'UTC' })
+        : truncate(String(v), 120)}`),
     ];
   }
   if (tool === 'schedule_followup') {
@@ -382,11 +398,26 @@ function metricSentence(metric: MetricToolResult, input: SynthesisInput, facts: 
       : metricUndefinedWhenEmpty(metric.metric)
         ? `it is an average over ${basis} and there are none, so there is no average to report; a zero would say the rows there are measured nothing`
         : 'the query matched no rows, so the honest answer is zero rather than a number';
-    lines.push(metric.snapshot
-      // A snapshot was never measured over the period, so blaming the period
-      // for the zero is a second wrong statement on top of the first.
-      ? `${who} has no ${metric.label.toLowerCase()}${emptyScope} right now — ${because}.`
-      : `${who} has no ${metric.label.toLowerCase()}${emptyScope} recorded for ${period} — ${because}.`);
+    // A currency the *question* named belongs in the sentence with the zero.
+    // "Brightline Foods has no outstanding balance right now" is false — they
+    // owe $127,840, 56 days past due — and the EUR scope that makes it true
+    // appeared two paragraphs below it.
+    const step = input.steps.find((one) => one.result === metric);
+    const named = typeof (step?.args as Record<string, unknown> | undefined)?.currency === 'string'
+      ? String((step!.args as Record<string, unknown>).currency).toUpperCase()
+      : '';
+    const book = named ? ` ${named}` : '';
+    // A window that has not started is not a window with nothing in it. "How
+    // much will we invoice next quarter?" came back as a historical zero for
+    // Q4 2026 — a period that has not happened, answered as though it had.
+    const ahead = !metric.snapshot && metric.window.start >= input.workspace.now;
+    lines.push(ahead
+      ? `${period} has not started, so there is no ${metric.label.toLowerCase()}${book}${emptyScope} to report for it — this measure counts what has already been recorded, and a zero would read as a forecast of nothing.`
+      : metric.snapshot
+        // A snapshot was never measured over the period, so blaming the period
+        // for the zero is a second wrong statement on top of the first.
+        ? `${who} has no${book} ${metric.label.toLowerCase()}${emptyScope} right now — ${because}.`
+        : `${who} has no${book} ${metric.label.toLowerCase()}${emptyScope} recorded for ${period} — ${because}.`);
   } else {
     // The supporting-row clause is dropped when it would just repeat the number.
     const redundant = metric.unit === 'count' && Math.round(metric.value) === metric.count;
@@ -454,6 +485,9 @@ function droppedPeriods(input: SynthesisInput, measured: string[]): string[] {
  * different question entirely.
  */
 function rankedAnswer(metric: MetricToolResult, input: SynthesisInput): string[] {
+  // Which end of the ranking ran. Reading the rows from the bottom and calling
+  // the first of them "the biggest" is the answer contradicting its own list.
+  const ascending = input.steps.find((step) => step.result === metric)?.args.direction === 'asc';
   const grouped: { key: string; label: string; formatted: string; value: number; count: number; currency: string | null }[] =
     metric.groups.length ? metric.groups : metric.top_accounts.map((a) => ({
       key: a.id, label: a.label, formatted: a.formatted, value: 0, count: 0, currency: a.currency ?? null,
@@ -477,7 +511,12 @@ function rankedAnswer(metric: MetricToolResult, input: SynthesisInput): string[]
   }
   // "Top 5" means five. Asking for a number and getting eight is the same class
   // of not-listening as asking for a quarter and getting a year.
-  const asked = Number(input.question.match(/\btop\s+(\d{1,2})\b/i)?.[1] ?? 0);
+  // The cut-off, wherever the sentence puts it. Reading only "top N" meant
+  // "give me the 4 largest accounts by revenue" came back with eight rows per
+  // book — the reader's own number dropped, silently, by a renderer that had
+  // one phrasing of it hard-coded. The ledger already parses every phrasing;
+  // this reads the same parser rather than a second, smaller one.
+  const asked = rankingLimit(input.question) ?? 0;
   const size = asked > 0 ? asked : 8;
   // One ordering over three currencies puts €292,800 above $498,854 because
   // 292,800 is the larger number, which is not a ranking of anything. With no
@@ -491,11 +530,13 @@ function rankedAnswer(metric: MetricToolResult, input: SynthesisInput): string[]
   if (metric.unit === 'money' && currencies.length > 1) {
     const home = rows.find((r) => r.currency === currencies[0]) ?? rows[0];
     const lines = [
-      `${home.label} is the biggest by ${noun} ${period} in ${(home.currency ?? '').toUpperCase()}, at ${home.formatted}.`,
+      ascending
+        ? `${home.label} has the least ${noun} ${period} in ${(home.currency ?? '').toUpperCase()}, at ${home.formatted}.`
+        : `${home.label} is the biggest by ${noun} ${period} in ${(home.currency ?? '').toUpperCase()}, at ${home.formatted}.`,
       [
         `${noun.charAt(0).toUpperCase()}${noun.slice(1)} here is booked in ${listPhrase(currencies.map((c) => c.toUpperCase()))}`,
         `and this platform holds no exchange rates, so ranking them in one list would order euros against dollars.`,
-        `Each book is ranked on its own, largest first:`,
+        `Each book is ranked on its own, ${ascending ? 'smallest' : 'largest'} first:`,
       ].join(' '),
     ];
     for (const currency of currencies) {
@@ -518,8 +559,11 @@ function rankedAnswer(metric: MetricToolResult, input: SynthesisInput): string[]
   }
   const shown = rows.slice(0, size);
   const [top, ...rest] = shown;
+  const tail = metric.value > 0 && metric.unit === 'money' && !metric.mixedCurrency ? ` of ${metric.formatted} across the workspace` : '';
   const lines = [
-    `${top.label} is the biggest by ${noun} ${period}, at ${top.formatted}${metric.value > 0 && metric.unit === 'money' && !metric.mixedCurrency ? ` of ${metric.formatted} across the workspace` : ''}.`,
+    ascending
+      ? `${top.label} has the least ${noun} ${period}, at ${top.formatted}${tail}.`
+      : `${top.label} is the biggest by ${noun} ${period}, at ${top.formatted}${tail}.`,
   ];
   lines.push(shown.map((row, index) =>
     `${index + 1}. ${row.label} — ${row.formatted}${row.count ? ` from ${countOf(row.count, ROW_NOUN[metric.sourceKind] ?? 'record')}` : ''}`).join('\n'));
@@ -612,6 +656,9 @@ const OP_PHRASE: Record<string, string> = {
   gt: 'more than', gte: 'at least', lt: 'less than', lte: 'at most',
 };
 
+/** A column that holds an instant, whose thresholds are ages rather than amounts. */
+const DATE_COLUMN = /(_at|_date)$|^(created|updated)$/;
+
 /**
  * Every filter the search actually ran, said out loud.
  *
@@ -629,6 +676,14 @@ function conditionClauses(
   const clauses: string[] = [];
   const labelFor = (list: { value: string; label: string }[] | undefined, value: string): string =>
     list?.find((row) => row.value === value)?.label ?? humanise(value);
+  // The pipeline in the same filter set decides what the stage is called:
+  // `discovery` is "Scoping" in Expansion and "Discovery" in New business, and
+  // a list scoped to one that reads back the other's word misdescribes itself.
+  const scopedPipeline = conditions.find((c) => String(c.property ?? '') === 'pipeline'
+    && typeof c.value === 'string')?.value as string | undefined;
+  const stageName = (value: string): string => (vocabulary
+    ? stageLabelIn(vocabulary, value, scopedPipeline ?? null) ?? labelFor(vocabulary.stages, value)
+    : humanise(value));
   for (const condition of conditions) {
     const property = String(condition.property ?? '');
     const op = String(condition.op ?? 'eq');
@@ -642,7 +697,7 @@ function conditionClauses(
       if (raw.length && raw.length <= 3) {
         const names = raw.map((value) => property === 'pipeline'
           ? labelFor(vocabulary?.pipelines, value)
-          : labelFor(vocabulary?.stages, value));
+          : stageName(value));
         clauses.push(property === 'pipeline'
           ? `in the ${listPhrase(names)} pipeline${names.length > 1 ? 's' : ''}`
           : `at the ${listPhrase(names)} stage${names.length > 1 ? 's' : ''}`);
@@ -651,6 +706,25 @@ function conditionClauses(
     }
     if (op === 'is_not_set') { clauses.push(`with no ${humanise(property).toLowerCase()}`); continue; }
     if (op === 'is_set') { clauses.push(`with a ${humanise(property).toLowerCase()}`); continue; }
+    // A threshold on a date column is an age, not a price. Rendering the epoch
+    // milliseconds through the money phrase produced "worth less than
+    // 1,783,185,687,392" over a correct set of rows — the filter applied, and
+    // the sentence describing it nonsense.
+    if (OP_PHRASE[op] && typeof condition.value === 'number' && DATE_COLUMN.test(property)) {
+      const days = Math.max(0, facts.days(condition.value));
+      const longer = op === 'lt' || op === 'lte';
+      clauses.push(property === 'stage_entered_at'
+        ? `in that stage for ${longer ? 'more' : 'less'} than ${days} ${days === 1 ? 'day' : 'days'}`
+        : `${humanise(property).toLowerCase()} ${longer ? 'more' : 'less'} than ${days} ${days === 1 ? 'day' : 'days'} ago`);
+      continue;
+    }
+    // A stored count whose unit is in its own column name reads as a term, not
+    // as a bare number after a machine name: "contract term months 36".
+    const unit = property.match(/_(months|days|years|weeks)$/)?.[1];
+    if (unit && op === 'eq' && typeof condition.value === 'number') {
+      clauses.push(`on a ${condition.value}-${unit.replace(/s$/, '')} ${humanise(property.replace(/_(months|days|years|weeks)$/, '')).toLowerCase()}`);
+      continue;
+    }
     if (OP_PHRASE[op] && typeof condition.value === 'number') {
       const money = /amount|value|revenue|price|cost|spend/.test(property);
       clauses.push(`worth ${OP_PHRASE[op]} ${money ? facts.money(condition.value) : condition.value.toLocaleString()}`);
@@ -681,6 +755,8 @@ function listLead(list: RecordSearchResult, args: Record<string, unknown>, input
     if (owner) clauses.push(`owned by ${owner.name}`);
   }
   if (input.subject && args.associated_to === input.subject.id) clauses.push(`on ${input.subject.label}`);
+  const listAssociation = associationClause(args, input);
+  if (listAssociation) clauses.push(listAssociation);
   const conditions = Array.isArray(args.conditions) ? (args.conditions as { property?: string; op?: string; value?: unknown; values?: unknown[] }[]) : [];
   const qualifier = conditionPhrase(conditions, input.stages);
   const facts = new Facts(input.workspace);
@@ -727,6 +803,18 @@ function listLead(list: RecordSearchResult, args: Record<string, unknown>, input
  * machine-generated non-English with the right number inside it, and the
  * conditions that produced the number nowhere in the sentence.
  */
+
+/** The clause naming a scope the plan applied through a set of associated records. */
+function associationClause(args: Record<string, unknown>, input: SynthesisInput): string | null {
+  const ids = Array.isArray(args.associated_to_any) ? (args.associated_to_any as string[]) : null;
+  if (!ids?.length) return null;
+  const scope = (input.associationScopes ?? []).find((one) =>
+    one.ids.length === ids.length && one.ids.every((id, i) => id === ids[i]));
+  if (!scope) return `at ${ids.length} named ${ids.length === 1 ? 'record' : 'records'}`;
+  return `at the ${scope.ids.length} ${scope.objectType === 'company' ? 'account' : scope.objectType}${scope.ids.length === 1 ? '' : 's'}`
+    + ` whose ${scope.noun.toLowerCase()} is ${scope.label}`;
+}
+
 function aggregateSentence(agg: RecordAggregateResult, input: SynthesisInput, ledger: Ledger): string[] {
   ledger.use(agg);
   const step = input.steps.find((s) => s.result === agg);
@@ -742,6 +830,8 @@ function aggregateSentence(agg: RecordAggregateResult, input: SynthesisInput, le
     : undefined;
   if (owner) scope.push(`owned by ${owner.name}`);
   if (input.subject && args.associated_to === input.subject.id) scope.push(`on ${input.subject.label}`);
+  const association = associationClause(args, input);
+  if (association) scope.push(association);
   // A window the aggregate actually filtered on belongs in the sentence: "3
   // closed-won deals" and "3 closed-won deals in Q2 2026" are different claims,
   // and the second is the one the plan computed.
@@ -771,8 +861,17 @@ function aggregateSentence(agg: RecordAggregateResult, input: SynthesisInput, le
   // The metric path phrases the identical figure as "open pipeline"; one run
   // must not speak two vocabularies about the same number.
   const property = typeof args.property === 'string' ? args.property : null;
+  // ...unless the rows the step actually measured contradict the measure's own
+  // name. "What is the total value of deals we won in the Renewal pipeline
+  // last year?" ran a closed-won aggregate and headlined it "$0 in open
+  // pipeline across 0 closed-won deals" — the noun and the set in one clause,
+  // disagreeing.
+  const outcome = conditions.find((c) => String(c.property ?? '') === 'deal_stage');
+  const decided = !!outcome && (Array.isArray(outcome.values) ? outcome.values : [outcome.value])
+    .every((value) => /^closed_/.test(String(value)));
   const measured = !counting && input.metric && property
     && MEASURE_PROPERTY[input.metric.metric.id] === property
+    && !(decided && /pipeline/i.test(input.metric.metric.label))
     ? input.metric.metric.label.toLowerCase()
     : null;
   const lines = [counting
@@ -1703,7 +1802,12 @@ function meteredUsageBlocks(usage: MeteredUsageResult, facts: Facts, workspace: 
     : `${facts.day(usage.window.start)} – ${facts.day(usage.window.end - 1)}`;
   const who = usage.subject ? usage.subject.label : workspace.name;
   if (!usage.accounts) {
-    return [`No ${usage.meter.name.toLowerCase()} was metered ${usage.subject ? `for ${who}` : `in ${workspace.name}`} in ${period} — the meter is live and no \`${usage.meter.event_name}\` event landed in that window, so the honest answer is none rather than a number from somewhere else.`];
+    // The meter's display name is plural as often as not — "Telemetry events",
+    // "Anomaly alerts raised" — and "No telemetry events was metered" is the
+    // kind of sentence that makes a reader distrust the number beside it. The
+    // verb follows the noun the name ends in.
+    const plural = /s$/i.test(usage.meter.name.replace(/\s+\w+ed$/i, '').trim());
+    return [`No ${usage.meter.name.toLowerCase()} ${plural ? 'were' : 'was'} metered ${usage.subject ? `for ${who}` : `in ${workspace.name}`} in ${period} — the meter is live and no \`${usage.meter.event_name}\` event landed in that window, so the honest answer is none rather than a number from somewhere else.`];
   }
   const blocks = [
     `${who} metered ${usage.formatted} on ${usage.meter.name} in ${period}`
@@ -2174,10 +2278,22 @@ function overview(input: SynthesisInput, facts: Facts, found: Gathered, ledger: 
     // "The largest of the 38 deals still open:" over five bullets counts one
     // row and shows five. A cut-off the reader wrote — "the 5 biggest" — has
     // to be the number in this sentence, or the sentence contradicts the list.
+    //
+    // And the sentence describes the query that ran, never the workspace: this
+    // line used to assert "still open" over a search with no stage filter (77
+    // deals, 39 of them closed) and to drop the pipeline the same run was
+    // scoped to, so a Renewal-only list read as a claim about all 38 open
+    // deals.
+    const args = input.steps.find((step) => step.result === deals)?.args ?? {};
     const shown = Math.min(5, deals.records.length);
-    blocks.push(shown === 1
-      ? `The largest of the ${deals.total} deals still open:`
-      : `The ${shown} largest of the ${deals.total} deals still open:`);
+    const ranked = orderWord(args) ?? 'most recent';
+    // "The 3 closing soonest:" — a phrase already says what it is over, and
+    // "of them" after it reads as a slip.
+    const order = ranked.includes(' ')
+      ? `The ${shown === 1 ? 'one' : shown} ${ranked}:`
+      : shown === 1 ? `The ${ranked} of them:` : `The ${shown} ${ranked} of them:`;
+    const counted = found.metrics.some((m) => m.count === deals.total);
+    blocks.push(counted ? order : `${listLead(deals, args, input)} ${order}`);
     blocks.push(...recordLines(deals, facts, input.workspace, ledger, 5));
   } else if (found.lists.length && found.lists[0].records.length) {
     blocks.push(...recordLines(found.lists[0], facts, input.workspace, ledger, 5));
@@ -2438,6 +2554,32 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
         blocks.push(...droppedPeriods(input, [a.window.label, b.window.label]));
         break;
       }
+      // Two teammates is a comparison, and neither side is a catalogue metric:
+      // `business_metric` takes no owner, so each rep is a shaped aggregate
+      // over the rows they own. Without this the run computed both figures
+      // correctly and printed "the question did not resolve to anything I can
+      // measure" over the top of them.
+      if (aggregates.length >= 2 && metrics.length < 2) {
+        const sides = aggregates.slice(0, 2).map((agg) => {
+          const step = input.steps.find((one) => one.result === agg);
+          const owner = String((step?.args as Record<string, unknown> | undefined)?.owner_id ?? '');
+          return { agg, who: input.workspace.people.find((p) => p.id === owner)?.name ?? input.workspace.name };
+        });
+        if (sides[0].who !== sides[1].who) {
+          for (const side of sides) ledger.use(side.agg);
+          const [lead, trail] = [...sides].sort((x, y) => y.agg.value - x.agg.value);
+          const measure = input.metric?.metric.label.toLowerCase() ?? lead.agg.measure.toLowerCase();
+          const gap = lead.agg.value - trail.agg.value;
+          const percent = trail.agg.value !== 0 ? `, ${((gap / Math.abs(trail.agg.value)) * 100).toFixed(0)}% ahead` : '';
+          blocks.push(gap === 0
+            ? `${lead.who} and ${trail.who} are level on ${measure}, both at ${lead.agg.formatted}.`
+            : `On ${measure}, ${lead.who} leads with ${lead.agg.formatted} against ${trail.who} at ${trail.agg.formatted} — a gap of ${facts.money(gap)}${percent}.`);
+          for (const side of [lead, trail]) {
+            blocks.push(bullet(`${side.who}: ${side.agg.formatted} across ${countOf(side.agg.matched_records, side.agg.object_type)}`));
+          }
+          break;
+        }
+      }
       if (metrics.length >= 2) {
         const [a, b] = metrics;
         const sideOf = (metric: MetricToolResult): string | null =>
@@ -2606,9 +2748,14 @@ export function synthesise(input: SynthesisInput): SynthesisOutput {
           // genuinely cannot, the lead-in says which slice they are looking at.
           const limit = 8;
           const shown = Math.min(limit, list.records.length);
-          const ranked = args.order_by === 'amount' ? 'largest' : 'most recent';
+          // The adjective is read off the query that ran. Hardcoding "largest"
+          // is how "the 3 smallest open deals" came back as the 3 smallest with
+          // the word "largest" over them — the one word in the sentence a
+          // reader uses to check the answer against their question.
+          const ranked = orderWord(args) ?? 'most recent';
           const order = shown < list.total
-            ? shown === 1 ? `The ${ranked} of them:` : `The ${shown} ${ranked} of them:`
+            ? ranked.includes(' ') ? `The ${shown === 1 ? 'one' : shown} ${ranked}:`
+              : shown === 1 ? `The ${ranked} of them:` : `The ${shown} ${ranked} of them:`
             : `The ${ranked}:`;
           // "Who owns the biggest open deal?" is answered by a name. It used to
           // come back as eight rows with the cut-off ignored and no sentence

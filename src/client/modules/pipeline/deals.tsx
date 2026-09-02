@@ -32,11 +32,12 @@ import {
   type TableState,
 } from '@/client/design';
 import {
-  ALL_PIPELINES, HORIZON_LABEL, HORIZONS, SORTS, matchesHorizon, snapshotMove, stageKey, viewToState,
+  ALL_PIPELINES, HORIZON_LABEL, HORIZONS, SORTS, boardMove, boardTabStop, isBoardKey, matchesHorizon,
+  snapshotMove, stageKey, viewToState,
   accountOf, civilDay, dealAmount, dealCloseDate, dealEnteredStage, dealPipeline, dealStage,
   dealWeighted, num, recordHref, str, totalsOf, useDealFormat, useDealProperties, usePipelines,
   useUserIndex, useUsers, useVelocities,
-  type BoardState, type CalendarFormat, type DealListEnvelope, type DealRecord, type DealView,
+  type BoardGrid, type BoardState, type CalendarFormat, type DealListEnvelope, type DealRecord, type DealView,
   type Horizon, type Pipeline, type PipelineStage, type StageVelocity,
 } from './api';
 import { ViewBar } from './views';
@@ -70,7 +71,8 @@ function StatLabel({ filtered, children }: { filtered: boolean; children: React.
 /* --------------------------------- card ---------------------------------- */
 
 function DealCard({
-  deal, stages, currentStage, velocity, ownerName, busy, dragging, onOpen, onMove, onDragStart, onDragEnd,
+  deal, stages, currentStage, velocity, ownerName, busy, dragging, tabStop, onOpen, onMove, onDragStart,
+  onDragEnd, onFocus, onKeyDown,
 }: {
   deal: DealRecord;
   stages: PipelineStage[];
@@ -79,15 +81,29 @@ function DealCard({
   ownerName: string | null;
   busy: boolean;
   dragging: boolean;
+  /** This is the one card on the board that Tab reaches; the rest are arrowed to. */
+  tabStop: boolean;
   onOpen: () => void;
   onMove: (stage: PipelineStage) => void;
   onDragStart: () => void;
   onDragEnd: () => void;
+  onFocus: () => void;
+  onKeyDown: (e: React.KeyboardEvent) => void;
 }) {
   const f = useDealFormat();
   const session = useSession();
   const now = session.now();
+  const card = useRef<HTMLLIElement>(null);
   const account = accountOf(deal);
+
+  // The card's own menu carries every action on the deal, so it belongs in the
+  // tab order beside the card that holds the tab stop — and out of it on the
+  // other twenty-one. `MenuButton` takes no `tabIndex`, so it is set on the
+  // element: the alternative is 22 extra tab stops, which is the defect.
+  useEffect(() => {
+    const menu = card.current?.querySelector<HTMLElement>('.pl-card__menu');
+    if (menu) menu.tabIndex = tabStop ? 0 : -1;
+  }, [tabStop]);
   const entered = dealEnteredStage(deal);
   const daysInStage = entered ? Math.floor((now - entered) / DAY_MS) : null;
   // A deal parked in Closed won has not stalled, it has finished — however long
@@ -126,15 +142,25 @@ function DealCard({
 
   return (
     <li
+      ref={card}
       className={`pl-card${dragging ? ' is-dragging' : ''}${busy ? ' is-busy' : ''}`}
       draggable
       onDragStart={(e) => { e.dataTransfer.setData('text/plain', deal.id); e.dataTransfer.effectAllowed = 'move'; onDragStart(); }}
       onDragEnd={onDragEnd}
+      onFocus={onFocus}
+      onKeyDown={onKeyDown}
       data-deal={deal.id}
       data-stage={currentStage?.name ?? ''}
     >
       <div className="pl-card__top">
-        <button type="button" className="pl-card__name" onClick={onOpen} title={deal.display_name}>
+        <button
+          type="button"
+          className="pl-card__name"
+          tabIndex={tabStop ? 0 : -1}
+          aria-keyshortcuts={tabStop ? 'ArrowUp ArrowDown ArrowLeft ArrowRight Home End' : undefined}
+          onClick={onOpen}
+          title={deal.display_name}
+        >
           {deal.display_name}
         </button>
         <MenuButton
@@ -241,7 +267,12 @@ function StageColumn({
           </span>
         )}
       </header>
-      <ol className="pl-col__body">
+      {/* Chromium makes an overflowing container focusable when nothing inside
+          it is — which, with a roving tabindex over the cards, is every column
+          but one. That put a tab stop back on each column and undid half the
+          grid. The cards are reachable by arrow key and focusing one scrolls it
+          into view, so the scroller needs no stop of its own. */}
+      <ol className="pl-col__body" tabIndex={-1}>
         {children}
         {deals.length === 0 && (
           <li className="pl-col__empty">
@@ -465,6 +496,24 @@ export function DealsPage() {
   }, [refocus]);
 
   /**
+   * The one key over the sidebar, the top bar and the whole toolbar.
+   *
+   * It lands on the card the grid's own arrow keys start from — the first card
+   * of the first column — rather than on the board container, because a
+   * container that only holds `tabIndex={-1}` columns announces nothing and
+   * leaves the next Tab back at the top of the toolbar. When the board is
+   * empty there is no card, so the region takes the caret and the empty state
+   * inside it is what gets read.
+   */
+  const focusFirstCard = useCallback(() => {
+    const card = document.querySelector<HTMLElement>('.pl-card__name[tabindex="0"]')
+      ?? document.querySelector<HTMLElement>('.pl-card__name')
+      ?? document.querySelector<HTMLElement>('#pl-board');
+    card?.focus();
+    card?.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+  }, []);
+
+  /**
    * Put the keyboard back in the grid after a bulk write.
    *
    * `Modal` restores focus to whatever opened it, and what opened these two is
@@ -562,6 +611,37 @@ export function DealsPage() {
     }
     return map;
   }, [boards, columnsOf, byStage]);
+
+  /**
+   * The board as a grid of deal ids, column by column in the order they are
+   * drawn — the value the keyboard moves around in.
+   */
+  const grid = useMemo<BoardGrid>(
+    () => boards.flatMap((pipeline) => columnsOf(pipeline)
+      .map((stage) => (byStage.get(stageKey(pipeline.name, stage.name)) ?? []).map((deal) => deal.id))),
+    [boards, columnsOf, byStage],
+  );
+
+  const [roving, setRoving] = useState<string | null>(null);
+  const tabStop = boardTabStop(grid, roving);
+
+  const focusCard = useCallback((id: string) => {
+    const card = document.querySelector<HTMLElement>(`.pl-card[data-deal="${CSS.escape(id)}"]`);
+    (card?.querySelector<HTMLElement>('.pl-card__name') ?? card)?.focus();
+  }, []);
+
+  /**
+   * Arrow keys across the board, the way every other grid on this platform
+   * moves. Anything else — Tab, Enter, the menu's own keys — is left alone.
+   */
+  const onCardKey = useCallback((id: string, e: React.KeyboardEvent) => {
+    if (e.altKey || e.metaKey || e.ctrlKey || !isBoardKey(e.key)) return;
+    const next = boardMove(grid, id, e.key);
+    if (!next) return;
+    e.preventDefault();
+    setRoving(next);
+    focusCard(next);
+  }, [grid, focusCard]);
 
   const boardShown = inView.length;
   const toolbarFiltered = !!query || !!owner || !!forecast || horizon !== 'all';
@@ -962,6 +1042,23 @@ export function DealsPage() {
         </>
       }
     >
+      {/* Thirty-six Tab presses from a fresh load to the first deal card: sixteen
+          through the sidebar, nine through the top bar, ten more through the
+          view toggle, the filters and the search box. The copilot has had a skip
+          link for this since its own tunnel was measured; the board is the
+          screen people live on and had none. It is the first focusable thing
+          here, and it lands on the card the arrow keys start from. */}
+      <a
+        className="pl-skip"
+        href="#pl-board"
+        onClick={(e) => {
+          e.preventDefault();
+          focusFirstCard();
+        }}
+      >
+        Skip to the board
+      </a>
+
       {board && (
         <div className="pl-summary">
           <Card padding="tight">
@@ -1143,7 +1240,9 @@ export function DealsPage() {
         />
       )}
 
-      {!error && !loading && board && populated > 0 && display === 'board' && boards.map((pipeline) => {
+      {!error && !loading && board && populated > 0 && display === 'board' && (
+      <div id="pl-board" tabIndex={-1} className="pl-boardregion" aria-label="Deal board">
+      {boards.map((pipeline) => {
         const strip = columnsOf(pipeline);
         const rows = strip.flatMap((stage) => byStage.get(stageKey(pipeline.name, stage.name)) ?? []);
         const openRows = rows.filter((deal) => !stageFor(deal)?.is_closed);
@@ -1223,6 +1322,9 @@ export function DealsPage() {
                         ownerName={deal.owner_id ? userIndex.get(deal.owner_id)?.name ?? null : null}
                         busy={!!pending[deal.id]}
                         dragging={dragging === deal.id}
+                        tabStop={deal.id === tabStop}
+                        onFocus={() => setRoving(deal.id)}
+                        onKeyDown={(e) => onCardKey(deal.id, e)}
                         onOpen={() => openDeal(deal)}
                         onMove={(stageTo) => requestMove(deal, stageTo)}
                         onDragStart={() => setDragging(deal.id)}
@@ -1236,6 +1338,8 @@ export function DealsPage() {
           </section>
         );
       })}
+      </div>
+      )}
 
       {!error && !loading && board && populated > 0 && display === 'table' && (
         <DataTable<DealRecord>

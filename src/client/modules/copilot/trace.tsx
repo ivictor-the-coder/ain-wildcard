@@ -11,12 +11,15 @@ import { useState } from 'react';
 import { api, useMutation } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import {
-  Badge, Banner, Button, Card, ChevronDownIcon, ChevronUpIcon, EmptyState, Icons, humanize,
+  AlertTriangleIcon,
+  Badge, Banner, Button, Card, Checkbox, ChevronDownIcon, ChevronUpIcon, EmptyState, Icons, humanize,
   iconByName, useFormat, useToast,
 } from '@/client/design';
 import {
-  CITATION_ICON, OUTCOME_LABEL, OUTCOME_TONE, SPAN_ICON, SPAN_TONE, citationHref, confidenceBand,
-  humanTool, outcomeSummary, recordLink, runOutcome, writeTargets,
+  CITATION_ICON, OUTCOME_LABEL, OUTCOME_TONE, SPAN_ICON, SPAN_TONE, approvalOutcome, citationHref,
+  confidenceBand, confidenceChip,
+  humanTool, outcomeSummary, recordLink, recordPhraseMismatch, runOutcome, writeTargetLabel,
+  writeTargets,
   type AiApproval, type AiRun, type AiSpan, type Citation,
 } from './api';
 
@@ -219,10 +222,29 @@ export function TraceSteps({ spans, decidedAfter }: { spans: AiSpan[]; decidedAf
  * It shows the exact arguments the engine prepared, not a paraphrase, because
  * approving a summary of a write is not approving the write.
  */
-export function ApprovalCard({ approval, onDecided }: { approval: AiApproval; onDecided?: () => void }) {
+export function ApprovalCard({ approval, question, onDecided }: {
+  approval: AiApproval;
+  /** The sentence this write was prepared from, so the target can be checked against it. */
+  question?: string;
+  onDecided?: () => void;
+}) {
   const toast = useToast();
   const f = useFormat();
   const [showArgs, setShowArgs] = useState(false);
+  const [acknowledged, setAcknowledged] = useState(false);
+
+  /**
+   * The record this write would land on, against the record the question named.
+   *
+   * "Move the Sakamoto Seiki — packaging line uplift deal to Negotiation" was
+   * prepared against *Sakamoto Seiki — multi-site rollout* — a closed-won deal
+   * for $321,840 — and the card showed the sentence and the wrong record's name
+   * three lines apart, with none of the reconciliation apparatus a read answer
+   * gets. A write is the one answer that cannot be taken back, so it gets the
+   * loudest version of the same check.
+   */
+  const target = writeTargetLabel(approval.tool, approval.args, approval.preview);
+  const mismatch = question && target ? recordPhraseMismatch(question, target) : null;
 
   const decide = useMutation<'approve' | 'decline', { executed?: boolean; status: string; outcome: string | null }>(
     (decision) => api.post(`/v1/ai/approvals/${encodeURIComponent(approval.id)}`, { decision }),
@@ -231,9 +253,15 @@ export function ApprovalCard({ approval, onDecided }: { approval: AiApproval; on
       onSuccess: (result, decision) => {
         if (decision === 'approve') {
           // The engine hands back a wire line; the person who pressed the button
-          // gets the same sentence the card above it is written in.
-          const { text } = outcomeSummary({ ...approval, status: 'approved', outcome: result.outcome });
-          toast.success('Written to the workspace', text);
+          // gets the same sentence the card above it is written in — and a write
+          // the tool refused is not announced as one that landed.
+          const decided = { ...approval, status: 'approved', outcome: result.outcome };
+          const { text } = outcomeSummary(decided);
+          if (approvalOutcome(decided) === 'failed') {
+            toast.error('Approved — and the write failed', `${text} Nothing changed.`, { duration: 0 });
+          } else {
+            toast.success('Written to the workspace', text);
+          }
         } else {
           toast.info('Declined', `${humanTool(approval.tool)} was not run. Nothing changed.`);
         }
@@ -245,6 +273,7 @@ export function ApprovalCard({ approval, onDecided }: { approval: AiApproval; on
   );
 
   const pending = approval.status === 'pending';
+  const landed = approvalOutcome(approval);
   const summary = pending ? null : outcomeSummary(approval);
 
   return (
@@ -259,6 +288,27 @@ export function ApprovalCard({ approval, onDecided }: { approval: AiApproval; on
       description={approval.reason}
     >
       <div style={{ display: 'grid', gap: 'var(--space-5)' }}>
+        {pending && mismatch && (
+          <Banner tone="danger" bar title="This write is not on the record you named">
+            <p>
+              You asked about <strong>{mismatch.asked}</strong>. This write would change{' '}
+              <strong>{mismatch.used}</strong> — a different record on the same account, and nothing
+              in the arguments below says which one you meant.
+            </p>
+            <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
+              Decline it and ask again naming the record in full, or tick the box to write to{' '}
+              {mismatch.used} anyway.
+            </p>
+            <div style={{ marginTop: 'var(--space-4)' }}>
+              <Checkbox
+                checked={acknowledged}
+                onChange={setAcknowledged}
+                label={`Yes — write to ${mismatch.used}`}
+              />
+            </div>
+          </Banner>
+        )}
+
         <div className="cp-approval__preview">
           {approval.preview.map((line, i) => <span key={i}>{line}</span>)}
         </div>
@@ -268,12 +318,16 @@ export function ApprovalCard({ approval, onDecided }: { approval: AiApproval; on
         )}
 
         {summary && (
-          <Banner tone={approval.status === 'approved' ? 'success' : 'neutral'} compact>
+          <Banner
+            tone={landed === 'written' ? 'success' : landed === 'failed' ? 'danger' : 'neutral'}
+            compact
+            title={landed === 'failed' ? 'Approved — the write failed' : undefined}
+          >
             {summary.text}
           </Banner>
         )}
 
-        {approval.status === 'approved' && <WrittenTo approval={approval} />}
+        {landed === 'written' && <WrittenTo approval={approval} />}
 
         <div className="cp-approval__actions">
           <Badge tone="neutral" size="sm" icon={<Icons.terminal size={11} />}>{approval.tool}</Badge>
@@ -295,10 +349,14 @@ export function ApprovalCard({ approval, onDecided }: { approval: AiApproval; on
                 size="sm"
                 variant="primary"
                 loading={decide.loading}
+                disabled={!!mismatch && !acknowledged}
+                title={mismatch && !acknowledged
+                  ? `This write targets ${mismatch.used}, not ${mismatch.asked}. Confirm the record above first.`
+                  : undefined}
                 iconLeft={<Icons.check size={13} />}
                 onClick={() => { void decide.run('approve').catch(() => undefined); }}
               >
-                Approve and run
+                {mismatch ? 'Approve anyway' : 'Approve and run'}
               </Button>
             </>
           )}
@@ -386,19 +444,34 @@ export function WrittenTo({ approval }: { approval: AiApproval }) {
 export function ApprovalResolution({ approval }: { approval: AiApproval }) {
   const f = useFormat();
   const [showArgs, setShowArgs] = useState(false);
-  const written = approval.status === 'approved';
+  // The decision a person made is not the same fact as what the tool did with
+  // it. A write refused by the tool — `Failed: "commercial_terms" belongs to
+  // the Renewal pipeline` — wore a green "Approved and written" badge and a
+  // link to the record it had not written to, above the sentence saying so.
+  const landed = approvalOutcome(approval);
+  const written = landed === 'written';
   const summary = outcomeSummary(approval);
+  const label = landed === 'written' ? 'Approved and written'
+    : landed === 'failed' ? 'Approved — the write failed'
+      : 'Declined';
   return (
     <div
-      className={`cp-resolution${written ? ' is-written' : ''}`}
+      className={`cp-resolution${written ? ' is-written' : ''}${landed === 'failed' ? ' is-failed' : ''}`}
       data-approval={approval.id}
+      data-outcome={landed}
       tabIndex={-1}
       role="status"
-      aria-label={`${written ? 'Approved and written' : 'Declined'}: ${summary.text}`}
+      aria-label={`${label}: ${summary.text}`}
     >
       <div className="cp-resolution__head">
-        <Badge tone={written ? 'success' : 'neutral'} size="sm" icon={written ? <Icons.check size={11} /> : <Icons.shield size={11} />}>
-          {written ? 'Approved and written' : 'Declined'}
+        <Badge
+          tone={landed === 'written' ? 'success' : landed === 'failed' ? 'danger' : 'neutral'}
+          size="sm"
+          icon={landed === 'written'
+            ? <Icons.check size={11} />
+            : landed === 'failed' ? <AlertTriangleIcon size={11} /> : <Icons.shield size={11} />}
+        >
+          {label}
         </Badge>
         <span className="cp-note">
           {approval.decided_at ? f.relative(approval.decided_at) : 'just now'} · {humanTool(approval.tool)}
@@ -421,7 +494,12 @@ export function ApprovalResolution({ approval }: { approval: AiApproval }) {
   );
 }
 
-export function ApprovalQueue({ approvals, onDecided }: { approvals: AiApproval[]; onDecided?: () => void }) {
+export function ApprovalQueue({ approvals, question, onDecided }: {
+  approvals: AiApproval[];
+  /** The question every one of these was prepared from, where they share one. */
+  question?: string;
+  onDecided?: () => void;
+}) {
   if (!approvals.length) {
     return (
       <EmptyState
@@ -435,7 +513,9 @@ export function ApprovalQueue({ approvals, onDecided }: { approvals: AiApproval[
   }
   return (
     <div style={{ display: 'grid', gap: 'var(--space-5)' }}>
-      {approvals.map((approval) => <ApprovalCard key={approval.id} approval={approval} onDecided={onDecided} />)}
+      {approvals.map((approval) => (
+        <ApprovalCard key={approval.id} approval={approval} question={question} onDecided={onDecided} />
+      ))}
     </div>
   );
 }
@@ -444,21 +524,39 @@ export function ApprovalQueue({ approvals, onDecided }: { approvals: AiApproval[
 
 /**
  * The engine's confidence is in its *reading of the question*, not in the
- * answer — so the chip says so. Labelling it "90% confident" beside a refusal
- * is the one place this surface could be read as claiming something it never
- * measured, which is why a refused run shows no badge at all.
+ * answer — so the chip says so, and no longer says it in the words "question
+ * read at". That label was highest exactly where the question had been read
+ * worst: 98% on a CSAT question answered with a company card, 98% on an
+ * outstanding-balance question answered with a deal list, 99% on the write that
+ * moved the wrong deal. It measures the intent classifier's margin, so it is
+ * named after that.
+ *
+ * And where a qualifier of the question went unbound the percentage does not
+ * appear at all. Printing "intent read at 99%" beside "1 unbound" put the
+ * number that is anti-correlated with trustworthiness first, in the biggest
+ * type on the card, on exactly the answers that answered something else. The
+ * count is the accurate half; the classifier's margin moves to the tooltip,
+ * where it is still readable and no longer the headline.
  */
-export function ConfidenceBadge({ run, refused }: { run: AiRun; refused?: boolean }) {
+export function ConfidenceBadge({ run, refused, unbound = 0 }: {
+  run: AiRun;
+  refused?: boolean;
+  /** Qualifiers the question named that the answer did not narrow to. */
+  unbound?: number;
+}) {
   if (run.confidence === null || refused) return null;
   const band = confidenceBand(run.confidence);
   const percent = Math.round(run.confidence * 100);
+  const tone = unbound > 0 ? 'danger' : band === 'high' ? 'success' : band === 'medium' ? 'warning' : 'danger';
   return (
     <Badge
       size="sm"
-      tone={band === 'high' ? 'success' : band === 'medium' ? 'warning' : 'danger'}
-      title={`The engine was ${percent}% sure it read this as a ${humanize(run.intent ?? 'question').toLowerCase()} question. It is not a claim about the answer.`}
+      tone={tone}
+      title={unbound > 0
+        ? `The intent classifier was ${percent}% sure this is a ${humanize(run.intent ?? 'question').toLowerCase()} question, and ${unbound === 1 ? 'one qualifier of it was' : `${unbound} qualifiers of it were`} left unbound. It is not a claim about the answer.`
+        : `The intent classifier was ${percent}% sure it read this as a ${humanize(run.intent ?? 'question').toLowerCase()} question. It is not a claim about the answer.`}
     >
-      question read at {percent}%
+      {confidenceChip(percent, unbound)}
     </Badge>
   );
 }
@@ -481,7 +579,7 @@ export function RunFacts({ run, toolMs, approvals, steps }: {
       hint: run.error ?? (outcome === 'written' ? 'A person approved the write and it ran' : outcome === 'declined' ? 'A person declined it; nothing was written' : undefined),
     },
     { label: 'Answered by', value: run.model, hint: humanize(run.provider) },
-    { label: 'Intent', value: run.intent ? humanize(run.intent) : '—', hint: run.confidence === null ? undefined : `question read at ${Math.round(run.confidence * 100)}%` },
+    { label: 'Intent', value: run.intent ? humanize(run.intent) : '—', hint: run.confidence === null ? undefined : `intent read at ${Math.round(run.confidence * 100)}%` },
     { label: 'Duration', value: `${f.number(run.duration_ms)} ms`, hint: toolMs === undefined ? `${f.plural(stepCount, 'step')}` : `${f.number(toolMs)} ms in tools` },
     { label: 'Tokens', value: f.number(run.usage.input_tokens + run.usage.output_tokens), hint: `${f.number(run.usage.input_tokens)} in · ${f.number(run.usage.output_tokens)} out` },
     {

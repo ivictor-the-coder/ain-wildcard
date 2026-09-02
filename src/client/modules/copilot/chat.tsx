@@ -17,19 +17,23 @@ import { useSession } from '@/client/kernel/session';
 import {
   Badge, Banner, Button, Card, ConfirmDialog, EmptyState, ErrorState, Field, Icons, Input, MenuButton,
   MessageSquareIcon, Modal, Page, SearchInput, Select, Skeleton, SkeletonText, Switch, Textarea,
-  humanize, useFormat, usePrefersReducedMotion, useToast, type MenuSection, type SelectOption,
+  humanize, useFormat, useHotkey, usePrefersReducedMotion, useToast, type MenuSection, type SelectOption,
 } from '@/client/design';
 import {
-  boardHref, carriedThrough, parseBlocks, parseBreakdown, reconcileBreakdown, reconcileScope,
-  refusalOf, splitToolEcho, useAiStatus, useAllApprovals, useSuggestions, useThread, useThreads,
+  boardHref, carriedThrough, correctedProse, dedupeCitations, deniedPipeline, misreadRefusal, parseBlocks,
+  parseBreakdown,
+  reconcileBreakdown, reconcileScope,
+  refusalOf, rephraseAsBreakdown, splitToolEcho, useAiStatus, useAllApprovals, useSuggestions,
+  useThread, useThreads,
   useTools, useRun, useVocabulary, withoutBreakdown,
-  type AiApproval, type AiMessage, type AiReply, type AiRun, type AiThread, type ThreadDetail,
+  type AiApproval, type AiMessage, type AiReply, type AiRun, type AiThread,
+  type ThreadDetail,
   type StepNote, type ToolEcho, type Vocabulary,
 } from './api';
 import {
   ApprovalCard, ApprovalResolution, CitationChips, ConfidenceBadge, ReasoningList, TraceSteps,
 } from './trace';
-import { BoardLink, BreakdownPanel, ScopeBar, ScopeWarning } from './scope';
+import { BoardLink, BreakdownPanel, RephraseLink, ScopeBar, ScopeWarning } from './scope';
 import { DraftDialog } from './draft';
 
 /* ------------------------------- typewriter ------------------------------- */
@@ -147,7 +151,9 @@ function TracePanel({ runId }: { runId: string }) {
 }
 
 function AssistantMessage({
-  message, run, approvals, newest, question, vocab, vocabUnread, vocabLoading, onDecided, onOpenRun,
+  message, run, approvals, newest, question, vocab, vocabUnread, vocabPartial, vocabLoading, onDecided,
+  onOpenRun,
+  onAsk, onOpenRecords,
 }: {
   message: AiMessage;
   run: AiRun | undefined;
@@ -158,10 +164,16 @@ function AssistantMessage({
   vocab: Vocabulary;
   /** True when the pipelines, teammates or metrics could not be read. */
   vocabUnread: boolean;
+  /** Parts of the vocabulary that failed, so the dimensions they carry are unchecked. */
+  vocabPartial: string[];
   /** True while they are still being read, so nothing is named yet. */
   vocabLoading: boolean;
   onDecided: () => void;
   onOpenRun: (id: string) => void;
+  /** Puts a suggested rephrasing back into the thread as the next question. */
+  onAsk: (question: string) => void;
+  /** Opens a screen this answer pointed at but could not measure over. */
+  onOpenRecords: (href: string) => void;
 }) {
   const f = useFormat();
   const [showTrace, setShowTrace] = useState(false);
@@ -171,8 +183,11 @@ function AssistantMessage({
   const refusal = refusalOf(run);
   const lowConfidence = !!run && run.confidence !== null && run.confidence < 0.55 && !refusal;
 
+  // Deduped by record id: the engine cites the row it read, and a ticket read
+  // twice — once for the count and once for the oldest — was listed twice in
+  // SOURCES, which reads as two tickets.
   const citations = useMemo(
-    () => (message.citations.length ? message.citations : run?.citations ?? []),
+    () => dedupeCitations(message.citations.length ? message.citations : run?.citations ?? []),
     [message.citations, run?.citations],
   );
 
@@ -210,6 +225,32 @@ function AssistantMessage({
   // the column totals the engine refuses or widens.
   const board = useMemo(() => boardHref(question, vocab), [question, vocab]);
 
+  // The phrasing of the same question this engine does answer. Only offered on
+  // a refusal: a question that was answered does not need rewording.
+  const rephrase = useMemo(() => rephraseAsBreakdown(question, vocab), [question, vocab]);
+
+  // A pipeline the answer says this workspace does not have, that it does.
+  const denied = useMemo(() => deniedPipeline(prose, vocab), [prose, vocab]);
+
+  // A refusal whose stated reason this workspace's own catalogue disproves:
+  // "open pipeline" refused as an unbindable *status*, one line under a chip
+  // offering the rephrasing that answers it perfectly.
+  const misread = useMemo(() => misreadRefusal(refusal, vocab), [refusal, vocab]);
+
+  /**
+   * The engine's own sentences, with the ones this card disproves corrected.
+   *
+   * Only three: a currency claim over a figure printed in another book, a
+   * denial that a pipeline exists beside the pipeline, and a refusal that asks
+   * a sales lead to send an API parameter. Each was previously rebutted in a
+   * banner above and left standing underneath, which leaves the reader holding
+   * a claim and its refutation with no way to tell which to trust.
+   */
+  const corrected = useMemo(
+    () => correctedProse(prose, { verdicts: scope.verdicts, denied, vocab }),
+    [prose, scope.verdicts, denied, vocab],
+  );
+
   const breakdown = useMemo(() => {
     const parsed = parseBreakdown(prose);
     if (!parsed) return null;
@@ -219,7 +260,7 @@ function AssistantMessage({
 
   // The breakdown sentence is lifted out of the prose so it can be reconciled
   // against the board rather than read as a settled list of stage figures.
-  const body = breakdown ? withoutBreakdown(prose) : prose;
+  const body = breakdown ? withoutBreakdown(corrected) : corrected;
   const { shown, done } = useReveal(body, newest);
 
   // The prose was composed when the engine stopped: it says "Nothing has been
@@ -236,7 +277,7 @@ function AssistantMessage({
           <Badge tone="brand" size="sm" icon={<Icons.sparkles size={11} />}>
             {run ? run.model : 'Copilot'}
           </Badge>
-          {run && <ConfidenceBadge run={run} refused={!!refusal} />}
+          {run && <ConfidenceBadge run={run} refused={!!refusal} unbound={scope.unscoped.length} />}
           {(waiting.length > 0 || (run?.status === 'needs_approval' && approvals.length === 0))
             && <Badge tone="warning" size="sm">waiting for approval</Badge>}
           {superseded && (
@@ -256,21 +297,67 @@ function AssistantMessage({
           )}
         </div>
 
-        {refusal && (
-          <Banner tone="warning" title="The engine refused to answer this one" bar>
-            {refusal.message}
-            {' '}
-            <span className="cp-mono">({refusal.code})</span>
+        {refusal && misread && (
+          <Banner tone="danger" bar title={`The reason given for refusing this is not true of this workspace`}>
+            <p>
+              It says it could not bind <strong>“{misread.text}”</strong> as a {misread.kind}. “{misread.text}” is
+              not a {misread.kind} here — it is <strong>{misread.metric.label}</strong>, a measure this workspace
+              publishes and computes constantly. The ranking you asked for is one rephrasing away.
+            </p>
+            {rephrase && <RephraseLink question={rephrase} onAsk={onAsk} />}
             {board && <BoardLink board={board} />}
           </Banner>
         )}
 
-        <ScopeWarning report={scope} board={board} />
+        {refusal && !misread && (
+          <Banner tone="warning" title="The engine refused to answer this one" bar>
+            {refusal.message}
+            {' '}
+            <span className="cp-mono">({refusal.code})</span>
+            {rephrase && <RephraseLink question={rephrase} onAsk={onAsk} />}
+            {board && <BoardLink board={board} />}
+          </Banner>
+        )}
+
+        {denied && (
+          <Banner tone="warning" bar title={`${denied.label} is a ${denied.objectType} pipeline in this workspace`}>
+            The engine answered that no pipeline is called “{denied.label}” and listed the deal
+            pipelines as though they were all of them. One is — it holds {denied.objectType}s rather
+            than deals, which is why the copilot cannot measure pipeline value over it. The answer
+            below has been corrected to say so.
+            {' '}
+            <a
+              className="cp-chip"
+              href={`/records/${denied.objectType}`}
+              onClick={(e) => {
+                if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+                e.preventDefault();
+                onOpenRecords(`/records/${denied.objectType}`);
+              }}
+            >
+              <Icons.tickets size={12} />
+              <span className="u-truncate">Open the {denied.objectType}s</span>
+            </a>
+          </Banner>
+        )}
+
+        <ScopeWarning
+          report={scope}
+          board={board}
+          rephrase={rephrase && !refusal ? { question: rephrase, onAsk } : null}
+        />
 
         {vocabUnread && scope.answering.length > 0 && (
           <Banner tone="warning" compact title="The scope of this answer was not checked">
             The pipelines, teammates and metric catalogue this workspace defines could not be read, so
             nothing below has been compared against what the question asked for.
+          </Banner>
+        )}
+
+        {!vocabUnread && vocabPartial.length > 0 && scope.answering.length > 0 && (
+          <Banner tone="warning" compact title="Part of this workspace’s vocabulary could not be read">
+            {f.list(vocabPartial)} did not answer, so a question naming one of those was not checked
+            against it. Everything else below was.
           </Banner>
         )}
 
@@ -293,7 +380,7 @@ function AssistantMessage({
           <Banner tone="danger" title="This run failed">{run.error}</Banner>
         )}
 
-        <ScopeBar report={scope} vocab={vocab} loading={vocabLoading} />
+        <ScopeBar report={scope} vocab={vocab} loading={vocabLoading} unread={vocabUnread} />
 
         <div className={superseded ? 'cp-superseded' : undefined}>
           <AnswerBody content={shown} revealing={!done} />
@@ -306,7 +393,7 @@ function AssistantMessage({
         <CitationChips citations={citations} />
 
         {waiting.map((approval) => (
-          <ApprovalCard key={approval.id} approval={approval} onDecided={onDecided} />
+          <ApprovalCard key={approval.id} approval={approval} question={question} onDecided={onDecided} />
         ))}
 
         {superseded && (
@@ -452,6 +539,10 @@ export function CopilotPage() {
 
   // On mount, and again each time an answer lands.
   useEffect(landFocus, [landFocus, newestMessage]);
+
+  // The way back to the box from anywhere on the screen. `allowInInput` is off,
+  // so typing the letter C into the composer or the filter box types a C.
+  useHotkey('c', () => composerRef.current?.focus());
 
 
   const visibleThreads = useMemo(() => {
@@ -684,6 +775,17 @@ export function CopilotPage() {
         </Banner>
       )}
 
+      {/* One key over the whole rail. Tabbing to the composer used to cost 26
+          shell stops plus two more for every conversation in the list, and the
+          tunnel grew with the thread count. */}
+      <a
+        className="cp-skip"
+        href="#cp-composer"
+        onClick={(e) => { e.preventDefault(); composerRef.current?.focus(); }}
+      >
+        Skip to the message box (C)
+      </a>
+
       <div className="cp-shell" ref={shellRef}>
         <Card
           className="cp-rail"
@@ -772,7 +874,7 @@ export function CopilotPage() {
 
         <div className="cp-convo">
           <div
-            className={`cp-stream${!composing && messages.length > 0 ? ' cp-stream--messages' : ''}`}
+            className="cp-stream"
             ref={streamRef}
             aria-live="polite"
             aria-busy={send.loading}
@@ -846,9 +948,12 @@ export function CopilotPage() {
                   question={questionFor(message, index)}
                   vocab={vocabulary.vocab}
                   vocabUnread={!!vocabulary.error}
+                  vocabPartial={vocabulary.partial}
                   vocabLoading={vocabulary.loading}
                   onDecided={() => { if (selected) refreshAfterAnswer(selected); }}
                   onOpenRun={(id) => navigate(`/copilot/runs/${id}`)}
+                  onAsk={ask}
+                  onOpenRecords={navigate}
                 />
               )
             ))}
@@ -869,8 +974,14 @@ export function CopilotPage() {
             )}
           </div>
 
+          {/* The landmark the skip link targets. Its name is deliberately not
+              "Ask the copilot" — that is the textarea's own name, and two things
+              with one accessible name is a region announced identically to the
+              box inside it. */}
           <form
             className="cp-composer"
+            id="cp-composer"
+            aria-label="Copilot message box"
             onSubmit={(e) => { e.preventDefault(); ask(draft); }}
           >
             <Textarea
@@ -894,7 +1005,7 @@ export function CopilotPage() {
                 label="Let it prepare writes"
                 hint="Nothing is written without your approval."
               />
-              <span className="cp-composer__hint">Enter sends · Shift+Enter for a new line</span>
+              <span className="cp-composer__hint">Enter sends · Shift+Enter for a new line · C jumps back here</span>
               <Button
                 type="submit"
                 variant="primary"

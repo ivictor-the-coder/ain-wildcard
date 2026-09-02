@@ -14,12 +14,12 @@ import { useFormat, type DateOptions, type Formatter } from '@/client/design';
 /* --------------------------- what the board is ---------------------------- */
 
 export {
-  ALL_PIPELINES, DAY_MS, HORIZON_LABEL, HORIZONS, SIX_WEEK_DAYS, SORTS, conditionsOf, describeBoardState,
-  horizonWindow, matchesHorizon, quarterEnd, quarterStart, sameBoardState, stageKey, stateToView,
-  viewToState,
+  ALL_PIPELINES, BOARD_KEYS, DAY_MS, HORIZON_LABEL, HORIZONS, SIX_WEEK_DAYS, SORTS, boardMove,
+  boardTabStop, conditionsOf, describeBoardState, horizonWindow, isBoardKey, matchesHorizon,
+  quarterEnd, quarterStart, sameBoardState, stageKey, stateToView, viewToState,
 } from './board-core';
 export type {
-  BoardState, FilterCondition, FilterGroup, FilterNode, Horizon, StoredView,
+  BoardGrid, BoardKey, BoardState, FilterCondition, FilterGroup, FilterNode, Horizon, StoredView,
 } from './board-core';
 
 import { DAY_MS, stageKey, type FilterNode } from './board-core';

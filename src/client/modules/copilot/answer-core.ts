@@ -12,6 +12,24 @@ export type ConfidenceBand = 'high' | 'medium' | 'low';
 export const confidenceBand = (confidence: number | null): ConfidenceBand =>
   confidence === null ? 'low' : confidence >= 0.8 ? 'high' : confidence >= 0.55 ? 'medium' : 'low';
 
+/**
+ * What the confidence chip says.
+ *
+ * The percentage is the intent classifier's margin, and it was highest exactly
+ * where the answer was worst: 99% on the write that moved the wrong deal, 98%
+ * on a named-deal question answered for the whole account, 98% on a CSAT
+ * refusal — against 79% and 67% on two correct, fully scoped answers. Printing
+ * it first put the anti-correlated number in the biggest type on the card. The
+ * unbound count is the half of this chip that is accurate, so where there is
+ * one it is the whole chip, and the margin moves to the tooltip.
+ */
+export const confidenceChip = (percent: number, unbound: number): string => {
+  if (unbound <= 0) return `intent read at ${percent}%`;
+  return unbound === 1
+    ? '1 qualifier of this question is unbound'
+    : `${unbound} qualifiers of this question are unbound`;
+};
+
 /** Assistant prose arrives as paragraphs, some of them bullet lists. */
 export interface Block { kind: 'text' | 'list'; lines: string[] }
 
@@ -99,7 +117,7 @@ export function parseBlocks(content: string): Block[] {
  * between an honest "I did not answer that" and a confident-looking paragraph
  * that happens to contain no numbers.
  */
-export function refusalOf(run: { reasoning: string[] } | undefined | null): { code: string; message: string } | null {
+export function refusalOf(run: { reasoning?: string[] } | undefined | null): { code: string; message: string } | null {
   for (const line of run?.reasoning ?? []) {
     // "Refused (period_unresolved): …" and "Refused after the run
     // (qualifier_unbound): …" are both the engine declining to answer. Only the

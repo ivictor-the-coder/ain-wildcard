@@ -1,0 +1,10 @@
+[
+ {"prompt":"How much open pipeline does Marcus Ilori own in the Renewal pipeline?","response_schema":{"type":"object","properties":{"amount":{"type":"number"},"count":{"type":"integer"},"owner":{"type":"string"},"pipeline":{"type":"string"}}}},
+ {"prompt":"How much did we invoice in GBP in Q2 2026?","response_schema":{"type":"object","properties":{"amount":{"type":"number"},"currency":{"type":"string"},"invoice_count":{"type":"integer"}}}},
+ "How much open pipeline is new business versus upsell deal type?",
+ "How many deals have a 36 month contract term?",
+ "How much open pipeline is with prospects rather than customers?",
+ "Which deals are stuck in Negotiation for more than 60 days?",
+ "How much did MF pay us this year?",
+ "What is the total value of deals we won in the Renewal pipeline last year?"
+]

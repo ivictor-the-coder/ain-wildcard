@@ -17,11 +17,11 @@ import {
 } from '@/client/design';
 import {
   OUTCOME_LABEL, OUTCOME_TONE, boardHref, reconcileScope, refusalOf, runOutcome, useAllApprovals, useApprovals,
-  useFeatureCatalogue, useRun, useVocabulary,
+  rephraseAsBreakdown, useFeatureCatalogue, useRun, useVocabulary,
   type AiRun, type RunDetail, type RunOutcome,
 } from './api';
 import { ApprovalQueue, CitationChips, ReasoningList, RunFacts, TraceSteps } from './trace';
-import { ScopeBar, ScopeWarning } from './scope';
+import { RephraseLink, ScopeBar, ScopeWarning } from './scope';
 
 /** How many runs one read of the log brings back, and how far each “show more” goes. */
 const PAGE = 100;
@@ -116,14 +116,18 @@ export function RunsPage() {
     let tokens = 0;
     let ms = 0;
     let failed = 0;
+    let refused = 0;
     for (const run of rows) {
       credits += run.usage.credits;
       tokens += run.usage.input_tokens + run.usage.output_tokens;
       ms += run.duration_ms;
       if (run.status === 'failed') failed += 1;
+      // Counted off the same rule the Outcome column shows, so the tile and
+      // the table can never disagree about how many questions went unanswered.
+      if (outcomeOf(run) === 'refused') refused += 1;
     }
-    return { credits, tokens, ms, failed, count: rows.length };
-  }, [rows]);
+    return { credits, tokens, ms, failed, refused, count: rows.length };
+  }, [rows, outcomeOf]);
 
   const columns = useMemo<DataTableColumn<AiRun>[]>(() => [
     {
@@ -231,7 +235,7 @@ export function RunsPage() {
       width="wide"
       subtitle={
         runs.data
-          ? `${f.plural(totals.count, 'run')} · ${f.number(totals.tokens)} tokens · ${f.plural(totals.credits, 'credit')}${totals.failed ? ` · ${totals.failed} failed` : ''}`
+          ? `${f.plural(totals.count, 'run')} · ${f.number(totals.tokens)} tokens · ${f.plural(totals.credits, 'credit')}${totals.refused ? ` · ${totals.refused} refused` : ''}${totals.failed ? ` · ${totals.failed} failed` : ''}`
           : 'Every question the engine has been asked, and what it did about it'
       }
       actions={
@@ -314,6 +318,18 @@ export function RunsPage() {
             <Card padding="tight">
               <Stat label="Failed" value={f.number(totals.failed)} icon={<AlertTriangleIcon size={15} />} caption="Runs that ended in an error" />
             </Card>
+            <Card padding="tight">
+              {/* A refusal is not a failure and not a success: the engine read
+                  the question, could not bind part of it and said so. It was
+                  logged as "Succeeded", which made the single most important
+                  operational number on this screen unreadable. */}
+              <Stat
+                label="Refused"
+                value={f.number(totals.refused)}
+                icon={<Icons.shield size={15} />}
+                caption={totals.count ? `${Math.round((totals.refused / totals.count) * 100)}% of the runs in view` : 'No runs yet'}
+              />
+            </Card>
           </div>
 
           <div className="pl-toolbar">
@@ -329,6 +345,7 @@ export function RunsPage() {
                 { value: 'needs_approval', label: 'Needs approval' },
                 { value: 'written', label: 'Approved and written' },
                 { value: 'declined', label: 'Declined' },
+                { value: 'refused', label: 'Refused' },
                 { value: 'failed', label: 'Failed' },
                 { value: 'running', label: 'Running' },
               ] as SelectOption[]}
@@ -439,6 +456,9 @@ export function RunDetailPage({ id }: { id: string }) {
 
   const detail: RunDetail = run.data;
   const refusal = refusalOf(detail);
+  // The phrasing of the same question the engine does answer, offered as one
+  // press rather than left to the reader to guess at.
+  const rephrase = rephraseAsBreakdown(detail.question, vocabulary.vocab);
   const outcome = runOutcome(detail, detail.approvals);
   // The header and the panel below it are counting the same array. They used to
   // read `span_count`, which is stamped when the run finishes and never sees the
@@ -500,6 +520,12 @@ export function RunDetailPage({ id }: { id: string }) {
       {refusal && (
         <Banner tone="warning" title="This run refused to answer" bar>
           {refusal.message} <span className="cp-mono">({refusal.code})</span>
+          {rephrase && (
+            <RephraseLink
+              question={rephrase}
+              onAsk={(next) => navigate(`/copilot?new=1&ask=${encodeURIComponent(next)}`)}
+            />
+          )}
         </Banner>
       )}
       {detail.status === 'failed' && detail.error && (
@@ -545,7 +571,7 @@ export function RunDetailPage({ id }: { id: string }) {
       {detail.approvals.length > 0 && (
         <>
               <Card title="Writes this run prepared" description="Each one had to be approved by a person before it could run">
-            <ApprovalQueue approvals={detail.approvals} onDecided={run.refetch} />
+            <ApprovalQueue approvals={detail.approvals} question={detail.question} onDecided={run.refetch} />
           </Card>
         </>
       )}

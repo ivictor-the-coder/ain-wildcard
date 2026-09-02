@@ -384,7 +384,15 @@ function conventionalValue(name: string, node: SchemaNode, context: ExtractionCo
   if (scoped !== undefined) return scoped;
   if (context.metricId) {
     const ids = new Set([normalise(context.metricId), normalise(context.metricLabel ?? '')].filter(Boolean));
-    if (ids.has(normalise(name))) {
+    // A caller writes the unit into the field name — `open_pipeline_cents`,
+    // `mrr_amount`, `total_revenue` — and the fill was keyed on the name
+    // matching the measure exactly, so the identical run filled `amount`
+    // correctly and left `open_pipeline_cents` null. The unit is not part of
+    // the measure's name.
+    const bare = normalise(name)
+      .replace(/^(?:total|sum of|the) /, '')
+      .replace(/ (?:cents|pence|minor units|amount|value|total|money|figure|sum|usd|eur|gbp)$/, '');
+    if (ids.has(normalise(name)) || ids.has(bare)) {
       if (context.metricCurrencies && context.metricCurrencies.length > 1) return undefined;
       return node.type === 'string' ? context.metricFormatted ?? context.metricValue : context.metricValue;
     }
