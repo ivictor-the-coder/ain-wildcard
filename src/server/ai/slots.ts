@@ -457,7 +457,11 @@ function build(
     const value: SlotValue = { kind: 'metric', id: def.id, label: def.label, unit: def.unit, snapshot: !!def.snapshot, supportsSubject: def.supportsSubject };
     const aliases = def.id === 'spend' ? SPEND_ALIASES : [def.label, ...(METRIC_ALIASES[def.id] ?? [])];
     for (const alias of aliases) {
-      if (def.id !== 'spend') add(def.snapshot ? 'snapshot-metric' : 'period-metric', alias, value);
+      // The open-deal count is labelled "Deals", and as a bare measure word
+      // that turned "how many deals have we got" — every deal — into the 38
+      // open ones. Its own aliases still say "open"; the label does not.
+      const bareDeals = def.id === 'deal_count' && alias === def.label;
+      if (def.id !== 'spend' && !bareDeals) add(def.snapshot ? 'snapshot-metric' : 'period-metric', alias, value);
       if (RANKABLE.has(def.id)) add('rank-metric', alias, value);
       if (OWNABLE.has(def.id)) add('ownable-metric', alias, value);
       if (LEDGER.has(def.id)) add(def.snapshot ? 'ledger-snapshot-metric' : 'ledger-period-metric', alias, value);

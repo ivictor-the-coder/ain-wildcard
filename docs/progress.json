@@ -1,11 +1,11 @@
 {
-  "updated": "2026-09-03T03:28:02.094969",
-  "headline": "The template engine is live: 91 templates, every slot typed and bound or no match. Every P0 the last critic priced is closed \u2014 \"how many won deals in total\" answers 25 where it answered 1, \"biggest customer\" refuses with the exact template that would answer instead of stating a falsehood, ARR is ARR. The 12,000 lines of free-text heuristics are gone from the answer path.",
+  "updated": "2026-09-03T04:09:20.811142",
+  "headline": "The template engine passes its own property suite: 282 rows, every template answered with the figure the database holds and no other, sixty near-misses refused with three questions that work. The old 7,588-line free-text suite is being retired \u2014 its live paths ported, its dead blocks deleted \u2014 and CI is red until that lands.",
   "stats": {
     "server modules": 10,
     "client modules": 8,
     "ai templates": 91,
-    "lines of code": "163,448"
+    "template suite": "282/282"
   },
   "waves": [
     {
@@ -309,11 +309,11 @@
           "id": "template-engine",
           "title": "The template whitelist engine",
           "status": "critique",
-          "rounds": 1,
+          "rounds": 2,
           "note": "91 templates from the 50-metric catalogue, the CRM object types and every enumerated dimension. clarify.ts, coverage.ts and dimensions.ts deleted; the tree is 8k lines smaller. Verified against the database: 25 closed-won, 39 closed, $1,463,440 Renewal.",
-          "operability": 0.9,
+          "operability": 0.92,
           "debt": 0,
-          "verdict": "The old 7,588-line suite still imports the deleted modules and is being retired for a property suite \u2014 every template \u00d7 two phrasings priced independently, plus 60 near-misses that must refuse."
+          "verdict": "Sixteen suite failures turned out to be two test defects and one engine defect: list ordinals counted as figures; a refusal\u2019s own reason (\"Q4 2026 has not started yet\") counted as a claim; and \"show me\" wired into value templates, so \"Show me our customers\" answered a count. Fixed; 282/282."
         },
         {
           "id": "copilot-templates",

@@ -200,7 +200,11 @@ export function renderMetric(result: MetricToolResult, workspace: WorkspaceProfi
     return { content, citations: [], facts: { ...NO_FACTS, unit: unitOf(result), count: 0, label, period, subject } };
   }
   // A counted measure is its own row count: "38 open deals", not "Deals is 38".
-  const counted = result.unit === 'count';
+  // Unless the rows are not the figure — connected assets are summed across
+  // the accounts that report them, and "23 accounts reporting telemetry" was
+  // the whole answer to "how many connected assets do we have", with the
+  // asset count nowhere in it.
+  const counted = result.unit === 'count' && result.value === result.count;
   const source = period ? rows.replace(/\s+in the period$/, '') : rows;
   const content = counted
     ? `${prefix}${capitalise(source)}${where ? ` ${where}` : ''}.`

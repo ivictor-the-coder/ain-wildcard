@@ -21,7 +21,7 @@ import type {
 } from './functions';
 import type { DraftResult } from './draft';
 import { linkedCustomerIds } from './metrics';
-import { plural, humanise, listPhrase } from './text';
+import { capitalise, plural, humanise, listPhrase } from './text';
 import {
   bind, bindsAnywhere, bound, slotSpan, stripPoliteness, tokenise,
   type Bindings, type Bound, type SlotKind, type SlotValue, type Token, type Vocabulary,
@@ -268,9 +268,15 @@ const maybe = <K extends SlotValue['kind']>(b: Bindings, name: string, kind: K):
 
 const resultOf = <T>(steps: StepOutcome[], index = 0): T => steps[index].result as T;
 
-const OUR = '(our|the|my|)';
-const WHAT_IS = '(what is|what are|whats|tell me|show me)';
-const WHAT_WAS = '(what was|what were|what is|what are|whats|tell me|show me)';
+// "my" is deliberately absent: the first person is an owner, and a shape that
+// read "what is my open pipeline" as "what is the open pipeline" answered the
+// workspace's $9.0M to a rep whose own book is a third of that.
+const OUR = '(our|the|)';
+// "Show me" asks for rows, not a value. Left in here it let "Show me our
+// customers" match the snapshot template and answer "23 accounts marked as a
+// customer" — a count under a request for a list. It belongs to LIST only.
+const WHAT_IS = '(what is|what are|whats|tell me)';
+const WHAT_WAS = '(what was|what were|what is|what are|whats|tell me)';
 const LIST = '(list|show me|show|give me|what are)';
 
 const thingOf = (state: Of<'state'> | null, object: Of<'object'>): string =>
@@ -393,6 +399,33 @@ export function samplesOf(v: Vocabulary): Samples {
 
 const need = (...parts: (string | number | null)[]): string | null =>
   (parts.some((p) => p === null) ? null : parts.join(''));
+
+/**
+ * A period that has not started holds nothing a backward-looking measure can
+ * read. "Revenue in the next 30 days" used to be answered with the invoices
+ * whose payment date the seed had placed ahead of the clock — a figure for a
+ * period that has not happened, stated as if it had. A period still running
+ * ("this quarter") is a period-to-date and is allowed; one wholly ahead of the
+ * clock is refused by name.
+ */
+const notYet = (b: Bindings, v: Vocabulary, names: string[] = ['period']): string | null => {
+  for (const name of names) {
+    const period = maybe(b, name, 'period');
+    if (period && period.window.start >= v.workspace.now) {
+      return `${capitalise(period.window.label)} has not started yet, and this measures what has already happened — ask about a period that has.`;
+    }
+  }
+  return null;
+};
+
+/** A decided deal was won or lost; "open" and the ledger verbs name no decision. */
+const decidedOnly = (b: Bindings): string | null => {
+  const verb = maybe(b, 'verb', 'verb');
+  if (verb && !['closed_won', 'closed_lost'].includes(verb.value)) return `"${b.verb.text}" is not a way a deal is decided.`;
+  const state = maybe(b, 'state', 'state');
+  if (state && state.label === 'open') return 'An open deal has not been decided in any period.';
+  return null;
+};
 
 /* ----------------------------- the catalogue ----------------------------- */
 
@@ -623,13 +656,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['record_search'],
     example: (v) => `Which deals did we win in ${samplesOf(v).year}?`,
-    check: (b) => {
-      const verb = maybe(b, 'verb', 'verb');
-      if (verb && !['closed_won', 'closed_lost'].includes(verb.value)) return `"${b.verb.text}" is not a way a deal is decided.`;
-      const state = maybe(b, 'state', 'state');
-      if (state && state.label === 'open') return 'An open deal has not been decided in any period.';
-      return null;
-    },
+    check: (b, v) => notYet(b, v) ?? decidedOnly(b),
     plan: (b, v) => {
       const period = slot(b, 'period', 'period');
       const verb = maybe(b, 'verb', 'verb');
@@ -657,13 +684,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['record_aggregate'],
     example: (v) => `How many deals did we win in ${samplesOf(v).year}?`,
-    check: (b) => {
-      const verb = maybe(b, 'verb', 'verb');
-      if (verb && !['closed_won', 'closed_lost'].includes(verb.value)) return `"${b.verb.text}" is not a way a deal is decided.`;
-      const state = maybe(b, 'state', 'state');
-      if (state && state.label === 'open') return 'An open deal has not been decided in any period.';
-      return null;
-    },
+    check: (b, v) => notYet(b, v) ?? decidedOnly(b),
     plan: (b, v) => {
       const period = slot(b, 'period', 'period');
       const verb = maybe(b, 'verb', 'verb');
@@ -810,6 +831,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: (v) => `What was our revenue in ${samplesOf(v).year}?`,
+    check: (b, v) => notYet(b, v),
     plan: (b) => {
       const metric = slot(b, 'metric', 'metric');
       const period = slot(b, 'period', 'period');
@@ -827,6 +849,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: (v) => `How much did we book in ${samplesOf(v).year}?`,
+    check: (b, v) => notYet(b, v),
     plan: (b) => {
       const verb = slot(b, 'verb', 'verb');
       const period = slot(b, 'period', 'period');
@@ -860,7 +883,9 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: (v) => need('What was our revenue in ', samplesOf(v).currency, ` in ${samplesOf(v).year}?`),
-    check: (b) => {
+    check: (b, v) => {
+      const ahead = notYet(b, v);
+      if (ahead) return ahead;
       const verb = maybe(b, 'verb', 'verb');
       return verb && !['invoiced', 'revenue'].includes(verb.value) ? `Deals carry no currency book, so "${b.verb.text}" cannot be narrowed to one.` : null;
     },
@@ -907,7 +932,9 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: (v) => `What was our win rate by owner in ${samplesOf(v).year}?`,
-    check: (b) => {
+    check: (b, v) => {
+      const ahead = notYet(b, v);
+      if (ahead) return ahead;
       const metric = slot(b, 'metric', 'metric');
       const dimension = slot(b, 'dimension', 'dimension');
       return (BREAKDOWNS[metric.id] ?? []).includes(dimension.groupBy) ? null
@@ -958,7 +985,9 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['record_aggregate'],
     example: (v) => need('How much did ', samplesOf(v).owner, ` book in ${samplesOf(v).year}?`),
-    check: (b) => {
+    check: (b, v) => {
+      const ahead = notYet(b, v);
+      if (ahead) return ahead;
       const verb = maybe(b, 'verb', 'verb');
       return verb && !['closed_won', 'closed_lost'].includes(verb.value) ? `"${b.verb.text}" is a ledger measure, and the ledger does not record who owns a bill.` : null;
     },
@@ -986,13 +1015,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['record_aggregate'],
     example: (v) => need('How many deals did ', samplesOf(v).owner, ` win in ${samplesOf(v).year}?`),
-    check: (b) => {
-      const verb = maybe(b, 'verb', 'verb');
-      if (verb && !['closed_won', 'closed_lost'].includes(verb.value)) return `"${b.verb.text}" is not a way a deal is decided.`;
-      const state = maybe(b, 'state', 'state');
-      if (state && state.label === 'open') return 'An open deal has not been decided in any period.';
-      return null;
-    },
+    check: (b, v) => notYet(b, v) ?? decidedOnly(b),
     plan: (b, v) => {
       const owner = slot(b, 'owner', 'owner');
       const period = slot(b, 'period', 'period');
@@ -1018,6 +1041,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['record_aggregate'],
     example: (v) => need('What was ', samplesOf(v).owner, `'s win rate in ${samplesOf(v).year}?`),
+    check: (b, v) => notYet(b, v),
     plan: (b, v) => {
       const owner = slot(b, 'owner', 'owner');
       const period = slot(b, 'period', 'period');
@@ -1047,6 +1071,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['record_aggregate'],
     example: (v) => need('How many meetings did ', samplesOf(v).owner, ' hold in the last 30 days?'),
+    check: (b, v) => notYet(b, v),
     plan: (b) => {
       const object = slot(b, 'object', 'object');
       const owner = slot(b, 'owner', 'owner');
@@ -1095,6 +1120,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: (v) => `Who booked the most in ${samplesOf(v).year}?`,
+    check: (b, v) => notYet(b, v),
     plan: (b) => {
       const most = slot(b, 'most', 'superlative');
       const period = slot(b, 'period', 'period');
@@ -1141,7 +1167,9 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: (v) => `Which accounts booked the most in ${samplesOf(v).year}?`,
-    check: (b) => {
+    check: (b, v) => {
+      const ahead = notYet(b, v);
+      if (ahead) return ahead;
       const metric = maybe(b, 'metric', 'metric');
       return metric?.snapshot ? `${metric.label} is a snapshot of right now, so it has no figure for a past period.` : null;
     },
@@ -1165,7 +1193,9 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: () => 'Top 5 customers by revenue',
-    check: (b) => {
+    check: (b, v) => {
+      const ahead = notYet(b, v);
+      if (ahead) return ahead;
       const metric = slot(b, 'metric', 'metric');
       return maybe(b, 'period', 'period') && metric.snapshot ? `${metric.label} is a snapshot of right now, so it has no figure for a past period.` : null;
     },
@@ -1309,6 +1339,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: (v) => `How many invoices did we issue in ${samplesOf(v).year}?`,
+    check: (b, v) => notYet(b, v),
     plan: (b) => {
       const period = slot(b, 'period', 'period');
       const paid = /\bpaid\b/.test(b.$question.text);
@@ -1382,6 +1413,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['metered_usage'],
     example: (v) => need('How many ', samplesOf(v).meter?.toLowerCase() ?? null, ' did we meter in the last 30 days?'),
+    check: (b, v) => notYet(b, v),
     plan: (b) => {
       const meter = slot(b, 'meter', 'meter');
       const period = slot(b, 'period', 'period');
@@ -1399,6 +1431,8 @@ export const TEMPLATES: Template[] = [
     tools: ['metered_usage'],
     example: (v) => need('How many ', samplesOf(v).meter?.toLowerCase() ?? null, ' did ', samplesOf(v).account, ' use in the last 30 days?'),
     check: (b, v) => {
+      const ahead = notYet(b, v);
+      if (ahead) return ahead;
       const account = slot(b, 'account', 'record');
       return linkedCustomerIds(v.ctx, v.orgId, { id: account.id, type: account.type, label: account.label }).length
         ? null
@@ -1483,6 +1517,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: (v) => need('How much did ', samplesOf(v).account, ` spend in ${samplesOf(v).year}?`),
+    check: (b, v) => notYet(b, v),
     plan: (b) => {
       const account = slot(b, 'account', 'record');
       const period = slot(b, 'period', 'period');
@@ -1510,6 +1545,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: (v) => need('How much did we invoice ', samplesOf(v).account, ` in ${samplesOf(v).year}?`),
+    check: (b, v) => notYet(b, v),
     plan: (b) => {
       const account = slot(b, 'account', 'record');
       const period = slot(b, 'period', 'period');
@@ -1548,7 +1584,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: (v) => need('What was ', samplesOf(v).account, `'s revenue in ${samplesOf(v).year}?`),
-    check: (b) => (slot(b, 'metric', 'metric').supportsSubject ? null : `${slot(b, 'metric', 'metric').label} is a workspace-wide measure and cannot be narrowed to one account.`),
+    check: (b, v) => notYet(b, v) ?? (slot(b, 'metric', 'metric').supportsSubject ? null : `${slot(b, 'metric', 'metric').label} is a workspace-wide measure and cannot be narrowed to one account.`),
     plan: (b) => {
       const account = slot(b, 'account', 'record');
       const metric = slot(b, 'metric', 'metric');
@@ -1596,8 +1632,12 @@ export const TEMPLATES: Template[] = [
   T({
     id: 'account-open-tickets', kind: 'list', intent: 'lookup',
     description: 'The open tickets on one account.',
+    // One shape per line: an alternation holds words, never a slot, so a
+    // pattern that nested {account} inside one could not be matched by any
+    // sentence — including this template's own published example.
     patterns: [
-      `(which|what) tickets (does {account} have open|are open (at|for|with|on) {account})`,
+      `(which|what) tickets does {account} have open`,
+      `(which|what) tickets are open (at|for|with|on) {account}`,
       `${LIST} (the|) open tickets (at|for|with|on) {account}`,
       `${LIST} {account} open tickets`,
     ],
@@ -1637,8 +1677,11 @@ export const TEMPLATES: Template[] = [
     id: 'account-open-deals', kind: 'list', intent: 'lookup',
     description: 'The open deals on one account.',
     patterns: [
-      `(which|what) deals (does {account} have open|are open (at|for|with|on) {account}|do we have open (at|for|with) {account})`,
-      `(which|what) (open|) deals (does|do) (we have with|) {account} (have|)`,
+      `(which|what) deals does {account} have open`,
+      `(which|what) deals are open (at|for|with|on) {account}`,
+      `(which|what) deals do we have open (at|for|with) {account}`,
+      `(which|what) (open|) deals does {account} have`,
+      `(which|what) (open|) deals do we have with {account}`,
       `${LIST} (the|) open deals (at|for|with|on) {account}`,
       `${LIST} {account} open deals`,
     ],
@@ -1822,6 +1865,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: (v) => `How did our closed-won bookings in ${samplesOf(v).year} compare with ${samplesOf(v).year - 1}?`,
+    check: (b, v) => notYet(b, v, ['a', 'b']),
     plan: (b) => {
       const metric = slot(b, 'metric', 'metric');
       const a = slot(b, 'a', 'period');
@@ -2077,7 +2121,9 @@ export const TEMPLATES: Template[] = [
       `${WHAT_IS} the (average|avg|mean|total|sum of) {property:numeric-property} (of|for|across|on) (our|the|all|) {object}`,
     ],
     tools: ['record_aggregate'],
-    example: () => 'What is the average contract term of open deals?',
+    // "Contract term" is not a spelling this workspace's property answers to —
+    // its label is "Term (months)" — so the example names a property that binds.
+    example: () => 'What is the average amount of open deals?',
     plan: (b) => {
       const object = slot(b, 'object', 'object');
       const property = slot(b, 'property', 'property');
@@ -2103,6 +2149,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['record_aggregate'],
     example: () => 'How many tickets were raised in the last 30 days?',
+    check: (b, v) => notYet(b, v),
     plan: (b) => {
       const object = slot(b, 'object', 'object');
       const period = slot(b, 'period', 'period');
@@ -2126,6 +2173,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['record_search'],
     example: () => 'Which tickets were raised in the last 30 days?',
+    check: (b, v) => notYet(b, v),
     plan: (b) => {
       const object = slot(b, 'object', 'object');
       const period = slot(b, 'period', 'period');
@@ -2149,6 +2197,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['business_metric'],
     example: (v) => `How many new customers did we add in ${samplesOf(v).year}?`,
+    check: (b, v) => notYet(b, v),
     plan: (b) => {
       const period = slot(b, 'period', 'period');
       return [{ tool: 'business_metric', args: { metric: 'new_customers', ...windowArgs(period.window), compare: false }, why: `Accounts that became customers over ${period.window.label}.` }];
@@ -2194,16 +2243,22 @@ export const TEMPLATES: Template[] = [
   T({
     id: 'write-note', kind: 'write', intent: 'act',
     description: 'Write a note onto a record’s timeline. Prepared for approval; nothing lands until a person approves it.',
+    // Punctuation never survives tokenising, so a colon in a pattern is a word
+    // no sentence can carry: the colon shape was dead until the colon moved
+    // into `check`, where the record's raw span still ends with it.
     patterns: [
       `(add|write|log|leave|put|create) a note (to|on|for|against) {record} (saying|that says|reading|which says) {text}`,
-      `(add|write|log|leave|put|create) a note (to|on|for|against) {record}: {text}`,
       `note (on|for|to) {record} (saying|that says|reading) {text}`,
+      `(add|write|log|leave|put|create) a note (to|on|for|against) {record} {note:text}`,
     ],
     tools: ['add_note'],
     example: (v) => need('Add a note to ', samplesOf(v).account, ' saying "The pilot slipped to October"'),
+    check: (b) => (b.note && !/:\s*$/.test(b.record.raw)
+      ? 'A note is written with "saying …" or a colon after the record, so where the record name ends is never a guess.'
+      : null),
     plan: (b) => {
       const record = slot(b, 'record', 'record');
-      const text = slot(b, 'text', 'text');
+      const text = maybe(b, 'text', 'text') ?? slot(b, 'note', 'text');
       const body = sentenceCase(text.text);
       return [{ tool: 'add_note', args: { record_ids: [record.id], subject: subjectOf(body), body }, why: `Write the note onto ${record.label}; the instruction wrapper is stripped so the timeline reads as a note.` }];
     },
