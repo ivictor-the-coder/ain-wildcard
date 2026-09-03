@@ -2032,62 +2032,127 @@ describe('smart dunning', () => {
     } finally { ws.close(); }
   });
 
-  test('expired_card gives up immediately instead of burning the remaining retries', async () => {
+  /**
+   * The day a four-attempt schedule would make its last presentation, for a
+   * first failure on MONDAY 1 June 2026, from the policy alone: gaps of 3, 5
+   * and 7 days, snapped to weekdays. 1 June + 3 = Thursday 4 June; + 5 =
+   * Tuesday 9 June; + 7 = Tuesday 16 June. The soft-decline test above walks
+   * the same dates as real attempts, so the hold ends exactly where a card
+   * that kept being refused would have been given up on.
+   */
+  const WINDOW_ENDS = '2026-06-16';
+
+  const inCollectionWindow = (ts: number) => {
+    const hour = new Date(ts).getUTCHours();
+    return hour >= 9 && hour < 13;
+  };
+
+  const pendingDeadline = (ws: Workspace, campaignId: string) => ws.app.ctx.db.get<{ run_at: number }>(
+    `SELECT run_at FROM jobs WHERE type = 'payments.dunning_retry' AND status = 'pending' AND idem_key = ?`,
+    `payments.dunning_retry:${campaignId}`,
+  );
+
+  test('expired_card drops the retries but holds the account until the schedule would have run out', async () => {
     const ws = await workspace(MONDAY);
     try {
       const customer = await ws.customer('Talbot Metalworks');
       await ws.card(customer.id, 'expired_card');
+      const before = (await ws.ok('GET', '/v1/dunning/summary')).totals.find((t: any) => t.currency === 'usd')
+        ?? { amount_at_risk: 0, lost_amount: 0 };
       const { sub, invoice } = await ws.subscribe(customer.id);
       assert.equal(invoice.status, 'open');
 
       const [campaign] = await ws.dunning(customer.id);
-      assert.equal(campaign.status, 'exhausted', 'waiting cannot un-expire a card');
+      assert.equal(campaign.status, 'recovering', 'the card is dead; the account is not written off in the same second');
       assert.equal(campaign.attempt_count, 1);
       assert.equal(campaign.attempts_remaining, 3, 'three scheduled retries were dropped, not spent');
-      assert.equal(campaign.next_attempt_at, null);
-      assert.equal(campaign.needs_human, true);
-      assert.match(campaign.recommended_action, /new (card|details)/i);
+      assert.equal(campaign.next_attempt_at, null, 'and none of them is presented: waiting cannot un-expire a card');
       assert.match(campaign.attempts[0].decision, /dropped/);
+      assert.match(campaign.attempts[0].decision, /held for a person/);
 
-      // The end behaviour applied, and it went through billing's own machine.
+      // Held, with the deadline the schedule itself would have had.
+      assert.ok(campaign.hold, 'the campaign says why nothing is scheduled');
+      assert.equal(campaign.hold.reason, 'card_needs_person');
+      assert.equal(dayKey(campaign.hold.until as number), WINDOW_ENDS, 'the hold ends the day the fourth attempt would have landed');
+      assert.ok(inCollectionWindow(campaign.hold.until as number), 'and in the collection window, like an attempt');
+      assert.equal(campaign.needs_human, true);
+      assert.match(campaign.recommended_action, /new card/i);
+      assert.match(campaign.recommended_action, /Jun 16, 2026/, 'the queue names the day the hold runs out');
+      assert.match(campaign.recommended_action, /marked unpaid/, 'and what happens then');
+
+      // The subscription is in arrears, not stopped — the state Stripe leaves
+      // it in for the whole retry window, whatever the decline code.
+      assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'past_due');
+
+      const held = (await ws.ok('GET', `/v1/events?type=dunning.held&object_id=${campaign.id}`)).data as any[];
+      const notice = held.find((e) => e.data?.invoice === invoice.id);
+      assert.ok(notice, 'dunning.held is emitted');
+      assert.equal(notice.data.reason, 'card_needs_person');
+      assert.equal(notice.data.until, campaign.hold.until);
+      assert.equal(notice.data.failure_code, 'expired_card');
+      assert.equal(
+        (await ws.ok('GET', `/v1/events?type=dunning.exhausted&object_id=${campaign.id}`)).data
+          .some((e: any) => e.type === 'dunning.exhausted' && e.data?.invoice === invoice.id),
+        false, 'nothing has been given up on',
+      );
+
+      // The deadline is a job, so the time machine can reach it.
+      const deadline = pendingDeadline(ws, campaign.id);
+      assert.ok(deadline, 'the hold has a deadline on the queue');
+      assert.equal(deadline.run_at, campaign.hold.until);
+
+      // The money is at risk, and it is not lost.
+      const after = (await ws.ok('GET', '/v1/dunning/summary')).totals.find((t: any) => t.currency === 'usd');
+      assert.equal(after.amount_at_risk, before.amount_at_risk + invoice.total, 'a held bill is still at risk');
+      assert.equal(after.lost_amount, before.lost_amount, 'and a card that needs replacing is not money that is gone');
+
+      // Ten days in: still held, and the dead card has not been presented again.
+      assert.equal((await ws.travel(10 * DAY)).failed, 0);
+      const midway = (await ws.dunning(customer.id))[0];
+      assert.equal(midway.status, 'recovering');
+      assert.equal(midway.attempt_count, 1, 'no further attempts were made against a dead card');
+      assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'past_due');
+
+      // The window closes with the bill still owed: now, and only now, the
+      // workspace's end behaviour applies — through billing's own machine.
+      assert.equal((await ws.travel(20 * DAY)).failed, 0);
+      const ended = (await ws.dunning(customer.id))[0];
+      assert.equal(ended.status, 'exhausted');
+      assert.equal(ended.attempt_count, 1, 'the deadline is a decision, not a presentation');
+      assert.equal(ended.hold, null);
+      assert.equal(ended.resolved_at, campaign.hold.until, 'given up on at the deadline, not a moment before');
+      assert.match(ended.resolution ?? '', /hold ran out/);
+      assert.match(ended.resolution ?? '', /marked unpaid/);
       assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'unpaid');
 
-      const events = await ws.ok('GET', `/v1/events?types=dunning.exhausted&limit=10`);
-      const exhausted = (events.data as any[]).find((e) => e.data?.invoice === invoice.id);
-      assert.ok(exhausted, 'dunning.exhausted is emitted');
-      assert.equal(exhausted.data.reason, 'decline_is_final');
+      const exhausted = ((await ws.ok('GET', `/v1/events?type=dunning.exhausted&object_id=${campaign.id}`)).data as any[])
+        .find((e) => e.data?.invoice === invoice.id);
+      assert.ok(exhausted, 'dunning.exhausted is emitted when the hold runs out');
+      assert.equal(exhausted.data.reason, 'hold_expired');
       assert.equal(exhausted.data.failure_code, 'expired_card');
-
-      // Nothing further is scheduled: the schedule was abandoned, not paused.
-      const pending = ws.app.ctx.db.count(
-        `SELECT COUNT(*) FROM jobs WHERE type = 'payments.dunning_retry' AND status = 'pending' AND idem_key = ?`,
-        `payments.dunning_retry:${campaign.id}`,
-      );
-      assert.equal(pending, 0);
-
-      const travelled = await ws.travel(30 * DAY);
-      assert.equal(travelled.failed, 0);
-      const stillOne = await ws.dunning(customer.id);
-      assert.equal(stillOne[0].attempt_count, 1, 'no further attempts were made against a dead card');
+      assert.equal(pendingDeadline(ws, campaign.id), undefined, 'and nothing is left on the queue');
     } finally { ws.close(); }
   });
 
-  test('a decline the schedule cannot answer ends it on attempt one and names who can', async () => {
+  test('a decline the schedule cannot answer drops the retries on attempt one and names who can', async () => {
     const ws = await workspace(MONDAY);
     try {
       const customer = await ws.customer('Ashcombe Automation');
       await ws.card(customer.id, 'authentication_required');
-      const { invoice } = await ws.subscribe(customer.id);
+      const { sub, invoice } = await ws.subscribe(customer.id);
 
       const [campaign] = await ws.dunning(customer.id);
-      assert.equal(campaign.status, 'exhausted', 'an off-session retry can never satisfy an issuer asking for the cardholder');
+      assert.equal(campaign.status, 'recovering', 'a card that merely wants the cardholder is not an account to write off');
       assert.equal(campaign.attempt_count, 1);
       assert.equal(campaign.attempts_remaining, 3, 'three retries were dropped rather than spent on an impossible outcome');
-      assert.equal(campaign.next_attempt_at, null);
+      assert.equal(campaign.next_attempt_at, null, 'an off-session retry can never satisfy an issuer asking for the cardholder');
       assert.equal(campaign.last_failure_code, 'authentication_required');
+      assert.equal(campaign.hold?.reason, 'card_needs_person');
+      assert.equal(dayKey(campaign.hold?.until as number), WINDOW_ENDS);
       assert.equal(campaign.needs_human, true);
       assert.match(campaign.recommended_action, /off_session=false/, 'the advice names a call that exists');
-      assert.match(campaign.recommended_action, /card that works/, 'and does not tell anyone to chase new details');
+      assert.doesNotMatch(campaign.recommended_action, /new card/i, 'and does not tell anyone to chase new details');
+      assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'past_due', 'in arrears, not unpaid');
 
       const action = await ws.ok('GET', '/v1/events?type=invoice.payment_action_required&limit=20');
       const notice = (action.data as any[]).find((e) => e.data?.invoice === invoice.id);
@@ -2095,16 +2160,106 @@ describe('smart dunning', () => {
       assert.equal(notice.data.reason, 'authentication_required');
       assert.match(notice.data.resolution, new RegExp(`/v1/invoices/${invoice.id}/retry`));
 
-      // Nothing further is queued: this schedule was abandoned, not paused.
-      assert.equal(
-        ws.app.ctx.db.count(
-          `SELECT COUNT(*) FROM jobs WHERE type = 'payments.dunning_retry' AND status = 'pending' AND idem_key = ?`,
-          `payments.dunning_retry:${campaign.id}`,
-        ),
-        0,
-      );
+      // The only thing on the queue is the deadline, and it presents nothing.
+      assert.equal(pendingDeadline(ws, campaign.id)?.run_at, campaign.hold?.until);
+      const presented = (await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all&limit=100`)).data.length;
       assert.equal((await ws.travel(60 * DAY)).failed, 0);
-      assert.equal((await ws.dunning(customer.id))[0].attempt_count, 1, 'sixty days later it still has not been retried');
+      const ended = (await ws.dunning(customer.id))[0];
+      assert.equal(ended.attempt_count, 1, 'sixty days later it still has not been retried');
+      assert.equal(
+        (await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all&limit=100`)).data.length, presented,
+        'the card was never presented off-session again',
+      );
+      assert.equal(ended.status, 'exhausted', 'nobody confirmed the card inside the window, so the account was given up on');
+      assert.equal(dayKey(ended.resolved_at as number), WINDOW_ENDS);
+      assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'unpaid');
+    } finally { ws.close(); }
+  });
+
+  test('a card attached during a hold is presented at once, and it is the new card that is charged', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const customer = await ws.customer('Hollins Gear');
+      const dead = await ws.card(customer.id, 'expired_card');
+      const { sub, invoice } = await ws.subscribe(customer.id);
+      const [held] = await ws.dunning(customer.id);
+      assert.equal(held.hold?.reason, 'card_needs_person');
+      assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'past_due');
+
+      // A week in, the customer adds a working card — without making it the
+      // default, which is how a card lands from a portal form. The hold was
+      // waiting for exactly this, so the bill is presented to that card now.
+      await ws.travel(7 * DAY);
+      const replacement = await ws.card(customer.id, 'succeeds', { set_default: false });
+      await ws.tick();
+
+      const settled = await ws.invoice(invoice.id);
+      assert.equal(settled.status, 'paid', 'the bill was presented to the card that arrived, not left for someone to remember');
+      assert.equal(settled.amount_paid, invoice.total);
+      const charges = (await ws.ok('GET', `/v1/charges?invoice=${invoice.id}&status=all&limit=10`)).data as Charge[];
+      const authorised = charges.find((c) => c.status === 'succeeded');
+      assert.equal(authorised?.payment_method, replacement.id, 'charged to the new card');
+      assert.notEqual(authorised?.payment_method, dead.id);
+
+      const [campaign] = await ws.dunning(customer.id);
+      assert.equal(campaign.status, 'recovered');
+      assert.equal(campaign.attempt_count, 2, 'the presentation spent a window like any other');
+      assert.equal(campaign.hold, null);
+      assert.equal(campaign.recovered_amount, invoice.total);
+      assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'active');
+      assert.equal(pendingDeadline(ws, campaign.id), undefined, 'the deadline went with the hold');
+      assert.equal((await ws.travel(30 * DAY)).failed, 0);
+      const later = (await ws.dunning(customer.id)).find((row) => row.id === campaign.id);
+      assert.equal(later?.status, 'recovered', 'and it never fires');
+      assert.equal(later?.attempt_count, 2);
+      await assertReconciled(ws, customer.id, 'after a replacement card collected a held bill');
+    } finally { ws.close(); }
+  });
+
+  test('the cardholder confirming part of a held bill keeps the hold on the rest', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const customer = await ws.customer('Bramhall Optics');
+      const card = await ws.card(customer.id, 'authentication_required');
+      const { invoice } = await ws.subscribe(customer.id);
+      const [held] = await ws.dunning(customer.id);
+      assert.equal(held.hold?.reason, 'card_needs_person');
+      const deadline = held.hold?.until as number;
+
+      // Over the phone, the customer confirms a quarter of the bill. Money
+      // arriving is not a card that can be presented again: the hold stays,
+      // with less behind it.
+      const part = Math.round(invoice.total / 4);
+      const intent: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: card.id, amount: part, confirm: true, off_session: false,
+      });
+      assert.equal(intent.status, 'requires_action');
+      const paid: PaymentIntent = await ws.ok('POST', `/v1/payment_intents/${intent.id}/authenticate`, { result: 'approve' });
+      assert.equal(paid.status, 'succeeded');
+
+      const [campaign] = await ws.dunning(customer.id);
+      assert.equal(campaign.status, 'recovering');
+      assert.equal(campaign.amount_at_risk, invoice.total - part, 'what is at risk is what is still owed');
+      assert.equal(campaign.next_attempt_at, null, 'nothing was scheduled against a card that needs the cardholder');
+      assert.equal(campaign.hold?.reason, 'card_needs_person');
+      assert.equal(campaign.hold?.until, deadline, 'and the deadline did not move');
+      assert.equal(pendingDeadline(ws, campaign.id)?.run_at, deadline);
+      await assertReconciled(ws, customer.id, 'after a part payment on a held bill');
+    } finally { ws.close(); }
+  });
+
+  test('a final decline on the last window has no window left to hold, and ends the campaign there', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      await ws.ok('PATCH', '/v1/payments/settings', { dunning: { max_attempts: 1 } });
+      const customer = await ws.customer('Crowle Systems');
+      await ws.card(customer.id, 'expired_card');
+      const { sub } = await ws.subscribe(customer.id);
+      const [campaign] = await ws.dunning(customer.id);
+      assert.equal(campaign.status, 'exhausted');
+      assert.equal(campaign.hold, null);
+      assert.match(campaign.resolution ?? '', /last window/);
+      assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'unpaid');
     } finally { ws.close(); }
   });
 
@@ -2147,7 +2302,9 @@ describe('smart dunning', () => {
       await ws.subscribe(customer.id);
 
       const [campaign] = await ws.dunning(customer.id);
-      assert.equal(campaign.status, 'exhausted');
+      assert.equal(campaign.status, 'recovering');
+      assert.equal(campaign.next_attempt_at, null, 'not presented again');
+      assert.equal(campaign.hold?.reason, 'card_needs_person');
       assert.equal(campaign.attempt_count, 1);
       assert.match(campaign.attempts[0].decision, /dropped/);
       assert.match(campaign.recommended_action, /re-enter the card/i);
@@ -2157,6 +2314,61 @@ describe('smart dunning', () => {
       assert.equal(rows.find((row) => row.code === 'incorrect_cvc')?.retried, false);
       assert.equal(rows.find((row) => row.code === 'authentication_required')?.retried, false);
       assert.equal(rows.find((row) => row.code === 'insufficient_funds')?.retried, true, 'the declines worth retrying still are');
+      assert.match(settings.schedule_explained, /held past due/);
+    } finally { ws.close(); }
+  });
+
+  test('the network’s do-not-retry family exists, is never presented again, and holds the account', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const family = ['stolen_card', 'lost_card', 'pickup_card', 'fraudulent', 'restricted_card'] as const;
+      const settings = await ws.ok('GET', '/v1/payments/settings');
+      const rows = settings.decline_codes as { code: string; severity: string; retried: boolean }[];
+      for (const code of family) {
+        const row = rows.find((r) => r.code === code);
+        assert.ok(row, `${code} is in the decline catalogue`);
+        assert.equal(row.severity, 'final', `${code} is final`);
+        assert.equal(row.retried, false, `${code} is never retried`);
+        assert.ok((settings.dunning.give_up_codes as string[]).includes(code), `${code} is in give_up_codes by default`);
+      }
+      // Response code 05 reads like a refusal for ever and is the issuer's
+      // generic "not right now": it is retried with the hard-decline gap.
+      const dnh = rows.find((r) => r.code === 'do_not_honor');
+      assert.equal(dnh?.severity, 'hard');
+      assert.equal(dnh?.retried, true);
+
+      const customer = await ws.customer('Marchbank Presses');
+      const stolen = await ws.card(customer.id, 'stolen_card');
+      assert.equal(stolen.simulated.behavior, 'stolen_card');
+      const { sub, invoice } = await ws.subscribe(customer.id);
+      assert.equal(invoice.status, 'open');
+      const charge = (await ws.ok('GET', `/v1/charges?invoice=${invoice.id}&status=all`)).data[0] as Charge;
+      assert.equal(charge.failure_code, 'stolen_card');
+      assert.equal(charge.outcome.network_status, 'declined_by_network');
+
+      const [campaign] = await ws.dunning(customer.id);
+      assert.equal(campaign.status, 'recovering');
+      assert.equal(campaign.attempt_count, 1);
+      assert.equal(campaign.next_attempt_at, null, 'a stolen card is never presented again');
+      assert.equal(campaign.hold?.reason, 'card_needs_person');
+      assert.equal(dayKey(campaign.hold?.until as number), WINDOW_ENDS);
+      assert.match(campaign.recommended_action, /never present this card again/i);
+      assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'past_due');
+
+      assert.equal((await ws.travel(60 * DAY)).failed, 0);
+      const ended = (await ws.dunning(customer.id))[0];
+      assert.equal(ended.attempt_count, 1, 'the card was never re-presented across the whole window');
+      assert.equal(ended.status, 'exhausted');
+      assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'unpaid');
+
+      // The generic code is still the generic code: presented again, later.
+      const other = await ws.customer('Marchbank Presses');
+      await ws.card(other.id, 'do_not_honor');
+      await ws.subscribe(other.id);
+      const [retried] = await ws.dunning(other.id);
+      assert.equal(retried.hold, null);
+      assert.ok(retried.next_attempt_at, 'do_not_honor is retried');
+      assert.match(retried.attempts[0].decision, /hard decline/);
     } finally { ws.close(); }
   });
 
@@ -2732,12 +2944,123 @@ describe('refunds', () => {
     await ws.fail('POST', '/v1/refunds', { invoice: invoice.id, amount: 100 }, 400, 'refund_exceeds_charge');
   });
 
-  test('a refund never re-opens the retry schedule', async () => {
+  test('a refund never re-opens the retry schedule, but the reopened bill is owed by somebody', async () => {
     const customer = await ws.customer('Ashgrove Instruments');
     await ws.card(customer.id, 'succeeds');
+    const { sub, invoice } = await ws.subscribe(customer.id);
+    const presented = (await ws.ok('GET', `/v1/payment_intents?invoice=${invoice.id}&status=all`)).data.length;
+    const refund: Refund = await ws.ok('POST', '/v1/refunds', { invoice: invoice.id, reason: 'duplicate' });
+    assert.match(refund.invoice_effect ?? '', /recovery queue/);
+
+    const reopened = await ws.invoice(invoice.id);
+    assert.equal(reopened.status, 'open');
+    assert.equal(reopened.amount_due, invoice.total);
+
+    // Giving money back is not a failed collection: no schedule, no
+    // presentation, no arrears. But the bill is open and owed, and a bill
+    // nothing owns is a bill nobody collects.
+    const [campaign] = await ws.dunning(customer.id);
+    assert.ok(campaign, 'the reopened bill is in the recovery queue');
+    assert.equal(campaign.status, 'recovering');
+    assert.equal(campaign.attempt_count, 0, 'nothing was refused');
+    assert.equal(campaign.next_attempt_at, null, 'and nothing is scheduled');
+    assert.equal(campaign.hold?.reason, 'reopened_by_refund');
+    assert.equal(campaign.hold?.until, null, 'nothing ends this but a person');
+    assert.equal(campaign.amount_at_risk, invoice.total);
+    assert.equal(campaign.needs_human, true);
+    assert.match(campaign.recommended_action, /credit note/);
+    assert.match(campaign.recommended_action, new RegExp(`/v1/invoices/${invoice.id}/retry`));
+    assert.match(campaign.recommended_action, /duplicate/, 'the queue says why the money went back');
+    assert.equal(
+      ws.app.ctx.db.count(
+        `SELECT COUNT(*) FROM jobs WHERE type = 'payments.dunning_retry' AND status = 'pending' AND idem_key = ?`,
+        `payments.dunning_retry:${campaign.id}`,
+      ),
+      0, 'no retry job',
+    );
+    assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'active', 'a refund is not a decline');
+    const summary = await ws.ok('GET', '/v1/dunning/summary');
+    assert.ok(summary.held_campaigns >= 1);
+
+    // Six weeks pass and nothing charges the card on the heels of a refund.
+    assert.equal((await ws.travel(45 * DAY)).failed, 0);
+    assert.equal((await ws.ok('GET', `/v1/payment_intents?invoice=${invoice.id}&status=all`)).data.length, presented, 'never presented');
+    assert.equal((await ws.dunning(customer.id))[0].hold?.reason, 'reopened_by_refund');
+    assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'active');
+
+    // A person presents it once the customer expects the charge, and the
+    // campaign that held it records the recovery.
+    const collected = await ws.ok('POST', `/v1/invoices/${invoice.id}/retry`, {});
+    assert.equal(collected.collected, true);
+    assert.equal((await ws.invoice(invoice.id)).status, 'paid');
+    const [done] = await ws.dunning(customer.id);
+    assert.equal(done.status, 'recovered');
+    assert.equal(done.hold, null);
+    assert.equal(done.attempt_count, 1);
+    assert.equal(done.recovered_amount, invoice.total);
+  });
+
+  test('a refund of a bill a schedule recovered reopens that campaign, and a credit note ends it', async () => {
+    const customer = await ws.customer('Fallowfield Drives');
+    const card = await ws.card(customer.id, 'insufficient_funds', { simulated_decline_count: 1 });
     const { invoice } = await ws.subscribe(customer.id);
-    await ws.ok('POST', '/v1/refunds', { invoice: invoice.id, reason: 'duplicate' });
-    assert.equal((await ws.dunning(customer.id)).length, 0, 'giving money back is not a failed collection');
+    assert.equal((await ws.travel(5 * DAY)).failed, 0);
+    const [recovered] = await ws.dunning(customer.id);
+    assert.equal(recovered.status, 'recovered');
+    assert.equal(recovered.recovered_amount, invoice.total);
+    const usdBefore = (await ws.ok('GET', '/v1/dunning/summary')).totals.find((t: any) => t.currency === 'usd');
+
+    const part = 5000;
+    await ws.ok('POST', '/v1/refunds', { invoice: invoice.id, amount: part, reason: 'goodwill' });
+    const [reopened] = await ws.dunning(customer.id);
+    assert.equal(reopened.id, recovered.id, 'one campaign per bill: the history is one story');
+    assert.equal(reopened.status, 'recovering');
+    assert.equal(reopened.hold?.reason, 'reopened_by_refund');
+    assert.equal(reopened.amount_at_risk, part);
+    assert.equal(reopened.recovered_amount, 0, 'what it had recovered is no longer counted as recovered');
+    assert.equal(reopened.attempt_count, recovered.attempt_count, 'the attempts it made are still its attempts');
+    const usdAfter = (await ws.ok('GET', '/v1/dunning/summary')).totals.find((t: any) => t.currency === 'usd');
+    assert.equal(usdAfter.recovered_amount, usdBefore.recovered_amount - invoice.total);
+    assert.equal(usdAfter.amount_at_risk, usdBefore.amount_at_risk + part);
+
+    // The goodwill was the point: the bill should have been smaller.
+    const note: CreditNote = await ws.ok('POST', '/v1/credit_notes', {
+      invoice: invoice.id, amount: part, reason: 'order_change', memo: 'Two days of ingestion downtime.',
+    });
+    assert.ok(note.id);
+    assert.equal((await ws.invoice(invoice.id)).status, 'paid');
+    const [ended] = await ws.dunning(customer.id);
+    assert.equal(ended.status, 'canceled');
+    assert.equal(ended.hold, null);
+    assert.match(ended.resolution ?? '', /settled/);
+    assert.equal(card.customer, customer.id);
+    await assertReconciled(ws, customer.id, 'after a refund and the credit note that answered it');
+  });
+
+  test('a refund of a part payment on a bill a schedule is chasing only tells the schedule the new balance', async () => {
+    const customer = await ws.customer('Ingleby Robotics');
+    const card = await ws.card(customer.id, 'insufficient_funds');
+    const { invoice } = await ws.subscribe(customer.id);
+    const [opened] = await ws.dunning(customer.id);
+    const window = opened.next_attempt_at as number;
+
+    await ws.ok('PATCH', `/v1/payment_methods/${card.id}`, { simulated_behavior: 'succeeds' });
+    const part = Math.round(invoice.total / 4);
+    await ws.ok('POST', '/v1/payment_intents', {
+      customer: customer.id, invoice: invoice.id, payment_method: card.id, amount: part, confirm: true, off_session: true,
+    });
+    const [partPaid] = await ws.dunning(customer.id);
+    assert.equal(partPaid.amount_at_risk, invoice.total - part);
+    assert.equal(partPaid.hold, null);
+
+    await ws.ok('POST', '/v1/refunds', { invoice: invoice.id, amount: part, reason: 'requested_by_customer' });
+    const [after] = await ws.dunning(customer.id);
+    assert.equal(after.status, 'recovering');
+    assert.equal(after.amount_at_risk, invoice.total, 'the schedule is told the balance it will present');
+    assert.equal(after.hold, null, 'a live schedule owns this bill, so nothing is put on hold');
+    assert.ok(after.next_attempt_at, 'and it keeps its window');
+    assert.equal(dayKey(after.next_attempt_at as number), dayKey(partPaid.next_attempt_at as number));
+    assert.equal(window > 0, true);
   });
 });
 

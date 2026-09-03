@@ -153,9 +153,10 @@ export default defineModule({
         'Contracted monthly recurring revenue: every interval normalised to a month with exact rationals, metered items ' +
         'excluded and reported separately on their own stated basis, trials and paused subscriptions shown as contracted ' +
         'but not recognised. Today\'s figure is billing\'s own subscriptionMrr(), so it cannot disagree with ' +
-        '/v1/subscriptions/overview. History is reconstructed from the dated contract changes in the proration ledger and ' +
-        'from the pause and resume events, so a closed month never moves. A book in more than one currency reports every ' +
-        'money figure in by_currency and nulls the scalars; ?currency=eur brings them back.',
+        '/v1/subscriptions/overview. History is reconstructed from every dated item change in the event log — prorated ' +
+        'or not, a schedule phase included — with the proration ledger dating what was written before the log carried ' +
+        'items, and from the pause and resume events, so a closed month never moves. A book in more than one currency ' +
+        'reports every money figure in by_currency and nulls the scalars; ?currency=eur brings them back.',
     });
 
     router.get('/v1/revenue/movement', (req: Req, c: Ctx) => revenueStore(c).movement(req.auth.orgId, query(req) as RevenueQuery & { top_movers?: number }), {
@@ -163,9 +164,10 @@ export default defineModule({
       tags: ['revenue'],
       query: movementQuery,
       description:
-        'New, expansion, contraction, churn and reactivation for every month in the range, classified per customer. ' +
-        'Each row carries a reconciliation proving opening + movements == closing, computed two ways; a month that does ' +
-        'not reconcile is named in unbalanced_months and the response sets balanced to false rather than drawing a wrong bar.',
+        'New, expansion, contraction, churn, reactivation, paused and resumed for every month in the range, classified ' +
+        'per customer. A collection pause is not churn: the contract is intact, so it has a bucket of its own. Each row ' +
+        'carries a reconciliation proving opening + movements == closing, computed two ways; a month that does not ' +
+        'reconcile is named in unbalanced_months and the response sets balanced to false rather than drawing a wrong bar.',
     });
 
     router.get('/v1/revenue/churn', (req: Req, c: Ctx) => revenueStore(c).churn(req.auth.orgId, query(req)), {
@@ -174,7 +176,8 @@ export default defineModule({
       query: rangeQuery,
       description:
         'Monthly logo churn, gross revenue churn, gross revenue retention and net revenue retention, plus the same ' +
-        'measures per signup cohort. Every rate carries the numerator and denominator it was divided from.',
+        'measures per signup cohort. Churn is cancellations only — a paused account is reported as paused, not lost — ' +
+        'and every rate carries the numerator and denominator it was divided from.',
     });
 
     router.get('/v1/revenue/cohorts', (req: Req, c: Ctx) => revenueStore(c).cohorts(req.auth.orgId, query(req)), {
@@ -191,9 +194,11 @@ export default defineModule({
       tags: ['revenue'],
       query: deferredQuery,
       description:
-        'Every finalised invoice line spread across the days of the period it covers, giving recognised-to-date and the ' +
-        'deferred balance at any date. Pass invoice=in_… or schedule=true for the day-by-day schedule, customer=cus_… or ' +
-        'subscription=sub_… to narrow it. invoiced = recognised + deferred is checked and reported.',
+        'Every finalised invoice line spread across the days of the period it covers, less every credit note issued ' +
+        'against it from the day it was issued, giving recognised-to-date and the deferred balance at any date, with ' +
+        'settled-but-unbilled usage as the arrears balance beside it. Pass invoice=in_… or schedule=true for the ' +
+        'day-by-day schedule, customer=cus_… or subscription=sub_… to narrow it. invoiced = recognised + deferred is ' +
+        'checked and reported.',
     });
 
     router.get('/v1/revenue/collections', (req: Req, c: Ctx) => revenueStore(c).collections(req.auth.orgId, query(req)), {
@@ -210,8 +215,9 @@ export default defineModule({
       tags: ['revenue'],
       query: rangeQuery,
       description:
-        'Revenue per meter split into metered value, the part prepaid credit absorbed and the part charged as overage; ' +
-        'credit purchased against credit burned; and the share of everything invoiced that is metered rather than recurring.',
+        'Revenue per meter split into metered value as the settlement priced it, the credit-covered and charged money ' +
+        'that reached finalised invoices, and the settled usage still waiting for a bill; credit purchased against credit ' +
+        'burned; and the share of everything invoiced that is metered rather than recurring.',
     });
 
     router.get('/v1/revenue/summary', (req: Req, c: Ctx) => revenueStore(c).summary(req.auth.orgId, query(req)), {
@@ -334,9 +340,10 @@ export default defineModule({
       {
         name: 'revenue_movement',
         description:
-          'Month-by-month MRR movement — new, expansion, contraction, churn and reactivation — with the accounts that ' +
-          'moved each month and a reconciliation proving opening plus movements equals closing. In a multi-currency ' +
-          'workspace the monthly figures come back per currency and each mover names its own.',
+          'Month-by-month MRR movement — new, expansion, contraction, churn, reactivation, and collection pauses and ' +
+          'resumptions as their own buckets — with the accounts that moved each month and a reconciliation proving ' +
+          'opening plus movements equals closing. In a multi-currency workspace the monthly figures come back per ' +
+          'currency and each mover names its own.',
         input: v.object({ months: v.optional(v.int({ min: 1, max: 60 })), currency: v.optional(v.currency()) }),
         readOnly: true,
         tags: ['revenue', 'reporting'],
@@ -362,8 +369,10 @@ export default defineModule({
               new_business: row.new_business,
               expansion: row.expansion,
               reactivation: row.reactivation,
+              resumed: row.resumed,
               contraction: row.contraction,
               churn: row.churn,
+              paused: row.paused,
               closing: row.closing,
               by_currency: row.by_currency,
               reconciled: row.reconciliation.balanced,

@@ -2,7 +2,7 @@ import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createApp, frozenClock, type App } from '../src/server/app';
 import type { Auth } from '../src/server/kernel/http';
-import { DAY } from '../src/shared/time';
+import { DAY, HOUR, type Period } from '../src/shared/time';
 import type { ChangePreview, Invoice, InvoiceLine, ProrationLine, Subscription } from '../src/server/modules/billing/types';
 import { TaxRates } from '../src/server/modules/billing/tax';
 
@@ -5243,5 +5243,374 @@ describe('what a bill says about whether it adds up', () => {
       await ws.ok('POST', `/v1/invoices/${open.id}/pay`, {});
       assert.equal((await ws.ok('GET', `/v1/invoices/${open.id}`)).reconciles, true);
     } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * The bill that waits for the window it settles
+ * ========================================================================== */
+
+/** Round half up of the exact rational `n / d`, the way the pricing engine does. */
+const halfUp = (n: bigint, d: bigint): number => {
+  const negative = n < 0n;
+  const a = negative ? -n : n;
+  const q = a / d;
+  const out = (a % d) * 2n >= d ? q + 1n : q;
+  return Number(negative ? -out : out);
+};
+
+/** What a per-unit price costs for `fraction` of a period, computed exactly. */
+const prorated = (unit: number, quantity: number, fraction: { numerator: number; denominator: number }): number =>
+  halfUp(BigInt(unit * quantity) * BigInt(fraction.numerator), BigInt(fraction.denominator));
+
+/** The exact fraction of a subscription's current period still ahead of `at`. */
+const remaining = (sub: Subscription, at: number) => ({
+  numerator: sub.current_period_end - at,
+  denominator: sub.current_period_end - sub.current_period_start,
+});
+
+/**
+ * A metered price with a ladder a reader can price by hand: the first 1,000
+ * events cost 2 minor units each, every event after that costs 1.
+ */
+const USAGE_FREE_TIER = 1_000;
+const usageCost = (units: number): number => Math.min(units, USAGE_FREE_TIER) * 2 + Math.max(0, units - USAGE_FREE_TIER);
+
+interface MeteredFixture { eventName: string; price: string }
+let meteredSeq = 0;
+async function meteredPrice(ws: Workspace): Promise<MeteredFixture> {
+  meteredSeq += 1;
+  const eventName = `bench_events_${meteredSeq}`;
+  await ws.ok('POST', '/v1/meters', {
+    name: `Bench meter ${meteredSeq}`, event_name: eventName, aggregation: 'sum', value_key: 'units', unit_label: 'event',
+  });
+  const product = await ws.ok('POST', '/v1/products', { name: `Bench usage ${meteredSeq}`, unit_label: 'event', category: 'component' });
+  const price = await ws.ok('POST', '/v1/prices', {
+    product: product.id, currency: 'usd', model: 'usage', type: 'recurring', tiers_mode: 'graduated',
+    nickname: `Bench usage ${meteredSeq}`,
+    tiers: [{ up_to: USAGE_FREE_TIER, unit_amount_decimal: '2' }, { up_to: 'inf', unit_amount_decimal: '1' }],
+    recurring: { interval: 'month', usage_type: 'metered', aggregate_usage: 'sum', meter: eventName },
+  });
+  return { eventName, price: price.id as string };
+}
+
+/** Move the clock to `at` and record `units` there — a meter refuses an event dated ahead of the workspace clock. */
+async function stream(ws: Workspace, fx: MeteredFixture, customerId: string, units: number, at: number, tag: string): Promise<void> {
+  await ws.travelTo(at);
+  await ws.ok('POST', '/v1/meter-events', {
+    event_name: fx.eventName, identifier: tag, timestamp: at, payload: { customer_id: customerId, units },
+  });
+}
+
+const cycleInvoices = async (ws: Workspace, subscriptionId: string): Promise<Invoice[]> =>
+  (await allInvoices(ws, `&subscription=${subscriptionId}`))
+    .filter((invoice) => invoice.billing_reason === 'subscription_cycle')
+    .sort((a, b) => a.period.start - b.period.start);
+
+interface HoldRelease { id: string; invoice: string | null; release_reason: string; status: string }
+const holdReleases = (ws: Workspace, subscriptionId: string): HoldRelease[] =>
+  ws.app.ctx.events.list(ORG, { types: ['invoice_hold.released'], objectId: subscriptionId, limit: 20 })
+    .map((event) => event.data as HoldRelease);
+
+describe('metered usage on the bill that closes its window', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 9, 3, 15, 37)); });
+  after(() => ws.close());
+
+  test('the renewal bills the usage of the window it says it settles, on the same document', async () => {
+    const fx = await meteredPrice(ws);
+    const customer = await ws.customer('Window Closer');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }, { price: fx.price }],
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+    const first: Period = { start: sub.current_period_start, end: sub.current_period_end };
+    await stream(ws, fx, customer.id, 1_500, first.start + 5 * DAY, 'window-closer-1');
+
+    await ws.travelTo(first.end + 60_000);
+
+    const cycles = await cycleInvoices(ws, sub.id);
+    assert.equal(cycles.length, 1, 'one renewal, one bill');
+    const renewal = cycles[0];
+    assert.deepEqual(renewal.arrears_period, first, 'the bill names the window that just closed');
+    assert.equal(renewal.period.start, first.end, 'and bills the next one in advance');
+    assert.equal(renewal.created, first.end, 'dated the boundary, not whenever the usage was priced');
+    assert.equal(renewal.due_date, first.end + 30 * DAY);
+    assert.equal(renewal.status, 'open');
+
+    const usage = renewal.lines.filter((line) => line.kind === 'usage');
+    assert.equal(usage.length, 1, 'the closed window\'s usage is on this bill, not the next one');
+    assert.equal(usage[0].quantity, 1_500);
+    assert.equal(usage[0].amount, usageCost(1_500), '1,000 events at 2 and 500 at 1');
+    assert.deepEqual(usage[0].period, first);
+    assert.equal(renewal.subtotal, GROWTH + usageCost(1_500));
+    assert.equal(sumLines(renewal), renewal.subtotal);
+    assert.equal(sumTax(renewal), renewal.tax);
+    assert.equal(renewal.subtotal + renewal.tax + renewal.balance_applied, renewal.total);
+
+    // The line is the one the credits module priced for exactly this window,
+    // and it has left the outbox: nothing is waiting for a later bill.
+    const settlements = await ws.ok('GET', `/v1/credit-settlements?customer=${customer.id}`);
+    assert.equal(settlements.data.length, 1);
+    assert.equal(settlements.data[0].period_start, first.start);
+    assert.equal(settlements.data[0].period_end, first.end);
+    const charged = settlements.data[0].lines.find((line: { kind: string }) => line.kind === 'charged');
+    assert.equal(usage[0].source.type, 'billable_item');
+    assert.equal(usage[0].source.id, charged.id);
+    const outbox = await ws.ok('GET', `/v1/credit-billable-items?customer=${customer.id}&status=pending`);
+    assert.equal(outbox.data.length, 0);
+
+    // The brief still went out at the boundary — before the bill, which is
+    // the point — and the release names the bill it became.
+    const briefs = ws.app.ctx.events.list(ORG, { types: ['subscription.invoice_due'], objectId: sub.id, limit: 10 })
+      .map((event) => event.data as { reason: string; invoice: string | null; invoice_hold: string | null; arrears_period: Period });
+    const brief = briefs.find((data) => data.reason === 'subscription_cycle');
+    assert.ok(brief, 'the renewal handed invoicing its brief');
+    assert.equal(brief.invoice, null, 'no bill existed when the brief went out');
+    assert.ok(brief.invoice_hold, 'the brief says the bill is waiting');
+    assert.deepEqual(brief.arrears_period, first);
+    const releases = holdReleases(ws, sub.id);
+    assert.equal(releases.length, 1);
+    assert.equal(releases[0].id, brief.invoice_hold);
+    assert.equal(releases[0].invoice, renewal.id);
+    assert.equal(releases[0].release_reason, 'announced', 'drawn when credits announced the priced line');
+
+    // The next window is the next bill's: nothing is billed twice, nothing late.
+    const second: Period = { start: renewal.period.start, end: renewal.period.end };
+    await stream(ws, fx, customer.id, 2_500, second.start + 3 * DAY, 'window-closer-2');
+    await ws.travelTo(second.end + 60_000);
+    const later = await cycleInvoices(ws, sub.id);
+    assert.equal(later.length, 2);
+    assert.deepEqual(later[1].arrears_period, second);
+    const secondUsage = later[1].lines.filter((line) => line.kind === 'usage');
+    assert.equal(secondUsage.length, 1);
+    assert.equal(secondUsage[0].quantity, 2_500);
+    assert.equal(secondUsage[0].amount, usageCost(2_500));
+    assert.equal(later[1].subtotal, GROWTH + usageCost(2_500));
+  });
+
+  test('a quiet window still bills the recurring fee, dated the boundary', async () => {
+    const fx = await meteredPrice(ws);
+    const customer = await ws.customer('Quiet Fleet');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }, { price: fx.price }],
+    });
+    await ws.travelTo(sub.current_period_end + 60_000);
+
+    const cycles = await cycleInvoices(ws, sub.id);
+    assert.equal(cycles.length, 1, 'a month with no usage still has a fee to bill');
+    assert.equal(cycles[0].subtotal, GROWTH);
+    assert.equal(cycles[0].lines.filter((line) => line.kind === 'usage').length, 0, 'an empty month is not an invoice line');
+    assert.equal(cycles[0].created, sub.current_period_end);
+    const releases = holdReleases(ws, sub.id);
+    assert.equal(releases.length, 1);
+    assert.equal(releases[0].release_reason, 'settled', 'nothing was announced because nothing was priced, so the settlement itself released it');
+    assert.equal(releases[0].invoice, cycles[0].id);
+    const settlements = await ws.ok('GET', `/v1/credit-settlements?customer=${customer.id}`);
+    assert.equal(settlements.data.length, 1, 'the window was still priced and closed');
+    assert.equal(settlements.data[0].billed_quantity, 0);
+  });
+
+  test('a settlement that never arrives cannot hold the bill past an hour', async () => {
+    const fx = await meteredPrice(ws);
+    const customer = await ws.customer('Stuck Meter');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }, { price: fx.price }],
+    });
+    await stream(ws, fx, customer.id, 700, sub.current_period_start + DAY, 'stuck-meter');
+    const boundary = sub.current_period_end;
+    await ws.travelTo(boundary - 60_000);
+
+    // Run the renewal by hand, then take its settlement away before it can run.
+    const queue = ws.app.ctx.jobs;
+    const renewal = queue.due(boundary, 200).find((job) =>
+      job.type === 'billing.renew' && (job.payload as { subscription: string }).subscription === sub.id);
+    assert.ok(renewal, 'the renewal is waiting for the boundary');
+    assert.equal(await queue.runOne(renewal, boundary), 'ok');
+    assert.ok(queue.cancel(ORG, { type: 'credits.settle_period' }, ws.now()) >= 1, 'the settlement the renewal asked for is gone');
+    assert.equal((await cycleInvoices(ws, sub.id)).length, 0, 'the bill is waiting for a window nothing will settle');
+
+    await ws.travelTo(boundary + HOUR + 60_000);
+    const cycles = await cycleInvoices(ws, sub.id);
+    assert.equal(cycles.length, 1, 'an hour on, the bill goes out with what it has');
+    assert.equal(cycles[0].subtotal, GROWTH);
+    assert.equal(cycles[0].created, boundary, 'still dated the boundary');
+    assert.equal(cycles[0].lines.filter((line) => line.kind === 'usage').length, 0);
+    const releases = holdReleases(ws, sub.id);
+    assert.equal(releases.length, 1);
+    assert.equal(releases[0].release_reason, 'deadline');
+    assert.equal(releases[0].invoice, cycles[0].id);
+  });
+
+  test('a subscription that ends mid-period is billed for the usage it ran up, on its final bill', async () => {
+    const fx = await meteredPrice(ws);
+    const customer = await ws.customer('Early Leaver');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }, { price: fx.price }], collection_method: 'send_invoice',
+    });
+    await stream(ws, fx, customer.id, 1_500, sub.current_period_start + 2 * DAY, 'early-leaver');
+    await ws.travelTo(sub.current_period_start + 10 * DAY);
+    const endedAt = ws.now();
+    const canceled: Subscription = await ws.ok('POST', `/v1/subscriptions/${sub.id}/cancel`, { cancellation_reason: 'lost_to_competitor' });
+    assert.equal(canceled.status, 'canceled');
+    assert.equal(canceled.ended_at, endedAt);
+
+    // The part-period settles off the cancellation, as a job; the final bill waits for it.
+    await ws.travelTo(ws.now());
+
+    const finals = (await allInvoices(ws, `&subscription=${sub.id}`)).filter((invoice) => invoice.billing_reason === 'subscription_update');
+    assert.equal(finals.length, 1, 'one final bill');
+    const final = finals[0];
+    assert.deepEqual(final.arrears_period, { start: sub.current_period_start, end: endedAt }, 'the window it used');
+    assert.equal(final.created, endedAt);
+    const usage = final.lines.filter((line) => line.kind === 'usage');
+    assert.equal(usage.length, 1);
+    assert.equal(usage[0].quantity, 1_500);
+    assert.equal(usage[0].amount, usageCost(1_500));
+    assert.equal(final.subtotal, usageCost(1_500), 'nothing else was owed');
+    assert.equal(sumLines(final), final.subtotal);
+    const releases = holdReleases(ws, sub.id);
+    assert.equal(releases.length, 1);
+    assert.equal(releases[0].release_reason, 'settled', 'a cancellation raises no brief, so the settlement is the last word');
+    const outbox = await ws.ok('GET', `/v1/credit-billable-items?customer=${customer.id}&status=pending`);
+    assert.equal(outbox.data.length, 0, 'nothing is left waiting for a bill that is never coming');
+  });
+});
+
+/* ========================================================================== *
+ * The last bill a subscription raises
+ * ========================================================================== */
+
+describe('prorations still waiting when the subscription ends', () => {
+  let ws: Workspace;
+  const ANCHOR = UTC(2026, 3, 1);
+  before(async () => { ws = await workspace(ANCHOR); });
+  after(() => ws.close());
+
+  const seats = async (name: string, quantity: number): Promise<{ customer: any; sub: Subscription }> => {
+    const customer = await ws.customer(name);
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }, { price: 'growth_seat_monthly', quantity }],
+      billing_cycle_anchor: ws.now(),
+    });
+    return { customer, sub };
+  };
+
+  const pendingOf = async (customerId: string): Promise<{ id: string; amount: number; kind: string }[]> =>
+    (await ws.ok('GET', `/v1/customers/${customerId}/pending_items`)).data;
+
+  test('cancelling at the end of the period bills what the next cycle would have swept', async () => {
+    const { customer, sub } = await seats('Departing Seats', 4);
+    const halfway = midpointOf(sub);
+    await ws.travelTo(halfway);
+    await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+      items: [{ id: sub.items[1].id, price: 'growth_seat_monthly', quantity: 6 }],
+      proration_behavior: 'create_prorations',
+      proration_date: halfway,
+    });
+    const waiting = await pendingOf(customer.id);
+    assert.equal(waiting.length, 2, 'the credit for four seats and the charge for six, waiting for the next bill');
+    const fraction = remaining(sub, halfway);
+    const net = prorated(GROWTH_SEAT, 6, fraction) - prorated(GROWTH_SEAT, 4, fraction);
+    assert.equal(waiting.reduce((total, item) => total + item.amount, 0), net);
+
+    await ws.ok('POST', `/v1/subscriptions/${sub.id}/cancel`, { at_period_end: true, cancellation_reason: 'too_expensive' });
+    await ws.travelTo(sub.current_period_end + 60_000);
+    const ended: Subscription = await ws.ok('GET', `/v1/subscriptions/${sub.id}`);
+    assert.equal(ended.status, 'canceled');
+
+    const final = (await allInvoices(ws, `&subscription=${sub.id}`)).find((invoice) => invoice.billing_reason === 'subscription_update');
+    assert.ok(final, 'the cancellation raised the bill the next cycle would have');
+    assert.equal(final.created, sub.current_period_end, 'dated the day the subscription ended');
+    assert.deepEqual(
+      final.lines.map((line) => line.source.id).sort(),
+      waiting.map((item) => item.id).sort(),
+      'and it carries exactly the items that were waiting',
+    );
+    assert.equal(final.subtotal, net);
+    assert.ok(final.lines.every((line) => line.proration));
+    assert.equal(sumLines(final), final.subtotal);
+    assert.equal(final.subtotal + final.tax + final.balance_applied, final.total);
+    assert.equal((await pendingOf(customer.id)).length, 0, 'nothing is left waiting for a cycle that is never coming');
+
+    const renewals = ws.app.ctx.events.list(ORG, { types: ['subscription.renewed'], objectId: sub.id, limit: 10 });
+    assert.equal(renewals.length, 0, 'it never renewed');
+    assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}/periods`)).data.length, 1, 'no period beyond the one it held');
+  });
+
+  test('an immediate cancellation sweeps what was already waiting onto the same final bill', async () => {
+    const { customer, sub } = await seats('Departing Now', 4);
+    const quarter = sub.current_period_start + Math.floor((sub.current_period_end - sub.current_period_start) / 4);
+    await ws.travelTo(quarter);
+    await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+      items: [{ id: sub.items[1].id, price: 'growth_seat_monthly', quantity: 5 }],
+      proration_behavior: 'create_prorations',
+      proration_date: quarter,
+    });
+    const waiting = await pendingOf(customer.id);
+    assert.equal(waiting.length, 2);
+    const waitingNet = waiting.reduce((total, item) => total + item.amount, 0);
+
+    const at = midpointOf(sub);
+    await ws.travelTo(at);
+    await ws.ok('POST', `/v1/subscriptions/${sub.id}/cancel`, { prorate: true, cancellation_reason: 'went_out_of_business' });
+
+    const final = (await allInvoices(ws, `&subscription=${sub.id}`)).find((invoice) => invoice.billing_reason === 'subscription_update');
+    assert.ok(final, 'cancelling with prorate raises the final bill on the spot');
+    assert.equal(final.lines.length, 4, 'the two items already waiting, plus the unused remainder of the plan and of the seats');
+    const swept = final.lines.filter((line) => waiting.some((item) => item.id === line.source.id));
+    assert.equal(swept.length, 2);
+    const fraction = remaining(sub, at);
+    const unused = -(prorated(GROWTH, 1, fraction) + prorated(GROWTH_SEAT, 5, fraction));
+    const own = final.lines.filter((line) => !waiting.some((item) => item.id === line.source.id));
+    assert.equal(own.length, 2);
+    assert.ok(own.every((line) => line.kind === 'unused_time'));
+    assert.equal(own.reduce((total, line) => total + line.amount, 0), unused);
+    assert.equal(final.subtotal, waitingNet + unused);
+    assert.equal(sumLines(final), final.subtotal);
+    assert.equal((await pendingOf(customer.id)).length, 0);
+  });
+
+  test('always_invoice sweeps the items already waiting, and the preview priced them in', async () => {
+    const { customer, sub } = await seats('Growing Fast', 4);
+    const quarter = sub.current_period_start + Math.floor((sub.current_period_end - sub.current_period_start) / 4);
+    await ws.travelTo(quarter);
+    await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+      items: [{ id: sub.items[1].id, price: 'growth_seat_monthly', quantity: 5 }],
+      proration_behavior: 'create_prorations',
+      proration_date: quarter,
+    });
+    const waiting = await pendingOf(customer.id);
+    assert.equal(waiting.length, 2);
+    const waitingNet = waiting.reduce((total, item) => total + item.amount, 0);
+
+    const halfway = midpointOf(sub);
+    await ws.travelTo(halfway);
+    const change = {
+      items: [{ id: sub.items[1].id, price: 'growth_seat_monthly', quantity: 8 }],
+      proration_behavior: 'always_invoice',
+      proration_date: halfway,
+    };
+    const preview: ChangePreview = await ws.ok('POST', `/v1/subscriptions/${sub.id}/preview`, change);
+    assert.equal(preview.lines.length, 2, 'the preview lists the change\'s own lines');
+    assert.ok(preview.notices.some((notice) => /already waiting/.test(notice)), 'and says what else the bill will carry');
+
+    await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, change);
+    const invoice = (await allInvoices(ws, `&subscription=${sub.id}`)).find((candidate) => candidate.billing_reason === 'subscription_update');
+    assert.ok(invoice, 'always_invoice raised a bill');
+    assert.equal(invoice.lines.length, 4, 'its own two lines and the two that were waiting');
+    const swept = invoice.lines.filter((line) => waiting.some((item) => item.id === line.source.id));
+    assert.equal(swept.length, 2);
+    const fraction = remaining(sub, halfway);
+    const ownNet = prorated(GROWTH_SEAT, 8, fraction) - prorated(GROWTH_SEAT, 5, fraction);
+    assert.equal(preview.net, ownNet);
+    assert.equal(invoice.subtotal, ownNet + waitingNet);
+    assert.equal(invoice.amount_due, preview.amount_due_now, 'the preview quoted the bill that was raised, sweep included');
+    assert.equal(invoice.tax, preview.tax_due_now);
+    assert.equal(sumLines(invoice), invoice.subtotal);
+    assert.equal((await pendingOf(customer.id)).length, 0);
   });
 });

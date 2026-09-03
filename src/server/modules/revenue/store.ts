@@ -14,8 +14,8 @@
  *    `by_currency` block is the answer — see `currency.ts` for why adding minor
  *    units across currencies is the worst thing a revenue report can do.
  *  - **Every figure is dated by something durable.** History is reached through
- *    the proration ledger and the event log, never through a `updated` column
- *    that the next unrelated write moves.
+ *    the event log and the proration ledger, never through a `updated` column
+ *    that the next unrelated write moves — and a closed month never moves.
  */
 import type { Ctx } from '../../kernel/context';
 import { rat, ratRound } from '../../../shared/money';
@@ -31,13 +31,13 @@ import {
   buildMatrix, churnSeries, cohortMatrix, movementSeries,
   type MovementSeries, type RevenueMatrix,
 } from './movement';
-import { recognise, scheduleFor, type RecognitionLine, type RecognitionReport } from './recognition';
+import { recognise, scheduleFor, type ArrearsItem, type RecognitionLine, type RecognitionReport } from './recognition';
 import {
   ageBook, collectionsReport, recoveryReport, type CollectionsReport, type InvoiceRow,
 } from './collections';
-import { usageReport, type UsageReport } from './usage';
+import { arrearsItems, readArrears, usageReport, type UsageReport } from './usage';
 import {
-  annualise, buildTimeline, readCollectionPauses, readContractChanges,
+  annualise, buildTimeline, contractHistory, readCollectionPauses,
   type ContractChange, type SubscriptionTimeline,
 } from './timeline';
 import {
@@ -110,6 +110,8 @@ export interface Book {
   /** The same matrix per currency, so a mixed book still has exact answers in it. */
   matrices: Map<string, RevenueMatrix>;
   changes: ContractChange[];
+  /** Item changes in the event log this module could not price, and therefore could not date. */
+  unpriced_changes: number;
   scope: CurrencyScope;
   reporting: string;
   requested: string | undefined;
@@ -154,10 +156,10 @@ export class Revenue {
       subscriptions.push(sub);
     }
 
-    const changesBySub = readContractChanges(this.ctx, orgId, priced);
+    const history = contractHistory(this.ctx, orgId, priced);
     const pausesBySub = readCollectionPauses(this.ctx, orgId);
     const timelines = subscriptions.map(
-      (sub) => buildTimeline(sub, priced, changesBySub.get(sub.id) ?? [], pausesBySub.get(sub.id) ?? []),
+      (sub) => buildTimeline(sub, priced, history.changes.get(sub.id) ?? [], pausesBySub.get(sub.id) ?? []),
     );
 
     const customers = new Map<string, CustomerRow>();
@@ -218,6 +220,7 @@ export class Revenue {
       matrix,
       matrices,
       changes: timelines.flatMap((line) => line.changes),
+      unpriced_changes: history.unpriced,
       scope,
       reporting: requested ?? this.reportingCurrency(orgId),
       requested,
@@ -288,7 +291,12 @@ export class Revenue {
       sources: {
         billing_subscriptions: book.subscriptions.length,
         billing_customers: book.customers.size,
-        billing_pending_items_contract_changes: book.changes.length,
+        contract_changes: book.changes.length,
+        contract_changes_dated_from_the_event_log: book.changes.filter((change) => change.source === 'event_log').length,
+        contract_changes_dated_from_the_proration_ledger: book.changes.filter((change) => change.source === 'proration_ledger').length,
+        contract_changes_confirmed_by_both_ledgers: book.changes.filter((change) => change.confirmed).length,
+        contract_changes_the_walk_back_disagrees_with: book.timelines.reduce((sum, line) => sum + line.history_disagreements, 0),
+        contract_changes_unpriced: book.unpriced_changes,
         months_in_series: cells.length,
         ...sources,
       },
@@ -389,7 +397,7 @@ export class Revenue {
           'MRR is gross of tax on a tax-inclusive price, because that is what the contract says. The `tax` block below names exactly how much of it is, so the gap between MRR and the revenue the same money is recognised at is stated rather than left for someone to find.',
           'trialing, incomplete and incomplete_expired subscriptions contribute nothing; a trial only starts counting at trial_end.',
           'A collection pause contributes nothing from the instant the subscription.paused event was written, and comes back at subscription.resumed. Both are durable and neither moves when a later renewal writes the row; a paused subscription with no event in the log falls back to the row\'s `updated` and says so in its own pauses[] block.',
-          'History is reached by walking backwards from today through the dated contract changes in billing_pending_items, so an upgrade moves MRR on the day it landed rather than at the next renewal. A change made with proration_behavior=none writes no dated line and therefore moves at the next renewal instead.',
+          'History is reached by walking backwards from today through every dated item change: the subscription.updated events that carry the items before and after each change (a prorated upgrade, a schedule phase, a change made with proration_behavior=none alike), dated at their proration_date, and the proration ledger for changes recorded before the log carried items. So an upgrade moves MRR on the day it landed rather than at the next renewal, a phase transition moves it on the phase date, and a closed month never moves. Where both ledgers hold the same change they are compared and the event log wins; where the walk back from today disagrees with what the log says a change left behind, the count is published in sources rather than absorbed.',
         ],
         {
           subscription_timelines: book.timelines.length,
@@ -553,8 +561,10 @@ export class Revenue {
       new_business: row.new_business,
       expansion: row.expansion,
       reactivation: row.reactivation,
+      resumed: row.resumed,
       contraction: row.contraction,
       churn: row.churn,
+      paused: row.paused,
       net: row.net,
       closing: row.closing,
       reconciliation: row.reconciliation,
@@ -574,8 +584,10 @@ export class Revenue {
         new_business: only(scope, row.new_business),
         expansion: only(scope, row.expansion),
         reactivation: only(scope, row.reactivation),
+        resumed: only(scope, row.resumed),
         contraction: only(scope, row.contraction),
         churn: only(scope, row.churn),
+        paused: only(scope, row.paused),
         net: only(scope, row.net),
         closing: only(scope, row.closing),
         counts: row.counts,
@@ -612,9 +624,9 @@ export class Revenue {
         [
           'A month opens at the last millisecond before it starts and closes at the last millisecond of the month, or at now if it has not finished. Closing March and opening April are the same instant, so the chain across months is an identity, not an approximation.',
           'Movement is classified per customer, not per subscription: an account that cancels a monthly plan and signs an annual one on the same day has expanded or contracted, it has not churned and re-joined.',
-          'new is an account that had no MRR at the open and never had any before this month. reactivation is one that had none at the open but did once. churn is an account that had MRR at the open and none at the close.',
+          'new is an account that had no MRR at the open and never had any before this month. reactivation is one that had none at the open but did once. churn is an account that had MRR at the open, none at the close, and no contract left: a cancellation, never a pause.',
           'expansion and contraction are the signed difference for accounts that had MRR at both ends; both are reported as positive magnitudes and applied with their sign in the reconciliation.',
-          'A collection pause takes a subscription out of recognised MRR from the instant the subscription.paused event was written, and puts it back at subscription.resumed. At customer level that reads as contraction, or as churn when it was the account\'s only subscription — which is the honest classification of an account that has stopped paying — and it comes back as reactivation when collection resumes.',
+          'A collection pause takes a subscription out of recognised MRR from the instant the subscription.paused event was written, and puts it back at subscription.resumed. The contract is intact, so the account is not churn: what left recognised MRR is booked as paused and what came back as resumed, each in the month it happened, and both are in the identity. An account that cancels while paused is churn for logo purposes and moves nothing, because its recognised MRR was already zero. A plan change landing in the same month as the pause is inside the paused figure, and shows as the difference between what was paused and what is later resumed.',
           'reconciliation.computed_closing is opening plus movements; reconciliation.reported_closing is the closing MRR summed straight from the subscription timelines. They are two different aggregations of the same reads, and unbalanced_months names any month where they differ.',
           'The identity is proved once per currency and once across the book, so a mixed month is reconciled in each of its currencies rather than in a sum of them.',
         ],
@@ -631,8 +643,10 @@ export class Revenue {
         new_business: only(scope, whole.totals.new_business),
         expansion: only(scope, whole.totals.expansion),
         reactivation: only(scope, whole.totals.reactivation),
+        resumed: only(scope, whole.totals.resumed),
         contraction: only(scope, whole.totals.contraction),
         churn: only(scope, whole.totals.churn),
+        paused: only(scope, whole.totals.paused),
         net: only(scope, whole.totals.net),
         closing: only(scope, whole.totals.closing),
       },
@@ -671,10 +685,13 @@ export class Revenue {
   private scopedMatrix(matrix: RevenueMatrix, offset: number): RevenueMatrix {
     if (offset === 0) return matrix;
     const values = new Map<string, number[]>();
+    const paused = new Map<string, number[]>();
     for (const [customer, row] of matrix.values) values.set(customer, row.slice(offset));
+    for (const [customer, row] of matrix.paused) paused.set(customer, row.slice(offset));
     return {
       instants: matrix.instants.slice(offset),
       values,
+      paused,
       firstRevenue: matrix.firstRevenue,
       totals: matrix.totals.slice(offset),
       customers: matrix.customers,
@@ -720,12 +737,16 @@ export class Revenue {
       contraction_mrr: only(scope, row.contraction_mrr),
       expansion_mrr: only(scope, row.expansion_mrr),
       reactivation_mrr: only(scope, row.reactivation_mrr),
+      paused_mrr: only(scope, row.paused_mrr),
+      resumed_mrr: only(scope, row.resumed_mrr),
       accounts_at_open: row.accounts_at_open,
       churned_accounts: row.churned_accounts,
+      paused_accounts: row.paused_accounts,
       logo_churn: row.logo_churn,
       logo_retention: row.logo_retention,
       gross_revenue_churn: onlyIn(scope, row.gross_revenue_churn),
       gross_revenue_retention: onlyIn(scope, row.gross_revenue_retention),
+      paused_share: onlyIn(scope, row.paused_share),
       net_revenue_retention: onlyIn(scope, row.net_revenue_retention),
       by_currency: parts.map((part) => ({ ...part.churn.rows[i], currency: part.currency })),
     });
@@ -736,9 +757,9 @@ export class Revenue {
         book,
         'Logo and revenue churn, gross and net retention, by month and by signup cohort.',
         [
-          'Logo churn is accounts that ended the month with no MRR over accounts that started it with some. An account with several subscriptions churns only when the last of them stops.',
-          'Gross revenue churn is churned MRR plus contraction over opening MRR. Gross revenue retention is the same base less those two, so churn and retention always add to 100%.',
-          'Net revenue retention adds expansion and reactivation from the same opening base. New business is never in it — that is the point of the measure.',
+          'Logo churn is accounts whose contract ended in the month over accounts that held one at its open, paused or not. An account with several subscriptions churns only when the last of them stops, and a collection pause is not churn: the contract is intact.',
+          'Gross revenue churn is churned MRR plus contraction over opening MRR; paused MRR is in neither. Gross revenue retention is the opening base less churn, contraction and pauses — paused revenue is not lost, but it is not being collected either — so churn, retention and paused_share always add to 100%.',
+          'Net revenue retention is what the accounts open at the start of the month close at, over what they opened at: the retained base plus expansion, reactivation and resumed collection. New business is never in it — that is the point of the measure.',
           'Range rates use the sum of every month\'s opening as the denominator, so a month with a large book weighs more than a small one. The monthly rates are unweighted and shown beside them.',
           'A cohort is the month an account first carried recurring revenue, not the month its customer record was created — a record created during a sales cycle is not a cohort.',
           'Logo churn is a ratio of account counts and holds across currencies. Every revenue-weighted rate is a money figure in disguise and is reported per currency only.',
@@ -757,12 +778,16 @@ export class Revenue {
         contraction_mrr: only(scope, whole.totals.contraction_mrr),
         expansion_mrr: only(scope, whole.totals.expansion_mrr),
         reactivation_mrr: only(scope, whole.totals.reactivation_mrr),
+        paused_mrr: only(scope, whole.totals.paused_mrr),
+        resumed_mrr: only(scope, whole.totals.resumed_mrr),
         churned_accounts: whole.totals.churned_accounts,
+        paused_accounts: whole.totals.paused_accounts,
         exposed_mrr: only(scope, whole.totals.exposed_mrr),
         exposed_accounts: whole.totals.exposed_accounts,
         logo_churn: whole.totals.logo_churn,
         gross_revenue_churn: onlyIn(scope, whole.totals.gross_revenue_churn),
         gross_revenue_retention: onlyIn(scope, whole.totals.gross_revenue_retention),
+        paused_share: onlyIn(scope, whole.totals.paused_share),
         net_revenue_retention: onlyIn(scope, whole.totals.net_revenue_retention),
       },
       by_currency: parts.map((part) => ({ currency: part.currency, totals: part.churn.totals })),
@@ -904,6 +929,29 @@ export class Revenue {
       ...(params as never[]),
     );
 
+    // Every credit note line issued by as_of against one of those lines, and
+    // still in force at as_of: a note voided later was in force at the time,
+    // and reconstructing the balance at any instant means reading it that way.
+    const credits = this.ctx.db.all<{
+      id: string; credit_note_id: string; credit_note_number: string; created: number; invoice_line_id: string;
+      invoice_id: string; number: string; status: string; customer_id: string; subscription_id: string | null;
+      kind: string; description: string; currency: string; amount: number; line_amount: number;
+      period_start: number; period_end: number;
+    }>(
+      `SELECT c.id, c.credit_note_id, n.number AS credit_note_number, n.created, c.invoice_line_id,
+              l.invoice_id, i.number, i.status, i.customer_id, l.subscription_id, l.kind, c.description,
+              c.currency, c.amount, l.amount AS line_amount, l.period_start, l.period_end
+         FROM billing_credit_note_lines c
+         JOIN billing_credit_notes n ON n.id = c.credit_note_id AND n.org_id = c.org_id
+         JOIN billing_invoice_lines l ON l.id = c.invoice_line_id AND l.org_id = c.org_id
+         JOIN billing_invoices i ON i.id = l.invoice_id AND i.org_id = l.org_id
+        WHERE ${clauses.join(' AND ')}
+          AND n.created <= ?
+          AND (n.status <> 'void' OR (n.voided_at IS NOT NULL AND n.voided_at > ?))
+        ORDER BY n.created ASC, c.id ASC`,
+      ...(params as never[]), asOf, asOf,
+    );
+
     const lineOf = (row: (typeof rows)[number]): RecognitionLine => ({
       invoice: row.invoice_id,
       invoice_number: row.number,
@@ -917,26 +965,60 @@ export class Revenue {
       amount: Number(row.amount),
       invoiced_at: Number(row.finalized_at),
       period: { start: Number(row.period_start), end: Number(row.period_end) },
+      credit_note: null,
+      credit_note_number: null,
+      reduces_line: null,
+      reduces_amount: null,
+      days: 0,
+      recognised_to_date: 0,
+      deferred: 0,
+      unbilled: 0,
+    });
+    const creditOf = (row: (typeof credits)[number]): RecognitionLine => ({
+      invoice: row.invoice_id,
+      invoice_number: row.number,
+      invoice_status: row.status,
+      line: row.id,
+      customer: row.customer_id,
+      subscription: row.subscription_id,
+      kind: 'credit_note',
+      description: row.description,
+      currency: row.currency,
+      amount: -Number(row.amount),
+      invoiced_at: Number(row.created),
+      period: { start: Number(row.period_start), end: Number(row.period_end) },
+      credit_note: row.credit_note_id,
+      credit_note_number: row.credit_note_number,
+      reduces_line: row.invoice_line_id,
+      reduces_amount: Number(row.line_amount),
       days: 0,
       recognised_to_date: 0,
       deferred: 0,
       unbilled: 0,
     });
 
-    const lines: RecognitionLine[] = rows.map(lineOf);
+    const lines: RecognitionLine[] = [...rows.map(lineOf), ...credits.map(creditOf)];
+    // Settled usage waiting for its bill is the arrears side of the balance.
+    // It belongs to the book, not to one invoice, so a report narrowed to an
+    // invoice, a subscription or a customer does not carry it.
+    const narrowed = !!(query.customer || query.subscription || query.invoice);
+    const arrears: ArrearsItem[] = narrowed ? [] : arrearsItems(readArrears(this.ctx, orgId, asOf, book.requested ?? null));
     // The scope of a recognition report is the currencies of the lines it holds,
     // not the currencies of the workspace: ?invoice=in_… narrows to one bill,
     // and one bill is always in one currency, so its figures are stateable.
-    const present = [...new Set(lines.map((line) => line.currency))];
+    const present = [...new Set([...lines.map((line) => line.currency), ...arrears.map((item) => item.currency)])];
     const scope = present.length
       ? currencyScope(book.requested, book.reporting, present)
       : currencyScope(book.requested, book.reporting, this.narrowedCurrencies(orgId, query) ?? book.scope.currencies);
-    const report: RecognitionReport = recognise(lines, cells, asOf, scope.single);
+    const report: RecognitionReport = recognise(lines, cells, asOf, scope.single, arrears);
     const parts = scope.currencies.map((currency) => ({
       currency,
       report: scope.single === currency
         ? report
-        : recognise(lines.filter((line) => line.currency === currency), cells, asOf, currency),
+        : recognise(
+          lines.filter((line) => line.currency === currency), cells, asOf, currency,
+          arrears.filter((item) => item.currency === currency),
+        ),
     }));
 
     const wantSchedule = query.schedule === true || !!query.invoice;
@@ -949,7 +1031,12 @@ export class Revenue {
         ...line,
         customer_name: book.names.get(line.customer) ?? line.customer,
         ...(wantSchedule
-          ? { schedule: scheduleFor(line.amount, line.currency, line.period.start, line.period.end, asOf) }
+          ? {
+            schedule: scheduleFor(
+              line.amount, line.currency, line.period.start, line.period.end, asOf,
+              line.credit_note ? line.invoiced_at : 0,
+            ),
+          }
           : {}),
       }));
 
@@ -960,18 +1047,22 @@ export class Revenue {
       as_of_recognition: asOf,
       ...this.envelope(
         book,
-        'Revenue recognition: every finalised invoice line spread across the days of the period it covers.',
+        'Revenue recognition: every finalised invoice line spread across the days of the period it covers, less every credit note issued against it.',
         [
           'Scope is every line of every finalised invoice (open, paid or uncollectible) raised on or before as_of. Drafts are not revenue and voided invoices were withdrawn, so neither is in scope; a voided invoice\'s lines are released and excluded by the same flag billing sets on them.',
-          'A line is split across the days of its period with allocate(), weighted by the seconds of service in each day, so the days always sum back to the line to the cent and the last part-day is not rounded away.',
+          'Every amount is the line\'s net-of-tax amount. Collections reports what a bill asked for gross of tax, which is the whole of the difference between its billed figure and the invoiced figure here.',
+          'A line is split across the days of its period along the straight line, weighted by the seconds of service in each day: the cumulative share at each day is rounded once from an exact rational, so recognised-to-date is never more than one minor unit from amount × elapsed ÷ total, the days always sum back to the line to the cent and the last part-day is not rounded away.',
           'A day is recognised once it has fully elapsed at as_of. Recognised-to-date is the sum of elapsed days; the deferred balance is what was invoiced less what has been recognised.',
+          'A credit note issued by as_of and in force at as_of reduces the line it names across the same days, as a negative line dated at its issue: the share of the service still ahead comes off the deferred balance, and the share already delivered — recognised in months that have closed — is booked as contra revenue on the day the note was issued, because a closed month never moves. invoiced is therefore net of credit notes; invoiced_gross and credited are published beside it.',
           'Every month in the series is read at its own close or at as_of, whichever is earlier, so the last cumulative figure in the series is the same number as totals.recognised rather than a later one.',
-          'deferred goes negative where revenue was earned before it was billed — metered usage settles in arrears — and that part is reported separately as unbilled_balance rather than netted away silently.',
-          'invoiced = recognised + deferred is an identity, not a check: deferred is defined as the difference. The checks that can actually fail are in reconciliation.checks — the daily schedule re-summed against its line, and recognised-to-date re-derived by a second traversal of the same days.',
+          'unbilled_balance is earned-but-not-yet-billed: metered usage settles in arrears, so every settled window not yet on a finalised invoice at the instant read is unbilled at its settled charge, and stops being so the moment its invoice is finalised. An invoice line whose period ran ahead of its own finalisation is unbilled the same way. A window still open is unpriced and not counted.',
+          'invoiced = recognised + deferred is an identity, not a check: deferred is defined as the difference. The checks that can actually fail are in reconciliation.checks — the daily schedule re-summed against its line, recognised-to-date re-derived by a second traversal of the same days, and every credit held against the line it reduces.',
         ],
         {
-          billing_invoice_lines: lines.length,
+          billing_invoice_lines: rows.length,
+          billing_credit_note_lines: credits.length,
           billing_invoices: new Set(lines.map((line) => line.invoice)).size,
+          credit_settlements_awaiting_an_invoice: arrears.filter((item) => item.finalized_at === null).length,
           recognition_days: lines.reduce((sum, line) => sum + line.days, 0),
         },
         { subject: 'Recognised revenue', scope },
@@ -984,6 +1075,7 @@ export class Revenue {
         in_scope: row.in_scope,
         currency: scope.single,
         invoiced: only(scope, row.invoiced),
+        credited: only(scope, row.credited),
         recognised: only(scope, row.recognised),
         invoiced_to_date: only(scope, row.invoiced_to_date),
         recognised_to_date: only(scope, row.recognised_to_date),
@@ -993,10 +1085,15 @@ export class Revenue {
       })),
       totals: {
         lines: report.totals.lines,
+        invoice_lines: report.totals.invoice_lines,
+        credit_note_lines: report.totals.credit_note_lines,
         invoiced: only(scope, report.totals.invoiced),
+        invoiced_gross: only(scope, report.totals.invoiced_gross),
+        credited: only(scope, report.totals.credited),
         recognised: only(scope, report.totals.recognised),
         deferred_balance: only(scope, report.totals.deferred_balance),
         unbilled_balance: only(scope, report.totals.unbilled_balance),
+        unbilled_usage: only(scope, report.totals.unbilled_usage),
         currency: scope.single,
       },
       by_currency: parts.map((part) => ({
@@ -1185,18 +1282,21 @@ export class Revenue {
         book,
         'Usage economics: revenue per meter, credit bought against credit burned, and how much of the book is overage.',
         [
-          'Every figure comes from the settlement ledger in credits, which prices a period once and records all three numbers for it: what the usage was worth, what prepaid credit absorbed, and what was charged.',
-          'A settlement is counted in the month its period ends, because that is the window the meter closed on and the window the invoice settles.',
+          'metered_value comes from the settlement ledger in credits, which prices a window once when it closes and records what the usage was worth, what prepaid credit absorbed and what was charged; a settlement is counted in the month its window ends. The settled split of the range\'s windows is published as `settled`.',
+          'charged is money that reached a finalised invoice: usage and true-up lines on invoices finalised in the range, counted in the month the invoice was finalised. credit_covered is the value the credit-covered lines on those invoices carried. Neither is read from the settlement — a settlement is a price, an invoice is a bill, and the two differ by exactly what is still unbilled.',
+          'unbilled is settled and not yet billed: charges for windows that closed in the range with no finalised invoice at the end of it. unbilled_balance is the same reading over every window that has ever closed, and is the arrears balance /v1/revenue/deferred reports. The bridge between the two ledgers is checked in reconciliation.checks: every settled charge on a finalised invoice is carried there at the amount the settlement said, or the report says so.',
           'Credit-covered usage is revenue that was recognised when the credit was sold, not when it was burned. It is reported beside charged usage, never added to it.',
           'Quantities are micro-units: 1 unit is 1,000,000 micro, which is how metering stores them so a sum is integer arithmetic.',
           'Monetary credit is reported in minor units; unit-denominated credit stays in micro-units and says so with a micro flag, because a telemetry event is not a cent.',
           'A credit flow is a ledger and is reported like one: every field is the signed sum of one ledger type, so a burn is negative and a refund carries whichever sign the refund had. Rollovers in and out are named separately from grants — a rollover is credit moving between grants, not credit sold — and any type this report does not name lands in `other` rather than disappearing.',
-          'Overage share is charged usage over everything invoiced in the range, on finalised invoices only.',
-          'reconciliation.checks are the checks that can fail: the three settlement columns re-summed against each other, the named flow components against the movement of the ledger they came from, and every ledger row against the grant it belongs to.',
+          'Overage share is charged usage over everything invoiced in the range, on finalised invoices only, both keyed on the invoice\'s finalisation. Its numerator is totals.charged.',
+          'reconciliation.checks are the checks that can fail: the three settlement columns re-summed against each other, every settled charge on a finalised invoice against the amount the invoice line carries, every metered invoice line against the settlement behind it, the named flow components against the movement of the ledger they came from, and every ledger row against the grant it belongs to.',
         ],
         {
           credit_settlements: report.totals.settlements,
           credit_settlements_skipped: report.totals.skipped_settlements,
+          credit_billable_items: report.sources.credit_billable_items,
+          billing_invoice_lines_metered: report.sources.billing_invoice_lines_metered,
           credit_grants: report.credit.grants,
           meters: report.meters.length,
           credit_ledger_entries: report.credit.flows.reduce((sum, flow) => sum + flow.entries, 0),
@@ -1211,12 +1311,16 @@ export class Revenue {
         metered_value: only(scope, row.metered_value),
         credit_covered: only(scope, row.credit_covered),
         charged: only(scope, row.charged),
+        unbilled_balance: only(scope, row.unbilled_balance),
         by_currency: report.by_currency.map((part) => ({ currency: part.currency, ...part.months[i] })),
       })),
       totals: {
         metered_value: only(scope, report.totals.metered_value),
         credit_covered: only(scope, report.totals.credit_covered),
         charged: only(scope, report.totals.charged),
+        unbilled: only(scope, report.totals.unbilled),
+        unbilled_balance: only(scope, report.totals.unbilled_balance),
+        settled: scope.single ? report.totals.settled : null,
         settlements: report.totals.settlements,
         skipped_settlements: report.totals.skipped_settlements,
         currency: scope.single,
@@ -1382,6 +1486,7 @@ export class Revenue {
         past_due: collections.totals.past_due,
         metered_value: usage.totals.metered_value,
         usage_charged: usage.totals.charged,
+        usage_unbilled: usage.totals.unbilled_balance,
         credit_purchased: usage.credit.purchased,
         credit_burned: usage.credit.burned_against_usage,
       },

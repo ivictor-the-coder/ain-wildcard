@@ -6,7 +6,7 @@ import { formatMoney, money } from '../../../shared/money';
 import v from '../../../shared/validate';
 import { billingStore } from '../billing/module';
 import type { Invoice } from '../billing/types';
-import { DEFAULT_POLICY, type DunningListFilter, type RecoverySummary } from './dunning';
+import { DEFAULT_POLICY, endBehaviorPhrase, type DunningListFilter, type RecoverySummary } from './dunning';
 import type { ChargeListFilter, CollectionResult, IntentListFilter, RefundInput } from './gateway';
 import type { MethodInput, MethodListFilter, MethodUpdateInput } from './methods';
 import { PAYMENTS_MIGRATIONS } from './schema';
@@ -195,7 +195,7 @@ const policyBody = v.object({
   hard_decline_multiplier: v.optional(v.number({ min: 1, max: 6 })),
   collection_hour: v.optional(v.int({ min: 0, max: 23 })),
   jitter_hours: v.optional(v.int({ min: 0, max: 12 })),
-  give_up_codes: v.optional(v.array(v.enum(DECLINE_CODES), { max: 9 })),
+  give_up_codes: v.optional(v.array(v.enum(DECLINE_CODES), { max: DECLINE_CODES.length })),
 });
 
 /** The shape every collection route answers with — the outcome, in words. */
@@ -403,17 +403,26 @@ export default defineModule({
         collection_method: 'charge_automatically', limit: 200,
       }).data;
       for (const invoice of held) {
-        // Only the bills the automatic charge never reached, which is the
-        // whole of the defect and the whole of the fix. A recovery campaign —
+        // Only the bills the automatic charge never reached, plus the one
+        // campaign that was waiting for exactly this. A recovery campaign —
         // running, spent or stood down — means the queue owns this bill and
-        // says so in words, down to telling an operator to attach a card and
-        // present it by hand. And an open bill that has been presented before
-        // is open for a *reason* that a new card does not answer: a refund
-        // reopened it, or a chargeback did, and re-presenting a bill the
+        // says so in words; the exception is a campaign held because the card
+        // on file can never be charged again, which a different card answers
+        // outright, so it is presented to that card now rather than left for
+        // someone to remember. A campaign held after a refund is not that:
+        // the money was just given back on purpose. And an open bill that has
+        // been presented before is open for a *reason* that a new card does
+        // not answer: a chargeback reopened it, and re-presenting a bill the
         // cardholder is disputing is the mirror image of the money this fix
-        // exists to collect. `invoice.finalized` never sees either state; a
-        // handler that fires on any card, at any time, sees both.
-        if (store.dunning.forInvoice(event.org_id, invoice.id)) continue;
+        // exists to collect. `invoice.finalized` never sees any of these
+        // states; a handler that fires on any card, at any time, sees them all.
+        const campaign = store.dunning.forInvoice(event.org_id, invoice.id);
+        if (campaign) {
+          if (campaign.status === 'recovering' && campaign.hold?.reason === 'card_needs_person') {
+            store.dunning.presentHeld(event.org_id, campaign.id, method.id);
+          }
+          continue;
+        }
         if (store.gateway.listIntents(event.org_id, { invoice: invoice.id, status: 'all', limit: 1 }).totalCount > 0) continue;
         restartCollection(ctx, store, event.org_id, invoice.id);
       }
@@ -720,7 +729,7 @@ export default defineModule({
     router.post('/v1/refunds', (req: Req, c: Ctx) =>
       created(paymentsStore(c).gateway.createRefund(req.auth.orgId, req.body as RefundInput, writeMeta(req))), {
       summary: 'Refund a charge', tags: ['payments'], roles: ['member'], idempotent: true,
-      description: 'Moves cash back and takes it off what the invoice records as collected, which leaves the bill owed again. A refund does not rewrite what was billed — to reduce the bill itself, and the tax on it, raise a credit note.',
+      description: 'Moves cash back and takes it off what the invoice records as collected, which leaves the bill owed again. Nothing charges the reopened balance automatically — a card is never presented on the heels of a refund — so the bill goes into the recovery queue held for a person, who credits it or presents it by hand. A refund does not rewrite what was billed — to reduce the bill itself, and the tax on it, raise a credit note.',
       body: refundCreateBody,
     });
 
@@ -958,6 +967,7 @@ export default defineModule({
               attempts: `${row.attempt_count} of ${row.max_attempts}`,
               last_decline: row.last_failure_code,
               next_attempt_at: row.next_attempt_at,
+              held: row.hold ? { reason: row.hold.reason, until: row.hold.until } : null,
               payment_method: row.payment_method?.display_name ?? 'none on file',
               recommended_action: row.recommended_action,
               needs_human: row.needs_human,
@@ -1020,16 +1030,12 @@ export default defineModule({
 function explainSchedule(policy: DunningPolicy): string {
   const gaps = policy.retry_days.map((d) => `${d} day${d === 1 ? '' : 's'}`).join(', then ');
   const window = `${String(policy.collection_hour).padStart(2, '0')}:00 UTC`;
-  const end = policy.end_behavior === 'cancel'
-    ? 'the subscription is cancelled'
-    : policy.end_behavior === 'mark_unpaid'
-      ? 'the subscription is marked unpaid and stops being collected'
-      : 'the subscription is left past due for someone to chase by hand';
+  const end = endBehaviorPhrase(policy.end_behavior);
   const spread = policy.jitter_hours > 0
     ? ` and spread across the ${policy.jitter_hours} hour${policy.jitter_hours === 1 ? '' : 's'} after it so a thousand accounts do not present at once`
     : ' with no spread, so every account presents at the top of the window';
   const givingUp = policy.give_up_codes.length
-    ? ` ${policy.give_up_codes.join(', ')} stop the schedule immediately, because none of them clear by waiting — they need a person: new details, corrected ones, or the cardholder confirming once on-session.`
-    : ' No decline ends the schedule early.';
-  return `The first failure is attempt one. Retries follow after ${gaps}, each presented in the ${window} window${spread}${policy.skip_weekends ? ', never on a weekend' : ''}. A hard decline waits ${policy.hard_decline_multiplier}x longer;${givingUp} After ${policy.max_attempts} attempts ${end}.`;
+    ? ` ${policy.give_up_codes.join(', ')} drop the remaining retries immediately, because none of them clear by waiting — they need a person: new details, corrected ones, or the cardholder confirming once on-session. The account is held past due for that person until the schedule would have run out, and a card attached in the meantime is presented straight away.`
+    : ' No decline drops the retries early.';
+  return `The first failure is attempt one. Retries follow after ${gaps}, each presented in the ${window} window${spread}${policy.skip_weekends ? ', never on a weekend' : ''}. A hard decline waits ${policy.hard_decline_multiplier}x longer;${givingUp} After ${policy.max_attempts} attempts, or once that many would have run, ${end}.`;
 }

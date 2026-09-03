@@ -8,7 +8,7 @@ import { describeBehavior } from './simulator';
 import type {
   BankAccountType, CardBrand, CardFunding, Charge, ChargeOutcome, ChargeStatus, DeclineCode, Dispute,
   DisputeEvidence, DisputeReason, DisputeStatus, Dunning, DunningAttempt, DunningAttemptOutcome,
-  DunningEndBehavior, DunningStatus, NetworkStatus, NextAction, OutcomeType, PaymentCancellationReason,
+  DunningEndBehavior, DunningHoldReason, DunningStatus, NetworkStatus, NextAction, OutcomeType, PaymentCancellationReason,
   PaymentIntent, PaymentIntentSource, PaymentIntentStatus, PaymentMethod, PaymentMethodStatus,
   PaymentMethodType, Refund, RefundReason, RefundStatus, RiskLevel, SimulatedBehavior,
 } from './types';
@@ -204,6 +204,13 @@ export function hydrateDunning(row: any): Dunning {
     retry_days: parseJson<number[]>(row.retry_days, []),
     end_behavior: String(row.end_behavior) as DunningEndBehavior,
     next_attempt_at: nullableNum(row.next_attempt_at),
+    hold: row.hold_reason
+      ? {
+        reason: String(row.hold_reason) as DunningHoldReason,
+        until: nullableNum(row.hold_until),
+        note: String(row.hold_note ?? ''),
+      }
+      : null,
     last_attempt_at: nullableNum(row.last_attempt_at),
     last_failure_code: text(row.last_failure_code) as DeclineCode | null,
     last_failure_message: text(row.last_failure_message),

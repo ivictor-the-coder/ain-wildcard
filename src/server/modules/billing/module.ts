@@ -6,6 +6,7 @@ import { formatMoney, money } from '../../../shared/money';
 import v from '../../../shared/validate';
 import { PRORATION_BEHAVIORS, type ProrationBehavior } from '../catalog/types';
 import { BILLING_MIGRATIONS } from './schema';
+import { HOLD_RELEASE_JOB } from './holds';
 import { describeCadence, describeInterval, isMetered, longDate, Pricebook, recurringLines, recurringSubtotal, subscriptionMrr } from './cycle';
 import { Billing } from './store';
 import { INVOICE_TAX_FILTERS } from './records';
@@ -362,6 +363,44 @@ export default defineModule({
   dependsOn: ['core', 'catalog', 'crm'],
   migrations: BILLING_MIGRATIONS,
 
+  /**
+   * The other half of a held bill. A renewal with metered items emits
+   * `subscription.invoice_due` and waits; metering turns that into settlement
+   * jobs, credits prices each window and announces what it is holding, and
+   * these are the three moments the waiting bill can be drawn at — the last
+   * settlement when nothing was left in the outbox, the announcement when
+   * something was, and a refusal, which is a settlement that decided no line
+   * is coming. Reached structurally: a build without the credits module never
+   * emits any of them, and never opens a hold either.
+   */
+  on: {
+    'credit.usage_settled': (event, ctx) => {
+      const data = (event.data ?? {}) as {
+        customer?: string; price?: string; subscription?: string | null; period_start?: number; period_end?: number;
+      };
+      if (!data.customer || !data.price || typeof data.period_start !== 'number' || typeof data.period_end !== 'number') return;
+      billingStore(ctx).billing.holds.onSettled(event.org_id, {
+        customer: data.customer, price: data.price, subscription: data.subscription ?? null,
+        period_start: data.period_start, period_end: data.period_end,
+      });
+    },
+    'credit.settlement_skipped': (event, ctx) => {
+      const data = (event.data ?? {}) as {
+        customer?: string; price?: string; subscription?: string | null; period_start?: number; period_end?: number;
+      };
+      if (!data.customer || !data.price || typeof data.period_start !== 'number' || typeof data.period_end !== 'number') return;
+      billingStore(ctx).billing.holds.onSettled(event.org_id, {
+        customer: data.customer, price: data.price, subscription: data.subscription ?? null,
+        period_start: data.period_start, period_end: data.period_end,
+      });
+    },
+    'credit.items_ready': (event, ctx) => {
+      const data = (event.data ?? {}) as { customer?: string; subscription?: string | null };
+      if (!data.customer) return;
+      billingStore(ctx).billing.holds.onAnnounced(event.org_id, { customer: data.customer, subscription: data.subscription ?? null });
+    },
+  },
+
   boot(ctx) {
     const { billing, schedules } = billingStore(ctx);
     // Billing draws its own invoices, so the customer summary reads real bills
@@ -437,6 +476,13 @@ export default defineModule({
           comment: sub.cancellation_comment,
         });
       });
+    });
+
+    // A bill waiting for a settlement that never came draws anyway, an hour
+    // after the boundary, with whatever has arrived; the rest reaches the
+    // next bill exactly as it used to.
+    ctx.jobs.handle(HOLD_RELEASE_JOB, (payload: { hold: string }, job) => {
+      billing.holds.expire(job.org_id, payload.hold);
     });
 
     ctx.jobs.handle('billing.resume', (payload: { subscription: string }, job) => {

@@ -282,6 +282,12 @@ export interface PreviewInput extends ProrateInput {
    * predicts will be held back from making.
    */
   automaticTax: AutomaticTax;
+  /**
+   * Invoice items already waiting for this customer's next bill. An
+   * `always_invoice` change sweeps them onto the bill it raises, so they are
+   * part of what that bill collects — and of `amount_due_now`.
+   */
+  waitingLines?: { price: string | null; amount: number; currency: string }[];
 }
 
 /**
@@ -317,8 +323,14 @@ export function previewChange(input: PreviewInput): ChangePreview {
   // bill that collects $188.50, and the preview answered $0.00 for it — on the
   // same button, one direction over.
   const settles = input.behavior === 'always_invoice';
+  // The bill sweeps what was already waiting along with these lines, so what
+  // it collects is priced over both — the same claim `issue()` makes.
+  const swept = settles && set.lines.length ? input.waitingLines ?? [] : [];
   const dueNow = settles && set.lines.length
-    ? input.taxOf(set.lines.map((line) => ({ price: line.price, amount: line.amount, currency: line.currency })))
+    ? input.taxOf([
+      ...set.lines.map((line) => ({ price: line.price, amount: line.amount, currency: line.currency })),
+      ...swept,
+    ])
     : null;
   const taxDueNow = dueNow ? dueNow.tax : 0;
   // The balance is drawn down by this bill and can never take it below zero,
@@ -357,6 +369,14 @@ export function previewChange(input: PreviewInput): ChangePreview {
   }
   if (!settles && set.net !== 0 && set.lines.length) {
     notices.push('These lines wait on the next invoice for this subscription. Use proration_behavior=always_invoice to bill them straight away.');
+  }
+  if (swept.length) {
+    const waiting = swept.reduce((total, line) => total + line.amount, 0);
+    notices.push(
+      `${swept.length} invoice item${swept.length === 1 ? '' : 's'} already waiting for this customer's next bill ` +
+      `(${formatMoney(money(waiting, input.currency), { locale: input.locale })} before tax) ${swept.length === 1 ? 'is' : 'are'} billed on this one too, ` +
+      'so amount_due_now covers more than the lines above.',
+    );
   }
 
   return {

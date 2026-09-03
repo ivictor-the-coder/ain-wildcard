@@ -91,6 +91,12 @@ export interface MetricResult {
   window: TimeWindow;
   subject: MetricSubject | null;
   groups: MetricGroup[];
+  /**
+   * How many groups the breakdown has before any cut. `groups` holds at most
+   * the caller's limit; the difference is what a rendering has to say it left
+   * out, or the twelve accounts it prints read as the whole book.
+   */
+  groupTotal: number;
   ids: string[];
   /**
    * The money behind this metric, one entry per currency. Empty for a metric
@@ -312,15 +318,18 @@ function timeLabeller(): (key: string) => string {
 }
 
 function groupSpec(input: MetricInput, dateProperty: string): Partial<Parameters<typeof aggregate>[2]> {
+  // The caller's row limit is the SQL cut, so a breakdown asked for 25 rows is
+  // not silently cut at the aggregate's default of twelve.
+  const cap = input.limit ? { groupLimit: input.limit } : {};
   switch (input.groupBy) {
-    case 'time': return { groupByDate: { property: dateProperty, grain: bucketGrain(input.window) } };
+    case 'time': return { ...cap, groupByDate: { property: dateProperty, grain: bucketGrain(input.window) } };
     case 'owner': return {};
-    case 'stage': return { groupBy: 'deal_stage' };
-    case 'pipeline': return { groupBy: 'pipeline' };
-    case 'industry': return { groupBy: 'industry' };
-    case 'status': return { groupBy: 'status' };
-    case 'priority': return { groupBy: 'priority' };
-    case 'source': return { groupBy: 'lead_source' };
+    case 'stage': return { ...cap, groupBy: 'deal_stage' };
+    case 'pipeline': return { ...cap, groupBy: 'pipeline' };
+    case 'industry': return { ...cap, groupBy: 'industry' };
+    case 'status': return { ...cap, groupBy: 'status' };
+    case 'priority': return { ...cap, groupBy: 'priority' };
+    case 'source': return { ...cap, groupBy: 'lead_source' };
     default: return {};
   }
 }
@@ -353,6 +362,8 @@ export interface InvoiceFacts {
   count: number;
   ids: string[];
   groups: { key: string; value: number; count: number; currency: string | null }[];
+  /** How many groups there are before the by-account cut. */
+  groupTotal: number;
   /** One entry per currency the matched invoices were raised in. */
   books: { currency: string; value: number; count: number }[];
   label: string;
@@ -418,7 +429,7 @@ export function invoiceFacts(
   const { ctx, workspace, window, subject } = input;
   const sources = billingSources(ctx.db);
   const invoices = sources.invoices;
-  if (!invoices) return { available: false, total: 0, count: 0, ids: [], groups: [], books: [], label: 'no invoice table in this workspace' };
+  if (!invoices) return { available: false, total: 0, count: 0, ids: [], groups: [], groupTotal: 0, books: [], label: 'no invoice table in this workspace' };
 
   const amountColumn = opts.paidOnly && invoices.paidColumn ? invoices.paidColumn : invoices.amountColumn;
   // Cash collected is dated by when it was paid; everything else is dated by
@@ -436,7 +447,7 @@ export function invoiceFacts(
   // terms and calling them overdue is a claim about the customers who owe them.
   if (opts.overdue) {
     if (!invoices.dueDateColumn) {
-      return { available: false, total: 0, count: 0, ids: [], groups: [], books: [], label: 'no due date on invoices in this workspace' };
+      return { available: false, total: 0, count: 0, ids: [], groups: [], groupTotal: 0, books: [], label: 'no due date on invoices in this workspace' };
     }
     where.push(`${invoices.dueDateColumn} IS NOT NULL`, `${invoices.dueDateColumn} < ?`);
     params.push(workspace.now);
@@ -457,7 +468,7 @@ export function invoiceFacts(
   }
   const customerIds = linkedCustomerIds(ctx, workspace.orgId, subject);
   if (subject && invoices.customerColumn) {
-    if (!customerIds.length) return { available: true, total: 0, count: 0, ids: [], groups: [], books: [], label: `${subject.label} has no billing account` };
+    if (!customerIds.length) return { available: true, total: 0, count: 0, ids: [], groups: [], groupTotal: 0, books: [], label: `${subject.label} has no billing account` };
     where.push(`${invoices.customerColumn} IN (${customerIds.map(() => '?').join(', ')})`);
     params.push(...customerIds);
   }
@@ -488,13 +499,23 @@ export function invoiceFacts(
     ).map((r) => ({ key: r.k, value: Number(r.v ?? 0), count: r.n, currency: (r.c ?? workspace.currency).toLowerCase() }));
 
   let groups: { key: string; value: number; count: number; currency: string | null }[] = [];
+  let groupTotal = 0;
   if (input.groupBy === 'time') {
     const format = bucketGrain(window) === 'day' ? '%Y-%m-%d' : bucketGrain(window) === 'year' ? '%Y' : '%Y-%m';
     groups = grouped(`strftime('${format}', ${dateColumn} / 1000, 'unixepoch')`, 'k');
+    groupTotal = groups.length;
   } else if (input.groupBy === 'account' && invoices.customerColumn) {
     groups = grouped(invoices.customerColumn, 'v DESC', ' LIMIT 40');
+    // The cut above is by value across every book, so the rows it drops are
+    // whichever accounts are smallest in raw minor units; the total says how
+    // many the answer has not printed.
+    groupTotal = Number(ctx.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM (SELECT ${invoices.customerColumn} AS k, ${currencyKey} AS c FROM ${invoices.table} WHERE ${whereSql} GROUP BY k, c)`,
+      ...(params as never[]),
+    )?.n ?? 0);
   } else if (input.groupBy === 'status' && invoices.statusColumn) {
     groups = grouped(invoices.statusColumn, 'v DESC');
+    groupTotal = groups.length;
   }
 
   const kind = opts.overdue ? 'overdue' : opts.outstanding ? 'outstanding' : opts.paidOnly ? 'paid' : 'issued';
@@ -506,6 +527,7 @@ export function invoiceFacts(
     count,
     ids,
     groups,
+    groupTotal,
     books,
     label: `${count} ${kind} ${count === 1 ? 'invoice' : 'invoices'}`,
   };
@@ -514,6 +536,8 @@ export function invoiceFacts(
 function result(input: MetricInput, def: Pick<MetricDefinition, 'id' | 'label' | 'unit'> & { snapshot?: boolean }, fields: {
   value: number; count: number; source: string; sourceKind: MetricResult['sourceKind'];
   groups?: MetricGroup[]; ids?: string[]; note?: string | null;
+  /** How many groups there were before `groups` was cut; defaults to the rows given. */
+  groupTotal?: number;
   /** Per-currency totals. Given by every money metric that reads real money. */
   books?: MoneyBook[];
   /**
@@ -556,6 +580,7 @@ function result(input: MetricInput, def: Pick<MetricDefinition, 'id' | 'label' |
     window: input.window,
     subject: input.subject ?? null,
     groups: fields.groups ?? [],
+    groupTotal: Math.max(fields.groupTotal ?? 0, (fields.groups ?? []).length),
     ids: fields.ids ?? [],
     books,
     mixedCurrency: mixed,
@@ -623,6 +648,12 @@ function recurringRevenue(input: MetricInput, months: 1 | 12): MetricResult {
   }
   const books = booksFrom(perCurrency, input.workspace);
 
+  // One cut per currency book, at the caller's limit. A ranking reads the top
+  // N of each book, and a single cut across books by raw minor units handed
+  // the USD book eight rows under "top 10" while a euro row it did not ask
+  // for took one of the places.
+  const perBook = input.limit ?? 12;
+  const kept = new Map<string, number>();
   const groups: MetricGroup[] = input.groupBy === 'account'
     ? [...perCustomer.entries()]
         .map(([customerId, row]) => ({
@@ -634,7 +665,11 @@ function recurringRevenue(input: MetricInput, months: 1 | 12): MetricResult {
           currency: row.currency,
         }))
         .sort((a, b) => b.value - a.value || a.label.localeCompare(b.label))
-        .slice(0, 12)
+        .filter((g) => {
+          const seen = kept.get(g.currency) ?? 0;
+          kept.set(g.currency, seen + 1);
+          return seen < perBook;
+        })
     : [];
 
   return result(input, def, {
@@ -642,6 +677,8 @@ function recurringRevenue(input: MetricInput, months: 1 | 12): MetricResult {
     count: counted,
     ids: ids.slice(0, 12),
     groups,
+    // Every account still billing, whether or not the cut above kept it.
+    groupTotal: input.groupBy === 'account' ? perCustomer.size : 0,
     books,
     source: `${counted} ${counted === 1 ? 'subscription' : 'subscriptions'} still billing`,
     sourceKind: 'subscriptions',
@@ -757,6 +794,7 @@ function moneyIn(
       sourceKind: 'invoices',
       ids: invoices.ids,
       books,
+      groupTotal: invoices.groupTotal,
       note: def.snapshot
         ? opts.overdue
           ? 'Overdue is what is late right now — every open invoice whose due date has passed — so it ignores the reporting period, and it is a smaller set than the outstanding book.'
@@ -796,6 +834,7 @@ function moneyIn(
     sourceKind: 'deals',
     ids: agg.ids,
     groups,
+    groupTotal: agg.groupTotal,
     note: 'Measured from closed-won deals: this workspace has no invoice ledger installed.',
   });
 }
@@ -927,7 +966,7 @@ const DEFS: MetricDefinition[] = [
         ? groupByOwner(input.ctx, input.workspace.orgId, 'deal', conditions, undefined, { property: 'amount', fn: 'sum' }, input.workspace, 'money', scope.associatedTo)
         : groupsFrom(agg, 'money', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined);
       return result(input, { snapshot: true, id: 'pipeline', label: 'Open pipeline', unit: 'money' }, {
-        value: agg.value, count: agg.count, ids: agg.ids, groups,
+        value: agg.value, count: agg.count, ids: agg.ids, groups, groupTotal: agg.groupTotal,
         source: `${agg.count} open ${agg.count === 1 ? 'deal' : 'deals'}`, sourceKind: 'deals',
         note: 'Open pipeline is a snapshot of every deal not yet closed, so it ignores the reporting period.',
       });
@@ -949,7 +988,7 @@ const DEFS: MetricDefinition[] = [
       });
       return result(input, { snapshot: true, id: 'weighted_pipeline', label: 'Weighted pipeline', unit: 'money' }, {
         value: agg.value, count: agg.count, ids: agg.ids,
-        groups: groupsFrom(agg, 'money', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined),
+        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'money', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined),
         source: `${agg.count} open ${agg.count === 1 ? 'deal' : 'deals'} weighted by probability`, sourceKind: 'deals',
         note: 'Weighted pipeline is every open deal multiplied by its stage probability, as it stands today — a snapshot of the whole book, not a total for one close-date window.',
       });
@@ -975,7 +1014,7 @@ const DEFS: MetricDefinition[] = [
         ? groupByOwner(input.ctx, input.workspace.orgId, 'deal', conditions, window, { property: 'amount', fn: 'sum' }, input.workspace, 'money', scope.associatedTo)
         : groupsFrom(agg, 'money', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined);
       return result(input, { id: 'closed_won', label: 'Closed-won bookings', unit: 'money' }, {
-        value: agg.value, count: agg.count, ids: agg.ids, groups,
+        value: agg.value, count: agg.count, ids: agg.ids, groups, groupTotal: agg.groupTotal,
         source: `${agg.count} closed-won ${agg.count === 1 ? 'deal' : 'deals'}`, sourceKind: 'deals',
       });
     },
@@ -993,7 +1032,7 @@ const DEFS: MetricDefinition[] = [
       });
       return result(input, { id: 'closed_lost', label: 'Closed-lost value', unit: 'money' }, {
         value: agg.value, count: agg.count, ids: agg.ids,
-        groups: groupsFrom(agg, 'money', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined),
+        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'money', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined),
         source: `${agg.count} closed-lost ${agg.count === 1 ? 'deal' : 'deals'}`, sourceKind: 'deals',
       });
     },
@@ -1064,7 +1103,7 @@ const DEFS: MetricDefinition[] = [
       });
       return result(input, { snapshot: true, id: 'deal_count', label: 'Deals', unit: 'count' }, {
         value: agg.count, count: agg.count, ids: agg.ids,
-        groups: groupsFrom(agg, 'count', input.workspace),
+        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace),
         source: `${agg.count} open ${agg.count === 1 ? 'deal' : 'deals'}`, sourceKind: 'deals',
       });
     },
@@ -1080,7 +1119,7 @@ const DEFS: MetricDefinition[] = [
       });
       return result(input, { id: 'new_customers', label: 'New customers', unit: 'count' }, {
         value: agg.count, count: agg.count, ids: agg.ids,
-        groups: groupsFrom(agg, 'count', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined),
+        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined),
         source: `${agg.count} ${agg.count === 1 ? 'account that became a customer' : 'accounts that became customers'}`, sourceKind: 'records',
       });
     },
@@ -1094,7 +1133,7 @@ const DEFS: MetricDefinition[] = [
         sampleIds: 8, ...(input.groupBy === 'industry' ? { groupBy: 'industry' } : {}),
       });
       return result(input, { snapshot: true, id: 'customers', label: 'Customers', unit: 'count' }, {
-        value: agg.count, count: agg.count, ids: agg.ids, groups: groupsFrom(agg, 'count', input.workspace),
+        value: agg.count, count: agg.count, ids: agg.ids, groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace),
         source: `${agg.count} ${agg.count === 1 ? 'account' : 'accounts'} marked as a customer`, sourceKind: 'records',
       });
     },
@@ -1110,7 +1149,7 @@ const DEFS: MetricDefinition[] = [
       });
       return result(input, { snapshot: true, id: 'open_tickets', label: 'Open tickets', unit: 'count' }, {
         value: agg.count, count: agg.count, ids: agg.ids,
-        groups: groupsFrom(agg, 'count', input.workspace),
+        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace),
         source: `${agg.count} ${agg.count === 1 ? 'ticket' : 'tickets'} not yet closed`, sourceKind: 'tickets',
       });
     },
@@ -1126,7 +1165,7 @@ const DEFS: MetricDefinition[] = [
       });
       return result(input, { id: 'tickets_created', label: 'Tickets raised', unit: 'count' }, {
         value: agg.count, count: agg.count, ids: agg.ids,
-        groups: groupsFrom(agg, 'count', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined),
+        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined),
         source: `${agg.count} ${agg.count === 1 ? 'ticket' : 'tickets'} raised in the period`, sourceKind: 'tickets',
       });
     },
@@ -1195,7 +1234,7 @@ const DEFS: MetricDefinition[] = [
         sampleIds: 6, ...subjectScope(input), groupBy: 'meeting_type',
       });
       return result(input, { id: 'meetings', label: 'Meetings held', unit: 'count' }, {
-        value: agg.count, count: agg.count, ids: agg.ids, groups: groupsFrom(agg, 'count', input.workspace),
+        value: agg.count, count: agg.count, ids: agg.ids, groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace),
         source: `${agg.count} ${agg.count === 1 ? 'meeting' : 'meetings'} on the timeline`, sourceKind: 'activities',
       });
     },
@@ -1220,7 +1259,7 @@ const DEFS: MetricDefinition[] = [
         ...(input.groupBy === 'industry' ? { groupBy: 'industry' } : {}),
       });
       return result(input, { snapshot: true, id: 'connected_assets', label: 'Connected assets', unit: 'count' }, {
-        value: agg.value, count: agg.count, ids: agg.ids, groups: groupsFrom(agg, 'count', input.workspace),
+        value: agg.value, count: agg.count, ids: agg.ids, groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace),
         source: `${agg.count} ${agg.count === 1 ? 'account' : 'accounts'} reporting telemetry`, sourceKind: 'records',
       });
     },

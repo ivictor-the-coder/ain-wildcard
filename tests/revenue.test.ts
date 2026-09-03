@@ -69,9 +69,22 @@ function monthlyByHand(annualMinorUnits: bigint): number {
   return Number(remainder * 2n >= 12n ? quotient + 1n : quotient);
 }
 
+/**
+ * The hand calculation behind daily recognition: the straight line, `amount ×
+ * elapsed ÷ days`, rounded half-up once in BigInt. Written longhand so it
+ * shares no code with the module under test.
+ */
+function recognisedByHand(amount: number, days: number, elapsed: number): number {
+  const numerator = BigInt(amount) * BigInt(elapsed);
+  const quotient = numerator / BigInt(days);
+  const remainder = numerator % BigInt(days);
+  return Number(remainder * 2n >= BigInt(days) ? quotient + 1n : quotient);
+}
+
 /** Every movement row must satisfy the identity the endpoint claims to prove. */
 function assertRowReconciles(row: any, where: string): void {
-  const computed = row.opening + row.new_business + row.expansion + row.reactivation - row.contraction - row.churn;
+  const computed = row.opening + row.new_business + row.expansion + row.reactivation + row.resumed
+    - row.contraction - row.churn - row.paused;
   assert.equal(
     computed, row.closing,
     `${where}: ${row.month} opening ${row.opening} + movements does not close at ${row.closing} (got ${computed})`,
@@ -114,6 +127,8 @@ const MONEY_KEYS = new Set([
   'lifetime_billed', 'purchased', 'burned_against_usage', 'outstanding_monetary', 'credit_purchased',
   'credit_burned', 'metered_share_of_invoiced', 'overage_share_of_invoiced', 'net_revenue_retention',
   'gross_revenue_retention', 'gross_revenue_churn', 'dso', 'collection_rate', 'recovery_rate',
+  'paused', 'resumed', 'paused_mrr', 'resumed_mrr', 'paused_share', 'invoiced_gross', 'unbilled',
+  'unbilled_usage', 'usage_unbilled', 'settled',
 ]);
 
 /**
@@ -350,8 +365,8 @@ describe('MRR movement', () => {
     }
     for (const row of mixed.series) {
       for (const part of row.by_currency) {
-        const computed = part.opening + part.new_business + part.expansion + part.reactivation
-          - part.contraction - part.churn;
+        const computed = part.opening + part.new_business + part.expansion + part.reactivation + part.resumed
+          - part.contraction - part.churn - part.paused;
         assert.equal(computed, part.closing, `${row.month} ${part.currency}: movements do not close the month`);
       }
     }
@@ -451,20 +466,26 @@ describe('MRR movement', () => {
     assert.equal(january.mrr, 0, 'and none in the months after it either');
   });
 
-  test('churn and retention add up to one, and every rate shows its fraction', async () => {
+  test('churn, retention and pauses add up to one, and every rate shows its fraction', async () => {
     const churn = await ws.ok('GET', '/v1/revenue/churn?months=12&currency=usd');
+    assert.ok(churn.series.some((row: any) => row.paused_mrr > 0), 'the seeded book pauses an account, which is what makes the third share real');
     for (const row of churn.series) {
       if (row.opening_mrr === 0) continue;
+      // Rounding happens once per rate, so three rounded shares can sit a
+      // basis point either side of 100%; the exact fractions cannot.
       assert.equal(
-        row.gross_revenue_churn.bps + row.gross_revenue_retention.bps, 10_000,
-        `${row.month}: churn ${row.gross_revenue_churn.percent} and retention ${row.gross_revenue_retention.percent} do not add to 100%`,
+        row.gross_revenue_churn.numerator + row.gross_revenue_retention.numerator + row.paused_share.numerator,
+        row.opening_mrr,
+        `${row.month}: churn ${row.gross_revenue_churn.percent}, retention ${row.gross_revenue_retention.percent} and paused ${row.paused_share.percent} do not partition the opening book`,
       );
       assert.equal(row.gross_revenue_churn.denominator, row.opening_mrr, 'the rate names the base it was divided by');
       assert.equal(row.gross_revenue_churn.numerator, row.churned_mrr + row.contraction_mrr);
+      assert.equal(row.paused_share.numerator, row.paused_mrr, 'a pause is neither churn nor retention');
       assert.equal(
         row.net_revenue_retention.numerator,
-        row.opening_mrr - row.churned_mrr - row.contraction_mrr + row.expansion_mrr + row.reactivation_mrr,
-        'net retention adds expansion and reactivation to the retained base, and nothing else',
+        row.opening_mrr - row.churned_mrr - row.contraction_mrr - row.paused_mrr
+          + row.expansion_mrr + row.reactivation_mrr + row.resumed_mrr,
+        'net retention is what the opening accounts close at: retained plus expansion, reactivation and resumed collection',
       );
       assert.equal(row.logo_churn.denominator, row.accounts_at_open);
     }
@@ -774,23 +795,32 @@ describe('usage economics', () => {
   before(async () => { ws = await workspace(UTC(2026, 6, 15)); });
   after(() => ws.close());
 
-  test('metered value splits into what credit covered and what was charged', async () => {
+  test('metered value splits into what credit covered and what was charged, and what was charged is billed or unbilled', async () => {
     const report = await ws.ok('GET', '/v1/revenue/usage?months=24');
     for (const meter of report.meters) {
       assert.equal(
-        meter.credit_covered + meter.charged, meter.metered_value,
-        `${meter.name}: covered plus charged must be the whole metered value`,
+        meter.settled.credit_covered + meter.settled.charged, meter.metered_value,
+        `${meter.name}: covered plus charged must be the whole metered value, as the settlement priced it`,
+      );
+      assert.equal(meter.settled.net_charged, meter.settled.charged + meter.settled.true_ups);
+      assert.equal(
+        meter.settled.invoiced + meter.unbilled, meter.settled.net_charged,
+        `${meter.name}: every settled charge is on a finalised invoice or it is unbilled`,
       );
       assert.equal(meter.charged_share.denominator, meter.metered_value);
+      assert.equal(meter.charged_share.numerator, meter.settled.net_charged);
     }
     for (const part of report.by_currency) {
       assert.equal(
-        part.totals.credit_covered + part.totals.charged, part.totals.metered_value,
+        part.totals.settled.credit_covered + part.totals.settled.charged, part.totals.metered_value,
         `${part.currency}: and the same holds across every meter in the currency`,
       );
+      assert.equal(part.totals.settled.invoiced + part.totals.unbilled, part.totals.settled.net_charged);
     }
     const split = report.reconciliation.checks.find((check: any) => check.name === 'settlement_components_match');
     assert.equal(split.ok, true, 'the settlement columns are checked against each other, not assumed');
+    const bridge = report.reconciliation.checks.find((check: any) => check.name === 'invoice_lines_carry_the_settled_amount');
+    assert.equal(bridge.ok, true, `${bridge.description}: expected ${bridge.expected}, got ${bridge.actual}`);
   });
 
   test('the invoiced mix is a partition of everything billed', async () => {
@@ -1126,9 +1156,9 @@ describe('a collection pause', () => {
       moversFor(movement, customer.id),
       [
         { month: '2026-02', kind: 'new', amount: GROWTH_MONTHLY },
-        { month: '2026-03', kind: 'churn', amount: -GROWTH_MONTHLY },
+        { month: '2026-03', kind: 'paused', amount: -GROWTH_MONTHLY },
       ],
-      'the churn is booked in the month collection stopped, not the month of the last renewal',
+      'the pause is booked in the month collection stopped, not the month of the last renewal — and as a pause, not churn',
     );
     for (const row of movement.series) assertRowReconciles(row, 'across a pause');
 
@@ -1175,10 +1205,432 @@ describe('a collection pause', () => {
     const signedUp = new Date(sub.start_date).toISOString().slice(0, 7);
     assert.deepEqual(
       mine.map((mover) => `${mover.month} ${mover.kind}`),
-      [`${signedUp} new`, '2026-08 churn', '2026-10 reactivation'],
-      'a pause reads as churn and its lifting as reactivation, both on their own dates',
+      [`${signedUp} new`, '2026-08 paused', '2026-10 resumed'],
+      'a pause reads as paused and its lifting as resumed, both on their own dates, and neither is churn',
     );
     for (const row of movement.series) assertRowReconciles(row, 'across a pause and a resume');
+  });
+
+  test('is not churn: the logo stays in the book, the revenue is a third share, and cancelling while paused is what churns it', async () => {
+    await ws.travelTo(UTC(2026, 12, 1));
+    const customer = await ws.customer('Selkirk Gantry Systems');
+    const sub = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }],
+      billing_cycle_anchor: ws.now(),
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+    await ws.travelTo(UTC(2027, 1, 12));
+    const before = await ws.ok('GET', '/v1/revenue/churn?months=3&currency=usd');
+    const januaryBefore = before.series.find((row: any) => row.month === '2027-01');
+
+    await ws.ok('POST', `/v1/subscriptions/${sub.id}/pause`, { behavior: 'keep_as_draft' });
+    const paused = await ws.ok('GET', '/v1/revenue/churn?months=3&currency=usd');
+    const january = paused.series.find((row: any) => row.month === '2027-01');
+    assert.equal(january.churned_accounts, januaryBefore.churned_accounts, 'a pause does not churn the logo');
+    assert.equal(january.churned_mrr, januaryBefore.churned_mrr, 'nor its revenue');
+    assert.equal(january.paused_accounts, januaryBefore.paused_accounts + 1, 'it is counted as paused');
+    assert.equal(january.paused_mrr, januaryBefore.paused_mrr + GROWTH_MONTHLY);
+    assert.equal(january.accounts_at_open, januaryBefore.accounts_at_open, 'the denominator does not move: the account is still a contract');
+    assert.equal(
+      january.gross_revenue_churn.numerator + january.gross_revenue_retention.numerator + january.paused_share.numerator,
+      january.opening_mrr,
+      'churn, retention and paused partition the opening book',
+    );
+    assert.equal(
+      january.gross_revenue_retention.numerator, januaryBefore.gross_revenue_retention.numerator - GROWTH_MONTHLY,
+      'paused revenue is not being collected, so it is not retained either',
+    );
+
+    // Cancelling the paused account is a real churn: one logo, no bar, because
+    // its recognised MRR was already zero.
+    await ws.travelTo(UTC(2027, 2, 8));
+    const open = await ws.ok('GET', '/v1/revenue/churn?months=3&currency=usd');
+    const februaryBefore = open.series.find((row: any) => row.month === '2027-02');
+    await ws.ok('POST', `/v1/subscriptions/${sub.id}/cancel`, { cancellation_reason: 'went_out_of_business' });
+    const after = await ws.ok('GET', '/v1/revenue/churn?months=3&currency=usd');
+    const february = after.series.find((row: any) => row.month === '2027-02');
+    assert.equal(february.churned_accounts, februaryBefore.churned_accounts + 1, 'the contract ended, so the logo churned');
+    assert.equal(february.churned_mrr, februaryBefore.churned_mrr, 'and no recognised revenue moved, because none was being recognised');
+    assert.equal(february.accounts_at_open, februaryBefore.accounts_at_open, 'a paused contract is in the denominator it churns out of');
+
+    const movement = await ws.ok('GET', '/v1/revenue/movement?months=4&top_movers=50&currency=usd');
+    for (const row of movement.series) assertRowReconciles(row, 'across a pause and a cancellation');
+    const signedUp = new Date(sub.start_date).toISOString().slice(0, 7);
+    assert.deepEqual(
+      moversFor(movement, customer.id).map((mover) => `${mover.month} ${mover.kind} ${mover.amount}`),
+      [`${signedUp} new ${GROWTH_MONTHLY}`, `2027-01 paused ${-GROWTH_MONTHLY}`],
+      'signing up and pausing are the only bars this account draws; cancelling from paused moves no recognised MRR',
+    );
+  });
+});
+
+/* ========================================================================== *
+ * 10. History that never moves
+ *
+ * A closed month is a fact. Every dated change in a subscription's life has to
+ * step its history on the day it happened — including the ones that wrote no
+ * proration line — or the walk back from today's contract re-prices the past.
+ * ========================================================================== */
+
+describe('a contract change without a proration line', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 3, 10)); });
+  after(() => ws.close());
+
+  const seriesOf = (account: any): Record<string, number> =>
+    Object.fromEntries(account.series.map((row: any) => [row.month, row.mrr]));
+
+  test('a schedule phase moves MRR on the phase date and leaves every closed month where it was', async () => {
+    const customer = await ws.customer('Halstead Precision Works');
+    const sub = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'starter_monthly' }],
+      billing_cycle_anchor: UTC(2026, 3, 10),
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+    assert.equal(sub.mrr, 9_900);
+    // Three months on Starter while the pilot line proves out, then Growth
+    // with twelve seats — the seeded ramp, with proration_behavior none on the
+    // first phase so the transition writes no proration line at all.
+    const schedule = await ws.ok('POST', '/v1/subscription-schedules', {
+      from_subscription: sub.id,
+      start_date: sub.current_period_start,
+      phases: [
+        { items: [{ price: 'starter_monthly', quantity: 1 }], iterations: 3, proration_behavior: 'none' },
+        {
+          items: [{ price: 'growth_monthly', quantity: 1 }, { price: 'growth_seat_monthly', quantity: 12 }],
+          iterations: 9,
+          proration_behavior: 'create_prorations',
+        },
+      ],
+    });
+    assert.equal(schedule.phases.length, 2);
+    const ramped = GROWTH_MONTHLY + 12 * GROWTH_SEAT_MONTHLY;
+    assert.equal(ramped, 84_700);
+
+    await ws.travelTo(UTC(2026, 6, 1));
+    const before = seriesOf(await ws.ok('GET', `/v1/revenue/accounts/${customer.id}?months=6`));
+    assert.deepEqual(
+      [before['2026-03'], before['2026-04'], before['2026-05']], [9_900, 9_900, 9_900],
+      'three months on Starter',
+    );
+
+    // Past the phase boundary on 10 June: the renewal applies the new phase.
+    await ws.travelTo(UTC(2026, 7, 5));
+    const detail = await ws.ok('GET', `/v1/subscriptions/${sub.id}`);
+    assert.equal(detail.mrr, ramped, 'billing moved the contract to Growth');
+    const pending = ws.app.ctx.db.count(
+      `SELECT COUNT(*) FROM billing_pending_items WHERE org_id = ? AND subscription_id = ?`, ORG, sub.id,
+    );
+    assert.equal(pending, 0, 'and wrote no proration line doing it — which is exactly the case that used to rewrite history');
+
+    const after = seriesOf(await ws.ok('GET', `/v1/revenue/accounts/${customer.id}?months=6`));
+    assert.deepEqual(
+      [after['2026-03'], after['2026-04'], after['2026-05']], [before['2026-03'], before['2026-04'], before['2026-05']],
+      'the three closed months read exactly what they read before the phase changed',
+    );
+    assert.equal(after['2026-06'], ramped, 'June closes on Growth');
+
+    const movement = await ws.ok('GET', '/v1/revenue/movement?months=6&top_movers=50&currency=usd');
+    for (const row of movement.series) assertRowReconciles(row, 'across a schedule phase');
+    assert.deepEqual(
+      moversFor(movement, customer.id),
+      [
+        { month: '2026-03', kind: 'new', amount: 9_900 },
+        { month: '2026-06', kind: 'expansion', amount: ramped - 9_900 },
+      ],
+      'the ramp is expansion in June, the month the phase started, and nowhere else',
+    );
+
+    const cohorts = await ws.ok('GET', '/v1/revenue/cohorts?currency=usd');
+    const march = cohorts.series.find((row: any) => row.cohort === '2026-03');
+    assert.ok(march.initial_mrr >= 9_900 && march.initial_mrr < march.initial_mrr + ramped, 'the March cohort was signed at Starter');
+
+    const mrr = await ws.ok('GET', '/v1/revenue/mrr?currency=usd');
+    assert.ok(mrr.sources.contract_changes_dated_from_the_event_log >= 1, 'the phase is a dated change in the event log');
+    assert.equal(mrr.sources.contract_changes_the_walk_back_disagrees_with, 0, 'and the walk back from today lands on what the log says');
+    assert.equal(mrr.sources.contract_changes_unpriced, 0);
+  });
+
+  test('an update with proration_behavior none steps on its own date, up and back down', async () => {
+    const customer = await ws.customer('Corvid Line Automation');
+    const sub = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }, { price: 'growth_seat_monthly', quantity: 5 }],
+      billing_cycle_anchor: ws.now(),
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+    const opening = GROWTH_MONTHLY + 5 * GROWTH_SEAT_MONTHLY;
+    assert.equal(sub.mrr, opening);
+    const signedUp = new Date(sub.start_date).toISOString().slice(0, 7);
+
+    // Five more seats, mid-cycle, with no proration: the customer pays the
+    // new figure from the next renewal but holds the seats from today.
+    await ws.travelTo(UTC(2026, 9, 20));
+    const up = await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+      items: [{ price: 'growth_seat_monthly', quantity: 10 }],
+      proration_behavior: 'none',
+    });
+    assert.equal(up.mrr, opening + 5 * GROWTH_SEAT_MONTHLY);
+    assert.equal(up.proration.lines.length, 0, 'nothing was prorated');
+
+    // Then seven seats come off the same way, two months later.
+    await ws.travelTo(UTC(2026, 11, 20));
+    const down = await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+      items: [{ price: 'growth_seat_monthly', quantity: 3 }],
+      proration_behavior: 'none',
+    });
+    assert.equal(down.mrr, GROWTH_MONTHLY + 3 * GROWTH_SEAT_MONTHLY);
+    await ws.travelTo(UTC(2027, 1, 4));
+
+    const series = seriesOf(await ws.ok('GET', `/v1/revenue/accounts/${customer.id}?months=12`));
+    assert.equal(series['2026-08'], opening, 'August is the contract as signed');
+    assert.equal(series['2026-09'], opening + 5 * GROWTH_SEAT_MONTHLY, 'September closes with ten seats');
+    assert.equal(series['2026-10'], opening + 5 * GROWTH_SEAT_MONTHLY);
+    assert.equal(series['2026-11'], GROWTH_MONTHLY + 3 * GROWTH_SEAT_MONTHLY, 'November closes with three');
+    assert.equal(series['2026-12'], GROWTH_MONTHLY + 3 * GROWTH_SEAT_MONTHLY);
+
+    const movement = await ws.ok('GET', '/v1/revenue/movement?months=12&top_movers=50&currency=usd');
+    for (const row of movement.series) assertRowReconciles(row, 'across two unprorated changes');
+    assert.deepEqual(
+      moversFor(movement, customer.id),
+      [
+        { month: signedUp, kind: 'new', amount: opening },
+        { month: '2026-09', kind: 'expansion', amount: 5 * GROWTH_SEAT_MONTHLY },
+        { month: '2026-11', kind: 'contraction', amount: -7 * GROWTH_SEAT_MONTHLY },
+      ],
+      'the upgrade and the downgrade each land once, in their own month, at their own size',
+    );
+  });
+
+  test('a prorated change is in both ledgers and counted once', async () => {
+    const customer = await ws.customer('Both Ledgers Foundry');
+    const sub = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }],
+      billing_cycle_anchor: ws.now(),
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+    await ws.app.travel(10 * DAY);
+    const at = ws.now();
+    await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+      items: [{ price: 'growth_seat_monthly', quantity: 4 }],
+      proration_behavior: 'always_invoice',
+    });
+    const lines = ws.app.ctx.db.count(
+      `SELECT COUNT(*) FROM billing_pending_items WHERE org_id = ? AND subscription_id = ? AND kind IN ('unused_time', 'remaining_time')`,
+      ORG, sub.id,
+    );
+    assert.ok(lines > 0, 'the proration ledger holds the change');
+    const logged = ws.app.ctx.db.count(
+      `SELECT COUNT(*) FROM events WHERE org_id = ? AND object_id = ? AND type = 'subscription.updated' AND json_type(previous, '$.items') = 'array'`,
+      ORG, sub.id,
+    );
+    assert.ok(logged > 0, 'and so does the event log');
+
+    const account = await ws.ok('GET', `/v1/revenue/accounts/${customer.id}?months=3`);
+    const timeline = account.subscriptions.find((line: any) => line.subscription === sub.id);
+    assert.equal(timeline.changes.length, 1, 'one change, not two');
+    assert.equal(timeline.changes[0].at, at);
+    assert.equal(timeline.changes[0].delta, 4 * GROWTH_SEAT_MONTHLY);
+    assert.equal(timeline.changes[0].source, 'event_log');
+    assert.equal(timeline.changes[0].confirmed, true, 'the proration ledger agrees with the log');
+    assert.equal(timeline.history_disagreements, 0);
+    assert.equal(account.mrr, GROWTH_MONTHLY + 4 * GROWTH_SEAT_MONTHLY);
+  });
+});
+
+/* ========================================================================== *
+ * 11. Credit notes reach recognition
+ * ========================================================================== */
+
+describe('a credit note against a finalised invoice', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 1, 10)); });
+  after(() => ws.close());
+
+  test('reduces invoiced and the deferred balance from the day it was issued, and a closed month never moves', async () => {
+    const customer = await ws.customer('Annual Prepay Foundry');
+    await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_annual' }],
+      billing_cycle_anchor: UTC(2026, 1, 10),
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+    const invoices = await ws.ok('GET', `/v1/invoices?customer=${customer.id}`);
+    const invoice = invoices.data.find((row: any) => row.status === 'open');
+    assert.ok(invoice, 'the year was billed up front');
+    assert.equal(invoice.total, GROWTH_ANNUAL);
+    const days = 365;
+
+    // Ninety days in. 499,000 over 365 days is 1,367 a day with 45 left over.
+    await ws.travelTo(UTC(2026, 4, 10));
+    const elapsed = 90;
+    const before = await ws.ok('GET', `/v1/revenue/deferred?invoice=${invoice.id}`);
+    assert.equal(before.totals.invoiced, GROWTH_ANNUAL);
+    assert.equal(before.totals.recognised, recognisedByHand(GROWTH_ANNUAL, days, elapsed));
+    assert.equal(before.totals.recognised, 123_041, '499,000 × 90 ÷ 365 is 123,041.09: the straight line, not a front-loaded remainder');
+    const schedule = before.lines[0].schedule;
+    for (let day = 1; day <= schedule.length; day++) {
+      const toDate = schedule.slice(0, day).reduce((sum: number, entry: any) => sum + entry.amount, 0);
+      assert.ok(
+        Math.abs(toDate - recognisedByHand(GROWTH_ANNUAL, days, day)) <= 1,
+        `day ${day}: cumulative ${toDate} strays from the straight line ${recognisedByHand(GROWTH_ANNUAL, days, day)}`,
+      );
+    }
+    assert.equal(before.totals.deferred_balance, GROWTH_ANNUAL - before.totals.recognised);
+    const bookBefore = await ws.ok('GET', `/v1/revenue/deferred?customer=${customer.id}&months=4`);
+    const monthOf = (report: any, month: string) => report.series.find((row: any) => row.month === month);
+
+    const credit = 9_900;
+    const note = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: credit, reason: 'service_credit' });
+    assert.equal(note.status, 'issued');
+    assert.equal(note.total, credit);
+    const credited = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(credited.amount_due, GROWTH_ANNUAL - credit, 'billing took it off what is owed');
+
+    const after = await ws.ok('GET', `/v1/revenue/deferred?invoice=${invoice.id}`);
+    const creditElapsed = recognisedByHand(credit, days, elapsed);
+    assert.equal(after.totals.invoiced, GROWTH_ANNUAL - credit, 'invoiced is net of the note');
+    assert.equal(after.totals.invoiced_gross, GROWTH_ANNUAL);
+    assert.equal(after.totals.credited, credit);
+    assert.equal(
+      after.totals.recognised, before.totals.recognised - creditElapsed,
+      'the ninety days already delivered are reversed at their share of the credit',
+    );
+    assert.equal(
+      after.totals.deferred_balance, before.totals.deferred_balance - (credit - creditElapsed),
+      'and the days still ahead come off the deferred balance',
+    );
+    assert.equal(after.totals.invoiced, after.totals.recognised + after.totals.deferred_balance);
+    assert.equal(after.reconciliation.balanced, true, after.reconciliation.note ?? '');
+    assert.equal(after.totals.credit_note_lines, 1);
+    const creditLine = after.lines.find((line: any) => line.kind === 'credit_note');
+    assert.ok(creditLine, 'the credit is a line of the schedule');
+    assert.equal(creditLine.amount, -credit);
+    assert.equal(creditLine.credit_note, note.id);
+    assert.equal(creditLine.reduces_line, credited.lines[0].id);
+    assert.equal(creditLine.recognised_to_date, -creditElapsed);
+
+    // The months that closed before the note read exactly what they read
+    // before it; the note's own month carries the whole reversal.
+    const bookAfter = await ws.ok('GET', `/v1/revenue/deferred?customer=${customer.id}&months=4`);
+    for (const month of ['2026-01', '2026-02', '2026-03']) {
+      assert.equal(monthOf(bookAfter, month).recognised, monthOf(bookBefore, month).recognised, `${month} moved`);
+      assert.equal(monthOf(bookAfter, month).invoiced, monthOf(bookBefore, month).invoiced, `${month} invoiced moved`);
+      assert.equal(monthOf(bookAfter, month).credited, 0);
+    }
+    assert.equal(monthOf(bookAfter, '2026-04').credited, credit, 'the note is booked in April');
+    assert.equal(monthOf(bookAfter, '2026-04').invoiced, monthOf(bookBefore, '2026-04').invoiced - credit);
+    assert.equal(
+      monthOf(bookAfter, '2026-04').recognised, monthOf(bookBefore, '2026-04').recognised - creditElapsed,
+      'the contra revenue for January to March lands in April, where the note was written',
+    );
+
+    const summary = await ws.ok('GET', `/v1/revenue/summary?currency=usd`);
+    assert.equal(summary.totals.invoiced, (await ws.ok('GET', '/v1/revenue/deferred?currency=usd')).totals.invoiced);
+
+    // Ten days on, withdrawn: the note gives everything back and the schedule
+    // reads as if it had never been written. The undo path is exact.
+    await ws.travelTo(UTC(2026, 4, 20));
+    await ws.ok('POST', `/v1/credit_notes/${note.id}/void`, {});
+    const restored = await ws.ok('GET', `/v1/revenue/deferred?invoice=${invoice.id}`);
+    assert.equal(restored.totals.invoiced, GROWTH_ANNUAL);
+    assert.equal(restored.totals.credited, 0);
+    assert.equal(restored.totals.recognised, recognisedByHand(GROWTH_ANNUAL, days, 100));
+    assert.equal(restored.totals.deferred_balance, GROWTH_ANNUAL - restored.totals.recognised);
+    assert.equal(restored.totals.credit_note_lines, 0);
+
+    // And a note that was in force at an earlier as_of is still read there,
+    // because the balance at that instant is a fact about that instant.
+    const then = await ws.ok('GET', `/v1/revenue/deferred?invoice=${invoice.id}&as_of=${UTC(2026, 4, 15)}`);
+    assert.equal(then.totals.credited, credit, 'voided later, in force then');
+    assert.equal(then.totals.recognised, recognisedByHand(GROWTH_ANNUAL, days, 95) - recognisedByHand(credit, days, 95));
+    const earlier = await ws.ok('GET', `/v1/revenue/deferred?invoice=${invoice.id}&as_of=${UTC(2026, 4, 9)}`);
+    assert.equal(earlier.totals.credited, 0, 'and not before it was issued');
+  });
+});
+
+/* ========================================================================== *
+ * 12. Usage revenue is invoice money
+ * ========================================================================== */
+
+describe('usage revenue', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 6, 15)); });
+  after(() => ws.close());
+
+  const FINALISED = `('open', 'paid', 'uncollectible')`;
+  const invoicedUsage = (from: number, to: number): number => ws.app.ctx.db.count(
+    `SELECT COALESCE(SUM(l.amount), 0) FROM billing_invoice_lines l
+       JOIN billing_invoices i ON i.id = l.invoice_id AND i.org_id = l.org_id
+      WHERE l.org_id = ? AND i.currency = 'usd' AND l.released = 0 AND i.status IN ${FINALISED}
+        AND i.finalized_at >= ? AND i.finalized_at < ? AND l.kind IN ('usage', 'true_up')`,
+    ORG, from, to,
+  );
+  const unbilledUsage = (at: number): number => ws.app.ctx.db.count(
+    `SELECT COALESCE(SUM(b.billed_amount), 0) FROM credit_billable_items b
+       LEFT JOIN billing_invoice_lines l
+         ON l.org_id = b.org_id AND l.source_type = 'billable_item' AND l.source_id = b.id AND l.released = 0
+       LEFT JOIN billing_invoices i
+         ON i.org_id = l.org_id AND i.id = l.invoice_id AND i.status IN ${FINALISED} AND i.finalized_at <= ?
+      WHERE b.org_id = ? AND b.currency = 'usd' AND b.kind IN ('charged', 'true_up') AND b.status <> 'void'
+        AND b.period_end <= ? AND i.id IS NULL`,
+    at, ORG, at,
+  );
+  const settledValue = (from: number, to: number): number => ws.app.ctx.db.count(
+    `SELECT COALESCE(SUM(full_amount), 0) FROM credit_settlements
+      WHERE org_id = ? AND currency = 'usd' AND status = 'settled' AND period_end > ? AND period_end <= ?`,
+    ORG, from, to,
+  );
+
+  const check = async (where: string) => {
+    const usage = await ws.ok('GET', '/v1/revenue/usage?months=12&currency=usd');
+    const { from, to } = usage.range;
+    assert.equal(usage.totals.charged, invoicedUsage(from, to), `${where}: charged is what the usage and true-up lines on finalised invoices carry`);
+    assert.equal(usage.totals.overage_share_of_invoiced.numerator, usage.totals.charged, `${where}: the overage share is that same figure`);
+    assert.equal(usage.totals.unbilled_balance, unbilledUsage(to), `${where}: unbilled is every settled charge with no finalised invoice`);
+    assert.equal(usage.totals.metered_value, settledValue(from, to), `${where}: metered value is what the settlements priced`);
+    assert.equal(usage.meters.reduce((sum: number, meter: any) => sum + meter.charged, 0), usage.totals.charged, `${where}: the meters add up to the total`);
+    assert.equal(usage.totals.settled.invoiced + usage.totals.unbilled, usage.totals.settled.net_charged, `${where}: settled is billed or unbilled`);
+    assert.equal(usage.series.reduce((sum: number, row: any) => sum + row.charged, 0), usage.totals.charged, `${where}: so do the months`);
+    assert.equal(usage.series[usage.series.length - 1].unbilled_balance, usage.totals.unbilled_balance);
+    assert.equal(usage.balanced, true, usage.reconciliation.note ?? '');
+    const bridge = usage.reconciliation.checks.find((c: any) => c.name === 'invoice_lines_carry_the_settled_amount');
+    assert.equal(bridge.ok, true);
+    const deferred = await ws.ok('GET', '/v1/revenue/deferred?months=12&currency=usd');
+    assert.equal(deferred.totals.unbilled_usage, usage.totals.unbilled_balance, `${where}: recognition reads the same arrears`);
+    assert.ok(deferred.totals.unbilled_balance >= deferred.totals.unbilled_usage);
+    const summary = await ws.ok('GET', '/v1/revenue/summary?months=12&currency=usd');
+    assert.equal(summary.totals.usage_charged, usage.totals.charged);
+    assert.equal(summary.totals.usage_unbilled, usage.totals.unbilled_balance);
+    return usage;
+  };
+
+  test('charged is what reached an invoice; settled usage waiting for its bill is unbilled', async () => {
+    // Northwind opens with a settled window that no invoice has drawn yet.
+    const settled = ws.app.ctx.db.count(
+      `SELECT COALESCE(SUM(billed_amount), 0) FROM credit_billable_items WHERE org_id = ? AND currency = 'usd' AND kind IN ('charged', 'true_up') AND status = 'pending'`,
+      ORG,
+    );
+    assert.ok(settled > 0, 'the seeded book has settled usage waiting for its invoice');
+    const opening = await check('at seed');
+    assert.equal(opening.totals.charged, 0, 'nothing metered has reached an invoice yet');
+    assert.equal(opening.totals.unbilled_balance, settled, 'so all of it is unbilled');
+    assert.ok(opening.totals.metered_value > 0, 'though the window has been priced');
+
+    // A quarter of renewals draws the invoices that carry it.
+    await ws.app.travel(90 * DAY);
+    const later = await check('after ninety days');
+    assert.ok(later.totals.charged > 0, 'the usage was billed');
+    assert.ok(later.totals.charged !== later.totals.settled.charged || later.totals.settled.true_ups === 0,
+      'a true-up on the invoice is in charged at what the invoice carries');
   });
 });
 

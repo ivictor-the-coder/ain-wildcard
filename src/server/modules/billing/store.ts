@@ -30,6 +30,7 @@ import {
   isRecurring, longDate, periodAt, Pricebook, recurringLines, recurringSubtotal,
   resolveInterval, sameCadence, snapToAnchorDay, subscriptionMrr, type PricedItem,
 } from './cycle';
+import { InvoiceHolds, type InvoiceHold } from './holds';
 import { Invoices, describeWindow, type DraftLine } from './invoices';
 import { previewChange, prorate, type ItemState, type ProrationSet } from './proration';
 import { assertTransition, countsAsRevenue, isTerminal, transitionEvent } from './status';
@@ -79,9 +80,13 @@ export class Billing {
   /** The only legal way to reduce a finalised bill. */
   readonly creditNotes: CreditNotes;
 
+  /** Bills waiting for the metered window they settle before they are drawn. */
+  readonly holds: InvoiceHolds;
+
   constructor(private readonly ctx: Ctx) {
     this.invoices = new Invoices(ctx, this);
     this.creditNotes = new CreditNotes(ctx, this);
+    this.holds = new InvoiceHolds(ctx, this);
   }
 
   book(orgId: string): Pricebook { return new Pricebook(this.ctx, orgId); }
@@ -904,6 +909,12 @@ export class Billing {
       // happens to agree today.
       taxOf: (lines) => this.invoices.taxTotals(orgId, customer, lines),
       automaticTax: this.automaticTaxFor(orgId, customer),
+      // What an `always_invoice` bill sweeps up besides its own lines: the
+      // items already waiting for this customer, in the currency the bill can
+      // carry — exactly the claim `issue()` will make.
+      waitingLines: this.pendingItems(orgId, { customer: customer.id, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE })
+        .filter((item) => item.currency === sub.currency)
+        .map((item) => ({ price: item.price, amount: item.amount, currency: item.currency })),
     });
 
     return {
@@ -1077,6 +1088,13 @@ export class Billing {
       // `always_invoice` means what it says whichever way the set nets. A
       // credit invoiced now is a document with the tax on it; a credit left to
       // the balance is a number with the tax silently kept.
+      //
+      // The bill sweeps everything waiting for this customer, not only the
+      // lines this change wrote. A seat change made with `create_prorations`
+      // last week is an invoice item waiting for "the next invoice", and this
+      // is it — leaving it behind to be billed by a renewal that a cancellation
+      // may never reach is how a net charge goes unbilled. The preview priced
+      // the same sweep into `amount_due_now`, so the two still agree.
       if (behavior === 'always_invoice' && settlement.pendingIds.length) {
         this.requestInvoice(orgId, updated, {
           reason: 'subscription_update',
@@ -1085,7 +1103,6 @@ export class Billing {
           fraction: null,
           book,
           immediate: true,
-          pendingItemIds: settlement.pendingIds,
           recurring: false,
           meta,
         });
@@ -1291,7 +1308,7 @@ export class Billing {
         book,
         trialEnd: sub.trial_end,
       });
-      this.settleCancellation(orgId, sub, set, book, meta);
+      this.settleCancellation(orgId, sub, set);
     }
     this.ctx.db.run(
       `UPDATE billing_subscription_periods SET status = 'canceled' WHERE org_id = ? AND subscription_id = ? AND period_end > ?`,
@@ -1300,31 +1317,27 @@ export class Billing {
     for (const item of sub.items) this.ctx.svc.catalog.releaseUsage(orgId, item.price, { type: 'subscription', id: sub.id });
     const canceled = this.transition(orgId, sub, 'canceled', { reason: opts.reason, comment: opts.comment ?? null, endedAt: opts.at, meta });
     this.cancelJobs(orgId, sub.id);
+    this.finalInvoice(orgId, canceled, meta);
     return canceled;
   }
 
   /**
    * Hand back the unused remainder of a period on the way out.
    *
-   * The lines are written and invoiced on the spot rather than left waiting,
-   * because a cancelled subscription has no next cycle to sweep them up. Going
+   * The lines are written as invoice items and left for `finalInvoice`, which
+   * follows in the same transaction: a cancelled subscription has no next
+   * cycle to sweep them up, so the final bill is the one that does. Going
    * through a real bill is also the only way the credit carries its tax: the
    * final invoice is a document with `unused time -$25.00` and `VAT -$4.75` on
    * it, and its value lands on the account balance because a bill can never go
    * below zero. A bare balance adjustment would have handed back the net and
    * kept the tax on service that was never supplied.
    */
-  private settleCancellation(
-    orgId: string, sub: Subscription, set: ProrationSet, book: Pricebook, meta: WriteMeta,
-  ): void {
-    if (!set.lines.length) return;
+  private settleCancellation(orgId: string, sub: Subscription, set: ProrationSet): void {
     const now = this.ctx.now();
-    const ids: string[] = [];
     for (const line of set.lines) {
-      const id = newId('invoiceitem');
-      ids.push(id);
       this.ctx.db.insert('billing_pending_items', {
-        id, org_id: orgId, customer_id: sub.customer, subscription_id: sub.id,
+        id: newId('invoiceitem'), org_id: orgId, customer_id: sub.customer, subscription_id: sub.id,
         subscription_item_id: line.subscription_item, price_id: line.price, quantity: line.quantity,
         amount: line.amount, currency: line.currency, description: line.description, explanation: line.explanation,
         kind: line.kind, period_start: line.period.start, period_end: line.period.end,
@@ -1333,15 +1346,52 @@ export class Billing {
         status: 'pending', invoice_id: null, created: now,
       } as any);
     }
-    this.requestInvoice(orgId, sub, {
+  }
+
+  /**
+   * The last bill a subscription raises.
+   *
+   * Everything still waiting for "the next invoice for this subscription" —
+   * a seat change made with `create_prorations` weeks ago, the credit for the
+   * unused remainder written a moment ago — has just lost the cycle that
+   * would have swept it. Left where it is, a customer who cancelled at the end
+   * of a period walked away from a net charge nobody ever billed, and the
+   * overview counted it under `uninvoiced_prorations` for ever. So the
+   * cancellation draws the bill the next cycle would have drawn, minus the
+   * period it will not enter.
+   *
+   * A subscription with metered items also owes for the part-period it used,
+   * which metering settles off `subscription.canceled` — after this commits.
+   * The bill waits for that settlement the same way a renewal's does, so the
+   * final document carries the final usage rather than leaving it to a bill
+   * that is never coming.
+   */
+  private finalInvoice(orgId: string, canceled: Subscription, meta: WriteMeta): Invoice | null {
+    const period: Period = { start: canceled.current_period_start, end: canceled.current_period_end };
+    const used: Period = { start: period.start, end: canceled.ended_at ?? period.end };
+    const hold = this.holds.open(orgId, canceled, {
       reason: 'subscription_update',
-      period: { start: sub.current_period_start, end: sub.current_period_end },
+      period,
+      arrearsPeriod: used,
+      recurring: [],
+      billDate: used.end,
+      awaitsAnnouncement: false,
+      meta,
+    });
+    if (hold) return null;
+    const customer = this.requireCustomer(orgId, canceled.customer);
+    return this.invoices.issue(orgId, {
+      reason: 'subscription_update',
+      customerId: canceled.customer,
+      subscription: canceled,
+      currency: canceled.currency,
+      period,
       arrearsPeriod: null,
-      fraction: null,
-      book,
-      immediate: true,
-      pendingItemIds: ids,
-      recurring: false,
+      recurring: [],
+      collectionMethod: canceled.collection_method,
+      daysUntilDue: canceled.days_until_due ?? customer.invoice_settings.days_until_due,
+      pauseBehavior: canceled.pause_collection?.behavior ?? null,
+      createdAt: used.end,
       meta,
     });
   }
@@ -1617,8 +1667,12 @@ export class Billing {
    * `invoiced`, point them at the bill, and hand back exactly what was claimed
    * so the caller can turn each one into a line.
    *
-   * `ids` narrows it to one change — what `always_invoice` bills — and
-   * `currency` keeps a claim from ever outrunning what the invoice can carry.
+   * `ids` narrows the claim to a named set of items, for a caller that bills
+   * exactly those and nothing else; every subscription bill — the cycle, an
+   * `always_invoice` change, the final invoice — leaves it out and sweeps the
+   * lot, because an item left waiting for "the next invoice" while one is
+   * being drawn is an item that may never be billed. `currency` keeps a claim
+   * from ever outrunning what the invoice can carry.
    * A row stamped `invoiced` that never becomes a line is money lost quietly,
    * which is why the filtering happens here rather than afterwards.
    */
@@ -1651,9 +1705,16 @@ export class Billing {
    * this same transaction so a bill and the event announcing it can never
    * disagree.
    *
+   * A cycle whose closed window has metered usage on it does not draw its bill
+   * here. Settlement is a job that reacts to the very event this call emits,
+   * so a bill drawn now would be dated for a window whose usage had not been
+   * priced yet — and would carry last cycle's usage instead. The hold draws
+   * the same bill, with the same lines, dated the same day, the moment the
+   * window is settled; `invoice` on the event is null until then and
+   * `invoice_hold` says why.
+   *
    * There is no invoice when there is nothing billable — a metered-only cycle
-   * still raises the event that settles its usage, and that usage arrives on
-   * the next bill.
+   * with no usage in the window settles to nothing and raises no document.
    */
   private requestInvoice(
     orgId: string, sub: Subscription,
@@ -1678,7 +1739,18 @@ export class Billing {
     // cycle swept up rather than what is left afterwards, which is nothing.
     const pending = this.pendingItems(orgId, { subscription: sub.id, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE });
 
-    const invoice = this.invoices.issue(orgId, {
+    const hold = opts.arrearsPeriod
+      ? this.holds.open(orgId, sub, {
+        reason: opts.reason,
+        period: opts.period,
+        arrearsPeriod: opts.arrearsPeriod,
+        recurring: scaled,
+        billDate: opts.createdAt ?? this.ctx.now(),
+        awaitsAnnouncement: true,
+        meta: opts.meta,
+      })
+      : null;
+    const invoice = hold ? null : this.invoices.issue(orgId, {
       reason: opts.reason,
       customerId: sub.customer,
       subscription: sub,
@@ -1713,13 +1785,42 @@ export class Billing {
       pending_total: pending.reduce((total, item) => total + item.amount, 0),
       customer_balance: customer.balance,
       // The bill these numbers became, so a subscriber can link straight to it
-      // instead of guessing. Null when nothing was billable in advance.
+      // instead of guessing. Null when nothing was billable in advance, or
+      // when the bill is waiting for the closed window's usage — in which
+      // case `invoice_hold` names the wait and `invoice_hold.released` names
+      // the bill.
       invoice: invoice?.id ?? null,
       invoice_number: invoice?.number ?? null,
       invoice_total: invoice?.total ?? 0,
+      invoice_hold: hold?.id ?? null,
     }, { objectId: sub.id, objectType: 'subscription' });
 
     return invoice;
+  }
+
+  /**
+   * Draw the bill a hold was waiting to draw: the advance lines it froze at
+   * the boundary, dated the boundary, plus every proration and every settled
+   * usage line waiting for this customer now. The subscription is read fresh
+   * for how the bill is collected; the lines are not, because a change made
+   * since the boundary belongs to the next bill, not this one.
+   */
+  drawHeldInvoice(orgId: string, hold: InvoiceHold): Invoice | null {
+    const sub = this.requireSubscription(orgId, hold.subscription);
+    const customer = this.requireCustomer(orgId, hold.customer);
+    return this.invoices.issue(orgId, {
+      reason: hold.billing_reason,
+      customerId: customer.id,
+      subscription: sub,
+      currency: sub.currency,
+      period: hold.period,
+      arrearsPeriod: hold.arrears_period,
+      recurring: hold.recurring,
+      collectionMethod: sub.collection_method,
+      daysUntilDue: sub.days_until_due ?? customer.invoice_settings.days_until_due,
+      pauseBehavior: sub.pause_collection?.behavior ?? null,
+      createdAt: hold.bill_date,
+    });
   }
 
   /**

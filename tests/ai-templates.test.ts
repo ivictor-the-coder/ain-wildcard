@@ -300,12 +300,12 @@ function winRate(rows: Rec[], extra: unknown[] = []): Expectation {
   return { figures: [pct(rate)], numbers: allow(pct(rate), won, decided, ...extra) };
 }
 
-/** A ranking: the leader named first, the top rows' figures and nothing below them. */
-function ranked(rows: { label: string; formatted: string }[], limit: number, extra: unknown[] = []): Expectation {
+/** A ranking: the leader named first, the top rows' figures, and the rows below them counted, never printed. */
+function ranked(rows: { label: string; formatted: string }[], limit: number, extra: unknown[] = [], total = rows.length): Expectation {
   const top = rows.slice(0, limit);
   return {
     figures: top.length ? [top[0].formatted] : [NONE],
-    numbers: allow(...top.map((r) => r.formatted), ...top.map((r) => r.label), ...extra),
+    numbers: allow(...top.map((r) => r.formatted), ...top.map((r) => r.label), Math.max(0, total - top.length), ...extra),
     also: (body) => {
       if (top.length < 2) return;
       const first = body.content.indexOf(top[0].label);
@@ -315,27 +315,59 @@ function ranked(rows: { label: string; formatted: string }[], limit: number, ext
   };
 }
 
+const lineOf = (r: { label: string; formatted: string }): string => `${r.label} — ${r.formatted}`;
+
 /** Top accounts by a per-company figure, ties at the cut-off included so the allowed set is closed under reordering. */
 function topCompanies(score: (c: Rec) => number, limit: number): { label: string; formatted: string; value: number }[] {
   const rows = recs('company').map((c) => ({ label: c.name, value: score(c) })).filter((r) => r.value > 0).sort((a, b) => b.value - a.value);
   const cut = rows[Math.min(limit, rows.length) - 1]?.value ?? 0;
   return rows.filter((r) => r.value >= cut).map((r) => ({ ...r, formatted: money(r.value) }));
 }
+/** How many accounts carry the figure at all — the base of a ranking's "…and N more". */
+const companiesWith = (score: (c: Rec) => number): number => recs('company').filter((c) => score(c) > 0).length;
+
+/**
+ * A ranking of accounts held in several currency books: the top of every book
+ * is stated in that book's currency, and the accounts below every cut are
+ * counted — never a cut across books by raw minor units.
+ */
+function rankedBooks(rows: (Group & { currency: string })[], limit: number, extra: unknown[] = []): Expectation {
+  const books = new Map<string, (Group & { currency: string })[]>();
+  for (const r of [...rows].sort((a, b) => b.value - a.value)) books.set(r.currency, [...(books.get(r.currency) ?? []), r]);
+  const figures: (string | RegExp)[] = [];
+  const numbers = allow(...extra);
+  let shown = 0;
+  for (const book of books.values()) {
+    const top = book.slice(0, limit);
+    shown += top.length;
+    figures.push(...top.map((r) => r.formatted));
+    for (const value of allow(...top.map((r) => r.formatted), ...top.map((r) => r.label), book.length - top.length)) numbers.add(value);
+  }
+  numbers.add(rows.length - shown);
+  return {
+    figures,
+    numbers,
+    also: (body) => {
+      for (const book of books.values()) for (const r of book.slice(limit)) assert.ok(!String(body.content).includes(lineOf(r)), `${r.label} is below the cut in ${r.currency.toUpperCase()}:\n${body.content}`);
+    },
+  };
+}
 
 /** Paid or issued invoices per billing customer, per currency, the way a ledger ranking reads them. */
 function invoiceRanking(w: Window, column: 'amount_paid' | 'total', status: string, limit: number): Expectation {
   const dated = column === 'amount_paid' ? 'paid_at' : 'finalized_at';
-  const rows = app.db.all<{ customer_id: string; currency: string; v: number | null; nn: number }>(
+  const every = app.db.all<{ customer_id: string; currency: string; v: number | null; nn: number }>(
     `SELECT customer_id, currency, SUM(${column}) AS v, COUNT(*) AS nn FROM billing_invoices
-     WHERE org_id = ? AND ${status} AND ${dated} >= ? AND ${dated} < ? GROUP BY customer_id, currency ORDER BY v DESC LIMIT 40`,
+     WHERE org_id = ? AND ${status} AND ${dated} >= ? AND ${dated} < ? GROUP BY customer_id, currency ORDER BY v DESC`,
     ORG, w.start, w.end);
+  const rows = every.slice(0, 40);
   const books = new Map<string, { label: string; formatted: string }[]>();
   for (const r of rows) {
     const book = books.get(r.currency) ?? [];
     book.push({ label: customerName(r.customer_id), formatted: money(Number(r.v ?? 0), r.currency) });
     books.set(r.currency, book);
   }
-  const numbers = allow(w.label);
+  const numbers = allow(w.label, every.length - rows.length);
   const figures: (string | RegExp)[] = [];
   for (const book of books.values()) {
     const top = book.slice(0, limit);
@@ -472,6 +504,8 @@ const pendingWrite = (tool: string, args: (body: Completion) => void, extra: unk
 const ACONCAGUA = 'Aconcagua Alimentos';
 const KESTREL = 'Kestrel Aerospace Components';
 const MERIDIAN = 'Meridian Forge Systems';
+const RHEINWERK = 'Rheinwerk Antriebstechnik';
+const BRIGHTLINE = 'Brightline Foods';
 const DEAL_A = 'Aconcagua Alimentos — pilot expansion to 3 lines';
 const DEAL_B = 'Meridian Forge Systems — predictive maintenance add-on';
 const cust = (name: string) => customerIds(byName('company', name).id);
@@ -479,10 +513,90 @@ const cust = (name: string) => customerIds(byName('company', name).id);
 const dealsBy = (name: string) => recs('deal').filter((d) => d.owner === personId(name));
 const decidedIn = (w: Window) => recs('deal').filter((d) => (isWon(d) || isLost(d)) && closeIn(d, w));
 
+/** An account with a ticket in one status, or a deal one predicate holds for, so the scoped count differs from the whole. */
+const withTicketStatus = (status: string): Rec => {
+  const found = recs('company').find((c) => associated(c.id, 'ticket').some((t) => str(t.p.status) === status));
+  assert.ok(found, `fixture: an account with a ${status} ticket`);
+  return found!;
+};
+const withDeal = (holds: (d: Rec) => boolean): Rec => {
+  const found = recs('company').find((c) => associated(c.id, 'deal').some(holds));
+  assert.ok(found, 'fixture: an account with such a deal');
+  return found!;
+};
+
+/* ------------------------- relative windows, by the clock ------------------ */
+
+const utcMonth = (ts: number): number => new Date(ts).getUTCFullYear() * 12 + new Date(ts).getUTCMonth();
+const monthStart = (index: number): number => Date.UTC(Math.floor(index / 12), index % 12, 1);
+const quarterOf = (ts: number): { q: number; y: number } => ({ q: Math.floor(new Date(ts).getUTCMonth() / 3) + 1, y: new Date(ts).getUTCFullYear() });
+const LAST_QUARTER = (now: number): Window => {
+  const { q, y } = quarterOf(now);
+  return q === 1 ? QUARTER(4, y - 1) : QUARTER(q - 1, y);
+};
+const THIS_QUARTER = (now: number): Window => { const { q, y } = quarterOf(now); return { ...QUARTER(q, y), label: `Q${q} ${y} to date` }; };
+const NEXT_QUARTER = (now: number): Window => { const { q, y } = quarterOf(now); return q === 4 ? QUARTER(1, y + 1) : QUARTER(q + 1, y); };
+const LAST_YEAR = (now: number): Window => YEAR(new Date(now).getUTCFullYear() - 1);
+const monthWindow = (index: number): Window => ({ start: monthStart(index), end: monthStart(index + 1), label: `${SHORT_MONTHS[index % 12]} ${Math.floor(index / 12)}` });
+const LAST_MONTH = (now: number): Window => monthWindow(utcMonth(now) - 1);
+const NEXT_MONTH = (now: number): Window => monthWindow(utcMonth(now) + 1);
+
+/* ----------------------------- breakdowns by account ----------------------- */
+
+interface Group { label: string; formatted: string; value: number; count?: number }
+
+/** Recurring revenue per billing customer, from the ledger's own normalisation, in the currency each subscription is priced in. */
+function recurringByAccount(months: 1 | 12): (Group & { currency: string })[] {
+  const billing = app.ctx.svc.billing!;
+  const per = new Map<string, { label: string; value: number; count: number; currency: string }>();
+  for (const sub of billing.subscriptions(ORG, { status: 'all', limit: 500 })) {
+    const monthly = billing.mrr(ORG, sub);
+    if (monthly <= 0) continue;
+    const currency = (sub.currency || 'usd').toLowerCase();
+    const row = per.get(sub.customer) ?? { label: customerName(sub.customer), value: 0, count: 0, currency };
+    row.value += monthly * months;
+    row.count += 1;
+    per.set(sub.customer, row);
+  }
+  return [...per.values()].map((r) => ({ ...r, formatted: money(r.value, r.currency) })).sort((a, b) => b.value - a.value);
+}
+
+/** Open pipeline per company, from the deals linked to it. */
+const pipelineByAccount = (): Group[] => recs('company')
+  .map((c) => { const open = associated(c.id, 'deal').filter(isOpen); return { label: c.name, value: total(open), count: open.length, formatted: money(total(open)) }; })
+  .filter((g) => g.value > 0)
+  .sort((a, b) => b.value - a.value);
+
+/**
+ * A breakdown cut at `limit`: every row above the cut is stated, the rows below
+ * it are counted in a tail and never printed, and a tie at the cut may fall
+ * either side of it.
+ */
+function cutBreakdown(groups: Group[], limit: number, extra: unknown[] = []): Expectation {
+  const sorted = [...groups].sort((a, b) => b.value - a.value);
+  const rest = Math.max(0, sorted.length - limit);
+  const cut = sorted[limit]?.value ?? -Infinity;
+  const stated = sorted.filter((g) => g.value > cut).slice(0, limit);
+  return {
+    figures: [...stated.map((g) => g.formatted), ...(rest > 0 ? [new RegExp(`…and ${n(rest)} more\\.`)] : [])],
+    numbers: allow(...sorted.flatMap((g) => [g.formatted, g.count ?? '', g.label]), rest, ...extra),
+    also: (body) => {
+      if (rest === 0) assert.doesNotMatch(body.content, /…and \d+ more/, `nothing was left out:\n${body.content}`);
+      const printed = sorted.filter((g) => body.content.includes(`${g.label} — ${g.formatted}`)).length;
+      assert.equal(printed, Math.min(limit, sorted.length), `prints exactly the rows above the cut:\n${body.content}`);
+    },
+  };
+}
+
 /** Every group of a breakdown: the rows are the answer, and no total is. */
 const breakdownOf = (groups: { label: string; formatted: string; count?: number }[], extra: unknown[] = []): Expectation => ({
   figures: groups.map((g) => g.formatted),
   numbers: allow(...groups.flatMap((g) => [g.formatted, g.count ?? '', g.label]), ...extra),
+});
+/** A counted measure broken down: the total is stated, and every group under it. */
+const countedBreakdown = (total: number, groups: { label: string; formatted: string }[]): Expectation => ({
+  figures: [countRe(total), ...groups.map((g) => g.formatted)],
+  numbers: allow(total, ...groups.flatMap((g) => [g.formatted, g.label])),
 });
 const groupBy = <T>(rows: T[], key: (row: T) => string): Map<string, T[]> => {
   const out = new Map<string, T[]>();
@@ -610,6 +724,9 @@ const CORPUS: CorpusRow[] = [
   { template: 'deals-decided-period', q: 'Which deals were lost in Q2 2026?', expect: () => listOf(recs('deal').filter((d) => isLost(d) && closeIn(d, QUARTER(2, 2026))), 'deal', 10, ['Q2 2026']) },
   { template: 'count-deals-decided-period', q: 'How many deals did we win in 2025?', expect: () => countRows(recs('deal').filter((d) => isWon(d) && closeIn(d, YEAR(2025))), [2025]) },
   { template: 'count-deals-decided-period', q: 'How many deals closed in 2025?', expect: () => countRows(decidedIn(YEAR(2025)), [2025]) },
+  // An article before a relative period is part of the phrase: "in the last quarter" is "last quarter".
+  { template: 'count-deals-decided-period', q: 'How many deals closed in the last quarter?', expect: (now) => countRows(decidedIn(LAST_QUARTER(now)), [LAST_QUARTER(now).label]) },
+  { template: 'deals-closing-period', q: 'Which deals close in the next quarter?', expect: (now) => listOf(recs('deal').filter((d) => isOpen(d) && closeIn(d, NEXT_QUARTER(now))), 'deal', 10, [NEXT_QUARTER(now).label]) },
 
   /* --------------------------- pipelines and stages -------------------------- */
   { template: 'pipeline-worth', q: 'What is the New business pipeline worth?', expect: () => dealMoney(recs('deal').filter((d) => isOpen(d) && str(d.p.pipeline) === 'new_business')) },
@@ -635,6 +752,8 @@ const CORPUS: CorpusRow[] = [
   { template: 'metric-period', q: 'What was our revenue in 2025?', expect: () => moneyOf(revenueBooks(YEAR(2025)), [2025]) },
   { template: 'metric-period', q: 'Tell me our win rate in 2025', expect: () => winRate(decidedIn(YEAR(2025)), [2025]) },
   { template: 'metric-period', q: 'What were our billings in Q2 2026?', expect: () => moneyOf(invoicedBooks(QUARTER(2, 2026)), ['Q2 2026']) },
+  { template: 'metric-period', q: 'What was our revenue in the previous quarter?', expect: (now) => moneyOf(revenueBooks(LAST_QUARTER(now)), [LAST_QUARTER(now).label]) },
+  { template: 'metric-period', q: 'What was our revenue in the last year?', expect: (now) => moneyOf(revenueBooks(LAST_YEAR(now)), [LAST_YEAR(now).label]) },
   { template: 'metric-verb-period', q: 'How much did we book in 2025?', expect: () => dealMoney(recs('deal').filter((d) => isWon(d) && closeIn(d, YEAR(2025))), [2025]) },
   { template: 'metric-verb-period', q: 'How much was invoiced in Q2 2026?', expect: () => moneyOf(invoicedBooks(QUARTER(2, 2026)), ['Q2 2026']) },
   { template: 'metric-currency-snapshot', q: 'What is our MRR in EUR?', expect: () => moneyOf(recurringBooks(1, { currency: 'eur' })) },
@@ -642,7 +761,13 @@ const CORPUS: CorpusRow[] = [
   { template: 'metric-currency-period', q: 'What was our revenue in EUR in 2025?', expect: () => moneyOf(revenueBooks(YEAR(2025), undefined, 'eur'), [2025]) },
   { template: 'metric-currency-period', q: 'How much did we invoice in USD in Q2 2026?', expect: () => moneyOf(invoicedBooks(QUARTER(2, 2026), undefined, 'usd'), ['Q2 2026']) },
   { template: 'breakdown-snapshot', q: 'What is our open pipeline by stage?', expect: () => breakdownOf([...groupBy(recs('deal').filter(isOpen), (d) => str(d.p.deal_stage)).values()].map((held) => ({ label: str(held[0].p.deal_stage), formatted: money(total(held)), count: held.length }))) },
-  { template: 'breakdown-snapshot', q: 'Break down our open tickets by priority', expect: () => breakdownOf([...groupBy(recs('ticket').filter(isOpenTicket), (t) => str(t.p.priority)).entries()].map(([label, held]) => ({ label, formatted: n(held.length) }))) },
+  // A counted measure leads with its total, the way a grouped record count does; the groups follow.
+  { template: 'breakdown-snapshot', q: 'Break down our open tickets by priority', expect: () => countedBreakdown(recs('ticket').filter(isOpenTicket).length, [...groupBy(recs('ticket').filter(isOpenTicket), (t) => str(t.p.priority)).entries()].map(([label, held]) => ({ label, formatted: n(held.length) }))) },
+  // By account: every book is stated in its own currency, and a cut says how many rows it left out.
+  { template: 'breakdown-snapshot', q: 'What is our MRR by account?', expect: () => cutBreakdown(recurringByAccount(1), 25) },
+  { template: 'breakdown-snapshot', q: 'What is our ARR by account?', expect: () => cutBreakdown(recurringByAccount(12), 25) },
+  { template: 'breakdown-snapshot', q: 'What is our open pipeline by account?', expect: () => cutBreakdown(pipelineByAccount(), 25) },
+  { template: 'breakdown-snapshot', q: 'How many customers do we have by industry?', expect: () => countedBreakdown(recs('company').filter((c) => str(c.p.type) === 'customer').length, [...groupBy(recs('company').filter((c) => str(c.p.type) === 'customer'), (c) => str(c.p.industry)).entries()].map(([value, held]) => ({ label: optionLabel('company', 'industry', value), formatted: n(held.length) }))) },
   { template: 'breakdown-period', q: 'What was our win rate by owner in 2025?', expect: () => breakdownOf([...groupBy(decidedIn(YEAR(2025)), (d) => d.owner ?? 'unassigned').values()].map((held) => ({ label: ownerName(held[0].owner), formatted: pct((held.filter(isWon).length / held.length) * 100) })), [2025]) },
   { template: 'breakdown-period', q: 'Split our closed won bookings by owner in 2025', expect: () => breakdownOf(ownerGroups(recs('deal').filter((d) => isWon(d) && closeIn(d, YEAR(2025)))), [2025]) },
 
@@ -661,16 +786,20 @@ const CORPUS: CorpusRow[] = [
   { template: 'owner-activities-period', q: 'How many calls has Priya logged in 2026?', expect: () => countRows(recs('call').filter((c) => c.owner === personId('Priya Raman') && inWindow(c.p.occurred_at, YEAR(2026))), [2026]) },
   { template: 'rep-most-metric', q: 'Who has the most open pipeline?', expect: () => { const groups = ownerGroups(recs('deal').filter(isOpen)); return { ...ranked(groups, groups.length), numbers: allow(...groups.flatMap((g) => [g.formatted, g.count, g.label])) }; } },
   { template: 'rep-most-metric', q: 'Which rep has the least pipeline?', expect: () => { const groups = ownerGroups(recs('deal').filter(isOpen)).reverse(); return { ...ranked(groups, groups.length), numbers: allow(...groups.flatMap((g) => [g.formatted, g.count, g.label])) }; } },
+  { template: 'rep-most-metric', q: 'Which rep carries the least open pipeline?', expect: () => { const groups = ownerGroups(recs('deal').filter(isOpen)).reverse(); return { ...ranked(groups, groups.length), numbers: allow(...groups.flatMap((g) => [g.formatted, g.count, g.label])) }; } },
   { template: 'rep-most-bookings-period', q: 'Who booked the most in 2025?', expect: () => { const groups = ownerGroups(recs('deal').filter((d) => isWon(d) && closeIn(d, YEAR(2025)))); return { ...ranked(groups, groups.length), numbers: allow(2025, ...groups.flatMap((g) => [g.formatted, g.count, g.label])) }; } },
   { template: 'rep-most-bookings-period', q: 'Which seller won the least in 2025?', expect: () => { const groups = ownerGroups(recs('deal').filter((d) => isWon(d) && closeIn(d, YEAR(2025)))).reverse(); return { ...ranked(groups, groups.length), numbers: allow(2025, ...groups.flatMap((g) => [g.formatted, g.count, g.label])) }; } },
 
   /* --------------------------------- rankings -------------------------------- */
-  { template: 'rank-accounts', q: 'Who is our biggest customer by closed-won bookings?', expect: (now) => ranked(topCompanies((c) => total(associated(c.id, 'deal').filter((d) => isWon(d) && closeIn(d, ALL_TIME(now)))), 5), 5) },
+  { template: 'rank-accounts', q: 'Who is our biggest customer by closed-won bookings?', expect: (now) => { const score = (c: Rec) => total(associated(c.id, 'deal').filter((d) => isWon(d) && closeIn(d, ALL_TIME(now)))); return ranked(topCompanies(score, 5), 5, [], companiesWith(score)); } },
   { template: 'rank-accounts', q: 'Which accounts have our highest revenue?', expect: (now) => invoiceRanking(ALL_TIME(now), 'amount_paid', `status = 'paid'`, 5) },
-  { template: 'rank-accounts-period', q: 'Which accounts booked the most in 2025?', expect: () => ranked(topCompanies((c) => total(associated(c.id, 'deal').filter((d) => isWon(d) && closeIn(d, YEAR(2025)))), 5), 5, [2025]) },
+  { template: 'rank-accounts-period', q: 'Which accounts booked the most in 2025?', expect: () => { const score = (c: Rec) => total(associated(c.id, 'deal').filter((d) => isWon(d) && closeIn(d, YEAR(2025)))); return ranked(topCompanies(score, 5), 5, [2025], companiesWith(score)); } },
   { template: 'rank-accounts-period', q: 'Who were our biggest customers by spend in 2025?', expect: () => invoiceRanking(YEAR(2025), 'amount_paid', `status = 'paid'`, 5) },
   { template: 'top-n-accounts', q: 'Top 5 customers by revenue', expect: (now) => invoiceRanking(ALL_TIME(now), 'amount_paid', `status = 'paid'`, 5) },
-  { template: 'top-n-accounts', q: 'What are our top 3 accounts by open pipeline', expect: () => ranked(topCompanies((c) => total(associated(c.id, 'deal').filter(isOpen)), 3), 3, [3]) },
+  { template: 'top-n-accounts', q: 'What are our top 3 accounts by open pipeline', expect: () => { const score = (c: Rec) => total(associated(c.id, 'deal').filter(isOpen)); return ranked(topCompanies(score, 3), 3, [3], companiesWith(score)); } },
+  // A ranking over several books is the top N of each book, never a cut across books by raw minor units.
+  { template: 'top-n-accounts', q: 'Top 5 customers by MRR', expect: () => rankedBooks(recurringByAccount(1), 5, [5]) },
+  { template: 'top-n-accounts', q: 'What are our top 10 customers by ARR?', expect: () => rankedBooks(recurringByAccount(12), 10, [10]) },
 
   /* ---------------------------------- ledger --------------------------------- */
   { template: 'subscriptions-on-plan', q: 'Which subscriptions are on the Telemetry Cloud Scale plan?', expect: () => { const on = subscriptionsOn('prod_nw_scale'); return { figures: [countRe(on.ids.length)], numbers: allow(on.ids.length, ...on.names, ...on.nicknames), ids: new Set(on.ids) }; } },
@@ -732,6 +861,15 @@ const CORPUS: CorpusRow[] = [
   { template: 'account-contacts-count', q: `How many people do we know at ${KESTREL}?`, expect: () => countRows(associated(byName('company', KESTREL).id, 'contact')) },
   { template: 'account-open-deals', q: `Which deals are open at ${ACONCAGUA}?`, expect: () => listOf(associated(byName('company', ACONCAGUA).id, 'deal').filter(isOpen), 'deal', 10) },
   { template: 'account-open-deals', q: () => `List ${withOpenDeals().name}'s open deals`, expect: () => listOf(associated(withOpenDeals().id, 'deal').filter(isOpen), 'deal', 10) },
+  // Without the word "open", every row on the account is the answer; with a state, the rows in that state.
+  { template: 'account-tickets-count', q: `How many tickets does ${RHEINWERK} have?`, expect: () => countRows(associated(byName('company', RHEINWERK).id, 'ticket')) },
+  { template: 'account-tickets-count', q: () => `How many closed tickets are there at ${withTicketStatus('closed').name}?`, expect: () => countRows(associated(withTicketStatus('closed').id, 'ticket').filter((t) => str(t.p.status) === 'closed')) },
+  { template: 'account-tickets-count', q: () => `How many escalated tickets does ${withTicketStatus('escalated').name} have?`, expect: () => countRows(associated(withTicketStatus('escalated').id, 'ticket').filter((t) => str(t.p.status) === 'escalated')) },
+  { template: 'account-deals', q: `Which deals does ${BRIGHTLINE} have?`, expect: () => listOf(associated(byName('company', BRIGHTLINE).id, 'deal'), 'deal', 10) },
+  { template: 'account-deals', q: () => `List the won deals at ${withDeal(isWon).name}`, expect: () => listOf(associated(withDeal(isWon).id, 'deal').filter(isWon), 'deal', 10) },
+  { template: 'account-deals', q: () => `Which lost deals do we have with ${withDeal(isLost).name}?`, expect: () => listOf(associated(withDeal(isLost).id, 'deal').filter(isLost), 'deal', 10) },
+  { template: 'account-deals-count', q: `How many deals does ${RHEINWERK} have?`, expect: () => countRows(associated(byName('company', RHEINWERK).id, 'deal')) },
+  { template: 'account-deals-count', q: () => `How many closed won deals are there at ${withDeal(isWon).name}?`, expect: () => countRows(associated(withDeal(isWon).id, 'deal').filter(isWon)) },
   { template: 'record-timeline', q: `What happened recently at ${ACONCAGUA}?`, expect: (now) => timelineOf(byName('company', ACONCAGUA), now) },
   { template: 'record-timeline', q: `Show me the recent history of ${KESTREL}`, expect: (now) => timelineOf(byName('company', KESTREL), now) },
 
@@ -769,7 +907,8 @@ const CORPUS: CorpusRow[] = [
 
   /* -------------------------------- dimensions ------------------------------- */
   { template: 'count-by-dimension', q: 'How many deals are there by stage?', expect: () => { const groups = [...groupBy(recs('deal'), (d) => str(d.p.deal_stage)).entries()]; return { figures: [countRe(recs('deal').length)], numbers: allow(recs('deal').length, ...groups.flatMap(([value, held]) => [held.length, optionLabel('deal', 'deal_stage', value)])) }; } },
-  { template: 'count-by-dimension', q: 'Companies by industry', expect: () => { const groups = [...groupBy(recs('company'), (c) => str(c.p.industry)).entries()]; return { figures: [countRe(recs('company').length)], numbers: allow(recs('company').length, ...groups.flatMap(([value, held]) => [held.length, optionLabel('company', 'industry', value)])) }; } },
+  // Every industry is a row: the aggregate's own twelve-group cut dropped two of fourteen under a head that still counted every company.
+  { template: 'count-by-dimension', q: 'Companies by industry', expect: () => { const groups = [...groupBy(recs('company'), (c) => str(c.p.industry)).entries()]; return { figures: [countRe(recs('company').length), ...groups.map(([value, held]) => `${optionLabel('company', 'industry', value)} — ${n(held.length)}`)], numbers: allow(recs('company').length, ...groups.flatMap(([value, held]) => [held.length, optionLabel('company', 'industry', value)])), also: (body) => assert.doesNotMatch(body.content, /…and \d+ more/, `all ${groups.length} industries fit under the cut:\n${body.content}`) }; } },
   { template: 'companies-in-industry', q: 'Which companies are in the consumer packaged goods industry?', expect: () => listOf(recs('company').filter((c) => str(c.p.industry) === optionValue('company', 'industry', 'Consumer packaged goods')), 'company', 25) },
   { template: 'companies-in-industry', q: 'List the pharma companies', expect: () => listOf(recs('company').filter((c) => str(c.p.industry) === optionValue('company', 'industry', 'Pharmaceuticals')), 'company', 25) },
   { template: 'count-companies-in-industry', q: 'How many companies are in the consumer packaged goods industry?', expect: () => countRows(recs('company').filter((c) => str(c.p.industry) === optionValue('company', 'industry', 'Consumer packaged goods'))) },
@@ -786,8 +925,10 @@ const CORPUS: CorpusRow[] = [
   { template: 'deals-lost-to-competitor', q: 'List the deals lost to Cognite', expect: () => listOf(recs('deal').filter((d) => isLost(d) && str(d.p.competitor) === optionValue('deal', 'competitor', 'Cognite')), 'deal', 10) },
   { template: 'count-deals-lost-to-competitor', q: 'How many deals did we lose to Tulip?', expect: () => countRows(recs('deal').filter((d) => isLost(d) && str(d.p.competitor) === optionValue('deal', 'competitor', 'Tulip'))) },
   { template: 'count-deals-lost-to-competitor', q: 'How many deals were lost to Sight Machine?', expect: () => countRows(recs('deal').filter((d) => isLost(d) && str(d.p.competitor) === optionValue('deal', 'competitor', 'Sight Machine'))) },
-  { template: 'deals-in-forecast-category', q: 'Which deals are in the Commit forecast category?', expect: () => listOf(recs('deal').filter((d) => isOpen(d) && str(d.p.forecast_category) === optionValue('deal', 'forecast_category', 'Commit')), 'deal', 10) },
+  // The open-stage filter follows the word "open": a category every deal can carry answers for every deal that carries it.
+  { template: 'deals-in-forecast-category', q: 'Which deals are in the Commit forecast category?', expect: () => listOf(recs('deal').filter((d) => str(d.p.forecast_category) === optionValue('deal', 'forecast_category', 'Commit')), 'deal', 10) },
   { template: 'deals-in-forecast-category', q: 'Show me the open deals in Best case', expect: () => listOf(recs('deal').filter((d) => isOpen(d) && str(d.p.forecast_category) === optionValue('deal', 'forecast_category', 'Best case')), 'deal', 10) },
+  { template: 'deals-in-forecast-category', q: 'Which deals are in the Closed forecast category?', expect: () => listOf(recs('deal').filter((d) => str(d.p.forecast_category) === optionValue('deal', 'forecast_category', 'Closed')), 'deal', 10) },
   { template: 'pipeline-in-forecast-category', q: 'How much open pipeline is in the Commit forecast category?', expect: () => dealMoney(recs('deal').filter((d) => isOpen(d) && str(d.p.forecast_category) === optionValue('deal', 'forecast_category', 'Commit'))) },
   { template: 'pipeline-in-forecast-category', q: 'What is our pipeline in the Best case category?', expect: () => dealMoney(recs('deal').filter((d) => isOpen(d) && str(d.p.forecast_category) === optionValue('deal', 'forecast_category', 'Best case'))) },
   { template: 'deals-with-term', q: 'How many deals have a 36-month contract term?', expect: () => countRows(recs('deal').filter((d) => num(d.p.contract_term_months) === 36), [36]) },
@@ -926,6 +1067,12 @@ const SLOT_OVERRIDES: Record<string, Record<string, string>> = {
   'stale-accounts-days': { number: '60' },
   'write-followup': { number: '7' },
   'compare-metric': { period: 'in 2025' },
+  // "open" reaches the open-only shape by its literal; a state sample has to be another state.
+  'account-tickets-count': { 'ticket-state': 'escalated' },
+  'account-deals': { 'deal-state': 'won' },
+  'account-deals-count': { 'deal-state': 'won' },
+  // "how many" is a count, so the metric sample has to be one, with a dimension it breaks down by.
+  'breakdown-snapshot': { 'snapshot-metric': 'customers', dimension: 'industry' },
 };
 const NAMED_SAMPLES: Record<string, string> = { b: '2024', note: ': the pilot slipped to october' };
 
@@ -1153,6 +1300,9 @@ const NEAR_MISSES: string[] = [
   'What is our ARR in total?',
   'What is our open pipeline in total?',
   'How much MRR do we have in total?',
+  // "how many" of a money measure, broken down
+  'How many open pipeline do we have by stage?',
+  'How many MRR are there by account?',
   // a competitor that appears on no deal
   'Which deals did we lose to Rockwell?',
   'How many deals did we lose to Siemens?',
@@ -1212,6 +1362,121 @@ describe('a near-miss is refused with three questions that can be answered', () 
       assert.ok(answered, `none of the three questions offered instead of "${q}" can be answered: ${analysis.nearest.map((t: { example: string }) => t.example).join(' | ')}`);
     });
   }
+});
+
+/* ------------------------ every row on every account ----------------------- */
+
+/**
+ * "How many tickets does X have" is every ticket on X. It was answered for the
+ * open ones because "open" was optional in the open-only shape, so the
+ * property is checked on every company: the unqualified question counts the
+ * whole set, and the qualified one counts the open subset, each on its own
+ * shape.
+ */
+describe('an account question without "open" is answered for every row on the account', () => {
+  test('every company: tickets and deals, whole and open', async () => {
+    for (const c of recs('company')) {
+      const tickets = associated(c.id, 'ticket');
+      const deals = associated(c.id, 'deal');
+      const cases: [string, string, Expectation][] = [
+        [`How many tickets does ${c.name} have?`, 'account-tickets-count', countRows(tickets)],
+        [`How many open tickets does ${c.name} have?`, 'account-open-tickets-count', countRows(tickets.filter(isOpenTicket))],
+        [`Which deals does ${c.name} have?`, 'account-deals', listOf(deals, 'deal', 10)],
+        [`Which open deals does ${c.name} have?`, 'account-open-deals', listOf(deals.filter(isOpen), 'deal', 10)],
+        [`How many deals does ${c.name} have?`, 'account-deals-count', countRows(deals)],
+      ];
+      for (const [q, template, expected] of cases) {
+        tick();
+        const body = await ask(q);
+        assert.equal(body.analysis.template?.id, template, `"${q}": ${body.analysis.refusal?.why ?? body.content}`);
+        for (const figure of expected.figures) assert.ok(figure instanceof RegExp ? figure.test(body.content) : body.content.includes(figure), `"${q}" does not state ${figure}:\n${body.content}`);
+        assertOnlyTheseNumbers(body.content, allow(...expected.numbers, c.name), q);
+        for (const citation of body.citations as { id: string; label: string }[]) assert.ok(expected.ids!.has(citation.id), `"${q}" cites ${citation.label}, which the question did not name`);
+        expected.also?.(body);
+      }
+    }
+  });
+});
+
+/* ------------------------- a period with an article ------------------------ */
+
+/**
+ * The window a phrase resolves to is compared with one computed here from the
+ * workspace clock, so "in the last quarter" has to bind the same quarter as
+ * "last quarter" — not refuse, and not a different quarter.
+ */
+describe('a relative period binds with or without an article, to the same window', () => {
+  const backward: [string, (now: number) => Window][] = [
+    ['last quarter', LAST_QUARTER], ['in the last quarter', LAST_QUARTER], ['in the previous quarter', LAST_QUARTER], ['over the prior quarter', LAST_QUARTER],
+    ['last year', LAST_YEAR], ['in the last year', LAST_YEAR], ['during the previous year', LAST_YEAR],
+    ['last month', LAST_MONTH], ['in the last month', LAST_MONTH],
+    ['this quarter', THIS_QUARTER], ['in the current quarter', THIS_QUARTER],
+  ];
+  for (const [phrase, windowOf] of backward) {
+    test(`deals closed ${phrase}`, async () => {
+      tick();
+      const now = app.ctx.now();
+      const w = windowOf(now);
+      const body = await ask(`How many deals closed ${phrase}?`);
+      assert.equal(body.analysis.template?.id, 'count-deals-decided-period', `"${phrase}": ${body.analysis.refusal?.why ?? body.content}`);
+      assert.deepEqual({ start: body.analysis.plan[0].args.start, end: body.analysis.plan[0].args.end }, { start: w.start, end: w.end }, `"${phrase}" measured a different window`);
+      const expected = countRows(decidedIn(w), [w.label]);
+      for (const figure of expected.figures) assert.ok(figure instanceof RegExp && figure.test(body.content), `"${phrase}":\n${body.content}`);
+      assertOnlyTheseNumbers(body.content, expected.numbers, phrase);
+    });
+  }
+  const forward: [string, (now: number) => Window][] = [
+    ['next quarter', NEXT_QUARTER], ['in the next quarter', NEXT_QUARTER], ['in the coming quarter', NEXT_QUARTER],
+    ['next month', NEXT_MONTH], ['in the next month', NEXT_MONTH],
+  ];
+  for (const [phrase, windowOf] of forward) {
+    test(`deals closing ${phrase}`, async () => {
+      tick();
+      const now = app.ctx.now();
+      const w = windowOf(now);
+      const body = await ask(`Which deals close ${phrase}?`);
+      assert.equal(body.analysis.template?.id, 'deals-closing-period', `"${phrase}": ${body.analysis.refusal?.why ?? body.content}`);
+      assert.deepEqual({ start: body.analysis.plan[0].args.start, end: body.analysis.plan[0].args.end }, { start: w.start, end: w.end }, `"${phrase}" measured a different window`);
+      const expected = listOf(recs('deal').filter((d) => isOpen(d) && closeIn(d, w)), 'deal', 10, [w.label]);
+      for (const figure of expected.figures) assert.ok(figure instanceof RegExp && figure.test(body.content), `"${phrase}":\n${body.content}`);
+      assertOnlyTheseNumbers(body.content, expected.numbers, phrase);
+      expected.also?.(body);
+    });
+  }
+});
+
+/* ------------------------- a breakdown that was cut ------------------------ */
+
+describe('a breakdown by account states every book in its own currency and counts what it left out', () => {
+  test('recurring revenue by account is sectioned per currency book', async () => {
+    tick();
+    const rows = recurringByAccount(1);
+    const books = new Set(rows.map((r) => r.currency));
+    assert.ok(books.size > 1, 'fixture: recurring revenue in more than one currency');
+    const body = await ask('What is our MRR by account?');
+    assert.equal(body.analysis.template?.id, 'breakdown-snapshot', body.analysis.refusal?.why ?? body.content);
+    const content = String(body.content);
+    for (const currency of books) {
+      const section = content.indexOf(`In ${currency.toUpperCase()}:`);
+      assert.ok(section >= 0, `a section for ${currency.toUpperCase()}:\n${content}`);
+      const next = [...books].map((c) => content.indexOf(`In ${c.toUpperCase()}:`)).filter((at) => at > section).sort((a, b) => a - b)[0] ?? content.length;
+      const inside = content.slice(section, next);
+      for (const r of rows.filter((held) => held.currency === currency)) assert.ok(inside.includes(lineOf(r)), `${r.label} is listed under ${currency.toUpperCase()}:\n${content}`);
+      // Largest first inside the book: the order a reader can use.
+      const order = rows.filter((r) => r.currency === currency).map((r) => inside.indexOf(lineOf(r)));
+      assert.deepEqual(order, [...order].sort((a, b) => a - b), `${currency.toUpperCase()} rows are largest first:\n${content}`);
+    }
+  });
+
+  test('open pipeline by account says how many accounts the cut left out', async () => {
+    tick();
+    const rows = pipelineByAccount();
+    assert.ok(rows.length > 25, `fixture: more accounts with open pipeline than the 25 the shape prints (${rows.length})`);
+    const body = await ask('What is our open pipeline by account?');
+    assert.equal(body.analysis.template?.id, 'breakdown-snapshot', body.analysis.refusal?.why ?? body.content);
+    assert.ok(String(body.content).includes(`…and ${n(rows.length - 25)} more.`), `the tail counts the ${rows.length - 25} accounts below the cut:\n${body.content}`);
+    for (const g of rows.slice(25)) assert.ok(!String(body.content).includes(g.label), `${g.label} is below the cut and not printed`);
+  });
 });
 
 /* ---------------------- the properties over everything --------------------- */

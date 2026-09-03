@@ -162,7 +162,11 @@ const RULES: Rule[] = [
     },
   },
   {
-    re: /\b(?:last|previous|prior)\s+(quarter|month|year|week)\b/i,
+    // The article is part of the phrase, as it already is for "the last 30
+    // days": without it here, "in the last quarter" left "the" in front of a
+    // resolved span and the period slot refused a question that "last
+    // quarter" answered.
+    re: /\b(?:the\s+)?(?:last|previous|prior)\s+(quarter|month|year|week)\b/i,
     build(m, now) {
       const key = m[1].toLowerCase();
       if (key === 'quarter') {
@@ -223,7 +227,9 @@ const RULES: Rule[] = [
     },
   },
   {
-    re: /\b(?:next|the\s+coming|the\s+following)\s+(quarter|month|year|week)\b/i,
+    // The forward twin of the rule above: "in the next quarter" binds the
+    // same way "in the last quarter" does.
+    re: /\b(?:the\s+)?(?:next|coming|following)\s+(quarter|month|year|week)\b/i,
     build(m, now) {
       const key = m[1].toLowerCase();
       if (key === 'quarter') {

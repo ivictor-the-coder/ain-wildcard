@@ -182,20 +182,23 @@ export function matchTemplates(question: string, vocab: Vocabulary, catalogue: T
   const tokens = stripPoliteness(tokenise(raw));
   const rejected: { template: Template; reason: string }[] = [];
   const matches: MatchResult[] = [];
+  // The whole normalised sentence, for a plan or a check that reads a literal
+  // word its pattern accepted — "paid" against "issued", "total" against
+  // "average", "how many" against a money measure. It is bound before the
+  // slots so a check can read it; a check that reached for it after the
+  // match was a 500 on every sentence it applied to.
+  const sentence = tokens.map((t) => t.text).join(' ');
+  const seed: Bindings = { $question: { name: '$question', slot: 'text', text: sentence, raw, value: { kind: 'text', text: sentence }, qualifier: null } };
   for (const template of catalogue) {
     for (const pattern of template.patterns) {
       let reason: string | null = null;
-      const found = matchElements(parsePattern(pattern), 0, tokens, 0, raw, vocab, {}, (b) => {
+      const found = matchElements(parsePattern(pattern), 0, tokens, 0, raw, vocab, seed, (b) => {
         if (!consistent(b)) return false;
         reason = template.check?.(b, vocab) ?? null;
         return reason === null;
       });
       if (found) {
-        const slotWords = Object.values(found).reduce((sum, one) => sum + one.text.split(' ').length, 0);
-        // The whole normalised sentence, for a plan that reads a literal word
-        // its pattern accepted — "paid" against "issued", "total" against "average".
-        const question = tokens.map((t) => t.text).join(' ');
-        found.$question = { name: '$question', slot: 'text', text: question, raw, value: { kind: 'text', text: question }, qualifier: null };
+        const slotWords = Object.values(found).filter((one) => !one.name.startsWith('$')).reduce((sum, one) => sum + one.text.split(' ').length, 0);
         matches.push({ template, bindings: found, slotWords });
         break;
       }
@@ -808,7 +811,10 @@ export const TEMPLATES: Template[] = [
     description: 'How many of a counted thing the workspace has right now — customers, connected assets.',
     patterns: [
       `how many {metric:snapshot-metric} (do we have|are there|have we got|are we running)`,
-      `how many (paying|) customers (do we have|are there|)`,
+      // Not "(paying|) customers": the measure is the CRM's customer type, and
+      // a paying customer is a different question — one this shape cannot
+      // answer and so must not match.
+      `how many customers (do we have|are there|)`,
     ],
     tools: ['business_metric'],
     example: () => 'How many customers do we have?',
@@ -905,12 +911,18 @@ export const TEMPLATES: Template[] = [
       `(break down|breakdown of|split) ${OUR} {metric:snapshot-metric} by {dimension}`,
       `${OUR} {metric:snapshot-metric} by {dimension}`,
       `how (is|does) ${OUR} {metric:snapshot-metric} (look|split|break down) by {dimension}`,
+      `how many {metric:snapshot-metric} (do we have|are there|) by {dimension}`,
     ],
     tools: ['business_metric'],
     example: () => 'What is our open pipeline by stage?',
     check: (b) => {
       const metric = slot(b, 'metric', 'metric');
       const dimension = slot(b, 'dimension', 'dimension');
+      // "How many" is a count. The same rule `count-metric` applies: money
+      // under it is not a breakdown of what was asked.
+      if (/^how many\b/.test(b.$question.text) && metric.unit !== 'count') {
+        return `${metric.label} is ${metric.unit === 'money' ? 'money' : 'not a count'}, so "how many" does not apply to it.`;
+      }
       return (BREAKDOWNS[metric.id] ?? []).includes(dimension.groupBy) ? null
         : `${metric.label} does not break down by ${dimension.label} in this workspace${BREAKDOWNS[metric.id]?.length ? ` — it breaks down by ${listPhrase(BREAKDOWNS[metric.id], 'or')}` : ''}.`;
     },
@@ -919,7 +931,7 @@ export const TEMPLATES: Template[] = [
       const dimension = slot(b, 'dimension', 'dimension');
       return [{ tool: 'business_metric', args: { metric: metric.id, group_by: dimension.groupBy, limit: 25, compare: false }, why: `${metric.label} by ${dimension.label}.` }];
     },
-    render: (steps, b, v) => renderBreakdown(resultOf<MetricToolResult>(steps), slot(b, 'dimension', 'dimension').label, v.workspace, {}),
+    render: (steps, b, v) => renderBreakdown(resultOf<MetricToolResult>(steps), slot(b, 'dimension', 'dimension').label, v.workspace, { limit: 25 }),
   }),
   T({
     id: 'breakdown-period', kind: 'breakdown', intent: 'aggregate',
@@ -946,7 +958,7 @@ export const TEMPLATES: Template[] = [
       const period = slot(b, 'period', 'period');
       return [{ tool: 'business_metric', args: { metric: metric.id, group_by: dimension.groupBy, limit: 25, ...windowArgs(period.window), compare: false }, why: `${metric.label} by ${dimension.label} over ${period.window.label}.` }];
     },
-    render: (steps, b, v) => renderBreakdown(resultOf<MetricToolResult>(steps), slot(b, 'dimension', 'dimension').label, v.workspace, { period: slot(b, 'period', 'period').window.label }),
+    render: (steps, b, v) => renderBreakdown(resultOf<MetricToolResult>(steps), slot(b, 'dimension', 'dimension').label, v.workspace, { period: slot(b, 'period', 'period').window.label, limit: 25 }),
   }),
 
   /* -------------------------------- owners ------------------------------- */
@@ -1089,7 +1101,7 @@ export const TEMPLATES: Template[] = [
     id: 'rep-most-metric', kind: 'breakdown', intent: 'aggregate',
     description: 'Which teammate carries the most, or least, open pipeline.',
     patterns: [
-      `(which|what) (rep|owner|teammate|seller|account executive|person) has the {most} (open|) pipeline`,
+      `(which|what) (rep|owner|teammate|seller|account executive|person) (has|carries|owns) the {most} (open|) pipeline`,
       `who has the {most} (open|) pipeline`,
       `who (owns|carries) the {most} (open|) pipeline`,
     ],
@@ -1620,14 +1632,42 @@ export const TEMPLATES: Template[] = [
   T({
     id: 'account-open-tickets-count', kind: 'count', intent: 'aggregate',
     description: 'How many open tickets one account has.',
+    // "open" is a literal of every shape here. Made optional, it let "how
+    // many tickets does Rheinwerk have" count the one open ticket and leave
+    // the closed one out — an answer to a narrower question than the one
+    // asked. A question without the word is `account-tickets-count`.
     patterns: [
-      `how many (open|) tickets does {account} have (open|)`,
-      `how many (open|) tickets are (open|) (at|for|with|on) {account}`,
+      `how many open tickets does {account} have`,
+      `how many tickets does {account} have open`,
+      `how many open tickets are (at|for|with|on) {account}`,
+      `how many tickets are open (at|for|with|on) {account}`,
     ],
     tools: ['record_aggregate'],
     example: (v) => need('How many open tickets does ', samplesOf(v).account, ' have?'),
     plan: (b) => [{ tool: 'record_aggregate', args: countArgs('ticket', [{ property: 'status', op: 'in', values: ['new', 'waiting_on_us', 'waiting_on_customer', 'escalated'] }], { associated_to: slot(b, 'account', 'record').id }), why: `Open tickets linked to ${slot(b, 'account', 'record').label}.` }],
     render: (steps, b, v) => renderAggregateCount(resultOf<RecordAggregateResult>(steps), 'open ticket|open tickets', `at ${slot(b, 'account', 'record').label}`, v.workspace, { subject: slot(b, 'account', 'record').label }),
+  }),
+  T({
+    id: 'account-tickets-count', kind: 'count', intent: 'aggregate',
+    description: 'How many tickets one account has — every ticket linked to it, or those in one status.',
+    patterns: [
+      `how many tickets does {account} have`,
+      `how many tickets (are there|do we have|are) (at|for|with|on) {account}`,
+      `how many {state:ticket-state} tickets does {account} have`,
+      `how many {state:ticket-state} tickets (are there|do we have|are) (at|for|with|on) {account}`,
+    ],
+    tools: ['record_aggregate'],
+    example: (v) => need('How many tickets does ', samplesOf(v).account, ' have?'),
+    plan: (b) => {
+      const account = slot(b, 'account', 'record');
+      const state = maybe(b, 'state', 'state');
+      return [{ tool: 'record_aggregate', args: countArgs('ticket', state?.conditions ?? [], { associated_to: account.id }), why: `${state ? `${capitalise(state.label)} tickets` : 'Every ticket'} linked to ${account.label}.` }];
+    },
+    render: (steps, b, v) => {
+      const account = slot(b, 'account', 'record');
+      const state = maybe(b, 'state', 'state');
+      return renderAggregateCount(resultOf<RecordAggregateResult>(steps), state ? `${state.noun} ticket|${state.noun} tickets` : 'ticket|tickets', `at ${account.label}`, v.workspace, { subject: account.label });
+    },
   }),
   T({
     id: 'account-open-tickets', kind: 'list', intent: 'lookup',
@@ -1676,12 +1716,15 @@ export const TEMPLATES: Template[] = [
   T({
     id: 'account-open-deals', kind: 'list', intent: 'lookup',
     description: 'The open deals on one account.',
+    // "open" is a literal of every shape, for the reason given on
+    // `account-open-tickets-count`: "which deals does Brightline have" once
+    // listed its one open deal and left the two closed ones out.
     patterns: [
       `(which|what) deals does {account} have open`,
       `(which|what) deals are open (at|for|with|on) {account}`,
       `(which|what) deals do we have open (at|for|with) {account}`,
-      `(which|what) (open|) deals does {account} have`,
-      `(which|what) (open|) deals do we have with {account}`,
+      `(which|what) open deals does {account} have`,
+      `(which|what) open deals do we have with {account}`,
       `${LIST} (the|) open deals (at|for|with|on) {account}`,
       `${LIST} {account} open deals`,
     ],
@@ -1689,6 +1732,52 @@ export const TEMPLATES: Template[] = [
     example: (v) => need('Which deals are open at ', samplesOf(v).account, '?'),
     plan: (b, v) => [{ tool: 'record_search', args: searchArgs('deal', [{ property: 'deal_stage', op: 'in', values: v.stages.open }], { associated_to: slot(b, 'account', 'record').id }), why: `Open deals linked to ${slot(b, 'account', 'record').label}.` }],
     render: (steps, b, v) => renderList(resultOf<RecordSearchResult>(steps), 'open deal|open deals', `at ${slot(b, 'account', 'record').label}`, v.workspace, { subject: slot(b, 'account', 'record').label }),
+  }),
+  T({
+    id: 'account-deals', kind: 'list', intent: 'lookup',
+    description: 'The deals on one account — every deal linked to it, or those in one state.',
+    patterns: [
+      `(which|what) deals does {account} have`,
+      `(which|what) deals do we have (with|at|for) {account}`,
+      `${LIST} (the|) deals (at|for|with|on) {account}`,
+      `${LIST} {account} deals`,
+      `(which|what) {state:deal-state} deals does {account} have`,
+      `(which|what) {state:deal-state} deals do we have (with|at|for) {account}`,
+      `${LIST} (the|) {state:deal-state} deals (at|for|with|on) {account}`,
+      `${LIST} {account} {state:deal-state} deals`,
+    ],
+    tools: ['record_search'],
+    example: (v) => need('Which deals does ', samplesOf(v).account, ' have?'),
+    plan: (b) => {
+      const account = slot(b, 'account', 'record');
+      const state = maybe(b, 'state', 'state');
+      return [{ tool: 'record_search', args: searchArgs('deal', state?.conditions ?? [], { associated_to: account.id }), why: `${state ? `${capitalise(state.label)} deals` : 'Every deal'} linked to ${account.label}.` }];
+    },
+    render: (steps, b, v) => {
+      const account = slot(b, 'account', 'record');
+      return renderList(resultOf<RecordSearchResult>(steps), dealThing(maybe(b, 'state', 'state')), `at ${account.label}`, v.workspace, { subject: account.label });
+    },
+  }),
+  T({
+    id: 'account-deals-count', kind: 'count', intent: 'aggregate',
+    description: 'How many deals one account has — every deal linked to it, or those in one state.',
+    patterns: [
+      `how many deals does {account} have`,
+      `how many deals (are there|do we have|are) (at|for|with|on) {account}`,
+      `how many {state:deal-state} deals does {account} have`,
+      `how many {state:deal-state} deals (are there|do we have|are) (at|for|with|on) {account}`,
+    ],
+    tools: ['record_aggregate'],
+    example: (v) => need('How many deals does ', samplesOf(v).account, ' have?'),
+    plan: (b) => {
+      const account = slot(b, 'account', 'record');
+      const state = maybe(b, 'state', 'state');
+      return [{ tool: 'record_aggregate', args: countArgs('deal', state?.conditions ?? [], { associated_to: account.id }), why: `${state ? `${capitalise(state.label)} deals` : 'Every deal'} linked to ${account.label}.` }];
+    },
+    render: (steps, b, v) => {
+      const account = slot(b, 'account', 'record');
+      return renderAggregateCount(resultOf<RecordAggregateResult>(steps), dealThing(maybe(b, 'state', 'state')), `at ${account.label}`, v.workspace, { subject: account.label });
+    },
   }),
   T({
     id: 'record-timeline', kind: 'lookup', intent: 'summarise',
@@ -2031,18 +2120,27 @@ export const TEMPLATES: Template[] = [
   }),
   T({
     id: 'deals-in-forecast-category', kind: 'list', intent: 'lookup',
-    description: 'The open deals in one forecast category.',
+    description: 'The deals in one forecast category — every deal carrying it, or the open ones when asked.',
     patterns: [
       `(which|what) (open|) deals are in (the|) {forecast:forecast-category} (forecast category|category|forecast|)`,
       `${LIST} (the|our|) (open|) deals in (the|) {forecast:forecast-category} (forecast category|category|forecast|)`,
     ],
     tools: ['record_search'],
     example: (v) => need('Which deals are in the ', samplesOf(v).forecast, ' forecast category?'),
+    // The open-stage filter follows the word "open", as it does for a lead
+    // source. Applied unconditionally it answered "which deals are in the
+    // Closed forecast category" with no open deals, while 39 closed ones
+    // carried exactly that category.
     plan: (b, v) => {
       const forecast = slot(b, 'forecast', 'option');
-      return [{ tool: 'record_search', args: searchArgs('deal', [{ property: 'deal_stage', op: 'in', values: v.stages.open }, { property: 'forecast_category', op: 'eq', value: forecast.value }]), why: `Open deals whose forecast category is ${forecast.label}.` }];
+      const open = /\bopen deals\b/.test(b.$question.text);
+      const conditions: Condition[] = [...(open ? [{ property: 'deal_stage', op: 'in', values: v.stages.open } as Condition] : []), { property: 'forecast_category', op: 'eq', value: forecast.value }];
+      return [{ tool: 'record_search', args: searchArgs('deal', conditions), why: `${open ? 'Open deals' : 'Deals'} whose forecast category is ${forecast.label}.` }];
     },
-    render: (steps, b, v) => renderList(resultOf<RecordSearchResult>(steps), 'open deal|open deals', `in the ${slot(b, 'forecast', 'option').label} forecast category`, v.workspace),
+    render: (steps, b, v) => {
+      const open = /\bopen deals\b/.test(b.$question.text);
+      return renderList(resultOf<RecordSearchResult>(steps), open ? 'open deal|open deals' : 'deal|deals', `in the ${slot(b, 'forecast', 'option').label} forecast category`, v.workspace);
+    },
   }),
   T({
     id: 'pipeline-in-forecast-category', kind: 'metric', intent: 'aggregate',

@@ -61,6 +61,12 @@ export interface AggregateResult {
   value: number;
   count: number;
   groups: AggregateGroup[];
+  /**
+   * How many groups there are before `groupLimit` cuts the list. A breakdown
+   * that prints twelve accounts and stops is read as the whole book unless it
+   * can say how many it left out.
+   */
+  groupTotal: number;
   ids: string[];
   sql: string;
 }
@@ -137,7 +143,7 @@ const GRAIN_FORMAT: Record<string, string> = {
 
 /** One aggregation, one round trip, exact to the cent. */
 export function aggregate(ctx: Ctx, orgId: string, spec: AggregateSpec): AggregateResult {
-  if (!hasTable(ctx.db, 'crm_records')) return { value: 0, count: 0, groups: [], ids: [], sql: '' };
+  if (!hasTable(ctx.db, 'crm_records')) return { value: 0, count: 0, groups: [], groupTotal: 0, ids: [], sql: '' };
 
   const where: string[] = [`r.org_id = ?`, `r.object_type = ?`, `r.archived = 0`, `r.merged_into IS NULL`];
   const params: unknown[] = [orgId, spec.objectType];
@@ -194,6 +200,7 @@ export function aggregate(ctx: Ctx, orgId: string, spec: AggregateSpec): Aggrega
   const total = ctx.db.get<{ v: number | null; n: number }>(totalSql, ...(joinParams as never[]), ...(params as never[]));
 
   let groups: AggregateGroup[] = [];
+  let groupTotal = 0;
   if (groupExpr) {
     const groupSql =
       `SELECT ${groupExpr} AS k, ${measureExpr} AS v, COUNT(DISTINCT r.id) AS n FROM crm_records r ${joinSql} ` +
@@ -202,6 +209,10 @@ export function aggregate(ctx: Ctx, orgId: string, spec: AggregateSpec): Aggrega
       groupSql, ...(joinParams as never[]), ...(params as never[]), spec.groupLimit ?? 12,
     ).map((row) => ({ key: row.k ?? '—', value: Number(row.v ?? 0), count: Number(row.n ?? 0) }));
     if (spec.groupByDate) groups.sort((a, b) => a.key.localeCompare(b.key));
+    groupTotal = Number(ctx.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM (SELECT ${groupExpr} AS k FROM crm_records r ${joinSql} WHERE ${whereSql} GROUP BY k)`,
+      ...(joinParams as never[]), ...(params as never[]),
+    )?.n ?? 0);
   }
 
   const ids = spec.sampleIds
@@ -215,6 +226,7 @@ export function aggregate(ctx: Ctx, orgId: string, spec: AggregateSpec): Aggrega
     value: Number(total?.v ?? 0),
     count: Number(total?.n ?? 0),
     groups,
+    groupTotal,
     ids,
     sql: totalSql,
   };

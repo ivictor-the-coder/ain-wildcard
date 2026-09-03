@@ -154,7 +154,7 @@ export function renderAggregateMeasure(result: RecordAggregateResult, measure: s
   };
 }
 
-/** Count per group, largest first. */
+/** Count per group, largest first, then how many groups were left out. */
 export function renderGroupedCount(result: RecordAggregateResult, thing: string, dimension: string, workspace: WorkspaceProfile): Rendered {
   const [, pluralForm] = thing.split('|');
   const total = result.matched_records;
@@ -162,8 +162,10 @@ export function renderGroupedCount(result: RecordAggregateResult, thing: string,
     ? `There are no ${pluralForm} to break down by ${dimension}.`
     : `${n(total, workspace.locale)} ${pluralForm} by ${dimension}:`;
   const lines = result.groups.map((g) => `• ${g.label} — ${g.formatted}`);
+  const rest = Math.max(result.group_total, result.groups.length) - result.groups.length;
+  const tail = rest > 0 ? `…and ${n(rest, workspace.locale)} more.` : '';
   return {
-    content: [head, lines.join('\n')].filter(Boolean).join('\n\n'),
+    content: [head, lines.join('\n'), tail].filter(Boolean).join('\n\n'),
     citations: [],
     facts: { ...NO_FACTS, value: total, formatted: String(total), unit: 'count', count: total, label: pluralForm, mixed: true, rows: result.groups.map((g) => ({ id: g.key, label: g.label })) },
   };
@@ -218,9 +220,18 @@ export function renderMetric(result: MetricToolResult, workspace: WorkspaceProfi
   };
 }
 
-/** A metric broken down by one dimension: the rows are the answer, not a total. */
-export function renderBreakdown(result: MetricToolResult, dimension: string, workspace: WorkspaceProfile, opts: { period?: string | null }): Rendered {
+/**
+ * A metric broken down by one dimension: the rows are the answer, not a total.
+ *
+ * Money rows are sectioned by currency book, the way a ranking is, because
+ * €12,200 sorted above $10,653 by raw minor units is not an order a reader
+ * can use. The tool cuts the list at the caller's limit, so the rows it left
+ * out are counted from the total it reports; a breakdown that stopped at
+ * twelve accounts without saying so read as the whole book.
+ */
+export function renderBreakdown(result: MetricToolResult, dimension: string, workspace: WorkspaceProfile, opts: { period?: string | null; limit?: number }): Rendered {
   const period = result.snapshot ? null : (opts.period ?? result.window.label);
+  const limit = opts.limit ?? 25;
   const groups = result.groups.length ? result.groups : result.top_accounts.map((a) => ({ key: a.id, label: a.label, formatted: a.formatted, count: 0, value: 0, currency: a.currency }));
   if (!groups.length) {
     return {
@@ -231,12 +242,45 @@ export function renderBreakdown(result: MetricToolResult, dimension: string, wor
   }
   const isRate = result.unit === 'percent';
   const noun = rowNoun(result);
-  const lines = groups.map((g) => `• ${g.label} — ${g.formatted}${g.count && !isRate && result.unit !== 'count' ? ` (${n(g.count, workspace.locale)} ${plural(g.count, noun)})` : ''}`);
-  const head = `${result.label} by ${dimension}${period ? ` ${periodPhrase(period)}` : ''}${isRate ? ' — each row is its own rate, and the rows do not sum' : ''}:`;
+  const line = (g: typeof groups[number]) => `• ${g.label} — ${g.formatted}${g.count && !isRate && result.unit !== 'count' ? ` (${n(g.count, workspace.locale)} ${plural(g.count, noun)})` : ''}`;
+  const books = new Map<string, typeof groups>();
+  if (result.unit === 'money') {
+    for (const g of groups) {
+      const currency = g.currency ?? workspace.currency;
+      books.set(currency, [...(books.get(currency) ?? []), g]);
+    }
+  }
+  const sectioned = books.size > 1;
+  const ordered = [...books.entries()].sort((a, b) => Number(b[0] === workspace.currency) - Number(a[0] === workspace.currency) || a[0].localeCompare(b[0]));
+  // Two cuts can hide rows: the tool's, counted by `groupTotal`, and this
+  // one at `limit`. Each is stated where it applies — per book when the
+  // books are sectioned, once at the end otherwise — and never twice.
+  const shown: typeof groups = [];
+  let body: string;
+  if (sectioned) {
+    body = ordered.map(([currency, rows]) => {
+      const top = rows.slice(0, limit);
+      shown.push(...top);
+      const hidden = rows.length - top.length;
+      return [`In ${currency.toUpperCase()}:`, ...top.map(line), hidden > 0 ? `…and ${n(hidden, workspace.locale)} more in ${currency.toUpperCase()}.` : ''].filter(Boolean).join('\n');
+    }).join('\n\n');
+  } else {
+    shown.push(...groups.slice(0, limit));
+    body = shown.map(line).join('\n');
+  }
+  const beyond = Math.max(result.groupTotal, groups.length) - groups.length;
+  const rest = sectioned ? beyond : beyond + (groups.length - shown.length);
+  const tail = rest > 0 ? `…and ${n(rest, workspace.locale)} more.` : '';
+  // A counted measure leads with its total, as a grouped record count does:
+  // "how many customers do we have by industry" is answered by the 23 as much
+  // as by the ten rows under it. Money and rates lead with the label only —
+  // a sum across books or across rates is not a figure.
+  const subject = result.unit === 'count' && result.value > 0 ? `${result.formatted} ${result.label.toLowerCase()}` : result.label;
+  const head = `${subject} by ${dimension}${period ? ` ${periodPhrase(period)}` : ''}${isRate ? ' — each row is its own rate, and the rows do not sum' : sectioned ? ' — one section per currency book, and the books are not added together' : ''}:`;
   return {
-    content: `${head}\n\n${lines.join('\n')}`,
+    content: [head, body, tail].filter(Boolean).join('\n\n'),
     citations: result.evidence.slice(0, 8),
-    facts: { ...NO_FACTS, unit: unitOf(result), label: result.label, period, mixed: true, rows: groups.map((g) => ({ id: g.key, label: g.label })) },
+    facts: { ...NO_FACTS, unit: unitOf(result), label: result.label, period, mixed: true, rows: shown.map((g) => ({ id: g.key, label: g.label })) },
   };
 }
 
@@ -271,6 +315,10 @@ export function renderRank(result: MetricToolResult, noun: string, direction: 'a
     sections.push([lead, list, rest > 0 ? `…and ${n(rest, workspace.locale)} more with ${result.label.toLowerCase()} in ${currency.toUpperCase()}.` : ''].filter(Boolean).join('\n\n'));
     cited.push(...top.map((row) => ({ id: row.id, label: row.label, type: row.id.startsWith('cus_') ? 'customer' : 'company' })));
   }
+  // The rows the tool itself cut, on top of what each book's tail counted:
+  // "top 5" over 17 accounts says there are 12 more, or it reads as 5 of 5.
+  const beyond = Math.max(result.groupTotal, rows.length) - rows.length;
+  if (beyond > 0) sections.push(`…and ${n(beyond, workspace.locale)} more.`);
   return {
     content: sections.join('\n\n'),
     citations: cited,

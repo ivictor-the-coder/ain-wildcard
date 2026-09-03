@@ -364,9 +364,10 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
   // accounts" answered with five is the same class of drop as an ignored
   // pipeline, one row further down the page.
   const ranking = Math.min(Math.max(args.limit ?? 5, 1), 25);
-  const accounts = args.group_by === 'account' && !result.groups.length
-    ? (ascending ? [...topAccounts(input, definition, 1000)].reverse().slice(0, ranking) : topAccounts(input, definition, ranking))
-    : [];
+  // Every account with a figure, then the cut: the count before it is what
+  // the answer says it left out.
+  const ranked = args.group_by === 'account' && !result.groups.length ? topAccounts(input, definition, 1000) : [];
+  const accounts = (ascending ? [...ranked].reverse() : ranked).slice(0, ranking);
 
   // A grouping that was asked for and never applied has to be said out loud.
   // "What is our win rate by owner" answered with one workspace-wide number is
@@ -401,6 +402,7 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
 
   return {
     ...result,
+    groupTotal: result.groups.length ? result.groupTotal : ranked.length,
     note,
     scope,
     window: { label: window.label, start: window.start, end: window.end, partial: window.partial },
@@ -809,6 +811,8 @@ export interface RecordAggregateResult {
    * "$9,010,960" — one run, two ways of writing the same money.
    */
   groups: { key: string; label: string; value: number; count: number; formatted: string }[];
+  /** How many groups there are before `groups` was cut at 25; the rest are counted, never dropped in silence. */
+  group_total: number;
   sample_ids: string[];
   /** The same rows, named — a citation reading "matched record" identifies nothing. */
   samples: { id: string; label: string }[];
@@ -844,6 +848,11 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
     // A rep named in the question is a filter on the count. Without it "how
     // many open deals does Priya have" answered with the workspace's 38.
     ownerId: args.owner_id,
+    // The aggregate's own default cut is twelve groups, and "companies by
+    // industry" has fourteen: two rows vanished under a head that still
+    // counted every company. The cut is the catalogue's, and the total says
+    // what it left out.
+    groupLimit: 25,
     sampleIds: 6,
   });
 
@@ -897,6 +906,7 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
       count: g.count,
       formatted: measure === 'count' ? g.count.toLocaleString(workspace.locale) : format(g.value),
     })),
+    group_total: byOwner ? groups.length : result.groupTotal,
     sample_ids: result.ids,
     samples: labelIds(ctx, orgId, result.ids, args.object_type).map((row) => ({ id: row.id, label: row.label })),
   };

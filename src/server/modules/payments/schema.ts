@@ -273,4 +273,18 @@ ALTER TABLE payments_dunning ADD COLUMN end_behavior_applied TEXT;
 ALTER TABLE payments_intents ADD COLUMN idempotency_fingerprint TEXT;
 `,
   },
+  {
+    id: 'payments.0004_dunning_holds',
+    sql: `
+-- A campaign that is still recovering but presenting nothing: the last decline
+-- was one no retry can answer, or a refund reopened the bill and a person has
+-- to decide what happens to it. hold_reason says which, hold_until says when
+-- the schedule's window runs out and the end behaviour applies (null when only
+-- a person ends it), and hold_note is the sentence the queue shows. All three
+-- are null while the schedule is presenting, and null once the campaign is over.
+ALTER TABLE payments_dunning ADD COLUMN hold_reason TEXT;
+ALTER TABLE payments_dunning ADD COLUMN hold_until INTEGER;
+ALTER TABLE payments_dunning ADD COLUMN hold_note TEXT;
+`,
+  },
 ];

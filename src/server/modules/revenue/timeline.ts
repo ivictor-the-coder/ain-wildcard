@@ -9,25 +9,28 @@
  *    `GET /v1/revenue/mrr` and `GET /v1/subscriptions/overview` can never drift
  *    apart. There is a test that asserts exactly that.
  *  - **The past is reached by walking backwards from today** through the
- *    contract changes billing actually recorded. Every mid-cycle change writes
- *    a proration set to `billing_pending_items` — a credit line for what the
- *    customer held and a charge line for what they moved to, each naming its
- *    price and quantity — so the whole-period value of the change is priced by
- *    the same engine that priced the change itself, and MRR steps on the day
- *    the change landed rather than at the next renewal.
+ *    contract changes billing actually recorded — and every item change is
+ *    recorded, whether or not it was prorated. `subscription.updated` carries
+ *    the items before and after each change, dated at the instant it took
+ *    effect, so a schedule phase or a `proration_behavior=none` update steps
+ *    MRR on its own date instead of silently re-pricing every month back to
+ *    the start. The proration ledger (`billing_pending_items`) dates the
+ *    changes that were written before the log carried items, and confirms the
+ *    ones written after it.
  *  - **Normalisation is exact.** An annual price is divided by twelve as a
  *    BigInt rational and rounded once, per item, in the same order billing
  *    rounds it. `£1,188.00/year` is `£99.00/month`, and `£1,187.99/year` is
  *    `£99.00/month` too — because that is what rounding once means.
  *
- * What it deliberately does not do: invent history it cannot read. A change
- * made with `proration_behavior=none` writes no dated line, so it moves MRR at
- * the next renewal, and the `basis` block on every endpoint says so.
+ * The rule underneath it: a closed month never moves. Every step in a timeline
+ * is dated by something durable — an event row, a proration line, `ended_at` —
+ * and never by `updated`, which the next unrelated write moves.
  */
 import type { Ctx } from '../../kernel/context';
+import { parseJson } from '../../kernel/db';
 import { money, mulFraction, rat, ratMul, ratRound } from '../../../shared/money';
 import type { IntervalUnit } from '../../../shared/time';
-import { Pricebook, isMetered, isRecurring, subscriptionMrr } from '../billing/cycle';
+import { Pricebook, isMetered, isRecurring, subscriptionMrr, type PricedItem } from '../billing/cycle';
 import { countsAsRevenue, isTerminal } from '../billing/status';
 import type { Price } from '../catalog/types';
 import type { Subscription, SubscriptionStatus } from '../billing/types';
@@ -87,6 +90,8 @@ export function taxInclusiveMrr(sub: Subscription, book: Pricebook): number {
 
 /* ---------------------------- contract changes ---------------------------- */
 
+export type ContractChangeSource = 'event_log' | 'proration_ledger';
+
 export interface ContractChange {
   subscription: string;
   customer: string;
@@ -107,6 +112,21 @@ export interface ContractChange {
    * exact to the cent it was rounded at; it just came the long way round.
    */
   reconstructed: boolean;
+  /** Which ledger dated this change. */
+  source: ContractChangeSource;
+  /**
+   * The contract's monthly value before and after the change, when the source
+   * states it outright. The event log does — it carries the items on both
+   * sides — so the walk back from today can be checked against it; the
+   * proration ledger only knows what moved.
+   */
+  before: number | null;
+  after: number | null;
+  /**
+   * True when the same change is in both ledgers and they agree: a prorated
+   * change written since the log carried items.
+   */
+  confirmed: boolean;
 }
 
 interface ProrationRow {
@@ -150,9 +170,9 @@ function wholeIntervalAmount(
 }
 
 /**
- * Every dated contract change in the workspace, grouped into the sets billing
- * wrote them in. A set is one change: the credits and the charges that were
- * computed together against the same instant.
+ * Every dated contract change in the proration ledger, grouped into the sets
+ * billing wrote them in. A set is one change: the credits and the charges that
+ * were computed together against the same instant.
  */
 export function readContractChanges(ctx: Ctx, orgId: string, book: Pricebook): Map<string, ContractChange[]> {
   const rows = ctx.db.all<ProrationRow>(
@@ -182,6 +202,10 @@ export function readContractChanges(ctx: Ctx, orgId: string, book: Pricebook): M
         credited: 0,
         lines: 0,
         reconstructed: false,
+        source: 'proration_ledger',
+        before: null,
+        after: null,
+        confirmed: false,
       };
       const list = bySubscription.get(row.subscription_id);
       if (list) list.push(current); else bySubscription.set(row.subscription_id, [current]);
@@ -199,6 +223,155 @@ export function readContractChanges(ctx: Ctx, orgId: string, book: Pricebook): M
     if (reconstructed) current.reconstructed = true;
   }
   return bySubscription;
+}
+
+interface ItemChangeRow {
+  object_id: string;
+  created: number;
+  data: string;
+  previous: string;
+}
+
+interface LoggedSubscription {
+  customer?: string;
+  currency?: string;
+  interval?: IntervalUnit;
+  interval_count?: number;
+  items?: { price: string; quantity: number; custom_unit_amount?: number | null }[];
+}
+
+const pricedItems = (items: LoggedSubscription['items']): PricedItem[] =>
+  (items ?? []).map((item) => ({
+    id: null,
+    price: item.price,
+    quantity: Number(item.quantity ?? 1),
+    custom_unit_amount: item.custom_unit_amount ?? null,
+  }));
+
+/**
+ * Every item change in the event log, priced on both sides.
+ *
+ * Billing emits `subscription.updated` inside the transaction that rewrites
+ * the items, with `previous.items` holding what they were — for a prorated
+ * upgrade, for a schedule phase, and for a change made with
+ * `proration_behavior=none` alike. That last one writes nothing to the
+ * proration ledger, which is why this module used to lose it: with no dated
+ * line to step at, the walk back from today's contract carried today's value
+ * into every closed month, and one phase transition rewrote a year of MRR.
+ *
+ * The instant is the change's `proration_date` when billing recorded one — a
+ * `subscription.prorated` event written in the same transaction — and the
+ * event's own `created` otherwise, which the time machine sets to the instant
+ * the job was due, not the instant the clock was advanced.
+ */
+export function readItemChanges(
+  ctx: Ctx, orgId: string, book: Pricebook,
+): { changes: Map<string, ContractChange[]>; unpriced: number } {
+  const prorationDates = new Map<string, number>();
+  for (const row of ctx.db.all<{ object_id: string; created: number; data: string }>(
+    `SELECT object_id, created, data FROM events
+      WHERE org_id = ? AND type = 'subscription.prorated' AND object_id IS NOT NULL`,
+    orgId,
+  )) {
+    const data = parseJson<{ proration_date?: number }>(row.data, {});
+    if (typeof data.proration_date === 'number') {
+      prorationDates.set(`${row.object_id}:${Number(row.created)}`, data.proration_date);
+    }
+  }
+
+  const rows = ctx.db.all<ItemChangeRow>(
+    `SELECT object_id, created, data, previous FROM events
+      WHERE org_id = ? AND type = 'subscription.updated' AND object_type = 'subscription'
+        AND object_id IS NOT NULL AND previous IS NOT NULL
+        AND json_type(previous, '$.items') = 'array'
+      ORDER BY object_id, created, rowid`,
+    orgId,
+  );
+
+  const changes = new Map<string, ContractChange[]>();
+  let unpriced = 0;
+  for (const row of rows) {
+    const after = parseJson<LoggedSubscription>(row.data, {});
+    const previous = parseJson<LoggedSubscription>(row.previous, {});
+    const currency = after.currency;
+    if (!currency || !after.interval) { unpriced += 1; continue; }
+    const cadenceAfter = { interval: after.interval, interval_count: Number(after.interval_count ?? 1), currency };
+    const cadenceBefore = {
+      interval: previous.interval ?? after.interval,
+      interval_count: Number(previous.interval_count ?? after.interval_count ?? 1),
+      currency,
+    };
+    let before: number, now: number;
+    try {
+      before = subscriptionMrr({ ...cadenceBefore, items: pricedItems(previous.items) }, book);
+      now = subscriptionMrr({ ...cadenceAfter, items: pricedItems(after.items) }, book);
+    } catch {
+      unpriced += 1;
+      continue;
+    }
+    const created = Number(row.created);
+    const change: ContractChange = {
+      subscription: row.object_id,
+      customer: after.customer ?? '',
+      currency,
+      at: prorationDates.get(`${row.object_id}:${created}`) ?? created,
+      delta: now - before,
+      charged: now,
+      credited: before,
+      lines: 0,
+      reconstructed: false,
+      source: 'event_log',
+      before,
+      after: now,
+      confirmed: false,
+    };
+    const list = changes.get(row.object_id);
+    if (list) list.push(change); else changes.set(row.object_id, [change]);
+  }
+  return { changes, unpriced };
+}
+
+/**
+ * One history per subscription, from both ledgers.
+ *
+ * A change the event log dates is taken from the event log: it names the
+ * contract on both sides, so it is the stronger record. A proration set at the
+ * same instant for the same subscription is the same change seen from the
+ * invoice side — it confirms the event rather than adding to it, and is marked
+ * so. A proration set with no event beside it is history written before the
+ * log carried items, and is the only record of that change.
+ */
+export function contractHistory(
+  ctx: Ctx, orgId: string, book: Pricebook,
+): { changes: Map<string, ContractChange[]>; unpriced: number } {
+  const ledger = readContractChanges(ctx, orgId, book);
+  const logged = readItemChanges(ctx, orgId, book);
+  const merged = new Map<string, ContractChange[]>();
+  const subscriptions = new Set([...ledger.keys(), ...logged.changes.keys()]);
+  for (const subscription of subscriptions) {
+    const fromLog = logged.changes.get(subscription) ?? [];
+    const instants = new Map<number, ContractChange[]>();
+    for (const change of fromLog) {
+      const list = instants.get(change.at);
+      if (list) list.push(change); else instants.set(change.at, [change]);
+    }
+    const kept: ContractChange[] = [...fromLog];
+    for (const change of ledger.get(subscription) ?? []) {
+      const twins = instants.get(change.at);
+      if (twins) {
+        // The ledger's delta and the log's must describe the same movement;
+        // when they do the change is confirmed, and when they do not the log
+        // — which carries the items themselves — wins, and says so.
+        const agreed = twins.reduce((sum, twin) => sum + twin.delta, 0) === change.delta;
+        for (const twin of twins) twin.confirmed = agreed;
+        continue;
+      }
+      kept.push(change);
+    }
+    kept.sort((a, b) => a.at - b.at);
+    merged.set(subscription, kept);
+  }
+  return { changes: merged, unpriced: logged.unpriced };
 }
 
 /* -------------------------------- timelines ------------------------------- */
@@ -240,8 +413,22 @@ export interface SubscriptionTimeline {
    * trialing or paused subscription would contribute if it were recognised.
    */
   contracted_mrr: number;
+  /** Recognised MRR over time: the contract with every pause cut out. */
   segments: MrrSegment[];
+  /**
+   * The contract over time, pauses and all — what the account would be worth
+   * if collection had never stopped. `contract - segments` at any instant is
+   * the paused pool, which is how a pause is told apart from a cancellation.
+   */
+  contract: MrrSegment[];
   changes: ContractChange[];
+  /**
+   * Changes whose logged `after` value does not match the value the walk back
+   * from today's contract arrived at. Zero is the only good answer; anything
+   * else means a change moved the items without being logged, and the months
+   * before it are being read at the wrong price.
+   */
+  history_disagreements: number;
 }
 
 /* -------------------------------- pauses ---------------------------------- */
@@ -295,18 +482,37 @@ export function readCollectionPauses(ctx: Ctx, orgId: string): Map<string, Pause
   return windows;
 }
 
-/** Remove every closed pause window from a set of segments. */
-function carve(segments: MrrSegment[], windows: PauseWindow[]): MrrSegment[] {
+/**
+ * Remove every pause window from a set of segments.
+ *
+ * A window still open runs to `until`: for a subscription that is still paused
+ * that is the pause itself, and the clip has already taken everything after it;
+ * for one that was cancelled while paused it is the cancellation, so the
+ * months between the pause and the end read zero rather than as revenue that
+ * was never collected.
+ */
+function carve(segments: MrrSegment[], windows: PauseWindow[], until: number): MrrSegment[] {
   let out = segments;
   for (const window of windows) {
-    if (window.to === OPEN_ENDED || window.to <= window.from) continue;
+    const to = window.to === OPEN_ENDED ? until : window.to;
+    if (to === OPEN_ENDED || to <= window.from) continue;
     const next: MrrSegment[] = [];
     for (const segment of out) {
-      if (window.to <= segment.from || window.from >= segment.to) { next.push(segment); continue; }
+      if (to <= segment.from || window.from >= segment.to) { next.push(segment); continue; }
       if (segment.from < window.from) next.push({ from: segment.from, to: window.from, mrr: segment.mrr });
-      if (window.to < segment.to) next.push({ from: window.to, to: segment.to, mrr: segment.mrr });
+      if (to < segment.to) next.push({ from: to, to: segment.to, mrr: segment.mrr });
     }
     out = next;
+  }
+  return out;
+}
+
+/** Cut every segment off at `to`. */
+function clip(segments: MrrSegment[], to: number): MrrSegment[] {
+  const out: MrrSegment[] = [];
+  for (const segment of segments) {
+    if (segment.from >= to) continue;
+    out.push(segment.to <= to ? segment : { ...segment, to });
   }
   return out;
 }
@@ -350,25 +556,36 @@ export function buildTimeline(
   const liveFrom = startOf(sub);
   const end = endOf(sub, pauses);
   const liveTo = Math.max(liveFrom, end.at);
+  // The contract outlives a pause: collection stopped, the items did not. So
+  // the walk back runs to the instant the contract ended, or to now, and a
+  // change made while collection was paused still steps the history.
+  const contractTo = end.because === 'canceled' ? liveTo : end.because === 'never_started' ? liveFrom : OPEN_ENDED;
   const applicable = changes
-    .filter((change) => change.at > liveFrom && change.at < liveTo && change.delta !== 0)
+    .filter((change) => change.at > liveFrom && change.at < contractTo && change.delta !== 0)
     .sort((a, b) => a.at - b.at);
 
+  let contract: MrrSegment[] = [];
   let segments: MrrSegment[] = [];
-  if (end.because !== 'never_started' && liveTo > liveFrom) {
+  let disagreements = 0;
+  if (end.because !== 'never_started' && contractTo > liveFrom) {
     // Walk backwards: today's contract minus every change made since.
     const values: number[] = new Array(applicable.length + 1);
     values[applicable.length] = contracted;
     for (let i = applicable.length - 1; i >= 0; i--) values[i] = values[i + 1] - applicable[i].delta;
-    const bounds = [liveFrom, ...applicable.map((change) => change.at), liveTo];
+    for (let i = 0; i < applicable.length; i++) {
+      if (applicable[i].after !== null && applicable[i].after !== values[i + 1]) disagreements += 1;
+    }
+    const bounds = [liveFrom, ...applicable.map((change) => change.at), contractTo];
     for (let i = 0; i < values.length; i++) {
       if (bounds[i + 1] <= bounds[i]) continue;
-      segments.push({ from: bounds[i], to: bounds[i + 1], mrr: values[i] });
+      contract.push({ from: bounds[i], to: bounds[i + 1], mrr: values[i] });
     }
     // A pause that has already ended is a hole in the timeline, not an end of
     // it: the months either side of it are unaffected, and the months inside it
-    // earned nothing.
-    segments = carve(segments, pauses);
+    // earned nothing. One still running is where recognised revenue stops —
+    // at the pause for a paused subscription, at the cancellation for one that
+    // ended without ever resuming.
+    segments = carve(clip(contract, liveTo), pauses, liveTo);
   }
 
   return {
@@ -386,13 +603,28 @@ export function buildTimeline(
     tax_inclusive_mrr: countsAsRevenue(sub.status) ? taxInclusiveMrr(sub, book) : 0,
     contracted_mrr: contracted,
     segments,
+    contract,
     changes: applicable,
+    history_disagreements: disagreements,
   };
 }
 
-export const mrrAt = (timeline: SubscriptionTimeline, at: number): number => {
-  for (const segment of timeline.segments) {
+const valueAt = (segments: MrrSegment[], at: number): number => {
+  for (const segment of segments) {
     if (at >= segment.from && at < segment.to) return segment.mrr;
   }
   return 0;
 };
+
+/** Recognised MRR at an instant. */
+export const mrrAt = (timeline: SubscriptionTimeline, at: number): number => valueAt(timeline.segments, at);
+
+/** What the contract was worth at an instant, whether or not it was being collected. */
+export const contractAt = (timeline: SubscriptionTimeline, at: number): number => valueAt(timeline.contract, at);
+
+/**
+ * The paused pool at an instant: contracted but not collected. Non-zero only
+ * inside a pause, because everywhere else the two series are the same series.
+ */
+export const pausedAt = (timeline: SubscriptionTimeline, at: number): number =>
+  contractAt(timeline, at) - mrrAt(timeline, at);

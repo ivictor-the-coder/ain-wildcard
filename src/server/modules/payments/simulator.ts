@@ -73,6 +73,65 @@ export const DECLINES: Record<DeclineCode, DeclineProfile> = {
     seller_message: 'The bank declined this payment and did not say why. Their fraud rules are the usual cause.',
     advice: 'Retry later with a longer gap, but ask for a different card if the second attempt is refused the same way.',
   },
+  do_not_honor: {
+    code: 'do_not_honor',
+    // Response code 05. It reads like a final refusal and is not one: the
+    // networks file it under "issuer cannot approve at this time", alongside
+    // insufficient funds, and it is the decline that clears most often on a
+    // later presentation. It is the stolen/lost/pickup family below that the
+    // issuer means never to see again.
+    severity: 'hard',
+    outcome_type: 'issuer_declined',
+    network_status: 'declined_by_network',
+    message: 'The card was declined: do not honor.',
+    seller_message: 'The bank declined this payment without giving a reason. The cardholder has to ask their bank why.',
+    advice: 'Worth one more presentation after a longer gap — this is the issuer’s generic refusal, and it often clears once the cardholder has spoken to their bank. Ask for a different card if it is refused the same way again.',
+  },
+  stolen_card: {
+    code: 'stolen_card',
+    severity: 'final',
+    outcome_type: 'issuer_declined',
+    network_status: 'declined_by_network',
+    message: 'The card has been reported stolen.',
+    seller_message: 'The bank has reported this card as stolen and will refuse every charge against it.',
+    advice: 'Never present this card again — the network treats a retry on a stolen card as a merchant problem. Ask the customer for a different card, and do not tell them the reason the issuer gave.',
+  },
+  lost_card: {
+    code: 'lost_card',
+    severity: 'final',
+    outcome_type: 'issuer_declined',
+    network_status: 'declined_by_network',
+    message: 'The card has been reported lost.',
+    seller_message: 'The bank has reported this card as lost and will refuse every charge against it.',
+    advice: 'Never present this card again. The customer has a replacement by now — ask for it, and do not tell them the reason the issuer gave.',
+  },
+  pickup_card: {
+    code: 'pickup_card',
+    severity: 'final',
+    outcome_type: 'issuer_declined',
+    network_status: 'declined_by_network',
+    message: 'The issuer has asked for the card to be retained.',
+    seller_message: 'The bank has withdrawn this card and will refuse every charge against it.',
+    advice: 'Never present this card again — a pick-up response is the issuer cancelling the card, not a temporary refusal. Ask the customer for a different one.',
+  },
+  fraudulent: {
+    code: 'fraudulent',
+    severity: 'final',
+    outcome_type: 'blocked',
+    network_status: 'declined_by_network',
+    message: 'The payment was declined as fraudulent.',
+    seller_message: 'The bank suspects this payment is fraudulent and has blocked it.',
+    advice: 'Never present this card again. Confirm the account with the customer by a channel you already trust before taking a different card from them.',
+  },
+  restricted_card: {
+    code: 'restricted_card',
+    severity: 'final',
+    outcome_type: 'issuer_declined',
+    network_status: 'declined_by_network',
+    message: 'The card cannot be used for this kind of payment.',
+    seller_message: 'The bank has restricted this card and will not allow it to be charged like this.',
+    advice: 'Stop retrying — the restriction is on the card itself, and every presentation gets the same answer. Ask the customer for a card that is not restricted.',
+  },
   expired_card: {
     code: 'expired_card',
     severity: 'final',

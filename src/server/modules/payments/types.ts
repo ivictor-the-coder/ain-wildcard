@@ -38,18 +38,27 @@ export type BankAccountType = (typeof BANK_ACCOUNT_TYPES)[number];
 /**
  * What the simulated processor will do with this method.
  *
- * The first seven are card outcomes, the last three belong to bank debits —
- * a direct debit cannot have the wrong CVC, and a card cannot be presented to
- * an account that was closed six weeks ago.
+ * Card outcomes first, then the three that belong to bank debits — a direct
+ * debit cannot have the wrong CVC, and a card cannot be presented to an
+ * account that was closed six weeks ago. The five from `stolen_card` to
+ * `restricted_card` are the network's "pick up card" family: the issuer has
+ * said this card is never to be presented again, and a retry schedule that
+ * does so anyway is a defect, not persistence.
  */
 export const SIMULATED_BEHAVIORS = [
   'succeeds',
   'insufficient_funds',
   'card_declined',
+  'do_not_honor',
   'expired_card',
   'incorrect_cvc',
   'processing_error',
   'authentication_required',
+  'stolen_card',
+  'lost_card',
+  'pickup_card',
+  'fraudulent',
+  'restricted_card',
   'account_closed',
   'no_account',
   'debit_not_authorized',
@@ -57,8 +66,9 @@ export const SIMULATED_BEHAVIORS = [
 export type SimulatedBehavior = (typeof SIMULATED_BEHAVIORS)[number];
 
 export const CARD_BEHAVIORS: readonly SimulatedBehavior[] = [
-  'succeeds', 'insufficient_funds', 'card_declined', 'expired_card',
+  'succeeds', 'insufficient_funds', 'card_declined', 'do_not_honor', 'expired_card',
   'incorrect_cvc', 'processing_error', 'authentication_required',
+  'stolen_card', 'lost_card', 'pickup_card', 'fraudulent', 'restricted_card',
 ];
 
 export const BANK_DEBIT_BEHAVIORS: readonly SimulatedBehavior[] = [
@@ -402,6 +412,38 @@ export interface DunningAttempt {
   created: number;
 }
 
+/**
+ * Why a campaign is not presenting the bill even though it is still open.
+ *
+ * `card_needs_person`: the last decline was one no schedule can answer — the
+ * card is expired, stolen, wrong, or the issuer wants the cardholder — so the
+ * retries were dropped, but the *window* they would have run in still runs.
+ * The account sits past due while a person replaces or confirms the card, and
+ * only when that window would have closed does the end behaviour apply. This
+ * is the difference between "do not retry this card" and "write this account
+ * off": the first is a fact about the card, the second is a decision the
+ * workspace's policy makes after a set number of days, not a millisecond.
+ *
+ * `reopened_by_refund`: a person gave the money back and the bill is owed
+ * again. Nothing presents it automatically — charging a card straight after
+ * refunding it is exactly the pair of lines on a statement that produces a
+ * chargeback — and nothing ends it but a person: a credit note if the bill
+ * should be smaller, or a hand retry once the customer expects the charge.
+ */
+export const DUNNING_HOLD_REASONS = ['card_needs_person', 'reopened_by_refund'] as const;
+export type DunningHoldReason = (typeof DUNNING_HOLD_REASONS)[number];
+
+export interface DunningHold {
+  reason: DunningHoldReason;
+  /**
+   * When the schedule's window would have run out, and the end behaviour
+   * applies to a bill still owed. Null when nothing ends the hold but a person.
+   */
+  until: number | null;
+  /** Why the bill is held and what ends it, in one or two sentences. */
+  note: string;
+}
+
 export interface Dunning {
   object: 'dunning';
   id: string;
@@ -416,7 +458,10 @@ export interface Dunning {
   max_attempts: number;
   retry_days: number[];
   end_behavior: DunningEndBehavior;
+  /** When the card is next presented. Null while the campaign is held for a person, or once it is over. */
   next_attempt_at: number | null;
+  /** Set while the bill is owed and no presentation is scheduled: who has to act, and by when. */
+  hold: DunningHold | null;
   last_attempt_at: number | null;
   last_failure_code: DeclineCode | null;
   last_failure_message: string | null;

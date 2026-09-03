@@ -412,4 +412,40 @@ ALTER TABLE billing_invoices ADD COLUMN automatic_tax_status TEXT NOT NULL DEFAU
 CREATE INDEX idx_billing_invoices_tax_status ON billing_invoices(org_id, automatic_tax_status);
 `,
   },
+  {
+    id: 'billing.0006_invoice_holds',
+    sql: `
+-- A bill that waits for the metered window it settles. The renewal used to draw
+-- its invoice before the closed window's usage was priced, so every metered
+-- charge landed one cycle late and a subscription that ended never billed its
+-- last month. The hold carries everything the bill needs — the advance lines
+-- priced at the boundary, the closed window, the settlements it waits for and
+-- the date it is dated — and draws when the last settlement lands or the
+-- deadline passes, whichever is first.
+CREATE TABLE billing_invoice_holds (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  subscription_id TEXT NOT NULL,
+  customer_id TEXT NOT NULL,
+  billing_reason TEXT NOT NULL,
+  period_start INTEGER NOT NULL,
+  period_end INTEGER NOT NULL,
+  arrears_start INTEGER NOT NULL,
+  arrears_end INTEGER NOT NULL,
+  recurring TEXT NOT NULL DEFAULT '[]',
+  awaiting TEXT NOT NULL DEFAULT '[]',
+  awaits_announcement INTEGER NOT NULL DEFAULT 1,
+  bill_date INTEGER NOT NULL,
+  deadline INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'awaiting',
+  release_reason TEXT,
+  invoice_id TEXT,
+  meta TEXT NOT NULL DEFAULT '{}',
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL
+);
+CREATE INDEX idx_billing_invoice_holds_customer ON billing_invoice_holds(org_id, customer_id, status);
+CREATE INDEX idx_billing_invoice_holds_subscription ON billing_invoice_holds(org_id, subscription_id, status);
+`,
+  },
 ];

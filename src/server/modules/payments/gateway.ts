@@ -963,10 +963,10 @@ export class Gateway {
    * it was scheduled for and what it decided to do next — so the callbacks are
    * held off for the duration of the call and no attempt is written twice.
    */
-  collectForDunning(orgId: string, invoiceId: string): CollectionResult {
+  collectForDunning(orgId: string, invoiceId: string, methodId: string | null = null): CollectionResult {
     this.drivenByDunning = true;
     try {
-      return this.collectInvoice(orgId, invoiceId, { source: 'dunning_retry', meta: { actorType: 'system' } });
+      return this.collectInvoice(orgId, invoiceId, { source: 'dunning_retry', methodId, meta: { actorType: 'system' } });
     } finally {
       this.drivenByDunning = false;
     }
@@ -1448,14 +1448,16 @@ export class Gateway {
       const shown = formatMoney(money(amount, charge.currency), { locale });
 
       let effect: string | null = null;
+      let reopened: { before: Invoice; after: Invoice } | null = null;
       if (charge.invoice) {
         const before = this.billing.invoices.require(orgId, charge.invoice);
         const after = this.reverseCollection(orgId, charge.invoice, amount, {
           note: `${shown} refunded to the customer on ${new Date(now).toISOString().slice(0, 10)} (${id}).`,
           at: now, meta,
         });
+        reopened = { before, after };
         effect = after.status === 'open' && before.status === 'paid'
-          ? `Invoice ${after.number} is open again with ${formatMoney(money(after.amount_due, after.currency), { locale })} showing as due, because the money that settled it has gone back. Raise a credit note if the bill itself should be smaller.`
+          ? `Invoice ${after.number} is open again with ${formatMoney(money(after.amount_due, after.currency), { locale })} showing as due, because the money that settled it has gone back. Nothing charges it automatically: it is in the recovery queue for a person to credit or present by hand. Raise a credit note if the bill itself should be smaller.`
           : `Invoice ${after.number} now records ${formatMoney(money(after.amount_paid, after.currency), { locale })} collected.`;
       }
 
@@ -1477,6 +1479,9 @@ export class Gateway {
         objectId: charge.id, objectType: 'charge',
         actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
       });
+      // A bill this refund put back on the books is owed by somebody from
+      // here: nothing charges it automatically, and the recovery queue says so.
+      if (reopened) this.payments.dunning.onRefundReopened(orgId, reopened.before, reopened.after, record);
       return record;
     });
   }
