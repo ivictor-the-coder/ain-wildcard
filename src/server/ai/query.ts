@@ -13,7 +13,7 @@ import { hasTable } from './grounding';
 import { bucketKey, type WindowGrain } from './dates';
 
 export type ConditionOp =
-  | 'eq' | 'neq' | 'in' | 'not_in' | 'gte' | 'gt' | 'lte' | 'lt' | 'is_set' | 'is_not_set' | 'contains';
+  | 'eq' | 'neq' | 'in' | 'not_in' | 'gte' | 'gt' | 'lte' | 'lt' | 'is_set' | 'is_not_set' | 'contains' | 'has';
 
 export interface Condition {
   property: string;
@@ -93,6 +93,15 @@ function conditionFragment(c: Condition): Fragment {
       return {
         sql: `NOT EXISTS (SELECT 1 FROM crm_record_values x WHERE x.record_id = r.id AND x.property = ? AND x.${column} = ?)`,
         params: [...params, c.value ?? null],
+      };
+    // A multi-select column holds every value of one record in one cell, wrapped
+    // in separators — `;siemens;fanuc;`. Equality against it matches nothing, so
+    // "how many companies run Siemens controls?" came back as a confident zero
+    // for 24 accounts that do. This is membership, not equality.
+    case 'has':
+      return {
+        sql: `EXISTS (SELECT 1 FROM crm_record_values x WHERE x.record_id = r.id AND x.property = ? AND x.value_text LIKE ? ESCAPE '\\')`,
+        params: [...params, `%;${String(c.value ?? '').toLowerCase().replace(/[\\%_]/g, (ch) => `\\${ch}`)};%`],
       };
     case 'contains':
       return {

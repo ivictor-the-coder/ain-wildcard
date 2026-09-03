@@ -660,6 +660,21 @@ const OP_PHRASE: Record<string, string> = {
 const DATE_COLUMN = /(_at|_date)$|^(created|updated)$/;
 
 /**
+ * A threshold on a stored count, in the column's own words.
+ *
+ * `connected_assets` is a plural of things you can have more than 500 of;
+ * `probability` is a scalar a row has one of. Reading both as "worth more than
+ * N" said money about neither.
+ */
+function countNoun(property: string, comparator: string, value: number): string {
+  const counted = property.replace(/_count$/, '');
+  const noun = humanise(counted).toLowerCase();
+  if (property.endsWith('_count')) return `${comparator} ${value.toLocaleString()} ${noun}s`;
+  if (/s$/.test(noun)) return `${comparator} ${value.toLocaleString()} ${noun}`;
+  return `a ${noun} of ${comparator} ${value.toLocaleString()}`;
+}
+
+/**
  * Every filter the search actually ran, said out loud.
  *
  * The rule this enforces: the headline describes the conditions that were sent,
@@ -721,13 +736,21 @@ function conditionClauses(
     // A stored count whose unit is in its own column name reads as a term, not
     // as a bare number after a machine name: "contract term months 36".
     const unit = property.match(/_(months|days|years|weeks)$/)?.[1];
-    if (unit && op === 'eq' && typeof condition.value === 'number') {
-      clauses.push(`on a ${condition.value}-${unit.replace(/s$/, '')} ${humanise(property.replace(/_(months|days|years|weeks)$/, '')).toLowerCase()}`);
+    if (unit && typeof condition.value === 'number' && (op === 'eq' || OP_PHRASE[op])) {
+      const noun = humanise(property.replace(/_(months|days|years|weeks)$/, '')).toLowerCase();
+      clauses.push(op === 'eq'
+        ? `on a ${condition.value}-${unit.replace(/s$/, '')} ${noun}`
+        : `with a ${noun} of ${OP_PHRASE[op]} ${condition.value} ${unit}`);
       continue;
     }
     if (OP_PHRASE[op] && typeof condition.value === 'number') {
       const money = /amount|value|revenue|price|cost|spend/.test(property);
-      clauses.push(`worth ${OP_PHRASE[op]} ${money ? facts.money(condition.value) : condition.value.toLocaleString()}`);
+      if (money) { clauses.push(`worth ${OP_PHRASE[op]} ${facts.money(condition.value)}`); continue; }
+      // A count is not a price. "7 companies worth more than 500" over a
+      // `connected_assets` threshold reads as half a thousand dollars, and the
+      // column the reader named is nowhere in the sentence — the same silent
+      // substitution as a dropped filter, printed as a caption.
+      clauses.push(`with ${countNoun(property, OP_PHRASE[op], condition.value)}`);
       continue;
     }
     const values = (Array.isArray(condition.values) ? condition.values : condition.value === undefined ? [] : [condition.value])

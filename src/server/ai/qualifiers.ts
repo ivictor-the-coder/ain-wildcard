@@ -44,6 +44,7 @@ import { extractMentions, type ResolvedEntity } from './resolve';
 import type { PeriodMention, TimeWindow } from './dates';
 import type { MetricDetection } from './metrics';
 import type { TaskIntent } from './intent';
+import { FURNITURE as CLOSED_CLASS } from './coverage';
 import { COMMON_WORDS, STOPWORDS, listPhrase, normalise } from './text';
 
 /**
@@ -126,8 +127,11 @@ export interface QualifierValue {
    * value on it. A threshold is still a qualifier — the $500,000 case has
    * always bound as one — so it settles the same way; it just is not a claim
    * that the set the step reads is inside a set of values.
+   *
+   * `has` is membership in a multi-select column: a company runs Siemens *and*
+   * Fanuc, and equality against the cell holding both matched neither.
    */
-  op?: 'eq' | 'in' | 'lt' | 'lte' | 'gt' | 'gte';
+  op?: 'eq' | 'in' | 'lt' | 'lte' | 'gt' | 'gte' | 'has';
 }
 
 /**
@@ -984,10 +988,28 @@ const DATE_NOUNS: { pattern: RegExp; property: string; label: string }[] = [
   { pattern: /\b(clos(?:e|es|ed|ing)|due|expiring|expires?|renew(?:s|ing|al\s+date)?)\b/i, property: 'close_date', label: 'close date' },
 ];
 
+/**
+ * A period somewhere in the sentence, which is what makes a closing word point
+ * at a column rather than describe a state.
+ */
+const PERIOD_MARKER =
+  /\b(last|next|this|past|coming|previous|prior|since|before|after|during|between|within|q[1-4]|h[12]|fy|day|days|week|weeks|month|months|quarter|quarters|year|years|ytd|mtd|qtd|today|yesterday|tomorrow|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december|20\d\d)\b/i;
+
+/** The closing words that are also a lifecycle state when no period is named. */
+const BARE_STATE = /^(closed|close|closes|closing|due|expired?)$/i;
+
 export function dateNounIn(question: string): { property: string; label: string; text: string } | null {
   for (const noun of DATE_NOUNS) {
     const hit = question.match(noun.pattern);
-    if (hit) return { property: noun.property, label: noun.label, text: hit[0] };
+    if (!hit) continue;
+    // "How many deals are closed?" names no period, so "closed" is the state the
+    // deal is in, not the column it would be measured on. Reading it as the
+    // column let the close-date claim spend the reader's "closed", so the
+    // question read as fully accounted and answered "38 open deals right now" —
+    // the opposite of what was asked, with nothing left to refuse on. With a
+    // period present ("closed won last quarter") the column is exactly right.
+    if (noun.property === 'close_date' && BARE_STATE.test(hit[0]) && !PERIOD_MARKER.test(question)) continue;
+    return { property: noun.property, label: noun.label, text: hit[0] };
   }
   return null;
 }
@@ -1509,7 +1531,7 @@ export interface RecordFilter {
   /** What a person calls the value — "Escalated", "Economic buyer". */
   label: string;
   /** How the value narrows, when it is not equality. */
-  op?: 'eq' | 'in' | 'lt' | 'lte' | 'gt' | 'gte';
+  op?: 'eq' | 'in' | 'lt' | 'lte' | 'gt' | 'gte' | 'has';
   /**
    * What a person calls the dimension — "Competitor", "Industry", "Priority".
    *
@@ -2032,7 +2054,11 @@ const ORDER_WORDS: { pattern: RegExp; property: string | null; direction: 'asc' 
   // A close date the question wants first is a different sort key as well as a
   // different direction: "the 3 deals closing soonest" answered by the 8
   // largest is two substitutions in one sentence.
-  { pattern: /\b(closing|close|closes|closed|due|expiring|expire|renewing|renew)\s+(soonest|first|earliest|next)\b/i, property: 'close_date', direction: 'asc', word: 'soonest to close' },
+  // "Next" is an ordering only when nothing follows it. "How much pipeline
+  // closes next quarter?" names a period and a date column — a query this
+  // engine runs exactly — and reading "closes next" as a sort order refused it
+  // with a sentence about a ranking nobody asked for.
+  { pattern: /\b(closing|close|closes|closed|due|expiring|expire|renewing|renew)\s+(soonest|first|earliest|next(?!\s+(?:\d|q[1-4]\b|quarter|month|year|week|day|fiscal|financial|half)))\b/i, property: 'close_date', direction: 'asc', word: 'soonest to close' },
   { pattern: /\b(soonest|earliest)\b/i, property: 'close_date', direction: 'asc', word: 'soonest to close' },
   { pattern: /\boldest\b/i, property: 'created', direction: 'asc', word: 'oldest' },
 ];
@@ -2144,6 +2170,11 @@ export function unknownModifier(question: string, matched: string, unknown: stri
   const before = normalise(question).slice(0, at).trim().split(' ').filter(Boolean);
   const previous = before[before.length - 1];
   if (!previous || DIRECTION_ADJECTIVE.has(previous)) return null;
+  // An auxiliary is not a modifier. "Which rep has the biggest book?" put "has"
+  // in front of the measure and was refused with a sentence asserting that
+  // "has" narrows Open pipeline to something this workspace does not hold —
+  // a false statement about the reader's grammar, in place of an answer.
+  if (CLOSED_CLASS.has(previous)) return null;
   const unresolved = new Set(unknown.map(normalise));
   return unresolved.has(previous) ? previous : null;
 }

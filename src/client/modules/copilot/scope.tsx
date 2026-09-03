@@ -232,7 +232,12 @@ export function ScopeWarning({ report, board, rephrase }: {
 export function RephraseLink({ question, onAsk }: { question: string; onAsk: (q: string) => void }) {
   return (
     <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
-      <button type="button" className="cp-chip" onClick={() => onAsk(question)}>
+      <button
+        type="button"
+        className="cp-chip cp-chip--wide"
+        title={`Ask “${question}”`}
+        onClick={() => onAsk(question)}
+      >
         <Icons.sparkles size={12} />
         <span className="u-truncate">Ask it as “{question}”</span>
       </button>
@@ -248,7 +253,8 @@ export function BoardLink({ board }: { board: { href: string; label: string } })
   return (
     <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
       <a
-        className="cp-chip"
+        className="cp-chip cp-chip--wide"
+        title={`Open the board for ${board.label}`}
         href={board.href}
         onClick={(e) => {
           if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;

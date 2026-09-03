@@ -264,6 +264,14 @@
 .cp-chip:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 .cp-chip[disabled] { cursor: default; opacity: 0.8; }
 a.cp-chip { text-decoration: none; }
+/* The way out of a refusal is a sentence, not a tag.
+   A rephrasing, a board link or the deal screen that can set the property the
+   copilot cannot: each is one action in a banner, and each carries the whole
+   question or record name a person has to read before pressing it. At the chip
+   row's 260px they read "Ask it as “How did bookings in Q2 2026 co…" and
+   "Set the owner on Redstone Energy Servic…" — an offer nobody can take. */
+.cp-chip--wide { max-width: 100%; }
+
 /* A cited record with no screen: still reachable, visibly not a way out. */
 .cp-chip--flat { cursor: default; border-style: dashed; color: var(--text-tertiary); }
 .cp-chip--flat:hover { border-color: var(--border-default); color: var(--text-tertiary); background: var(--bg-surface); }

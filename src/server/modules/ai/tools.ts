@@ -22,7 +22,7 @@ import type { Condition } from '../../ai/query';
 
 const conditionInput = v.array(v.object({
   property: v.string({ min: 1, max: 60, description: 'Machine name of the property, e.g. deal_stage.' }),
-  op: v.enum(['eq', 'neq', 'in', 'not_in', 'gte', 'gt', 'lte', 'lt', 'is_set', 'is_not_set', 'contains'] as const),
+  op: v.enum(['eq', 'neq', 'in', 'not_in', 'gte', 'gt', 'lte', 'lt', 'is_set', 'is_not_set', 'contains', 'has'] as const),
   value: v.optional(v.any()),
   values: v.optional(v.array(v.any(), { max: 40 })),
 }), { max: 10 });
@@ -84,7 +84,7 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
       name: 'record_search',
       description:
         'List records of one object type with structured conditions — open deals over $100k, tickets escalated this week, companies in a region. ' +
-        'Conditions use property machine names and the operators eq, neq, in, not_in, gt, gte, lt, lte, contains, is_set and is_not_set.',
+        'Conditions use property machine names and the operators eq, neq, in, not_in, gt, gte, lt, lte, contains, has (one value of a multi-select), is_set and is_not_set.',
       readOnly: true,
       tags: ['ai', 'crm'],
       input: v.object({

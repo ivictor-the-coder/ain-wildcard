@@ -539,6 +539,36 @@ export function countedObject(text: string): { value: string; label: string; tex
   return found ? { value: found.value, label: found.label, text: match[0] } : null;
 }
 
+/**
+ * The records a lookup asks to be shown, as its own head noun.
+ *
+ * `Which customers are overdue on payment?` is a request for a list of
+ * customers, not for the measure `Customers` — the engine reads the measure off
+ * "overdue" and answers with the two accounts that owe. Only the noun is
+ * returned, and only from a listing frame: the word is used to stop the metric
+ * catalogue spending it a second time, never to claim a scope of its own.
+ */
+const LOOKUP_FRAME = /\b(?:which|what|who|list|show me|show us|find|give me)\s+(?:(?:the|our|all|my|open|active|closed|won|lost|new|top|biggest|largest|current)\s+)*([a-z][a-z-]{2,})\b/;
+
+export function lookupObject(text: string): string | null {
+  const match = LOOKUP_FRAME.exec(norm(text));
+  return match ? match[1] : null;
+}
+
+/**
+ * The noun a question is asking about, whichever frame it is written in.
+ *
+ * Unlike `countedObject` this claims nothing about the record type — it is the
+ * word itself, and it exists so that the repair offered on a refusal never cuts
+ * the subject out of the sentence. "How many contacts are in the Expansion
+ * pipeline?" is refused on the word "contacts", and "How many are in the
+ * Expansion pipeline?" is not a question.
+ */
+export const questionHeadNoun = (text: string): string | null => {
+  const counted = COUNT_FRAME.exec(norm(text));
+  return counted ? counted[1] : lookupObject(text);
+};
+
 /* ------------------------ enumerated record properties -------------------- */
 
 /**
@@ -980,15 +1010,36 @@ export function namedQualifiers(question: string, vocab: Vocabulary): NamedQuali
   // first word happens to match: "pipeline velocity" is not open pipeline.
   const unknown = unknownMeasure(text, vocab, consumed);
   const metric = unknown ? null : metricAsked(text, vocab, consumed);
-  // The head noun of a counting question has already spent those words.
+  // The head noun of the question has already spent those words.
+  //
   // "open deals" is a keyword of Open pipeline as well as the thing being
   // counted, so "How many open deals came from a trade show?" — answered with
   // a correct deal count — was topped with a red "You asked for Open pipeline.
   // This figure is Deals, which is a different measure." A guard that fires on
   // correct answers is how the ones over real substitutions get ignored.
-  const spentOnTheCount = !!counted && !!metric && norm(counted.text).includes(norm(metric.phrase));
+  //
+  // A count is not the only frame that spends its noun. "What is the total
+  // value of deals in negotiation?" is answered $1,596,340 at the Negotiation
+  // stage — the right number, from the right column — and "deals" in it is the
+  // thing being valued, not the count metric `Deals`. Read as the measure, it
+  // put "You asked for Deals. This figure is Open pipeline, which is a
+  // different measure." in red over an answer the engine's own notes record as
+  // `Metric: Open pipeline (matched "value of deals")`. So every object noun
+  // this question is *about* spends its own word, not just a counted one.
+  const objectNouns = found.filter((q) => q.kind === 'object').map((q) => norm(q.text));
+  const spentOnTheObject = !!metric && objectNouns.some((noun) => noun.includes(norm(metric.phrase)));
+  // And the head noun of a lookup spends it too. "Which customers are overdue
+  // on payment?" is answered with the two customers who owe — the engine reads
+  // the measure off "overdue" — and "customers" is what is being listed. Read
+  // as the measure `Customers`, it produced "You asked for Customers. Nothing
+  // in this answer measured it" over an answer that is exactly the list asked
+  // for. Equality only: "Which rep has the most open pipeline?" still names a
+  // measure, because "rep" is not it.
+  const lookup = lookupObject(text);
+  const spentOnTheLookup = !!metric && !!lookup && lookup === norm(metric.phrase);
+  const spentOnTheNoun = spentOnTheObject || spentOnTheLookup;
   if (unknown) add({ kind: 'metric', text: unknown, label: humanizeName(unknown), value: null });
-  else if (metric && !spentOnTheCount) {
+  else if (metric && !spentOnTheNoun) {
     add({ kind: 'metric', text: metric.phrase, label: metric.metric.label, value: metric.metric.id });
   }
 
@@ -1210,6 +1261,19 @@ const DROPPABLE = new Set(['period', 'limit']);
  * same sentence without that one word — "…compare with the quarter?" — answers
  * $334,840 against $1,791,400, which is the comparison the prompt promised.
  */
+/**
+ * Words a question cannot end on.
+ *
+ * Narrower than `FILLER` on purpose: "What is our top pipeline by value?" ends
+ * on a word that means nothing on its own and is still a sentence, while
+ * "…overdue on?" is not one. Only what has to be followed by something.
+ */
+const DANGLING = new Set([
+  'in', 'on', 'at', 'of', 'for', 'from', 'to', 'by', 'with', 'about', 'across', 'over', 'per',
+  'into', 'onto', 'and', 'or', 'than', 'as', 'the', 'a', 'an', 'our', 'my', 'your', 'their', 'its',
+  'this', 'that', 'these', 'those',
+]);
+
 const UNACCOUNTED = /\btokens?\s+unaccounted\s+for:\s*(.+?)\.?$/i;
 
 const unaccountedTokens = (message: string): string[] => {
@@ -1226,15 +1290,32 @@ const unaccountedTokens = (message: string): string[] => {
 export function withoutRefusedQualifier(
   question: string,
   refusal: { code: string; message: string } | null | undefined,
+  vocab?: Vocabulary,
 ): string | null {
   if (!refusal) return null;
   let out = question;
   let dropped = false;
+  const unaccounted = unaccountedTokens(refusal.message);
+  // A word the engine could not place is only droppable when the question
+  // survives without it. Two do not.
+  //
+  // The subject: "How many contacts are in the Expansion pipeline?" is refused
+  // on "contacts", and "How many are in the Expansion pipeline?" is not a
+  // sentence — it is the reader's own question with its subject removed, handed
+  // back as the way out.
+  const head = questionHeadNoun(question);
+  if (head && unaccounted.some((token) => norm(token) === head)) return null;
+  // And the measure: "What is our pipeline velocity?" is refused on
+  // "velocity", and "What is our pipeline?" is a different, larger, standard
+  // number. Substituting the measure is the thing this file exists to catch, so
+  // it cannot be the thing this file offers.
+  const unknown = vocab ? norm(unknownMeasure(question, vocab) ?? '') : '';
+  if (unknown && unaccounted.some((token) => hasPhrase(unknown, norm(token)))) return null;
   const phrases = [
     ...[...refusal.message.matchAll(new RegExp(REFUSED_QUALIFIER.source, 'gi'))]
       .filter((match) => DROPPABLE.has(match[1].toLowerCase()))
       .map((match) => match[2]),
-    ...unaccountedTokens(refusal.message),
+    ...unaccounted,
   ];
   for (const raw of phrases) {
     const phrase = raw.trim();
@@ -1249,7 +1330,53 @@ export function withoutRefusedQualifier(
   const tidied = out.replace(/\s{2,}/g, ' ').replace(/\s+([?.!,])/g, '$1').trim();
   // Something has to be left to ask.
   const words = tidied.replace(/[^A-Za-z0-9]+/g, ' ').trim().split(' ').filter(Boolean);
-  return words.length >= 3 && norm(tidied) !== norm(question) ? tidied : null;
+  if (words.length < 3 || norm(tidied) === norm(question)) return null;
+  // And it has to end somewhere. "Which customers are overdue on payment?" is
+  // refused on "payment", and taking that one word out leaves "Which customers
+  // are overdue on?" — a preposition with nothing after it, offered to a
+  // finance lead as the question that works.
+  return DANGLING.has(words[words.length - 1].toLowerCase()) ? null : tidied;
+}
+
+/**
+ * The comparison the engine resolved, in the two periods it named itself.
+ *
+ * "How did bookings last quarter compare with the quarter before?" is this
+ * workspace's fifth starter prompt, and it is refused on the single word
+ * "before" — after the engine has already worked out, and written down, exactly
+ * what it meant: `Comparison windows: Q2 2026 against Q1 2026 (preceding
+ * period).` Cutting the refused word out of the sentence leaves "…compare with
+ * the quarter?", which is not English and is not what anybody would press.
+ *
+ * So the way out is the engine's own two windows, put back into the question in
+ * the words it read the measure from — `Metric: Closed-won bookings (matched
+ * "bookings")` — giving "How did bookings in Q2 2026 compare with Q1 2026?",
+ * which this engine answers with the comparison the prompt promised.
+ *
+ * Only for a measure that takes a period at all: Open pipeline is a snapshot,
+ * and offering to compare two quarters of it would trade one dead end for
+ * another.
+ */
+const COMPARISON_WINDOWS = /^Comparison windows:\s*(.+?)\s+against\s+(.+?)\s*(?:\(|$)/;
+const MEASURE_READ = /^Metric:\s*(.+?)\s*\(matched\s+["“]([^"”]+)["”]/;
+
+export function comparisonRephrase(reasoning: string[], vocab: Vocabulary): string | null {
+  let windows: [string, string] | null = null;
+  let measure: { label: string; phrase: string } | null = null;
+  for (const line of reasoning) {
+    const compared = COMPARISON_WINDOWS.exec(line.trim());
+    if (compared) { windows = [compared[1].trim(), compared[2].trim()]; continue; }
+    const read = MEASURE_READ.exec(line.trim());
+    if (read) measure = { label: read[1].trim(), phrase: read[2].trim() };
+  }
+  if (!windows || !measure) return null;
+  const [first, second] = windows;
+  if (!first || !second || norm(first) === norm(second)) return null;
+  const known = vocab.metrics.find((m) => norm(m.label) === norm(measure.label));
+  // A measure this workspace does not publish, or one measured as of now, has
+  // no two-period comparison to offer.
+  if (!known || known.snapshot) return null;
+  return `How did ${measure.phrase} in ${first} compare with ${second}?`;
 }
 
 /* -------------------- sentences the answer should not keep ---------------- */
@@ -1448,6 +1575,23 @@ export const WIDE_SCOPE: Record<QualifierKind, string> = {
   property: 'every value of it',
 };
 
+/**
+ * Whether this turn was asked to change something rather than to measure it.
+ *
+ * Three shapes, all written by the engine itself: a write it prepared and
+ * stopped on for approval, a write it could not prepare, and a write it would
+ * not prepare because the run is read-only. Every one of them is a sentence
+ * whose nouns are arguments — the deal to move, the teammate to assign — and
+ * not a scope any figure was measured at.
+ */
+const WRITE_LINES = [
+  /^No write prepared:/i,
+  /\bfailed \(approval_required\)/i,
+];
+
+export const isWriteRequest = (reasoning: string[]): boolean =>
+  reasoning.some((line) => WRITE_LINES.some((pattern) => pattern.test(line.trim())));
+
 export interface ReconcileInput {
   question: string;
   prose: string;
@@ -1469,6 +1613,26 @@ export interface ReconcileInput {
 export function reconcileScope(input: ReconcileInput): ScopeReport {
   const measurements = measurementsOf(input.toolCalls, input.reasoning, input.vocab);
   const answering = answeringMeasurements(measurements, input.prose);
+  // Every rule below compares a *figure* against the filters a question asked
+  // for. A sentence that asks for a write names no filters: "Change the owner
+  // of the Redstone Energy Services — line 2 monitoring deal to Priya Raman" is
+  // an instruction whose words are the write's arguments, and reading them as
+  // scope produced two red sentences — "You asked about Priya Raman. This
+  // figure was measured for Redstone Energy Services" — over a turn that
+  // measured no figure, wrote nothing, and said so. The card already carries
+  // the true fact about that turn, which is that the copilot cannot set an
+  // owner; the reconciliation has nothing to add and no figure to add it about.
+  if (isWriteRequest(input.reasoning)) {
+    return {
+      measurements,
+      answering,
+      verdicts: [],
+      unscoped: [],
+      unchecked: [],
+      invented: [],
+      resolve: resolver(input.resolveId, parseLedger(input.reasoning)),
+    };
+  }
   const named = namedQualifiers(input.question, input.vocab);
   const ledger = parseLedger(input.reasoning);
   const evidence: Evidence = { prose: input.prose };

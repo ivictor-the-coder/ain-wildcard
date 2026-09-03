@@ -46,6 +46,8 @@ export interface DimensionOption {
 export interface Dimension {
   objectType: string;
   property: string;
+  /** True when a record may hold several of these at once. */
+  multi: boolean;
   /** What a person calls the dimension — "Competitor", "Original source". */
   noun: string;
   /** The phrases that name the dimension itself, for an anchored match. */
@@ -83,6 +85,9 @@ const AMBIGUOUS = new Set([
   'pipeline', 'expansion', 'renewal', 'business', 'quality', 'finance', 'executive',
   'billing', 'hardware', 'security', 'integration', 'dashboards', 'mobile', 'api',
   'food', 'energy', 'timing', 'connected', 'progress',
+  // "Pilot" is an automation maturity here and the first word of "pilot
+  // conversion", a deal type, and of half the deal names in the book.
+  'pilot', 'pilots',
 ]);
 
 /** Extra ways people name a dimension, beyond the words of its own label. */
@@ -138,6 +143,14 @@ function surfaceForms(label: string, value: string): string[] {
   // deals have the Tulip competitor?" answer 0: the word naming the dimension
   // was consumed as a value of a different one.
   if (value.includes('_') || normalise(value) === normalise(label)) add(value.replace(/_/g, ' '));
+  // …and when it is the label's own opening, abbreviated. `pharma` is stored
+  // for "Pharmaceuticals" and `litmus` for "Litmus Edge"; both are how this
+  // workspace itself spells the value, and refusing them said "Northwind
+  // Robotics records no industry called \"pharma\"" about the string in its own
+  // column. Five characters and a shared opening, so a shorthand somebody chose
+  // for something else — `competitor` for "Lost to competitor" — is still not a
+  // spelling of it.
+  if (normalise(value).length >= 5 && normalise(label).startsWith(normalise(value))) add(value);
   const head = label.split(/\s*[&/]\s*/)[0];
   if (head && head !== label) add(head);
   return [...out].sort((a, b) => b.length - a.length);
@@ -185,7 +198,7 @@ export function dimensionsOf(ctx: Ctx, orgId: string, objectType: string, reserv
         anchored: forms,
       });
     }
-    if (options.length) out.push({ objectType, property, noun: definition.label, anchors, options });
+    if (options.length) out.push({ objectType, property, noun: definition.label, anchors, options, multi: definition.type === 'multi_enum' });
   }
   return out;
 }
@@ -196,6 +209,8 @@ export interface DimensionMatch {
   noun: string;
   value: string;
   label: string;
+  /** True when the column holds several values per record, so the test is membership. */
+  multi: boolean;
   /** The words in the question that named it. */
   matched: string;
 }
@@ -280,6 +295,7 @@ export function dimensionsIn(question: string, dimensions: Dimension[]): Dimensi
       noun: dimension.noun,
       value: best.option.value,
       label: best.option.label,
+      multi: dimension.multi,
       matched: spelling(question, best.form),
     });
   }
@@ -293,7 +309,18 @@ export function recordsMatching(
   objectType: string,
   property: string,
   value: string,
+  multi = false,
 ): string[] {
+  // A multi-select cell holds every value of the record at once, separated:
+  // `;siemens;fanuc;`. Equality against it finds nobody.
+  if (multi) {
+    return ctx.db.all<{ id: string }>(
+      `SELECT r.id FROM crm_records r JOIN crm_record_values v ON v.record_id = r.id
+        WHERE r.org_id = ? AND r.object_type = ? AND r.archived = 0 AND r.merged_into IS NULL
+          AND v.property = ? AND v.value_text LIKE ? ESCAPE '\\' ORDER BY r.id`,
+      orgId, objectType, property, `%;${value.toLowerCase().replace(/[\\%_]/g, (ch) => `\\${ch}`)};%`,
+    ).map((r) => r.id);
+  }
   return ctx.db.all<{ id: string }>(
     `SELECT r.id FROM crm_records r JOIN crm_record_values v ON v.record_id = r.id
       WHERE r.org_id = ? AND r.object_type = ? AND r.archived = 0 AND r.merged_into IS NULL
@@ -387,6 +414,45 @@ export interface NumericDimension {
 
 const UNIT_MULTIPLIER: Record<string, number> = { day: DAY, week: 7 * DAY, month: 30 * DAY, year: 365 * DAY };
 
+/**
+ * Words a numeric property's label spends on grammar rather than on identity.
+ *
+ * "Total open deal value" and "Time to resolution (min)" are named by "deal"
+ * and "resolution"; requiring the reader to write "total" or "time" as well
+ * would make the filter unreachable, and treating those words as identifying
+ * would let "how much time do we have" land on a column.
+ */
+const GENERIC_LABEL_WORD = new Set(['total', 'count', 'number', 'value', 'time', 'score', 'logged', 'stored']);
+
+/**
+ * The comparator in front of a number, and the operator it means.
+ *
+ * "a 24-month contract term" and "a contract term over 24 months" are two
+ * different questions, and the second one used to be answered as the first:
+ * `contract_term_months = 24` returned 17 deals where the reader's own
+ * threshold returns 15. The comparator is half the filter, so it is read with
+ * the number rather than after it.
+ */
+const COMPARATORS: [RegExp, 'gt' | 'gte' | 'lt' | 'lte'][] = [
+  [/\b(?:more\s+than|greater\s+than|larger\s+than|longer\s+than|bigger\s+than|over|above|north\s+of|exceeding|in\s+excess\s+of|beyond)\s*$/i, 'gt'],
+  [/\b(?:at\s+least|no\s+less\s+than|minimum\s+of|or\s+more\s+than)\s*$/i, 'gte'],
+  [/\b(?:less\s+than|fewer\s+than|smaller\s+than|shorter\s+than|under|below|beneath|south\s+of)\s*$/i, 'lt'],
+  [/\b(?:at\s+most|no\s+more\s+than|up\s+to|or\s+fewer\s+than)\s*$/i, 'lte'],
+];
+
+/** The operator the words immediately before a number ask for, or `eq`. */
+function comparatorBefore(question: string, at: number): { op: 'eq' | 'lt' | 'lte' | 'gt' | 'gte'; matched: string } {
+  const before = question.slice(Math.max(0, at - 28), at);
+  for (const [pattern, op] of COMPARATORS) {
+    const hit = before.match(pattern);
+    if (hit) return { op, matched: hit[0].trim() };
+  }
+  return { op: 'eq', matched: '' };
+}
+
+/** How a person reads an operator back. */
+const OP_WORD: Record<string, string> = { eq: '', gt: 'more than ', gte: 'at least ', lt: 'under ', lte: 'at most ' };
+
 /** "for more than 60 days", "for over 3 months" — a duration the sentence names. */
 const AGE_THRESHOLD =
   /\b(?:for\s+)?(more\s+than|over|longer\s+than|at\s+least|less\s+than|under|within|fewer\s+than)\s+(\d{1,4})\s*(day|days|week|weeks|month|months|year|years)\b/i;
@@ -419,12 +485,48 @@ export function numericDimensionsIn(
     const anchors = normalise(definition.label).split(' ')
       .filter((word) => word.length >= 4 && !/^(month|months|day|days|week|weeks|year|years)$/.test(word));
     if (anchors.length && !anchors.some((word) => text.includes(` ${word} `))) continue;
-    const hit = question.match(new RegExp(`\\b(\\d{1,4})\\s*[-\u2013 ]?\\s*${unit}s?\\b`, 'i'));
+    const hit = new RegExp(`\\b(\\d{1,4})\\s*[-\u2013 ]?\\s*${unit}s?\\b`, 'i').exec(question);
     if (!hit) continue;
+    // "over 24 months" is not "24 months". Reading the comparator with the
+    // number is the difference between the 15 deals the reader asked for and
+    // the 17 the equality returns.
+    const comparator = comparatorBefore(question, hit.index);
+    const amount = Number(hit[1]);
     out.push({
-      objectType, property, noun: definition.label, op: 'eq', value: Number(hit[1]),
-      label: `${hit[1]} ${unit}${Number(hit[1]) === 1 ? '' : 's'}`, matched: hit[0],
+      objectType, property, noun: definition.label, op: comparator.op, value: amount,
+      label: `${OP_WORD[comparator.op]}${hit[1]} ${unit}${amount === 1 ? '' : 's'}`,
+      matched: comparator.matched ? `${comparator.matched} ${hit[0]}` : hit[0],
     });
+  }
+
+  // A threshold on any stored number, read against the property's own label.
+  //
+  // "How many companies have more than 500 connected assets?" named a column
+  // this workspace holds, a comparator and a figure, and every part of it was
+  // dropped: the engine could only threshold money, so the question came back
+  // as a refusal naming "500" while `connected_assets` sat in the schema. The
+  // comparator is required — a bare number beside a column name is a value
+  // somebody is quoting, not a filter — and every distinctive word of the
+  // label has to be in the sentence, so "over 24 months" cannot land on
+  // "Days to close" for sharing the word "days".
+  for (const [property, definition] of properties) {
+    if (definition.type !== 'number') continue;
+    if (out.some((entry) => entry.property === property)) continue;
+    const words = normalise(definition.label).replace(/[^a-z0-9 ]+/g, ' ').split(' ')
+      .filter((word) => word.length >= 4 && !GENERIC_LABEL_WORD.has(word));
+    if (!words.length || !words.every((word) => text.includes(` ${word} `) || text.includes(` ${word}s `))) continue;
+    for (const hit of question.matchAll(/\b(\d[\d,]*(?:\.\d+)?)\s*(%|percent)?\b/gi)) {
+      const comparator = comparatorBefore(question, hit.index ?? 0);
+      if (comparator.op === 'eq') continue;
+      const amount = Number(hit[1].replace(/,/g, ''));
+      if (!Number.isFinite(amount)) continue;
+      out.push({
+        objectType, property, noun: definition.label, op: comparator.op, value: amount,
+        label: `${OP_WORD[comparator.op]}${amount.toLocaleString('en-US')} ${definition.label.toLowerCase()}`,
+        matched: `${comparator.matched} ${hit[0]}`.trim(),
+      });
+      break;
+    }
   }
 
   // An age in a state, which is a threshold on the date the state began.

@@ -201,9 +201,12 @@ const RECENT_HISTORY =
 const GONE_QUIET =
   /\b(gone\s+(?:quiet|cold|dark|silent)|going\s+(?:quiet|cold)|no\s+(?:recent\s+)?(?:activity|contact|touch(?:es|points?)?)|not\s+(?:been\s+)?(?:touched|contacted)|haven'?t\s+(?:touched|contacted|spoken\s+to|heard\s+from)|hasn'?t\s+been\s+touched|stale\s+accounts?|neglected|slipping\s+through|dormant|inactive\s+accounts?|which\s+accounts?\s+.{0,24}\bquiet\b)/i;
 
+/** The operators whose operand is a number rather than a stored label. */
+const NUMERIC_OP = new Set(['gt', 'gte', 'lt', 'lte']);
+
 export interface InferredCondition {
   property: string;
-  op: 'eq' | 'in' | 'gt' | 'gte' | 'lt' | 'lte' | 'is_set' | 'is_not_set';
+  op: 'eq' | 'in' | 'gt' | 'gte' | 'lt' | 'lte' | 'is_set' | 'is_not_set' | 'has';
   value?: string | number;
   values?: string[];
   /**
@@ -356,7 +359,7 @@ export function inferConditions(
       : {
         property: resolved.property,
         op: resolved.op ?? 'eq',
-        value: resolved.op && resolved.op !== 'eq' && resolved.op !== 'in' ? Number(resolved.value) : String(resolved.value),
+        value: NUMERIC_OP.has(resolved.op ?? 'eq') ? Number(resolved.value) : String(resolved.value),
         matched: entry.text,
       };
     const at = out.findIndex((condition) => condition.property === resolved.property);
@@ -491,7 +494,7 @@ export function ledgerFilters(input: PlanInput, objectType: string): InferredCon
         // A threshold is compared as a number; a picklist value as text. The
         // column the query reads depends on which, so the type is not
         // decoration.
-        value: resolved.op && resolved.op !== 'eq' && resolved.op !== 'in' ? Number(resolved.value) : String(resolved.value),
+        value: NUMERIC_OP.has(resolved.op ?? 'eq') ? Number(resolved.value) : String(resolved.value),
         matched: entry.text,
       });
   }
@@ -1215,6 +1218,15 @@ function rowLimit(input: PlanInput, fallback: number): number {
  * reader's own scoped sentence. `record_aggregate` takes all three, over the
  * same rows, to the cent.
  */
+/** The money threshold the question puts on the rows a catalogue measure is built from. */
+function metricThreshold(input: PlanInput, metricId: string): InferredCondition | null {
+  const shape = MONEY_METRIC_SHAPE[metricId];
+  if (!shape) return null;
+  const property = shape.property ?? MONEY_PROPERTY[shape.objectType];
+  if (!property) return null;
+  return moneyThreshold(input.question, property);
+}
+
 function scopedAggregate(
   input: PlanInput,
   metric: NonNullable<PlanInput['metric']>,
@@ -1233,6 +1245,7 @@ function scopedAggregate(
   // "open tickets waiting on the customer" is one status, not the open set and
   // that status at once, and the reader asked about the narrower one.
   const dimensions = ledgerFilters(input, shape.objectType);
+  const threshold = metricThreshold(input, metric.metric.id);
   const base = shape.conditions(input.stages).filter((c) => !dimensions.some((d) => d.property === c.property));
   const conditions: InferredCondition[] = [
     ...(stageValue || outcome.length ? base.filter((c) => c.property !== 'deal_stage') : base),
@@ -1243,6 +1256,8 @@ function scopedAggregate(
     // takes stage, pipeline and owner and silently drops the lead source is
     // still answering a wider question than the one asked.
     ...dimensions,
+    // …and the money threshold, on the column the rows hold it in.
+    ...(threshold && !dimensions.some((d) => d.property === threshold.property) ? [threshold] : []),
   ];
   const cross = crossScopeFilter(input, shape.objectType);
   // A decided deal is dated by when it closed, so a period on a won or lost
@@ -1604,6 +1619,12 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
       } else if (metric && MONEY_METRIC_SHAPE[metric.metric.id]
         && (namedOwner(input) || closesInWindow(input) || outcomeOverride(input).length > 0
           || ledgerFilters(input, MONEY_METRIC_SHAPE[metric.metric.id].objectType).length > 0
+          // A threshold is a filter on the rows, and the catalogue measure
+          // takes none. "How many open deals are worth at least $300,000?" was
+          // refused for naming a figure this engine can filter on exactly, one
+          // phrasing away from "which open deals are worth over $400,000?",
+          // which it answers.
+          || !!metricThreshold(input, metric.metric.id)
           || crossScopeFilter(input, MONEY_METRIC_SHAPE[metric.metric.id].objectType))) {
         // The catalogue measure takes no lead source, no competitor and no
         // industry. Running it anyway is how "how much open pipeline came from

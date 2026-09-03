@@ -329,7 +329,7 @@ export function recordPropertyFilters(
   types: string[],
   stages: StageSets,
 ): RecordFilter[] {
-  const out: RecordFilter[] = [];
+  let out: RecordFilter[] = [];
   const text = ` ${normalise(question)} `;
   // The pipeline and stage labels belong to their own qualifier kinds. Reading
   // them again as enumerated values would put two entries in the ledger for one
@@ -370,10 +370,14 @@ export function recordPropertyFilters(
         matched: hit.matched,
         label: hit.label,
         noun: hit.noun,
+        // A record can run Siemens *and* Fanuc, and the column holds both. The
+        // test is membership; equality against it answered "0 companies" for
+        // the 24 that do.
+        ...(hit.multi ? { op: 'has' as const } : {}),
         // The rows this filter picks out, so a question about pharmaceutical
         // *companies* can scope a query over *deals* to exactly those accounts
         // rather than losing the word on the way in.
-        ids: recordsMatching(ctx, orgId, hit.objectType, hit.property, hit.value),
+        ids: recordsMatching(ctx, orgId, hit.objectType, hit.property, hit.value, hit.multi),
       });
     }
   }
@@ -428,6 +432,17 @@ export function recordPropertyFilters(
       });
     }
   }
+  // A value written inside a longer value is not a second filter.
+  //
+  // "How many pilot conversion deals are there?" names the deal type "Pilot
+  // conversion"; the word "pilot" inside it is also an automation maturity of a
+  // company, so a second filter scoped the count to the two accounts in a pilot
+  // cell and the answer was "0 deals" for a question whose answer is 25. The
+  // longer span is the one the reader wrote.
+  const spans = out.map((filter) => normalise(filter.matched));
+  const swallowed = out.filter((filter, at) => spans.some((span, other) =>
+    other !== at && span.length > spans[at].length && ` ${span} `.includes(` ${spans[at]} `)));
+  out = out.filter((filter) => !swallowed.includes(filter));
   // One filter per column. The dimension pass and the pattern pass can both
   // read the same word, and two entries for one span reads to the ledger as a
   // question naming two of a kind — which is a refusal, on a sentence that
@@ -475,7 +490,7 @@ export function unknownFilterValue(
     if (!CRM_OBJECT_TYPES.has(objectType)) continue;
     const dimensions = dimensionsOf(ctx, orgId, objectType, reserved);
     const unknown = unknownDimensionValue(question, dimensions,
-      found.filter((f) => f.objectType === objectType).map((f) => ({ ...f, noun: '', value: '', label: '', matched: '' })));
+      found.filter((f) => f.objectType === objectType).map((f) => ({ ...f, noun: '', value: '', label: '', matched: '', multi: false })));
     if (unknown) return unknown;
   }
   return null;
@@ -859,14 +874,16 @@ export function queriedTypes(plan: { tool: string; args: Record<string, unknown>
     const metric = step.args.metric;
     if (typeof metric === 'string' && METRIC_ROWS[metric]) out.add(METRIC_ROWS[metric]);
     if (step.args.meter) out.add('usage');
-    // A capability named for its own domain reads that domain's rows.
-    const domain = step.tool.split('_')[0];
+    // A capability named for its own domain reads that domain's rows. The
+    // ledger names itself with a dot — `credits.balance` — so the split has to
+    // take both separators, or a credit question is refused for naming grants.
+    const domain = step.tool.split(/[._]/)[0];
     if (domain === 'billing') out.add('invoice');
     if (domain === 'credits') out.add('credit');
     if (step.tool.includes('invoice')) out.add('invoice');
     if (step.tool.includes('subscription')) out.add('subscription');
     if (step.tool.includes('usage') || step.tool.includes('meter')) out.add('usage');
-    if (step.tool.includes('customer')) { out.add('customer'); out.add('company'); }
+    if (step.tool.includes('customer') || step.tool.includes('account')) { out.add('customer'); out.add('company'); }
     if (step.tool === 'account_profile') { out.add('company'); out.add('customer'); out.add('deal'); out.add('contact'); out.add('ticket'); }
     if (step.tool === 'record_timeline' || step.tool === 'workspace_search') out.add('activity');
   }
@@ -914,6 +931,44 @@ export function jobTitleWords(ctx: Ctx, orgId: string): string[] {
   const words = [...out];
   titleCache.set(orgId, words);
   return words;
+}
+
+/**
+ * Every word this workspace enumerates, which a tool's prose may not spend.
+ *
+ * The nouns it calls its rows, and every surface form of every value of every
+ * enumeration it holds. Each of these has a place in the plan to reach — the
+ * object-type rule, a record filter, the qualifier ledger — and until it reaches
+ * one, the question is not accounted for. Letting a capability's description
+ * claim them instead is how "how many tickets are about connectivity?" was
+ * answered with the quarter's ticket volume: `business_metric` publishes its
+ * whole metric list in its blurb, and the blurb was read as comprehension.
+ */
+const enumeratedCache = new Map<string, Set<string>>();
+export function enumeratedWords(ctx: Ctx, orgId: string, types: string[]): Set<string> {
+  const key = `${orgId}:${[...types].sort().join(',')}`;
+  const cached = enumeratedCache.get(key);
+  if (cached) return cached;
+  const out = new Set<string>();
+  const add = (phrase: string): void => {
+    for (const word of normalise(phrase).split(' ')) if (word.length > 2) out.add(word);
+  };
+  for (const nouns of Object.values(TYPE_NOUNS)) for (const noun of nouns) add(noun);
+  // Only the types this question is about. "New" is a lead status and a ticket
+  // status, and reserving it for every question made `revenue_movement`'s own
+  // published word — "new, expansion, contraction, churn" — unreadable, so
+  // "how much new MRR did we add last quarter?" refused a report it holds.
+  for (const type of new Set(types)) {
+    if (!CRM_OBJECT_TYPES.has(type)) continue;
+    for (const dimension of dimensionsOf(ctx, orgId, type, new Set())) {
+      for (const option of dimension.options) {
+        add(option.label);
+        for (const form of option.open) add(form);
+      }
+    }
+  }
+  enumeratedCache.set(key, out);
+  return out;
 }
 
 /** Every numeric property a record search can compare against, per type. */
@@ -965,8 +1020,24 @@ export function coverageClaims(input: {
   roleWords: string[];
   /** The meters and features a ledger step's numbers are denominated in. */
   units: string[];
+  /**
+   * Every word this workspace enumerates as a value, a row noun or a measure.
+   *
+   * A capability's description is a catalogue of everything it *could* do —
+   * `business_metric` publishes the whole metric list, `record_search`
+   * publishes "open deals over $100k, tickets escalated this week, companies in
+   * a region" — and reading it as a claim let the prose spend the reader's own
+   * qualifier. "How many tickets are about connectivity?" came back as the
+   * quarter's 14 tickets with the category gone, and "how many billing tickets
+   * do we have?" came back as $76,450.05 of collected revenue: in both, the
+   * word that narrowed the question was reported as understood because a tool's
+   * blurb happened to contain it. A word this workspace enumerates has to reach
+   * an argument. Prose may only spend the words nothing here enumerates.
+   */
+  reservedWords: Set<string>;
 }): CoverageClaim[] {
   const claims: CoverageClaim[] = [];
+  const reserved = (word: string): boolean => input.reservedWords.has(word) || input.reservedWords.has(stem(word));
   if (input.metric) claims.push({ text: input.metric.matched, by: `the measure ${input.metric.metric.label}` });
   for (const window of input.windows) claims.push({ text: window.matched, by: `the period ${window.label}` });
   for (const mention of input.mentions) claims.push({ text: mention.text, by: 'a period' });
@@ -1047,9 +1118,9 @@ export function coverageClaims(input: {
   const negation = new Set(NEGATIONS);
   const askedWords = new Set(normalise(input.question).split(' ').filter(Boolean).map(stem));
   for (const capability of input.capabilities) {
-    claims.push({ text: capability.name.replace(/[._]/g, ' '), by: `\`${capability.name}\`` });
-    for (const word of capability.name.split(/[._]/)) claims.push({ text: word, by: `\`${capability.name}\`` });
-    const described = contentWords(capability.description);
+    claims.push({ text: capability.name.replace(/[._]/g, ' '), by: `\`${capability.name}\``, exact: true });
+    for (const word of capability.name.split(/[._]/)) claims.push({ text: word, by: `\`${capability.name}\``, exact: true });
+    const described = contentWords(capability.description).filter((word) => !reserved(word));
     for (const word of described) {
       // A negation is the one word a description may not spend on its own.
       // `record_search` publishes its operator list — "eq, neq, in, not_in …" —
@@ -1060,11 +1131,11 @@ export function coverageClaims(input: {
       // description have to be words the question itself uses, which is how
       // `stale_accounts` ("what have we not touched") answers for "which
       // accounts have not been touched in 90 days".
-      if (!negation.has(word)) { claims.push({ text: word, by: `\`${capability.name}\`` }); continue; }
+      if (!negation.has(word)) { claims.push({ text: word, by: `\`${capability.name}\``, exact: true }); continue; }
       const at = described.indexOf(word);
       const nearby = described.slice(Math.max(0, at - 3), at + 4).filter((near) => !negation.has(near));
       if (nearby.some((near) => askedWords.has(stem(near)))) {
-        claims.push({ text: word, by: `\`${capability.name}\`` });
+        claims.push({ text: word, by: `\`${capability.name}\``, exact: true });
       }
     }
   }
@@ -1105,13 +1176,20 @@ export function coverageClaims(input: {
   // "How many open deals do we have and what are they worth?" measures the
   // count and mentions the value; the second measure is a second question, not
   // an unread word, and the answer names both.
+  //
+  // Word for word, though, and never over a word this workspace enumerates.
+  // The shared-opening rule let `connected_assets` spend the reader's
+  // "connectivity" — a ticket category — and `tickets_created` spend the
+  // "tickets" in a question the plan answered from the invoice book: two
+  // questions answered with two confident figures about something else.
   if (input.metric) {
     for (const word of measureWords()) {
-      claims.push({ text: word, by: 'the measure vocabulary' });
+      if (reserved(word)) continue;
+      claims.push({ text: word, by: 'the measure vocabulary', exact: true });
       // "we booked" and "did we book" are the same verb as "bookings"; one
       // stemming pass leaves "booking", which is not the word the reader wrote.
       const twice = stem(stem(word));
-      if (twice !== word && twice.length >= 3) claims.push({ text: twice, by: 'the measure vocabulary' });
+      if (twice !== word && twice.length >= 3) claims.push({ text: twice, by: 'the measure vocabulary', exact: true });
     }
   }
   // The predicate that made this a balance question rather than a consumption
@@ -1789,10 +1867,17 @@ export function builtinEngine(): AiProvider {
           qualifiers.waive('period', `${listPhrase(blind.map((b) => `\`${b.tool}\``))} ${blind.length === 1 ? 'takes' : 'take'} no reporting period, so this is the position as it stands today rather than a figure for ${listPhrase(windows.map((w) => w.label))}.`);
         }
       }
-      // A ranking cut-off nothing in the plan can take is waived the same way.
-      if (plan.length && qualifiers.pending().some((q) => q.kind === 'limit')) {
-        qualifiers.waive('limit', `Nothing in this plan takes a row limit, so the answer is not cut to the number you named.`);
-      }
+      // A ranking cut-off nothing in the plan can take is *not* waived.
+      //
+      // A waiver is honest when the narrowing cannot change the figure — a
+      // snapshot has no period, a count has no currency book. A cut-off is not
+      // that: "what is the top 3 by open pipeline?" came back with the waiver
+      // in front of "$9,010,960 in open pipeline, from 38 open deals", which is
+      // the whole book under a question that asked for three rows of it. A
+      // reader stops at the first number, and that number was thirty-eight
+      // deals wider than the question. It stays pending, and the gate below
+      // refuses it by name.
+
       // Nothing ran, so nothing was substituted. A question with no capability
       // behind it, or one whose capability this run refused to fake, already
       // says so in its own words — a second refusal about a qualifier would be
@@ -1902,7 +1987,20 @@ export function builtinEngine(): AiProvider {
               metric, windows, mentions, entities, qualifiers, recordFilters, types,
               meter, currencyWord, order: namedOrder, question,
               usedIds: idsInPlan(plan),
-              queriedTypes: queriedTypes(plan, groupBy),
+              // A scope applied through a set of associated records reads those
+              // records too: "how much open pipeline is with metals and mining
+              // accounts?" runs over deals, through the accounts whose industry
+              // it is, and the reader's word for them is "accounts".
+              queriedTypes: (() => {
+                const reached = queriedTypes(plan, groupBy);
+                for (const entry of qualifiers.bound()) {
+                  const through = entry.binding?.args?.associated_to_any ?? entry.binding?.args?.associated_to;
+                  if (through === undefined || !entry.resolved?.objectType) continue;
+                  reached.add(entry.resolved.objectType);
+                  if (entry.resolved.objectType === 'company') reached.add('customer');
+                }
+                return reached;
+              })(),
               ranking,
               ownerBound: qualifiers.entries.some((q) => q.kind === 'owner')
                 || entities.some((e) => e.entity.type === 'user') || groupBy === 'owner',
@@ -1934,6 +2032,7 @@ export function builtinEngine(): AiProvider {
                 || step.tool === 'record_timeline')
                 ? jobTitleWords(ctx, orgId)
                 : [],
+              reservedWords: enumeratedWords(ctx, orgId, types),
             }),
             boundNumbers: plan.flatMap((step) => numbersIn(step.args)),
             boundComparison: plan.some((step) => carriesComparison(step.args)),
@@ -1946,6 +2045,7 @@ export function builtinEngine(): AiProvider {
               numeric: numericProperties(ctx, orgId, types),
               meters: index.entities.filter((e) => e.type === 'meter').map((e) => e.label),
               metrics: metricIds().map((id) => metricById(id)?.label ?? id),
+              people: workspace.people.map((person) => person.name),
             },
             workspaceName: workspace.name,
           })
@@ -2183,10 +2283,19 @@ export function builtinEngine(): AiProvider {
           metricCurrencies: (metricResult?.books ?? []).map((b) => b.currency),
           metricId: metric?.metric.id ?? null,
           metricLabel: metric?.metric.label ?? null,
+          // The measure's own one-word names, so a schema field spelt the way
+          // the catalogue itself writes it is filled from the figure it holds.
+          metricWords: metric
+            ? [...(metric.metric.phrases ?? []), ...metric.metric.keywords].filter((word) => !word.includes(' '))
+            : [],
           // The row count the same aggregate carries, so a `deal_count` field
           // is not null next to an `open_pipeline` it filled.
           rowCount: metricResult?.matched_records ?? metricResult?.count ?? listed?.count ?? null,
           rowType: countedNoun ?? listed?.type ?? null,
+          // …and every word this platform calls those rows, so a field named
+          // with the reader's own noun for them is filled from the same figure
+          // the prose states.
+          rowNouns: TYPE_NOUNS[countedNoun ?? listed?.type ?? ''] ?? [],
           metricUnit: metric?.metric.unit ?? null,
           // The words the reader actually wrote, so a field name that adds one
           // of its own — `churned_subscriptions` over a question about active

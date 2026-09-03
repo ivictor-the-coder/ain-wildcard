@@ -16,8 +16,9 @@ import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
 import {
-  agreeWithTheCount, correctPipelineDenial, correctedProse, isWiderName, metricsMeasured,
-  misreadRefusal, namedQualifiers, propertyVocabulary,
+  agreeWithTheCount, comparisonRephrase, correctPipelineDenial, correctedProse, isWiderName,
+  isWriteRequest, lookupObject, metricsMeasured,
+  misreadRefusal, namedQualifiers, propertyVocabulary, questionHeadNoun,
   reconcileScope, recordPhraseMismatch, refusalDisprovedByThread, scopeChips, warningSentence,
   withoutCurrencyClaim, withoutRefusedQualifier, withoutWriteParameter,
   type QualifierVerdict, type VocabPropertyDef, type Vocabulary,
@@ -1401,6 +1402,301 @@ describe('a starter question the engine refuses', () => {
     assert.equal(
       withoutRefusedQualifier('What is our open pipeline?',
         { code: 'question_not_covered', message: '2 tokens unaccounted for: "our", "is".' }),
+      null,
+    );
+  });
+
+  /**
+   * And never takes the subject out of one either.
+   *
+   * "How many contacts are in the Expansion pipeline?" is refused on the word
+   * "contacts" — verbatim, `1 token unaccounted for: "contacts"` — and the way
+   * out this surface offered was "How many are in the Expansion pipeline?": the
+   * reader's own question with the thing it asks about removed.
+   */
+  it('leaves the subject of the question in the question', () => {
+    assert.equal(
+      withoutRefusedQualifier('How many contacts are in the Expansion pipeline?',
+        { code: 'question_not_covered', message: '1 token unaccounted for: "contacts".' }, VOCAB),
+      null,
+    );
+    assert.equal(
+      withoutRefusedQualifier('Which customers are overdue on payment?',
+        { code: 'question_not_covered', message: '1 token unaccounted for: "customers".' }, VOCAB),
+      null,
+    );
+    assert.equal(questionHeadNoun('How many contacts are in the Expansion pipeline?'), 'contacts');
+  });
+
+  /**
+   * "What is our pipeline velocity?" is refused on "velocity", and dropping it
+   * leaves "What is our pipeline?" — a different, larger, standard number. This
+   * file's whole subject is a measure quietly swapped for another one, so the
+   * repair it offers cannot be that swap.
+   */
+  /**
+   * "Which customers are overdue on payment?" is refused on "payment", and the
+   * sentence without it ends "…are overdue on?".
+   */
+  it('will not offer a sentence that ends on a preposition', () => {
+    assert.equal(
+      withoutRefusedQualifier('Which customers are overdue on payment?',
+        { code: 'question_not_covered', message: '1 token unaccounted for: "payment".' }, VOCAB),
+      null,
+    );
+    // A word that means little on its own is still an ending: "…by value?" is
+    // a question, and this guard must not take it away.
+    assert.equal(
+      withoutRefusedQualifier('What is our top 2 pipeline by value?',
+        { code: 'qualifier_unbound', message: '1 qualifier could not be bound: limit "2".' }, VOCAB),
+      'What is our top pipeline by value?',
+    );
+  });
+
+  it('will not offer a different measure as the rephrasing', () => {
+    assert.equal(
+      withoutRefusedQualifier('What is our pipeline velocity?',
+        { code: 'question_not_covered', message: '1 token unaccounted for: "velocity".' }, VOCAB),
+      null,
+    );
+    // Without the catalogue there is nothing to check it against, and the
+    // period repair — which needs no catalogue — still works.
+    assert.equal(
+      withoutRefusedQualifier('Which support tickets need attention today?',
+        { code: 'qualifier_unbound', message: '1 qualifier could not be bound: period "today".' }, VOCAB),
+      'Which support tickets need attention?',
+    );
+  });
+});
+
+/* ========= P1 · the reconciliation crying wolf over a write request ======= */
+
+/**
+ * A sentence that asks for a change names no filters.
+ *
+ * "Change the owner of the Redstone Energy Services — line 2 monitoring deal to
+ * Priya Raman" is a write this engine cannot prepare — its extractor reads a
+ * stage and nothing else — so it reads the account instead and says "I changed
+ * nothing." Every fixture below is that run verbatim.
+ *
+ * The card printed the true fact about it (the copilot cannot set an owner) and,
+ * above the answer, a red banner headed "This answer measured something other
+ * than what was asked" with two sentences under it: "You asked about Priya
+ * Raman. This figure was measured for Redstone Energy Services" and "You named
+ * Redstone Energy Services — line 2 monitoring. This figure was measured over
+ * the whole of Redstone Energy Services". There is no figure. Nothing was
+ * measured, nothing was written, and "to Priya Raman" is the value the write
+ * would set — not a scope anybody asked an answer to be narrowed to.
+ */
+describe('a question that asks for a write, not a measurement', () => {
+  const OWNER_CHANGE = {
+    question: 'Change the owner of the Redstone Energy Services — line 2 monitoring deal to Priya Raman',
+    prose: 'I changed nothing. That reads as a request to update record, but I could not tell which '
+      + 'property to set — name the property and the value, e.g. "move <deal> to Negotiation".',
+    toolCalls: [{ name: 'account_profile', arguments: { id: 'cmp_nw_15' } }],
+    reasoning: [
+      'Workspace Northwind Robotics: currency USD, timezone America/New_York, clock 2026-09-02T22:29:44.894Z.',
+      'Intent act (confidence 99%, margin 4.08); signals: act.update "Change" +4.08',
+      'No period in the question; defaulting to Q3 2026 to date.',
+      'Resolved 6 records: Redstone Energy Services (company, 0.96, name_exact); Priya Raman (user, 0.91, name_exact); Redstone Energy Services — line 2 monitoring (deal, 0.86, prefix).',
+      'No write prepared: the request looks like update_record, but I could not tell which property to set — name the property and the value, e.g. "move <deal> to Negotiation".',
+      'Plan (1 step, budget 8): account_profile.',
+      '  account_profile: No write could be prepared, so this reads Redstone Energy Services rather than pretending to change it.',
+      'Ran account_profile in 6ms → Redstone Energy Services.',
+      'Usage: 4289 input + 43 output tokens, 5 credits, no marginal cost (local engine).',
+    ],
+    vocab: VOCAB,
+    resolveId: (id: string) => (id === 'cmp_nw_15' ? 'Redstone Energy Services' : null),
+  };
+
+  it('is not accused of measuring the wrong thing', () => {
+    const report = reconcileScope(OWNER_CHANGE);
+    assert.deepEqual(report.unscoped.map((v) => `${v.kind}:${v.state}`), []);
+    assert.deepEqual(report.verdicts, []);
+  });
+
+  it('says nothing at all about a figure it never printed', () => {
+    const report = reconcileScope(OWNER_CHANGE);
+    assert.equal(report.answering.every((m) => m.figure === null), true);
+    assert.equal(report.invented.length, 0);
+  });
+
+  it('reads the same way for a write that was prepared and is waiting', () => {
+    const report = reconcileScope({
+      question: 'Move the Redstone Energy Services — line 2 monitoring deal to Negotiation',
+      prose: 'I prepared update_record and stopped there — it changes the workspace, so it needs your '
+        + 'approval first. Nothing has been written.',
+      toolCalls: [],
+      reasoning: [
+        'Intent act (confidence 99%, margin 4.08); signals: act.update "Move" +4.08',
+        'Plan (1 step, budget 8): update_record.',
+        '  update_record: Set Redstone Energy Services — line 2 monitoring to the Negotiation stage; probability and forecast category restamp from the pipeline.',
+        'update_record failed (approval_required): "update_record" is waiting for approval before it can run.',
+      ],
+      vocab: VOCAB,
+    });
+    assert.deepEqual(report.unscoped, []);
+  });
+
+  it('still reconciles a question that really did measure something', () => {
+    // The guard is about write requests, not about quiet: an owner question
+    // answered for a company is still the substitution this file exists for.
+    const report = reconcileScope({
+      question: 'What is Priya Raman’s open pipeline?',
+      prose: 'Redstone Energy Services is carrying $1,463,440 in open pipeline, from 6 open deals.',
+      toolCalls: [{ name: 'business_metric', arguments: { metric: 'pipeline', subject_id: 'cmp_nw_15', group_by: 'none' } }],
+      reasoning: ['Ran business_metric in 9ms → $1,463,440 (6 open deals).'],
+      vocab: VOCAB,
+      resolveId: (id: string) => (id === 'cmp_nw_15' ? 'Redstone Energy Services' : null),
+    });
+    assert.equal(verdictOf(report.unscoped, 'owner')?.state, 'substituted');
+  });
+
+  it('knows a write request from the engine’s own notes', () => {
+    assert.equal(isWriteRequest(['No write prepared: the request looks like update_record, but this run is read-only.']), true);
+    assert.equal(isWriteRequest(['update_record failed (approval_required): "update_record" is waiting for approval before it can run.']), true);
+    assert.equal(isWriteRequest(['Ran business_metric in 9ms → $9,010,960 (38 open deals).']), false);
+  });
+});
+
+/* ====== P1 · the reconciliation crying wolf over the question’s noun ====== */
+
+/**
+ * The word a question is *about* is not the name of a measure.
+ *
+ * Both fixtures are verbatim runs against the seeded workspace, and both are
+ * correct answers that carried a red banner.
+ *
+ * "What is the total value of deals in negotiation?" is answered $1,596,340
+ * over the Negotiation column — the engine's own notes read `Metric: Open
+ * pipeline (matched "value of deals")` — and the card said "You asked for
+ * Deals. This figure is Open pipeline, which is a different measure." The word
+ * "deals" is the thing being valued.
+ *
+ * "Which customers are overdue on payment?" is answered with the two accounts
+ * that owe, read off the customer ledger, and the card said "You asked for
+ * Customers. Nothing in this answer measured it." The word "customers" is what
+ * was asked to be listed.
+ */
+describe('a measure claimed from the noun the question is about', () => {
+  const VALUE_OF_DEALS = {
+    question: 'What is the total value of deals in negotiation?',
+    prose: 'Northwind Robotics is carrying $1,596,340 in pipeline at the Negotiation stage, from 8 open deals.',
+    toolCalls: [{
+      name: 'business_metric',
+      arguments: { metric: 'pipeline', stage: 'negotiation', group_by: 'none', compare: true },
+    }],
+    reasoning: [
+      'Metric: Open pipeline (matched "value of deals", score 0.5).',
+      'Qualifier ledger: metric "value of deals" → pending (Open pipeline); stage "negotiation" → pending (Negotiation).',
+      'Qualifier ledger settled: metric "value of deals" bound → business_metric; stage "negotiation" bound → business_metric.',
+      'Ran business_metric in 3ms → $1,596,340 (8 open deals).',
+    ],
+    vocab: VOCAB,
+  };
+
+  const OVERDUE_CUSTOMERS = {
+    question: 'Which customers are overdue on payment?',
+    prose: '2 customers are past due on the customer ledger:\n• Brightline Foods — $127,840.00 across 1 '
+      + 'open invoice, the oldest 56 days past due\n• Van Dijk Verpakking — $18,900.00 across 1 open invoice',
+    toolCalls: [{ name: 'delinquent_customers', arguments: { limit: 10 } }],
+    reasoning: [
+      'Metric: Outstanding balance (matched "overdue", score 1.07).',
+      'Plan (1 step, budget 8): delinquent_customers.',
+      '  delinquent_customers: The question asks which customers owe, which is a fact about the customer ledger.',
+      'Ran delinquent_customers in 2ms → {"object":"delinquent_customers","total":2,"customers":[{"id":"cus_3rs1sna94eEFZ9KR","name":"Brightline Foods"….',
+    ],
+    vocab: VOCAB,
+  };
+
+  it('does not read the thing being valued as the count of it', () => {
+    const named = namedQualifiers(VALUE_OF_DEALS.question, VOCAB);
+    assert.equal(named.some((q) => q.kind === 'metric'), false);
+    assert.equal(verdictOf(reconcileScope(VALUE_OF_DEALS).unscoped, 'metric'), undefined);
+  });
+
+  it('leaves the stage it really did name standing', () => {
+    // The guard takes one word off the question, not the whole reconciliation.
+    const named = namedQualifiers(VALUE_OF_DEALS.question, VOCAB);
+    assert.equal(named.find((q) => q.kind === 'stage')?.value, 'negotiation');
+    assert.equal(verdictOf(reconcileScope(VALUE_OF_DEALS).verdicts, 'stage')?.state, 'bound');
+  });
+
+  it('does not read the records being listed as a measure of them', () => {
+    const named = namedQualifiers(OVERDUE_CUSTOMERS.question, VOCAB);
+    assert.equal(named.some((q) => q.kind === 'metric'), false);
+    assert.deepEqual(reconcileScope(OVERDUE_CUSTOMERS).unscoped, []);
+  });
+
+  it('reads the head noun of a listing question and nothing else', () => {
+    assert.equal(lookupObject('Which customers are overdue on payment?'), 'customers');
+    assert.equal(lookupObject('Which rep has the most open pipeline?'), 'rep');
+    assert.equal(lookupObject('What is our open pipeline?'), null);
+  });
+
+  it('still hears a measure the question really does name', () => {
+    // "Which rep has the most open pipeline?" names Open pipeline, and a run
+    // that measured Weighted pipeline instead is still the substitution.
+    const report = reconcileScope({
+      question: 'Which rep has the most open pipeline?',
+      prose: 'Priya Raman is the biggest by weighted pipeline right now, at $2,101,000.',
+      toolCalls: [{ name: 'business_metric', arguments: { metric: 'weighted_pipeline', group_by: 'owner' } }],
+      reasoning: ['Ran business_metric in 6ms → $2,101,000 (17 open deals).'],
+      vocab: VOCAB,
+    });
+    assert.equal(verdictOf(report.unscoped, 'metric')?.state, 'substituted');
+  });
+});
+
+/* ===== P1 · the other starter prompt, offered back as a real sentence ===== */
+
+/**
+ * "How did bookings last quarter compare with the quarter before?" is the fifth
+ * prompt this workspace prints, and it is refused on the single word "before" —
+ * after the engine has already resolved and written down the two windows it
+ * meant. Cutting the word out leaves "…compare with the quarter?", which is not
+ * a sentence anybody would press. The reasoning below is that run verbatim.
+ */
+describe('the comparison a refused starter had already worked out', () => {
+  const REASONING = [
+    'Intent compare (confidence 85%, margin 3.72); signals: cmp.versus "compare with" +3.4',
+    'Period "last quarter" → Q2 2026 (Q2 2026).',
+    'Comparison windows: Q2 2026 against Q1 2026 (preceding period).',
+    'Metric: Closed-won bookings (matched "bookings", score 1).',
+    'Token accounting: 6 of 10 content tokens claimed by the plan, 3 closed-class, 1 unaccounted ("before").',
+    'Refused (question_not_covered): 1 token unaccounted for: "before".',
+  ];
+
+  it('is offered back in the two periods the engine named itself', () => {
+    assert.equal(
+      comparisonRephrase(REASONING, VOCAB),
+      'How did bookings in Q2 2026 compare with Q1 2026?',
+    );
+  });
+
+  it('offers nothing where the engine resolved no second window', () => {
+    assert.equal(comparisonRephrase(REASONING.filter((line) => !line.startsWith('Comparison windows')), VOCAB), null);
+    assert.equal(comparisonRephrase(REASONING.filter((line) => !line.startsWith('Metric:')), VOCAB), null);
+  });
+
+  it('refuses to offer a period comparison of a snapshot measure', () => {
+    // Open pipeline is the book as it stands today; "Q2 2026 against Q1 2026"
+    // on it is one dead end traded for another.
+    assert.equal(
+      comparisonRephrase([
+        'Comparison windows: Q2 2026 against Q1 2026 (preceding period).',
+        'Metric: Open pipeline (matched "pipeline", score 1).',
+      ], VOCAB),
+      null,
+    );
+  });
+
+  it('offers nothing for a measure this workspace does not publish', () => {
+    assert.equal(
+      comparisonRephrase([
+        'Comparison windows: Q2 2026 against Q1 2026 (preceding period).',
+        'Metric: Pipeline velocity (matched "velocity", score 1).',
+      ], VOCAB),
       null,
     );
   });

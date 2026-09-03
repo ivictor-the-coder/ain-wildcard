@@ -511,9 +511,11 @@ export type { Consequence, DealNow, StageConsequences, StageWrite } from './writ
 
 export {
   EMPTY_VOCABULARY, MONEY_TOTAL, QUALIFIER_KINDS, UNMEASURED, agreeWithTheCount, boardHref, boundScopeOf,
-  carriedThrough, correctPipelineDenial, correctedProse,
+  carriedThrough, comparisonRephrase, correctPipelineDenial, correctedProse,
   countedObject, currencyAsked, currencyOfFigure, figureSpeaks, figureUnits, groupAsked, humanizeName,
-  isWiderName, labelOfPipeline, labelOfStage, lastInstantOf, looksLikeRecordId, measurementsOf,
+  isWiderName, isWriteRequest, labelOfPipeline, labelOfStage, lastInstantOf, looksLikeRecordId,
+  lookupObject, measurementsOf,
+  questionHeadNoun,
   metricAsked, metricsMeasured, misreadRefusal, namedQualifiers, openStagesOf, parseBreakdown,
   parseLedger, refusalDisprovedByThread,
   inventedFilters, propertyVocabulary, reconcileBreakdown,

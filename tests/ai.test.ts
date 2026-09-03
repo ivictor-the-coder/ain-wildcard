@@ -6461,3 +6461,711 @@ describe('the substitutions this engine exists to refuse, in the words they were
     });
   }
 });
+
+/* -------------------------------------------------------------------------- */
+/*  The corpus                                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The property this suite exists to protect:
+ *
+ *   > No question produces a number that is not the answer to that question.
+ *
+ * Not "these sixty-six cases pass". Six rounds of this engine were built by
+ * enumerating the qualifiers that were leaking and guarding each one, and each
+ * round moved the leak somewhere nobody had thought to look — a money
+ * threshold, a derived state, a ticket attribute, a currency, a competitor, a
+ * recency filter, a forward period, a second owner, a unit-denominated pot.
+ * So the assertion here is not a list of accepted strings. It is:
+ *
+ *   1. every question either states the figure computed *in this file, from
+ *      `crm_records` and the meter tables* — never from the engine — or refuses
+ *      and names the word it could not read;
+ *   2. the sentence a reader stops at — the first one with a figure in it —
+ *      states no *decoy*: none of the workspace-wide populations a dropped
+ *      qualifier collapses to. A wider figure is never a partial answer; it is
+ *      a precise answer to a question nobody asked.
+ *
+ * Coverage loss is a pass. A confident wrong figure is the only failure that
+ * matters, and rule 2 is what catches the leak the enumeration missed.
+ */
+
+const digitsOf = (text: string): string => text.replace(/[^0-9]/g, '').replace(/^0+(?=\d)/, '');
+
+/** The sentence a reader stops at: the first one carrying a figure. */
+function headline(content: string): string {
+  const sentences = content.replace(/\n+/g, ' ').split(/(?<=[.!?])\s+/);
+  return sentences.find((sentence) => /\d/.test(sentence)) ?? sentences[0] ?? content;
+}
+
+/**
+ * Every figure a sentence states, with the dates taken out.
+ *
+ * "Q4 2026", "Aug 30, 2026" and a bare year are the period, not the answer, and
+ * a period already has to be bound or refused before an answer exists.
+ */
+function figuresIn(sentence: string): Set<string> {
+  return new Set(figureList(sentence));
+}
+
+/** The same figures, in the order a reader meets them. */
+function figureList(sentence: string): string[] {
+  const MONTH = 'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec';
+  const withoutDates = sentence
+    .replace(new RegExp(`\\b(?:${MONTH})[a-z]*\\.?\\s+\\d{1,2},?\\s*\\d{4}\\b`, 'gi'), ' ')
+    .replace(new RegExp(`\\b(?:${MONTH})[a-z]*\\.?\\s+\\d{4}\\b`, 'gi'), ' ')
+    .replace(/\b[QH][1-4]\s*\d{4}\b/gi, ' ')
+    .replace(/\b(?:19|20)\d{2}\b/g, ' ');
+  return (withoutDates.match(/\d[\d,]*(?:\.\d+)?/g) ?? []).map(digitsOf).filter(Boolean);
+}
+
+const companyRows = (): Record<string, unknown>[] => app.ctx.db.all<{ properties: string }>(
+  `SELECT properties FROM crm_records WHERE org_id = ? AND object_type = 'company' AND archived = 0 AND merged_into IS NULL`, ORG,
+).map((row) => JSON.parse(row.properties) as Record<string, unknown>);
+
+const contactRows = (): Record<string, unknown>[] => app.ctx.db.all<{ properties: string }>(
+  `SELECT properties FROM crm_records WHERE org_id = ? AND object_type = 'contact' AND archived = 0 AND merged_into IS NULL`, ORG,
+).map((row) => JSON.parse(row.properties) as Record<string, unknown>);
+
+const wonDeals = (): FullDeal[] => {
+  const won = stageSets(app.ctx, ORG).won;
+  return fullDeals().filter((deal) => won.includes(deal.stage));
+};
+
+const weightedOpen = (): number => app.ctx.db.all<{ properties: string }>(
+  `SELECT properties FROM crm_records WHERE org_id = ? AND object_type = 'deal' AND archived = 0`, ORG,
+).map((row) => JSON.parse(row.properties) as Record<string, unknown>)
+  .filter((p) => stageSets(app.ctx, ORG).open.includes(String(p.deal_stage ?? '')))
+  .reduce((sum, p) => sum + Number(p.weighted_amount ?? 0), 0);
+
+/** A meter's own figure over a window, read from the summaries rather than from the engine. */
+function metered(meterId: string, aggregation: 'sum' | 'count' | 'max', start: number, end: number, customerId?: string): number {
+  const HOUR = 3_600_000;
+  const rows = app.ctx.db.all<{ customer_id: string; sum_micro: number; max_micro: number; event_count: number }>(
+    `SELECT customer_id, sum_micro, max_micro, event_count FROM meter_event_summaries
+      WHERE org_id = ? AND meter_id = ? AND hour_start >= ? AND hour_start < ?${customerId ? ' AND customer_id = ?' : ''}`,
+    ...[ORG, meterId, Math.floor(start / HOUR) * HOUR, Math.ceil(end / HOUR) * HOUR, ...(customerId ? [customerId] : [])],
+  );
+  if (aggregation === 'count') return rows.reduce((sum, row) => sum + row.event_count, 0);
+  if (aggregation === 'max') return Math.max(0, ...rows.map((row) => row.max_micro)) / 1_000_000;
+  return rows.reduce((sum, row) => sum + row.sum_micro, 0) / 1_000_000;
+}
+
+const customerIdOf = (companyId: string): string => app.ctx.db.pluck<string>(
+  `SELECT id FROM billing_customers WHERE org_id = ? AND crm_record_id = ?`, ORG, companyId,
+)!;
+
+const AUGUST_2026: [number, number] = [Date.UTC(2026, 7, 1), Date.UTC(2026, 8, 1)];
+const Q4_2026: [number, number] = [Date.UTC(2026, 9, 1), Date.UTC(2027, 0, 1)];
+const Q2_2026: [number, number] = [Date.UTC(2026, 3, 1), Date.UTC(2026, 6, 1)];
+
+/**
+ * The figures every dropped qualifier collapses to on this book.
+ *
+ * Each is a true statement about Northwind Robotics and a false answer to
+ * almost every question in the corpus. A headline holding one of these that the
+ * question did not ask for is the substitution, whatever words surround it.
+ */
+function decoys(): { why: string; figure: string }[] {
+  return [
+    { why: 'the whole open book, in money', figure: digitsOf(cash(total(openDeals()))) },
+    { why: 'the whole open book, in rows', figure: `${openDeals().length}` },
+    { why: 'every deal this workspace holds', figure: `${fullDeals().length}` },
+    { why: 'every company this workspace holds', figure: `${companyRows().length}` },
+    { why: 'every contact this workspace holds', figure: `${contactRows().length}` },
+    { why: 'every ticket this workspace holds', figure: `${ticketProperties().length}` },
+    { why: 'the quarter-to-date ticket intake', figure: `${ticketsRaisedThisPeriod()}` },
+    { why: 'closed-won across all time', figure: digitsOf(cash(total(wonDeals()))) },
+    { why: 'weighted pipeline across the open book', figure: digitsOf(cash(weightedOpen())) },
+  ];
+}
+
+interface CorpusCase {
+  /** The qualifier dimension this question narrows on. */
+  dimension: string;
+  q: string;
+  /**
+   * Every figure the reader's sentence is allowed to lead with, computed here
+   * from the database. The first one has to be in the headline.
+   */
+  answer?: () => (string | number)[];
+  /** Strings the whole answer must carry — the label that says what was measured. */
+  says?: () => (string | RegExp)[];
+  /** A refusal is the only honest outcome, and it has to name this word. */
+  refuses?: string;
+  /** Figures that would mean a wider set was measured, beyond the shared decoys. */
+  never?: () => (string | number)[];
+}
+
+const CORPUS: CorpusCase[] = [
+  /* --- money thresholds -------------------------------------------------- */
+  {
+    dimension: 'threshold (money, over)',
+    q: 'Which open deals are worth over $400,000?',
+    answer: () => [openDeals().filter((d) => d.amount > 40_000_000).length],
+    says: () => [/more than \$400,000/],
+  },
+  {
+    dimension: 'threshold (money, under)',
+    q: 'Which open deals are worth under $50,000?',
+    answer: () => [openDeals().filter((d) => d.amount < 5_000_000).length],
+  },
+  {
+    dimension: 'threshold (money, at least)',
+    q: 'How many open deals are worth at least $300,000?',
+    answer: () => [openDeals().filter((d) => d.amount >= 30_000_000).length],
+  },
+  {
+    dimension: 'threshold (money, on a measure that takes none)',
+    q: 'What is our outstanding balance over $10,000?',
+    refuses: '$10,000',
+  },
+  /* --- count and percentage thresholds ----------------------------------- */
+  {
+    dimension: 'threshold (a stored count)',
+    q: 'How many companies have more than 500 connected assets?',
+    answer: () => [companyRows().filter((c) => Number(c.connected_assets ?? 0) > 500).length],
+    says: () => [/more than 500 connected assets/],
+  },
+  {
+    dimension: 'threshold (a stored count, listed)',
+    q: 'Which companies have over 1000 employees?',
+    answer: () => [companyRows().filter((c) => Number(c.employee_count ?? 0) > 1000).length],
+  },
+  {
+    dimension: 'threshold (a percentage)',
+    q: 'How many deals are above 50% probability?',
+    answer: () => [openDeals().filter((d) => Number(dealProperty(d.id, 'probability')) > 50).length],
+  },
+  {
+    dimension: 'threshold (a term in months, with a comparator)',
+    q: 'Which deals have a contract term over 24 months?',
+    answer: () => [fullDeals().filter((d) => (d.termMonths ?? 0) > 24).length],
+    says: () => [/contract term of more than 24 months/],
+    never: () => [fullDeals().filter((d) => d.termMonths === 24).length],
+  },
+  {
+    dimension: 'threshold (a term in months, exactly)',
+    q: 'How many deals are on a 24-month contract term?',
+    answer: () => [openDeals().filter((d) => d.termMonths === 24).length],
+    says: () => [/24-month contract term/],
+  },
+  /* --- derived states the workspace does not store ------------------------ */
+  { dimension: 'derived state (an SLA breach)', q: 'How many tickets breached their SLA?', refuses: 'sla' },
+  { dimension: 'derived state (an absence)', q: 'How many companies have never had a deal?', refuses: 'never' },
+  { dimension: 'derived state (an empty field)', q: 'How many deals have no next step?', refuses: 'step' },
+  { dimension: 'derived state (a conversion)', q: 'How many pilots converted?', refuses: 'pilots' },
+  /* --- currencies --------------------------------------------------------- */
+  {
+    dimension: 'currency (a book the ledger holds)',
+    q: 'What is our GBP revenue?',
+    answer: () => [collected('gbp')],
+    says: () => [/GBP book/],
+  },
+  {
+    dimension: 'currency (a book, over a named quarter)',
+    q: 'How much did we invoice in EUR last quarter?',
+    answer: () => [invoiced('eur', ...Q2_2026)],
+    says: () => [/EUR book/],
+  },
+  {
+    dimension: 'currency (written as a word)',
+    q: 'How much of our revenue is in euros?',
+    answer: () => [collected('eur')],
+    says: () => [/EUR book/],
+  },
+  {
+    dimension: 'currency (a measure that carries no book)',
+    q: 'How much pipeline do we have in GBP?',
+    refuses: 'gbp',
+  },
+  /* --- ticket attributes -------------------------------------------------- */
+  {
+    dimension: 'ticket attribute (a category, anchored)',
+    q: 'How many tickets are in the security category?',
+    answer: () => [ticketsWhere('category', 'security')],
+    says: () => [/category Security/i],
+  },
+  {
+    dimension: 'ticket attribute (a category, bare)',
+    q: 'How many tickets are about connectivity?',
+    refuses: 'connectivity',
+  },
+  {
+    dimension: 'ticket attribute (a multi-word category)',
+    q: 'How many data gap tickets are there?',
+    answer: () => [ticketsWhere('category', 'data_gap')],
+  },
+  {
+    dimension: 'ticket attribute (a product area, anchored)',
+    q: 'How many tickets are in the dashboards product area?',
+    answer: () => [ticketsWhere('product_area', 'dashboards')],
+  },
+  {
+    dimension: 'ticket attribute (a status)',
+    q: 'How many tickets are escalated?',
+    answer: () => [ticketsWhere('status', 'escalated')],
+  },
+  {
+    dimension: 'ticket attribute (a priority and a status)',
+    q: 'How many high priority tickets are open?',
+    answer: () => [ticketProperties().filter((t) => t.priority === 'high' && OPEN_TICKET.includes(String(t.status ?? ''))).length],
+  },
+  {
+    dimension: 'ticket attribute (a channel, bare)',
+    q: 'How many tickets came through the portal?',
+    refuses: 'portal',
+  },
+  {
+    dimension: 'object type (a ticket question the ledger would have answered)',
+    q: 'How many billing tickets do we have?',
+    refuses: 'tickets',
+  },
+  /* --- competitors -------------------------------------------------------- */
+  {
+    dimension: 'competitor (a value this workspace holds)',
+    q: 'How many deals did we lose to Tulip?',
+    answer: () => [fullDeals().filter((d) => d.stage === 'closed_lost' && d.competitor === 'tulip').length],
+    says: () => [/Tulip/],
+  },
+  {
+    dimension: 'competitor (a value written short)',
+    q: 'How many deals did we win against Litmus?',
+    answer: () => [fullDeals().filter((d) => d.stage === 'closed_won' && d.competitor === 'litmus').length],
+  },
+  {
+    dimension: 'competitor (a value this workspace has never faced)',
+    q: 'How many deals did we lose to Siemens?',
+    refuses: 'siemens',
+  },
+  {
+    dimension: 'competitor (a true zero, said as one)',
+    q: 'Which deals did we lose to Sight Machine?',
+    answer: () => [],
+    says: () => [/No closed-lost deals/i, /Sight machine/i],
+  },
+  /* --- a multi-select column ---------------------------------------------- */
+  {
+    dimension: 'multi-select (membership, not equality)',
+    q: 'How many companies run Siemens controls?',
+    answer: () => [companyRows().filter((c) => Array.isArray(c.controls_platform) && c.controls_platform.includes('siemens')).length],
+    says: () => [/Siemens/],
+    never: () => [0],
+  },
+  {
+    dimension: 'multi-select (listed)',
+    q: 'Which companies use Rockwell?',
+    answer: () => [companyRows().filter((c) => Array.isArray(c.controls_platform) && c.controls_platform.includes('rockwell')).length],
+  },
+  /* --- recency ------------------------------------------------------------ */
+  {
+    dimension: 'recency (a named threshold in days)',
+    q: 'Which accounts have not been touched in 60 days?',
+    answer: () => [quietAccounts(60)],
+    says: () => [/more than 60 days/],
+  },
+  {
+    dimension: 'recency (a different threshold in the same shape)',
+    q: 'Which accounts have we not touched in 120 days?',
+    answer: () => [quietAccounts(120)],
+    says: () => [/more than 120 days/],
+  },
+  /* --- rankings ----------------------------------------------------------- */
+  {
+    dimension: 'ranking (a cut-off and a direction)',
+    q: 'Who are the three smallest open deals?',
+    answer: () => [openDeals().length],
+    says: () => [/3 smallest/, smallestOpen(0).name, smallestOpen(1).name, smallestOpen(2).name],
+  },
+  {
+    dimension: 'ranking (a cut-off nothing can take)',
+    q: 'What is the top 3 by open pipeline?',
+    refuses: '3',
+  },
+  {
+    dimension: 'ranking (per rep, from a superlative)',
+    q: 'Which rep has the biggest book?',
+    answer: () => [cash(bookOf('Priya Raman'))],
+    says: () => [/Priya Raman/],
+  },
+  {
+    dimension: 'ranking (a cut-off the account breakdown takes)',
+    q: 'What are our top 5 accounts by revenue?',
+    says: () => [/1\. /, /5\. /],
+  },
+  /* --- forward periods ---------------------------------------------------- */
+  {
+    dimension: 'forward period (a named quarter, counted)',
+    q: 'How many deals close in Q4 2026?',
+    answer: () => [closingIn(...Q4_2026).length],
+    says: () => [/Q4 2026/],
+  },
+  {
+    dimension: 'forward period (a relative quarter, in money)',
+    q: 'How much pipeline closes next quarter?',
+    answer: () => [cash(total(closingIn(...Q4_2026))), closingIn(...Q4_2026).length],
+    says: () => [/Q4 2026/],
+  },
+  {
+    dimension: 'forward period (a quarter with nothing in it)',
+    q: 'What is our pipeline closing in Q1 2027?',
+    answer: () => [cash(0), 0],
+    says: () => [/Q1 2027/],
+  },
+  {
+    dimension: 'forward period (a year)',
+    q: 'How many deals close next year?',
+    answer: () => [closingIn(Date.UTC(2027, 0, 1), Date.UTC(2028, 0, 1)).length],
+  },
+  /* --- backward periods and the column they name -------------------------- */
+  {
+    dimension: 'period (a close date over a completed quarter)',
+    q: 'How many deals did we close in Q2 2026?',
+    answer: () => [decidedIn(...Q2_2026).length],
+    says: () => [/Q2 2026/],
+  },
+  {
+    dimension: 'period (won, not decided)',
+    q: 'How many deals closed won last quarter?',
+    answer: () => [decidedIn(...Q2_2026).filter((d) => d.stage === 'closed_won').length],
+    says: () => [/closed-won/i],
+  },
+  {
+    dimension: 'period (a creation date, not a close date)',
+    q: 'How many deals were created last month?',
+    answer: () => [createdIn(...AUGUST_2026).length],
+    says: () => [/created/i],
+  },
+  /* --- owners ------------------------------------------------------------- */
+  {
+    dimension: 'owner (one teammate)',
+    q: 'How much pipeline does Marcus Ilori own?',
+    answer: () => [cash(bookOf('Marcus Ilori'))],
+    says: () => [/Marcus Ilori/],
+  },
+  {
+    dimension: 'owner (two teammates, as a comparison)',
+    q: "Compare Dana Whitfield's pipeline to Marcus Ilori's",
+    answer: () => [cash(bookOf('Dana Whitfield')), cash(bookOf('Marcus Ilori'))],
+    says: () => [/Dana Whitfield/, /Marcus Ilori/],
+  },
+  {
+    dimension: 'owner (two teammates the plan can only carry one of)',
+    q: 'What is the pipeline for Dana Whitfield and Marcus Ilori?',
+    refuses: 'Marcus Ilori',
+  },
+  {
+    dimension: 'owner (a first name on its own)',
+    q: 'How much pipeline do Dana and Marcus own between them?',
+    refuses: 'Dana Whitfield',
+  },
+  {
+    dimension: 'owner (the person asking)',
+    q: 'How much pipeline do I own?',
+    answer: () => [cash(bookOf('Dana Whitfield'))],
+    says: () => [/Dana Whitfield/],
+  },
+  /* --- unit-denominated credit ------------------------------------------- */
+  {
+    dimension: 'unit credit (a pot measured in a meter, not in money)',
+    q: 'How many telemetry events does Meridian Forge Systems have left?',
+    answer: () => [unitCreditLeft('cmp_nw_01')!.units.toLocaleString('en-US', { maximumFractionDigits: 2 })],
+    says: () => [/events/, /Meridian Forge Systems/],
+  },
+  {
+    dimension: 'unit credit (the same pot, asked for as credit)',
+    q: 'How many credits does Meridian Forge Systems have left?',
+    answer: () => [unitCreditLeft('cmp_nw_01')!.units.toLocaleString('en-US', { maximumFractionDigits: 2 })],
+    says: () => [/events/],
+  },
+  /* --- meters ------------------------------------------------------------- */
+  {
+    dimension: 'meter (a summed volume for the workspace)',
+    q: 'How many bulk export GB did we meter in August 2026?',
+    answer: () => [metered('mtr_nw_export', 'sum', ...AUGUST_2026).toLocaleString('en-US')],
+    says: () => [/Bulk export volume/, /GB/],
+  },
+  {
+    dimension: 'meter (a counted volume for one account)',
+    q: 'How many anomaly alerts did Meridian Forge Systems raise last month?',
+    answer: () => [metered('mtr_nw_alerts', 'count', ...AUGUST_2026, customerIdOf('cmp_nw_01'))],
+    says: () => [/Anomaly alerts raised/, /Meridian Forge Systems/],
+  },
+  {
+    dimension: 'meter (a high-water mark, published under its own name)',
+    q: 'Peak connected robots for August 2026',
+    answer: () => [metered('mtr_nw_robots', 'max', ...AUGUST_2026)],
+    says: () => [/Peak connected robots/, /robots/],
+  },
+  {
+    dimension: 'meter (a high-water mark for one account)',
+    q: 'How many robots did Ironwood Packaging Group peak at in August 2026?',
+    answer: () => [metered('mtr_nw_robots', 'max', ...AUGUST_2026, customerIdOf('cmp_nw_06'))],
+    says: () => [/Ironwood Packaging Group/, /Peak connected robots/],
+    never: () => [Number(companyRows().find((c) => c.name === 'Ironwood Packaging Group')?.connected_assets ?? -1)],
+  },
+  {
+    dimension: 'meter (a quantity nothing here measures)',
+    q: 'How many widgets did we meter in August 2026?',
+    refuses: 'widgets',
+  },
+  /* --- company and contact dimensions ------------------------------------- */
+  {
+    dimension: 'industry (a value stored short of its label)',
+    q: 'How many companies are in the pharma industry?',
+    answer: () => [companyRows().filter((c) => c.industry === 'pharma').length],
+  },
+  {
+    dimension: 'industry (listed)',
+    q: 'Which companies are in the automotive industry?',
+    answer: () => [companyRows().filter((c) => c.industry === 'automotive').length],
+  },
+  {
+    dimension: 'support tier',
+    q: 'How many mission critical accounts do we have?',
+    answer: () => [companyRows().filter((c) => c.support_tier === 'mission_critical').length],
+  },
+  {
+    dimension: 'relationship',
+    q: 'How many companies are prospects?',
+    answer: () => [companyRows().filter((c) => c.type === 'prospect').length],
+  },
+  {
+    dimension: 'buying role',
+    q: 'How many contacts are economic buyers?',
+    answer: () => [contactsWithRole('economic_buyer')],
+  },
+  {
+    dimension: 'seniority',
+    q: 'Which contacts are C level?',
+    answer: () => [contactRows().filter((c) => c.seniority === 'c_level').length],
+  },
+  {
+    dimension: 'sales region (bare, and refused as such)',
+    q: 'Which accounts in EMEA have open deals?',
+    refuses: 'emea',
+  },
+  /* --- deal dimensions ---------------------------------------------------- */
+  {
+    dimension: 'lead source',
+    q: 'How many deals came from a trade show?',
+    answer: () => [openDeals().filter((d) => d.leadSource === 'trade_show').length],
+    says: () => [/open deals/, /Trade show/i],
+  },
+  {
+    dimension: 'close reason',
+    q: 'Which deals did we lose because of a product gap?',
+    answer: () => [fullDeals().filter((d) => d.stage === 'closed_lost'
+      && String(dealProperty(d.id, 'close_reason')) === 'product_gap').length],
+  },
+  {
+    dimension: 'deal type',
+    q: 'How many pilot conversion deals are there?',
+    answer: () => [fullDeals().filter((d) => d.dealType === 'pilot_conversion').length],
+  },
+  {
+    dimension: 'pipeline',
+    q: 'How many expansion deals do we have?',
+    answer: () => [fullDeals().filter((d) => d.pipeline === 'expansion').length],
+    says: () => [/Expansion pipeline/],
+  },
+  {
+    dimension: 'forecast category',
+    q: 'How many deals are in the commit forecast category?',
+    answer: () => [openDeals().filter((d) => d.forecast === 'commit').length],
+    says: () => [/Commit/],
+  },
+  {
+    dimension: 'stage',
+    q: 'How many deals are in Negotiation?',
+    answer: () => [fullDeals().filter((d) => d.stage === 'negotiation').length],
+  },
+  /* --- measures over the whole book, which are their own answer ----------- */
+  {
+    dimension: 'measure (a snapshot with no qualifier on it)',
+    q: 'What is our open pipeline?',
+    answer: () => [cash(total(openDeals())), openDeals().length],
+  },
+  {
+    dimension: 'measure (a rate)',
+    q: 'What is our win rate this year?',
+    says: () => [/%/, /win|closed/i],
+  },
+  {
+    dimension: 'measure (a modifier this workspace does not hold)',
+    q: 'What is our flurbo revenue?',
+    refuses: 'flurbo',
+  },
+  {
+    dimension: 'measure (a word that is no measure at all)',
+    q: 'How much did we close in Q2 2026?',
+    refuses: 'measure',
+  },
+];
+
+/** One property of one deal, straight off the row. */
+const dealProperty = (id: string, property: string): unknown => JSON.parse(
+  app.ctx.db.pluck<string>(`SELECT properties FROM crm_records WHERE org_id = ? AND id = ?`, ORG, id) ?? '{}',
+)[property];
+
+const ticketsWhere = (property: string, value: string): number =>
+  ticketProperties().filter((row) => String(row[property] ?? '') === value).length;
+
+const closingIn = (start: number, end: number): FullDeal[] =>
+  openDeals().filter((deal) => deal.close >= start && deal.close < end);
+
+const decidedIn = (start: number, end: number): FullDeal[] => {
+  const decided = [...stageSets(app.ctx, ORG).won, ...stageSets(app.ctx, ORG).lost];
+  return fullDeals().filter((deal) => decided.includes(deal.stage) && deal.close >= start && deal.close < end);
+};
+
+const createdIn = (start: number, end: number): FullDeal[] =>
+  openDeals().filter((deal) => deal.created >= start && deal.created < end);
+
+const bookOf = (name: string): number =>
+  total(openDeals().filter((deal) => deal.owner === personId(name)));
+
+const smallestOpen = (at: number): FullDeal => [...openDeals()].sort((a, b) => a.amount - b.amount)[at];
+
+/** Accounts with no logged activity for longer than a threshold, counted here. */
+const quietAccounts = (days: number): number => {
+  const cutoff = app.ctx.now() - days * 86_400_000;
+  return companyRows().filter((company) => {
+    const last = Number(company.last_activity_at ?? 0);
+    return !last || last < cutoff;
+  }).length;
+};
+
+const collected = (currency: string): string => {
+  const start = startOfQuarter(app.ctx.now());
+  const minor = app.ctx.db.pluck<number>(
+    `SELECT COALESCE(SUM(amount_paid), 0) FROM billing_invoices
+      WHERE org_id = ? AND currency = ? AND status = 'paid' AND COALESCE(paid_at, created) >= ?`,
+    ORG, currency, start,
+  ) ?? 0;
+  return formatMoney({ amount: minor, currency }, { locale: 'en-US', trimZeroFraction: true });
+};
+
+const invoiced = (currency: string, start: number, end: number): string => {
+  const minor = app.ctx.db.pluck<number>(
+    `SELECT COALESCE(SUM(total), 0) FROM billing_invoices
+      WHERE org_id = ? AND currency = ? AND status != 'draft' AND status != 'void'
+        AND COALESCE(finalized_at, created) >= ? AND COALESCE(finalized_at, created) < ?`,
+    ORG, currency, start, end,
+  ) ?? 0;
+  return formatMoney({ amount: minor, currency }, { locale: 'en-US', trimZeroFraction: true });
+};
+
+describe('the corpus: no question produces a number that is not the answer to that question', () => {
+  test('the corpus spans every qualifier dimension a reader narrows on', () => {
+    assert.ok(CORPUS.length >= 60, `the corpus is ${CORPUS.length} questions; the invariant needs at least 60.`);
+    const dimensions = new Set(CORPUS.map((one) => one.dimension.split(' (')[0]));
+    for (const required of [
+      'threshold', 'derived state', 'currency', 'ticket attribute', 'competitor', 'recency',
+      'ranking', 'forward period', 'owner', 'unit credit', 'meter', 'multi-select',
+    ]) {
+      assert.ok(dimensions.has(required), `nothing in the corpus narrows on a ${required}.`);
+    }
+  });
+
+  for (const scenario of CORPUS) {
+    test(`${scenario.dimension} — "${scenario.q}"`, async () => {
+      const answer = await ask(scenario.q);
+      assertLedgerSettled(answer);
+      const lead = headline(answer.content);
+      const stated = figuresIn(lead);
+
+      if (scenario.refuses) {
+        assert.ok(answer.analysis.refusal,
+          `"${scenario.q}" narrows on something this run cannot carry, so a refusal is the only honest outcome:\n${answer.content}`);
+        assert.ok(answer.content.toLowerCase().includes(scenario.refuses.toLowerCase()),
+          `the refusal has to name "${scenario.refuses}" — a bare "I don't know" leaves the reader with nothing to ask instead:\n${answer.content}`);
+        assert.ok(answer.content.length > 80,
+          `a refusal has to say what could not be done and offer the nearest phrasing:\n${answer.content}`);
+      } else {
+        assert.equal(answer.analysis.refusal, null,
+          `"${scenario.q}" is answerable from the rows in this database and was refused:\n${answer.content}`);
+        const expected = (scenario.answer?.() ?? []).map((figure) => digitsOf(String(figure)));
+        if (expected.length) {
+          assert.equal(figureList(lead)[0], expected[0],
+            `a reader stops at the first number. The answer, computed here from the database, is ${expected[0]};`
+            + ` the first figure this run printed is ${figureList(lead)[0] ?? 'none'}:\n${answer.content}`);
+        }
+        for (const figure of expected.slice(1)) {
+          assert.ok(figuresIn(answer.content).has(figure),
+            `"${scenario.q}" must state ${figure}, computed from the database:\n${answer.content}`);
+        }
+      }
+
+      /* The property, over every case: the first figure a reader meets is never
+         a population the question did not ask for. */
+      const allowed = new Set((scenario.answer?.() ?? []).map((figure) => digitsOf(String(figure))));
+      const first = figureList(lead)[0];
+      for (const decoy of decoys()) {
+        if (allowed.has(decoy.figure) || first === undefined) continue;
+        assert.notEqual(first, decoy.figure,
+          `"${scenario.q}" leads with ${decoy.figure} — ${decoy.why} — which is a precise answer to a question nobody asked:\n${answer.content}`);
+      }
+      for (const banned of scenario.never?.() ?? []) {
+        assert.ok(!stated.has(digitsOf(String(banned))),
+          `"${scenario.q}" states ${banned}, which is the answer to a different question:\n${answer.content}`);
+      }
+      for (const want of scenario.says?.() ?? []) {
+        assert.ok(contains(answer.content, want),
+          `"${scenario.q}" has to say ${want} — a label that does not match what was measured is the same substitution, one line later:\n${answer.content}`);
+      }
+    });
+  }
+});
+
+describe('one run, one figure, whatever the caller calls the field', () => {
+  /**
+   * The P0 this closes: a run that computed 30 filled `count` with 30, another
+   * field with a confident `0`, and two more with `null` — four field names,
+   * four different answers, out of one measurement. An automation persisting
+   * any of the three is holding a wrong number with no hedge on it.
+   */
+  test('every name the reader has for the rows takes the count the prose states', async () => {
+    const expected = contactsWithRole('economic_buyer');
+    const prose = await ask('How many contacts are economic buyers?');
+    assert.match(prose.content, new RegExp(`\\b${expected}\\b`), `the prose states ${expected}:\n${prose.content}`);
+    const answer = await ask('How many contacts are economic buyers?', {
+      response_schema: {
+        type: 'object',
+        properties: {
+          count: { type: 'number' }, contact_count: { type: 'number' },
+          economic_buyer_count: { type: 'number' }, buyers: { type: 'number' }, total: { type: 'number' },
+        },
+      },
+    });
+    const value = JSON.parse(answer.content) as Record<string, number | null>;
+    for (const [field, held] of Object.entries(value)) {
+      assert.equal(held, expected,
+        `\`${field}\` came back ${JSON.stringify(held)} out of the run whose prose says ${expected}: `
+        + `one figure under five field names has to be one figure.\n${answer.content}`);
+    }
+  });
+
+  test('a field spelt the way the catalogue spells the measure is filled from it', async () => {
+    const answer = await ask('How much did we book in Q2 2026?', {
+      response_schema: { type: 'object', properties: { bookings: { type: 'number' }, amount: { type: 'number' } } },
+    });
+    const value = JSON.parse(answer.content) as { bookings: number | null; amount: number | null };
+    assert.equal(value.bookings, value.amount,
+      `"bookings" is what this catalogue calls closed-won bookings in every sentence it writes, `
+      + `and it was the one spelling the schema could not use:\n${answer.content}`);
+    assert.ok(typeof value.bookings === 'number' && value.bookings > 0, `no figure at all:\n${answer.content}`);
+  });
+
+  test('a date field holds a date, not thirteen digits', async () => {
+    const answer = await ask('Tell me about the largest open deal.', {
+      response_schema: { type: 'object', properties: { deal_name: { type: 'string' }, close_date: { type: 'string' } } },
+    });
+    const value = JSON.parse(answer.content) as { deal_name: string | null; close_date: string | null };
+    assert.ok(value.close_date, `no close date at all:\n${answer.content}`);
+    assert.match(value.close_date!, /^\d{4}-\d{2}-\d{2}$/,
+      `a caller asking for a close date as a string got epoch milliseconds, which reads as a serial number:\n${answer.content}`);
+    const largest = [...openDeals()].sort((a, b) => b.amount - a.amount)[0];
+    assert.equal(value.close_date, new Date(largest.close).toISOString().slice(0, 10));
+  });
+});

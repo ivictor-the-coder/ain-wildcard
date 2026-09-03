@@ -44,6 +44,16 @@ export interface CoverageClaim {
   text: string;
   /** For the trace: "the metric", "the period Q2 2026", "`record_search`.conditions". */
   by: string;
+  /**
+   * Match this claim word-for-word rather than on a shared opening.
+   *
+   * The prefix rule below makes "subscribed" the same word as "subscriptions",
+   * which is right for a measure that bound. It also made "connected" — a word
+   * inside `business_metric`'s published metric list — spend the reader's
+   * "connectivity", and a ticket-category question came back as the quarter's
+   * ticket volume. A capability's prose gets the strict test.
+   */
+  exact?: boolean;
 }
 
 export interface CoverageGap {
@@ -74,6 +84,8 @@ export interface CoverageVocabulary {
   numeric: CoverageNumeric[];
   meters: string[];
   metrics: string[];
+  /** The people who own records here, so a half-written name is not called a stranger. */
+  people: string[];
 }
 
 export interface CoverageInput {
@@ -125,7 +137,7 @@ export const NEGATIONS = new Set<string>([
   'no', 'not', 'never', 'without', 'neither', 'nor', 'except', 'excluding', 'none', 'nothing',
 ]);
 
-const FURNITURE = new Set<string>([
+export const FURNITURE = new Set<string>([
   ...STOPWORDS,
   // question words and their contractions, already normalised
   'how', 'what', 'whats', 'which', 'who', 'whose', 'whom', 'where', 'when', 'why', 'whether',
@@ -258,8 +270,9 @@ const tokensOf = (text: string): string[] => normalise(text).split(' ').filter(B
  * a revenue measure quietly spending the word "billing" is how a question about
  * billing *tickets* was answered with collected revenue.
  */
-function sameWord(token: string, wanted: string, tokenStem: string, wantedStem: string): boolean {
+function sameWord(token: string, wanted: string, tokenStem: string, wantedStem: string, exact = false): boolean {
   if (token === wanted || tokenStem === wantedStem) return true;
+  if (exact) return false;
   if (token.length < 5 || wanted.length < 5) return false;
   let shared = 0;
   while (shared < token.length && shared < wanted.length && token[shared] === wanted[shared]) shared += 1;
@@ -280,7 +293,7 @@ function markClaims(tokens: string[], claims: CoverageClaim[]): (string | null)[
     for (let at = 0; at + wanted.length <= tokens.length; at += 1) {
       let hit = true;
       for (let k = 0; k < wanted.length && hit; k += 1) {
-        hit = sameWord(tokens[at + k], wanted[k], stems[at + k], wantedStems[k]);
+        hit = sameWord(tokens[at + k], wanted[k], stems[at + k], wantedStems[k], claim.exact);
       }
       if (!hit) continue;
       for (let k = 0; k < wanted.length; k += 1) if (!by[at + k]) by[at + k] = claim.by;
@@ -293,7 +306,7 @@ function markClaims(tokens: string[], claims: CoverageClaim[]): (string | null)[
     // makes it: a record the plan never queried claims nothing at all.
     for (let k = 0; k < wanted.length; k += 1) {
       for (let at = 0; at < tokens.length; at += 1) {
-        if (!by[at] && sameWord(tokens[at], wanted[k], stems[at], wantedStems[k])) by[at] = claim.by;
+        if (!by[at] && sameWord(tokens[at], wanted[k], stems[at], wantedStems[k], claim.exact)) by[at] = claim.by;
       }
     }
   }
@@ -327,6 +340,18 @@ function suggestFor(token: string, input: CoverageInput): { why: string; suggest
     return {
       why: `"${token}" is a ${best.dimension.noun.toLowerCase()} of a ${best.dimension.objectType} here, but on its own it is an English word too, so I will not read it as a filter and then quote you a number as though I had.`,
       suggestion: `ask for "${noun} in the ${best.label} ${best.dimension.noun.toLowerCase()}" and I will filter on it exactly`,
+    };
+  }
+
+  // A first name on its own. "How much pipeline do Dana and Marcus own between
+  // them?" was refused with '"dana" is not a record, a measure, a period, a
+  // meter or any value this workspace enumerates' — a false statement about the
+  // person who is asking, in the sentence that declines to answer her.
+  const person = input.vocabulary.people.find((name) => normalise(name).split(' ').includes(target));
+  if (person) {
+    return {
+      why: `"${token}" is part of ${person}'s name, and nothing in this run is scoped to them — a teammate is a filter here, and half a name is not one I will complete for you.`,
+      suggestion: `write "${person}" out in full and I will scope the answer to the records they own`,
     };
   }
 
@@ -440,14 +465,23 @@ export function auditCoverage(input: CoverageInput): CoverageReport {
 
   const comparators = [...asked.matchAll(COMPARATOR)]
     // "between 2026-01-01 and 2026-03-31" compares two dates, and the period
-    // claim already spends them. A comparator whose operand the run bound is a
-    // comparator the run read.
+    // claim already spends them. A comparator a period read is a comparator the
+    // run read.
+    //
+    // A comparator whose operand merely reached *some* argument is not. "A
+    // contract term over 24 months" bound `contract_term_months = 24`: the
+    // number arrived, the "over" did not, and 17 rows were printed under a
+    // question whose answer is 15. The operator is half the filter, so the
+    // proof that it was read is an operator in the plan, not a number in it.
     .filter((match) => {
       const after = asked.slice((match.index ?? 0) + match[0].length, (match.index ?? 0) + match[0].length + 32);
       const operand = /^[$€£¥]?\s?([\d,]*\d(?:\.\d+)?)/.exec(after);
       if (!operand) return true;
-      return !quantityValues(operand[0]).some((value) => bound.has(value))
-        && !tokensOf(operand[0]).every((token) => numericClaimed.has(token));
+      const spelled = tokensOf(operand[0]);
+      return !spelled.length || !spelled.every((token) => {
+        const at = tokens.indexOf(token);
+        return at >= 0 && by[at] !== null && /period/.test(by[at]!);
+      });
     })
     .map((match) => match[0].trim());
   if (comparators.length && !input.boundComparison && !gaps.length) {

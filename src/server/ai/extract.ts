@@ -38,6 +38,8 @@ export interface ExtractionContext {
   /** The metric this run computed, so a field named after it can be filled. */
   metricId?: string | null;
   metricLabel?: string | null;
+  /** The measure's own single-word names, so `bookings` reaches closed-won bookings. */
+  metricWords?: string[];
   /**
    * How many rows the figure was computed over, and of what type.
    *
@@ -48,6 +50,16 @@ export interface ExtractionContext {
    */
   rowCount?: number | null;
   rowType?: string | null;
+  /**
+   * Every noun this platform uses for those rows.
+   *
+   * A field name is the reader's own word for what they counted. "How many
+   * contacts are economic buyers?" answered 30 in prose and filled `count`,
+   * `contact_count` and `economic_buyer_count` with it — and left `buyers`
+   * null, because "buyer" is a contact and the extractor only knew the schema's
+   * word for the type. One figure, one run, two field names, two answers.
+   */
+  rowNouns?: string[];
   /** The unit the measure is denominated in, so a count word never takes money. */
   metricUnit?: string | null;
   /** The question, tokenised, so a field name may only add words the reader wrote. */
@@ -176,7 +188,10 @@ function moneyInText(text: string, currency: string): number | null {
   } catch { return null; }
 }
 
-function coerce(node: SchemaNode, raw: unknown, context: ExtractionContext): unknown {
+/** A field asking for a date, by the name a caller gives it. */
+const DATE_FIELD = /(^|_)(date|day|when|deadline|due|expiry|expires|renewal)($|_)|_(at|on)$/;
+
+function coerce(node: SchemaNode, raw: unknown, context: ExtractionContext, name = ''): unknown {
   if (raw === undefined || raw === null || raw === '') return null;
   switch (node.type) {
     case 'integer':
@@ -221,6 +236,14 @@ function coerce(node: SchemaNode, raw: unknown, context: ExtractionContext): unk
       if (node.format === 'unix-ms' || node.type === 'integer') {
         const parsed = Date.parse(text);
         return Number.isFinite(parsed) ? parsed : null;
+      }
+      // A date field holding "1789084800000" is a wrong value, not a null: the
+      // engine holds close dates as epoch milliseconds and a caller asking for
+      // `close_date` as a string gets thirteen digits where a date belongs.
+      if (DATE_FIELD.test(normalise(name).replace(/\s+/g, '_')) && /^\d{10,14}$/.test(text)) {
+        const stamp = Number(text);
+        const at = new Date(text.length <= 10 ? stamp * 1000 : stamp);
+        if (!Number.isNaN(at.getTime())) return at.toISOString().slice(0, 10);
       }
       return node.max ? text.slice(0, node.max) : text;
     }
@@ -374,7 +397,10 @@ function countsRows(name: string, context: ExtractionContext): boolean {
   const words = normalise(name).split(' ').filter(Boolean);
   if (!words.length) return false;
   const type = normalise(context.rowType ?? '');
-  const typeForms = new Set(type ? forms(type) : []);
+  const typeForms = new Set([
+    ...(type ? forms(type) : []),
+    ...(context.rowNouns ?? []).flatMap((noun) => forms(normalise(noun))),
+  ]);
   let counting = false;
   let named = false;
   for (const word of words) {
@@ -446,8 +472,14 @@ function conventionalValue(name: string, node: SchemaNode, context: ExtractionCo
       // "who are our biggest customers?" a lone `amount` of $583,200 — one
       // unrelated deal — beside a null company and a null deal name.
       if (recordless) return undefined;
-      return findInResults(name, context.results) ?? moneyInText(context.answer, context.workspace.currency)
+      const found = findInResults(name, context.results) ?? moneyInText(context.answer, context.workspace.currency)
         ?? moneyInText(context.question, context.workspace.currency);
+      if (found !== undefined && found !== null) return found;
+      // A run that computed no money has exactly one figure in it, and a field
+      // whose name is a counting word is asking for that one. `{"total": null}`
+      // came back beside prose stating 30 and `{"count": 30}` out of the same
+      // run — one figure, three field names, two of them empty.
+      return context.metricUnit !== 'money' && countsRows(name, context) ? context.rowCount : undefined;
     }
     // Several books, no exchange rates, one `amount` field: filling it with the
     // largest one under-reported recurring revenue by a third and flagged
@@ -472,7 +504,14 @@ function conventionalValue(name: string, node: SchemaNode, context: ExtractionCo
   const scoped = context.scope?.[key];
   if (scoped !== undefined) return scoped;
   if (context.metricId) {
-    const ids = new Set([normalise(context.metricId), normalise(context.metricLabel ?? '')].filter(Boolean));
+    // The measure's own words as well as its id and label. `{"bookings": …}`
+    // came back null beside `{"closed_won": "$334,840"}` from the same run:
+    // "bookings" is what this catalogue calls that measure in every sentence it
+    // writes, and it was the one spelling the schema could not use.
+    const ids = new Set([
+      normalise(context.metricId), normalise(context.metricLabel ?? ''),
+      ...(context.metricWords ?? []).map(normalise),
+    ].filter(Boolean));
     // A caller writes the unit into the field name — `open_pipeline_cents`,
     // `mrr_amount`, `total_revenue` — and the fill was keyed on the name
     // matching the measure exactly, so the identical run filled `amount`
@@ -639,7 +678,7 @@ export function extractStructured(schema: SchemaNode, context: ExtractionContext
     ];
     for (const candidate of candidates) {
       if (candidate === undefined || candidate === null) continue;
-      const value = coerce(node, candidate, context);
+      const value = coerce(node, candidate, context, name);
       if (value !== null && !(Array.isArray(value) && !value.length)) {
         filled.push(path || name);
         return value;

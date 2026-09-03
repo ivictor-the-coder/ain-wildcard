@@ -20,7 +20,7 @@ import {
   humanize, useFormat, useHotkey, usePrefersReducedMotion, useToast, type MenuSection, type SelectOption,
 } from '@/client/design';
 import {
-  boardHref, carriedScope, carriedThrough, contradictsCarried, correctedProse, decidedBadge,
+  boardHref, carriedScope, carriedThrough, comparisonRephrase, contradictsCarried, correctedProse, decidedBadge,
   dealNamedIn, dedupeCitations, deniedPipeline, editHref, metricsMeasured, misreadRefusal,
   noWritePrepared,
   parseBlocks, parseBreakdown, propertyAsked,
@@ -246,7 +246,23 @@ function AssistantMessage({
    * five starter prompts and this engine refuses it on the word "today". The
    * same sentence without it answers with all seven tickets.
    */
-  const dropped = useMemo(() => withoutRefusedQualifier(question, refusal), [question, refusal]);
+  const cut = useMemo(() => withoutRefusedQualifier(question, refusal, vocab), [question, refusal, vocab]);
+
+  /**
+   * The same comparison, in the two periods the engine itself resolved.
+   *
+   * The other refused starter — "How did bookings last quarter compare with the
+   * quarter before?" — loses the single word "before", and cutting that word
+   * out leaves "…compare with the quarter?", which is not a sentence anybody
+   * would press. The engine had already written down what it meant:
+   * `Comparison windows: Q2 2026 against Q1 2026`. That is the offer, and it is
+   * made ahead of the cut-down sentence wherever there is one.
+   */
+  const windows = useMemo(
+    () => (refusal ? comparisonRephrase(run?.reasoning ?? [], vocab) : null),
+    [refusal, run?.reasoning, vocab],
+  );
+  const dropped = windows ?? cut;
 
   // A pipeline the answer says this workspace does not have, that it does.
   const denied = useMemo(() => deniedPipeline(prose, vocab), [prose, vocab]);
@@ -421,7 +437,11 @@ function AssistantMessage({
             {suggested && (
               <p>
                 A prompt this workspace offered you is a promise. This one was refused
-                {dropped ? ', and the same question without the part it could not place answers it:' : '.'}
+                {!dropped
+                  ? '.'
+                  : windows
+                    ? ', and the same comparison — over the two quarters it worked out for itself — answers it:'
+                    : ', and the same question without the part it could not place answers it:'}
               </p>
             )}
             <p className={suggested ? 'cp-note' : undefined} style={suggested ? { marginTop: 'var(--space-3)' } : undefined}>
@@ -444,7 +464,8 @@ function AssistantMessage({
             {settable && (
               <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
                 <a
-                  className="cp-chip"
+                  className="cp-chip cp-chip--wide"
+                  title={`Open ${settable.display_name} with ${wanted.label} on screen`}
                   href={editHref(settable.id, wanted.group)}
                   onClick={(e) => {
                     if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
@@ -468,7 +489,8 @@ function AssistantMessage({
             below has been corrected to say so.
             {' '}
             <a
-              className="cp-chip"
+              className="cp-chip cp-chip--wide"
+              title={`Open the ${denied.objectType}s`}
               href={`/records/${denied.objectType}`}
               onClick={(e) => {
                 if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
