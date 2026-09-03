@@ -332,7 +332,13 @@ export function vocabulary(ctx: Ctx, orgId: string, opts: { tools: string[]; act
   if (!byOrg) { byOrg = new Map(); cache.set(ctx.db, byOrg); }
   const cached = byOrg.get(orgId);
   const base = cached && cached.stamp === stamp ? cached.vocab : build(ctx, orgId, index.entities, crm, stamp, byOrg);
-  return { ...base, ctx, tools: new Set(opts.tools), actorId: opts.actorId };
+  // What is cached is the workspace's words, which change when its records
+  // do. Its clock changes on every call, and {period} binds against it: with
+  // the profile held in the cache, "last quarter" stayed the quarter before
+  // the one the cache was built in until some record happened to change —
+  // a workspace that moved its clock a season forward was still measured
+  // against the old one.
+  return { ...base, ctx, workspace: workspaceProfile(ctx, orgId), tools: new Set(opts.tools), actorId: opts.actorId };
 }
 
 function build(
