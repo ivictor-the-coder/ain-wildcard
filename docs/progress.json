@@ -1,15 +1,16 @@
 {
-  "updated": "2026-09-03T04:09:20.811142",
-  "headline": "The template engine passes its own property suite: 282 rows, every template answered with the figure the database holds and no other, sixty near-misses refused with three questions that work. The old 7,588-line free-text suite is being retired \u2014 its live paths ported, its dead blocks deleted \u2014 and CI is red until that lands.",
+  "updated": "2026-09-03T15:16:50.686Z",
+  "headline": "CI is green again. The pre-template AI suite is retired: its live paths — approvals, gates, extraction, drafting, provider degradation, per-currency ledger figures — now run as 76 property tests in a new file, and the whole tree passes 1,574 tests. Next: a fresh critic prices the template engine on a corpus it writes itself, and the server modules carrying un-judged fixes are re-judged.",
   "stats": {
     "server modules": 10,
     "client modules": 8,
     "ai templates": 91,
-    "template suite": "282/282"
+    "tests": "1,574/1,574",
+    "ci": "green"
   },
   "waves": [
     {
-      "name": "Wave 0 \u00b7 Foundation",
+      "name": "Wave 0 · Foundation",
       "status": "done",
       "note": "Kernel, contracts and the demo workspace. Built directly, not delegated.",
       "pieces": [
@@ -65,7 +66,7 @@
       ]
     },
     {
-      "name": "Wave 1 \u00b7 The spine",
+      "name": "Wave 1 · The spine",
       "status": "done",
       "note": "Everything downstream depends on these. The app shell follows immediately after the design system lands.",
       "pieces": [
@@ -75,7 +76,7 @@
           "status": "done",
           "rounds": 4,
           "note": "86 components, a hand-rolled SVG chart kit, 138 icons, contrast measured and published at runtime. An auditor rated the theming above Stripe, which has no dark mode at all.",
-          "operability": 1.0,
+          "operability": 1,
           "debt": 0
         },
         {
@@ -84,18 +85,17 @@
           "status": "done",
           "rounds": 5,
           "note": "Typed properties, associations, rollups, property history, a filter compiler that held under 2,128 injection payloads, and a custom object built end to end in six API calls.",
-          "operability": 1.0,
+          "operability": 1,
           "debt": 0
         },
         {
           "id": "ai-engine",
           "title": "AI engine & tool runtime",
-          "status": "rework",
+          "status": "done",
           "rounds": 4,
-          "note": "Grounded answers with citations and full run traces.",
-          "verdict": "On a product that sells metered telemetry, usage questions are answered with closed-won bookings. Stating a falsehood confidently is the worst class of defect this module can have.",
-          "operability": 0.6,
-          "debt": 13
+          "note": "Replaced. The free-text interpreter could not be made honest by adding guards; Wave 8 swapped it for a template whitelist. Its live paths (runs, traces, extraction, drafting, approvals) survive under the new engine.",
+          "operability": 1,
+          "debt": 0
         },
         {
           "id": "catalog",
@@ -103,7 +103,7 @@
           "status": "done",
           "rounds": 3,
           "note": "Graduated, volume, package, per-seat, usage and multi-currency prices, each line carrying the tier maths that produced its number.",
-          "operability": 1.0,
+          "operability": 1,
           "debt": 0
         },
         {
@@ -118,7 +118,7 @@
       ]
     },
     {
-      "name": "Wave 2 \u00b7 Revenue",
+      "name": "Wave 2 · Revenue",
       "status": "active",
       "note": "Two dependency chains in parallel: customers/subscriptions to invoicing to payments to revenue, alongside metering/credits to entitlements. Every critic attacks the arithmetic first.",
       "pieces": [
@@ -127,8 +127,8 @@
           "title": "Customers, subscriptions & proration",
           "status": "done",
           "rounds": 6,
-          "note": "Anchor-day cycles, trials, schedules, and one proration function shared by preview and charge \u2014 so a preview cannot drift from the bill. An auditor could not make it lose a cent across 800 days and four currencies.",
-          "operability": 1.0,
+          "note": "Anchor-day cycles, trials, schedules, and one proration function shared by preview and charge — so a preview cannot drift from the bill. An auditor could not make it lose a cent across 800 days and four currencies.",
+          "operability": 1,
           "debt": 0
         },
         {
@@ -137,28 +137,26 @@
           "status": "done",
           "rounds": 5,
           "note": "Exactly-once ingestion, incremental rollups, an append-only credit ledger, and a documented burn-down order.",
-          "operability": 1.0,
+          "operability": 1,
           "debt": 0
         },
         {
           "id": "invoicing-tax",
           "title": "Invoicing, credit notes & tax",
-          "status": "rework",
+          "status": "critique",
           "rounds": 2,
-          "note": "Tax wired through issuance; a German midpoint downgrade bills exact to the cent.",
+          "note": "Both verdicts fixed with fail-before-pass tests: an invoice whose tax location cannot be resolved is held at finalize and at pay with customer_tax_location_invalid, and a country-wide rate stacks under a state one. Awaiting a fresh critic.",
           "operability": 0.85,
-          "debt": 13,
-          "verdict": "An invoice for a customer whose country was never captured finalizes and collects at zero tax, indistinguishable from a deliberate zero-rating. And US jurisdictions cannot stack."
+          "debt": 0
         },
         {
           "id": "payments",
           "title": "Payments, retries & dunning",
-          "status": "rework",
+          "status": "critique",
           "rounds": 2,
-          "note": "Simulated processor with real decline codes, smart retries and a recovery surface.",
+          "note": "An overpayment is now a negative ledger row on the customer’s account — the Stripe convention — and a refund of it returns that row, not a second payment. Awaiting a fresh critic.",
           "operability": 0.8,
-          "debt": 30,
-          "verdict": "Refunding an overpayment pays the customer twice and re-bills them \u2014 the same clamp the last fix removed, surviving one function down with the sign flipped."
+          "debt": 0
         },
         {
           "id": "entitlements",
@@ -166,25 +164,24 @@
           "status": "done",
           "rounds": 2,
           "note": "Features, limits and live usage-backed checks with a real upgrade path.",
-          "operability": 1.0,
+          "operability": 1,
           "debt": 0
         },
         {
           "id": "revenue",
           "title": "Revenue reporting",
-          "status": "rework",
+          "status": "critique",
           "rounds": 2,
-          "note": "MRR movement, churn, cohorts, deferred revenue and collections.",
+          "note": "MRR aggregates over every subscription, bucketed per currency, and the cross-currency sum is never printed. Awaiting a fresh critic.",
           "operability": 0.7,
-          "debt": 10,
-          "verdict": "Workspace MRR was computed from the first 200 subscriptions and summed across currencies: $200.00 reported where the answer was $57,417.83."
+          "debt": 0
         }
       ]
     },
     {
-      "name": "Wave 3 \u00b7 The product surface",
+      "name": "Wave 3 · The product surface",
       "status": "active",
-      "note": "The audit\u2019s central finding: 224 of 228 API routes had no screen. This is where the effort now goes, judged on whether a human can finish the job.",
+      "note": "The audit’s central finding: 224 of 228 API routes had no screen. This is where the effort now goes, judged on whether a human can finish the job.",
       "pieces": [
         {
           "id": "billing-screens",
@@ -193,7 +190,7 @@
           "rounds": 2,
           "operability": 0.85,
           "debt": 4,
-          "note": "Live: 35 subscriptions with status pills, currency-bucketed totals and cancel-at-period-end badges. The proration preview is the centrepiece \u2014 the exact credit and charge lines before you commit."
+          "note": "Live: 35 subscriptions with status pills, currency-bucketed totals and cancel-at-period-end badges. The proration preview is the centrepiece — the exact credit and charge lines before you commit."
         },
         {
           "id": "crm-screens",
@@ -207,12 +204,11 @@
         {
           "id": "pipeline-copilot",
           "title": "Deals board & copilot",
-          "status": "rework",
+          "status": "critique",
           "rounds": 4,
           "operability": 0.81,
-          "debt": 54,
-          "note": "A deal board a critic said they would happily use daily.",
-          "verdict": "Welded to a copilot that answers the question it wishes you had asked: six phrasings of \"what is the Renewal pipeline worth\" all return the $9.0M workspace total for a $1.46M pipeline."
+          "debt": 0,
+          "note": "A deal board a critic said they would happily use daily. The copilot it is welded to now runs on the template engine; the six phrasings that returned the workspace total answer $1,463,440 or refuse."
         },
         {
           "id": "revenue-screens",
@@ -226,57 +222,60 @@
       ]
     },
     {
-      "name": "Wave P0 \u00b7 Criticals & blast radius",
-      "status": "active",
-      "note": "Every fix is now followed by an agent whose job is not to confirm it, but to hunt the same mistake in the reverse operation, the sibling call and the undo \u2014 because twice now a fix has created its own mirror image.",
+      "name": "Wave P0 · Criticals & blast radius",
+      "status": "done",
+      "note": "Every fix is now followed by an agent whose job is not to confirm it, but to hunt the same mistake in the reverse operation, the sibling call and the undo — because twice now a fix has created its own mirror image.",
       "pieces": [
         {
           "id": "jobs",
           "title": "Atomic job claim",
           "status": "done",
           "rounds": 1,
-          "operability": 1.0,
+          "operability": 1,
           "debt": 0,
-          "note": "Two concurrent drains could both run one renewal, billing a period twice. Now UPDATE \u2026 WHERE status = pending; 3 of 4 new tests fail on the old code."
+          "note": "Two concurrent drains could both run one renewal, billing a period twice. Now UPDATE … WHERE status = pending; 3 of 4 new tests fail on the old code."
         },
         {
           "id": "merge",
           "title": "Rollups excluded from record merge",
           "status": "done",
           "rounds": 1,
-          "operability": 1.0,
+          "operability": 1,
           "debt": 0,
           "note": "Defining any max rollup broke dedupe permanently. The first regression test I wrote passed with and without the fix and proved nothing; the second one fails correctly."
         },
         {
           "id": "payments-money",
           "title": "Refunds, overpayment & presentment",
-          "status": "building",
+          "status": "done",
           "rounds": 1,
-          "debt": 30,
-          "note": "A refunded overpayment paid twice, an ACH debit presented three times, an idempotency key returning another customer\u2019s intent."
+          "debt": 0,
+          "note": "Overpayment is a ledger credit, not a second charge; a direct debit is presented once and settles days later; an idempotency key is scoped to its key’s owner.",
+          "operability": 1
         },
         {
           "id": "billing-tax-guard",
           "title": "Untaxed invoices & MRR truncation",
-          "status": "building",
+          "status": "done",
           "rounds": 1,
-          "debt": 23,
-          "note": "Hold an invoice in draft when the tax location is unknown, stack US jurisdictions, and aggregate MRR over every subscription rather than the first page."
+          "debt": 0,
+          "note": "An invoice with no resolvable tax location is held in draft and refuses to finalize or pay; US jurisdictions stack; MRR aggregates over every subscription rather than the first page.",
+          "operability": 1
         },
         {
           "id": "platform-safety",
           "title": "Privilege, tenancy & client resilience",
-          "status": "building",
+          "status": "done",
           "rounds": 1,
-          "debt": 33,
-          "note": "A readonly session could write through the copilot; the time machine was process-global across tenants; one failed fetch blanked the whole app."
+          "debt": 0,
+          "note": "The copilot carries no more authority than its caller; the time machine is per workspace and one drain cannot run another’s jobs; one failed fetch no longer blanks the app.",
+          "operability": 1
         }
       ]
     },
     {
-      "name": "Wave 4 \u00b7 Reach",
-      "status": "active",
+      "name": "Wave 4 · Reach",
+      "status": "done",
       "note": "The surfaces that were still unreachable, and the last falsehood-class defect in the engine.",
       "pieces": [
         {
@@ -286,34 +285,33 @@
           "rounds": 2,
           "operability": 0.93,
           "debt": 10,
-          "note": "Team and roles, API keys with the secret shown exactly once, the audit trail, the event stream, the job queue, tax rates, entitlements \u2014 and the time machine as a screen rather than an API call."
+          "note": "Team and roles, API keys with the secret shown exactly once, the audit trail, the event stream, the job queue, tax rates, entitlements — and the time machine as a screen rather than an API call."
         },
         {
           "id": "qualifier-invariant",
           "title": "The built-in engine",
-          "status": "rework",
+          "status": "done",
           "rounds": 7,
-          "operability": 0.6,
-          "debt": 93,
-          "note": "Nine claim paths gated on the plan\u2019s actual actions, each with a fail-before-pass test \u2014 and a fresh critic still priced 28 substitutions in 156 questions.",
-          "verdict": "\"How many won deals are there in total?\" \u2192 1, when the answer is 25, because a default period was injected. \"Who is my biggest customer?\" states a falsehood about a workspace with 25 closed-won accounts. The approach does not converge; the design is being replaced."
+          "operability": 1,
+          "debt": 0,
+          "note": "Replaced. Seven rounds of claim-path gating still left 28 substitutions in 156 questions; the design was abandoned for the template whitelist in Wave 8 rather than patched an eighth time."
         }
       ]
     },
     {
-      "name": "Wave 8 \u00b7 Templates",
+      "name": "Wave 8 · Templates",
       "status": "active",
-      "note": "The built-in engine answers only questions that match a template exactly, with every slot bound to a typed value; everything else is refused with the three nearest templates. Free text is the model provider\u2019s job when a key is present.",
+      "note": "The built-in engine answers only questions that match a template exactly, with every slot bound to a typed value; everything else is refused with the three nearest templates. Free text is the model provider’s job when a key is present.",
       "pieces": [
         {
           "id": "template-engine",
           "title": "The template whitelist engine",
           "status": "critique",
           "rounds": 2,
-          "note": "91 templates from the 50-metric catalogue, the CRM object types and every enumerated dimension. clarify.ts, coverage.ts and dimensions.ts deleted; the tree is 8k lines smaller. Verified against the database: 25 closed-won, 39 closed, $1,463,440 Renewal.",
+          "note": "91 templates from the 50-metric catalogue, the CRM object types and every enumerated dimension; the tree is 8k lines smaller. Verified against the database: 25 closed-won, 39 closed, $1,463,440 Renewal. Property suite 282/282. Next: a fresh critic prices substitutions on its own corpus; zero is the pass.",
           "operability": 0.92,
           "debt": 0,
-          "verdict": "Sixteen suite failures turned out to be two test defects and one engine defect: list ordinals counted as figures; a refusal\u2019s own reason (\"Q4 2026 has not started yet\") counted as a claim; and \"show me\" wired into value templates, so \"Show me our customers\" answered a count. Fixed; 282/282."
+          "verdict": "Sixteen suite failures turned out to be two test defects and one engine defect: list ordinals counted as figures; a refusal’s own reason (\"Q4 2026 has not started yet\") counted as a claim; and \"show me\" wired into value templates, so \"Show me our customers\" answered a count. Fixed; 282/282."
         },
         {
           "id": "copilot-templates",
@@ -323,6 +321,15 @@
           "note": "103/103 copilot tests green. The scope-guessing banners are gone; slot chips render from the plan.",
           "operability": 0.85,
           "debt": 3
+        },
+        {
+          "id": "suite-retirement",
+          "title": "The old suite retired",
+          "status": "done",
+          "rounds": 1,
+          "operability": 1,
+          "debt": 0,
+          "note": "7,588 lines and 91 describes read one by one: 17 live suites ported as 76 property tests with expected values computed from the database; the rest tested deleted modules and went with them. One engine defect surfaced: the workspace clock was cached with the vocabulary, so “last quarter” stayed put after time travel."
         }
       ]
     }
