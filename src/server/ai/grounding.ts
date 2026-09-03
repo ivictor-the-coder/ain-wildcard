@@ -88,6 +88,15 @@ export interface InvoiceSource {
   paidDateColumn: string | null;
   /** When the bill was raised — the date every other invoice question means. */
   issuedDateColumn: string;
+  /**
+   * When the bill fell due.
+   *
+   * Outstanding is what is owed; overdue is what is *late*. On this workspace
+   * that is $133,400, €1,007 and £1,560 across 7 invoices against $127,840
+   * across 1 — and every "overdue", "past due" and "in arrears" question was
+   * answered with the first pair of figures.
+   */
+  dueDateColumn: string | null;
   statusColumn: string | null;
   customerColumn: string | null;
   currencyColumn: string | null;
@@ -151,6 +160,10 @@ export function billingSources(db: Db): BillingSources {
           paidColumn: firstColumn(db, invoiceTable, ['amount_paid', 'paid_amount']),
           paidDateColumn: firstColumn(db, invoiceTable, ['paid_at', 'paid_date', 'settled_at']),
           issuedDateColumn,
+          // When the bill fell due, which is the whole of the difference
+          // between outstanding and overdue: an open invoice inside its terms
+          // is money owed, not money late.
+          dueDateColumn: firstColumn(db, invoiceTable, ['due_date', 'due_at', 'payment_due_at']),
           statusColumn: firstColumn(db, invoiceTable, ['status', 'state']),
           customerColumn: firstColumn(db, invoiceTable, ['customer_id', 'account_id', 'company_id', 'customer']),
           currencyColumn: firstColumn(db, invoiceTable, ['currency']),

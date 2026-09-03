@@ -322,6 +322,10 @@ function headline(metric: MetricToolResult, who: string, period: string, hasSubj
     case 'revenue': return `${who} collected ${value} in ${period}`;
     case 'invoiced': return hasSubject ? `${who} was invoiced ${value} in ${period}` : `${who} invoiced ${value} in ${period}`;
     case 'outstanding': return `${who} has ${value} outstanding`;
+    // "Overdue" is the whole claim: the reader is being told which of the open
+    // invoices are actually late, so the sentence says late rather than owed.
+    // The note under it says what late means here; the headline stays a number.
+    case 'overdue': return `${who} has ${value} overdue`;
     case 'pipeline': return `${who} is carrying ${value} in ${metric.scope?.stage ? 'pipeline' : 'open pipeline'}`;
     case 'weighted_pipeline': return `${who} has ${value} of weighted pipeline`;
     case 'closed_won': return `${who} booked ${value} in ${period}`;
@@ -753,6 +757,15 @@ function conditionClauses(
       clauses.push(`with ${countNoun(property, OP_PHRASE[op], condition.value)}`);
       continue;
     }
+    // A flag is a yes or a no, not a column name with a JSON literal after it.
+    // "14 companies is key account True" is the schema talking to itself; the
+    // reader is being told which 14 companies those are.
+    if (typeof condition.value === 'boolean' || condition.value === 'true' || condition.value === 'false') {
+      const yes = condition.value === true || condition.value === 'true';
+      const flag = humanise(property.replace(/^(is|has)_/, '')).toLowerCase();
+      clauses.push(`${yes ? 'flagged' : 'not flagged'} as ${/s$/.test(flag) ? flag : `${flag}s`}`);
+      continue;
+    }
     const values = (Array.isArray(condition.values) ? condition.values : condition.value === undefined ? [] : [condition.value])
       .map((v) => humanise(String(v)));
     if (!values.length || values.length > 3) continue;
@@ -907,16 +920,33 @@ function aggregateSentence(agg: RecordAggregateResult, input: SynthesisInput, le
       // available — but as English, not as a column key.
       : `${agg.formatted} is the ${agg.measure.toLowerCase().replace(/^sum of /, 'total ').replace(/^avg of /, 'average ').replace(/_/g, ' ')} across ${subject}${where}.`];
   if (agg.groups.length) {
-    lines.push(`Breakdown: ${agg.groups.slice(0, 8).map((g) => `${g.label} ${g.value.toLocaleString(input.workspace.locale)}`).join(' · ')}.`);
+    lines.push(`Breakdown: ${breakdownRows(agg.groups, 8)}.`);
   }
   return lines;
+}
+
+/**
+ * A breakdown's rows, with the ones that did not fit accounted for.
+ *
+ * "Support backlog: 7 open tickets — Onboarding 2 · Missing data 2 ·
+ * Integration 1 · Feature request 1" adds up to 6, because the fifth group was
+ * cut off silently. A reader who checks the arithmetic on a truncated list
+ * concludes the count is wrong.
+ */
+function breakdownRows(
+  groups: { label: string; formatted: string }[],
+  limit: number,
+): string {
+  const shown = groups.slice(0, limit);
+  const rest = groups.length - shown.length;
+  return `${shown.map((g) => `${g.label} ${g.formatted}`).join(' · ')}`
+    + (rest > 0 ? ` (+${rest} smaller ${rest === 1 ? 'group' : 'groups'})` : '');
 }
 
 function metricBreakdown(metric: MetricToolResult): string[] {
   const lines: string[] = [];
   if (metric.groups.length) {
-    const rows = metric.groups.slice(0, 8).map((g) => `${g.label} ${g.formatted}`);
-    lines.push(`Breakdown: ${rows.join(' · ')}.`);
+    lines.push(`Breakdown: ${breakdownRows(metric.groups, 8)}.`);
   }
   if (metric.top_accounts.length) {
     lines.push(`Biggest contributors: ${metric.top_accounts.map((a) => `${a.label} ${a.formatted}`).join(' · ')}.`);
@@ -2325,7 +2355,7 @@ function overview(input: SynthesisInput, facts: Facts, found: Gathered, ledger: 
   for (const aggregate of found.aggregates) {
     if (!aggregate.groups.length) continue;
     ledger.use(aggregate);
-    const rows = aggregate.groups.slice(0, 4).map((g) => `${g.label} ${g.value.toLocaleString(input.workspace.locale)}`).join(' · ');
+    const rows = breakdownRows(aggregate.groups, 6);
     blocks.push(aggregate.object_type === 'ticket'
       ? `Support backlog: ${countOf(aggregate.matched_records, 'open ticket')} — ${rows}.`
       : `${aggregate.measure} across ${countOf(aggregate.matched_records, aggregate.object_type)}: ${rows}.`);

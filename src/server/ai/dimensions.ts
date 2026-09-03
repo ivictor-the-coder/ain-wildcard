@@ -302,6 +302,46 @@ export function dimensionsIn(question: string, dimensions: Dimension[]): Dimensi
   return out;
 }
 
+/**
+ * Row nouns that are also a word inside a column's name.
+ *
+ * "by deal" is the object type, not the Deal type column, and grouping a
+ * measure by `deal_type` because the reader wrote the word "deal" would be the
+ * substitution this file exists to stop, wearing a `group_by`.
+ */
+const NOT_A_GROUPING = new Set(['deal', 'deals', 'company', 'companies', 'ticket', 'tickets',
+  'contact', 'contacts', 'customer', 'customers', 'account', 'accounts', 'invoice', 'invoices',
+  'lead', 'leads', 'sales', 'product', 'support', 'original', 'preferred', 'controls']);
+
+/**
+ * The dimension a breakdown is asked for, when it is one of this workspace's
+ * own columns rather than one of the handful `GroupBy` enumerates.
+ *
+ * "Break down open pipeline by forecast category" is a real report — five rows
+ * of it — and `record_aggregate` groups by any property there is. Without this
+ * the phrase reached no argument at all, so the reader's own instruction was
+ * either dropped under one undivided total or refused.
+ */
+export function groupingDimensionIn(
+  question: string,
+  dimensions: Dimension[],
+): { objectType: string; property: string; noun: string; matched: string } | null {
+  const text = ` ${deArticled(normalise(question))} `;
+  const marker = /\b(?:split|splits|broken\s+(?:down|out)|break\s+(?:down|out)|grouped|group|bucketed|segmented|sliced)(?:\s+up)?\s+by\s+|\b(?:by|per|each)\s+/g;
+  const tails = [...text.matchAll(marker)].map((hit) => text.slice((hit.index ?? 0) + hit[0].length));
+  if (!tails.length) return null;
+  let best: { objectType: string; property: string; noun: string; matched: string } | null = null;
+  for (const dimension of dimensions) {
+    for (const anchor of dimension.anchors) {
+      if (anchor.length < 4 || NOT_A_GROUPING.has(anchor)) continue;
+      if (!tails.some((tail) => tail.startsWith(`${anchor} `))) continue;
+      if (best && anchor.length <= best.matched.length) continue;
+      best = { objectType: dimension.objectType, property: dimension.property, noun: dimension.noun, matched: anchor };
+    }
+  }
+  return best;
+}
+
 /** The record ids a dimension filter picks out, for a query one table over. */
 export function recordsMatching(
   ctx: Ctx,

@@ -70,6 +70,8 @@ export interface CoverageDimension {
   property: string;
   /** What a person calls the dimension — "Category", "Product area". */
   noun: string;
+  /** The phrases that name the dimension itself — "forecast", "came from", "lost to". */
+  anchors: string[];
   options: { value: string; label: string }[];
 }
 
@@ -79,6 +81,14 @@ export interface CoverageNumeric {
   noun: string;
 }
 
+/** A row noun this workspace uses, and whether the plan read those rows. */
+export interface CoverageRowNoun {
+  objectType: string;
+  nouns: string[];
+  /** True when some planned step actually queries this type. */
+  queried: boolean;
+}
+
 export interface CoverageVocabulary {
   dimensions: CoverageDimension[];
   numeric: CoverageNumeric[];
@@ -86,6 +96,10 @@ export interface CoverageVocabulary {
   metrics: string[];
   /** The people who own records here, so a half-written name is not called a stranger. */
   people: string[];
+  /** What this workspace calls each kind of row, and which kinds the plan read. */
+  rowNouns: CoverageRowNoun[];
+  /** The currency books this workspace actually keeps, lowercase ISO codes. */
+  currencies: string[];
 }
 
 export interface CoverageInput {
@@ -324,6 +338,34 @@ function suggestFor(token: string, input: CoverageInput): { why: string; suggest
     return trigramSimilarity(value, target);
   };
 
+  // A negation is an operator, not a value. "How many companies have no open
+  // deals?" was refused with '"no" is a close reason a deal carries here',
+  // because the word trigram-matches "No decision" — a sentence that
+  // misdescribes the reader's own grammar back at them while declining to
+  // answer.
+  if (NEGATIONS.has(target)) {
+    return {
+      why: `"${token}" selects rows by what they do *not* have, and no step in the plan I built carries an absence filter — the figure I would print includes the very rows you were excluding.`,
+      suggestion: `ask for the absence on a column the record itself carries — "deals with no next step" — which I filter exactly`,
+    };
+  }
+
+  // A noun this workspace uses for a kind of row, on a plan that read a
+  // different kind. "How many billing tickets do we have?" was refused with
+  // '"tickets" did not resolve to a measure this workspace computes' — while
+  // the plan it built was reading the invoice book, which is the thing worth
+  // saying.
+  const rows = input.vocabulary.rowNouns.find((entry) => !entry.queried
+    && entry.nouns.some((noun) => normalise(noun) === target));
+  if (rows) {
+    const read = input.vocabulary.rowNouns.filter((entry) => entry.queried).map((entry) => plural(entry.objectType));
+    return {
+      why: `"${token}" is one of this workspace's words for its ${rows.nouns[0]} records, and no step in the plan I built reads them`
+        + `${read.length ? ` — the figure I would print comes off the ${listPhrase(read)}` : ' — so there is nothing behind the figure I would print'}.`,
+      suggestion: `ask about the ${rows.nouns[0]} records on their own and the answer is measured over those rows`,
+    };
+  }
+
   // A value of one of this workspace's own enumerations, written without the
   // dimension beside it. "Security" is a ticket category here; on its own it is
   // also an English word, so the engine will not read it as the filter — but it
@@ -338,8 +380,27 @@ function suggestFor(token: string, input: CoverageInput): { why: string; suggest
   if (best) {
     const noun = plural(best.dimension.objectType);
     return {
-      why: `"${token}" is a ${best.dimension.noun.toLowerCase()} of a ${best.dimension.objectType} here, but on its own it is an English word too, so I will not read it as a filter and then quote you a number as though I had.`,
+      why: `"${token}" is a ${best.dimension.noun.toLowerCase()} a ${best.dimension.objectType} carries here, and no step in the plan I built filters on it`
+        + ` — on its own it is an English word too, so the figure I would print is over every ${best.dimension.objectType}, not the ones you narrowed it to.`,
       suggestion: `ask for "${noun} in the ${best.label} ${best.dimension.noun.toLowerCase()}" and I will filter on it exactly`,
+    };
+  }
+
+  // The *name* of one of this workspace's own columns, with no value beside it.
+  // "How many deals are forecast to close?" came back as all 38 open deals:
+  // "forecast" names the Forecast category column and narrows nothing until a
+  // value is written with it, and saying which values it holds is the whole of
+  // the help this refusal can give.
+  const named = input.vocabulary.dimensions.find((dimension) =>
+    dimension.anchors.some((anchor) => normalise(anchor) === target));
+  if (named) {
+    const example = named.options[0]?.label;
+    return {
+      why: `"${token}" names the ${named.noun} column this workspace keeps on every ${named.objectType}, and no step in the plan I built filters or groups on it`
+        + ` — a column's name narrows nothing until a value is written beside it, so the figure I would print is over every ${named.objectType}.`,
+      suggestion: example
+        ? `name a value with it — "${plural(named.objectType)} in the ${example} ${named.noun.toLowerCase()}" — or ask for the breakdown by ${named.noun.toLowerCase()}`
+        : `ask for the breakdown by ${named.noun.toLowerCase()}`,
     };
   }
 
@@ -352,6 +413,37 @@ function suggestFor(token: string, input: CoverageInput): { why: string; suggest
     return {
       why: `"${token}" is part of ${person}'s name, and nothing in this run is scoped to them — a teammate is a filter here, and half a name is not one I will complete for you.`,
       suggestion: `write "${person}" out in full and I will scope the answer to the records they own`,
+    };
+  }
+
+  // A currency book this workspace keeps, on an answer nothing scoped to it.
+  // "How many deals are in EUR?" waived the currency with "Deals is not a money
+  // measure, so restricting it to one currency book would change nothing" and
+  // printed every deal in the book. A deal here is not raised in a currency at
+  // all — the restriction is not a no-op, it is unavailable — and saying so is
+  // the answer.
+  const currency = input.vocabulary.currencies.find((code) => normalise(code) === target);
+  if (currency) {
+    return {
+      why: `"${token}" is one of the currency books ${input.workspaceName} keeps, and nothing in this plan is scoped to it — ${
+        input.objectTypes.length ? `a ${input.objectTypes[0]} is not raised in a currency book here` : 'this measure carries no currency'
+      }, so the figure I would print is over every book, not the ${token.toUpperCase()} one.`,
+      suggestion: `ask for a money measure in it — "how much revenue did we collect in ${token.toUpperCase()}" — and I will scope the answer to that book`,
+    };
+  }
+
+  // A column this workspace keeps on its own records, asked for by name. "The
+  // total annual revenue of our customers" is the Annual revenue column on the
+  // accounts, not this workspace's collected invoice revenue, and pointing at
+  // the nearest *measure* sent the reader to Annual recurring revenue — a third
+  // number, and no closer to what they asked for.
+  const column = input.vocabulary.numeric
+    .map((entry) => ({ entry, score: near(entry.noun) }))
+    .sort((a, b) => b.score - a.score)[0];
+  if (column && column.score >= 0.9) {
+    return {
+      why: `"${token}" reads like ${column.entry.noun}, a column this workspace keeps on every ${column.entry.objectType}, and no step in the plan I built reads it — the figure I would print comes from somewhere else entirely.`,
+      suggestion: `ask for "total ${column.entry.noun.toLowerCase()} across our ${plural(column.entry.objectType)}" and I will add up that column`,
     };
   }
 

@@ -19,9 +19,9 @@ import {
   agreeWithTheCount, comparisonRephrase, correctPipelineDenial, correctedProse, isWiderName,
   isWriteRequest, lookupObject, metricsMeasured,
   misreadRefusal, namedQualifiers, propertyVocabulary, questionHeadNoun,
-  reconcileScope, recordPhraseMismatch, refusalDisprovedByThread, scopeChips, warningSentence,
+  carriedThrough, reconcileScope, recordPhraseMismatch, refusalDisprovedByThread, scopeChips, warningSentence,
   withoutCurrencyClaim, withoutRefusedQualifier, withoutWriteParameter,
-  type QualifierVerdict, type VocabPropertyDef, type Vocabulary,
+  type QualifierKind, type QualifierVerdict, type VocabPropertyDef, type Vocabulary,
 } from '../src/client/modules/copilot/scope-core';
 import {
   carriedScope, confidenceChip, contradictsCarried, noWritePrepared, propertyAsked, refusalOf,
@@ -32,7 +32,8 @@ import {
   stageWriteOf, type DealNow,
 } from '../src/client/modules/copilot/write-core';
 import {
-  EMPTY_LEDGER, checkDunning, draftsFromAccount, ledgerFrom, ledgerTotal,
+  EMPTY_LEDGER, chaseVerdict, checkDunning, draftsFromAccount, figuresIn, invoiceNumbersIn,
+  ledgerFrom, ledgerTotal,
 } from '../src/client/modules/copilot/draft-core';
 import {
   approvalOutcome, decidedBadge, runOutcome, type AiApproval,
@@ -1037,6 +1038,134 @@ describe('a chase checked against the ledger it is about', () => {
   });
 });
 
+/* ===== P0 · the guarantee the draft surface prints about money ============ */
+
+/**
+ * "The draft is checked against these figures before it can be logged."
+ *
+ * That sentence sits over the ledger read-out on the compose step, and the body
+ * under it is a `<Textarea>`. The check ran on `draft` — the object the engine
+ * returned — and the Log button posted `editSubject`/`editBody`, so the promise
+ * held for exactly as long as nobody typed. Every letter below is the account
+ * draft with one edit in it, and every one of them was logged onto Brightline
+ * Foods's timeline under that banner with no check behind it.
+ */
+const EDITED = {
+  /** The invoice number retyped to one this account does not hold. */
+  wrongInvoice: {
+    subject: 'Invoice NR-000099 for Brightline Foods — $127,840.00 outstanding',
+    body: 'Hi Marlene,\n\nInvoice NR-000099 for $127,840.00 is still outstanding, due Jul 8, 2026 — 56 days ago.',
+  },
+  /** Two digits swapped in the amount — the ledger holds $127,840.00. */
+  wrongAmount: {
+    subject: 'Invoice NR-000032 for Brightline Foods — $127,480.00 outstanding',
+    body: 'Hi Marlene,\n\nInvoice NR-000032 for $127,480.00 is still outstanding, due Jul 8, 2026 — 56 days ago.',
+  },
+  /** A figure nobody owes, added to a letter that is otherwise true. */
+  inventedLine: {
+    subject: 'Invoice NR-000032 for Brightline Foods — $127,840.00 outstanding',
+    body: 'Hi Marlene,\n\nInvoice NR-000032 for $127,840.00 is still outstanding, due Jul 8, 2026 — 56 days ago.'
+      + '\n\nLate interest of $4,200.00 has been added to the account.',
+  },
+};
+
+describe('the one guarantee the draft surface prints about money', () => {
+  it('checks the letter that will be logged, not the letter that arrived', () => {
+    // The engine's own draft is honest, and the dialog holds it either way.
+    // What decides whether the Log button lights up is the text in the boxes.
+    const honest = chaseVerdict('dunning', ACCOUNT_DRAFT, ACCOUNT_DRAFT, BRIGHTLINE_LEDGER);
+    assert.deepEqual(honest, { state: 'ok' });
+    const tampered = chaseVerdict('dunning', ACCOUNT_DRAFT, EDITED.wrongInvoice, BRIGHTLINE_LEDGER);
+    assert.equal(tampered?.state, 'contradicted');
+  });
+
+  it('names the figure the edit invented, and what the ledger holds against it', () => {
+    const verdict = chaseVerdict('dunning', ACCOUNT_DRAFT, EDITED.wrongAmount, BRIGHTLINE_LEDGER);
+    assert.equal(verdict?.state, 'contradicted');
+    const why = verdict.state === 'contradicted' ? verdict.why : '';
+    assert.match(why, /\$127,480\.00/, 'the figure the reader typed, in their own words');
+    assert.match(why, /NR-000032/, 'the invoice it was meant to be');
+    assert.match(why, /\$127,840\.00/, 'what the ledger actually holds');
+  });
+
+  it('refuses a body that chases an invoice the subject line does not', () => {
+    // The subject still reads NR-000032, so one held number is cited and the
+    // old rule was satisfied — while the paragraph the customer reads chases an
+    // invoice that does not exist.
+    const split = {
+      subject: ACCOUNT_DRAFT.subject,
+      body: ACCOUNT_DRAFT.body.replace('NR-000032', 'NR-000099'),
+    };
+    const verdict = chaseVerdict('dunning', ACCOUNT_DRAFT, split, BRIGHTLINE_LEDGER);
+    assert.equal(verdict?.state, 'contradicted');
+    const why = verdict.state === 'contradicted' ? verdict.why : '';
+    assert.match(why, /NR-000099/);
+    assert.match(why, /NR-000032/);
+    // The numbering is read off the ledger, not typed into this file.
+    assert.deepEqual(
+      invoiceNumbersIn(split.body, BRIGHTLINE_LEDGER.bills),
+      ['NR-000099'],
+    );
+  });
+
+  it('refuses a figure added to an otherwise true letter', () => {
+    const verdict = chaseVerdict('dunning', ACCOUNT_DRAFT, EDITED.inventedLine, BRIGHTLINE_LEDGER);
+    assert.equal(verdict?.state, 'contradicted');
+    assert.match(verdict.state === 'contradicted' ? verdict.why : '', /\$4,200\.00/);
+  });
+
+  it('lets the total stand beside the invoices it is the total of', () => {
+    // Two bills in one book: $2,760.00 and $2,300.00 on Meridian Forge Systems.
+    // "$5,060.00 across two invoices" is a true sentence a person may write.
+    const meridian = ledgerFrom([
+      { number: 'NR-000339', amount_due: 276_000, currency: 'usd', due_date: Date.UTC(2026, 9, 3), status: 'open' },
+      { number: 'NR-000338', amount_due: 230_000, currency: 'usd', due_date: Date.UTC(2026, 9, 3), status: 'open' },
+    ], Date.UTC(2026, 8, 2));
+    const summed = {
+      subject: 'Two invoices for Meridian Forge Systems — $5,060.00 outstanding',
+      body: 'NR-000339 for $2,760.00 and NR-000338 for $2,300.00 are still outstanding — $5,060.00 in all.',
+    };
+    assert.deepEqual(chaseVerdict('dunning', summed, summed, meridian), { state: 'ok' });
+  });
+
+  it('reads a figure in the book it is written in, and no other number as money', () => {
+    const ledger = ledgerFrom(
+      [{ number: 'NR-000138', amount_due: 91_800, currency: 'eur', due_date: null, status: 'open' }],
+      Date.UTC(2026, 8, 2),
+    );
+    // 6,400 employees and 848 assets are facts the engine puts in a draft; a
+    // guard that reads them as money is one nobody can leave switched on.
+    assert.deepEqual(figuresIn('€918.00 across 6,400 employees and 848 assets', ['eur']), [
+      { text: '€918.00', minor: 91_800, currency: 'eur' },
+    ]);
+    const chase = {
+      subject: 'Invoice NR-000138 — €918.00 outstanding',
+      body: 'Västerö Industriteknik runs 848 connected assets. Invoice NR-000138 for €918.00 is still due.',
+    };
+    assert.deepEqual(chaseVerdict('dunning', chase, chase, ledger), { state: 'ok' });
+    // The same amount in the wrong book is not the amount on the ledger.
+    const wrongBook = { ...chase, body: chase.body.replace('€918.00', '$918.00') };
+    assert.equal(chaseVerdict('dunning', chase, wrongBook, ledger)?.state, 'contradicted');
+  });
+
+  it('refuses a money figure put to an account that owes nothing', () => {
+    const clean = ledgerFrom([], Date.UTC(2026, 8, 2));
+    const chase = { subject: 'Your account', body: 'You still owe $12,000.00 on the account.' };
+    const verdict = chaseVerdict('dunning', chase, chase, clean);
+    assert.equal(verdict?.state, 'contradicted');
+    assert.match(verdict.state === 'contradicted' ? verdict.why : '', /\$12,000\.00/);
+  });
+
+  it('says nothing at all about the kinds that are not claims about a ledger', () => {
+    // A follow-up quoting a deal's $315,900 is not a chase, and the ledger has
+    // no opinion about it.
+    const followUp = { subject: 'Next step', body: 'The predictive maintenance add-on is $315,900.' };
+    assert.equal(chaseVerdict('follow_up', followUp, followUp, BRIGHTLINE_LEDGER), null);
+    // And there is nothing to check before the engine has answered.
+    assert.equal(chaseVerdict('dunning', null, { subject: '', body: '' }, BRIGHTLINE_LEDGER), null);
+  });
+});
+
 /* ====== P0 · a thread that narrows every later question to one record ===== */
 
 /**
@@ -1698,6 +1827,294 @@ describe('the comparison a refused starter had already worked out', () => {
         'Metric: Pipeline velocity (matched "velocity", score 1).',
       ], VOCAB),
       null,
+    );
+  });
+});
+
+/* ====== P1 · the guard layer, counted over a corpus of correct answers ==== */
+
+/**
+ * A warning that fires on a right answer is worse than no warning at all.
+ *
+ * 141 questions were put to this engine against the freshly seeded workspace
+ * and every answer was checked against `crm_records` and `billing_invoices` by
+ * hand. Thirteen of them drew a banner. Six of those thirteen were on answers
+ * that were correct to the penny — so on this corpus the guard layer cried wolf
+ * six times and caught seven, and a reader who met it in that ratio would
+ * rightly stop reading it.
+ *
+ * Each fixture below is one of those six, verbatim: the prose the engine wrote,
+ * the arguments it passed and the reasoning lines the reconciliation reads.
+ * Lines that carry no qualifier — the clock, token accounting, usage — are the
+ * only thing left out.
+ */
+const OPEN_STAGE_FILTER = {
+  property: 'deal_stage', op: 'in',
+  values: ['qualification', 'discovery', 'proposal', 'negotiation', 'technical_validation',
+    'renewal_outreach', 'usage_review', 'commercial_terms'],
+};
+
+interface Probe {
+  question: string;
+  prose: string;
+  toolCalls: { name: string; arguments: Record<string, unknown> }[];
+  reasoning: string[];
+  /** What makes the answer right, checked against the database by hand. */
+  truth: string;
+}
+
+const RIGHT: Probe[] = [
+  {
+    // `billing_invoices` holds exactly 7 rows at status open.
+    question: 'How many invoices are open?',
+    prose: '7 invoices are at status open. They are carrying €1,007.00, £1,560.00 and $133,400.00 still due:\n\n'
+      + '• NR-000341 — Ironwood Packaging Group · Open · $500.00 · due Oct 3, 2026\n'
+      + '• NR-000032 — Brightline Foods · Open · $127,840.00 · due Jul 9, 2026',
+    toolCalls: [
+      { name: 'billing_list_invoices', arguments: { status: 'open', limit: 10 } },
+      { name: 'delinquent_customers', arguments: { limit: 10 } },
+    ],
+    reasoning: [
+      'Plan (2 steps, budget 8): billing_list_invoices → delinquent_customers.',
+      '  billing_list_invoices: invoice is measured by the module that owns those rows, not by the CRM and not by a sales metric.',
+      'Ran billing_list_invoices in 1ms → {"total":7,"outstanding_by_currency":[{"currency":"eur","amount":100700….',
+    ],
+    truth: '7 open invoices — the answer is the list, and "open" in it is an invoice status',
+  },
+  {
+    // NR-000032, $127,840.00, the one invoice on that account.
+    question: 'How many open invoices does Brightline Foods have?',
+    prose: '1 invoice is at status open. It is carrying $127,840.00 still due:\n\n'
+      + '• NR-000032 — Brightline Foods · Open · $127,840.00 · due Jul 9, 2026',
+    toolCalls: [
+      { name: 'billing_list_invoices', arguments: { customer: 'cus_rvJqMEr8CLBuvIB7', status: 'open', limit: 10 } },
+      { name: 'account_profile', arguments: { id: 'cmp_nw_04' } },
+    ],
+    reasoning: [
+      'Qualifier ledger settled: account "Brightline Foods" bound → account_profile.',
+      'Ran billing_list_invoices in 1ms → {"total":1,"outstanding_by_currency":[{"currency":"usd","amount":12784000….',
+      'Ran account_profile in 5ms → Brightline Foods.',
+    ],
+    truth: 'one open invoice on Brightline Foods, and it is named',
+  },
+  {
+    // 25 deals carry deal_status = won.
+    question: 'How many deals are in Closed won?',
+    prose: 'Northwind Robotics has 25 deals right now at the Closed won stage.',
+    toolCalls: [{
+      name: 'business_metric',
+      arguments: {
+        metric: 'deal_count', start: 1782864000000, end: 1790812800000,
+        window_label: 'Q3 2026 to date', stage: 'closed_won', group_by: 'none', compare: true,
+      },
+    }],
+    reasoning: [
+      'Metric: Deals (matched "How many deals", score 1), over closed_won.',
+      'Qualifier ledger settled: metric "How many deals" bound → business_metric; stage "closed won" bound → business_metric.',
+      'Ran business_metric in 0ms → 25 (25 open deals).',
+    ],
+    truth: '25 deals at Closed won — the right count from the right column',
+  },
+  {
+    // 4 open deals carry amount > 50_000_000.
+    question: 'Show me open deals over $500k',
+    prose: '4 open deals worth more than $500,000. The largest:\n\n'
+      + '• Rheinwerk Antriebstechnik — OEE programme phase 2 — $729,000 · Qualification · closes Sep 12, 2026 · Priya Raman',
+    toolCalls: [{
+      name: 'record_search',
+      arguments: {
+        object_type: 'deal',
+        conditions: [OPEN_STAGE_FILTER, { property: 'amount', op: 'gt', value: 50_000_000 }],
+        order_by: 'amount', direction: 'desc', limit: 10,
+      },
+    }],
+    reasoning: [
+      'Metric: Open pipeline (matched "open deals", score 1).',
+      '  record_search: The question asks for deal records qualified by deal_stage and amount.',
+      'Ran record_search in 1ms → 4 records.',
+    ],
+    truth: 'the four deals asked for — a listing question answered with the list',
+  },
+  {
+    // 10 open deals carry deal_type = expansion, summing to $3,162,060.
+    question: 'What is the open pipeline for expansion deal types?',
+    prose: '$3,162,060 in open pipeline across 10 open deals deal type Expansion.',
+    toolCalls: [{
+      name: 'record_aggregate',
+      arguments: {
+        object_type: 'deal', measure: 'sum', property: 'amount',
+        conditions: [OPEN_STAGE_FILTER, { property: 'deal_type', op: 'eq', value: 'expansion' }],
+      },
+    }],
+    reasoning: [
+      'Metric: Open pipeline (matched "open   deal", score 1.03).',
+      'Qualifier ledger settled: metric "open   deal" bound → record_aggregate; status "expansion" bound → record_aggregate.',
+      'Ran record_aggregate in 1ms → $3,162,060 ().',
+    ],
+    truth: 'deal_type = expansion across every pipeline, which is the question',
+  },
+  {
+    // `sales_cycle` is measured over closed-won deals and nothing else.
+    question: 'What is the average sales cycle for won deals?',
+    prose: 'Northwind Robotics took 154 days on average to close a deal in Q3 2026 to date, from 1 closed-won deal.',
+    toolCalls: [{
+      name: 'business_metric',
+      arguments: {
+        metric: 'sales_cycle', start: 1782864000000, end: 1790812800000,
+        window_label: 'Q3 2026 to date', group_by: 'none', compare: true,
+      },
+    }],
+    reasoning: [
+      'Metric: Average sales cycle (matched "average sales cycle", score 1), over closed_won.',
+      'Qualifier ledger settled: metric "average sales cycle" bound → business_metric.',
+      'Ran business_metric in 1ms → 154 days (1 closed-won deal).',
+    ],
+    truth: 'the measure counts won deals by definition, and the answer says so',
+  },
+  {
+    // Controls: two answers the guard was already right to leave alone.
+    question: 'What is the open pipeline in the Renewal pipeline?',
+    prose: 'Northwind Robotics is carrying $1,463,440 in open pipeline in the Renewal pipeline, from 6 open deals.',
+    toolCalls: [{
+      name: 'business_metric',
+      arguments: { metric: 'pipeline', window_label: 'Q3 2026 to date', pipeline: 'renewal', group_by: 'none' },
+    }],
+    reasoning: [
+      'Qualifier ledger settled: metric "pipeline" bound → business_metric; pipeline "Renewal" bound → business_metric.',
+      'Ran business_metric in 1ms → $1,463,440 (6 open deals).',
+    ],
+    truth: 'the Renewal columns sum to $1,463,440 across 6 open deals',
+  },
+  {
+    question: 'How many deals are in Negotiation?',
+    prose: 'Northwind Robotics has 8 deals right now at the Negotiation stage.',
+    toolCalls: [{
+      name: 'business_metric',
+      arguments: { metric: 'deal_count', stage: 'negotiation', group_by: 'none' },
+    }],
+    reasoning: [
+      'Qualifier ledger settled: metric "How many deals" bound → business_metric; stage "negotiation" bound → business_metric.',
+      'Ran business_metric in 1ms → 8 (8 open deals).',
+    ],
+    truth: '8 open deals sit in a Negotiation column',
+  },
+];
+
+/**
+ * The other half of the same measurement: the answers that really are wrong.
+ *
+ * Silencing the six above is only worth anything if these still speak. Each was
+ * checked against the database too, and each is wrong in the way the banner
+ * says it is.
+ */
+const WRONG: (Probe & { fires: QualifierKind })[] = [
+  {
+    question: 'Which stage has the most open pipeline?',
+    prose: '38 open deals. The 8 largest of them:\n\n'
+      + '• Rheinwerk Antriebstechnik — OEE programme phase 2 — $729,000 · Qualification · closes Sep 12, 2026 · Priya Raman',
+    toolCalls: [{
+      name: 'record_search',
+      arguments: {
+        object_type: 'deal', conditions: [OPEN_STAGE_FILTER],
+        order_by: 'amount', direction: 'desc', limit: 10,
+      },
+    }],
+    reasoning: [
+      'Metric: Open pipeline (matched "open pipeline", score 1).',
+      'The question asks for a ranking, so the answer leads with the ordered groups rather than a list of records.',
+      'Ran record_search in 0ms → 10 records.',
+    ],
+    truth: 'a ranking question answered with eight individual deals — no stage is ranked',
+    fires: 'group',
+  },
+  {
+    question: 'How many companies are in the Renewal pipeline?',
+    prose: 'Northwind Robotics is carrying $1,463,440 in open pipeline in the Renewal pipeline, from 6 open deals.',
+    toolCalls: [{
+      name: 'business_metric',
+      arguments: {
+        metric: 'pipeline', start: 1782864000000, end: 1790812800000,
+        window_label: 'Q3 2026 to date', pipeline: 'renewal', group_by: 'none', compare: true,
+      },
+    }],
+    reasoning: [
+      'Qualifier ledger settled: metric "pipeline" bound → business_metric; pipeline "Renewal" bound → business_metric.',
+      'Ran business_metric in 1ms → $1,463,440 (6 open deals).',
+    ],
+    truth: 'a count of companies answered with a money total',
+    fires: 'object',
+  },
+  {
+    question: 'How many won deals do we have?',
+    prose: 'Northwind Robotics booked $317,400 in Q3 2026 to date, from 1 closed-won deal.',
+    toolCalls: [{
+      name: 'business_metric',
+      arguments: {
+        metric: 'closed_won', start: 1782864000000, end: 1790812800000,
+        window_label: 'Q3 2026 to date', group_by: 'none', compare: true,
+      },
+    }],
+    reasoning: [
+      'Qualifier ledger settled: metric "won" bound → business_metric.',
+      'Ran business_metric in 1ms → $317,400 (1 closed-won deal).',
+    ],
+    truth: '25 deals carry deal_status = won; this answers a count with a quarter-to-date money figure',
+    fires: 'object',
+  },
+];
+
+const bannerKinds = (probe: Probe) =>
+  reconcileScope({ ...probe, vocab: VOCAB }).unscoped.map((v) => v.kind);
+
+describe('the guard layer, counted over a corpus of correct answers', () => {
+  for (const probe of RIGHT) {
+    it(`says nothing about “${probe.question}” — ${probe.truth}`, () => {
+      const report = reconcileScope({ ...probe, vocab: VOCAB });
+      assert.deepEqual(report.unscoped, [], 'a correct answer drew the loudest banner in the design system');
+      assert.deepEqual(report.invented, []);
+      assert.deepEqual(
+        carriedThrough(probe.reasoning, VOCAB)
+          .filter((term) => !report.verdicts.some((v) => v.kind === term.kind)),
+        [],
+      );
+    });
+  }
+
+  it('cries wolf on none of them, where it used to cry wolf on six', () => {
+    const crying = RIGHT.filter((probe) => bannerKinds(probe).length > 0);
+    assert.deepEqual(crying.map((probe) => probe.question), []);
+  });
+
+  for (const probe of WRONG) {
+    it(`still speaks up about “${probe.question}” — ${probe.truth}`, () => {
+      assert.ok(
+        bannerKinds(probe).includes(probe.fires),
+        `silencing the false alarms took this one with it: ${bannerKinds(probe).join(', ') || 'nothing fired'}`,
+      );
+    });
+  }
+
+  it('still holds the answers each of those six was silenced by name', () => {
+    // The six repairs are narrow by construction, and each has an opposite the
+    // guard must keep. A deal status on a question that really is about deals;
+    // a measure a listing question really did name and not answer; a pipeline
+    // named as a pipeline; a status the answer's own words contradict.
+    assert.equal(
+      namedQualifiers('How many deals did we close in Q2 2026?', VOCAB).find((q) => q.kind === 'status')?.value,
+      'closed',
+    );
+    assert.equal(
+      namedQualifiers('Which stage has the most open pipeline?', VOCAB).find((q) => q.kind === 'metric')?.value,
+      'pipeline',
+    );
+    assert.equal(
+      namedQualifiers('What is the open pipeline in the Renewal pipeline?', VOCAB)
+        .find((q) => q.kind === 'pipeline')?.value,
+      'renewal',
+    );
+    assert.equal(
+      namedQualifiers('How many won deals are there?', VOCAB).find((q) => q.kind === 'status')?.value,
+      'won',
     );
   });
 });

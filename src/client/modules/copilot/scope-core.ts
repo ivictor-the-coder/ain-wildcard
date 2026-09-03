@@ -556,6 +556,37 @@ export function lookupObject(text: string): string | null {
 }
 
 /**
+ * The whole listing phrase, not just its head noun.
+ *
+ * "Show me open deals over $500k" is answered with the four deals over
+ * $500,000, which is the answer, and the card put "You asked for Open pipeline.
+ * Nothing in this answer measured it" above it in red — because "open deals" is
+ * a keyword of that measure and only the bare word "deals" was being held
+ * against it. The counting frame has spent its whole phrase since it was
+ * written (`countedObject` returns "how many open deals"); the listing frame
+ * has to spend its own the same way, or the two frames disagree about the same
+ * four words.
+ */
+export const lookupPhrase = (text: string): { phrase: string; noun: string } | null => {
+  const match = LOOKUP_FRAME.exec(norm(text));
+  return match ? { phrase: match[0], noun: match[1] } : null;
+};
+
+/**
+ * The kind of record a question is asking about, from its own head noun.
+ *
+ * Only the nouns this product has a record type for, and only from a frame that
+ * makes the noun the subject — so this is "invoices" for "How many invoices are
+ * open?" and nothing at all for "How much open pipeline do we have?".
+ */
+export function askedObject(text: string): string | null {
+  const counted = countedObject(text);
+  if (counted) return counted.value;
+  const listed = lookupObject(text);
+  return listed ? OBJECT_NOUNS.find((row) => row.word.test(listed))?.value ?? null : null;
+}
+
+/**
  * The noun a question is asking about, whichever frame it is written in.
  *
  * Unlike `countedObject` this claims nothing about the record type — it is the
@@ -884,6 +915,33 @@ const CLOSE_VERB = /^closes?$/;
 const OPEN_SET = /(^|[^a-z])(open|active|live|outstanding)\s+(deals?|opportunit(?:y|ies)|pipelines?)([^a-z]|$)/;
 
 /**
+ * Whether the word after a pipeline's name hands that name to another dimension.
+ *
+ * This CRM stamps the same three words on two different columns: `pipeline` and
+ * `deal_type` both take `new_business`, `expansion`, `renewal`. So "What is the
+ * open pipeline for expansion deal types?" is answered `deal_type = expansion`
+ * across every pipeline — exactly the question — and the card called it
+ * "You asked about Expansion. This figure counts every pipeline." in red,
+ * because the sentence contains the word "pipeline" (in the name of the
+ * measure) and the word "expansion" (in the name of a deal type).
+ *
+ * The question says which it means, in the two words after the name. Only this
+ * workspace's own property labels count, so nothing is claimed about a
+ * dimension the CRM does not publish.
+ */
+const namesAnotherDimension = (text: string, phrase: string, vocab: Vocabulary): boolean => {
+  const at = text.indexOf(norm(phrase));
+  if (at === -1) return false;
+  const after = text.slice(at + norm(phrase).length).trim();
+  const dimensions = new Set((vocab.properties ?? []).map((row) => norm(row.propertyLabel)));
+  for (const dimension of dimensions) {
+    if (!dimension || dimension === 'pipeline') continue;
+    if (after.startsWith(dimension) || after.startsWith(pluralOf(dimension))) return true;
+  }
+  return false;
+};
+
+/**
  * The qualifiers a question names, matched against this workspace's vocabulary.
  *
  * Precision matters more than recall here, because every match becomes a claim
@@ -907,7 +965,9 @@ export function namedQualifiers(question: string, vocab: Vocabulary): NamedQuali
   if (cue) {
     for (const pipeline of vocab.pipelines) {
       const phrase = [pipeline.label, humanizeName(pipeline.name)].find((candidate) => hasPhrase(text, candidate));
-      if (phrase) add({ kind: 'pipeline', text: phrase, label: pipeline.label, value: pipeline.name });
+      if (phrase && !namesAnotherDimension(text, phrase, vocab)) {
+        add({ kind: 'pipeline', text: phrase, label: pipeline.label, value: pipeline.name });
+      }
     }
   }
   // The words another qualifier has already taken. "the Expansion pipeline" has
@@ -955,9 +1015,19 @@ export function namedQualifiers(question: string, vocab: Vocabulary): NamedQuali
   // counts every status." over a correct win-rate answer.
   const measurePhrase = norm(metricAsked(text, vocab, consumed)?.phrase ?? '');
   const namesOpenSet = OPEN_SET.test(text);
+  // Every word in `STATUS_WORDS` is a *deal* status, and every label it carries
+  // says so — "Open deals", "Won deals". "How many invoices are open?" is
+  // answered with the seven open invoices, correctly, and was topped with "You
+  // asked about open deals. This figure counts every status.": a sentence about
+  // the reader's own question that the reader can see is false, over a right
+  // answer, on a question with no deal in it. An invoice, a ticket and a
+  // subscription each carry a status of their own, and none of them is this
+  // vocabulary.
+  const asksAboutDeals = (askedObject(text) ?? 'deal') === 'deal';
   for (const status of STATUS_WORDS) {
     const hit = status.word.exec(text);
     if (!hit) continue;
+    if (!asksAboutDeals) break;
     if (measurePhrase && hasPhrase(measurePhrase, hit[2])) break;
     // The set is already named in the sentence, so a bare "close" in it is the
     // verb — the date these open deals land on, not a second status filter.
@@ -1006,6 +1076,27 @@ export function namedQualifiers(question: string, vocab: Vocabulary): NamedQuali
     add({ kind: 'property', text: row.label, label: row.label, value: row.value, dimension: row.propertyLabel });
   }
 
+  // A column of this board has spent its own name.
+  //
+  // "How many deals are in Closed won?" is answered "25 deals right now at the
+  // Closed won stage" — the right count, from the right column, and the stage
+  // rule above has already claimed those two words. The metric catalogue then
+  // claimed them a second time, because "closed won" is a keyword of
+  // `Closed-won bookings`, and the card said "You asked for Closed-won
+  // bookings. This figure is Deals, which is a different measure." over a
+  // correct answer. One phrase, one qualifier: the stage rule has already
+  // settled which of the two readings this question meant — a strictly longer
+  // measure name still wins there, which is why "closed-won bookings" is a
+  // measure and "Closed won" is a column.
+  //
+  // Added here rather than beside the stage itself so the status rule above
+  // still sees the measure phrase it turns on: consuming these words earlier
+  // would let "won" back out of "Closed won" as a second warning about the
+  // dimension the stage warning already covers.
+  for (const claimed of found) {
+    if (claimed.kind === 'stage' || claimed.kind === 'pipeline') consumed.add(norm(claimed.text));
+  }
+
   // A measure the catalogue does not define wins over the catalogue entry its
   // first word happens to match: "pipeline velocity" is not open pipeline.
   const unknown = unknownMeasure(text, vocab, consumed);
@@ -1035,8 +1126,20 @@ export function namedQualifiers(question: string, vocab: Vocabulary): NamedQuali
   // in this answer measured it" over an answer that is exactly the list asked
   // for. Equality only: "Which rep has the most open pipeline?" still names a
   // measure, because "rep" is not it.
-  const lookup = lookupObject(text);
-  const spentOnTheLookup = !!metric && !!lookup && lookup === norm(metric.phrase);
+  //
+  // And where that head noun is a record type this product holds, the whole
+  // listing phrase spends its words, exactly as the counting frame's does.
+  // "Show me open deals over $500k" comes back with the four deals over
+  // $500,000 — the answer — and "open deals" in it is the records being listed,
+  // not the money measure whose keyword it also is. Read as the measure, it put
+  // "You asked for Open pipeline. Nothing in this answer measured it" in red
+  // over the right list. "Which stage has the most open pipeline?" is untouched
+  // by this: "stage" is no record type, so that question still names the
+  // measure it was answered without.
+  const lookup = lookupPhrase(text);
+  const listsRecords = !!lookup && OBJECT_NOUNS.some((row) => row.word.test(lookup.noun));
+  const spentOnTheLookup = !!metric && !!lookup
+    && (lookup.noun === norm(metric.phrase) || (listsRecords && hasPhrase(lookup.phrase, metric.phrase)));
   const spentOnTheNoun = spentOnTheObject || spentOnTheLookup;
   if (unknown) add({ kind: 'metric', text: unknown, label: humanizeName(unknown), value: null });
   else if (metric && !spentOnTheNoun) {
@@ -1720,7 +1823,13 @@ export function reconcileScope(input: ReconcileInput): ScopeReport {
   // correct ticket count — the cry-wolf half of the defect this file exists for.
   const wrongObject = verdicts.some((v) => v.kind === 'object' && v.state === 'substituted');
   const measuredType = answering.map((m) => m.scope.objectType).find((type) => !!type) ?? null;
-  const kept = wrongObject || (measuredType !== null && measuredType !== 'deal')
+  // The billing tools carry no record type in their arguments at all, so
+  // `measuredType` is null for every one of them and this rule used to hold
+  // "How many open invoices does Brightline Foods have?" — answered with the
+  // one open invoice, correctly — against the deal board's statuses. Where the
+  // answer does not say what it counted, the question's own head noun does.
+  const aboutType = measuredType ?? askedObject(input.question);
+  const kept = wrongObject || (aboutType !== null && aboutType !== 'deal')
     ? verdicts.filter((v) => v.state === 'bound' || !DEAL_DIMENSIONS.includes(v.kind))
     : verdicts;
 
@@ -1893,6 +2002,24 @@ export function figureUnits(text: string): string[] {
   return out;
 }
 
+/**
+ * The set an answer names its own deals as, where it names one.
+ *
+ * The same evidence the unit rule turns on — what the engine actually printed —
+ * on the other half of the sentence. "from 1 closed-won deal" is the answer
+ * saying which deals it counted; "0 open deals closing in Q2 2026" over a
+ * question about deals we *closed* says the opposite, and is left to be caught.
+ */
+const STATUS_PRINTED: Record<string, RegExp> = {
+  open: /(^|[^a-z])open (?:deals?|opportunit(?:y|ies))([^a-z]|$)/i,
+  won: /(^|[^a-z])(?:closed[- ])?won (?:deals?|opportunit(?:y|ies))([^a-z]|$)/i,
+  lost: /(^|[^a-z])(?:closed[- ])?lost (?:deals?|opportunit(?:y|ies))([^a-z]|$)/i,
+  closed: /(^|[^a-z])closed (?:deals?|opportunit(?:y|ies))([^a-z]|$)/i,
+};
+
+const statusPrinted = (prose: string, status: string | null): boolean =>
+  (status ? STATUS_PRINTED[status]?.test(prose) ?? false : false);
+
 const singularOf = (word: string): string =>
   word.endsWith('ies') ? `${word.slice(0, -3)}y` : word.endsWith('ses') ? word.slice(0, -2)
     : word.endsWith('s') && !word.endsWith('ss') ? word.slice(0, -1) : word;
@@ -2059,7 +2186,20 @@ function stateOf(
       if (fromMetric && hasPhrase(norm(fromMetric.label), qualifier.value ?? '')) {
         return { state: 'bound', used: fromMetric.label };
       }
-      if (!scope.status) return { state: 'unbound', used: wide };
+      // Not every metric wears its status in its name. "What is the average
+      // sales cycle for won deals?" runs `sales_cycle`, whose label says
+      // nothing about a status and which measures nothing but closed-won deals
+      // — and the answer says so in its own words: "154 days on average …, from
+      // 1 closed-won deal". A red "You asked about won deals. This figure
+      // counts every status." over a figure the engine denominated in won deals
+      // is the same lie the unit rule refuses to tell, pointing the other way.
+      // Only a positive reading counts: prose that says nothing about the set
+      // leaves the dimension exactly as unbound as it was.
+      if (!scope.status) {
+        return statusPrinted(evidence.prose, qualifier.value)
+          ? { state: 'bound', used: `${qualifier.value} deals` }
+          : { state: 'unbound', used: wide };
+      }
       return scope.status === qualifier.value
         ? { state: 'bound', used: `${scope.status} deals` }
         : { state: 'substituted', used: `${scope.status} deals` };

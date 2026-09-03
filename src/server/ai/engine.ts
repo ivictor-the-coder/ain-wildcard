@@ -38,7 +38,8 @@ import {
   type BlockedCapability, type BuiltinTool, type PlannedStep, type SkippedTool, type WindowPair, type WriteBlocked,
 } from './plan';
 import {
-  dimensionsIn, dimensionsOf, numericDimensionsIn, recordsMatching, unknownDimensionValue, type UnknownValue,
+  dimensionsIn, dimensionsOf, groupingDimensionIn, numericDimensionsIn, recordsMatching, unknownDimensionValue,
+  type UnknownValue,
 } from './dimensions';
 import { propertyMap } from './query';
 import {
@@ -851,7 +852,7 @@ const TYPE_NOUNS: Record<string, string[]> = {
  * $76,450.05 of collected revenue.
  */
 const METRIC_ROWS: Record<string, string> = {
-  spend: 'invoice', revenue: 'invoice', invoiced: 'invoice', outstanding: 'invoice',
+  spend: 'invoice', revenue: 'invoice', invoiced: 'invoice', outstanding: 'invoice', overdue: 'invoice',
   pipeline: 'deal', weighted_pipeline: 'deal', closed_won: 'deal', closed_lost: 'deal',
   win_rate: 'deal', avg_deal_size: 'deal', sales_cycle: 'deal', deal_count: 'deal',
   new_customers: 'company', customers: 'company', churn: 'company',
@@ -891,6 +892,45 @@ export function queriedTypes(plan: { tool: string; args: Record<string, unknown>
   if (out.has('company')) out.add('customer');
   if (out.has('customer')) out.add('company');
   return out;
+}
+
+/**
+ * Whether an owner slot was actually filled.
+ *
+ * A question naming two teammates resolves two people and scopes to at most
+ * one, so a run that credits "own", "owns" and "assigned" to the owner slot on
+ * the strength of the *resolution* reports the second name as read while
+ * measuring only the first. The proof is `owner_id` in a step's arguments, a
+ * teammate's id reaching one, or a grouping by teammate.
+ */
+export function ownerReached(
+  plan: { args: Record<string, unknown> }[],
+  entities: ResolvedEntity[],
+  qualifiers: QualifierLedger,
+): boolean {
+  const ids = idsInPlan(plan);
+  return plan.some((step) => step.args.owner_id !== undefined || step.args.owner !== undefined
+      || step.args.group_by === 'owner')
+    || entities.some((entity) => entity.entity.type === 'user' && ids.has(entity.entity.id))
+    || qualifiers.entries.some((entry) => entry.kind === 'owner' && entry.state === 'bound');
+}
+
+/**
+ * Whether the run actually read a meter.
+ *
+ * The metering verbs — "metered", "consumed", "ingested" — are the run's to
+ * spend once a meter is in a step's arguments. A meter the sentence merely
+ * named is a meter nothing measured.
+ */
+export function meterReached(
+  plan: { args: Record<string, unknown> }[],
+  meter: ResolvedEntity | null,
+  types: string[],
+  queried: Set<string>,
+): boolean {
+  return plan.some((step) => !!step.args.meter)
+    || (!!meter && idsInPlan(plan).has(meter.entity.id))
+    || (types.includes('usage') && queried.has('usage'));
 }
 
 /** Every record id that reached a planned step's arguments. */
@@ -961,6 +1001,13 @@ export function enumeratedWords(ctx: Ctx, orgId: string, types: string[]): Set<s
   for (const type of new Set(types)) {
     if (!CRM_OBJECT_TYPES.has(type)) continue;
     for (const dimension of dimensionsOf(ctx, orgId, type, new Set())) {
+      // The names this workspace gives its own columns, as well as their
+      // values. "How many deals are forecast to close?" came back as all 38
+      // open deals because "forecast" is a word inside the measure catalogue's
+      // own prose, so the catalogue spent the reader's name for a column it
+      // never filtered on. A column's name has an argument to reach exactly as
+      // its values do.
+      for (const anchor of dimension.anchors) add(anchor);
       for (const option of dimension.options) {
         add(option.label);
         for (const form of option.open) add(form);
@@ -969,6 +1016,46 @@ export function enumeratedWords(ctx: Ctx, orgId: string, types: string[]): Set<s
   }
   enumeratedCache.set(key, out);
   return out;
+}
+
+/**
+ * A number this workspace keeps in a column of its own, asked for by name.
+ *
+ * "What is the total annual revenue of our customers?" is the Annual revenue
+ * column on the accounts — $53,986,000,000 across 48 companies, which
+ * `record_aggregate` computes exactly. The measure catalogue matched half the
+ * phrase ("revenue") and answered with $83,826.29 of collected invoice revenue:
+ * a number three orders of magnitude out, about a different table, under the
+ * reader's own words. The word sitting on the measure is what tells the two
+ * apart, so the column wins only when the reader wrote its whole name.
+ */
+export function columnMeasureIn(
+  ctx: Ctx,
+  orgId: string,
+  question: string,
+  types: string[],
+  metric: MetricDetection | null,
+): { objectType: string; property: string; noun: string; matched: string } | null {
+  if (!metric) return null;
+  const asked = normalise(question);
+  const measure = normalise(metric.matched);
+  const at = asked.indexOf(measure);
+  if (at <= 0) return null;
+  const before = asked.slice(0, at).trim().split(' ').filter(Boolean);
+  const previous = before[before.length - 1];
+  if (!previous) return null;
+  const wanted = `${previous} ${measure}`;
+  const searched = types.map((type) => (type === 'customer' ? 'company' : type)).filter((type) => CRM_OBJECT_TYPES.has(type));
+  for (const objectType of searched.length ? [...new Set(searched)] : [...CRM_OBJECT_TYPES]) {
+    for (const [property, definition] of propertyMap(ctx, orgId, objectType)) {
+      if (definition.type !== 'number' && definition.type !== 'currency') continue;
+      if (normalise(definition.label) !== wanted) continue;
+      // The reader's own spelling of the span, for the trace and the answer.
+      const spelled = question.match(new RegExp(`\\b${previous}\\W+${measure.replace(/\s+/g, '\\W+')}\\b`, 'i'))?.[0];
+      return { objectType, property, noun: definition.label, matched: spelled ?? wanted };
+    }
+  }
+  return null;
 }
 
 /** Every numeric property a record search can compare against, per type. */
@@ -982,6 +1069,73 @@ export function numericProperties(ctx: Ctx, orgId: string, types: string[]): Cov
     }
   }
   return out;
+}
+
+/** One enumerated dimension, with every phrase that names the dimension itself. */
+export interface DimensionAnchor {
+  objectType: string;
+  property: string;
+  /** What a person calls it — "Forecast category", "Competitor", "Close reason". */
+  noun: string;
+  /** "forecast category", "competitor", "lost to", "close" — the dimension's own names. */
+  anchors: string[];
+}
+
+/**
+ * The properties some planned step actually selects on.
+ *
+ * This is the whole of the rule the coverage gate turns on: *a word is
+ * accounted for when the plan acted on it, never when the workspace merely
+ * recognises it.* Knowing that `close_reason` exists is not the same as having
+ * filtered by it, so the proof has to be an argument in the plan — a condition
+ * on the column, a grouping by it, an ordering on it, or a named argument
+ * carrying a value for it.
+ *
+ * Measured on this workspace: "how many deals are closed?" answered "38 open
+ * deals" — the opposite of the question — because "closed" stems onto `close`,
+ * the anchor of the Close reason column, and being a word this workspace
+ * enumerates was read as having been selected.
+ */
+export function boundProperties(
+  plannedArgs: { tool: string; args: Record<string, unknown> }[],
+  recordFilters: RecordFilter[] = [],
+): Set<string> {
+  const bound = new Set<string>();
+  const NAMED_COLUMN = ['group_by', 'property', 'order_by', 'measure', 'date_property'];
+  /** Every id a step reached a second table through, so a filter one table over counts. */
+  const through = new Set<string>();
+  for (const step of plannedArgs) {
+    for (const [key, value] of Object.entries(step.args)) {
+      if (value === undefined || value === null) continue;
+      if (key === 'associated_to' || key === 'associated_to_any') {
+        for (const id of Array.isArray(value) ? value : [value]) if (typeof id === 'string') through.add(id);
+        continue;
+      }
+      if (key === 'conditions') {
+        for (const condition of Array.isArray(value) ? value : []) {
+          const held = condition as { property?: unknown; value?: unknown; values?: unknown; op?: unknown } | null;
+          if (typeof held?.property !== 'string') continue;
+          // A column named with nothing to compare it to selects nothing —
+          // except by absence, which is what `is_set`/`is_not_set` express.
+          const selects = held.value !== undefined || held.values !== undefined
+            || (typeof held.op === 'string' && /is_(not_)?set/.test(held.op));
+          if (selects) bound.add(held.property);
+        }
+        continue;
+      }
+      if (NAMED_COLUMN.includes(key) && typeof value === 'string') { bound.add(value); continue; }
+      // A capability with the column in its own argument list — `industry`,
+      // `stage`, `priority` — binds it by being given a value for it.
+      bound.add(key);
+    }
+  }
+  // "How much open pipeline is with accounts in the metals and mining
+  // industry?" filters companies and sums deals: the industry never appears in
+  // the deal query, only the ids it picked out do. Those ids are the binding.
+  for (const filter of recordFilters) {
+    if (filter.ids?.some((id) => through.has(id))) bound.add(filter.property);
+  }
+  return bound;
 }
 
 /**
@@ -1001,6 +1155,8 @@ export function coverageClaims(input: {
   types: string[];
   meter: ResolvedEntity | null;
   currencyWord: { code: string; matched: string } | null;
+  /** True when the currency the question named actually scoped the query. */
+  currencyApplied: boolean;
   order: { text: string } | null;
   /** The record ids that reached a planned step's arguments. */
   usedIds: Set<string>;
@@ -1009,8 +1165,15 @@ export function coverageClaims(input: {
   ranking: boolean;
   ownerBound: boolean;
   dateNoun: { property: string; label: string; text: string } | null;
-  /** Every phrase this workspace uses to name one of its own dimensions. */
-  dimensionAnchors: string[];
+  /**
+   * The dimensions this workspace enumerates, each with the phrases that name it.
+   *
+   * Carried whole rather than pre-filtered so the claim can be settled here,
+   * against the plan, by the one rule this file is built on: a dimension's name
+   * is claimed when the plan *bound* that dimension, never when the workspace
+   * merely recognises the word.
+   */
+  dimensionAnchors: DimensionAnchor[];
   /** The capabilities the plan runs, with the words they publish themselves under. */
   capabilities: { name: string; description: string }[];
   plannedArgs: { tool: string; args: Record<string, unknown> }[];
@@ -1020,6 +1183,8 @@ export function coverageClaims(input: {
   roleWords: string[];
   /** The meters and features a ledger step's numbers are denominated in. */
   units: string[];
+  /** The measures the plan actually computes, whose vocabulary this run may spend. */
+  measuresRun: string[];
   /**
    * Every word this workspace enumerates as a value, a row noun or a measure.
    *
@@ -1038,6 +1203,11 @@ export function coverageClaims(input: {
 }): CoverageClaim[] {
   const claims: CoverageClaim[] = [];
   const reserved = (word: string): boolean => input.reservedWords.has(word) || input.reservedWords.has(stem(word));
+  // The one test every claim below is settled against: *did the plan act on
+  // this?* Recognising a column, a superlative, an owner slot or a currency is
+  // not the same as having queried by it, and every substitution this gate was
+  // written to stop came from crediting the first as though it were the second.
+  const bound = boundProperties(input.plannedArgs, input.recordFilters);
   if (input.metric) claims.push({ text: input.metric.matched, by: `the measure ${input.metric.metric.label}` });
   for (const window of input.windows) claims.push({ text: window.matched, by: `the period ${window.label}` });
   for (const mention of input.mentions) claims.push({ text: mention.text, by: 'a period' });
@@ -1082,22 +1252,45 @@ export function coverageClaims(input: {
     claims.push({ text: input.meter.mention, by: `the meter ${input.meter.entity.label}` });
     claims.push({ text: input.meter.entity.label, by: `the meter ${input.meter.entity.label}` });
   }
-  if (input.currencyWord) claims.push({ text: input.currencyWord.matched, by: `the currency ${input.currencyWord.code.toUpperCase()}` });
-  if (input.order) claims.push({ text: input.order.text, by: 'the ordering' });
+  // A currency book the answer is actually scoped to. "How many deals are in
+  // EUR?" waived the currency with "Deals is not a money measure, so
+  // restricting it to one currency book would change nothing" and printed 38
+  // open deals: two false things in one sentence — a deal here is not raised in
+  // a currency book at all, so the restriction is not a no-op, it is
+  // unavailable, and the count given is of every deal in every book.
+  if (input.currencyWord && input.currencyApplied) {
+    claims.push({ text: input.currencyWord.matched, by: `the currency ${input.currencyWord.code.toUpperCase()}` });
+  }
   // A superlative is the instruction that produced the ordering, and the
   // ordering is in the plan. "Who is my biggest customer?" spends "biggest" on
   // the ranking exactly as "in Q2" spends its words on the period.
+  //
+  // The ordering has to be in the plan, though, and not merely in the sentence.
+  // `isRankingQuestion` reading a superlative is recognition; `order_by`,
+  // `direction` or `limit` reaching a step is the ranking itself — and a plan
+  // that carries none of them returns the same rows in the same order whatever
+  // the reader asked for, so "the smallest" and "the largest" would be
+  // accounted for by the same unordered query.
   const ordered = input.plannedArgs.some((step) => step.args.order_by !== undefined
     || step.args.direction !== undefined || step.args.limit !== undefined);
-  if (input.ranking || input.order || ordered) {
+  if (input.order && ordered) claims.push({ text: input.order.text, by: 'the ordering' });
+  if (ordered) {
     for (const word of SUPERLATIVES) claims.push({ text: word, by: 'the ranking' });
   }
-  // The verbs that put a name in an owner slot, once an owner is bound.
+  // The verbs that put a name in an owner slot, once an owner is bound — bound
+  // meaning a teammate reached an argument, not merely that the sentence named
+  // one. A question naming two owners resolves two people and scopes to at most
+  // one of them, and crediting "own" to the owner slot on the strength of the
+  // resolution alone is what let the second name go by in silence.
   if (input.ownerBound) {
     for (const word of OWNERSHIP) claims.push({ text: word, by: 'the owner' });
   }
-  // The noun that picked the date column — "created", "closing", "due".
-  if (input.dateNoun) claims.push({ text: input.dateNoun.text, by: `the ${input.dateNoun.label} column` });
+  // The noun that picked the date column — "created", "closing", "due" — spent
+  // only where the plan dates on that column. A column nothing queried is a
+  // column the reader's word did not reach.
+  if (input.dateNoun && bound.has(input.dateNoun.property)) {
+    claims.push({ text: input.dateNoun.text, by: `the ${input.dateNoun.label} column` });
+  }
   // A measure's own vocabulary. "What is the Renewal pipeline worth?" spends
   // "worth" on Open pipeline, and "how much did we book" spends "book" on
   // closed-won bookings — both are the measure's own words, not stray content.
@@ -1107,9 +1300,21 @@ export function coverageClaims(input: {
     }
   }
   // The names this workspace gives its own dimensions — "stage", "category",
-  // "product area", "came from". A dimension's *name* narrows nothing on its
-  // own; only a value does, and a value is claimed only when it binds.
-  for (const anchor of input.dimensionAnchors) claims.push({ text: anchor, by: 'a dimension this workspace enumerates' });
+  // "product area", "came from" — spent only by the dimensions the plan bound.
+  //
+  // Every anchor of every dimension of every object type used to be a claim,
+  // so any word matching any enumerated column name anywhere in the workspace
+  // was reported as understood. "How many deals are closed?" answered
+  // "Northwind Robotics has 38 open deals right now" with "0 unaccounted" in
+  // its own trace: "closed" stems onto `close`, the Close reason column's
+  // anchor, and recognising the column was credited as having filtered on it.
+  // A dimension the plan did not bind explains nothing and claims nothing.
+  for (const dimension of input.dimensionAnchors) {
+    if (!bound.has(dimension.property)) continue;
+    for (const anchor of dimension.anchors) {
+      claims.push({ text: anchor, by: `the ${dimension.noun.toLowerCase()} filter` });
+    }
+  }
   // A capability spends the words of its own name and of the sentence this
   // workspace publishes it under. "Show me the recovery queue" runs
   // `payments_recovery_queue`; "which accounts have gone quiet" runs the
@@ -1182,9 +1387,32 @@ export function coverageClaims(input: {
   // "connectivity" — a ticket category — and `tickets_created` spend the
   // "tickets" in a question the plan answered from the invoice book: two
   // questions answered with two confident figures about something else.
+  //
+  // …and never over the word sitting directly on the measure. A content word
+  // immediately in front of the bound measure modifies it, so it is part of
+  // that measure's name or it names a different measure — the doctrine
+  // `unknownModifier` already applies to a word nobody can resolve. Resolving
+  // it to a measure the plan never ran is the same substitution with a better
+  // disguise: "what is the total annual revenue of our customers?" spent
+  // "annual" on Annual recurring revenue, which did not run, and answered with
+  // $83,826.29 of collected invoice revenue — while this workspace holds an
+  // Annual revenue column on the very accounts the question is about.
+  const runWords = measureWords(input.measuresRun);
+  const root = (word: string): string => stem(stem(word));
+  const modifier = (() => {
+    if (!input.metric) return null;
+    const asked = normalise(input.question);
+    const at = asked.indexOf(normalise(input.metric.matched));
+    if (at <= 0) return null;
+    const before = asked.slice(0, at).trim().split(' ').filter(Boolean);
+    const previous = before[before.length - 1];
+    if (!previous || runWords.has(previous) || [...runWords].some((word) => root(word) === root(previous))) return null;
+    return previous;
+  })();
   if (input.metric) {
     for (const word of measureWords()) {
       if (reserved(word)) continue;
+      if (modifier && root(word) === root(modifier)) continue;
       claims.push({ text: word, by: 'the measure vocabulary', exact: true });
       // "we booked" and "did we book" are the same verb as "bookings"; one
       // stemming pass leaves "booking", which is not the word the reader wrote.
@@ -1204,7 +1432,8 @@ export function coverageClaims(input: {
     claims.push({ text: input.meter.mention, by: `the unit ${input.meter.entity.label}` });
     claims.push({ text: input.meter.entity.label, by: `the unit ${input.meter.entity.label}` });
   }
-  // The verbs a metered workspace measures with, once the plan reads a meter.
+  // The verbs a metered workspace measures with, once the plan reads a meter —
+  // a meter *in a step's arguments*, never a meter the sentence merely named.
   if (input.usage) for (const word of USAGE_VERBS) claims.push({ text: word, by: 'the metered volume' });
   // A step that returns an account's card returns its buying committee with it,
   // so the job titles this workspace holds — and their acronyms — are words
@@ -1214,7 +1443,14 @@ export function coverageClaims(input: {
   for (const unit of input.units) claims.push({ text: unit, by: 'a unit this workspace meters in' });
   // "Broken down by owner" is an instruction to the query, and the words that
   // spell it are spent on the grouping.
-  const grouping = input.question.match(/\b(?:split|splits|broken\s+(?:down|out)|break\s+(?:down|out)|grouped|group|bucketed|segmented|sliced)(?:\s+up)?\s+by\s+[a-z]+\b/i)
+  //
+  // …once the query is actually grouped. "Broken down by owner" with no
+  // `group_by` in the plan is a breakdown the reader will not get, and spending
+  // their words on it prints one undivided figure under their own phrasing.
+  const grouped = input.plannedArgs.some((step) => typeof step.args.group_by === 'string'
+    && step.args.group_by !== 'none' && step.args.group_by !== '');
+  const grouping = !grouped ? null
+    : input.question.match(/\b(?:split|splits|broken\s+(?:down|out)|break\s+(?:down|out)|grouped|group|bucketed|segmented|sliced)(?:\s+up)?\s+by\s+[a-z]+\b/i)
     ?? input.question.match(/\b(?:by|per|each)\s+(?:month|quarter|week|day|year|rep|reps|owner|owners|stage|stages|industry|industries|region|regions|product|products|customer|customers|account|accounts|pipeline|pipelines|source|sources|type|types|category|categories)\b/i);
   if (grouping) claims.push({ text: grouping[0], by: 'the grouping' });
   return claims;
@@ -1745,6 +1981,16 @@ export function builtinEngine(): AiProvider {
         dateProperty: dateNounIn(question)?.property ?? null,
         order: namedOrder,
         currency,
+        // A column of this workspace's own, named in full, beats a measure that
+        // matched half of its name.
+        columnMeasure: columnMeasureIn(ctx, orgId, question, types, metric),
+        // A breakdown by a column `GroupBy` does not enumerate. Only when the
+        // enum found nothing: it owns the breakdowns it knows.
+        groupDimension: groupBy === 'none'
+          ? groupingDimensionIn(question, [...new Set([...types, 'deal', 'company', 'ticket', 'contact'])]
+              .filter((type) => CRM_OBJECT_TYPES.has(type))
+              .flatMap((type) => dimensionsOf(ctx, orgId, type, new Set())))
+          : null,
         qualifiers,
       };
       // A phrase that is a capability's own title is not an unreadable question.
@@ -1832,8 +2078,20 @@ export function builtinEngine(): AiProvider {
       if (metric?.metric.snapshot && windows.length && qualifiers.first('period') && !closeWindow) {
         qualifiers.waive('period', `${metric.metric.label} is a snapshot of the book as it stands today, so ${listPhrase(windows.map((w) => w.label))} cannot be applied to it — this is the figure right now, not for that period.`);
       }
-      if (metric && metric.metric.unit !== 'money' && qualifiers.first('currency')) {
-        qualifiers.waive('currency', `${metric.metric.label} is not a money measure, so restricting it to one currency book would change nothing.`);
+      // A currency on a measure that is not money is not a no-op — it is a
+      // question this workspace cannot answer. "How many deals are in EUR?"
+      // waived it with "restricting it to one currency book would change
+      // nothing" and printed 38 open deals: a deal here is not raised in a
+      // currency book at all, so there is no EUR count to give, and the count
+      // that was given is of every deal in the workspace. A waiver states
+      // something false about the run; a refusal states what is true.
+      if (metric && metric.metric.unit !== 'money') {
+        for (const entry of qualifiers.pending()) {
+          if (entry.kind !== 'currency') continue;
+          entry.detail = `${metric.metric.label} counts rows that are not raised in a currency book here,`
+            + ` so there is no ${String(entry.resolved?.value ?? entry.text).toUpperCase()} figure of it to give —`
+            + ` this workspace keeps one book per currency for money, and a count belongs to none of them.`;
+        }
       }
       // A comparison measures exactly two periods, and which two is decided
       // before the plan: "the same period last year" is one phrase and one
@@ -1986,6 +2244,10 @@ export function builtinEngine(): AiProvider {
             claims: coverageClaims({
               metric, windows, mentions, entities, qualifiers, recordFilters, types,
               meter, currencyWord, order: namedOrder, question,
+              // A currency waived by the measure is a currency the answer is
+              // not scoped to, whatever the sentence said.
+              currencyApplied: qualifiers.entries.some((q) => q.kind === 'currency' && q.state === 'bound')
+                || (!qualifiers.first('currency') && plan.some((step) => typeof step.args.currency === 'string')),
               usedIds: idsInPlan(plan),
               // A scope applied through a set of associated records reads those
               // records too: "how much open pipeline is with metals and mining
@@ -2002,12 +2264,17 @@ export function builtinEngine(): AiProvider {
                 return reached;
               })(),
               ranking,
-              ownerBound: qualifiers.entries.some((q) => q.kind === 'owner')
-                || entities.some((e) => e.entity.type === 'user') || groupBy === 'owner',
+              // An owner slot the plan filled — `owner_id` in a step's
+              // arguments, a teammate whose id reached one, or a grouping by
+              // teammate. Resolving a name is not filling the slot.
+              ownerBound: ownerReached(plan, entities, qualifiers),
               dateNoun: dateNounIn(question),
-              dimensionAnchors: [...new Set([...types, 'deal', 'company', 'ticket', 'contact']
-                .filter((type) => CRM_OBJECT_TYPES.has(type))
-                .flatMap((type) => dimensionsOf(ctx, orgId, type, new Set()).flatMap((d) => d.anchors)))],
+              // Carried whole; `coverageClaims` credits only the ones the plan
+              // bound, because recognising a column is not filtering on it.
+              dimensionAnchors: [...types, 'deal', 'company', 'ticket', 'contact']
+                .filter((type, at, all) => CRM_OBJECT_TYPES.has(type) && all.indexOf(type) === at)
+                .flatMap((type) => dimensionsOf(ctx, orgId, type, new Set())
+                  .map((d) => ({ objectType: d.objectType, property: d.property, noun: d.noun, anchors: d.anchors }))),
               // A capability the plan reached brings its whole family with it:
               // `credits.balance` is one verb of the credit ledger, and the
               // ledger's own words for what it holds — grants, burn order,
@@ -2027,7 +2294,14 @@ export function builtinEngine(): AiProvider {
                 : [],
               plannedArgs: plan.map((step) => ({ tool: step.tool, args: step.args })),
               balance: balanceQuestion,
-              usage: types.includes('usage') || !!meter || plan.some((step) => !!step.args.meter),
+              // A meter the plan reads, never a meter the sentence merely named.
+              usage: meterReached(plan, meter, types, queriedTypes(plan, groupBy)),
+              // The measures this run computes. Their words are the run's to
+              // spend; every other measure's are somebody else's question.
+              measuresRun: [...new Set([
+                ...(metric ? [metric.metric.id] : []),
+                ...plan.map((step) => step.args.metric).filter((id): id is string => typeof id === 'string'),
+              ])],
               roleWords: plan.some((step) => step.tool === 'account_profile' || step.args.object_type === 'contact'
                 || step.tool === 'record_timeline')
                 ? jobTitleWords(ctx, orgId)
@@ -2038,14 +2312,26 @@ export function builtinEngine(): AiProvider {
             boundComparison: plan.some((step) => carriesComparison(step.args)),
             objectTypes: types,
             vocabulary: {
-              dimensions: [...new Set([...types, ...(types.includes('deal') ? ['company'] : [])])]
+              // Every CRM type, not only the ones the question named. A gap's
+              // sentence asserts what this workspace does and does not
+              // enumerate: '"price" is not ... any value this workspace
+              // enumerates' was said about a close reason sitting in the deal
+              // schema, because the question named no object type and the
+              // vocabulary was built from that empty list.
+              dimensions: [...new Set([...types, 'deal', 'company', 'ticket', 'contact'])]
                 .filter((type) => CRM_OBJECT_TYPES.has(type))
                 .flatMap((type) => dimensionsOf(ctx, orgId, type, new Set())
-                  .map((d) => ({ objectType: d.objectType, property: d.property, noun: d.noun, options: d.options }))),
+                  .map((d) => ({ objectType: d.objectType, property: d.property, noun: d.noun, anchors: d.anchors, options: d.options }))),
               numeric: numericProperties(ctx, orgId, types),
               meters: index.entities.filter((e) => e.type === 'meter').map((e) => e.label),
               metrics: metricIds().map((id) => metricById(id)?.label ?? id),
               people: workspace.people.map((person) => person.name),
+              currencies: currencyBooks(ctx, orgId),
+              rowNouns: (() => {
+                const reached = queriedTypes(plan, groupBy);
+                return Object.entries(TYPE_NOUNS)
+                  .map(([objectType, nouns]) => ({ objectType, nouns, queried: reached.has(objectType) }));
+              })(),
             },
             workspaceName: workspace.name,
           })

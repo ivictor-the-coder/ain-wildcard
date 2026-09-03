@@ -802,7 +802,13 @@ export interface RecordAggregateResult {
   value: number;
   formatted: string;
   matched_records: number;
-  groups: { key: string; label: string; value: number; count: number }[];
+  /**
+   * `formatted` is not optional, because the raw value is in minor units.
+   * "Breakdown: Pipeline 365,518,000" was $3,655,180 printed as its own cents,
+   * with no currency symbol on it, in the same answer whose headline read
+   * "$9,010,960" — one run, two ways of writing the same money.
+   */
+  groups: { key: string; label: string; value: number; count: number; formatted: string }[];
   sample_ids: string[];
   /** The same rows, named — a citation reading "matched record" identifies nothing. */
   samples: { id: string; label: string }[];
@@ -869,6 +875,7 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
       label: optionLabels.get(g.key) ?? humanise(g.key),
       value: measure === 'count' ? g.count : g.value,
       count: g.count,
+      formatted: measure === 'count' ? g.count.toLocaleString(workspace.locale) : format(g.value),
     })),
     sample_ids: result.ids,
     samples: labelIds(ctx, orgId, result.ids, args.object_type).map((row) => ({ id: row.id, label: row.label })),

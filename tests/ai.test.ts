@@ -5,11 +5,12 @@ import type { AddressInfo } from 'node:net';
 import { createApp, type App } from '../src/server/app';
 import type { Auth } from '../src/server/kernel/http';
 import { aiRuntime, DEFAULT_BUDGET, type AiCallContext } from '../src/server/ai/runtime';
-import { ENGINE_MODEL } from '../src/server/ai/engine';
+import { ENGINE_MODEL, boundProperties, columnMeasureIn, coverageClaims, meterReached, ownerReached } from '../src/server/ai/engine';
+import { dimensionsOf, groupingDimensionIn } from '../src/server/ai/dimensions';
 import { scoreTool } from '../src/server/ai/plan';
 import { classifyIntent } from '../src/server/ai/intent';
 import { resolveWindow, resolveWindows, reversedRange, startOfQuarter, addQuarters, unresolvedPeriods } from '../src/server/ai/dates';
-import { entityIndex, workspaceProfile } from '../src/server/ai/grounding';
+import { billingSources, entityIndex, workspaceProfile } from '../src/server/ai/grounding';
 import { resolveEntities } from '../src/server/ai/resolve';
 import { estimateTokens, accountUsage } from '../src/server/ai/usage';
 import { stageSets } from '../src/server/ai/metrics';
@@ -4746,6 +4747,32 @@ const unitCreditLeft = (companyId: string): { units: number; unit: string } | nu
   return { units: micro / 1_000_000, unit };
 };
 
+/** Every number an answer states, commas and currency symbols removed. */
+const statedNumbers = (content: string): number[] => [...content.matchAll(/\d[\d,]*(?:\.\d+)?/g)]
+  .map((hit) => Number(hit[0].replace(/,/g, '')))
+  .filter((value) => Number.isFinite(value));
+
+/**
+ * The figures a wider question would produce, whatever sentence wraps them.
+ *
+ * A `never` string is one phrasing of one wrong answer. This suite forbade
+ * "14 closed-lost deals" under "how many deals did we lose to Cognite?", and
+ * the identical 14 went out under "how many deals did we lose to a
+ * competitor?" — same engine, same figure, a sentence the blacklist had never
+ * met. What is wrong with that answer is the number, so the number is what is
+ * checked, and a phrasing nobody has written yet is covered by it.
+ *
+ * Money is given in minor units and compared as the major-unit figure the
+ * answer prints.
+ */
+const assertNotStated = (content: string, figures: number[], question: string): void => {
+  const stated = statedNumbers(content);
+  for (const figure of figures) {
+    assert.ok(!stated.includes(figure),
+      `"${question}" states ${figure.toLocaleString('en-US')}, which is the answer to a wider question than the one asked:\n${content}`);
+  }
+};
+
 interface QualifierCase {
   /** Which qualifier type this row pins down. */
   kind: string;
@@ -4754,6 +4781,13 @@ interface QualifierCase {
   must?: () => (string | RegExp)[];
   /** The answer to a question nobody asked — must appear nowhere. */
   never?: () => (string | RegExp)[];
+  /**
+   * Figures a dropped qualifier collapses to, in any phrasing.
+   *
+   * Prefer this to `never`: a string pins one sentence, a figure pins the
+   * defect. Money in major units, as the answer prints it.
+   */
+  notThese?: () => number[];
   /** Or: the engine must refuse, and the refusal must read like this. */
   refuse?: RegExp;
 }
@@ -4970,7 +5004,7 @@ const QUALIFIER_CASES: QualifierCase[] = [
         && d.close >= Date.UTC(2026, 3, 1) && d.close < Date.UTC(2026, 6, 1));
       return [String(rows.length), ...rows.slice(0, 1).map((d) => d.name)];
     },
-    never: () => [`${openFacts().length} open deals`],
+    notThese: () => [openFacts().length],
   },
   {
     kind: 'status (a win rate scoped to a pipeline with nothing decided in it)',
@@ -5027,7 +5061,7 @@ const QUALIFIER_CASES: QualifierCase[] = [
     },
     // The pot is a different quantity from the consumption, and neither may
     // stand in for the other.
-    never: () => ['9,131.22'],
+    notThese: () => [unitCreditLeft('cmp_nw_01')!.units],
   },
   /* --- ranking cut-off -------------------------------------------------- */
   {
@@ -5231,7 +5265,7 @@ const QUALIFIER_CASES: QualifierCase[] = [
     kind: 'ranking (a scoped list restates its scope)',
     q: 'Show me the 5 largest open deals in the Renewal pipeline',
     must: () => [/in the Renewal pipeline/, String(openFacts().filter((d) => d.pipeline === 'renewal').length)],
-    never: () => [`${openFacts().length} deals still open`, `${openFacts().length} open deals.`],
+    notThese: () => [openFacts().length],
   },
   {
     // 77 is every deal on the book, 39 of them closed. The sentence over an
@@ -5286,7 +5320,7 @@ const QUALIFIER_CASES: QualifierCase[] = [
         && d.close >= Date.UTC(2026, 3, 1) && d.close < Date.UTC(2026, 6, 1));
       return [String(rows.length), ...rows.map((d) => d.name)];
     },
-    never: () => [`${openFacts().length} open deals`],
+    notThese: () => [openFacts().length],
   },
   {
     kind: 'status (the win side of the same list)',
@@ -5297,7 +5331,7 @@ const QUALIFIER_CASES: QualifierCase[] = [
         && d.close >= Date.UTC(2026, 3, 1) && d.close < Date.UTC(2026, 6, 1));
       return [String(rows.length), ...rows.map((d) => d.name)];
     },
-    never: () => [`${openFacts().length} open deals`],
+    notThese: () => [openFacts().length],
   },
   /* --- vocabulary this workspace does not have -------------------------- */
   {
@@ -5332,7 +5366,7 @@ const QUALIFIER_CASES: QualifierCase[] = [
       const rows = openFacts().filter((d) => d.owner === personId('Priya Raman') && d.amount > 50_000_000);
       return [String(rows.length), /more than \$500,000/, ...rows.map((d) => d.name)];
     },
-    never: () => [`${openFacts().filter((d) => d.owner === personId('Priya Raman')).length} open deals owned by Priya Raman.`],
+    notThese: () => [openFacts().filter((d) => d.owner === personId('Priya Raman')).length],
   },
   {
     kind: 'currency (a name that is also a currency word)',
@@ -5545,6 +5579,7 @@ describe('the qualifier invariant: a scoped question is answered in its own scop
         assert.ok(!contains(answer.content, banned),
           `"${scenario.q}" answered with ${banned}, which is the answer to a question nobody asked:\n${answer.content}`);
       }
+      assertNotStated(answer.content, scenario.notThese?.() ?? [], scenario.q);
     });
   }
 
@@ -5901,6 +5936,8 @@ interface DimensionCase {
   refuse?: RegExp;
   /** Strings whose presence means the qualifier was dropped and a wider set answered. */
   never?: () => (string | RegExp)[];
+  /** The same, stated as figures, so it holds for a phrasing nobody has written. */
+  notThese?: () => number[];
 }
 
 const DIMENSION_CASES: DimensionCase[] = [
@@ -5950,7 +5987,7 @@ const DIMENSION_CASES: DimensionCase[] = [
     kind: 'contract term (a number with a unit in its own column name)',
     q: 'How many deals have a 36-month contract term?',
     must: () => [new RegExp(`\\b${openDeals().filter((d) => d.termMonths === 36).length}\\b`), /36-month/],
-    never: () => [WORKSPACE_OPEN_COUNT(), `${openDeals().length} open deals right now`],
+    notThese: () => [openDeals().length],
   },
   /* --- a competitor, including one this workspace has never faced -------- */
   {
@@ -5961,9 +5998,12 @@ const DIMENSION_CASES: DimensionCase[] = [
       const rows = fullDeals().filter((d) => lost.includes(d.stage) && d.competitor === 'cognite');
       return [new RegExp(`\\b${rows.length}\\b`), /Cognite/];
     },
-    never: () => {
+    // The count of every deal this workspace has ever lost, whatever sentence
+    // it is wrapped in — the string form of this let the same figure through
+    // under a phrasing the blacklist had not met.
+    notThese: () => {
       const lost = stageSets(app.ctx, ORG).lost;
-      return [`${fullDeals().filter((d) => lost.includes(d.stage)).length} closed-lost deals`];
+      return [fullDeals().filter((d) => lost.includes(d.stage)).length];
     },
   },
   {
@@ -5973,9 +6013,9 @@ const DIMENSION_CASES: DimensionCase[] = [
     kind: 'competitor (one this workspace has never faced)',
     q: 'How many open deals are we losing to Siemens?',
     refuse: /no competitor called "Siemens"/i,
-    never: () => {
+    notThese: () => {
       const lost = stageSets(app.ctx, ORG).lost;
-      return [`${fullDeals().filter((d) => lost.includes(d.stage)).length} closed-lost deals`, WORKSPACE_OPEN_COUNT()];
+      return [fullDeals().filter((d) => lost.includes(d.stage)).length, openDeals().length];
     },
   },
   /* --- an industry, which narrows a table the answer does not measure ---- */
@@ -6019,7 +6059,7 @@ const DIMENSION_CASES: DimensionCase[] = [
       const rows = openDeals().filter((deal) => region.has(link.get(deal.id) ?? ''));
       return [new RegExp(`\\b${rows.length} open deals\\b`), /EMEA/];
     },
-    never: () => [`${openDeals().length} open deals right now`],
+    notThese: () => [openDeals().length],
   },
   {
     kind: 'relationship (prospects, on a question about deals)',
@@ -6061,7 +6101,7 @@ const DIMENSION_CASES: DimensionCase[] = [
     kind: 'ticket status (with an article inside the stored label)',
     q: 'How many open tickets are waiting on the customer?',
     must: () => [new RegExp(`\\b${ticketsWithStatus('waiting_on_customer')}\\b`), /Waiting on customer/i],
-    never: () => [`${openTickets()} open tickets`],
+    notThese: () => [openTickets()],
   },
   {
     // "urgent" and "high priority" returned the identical sentence — three
@@ -6100,6 +6140,7 @@ describe('the qualifier invariant, over every dimension this workspace enumerate
         assert.ok(!contains(answer.content, banned),
           `"${scenario.q}" answered with ${banned}, which is a wider set than the one the question named:\n${answer.content}`);
       }
+      assertNotStated(answer.content, scenario.notThese?.() ?? [], scenario.q);
     });
   }
 
@@ -7167,5 +7208,381 @@ describe('one run, one figure, whatever the caller calls the field', () => {
       `a caller asking for a close date as a string got epoch milliseconds, which reads as a serial number:\n${answer.content}`);
     const largest = [...openDeals()].sort((a, b) => b.amount - a.amount)[0];
     assert.equal(value.close_date, new Date(largest.close).toISOString().slice(0, 10));
+  });
+});
+
+/* ========================================================================== *
+ * Accounted for means acted on.
+ *
+ * The coverage gate walks the question's own tokens and requires each one to be
+ * claimed by some part of the run. Every leak it has ever had was the same
+ * mistake: a claim raised because this workspace *recognised* a word rather
+ * than because the plan *did* something with it. "How many deals are closed?"
+ * answered "Northwind Robotics has 38 open deals right now" — the opposite of
+ * the question — with "0 unaccounted" in its own trace, because "closed" stems
+ * onto `close`, the anchor of the Close reason column, and knowing that a
+ * column exists was credited as having filtered on it.
+ *
+ * These tests state the rule rather than the sentence. A `never` clause holding
+ * a literal string is an allowlist: this suite forbade "14 closed-lost deals"
+ * for one phrasing and let the identical figure out under another. What is
+ * wrong with that answer is the number, so the number is what is asserted.
+ * ========================================================================== */
+
+/** A `coverageClaims` input with nothing claimed, for a test to fill one field of. */
+const claimInput = (over: Partial<Parameters<typeof coverageClaims>[0]> = {}): Parameters<typeof coverageClaims>[0] => ({
+  question: '',
+  metric: null,
+  windows: [],
+  mentions: [],
+  entities: [],
+  qualifiers: new QualifierLedger(),
+  recordFilters: [],
+  types: [],
+  meter: null,
+  currencyWord: null,
+  currencyApplied: false,
+  order: null,
+  usedIds: new Set<string>(),
+  queriedTypes: new Set<string>(),
+  ranking: false,
+  ownerBound: false,
+  dateNoun: null,
+  dimensionAnchors: [],
+  capabilities: [],
+  plannedArgs: [],
+  balance: false,
+  usage: false,
+  roleWords: [],
+  units: [],
+  measuresRun: [],
+  reservedWords: new Set<string>(),
+  ...over,
+});
+
+const claimedBy = (claims: { text: string; by: string }[], text: string): string | null =>
+  claims.find((claim) => claim.text === text)?.by ?? null;
+
+describe('a word is accounted for when the plan acted on it, never when the workspace recognises it', () => {
+  /**
+   * The rule, over every dimension this workspace holds, on both sides.
+   *
+   * Written against `dimensionsOf` rather than against a list, so a workspace
+   * that adds a picklist is covered without touching this file. Before the fix
+   * every anchor of every dimension of every object type was a claim, whatever
+   * the plan bound — which is the whole defect, stated once.
+   */
+  test('a dimension anchor claims a word only where the plan bound that dimension', () => {
+    for (const objectType of ['deal', 'company', 'ticket', 'contact']) {
+      const dimensions = dimensionsOf(app.ctx, ORG, objectType, new Set())
+        .map((d) => ({ objectType: d.objectType, property: d.property, noun: d.noun, anchors: d.anchors }));
+      assert.ok(dimensions.length, `${objectType} enumerates no dimensions, so this test proves nothing.`);
+
+      const counted = [{ tool: 'record_aggregate', args: { object_type: objectType, measure: 'count' } }];
+      const unbound = coverageClaims(claimInput({ dimensionAnchors: dimensions, plannedArgs: counted }));
+      for (const dimension of dimensions) {
+        const asDimension = `the ${dimension.noun.toLowerCase()} filter`;
+        for (const anchor of dimension.anchors) {
+          assert.ok(!unbound.some((claim) => claim.text === anchor && claim.by === asDimension),
+            `"${anchor}" names ${dimension.noun} on a ${objectType}, and this plan filters on nothing — `
+            + `crediting it says the question was understood when the figure would be over every row.`);
+        }
+      }
+
+      for (const dimension of dimensions) {
+        const value = dimension.anchors.length ? dimensionsOf(app.ctx, ORG, objectType, new Set())
+          .find((d) => d.property === dimension.property)!.options[0] : null;
+        if (!value) continue;
+        const filtered = [{
+          tool: 'record_aggregate',
+          args: {
+            object_type: objectType,
+            measure: 'count',
+            conditions: [{ property: dimension.property, op: 'eq', value: value.value }],
+          },
+        }];
+        const claims = coverageClaims(claimInput({ dimensionAnchors: dimensions, plannedArgs: filtered }));
+        const asDimension = `the ${dimension.noun.toLowerCase()} filter`;
+        for (const anchor of dimension.anchors) {
+          assert.ok(claims.some((claim) => claim.text === anchor && claim.by === asDimension),
+            `the plan filters on ${dimension.property}, so "${anchor}" — this workspace's own name for it — is read, `
+            + `and refusing the question for it would be a refusal of a query that ran.`);
+        }
+      }
+    }
+  });
+
+  test('`boundProperties` counts a column the plan selected on, and no column it merely named', () => {
+    assert.deepEqual(
+      [...boundProperties([{ tool: 'record_aggregate', args: { object_type: 'deal', conditions: [{ property: 'competitor', op: 'eq', value: 'tulip' }] } }])]
+        .filter((property) => property === 'competitor'),
+      ['competitor'],
+    );
+    // A column with nothing to compare it against selects nothing.
+    assert.ok(!boundProperties([{ tool: 'record_search', args: { conditions: [{ property: 'competitor' }] } }]).has('competitor'));
+    // …except by absence, which is a filter.
+    assert.ok(boundProperties([{ tool: 'record_search', args: { conditions: [{ property: 'next_step', op: 'is_not_set' }] } }]).has('next_step'));
+    // A grouping is an action on the column too.
+    assert.ok(boundProperties([{ tool: 'record_aggregate', args: { group_by: 'forecast_category' } }]).has('forecast_category'));
+    // A filter one table over binds through the ids it picked out.
+    assert.ok(boundProperties(
+      [{ tool: 'record_aggregate', args: { object_type: 'deal', associated_to_any: ['cmp_1', 'cmp_2'] } }],
+      [{ objectType: 'company', property: 'industry', matched: 'pharmaceutical', label: 'Pharmaceuticals', ids: ['cmp_1', 'cmp_2'] }],
+    ).has('industry'));
+  });
+
+  test('a superlative is spent by the ordering in the plan, not by the superlative in the sentence', () => {
+    const recognised = coverageClaims(claimInput({ ranking: true, order: { text: 'biggest' }, plannedArgs: [{ tool: 'business_metric', args: { metric: 'closed_won' } }] }));
+    assert.equal(claimedBy(recognised, 'biggest'), null,
+      'nothing in that plan orders or cuts anything, so "biggest" reached no argument.');
+    const ordered = coverageClaims(claimInput({ plannedArgs: [{ tool: 'business_metric', args: { metric: 'closed_won', limit: 1 } }] }));
+    assert.equal(claimedBy(ordered, 'biggest'), 'the ranking');
+  });
+
+  test('an ownership verb is spent by an owner in the arguments, not by a name in the sentence', () => {
+    const unbound = coverageClaims(claimInput({ ownerBound: false, plannedArgs: [{ tool: 'record_aggregate', args: { object_type: 'deal' } }] }));
+    assert.equal(claimedBy(unbound, 'own'), null);
+    const bound = coverageClaims(claimInput({ ownerBound: true, plannedArgs: [{ tool: 'record_aggregate', args: { object_type: 'deal', owner_id: 'usr_seed02' } }] }));
+    assert.equal(claimedBy(bound, 'own'), 'the owner');
+
+    // …and what makes that boolean true is the plan, not the resolver. A
+    // teammate the sentence named and the query never used fills no slot.
+    const marcus = entityIndex(app.ctx, ORG).entities.find((e) => e.type === 'user' && e.label === 'Marcus Ilori')!;
+    const resolved = [{ entity: marcus, mention: 'Marcus', score: 1 }] as never as Parameters<typeof ownerReached>[1];
+    assert.equal(ownerReached([{ args: { object_type: 'deal', measure: 'count' } }], resolved, new QualifierLedger()), false,
+      'the resolver found Marcus Ilori and the query counts every deal in the book — nothing here is scoped to him.');
+    assert.equal(ownerReached([{ args: { object_type: 'deal', owner_id: marcus.id } }], resolved, new QualifierLedger()), true);
+    assert.equal(ownerReached([{ args: { metric: 'closed_won', group_by: 'owner' } }], [], new QualifierLedger()), true);
+  });
+
+  test('a metering verb is spent by a meter in the arguments, not by a meter in the sentence', () => {
+    const meter = entityIndex(app.ctx, ORG).entities.find((e) => e.type === 'meter')!;
+    const named = { entity: meter, mention: meter.label, score: 1 } as never as Parameters<typeof meterReached>[1];
+    assert.equal(meterReached([{ args: { metric: 'closed_won' } }], named, ['usage'], new Set(['deal'])), false,
+      'the sentence names a meter and the plan measures bookings — "metered" belongs to a run that read the meter.');
+    assert.equal(meterReached([{ args: { meter: meter.id } }], named, ['usage'], new Set(['usage'])), true);
+    assert.equal(meterReached([{ args: { customer: 'cus_1', id: meter.id } }], named, [], new Set()), true);
+  });
+
+  test('a breakdown phrase is spent by a grouped query, not by the word "by"', () => {
+    const flat = coverageClaims(claimInput({
+      question: 'Break down bookings by owner',
+      plannedArgs: [{ tool: 'business_metric', args: { metric: 'closed_won', group_by: 'none' } }],
+    }));
+    assert.equal(claimedBy(flat, 'by owner'), null,
+      'the query is not grouped, so the reader gets one undivided figure under their own instruction.');
+    const grouped = coverageClaims(claimInput({
+      question: 'Break down bookings by owner',
+      plannedArgs: [{ tool: 'business_metric', args: { metric: 'closed_won', group_by: 'owner' } }],
+    }));
+    assert.equal(claimedBy(grouped, 'by owner'), 'the grouping');
+  });
+
+  test('a date noun is spent by the column the plan dates on', () => {
+    const noun = { property: 'close_date', label: 'close date', text: 'closing' };
+    const undated = coverageClaims(claimInput({ dateNoun: noun, plannedArgs: [{ tool: 'record_aggregate', args: { object_type: 'deal' } }] }));
+    assert.equal(claimedBy(undated, 'closing'), null);
+    const dated = coverageClaims(claimInput({
+      dateNoun: noun,
+      plannedArgs: [{ tool: 'record_aggregate', args: { object_type: 'deal', date_property: 'close_date', start: 0, end: 1 } }],
+    }));
+    assert.equal(claimedBy(dated, 'closing'), 'the close date column');
+  });
+
+  test('a currency word is spent only when the currency scoped the query', () => {
+    const word = { code: 'eur', matched: 'EUR' };
+    assert.equal(claimedBy(coverageClaims(claimInput({ currencyWord: word, currencyApplied: false })), 'EUR'), null);
+    assert.equal(claimedBy(coverageClaims(claimInput({ currencyWord: word, currencyApplied: true })), 'EUR'), 'the currency EUR');
+  });
+});
+
+describe('the answer is about the rows the question named', () => {
+  /**
+   * The property the old string blacklist was standing in for.
+   *
+   * `never: () => ['14 closed-lost deals']` forbade one sentence, so the same
+   * 14 went out under a phrasing nobody had written down. Every phrasing here
+   * is checked against the figure itself: whatever the engine says, it may not
+   * be the count of every deal this workspace has ever lost unless that is
+   * genuinely the answer.
+   */
+  test('a competitor question is answered about that competitor, or refused — never with every deal we ever lost', async () => {
+    const lost = stageSets(app.ctx, ORG).lost;
+    const everLost = fullDeals().filter((deal) => lost.includes(deal.stage)).length;
+    for (const question of [
+      'How many deals did we lose to Cognite?',
+      'How many deals did we lose to a competitor?',
+      'How many deals have we lost to competitors?',
+      'How many open deals are we losing to Siemens?',
+      'What is our win rate against competitors?',
+    ]) {
+      const answer = await ask(question);
+      assertLedgerSettled(answer);
+      assert.ok(!statedNumbers(answer.content).includes(everLost),
+        `"${question}" states ${everLost} — every deal Northwind has ever lost — under a question that named one competitor:\n${answer.content}`);
+    }
+    // …and the one that does name a competitor still gets its own figure.
+    const cognite = fullDeals().filter((deal) => lost.includes(deal.stage) && deal.competitor === 'cognite').length;
+    const answer = await ask('How many deals did we lose to Cognite?');
+    assert.ok(statedNumbers(answer.content).includes(cognite),
+      `Cognite is on ${cognite} closed-lost deals:\n${answer.content}`);
+  });
+
+  /**
+   * The question the diagnosis started from.
+   *
+   * "How many deals are closed?" is the opposite of "how many are open", and it
+   * came back as the open count with nothing in the run saying so.
+   */
+  test('a deal outcome the plan did not filter on is refused, not answered with the open book', async () => {
+    const answer = await ask('How many deals are closed?');
+    assertLedgerSettled(answer);
+    assert.ok(answer.analysis.refusal,
+      `"closed" narrows the question and no step filtered on it, so this must refuse:\n${answer.content}`);
+    assert.match(answer.content, /"closed"/);
+    assert.ok(!statedNumbers(answer.content).includes(openDeals().length),
+      `the open-deal count is the answer to the opposite question:\n${answer.content}`);
+  });
+
+  test('a column named with no value beside it is refused, not answered over every row', async () => {
+    for (const question of ['How many deals are forecast to close?', 'How much pipeline is committed?']) {
+      const answer = await ask(question);
+      assertLedgerSettled(answer);
+      assert.ok(answer.analysis.refusal, `"${question}" narrows nothing the plan carried:\n${answer.content}`);
+      assert.ok(!statedNumbers(answer.content).includes(openDeals().length)
+        && !statedNumbers(answer.content).includes(total(openDeals())),
+        `"${question}" came back with the unqualified open book:\n${answer.content}`);
+    }
+  });
+
+  /**
+   * Outstanding is what is owed. Overdue is what is late.
+   *
+   * Both figures are computed here from `billing_invoices`, so the test states
+   * the difference rather than a number somebody typed: the overdue question
+   * must print the late book and must not print the open one.
+   */
+  test('an overdue question is answered from the invoices that are late, not from the whole open book', async () => {
+    const invoices = billingSources(app.ctx.db).invoices!;
+    const open = `status IN ('open', 'past_due', 'unpaid', 'uncollectible')`;
+    const outstanding = app.ctx.db.all<{ currency: string; total: number; n: number }>(
+      `SELECT currency, SUM(total) AS total, COUNT(*) AS n FROM ${invoices.table} WHERE org_id = ? AND ${open} GROUP BY currency`, ORG);
+    const overdue = app.ctx.db.all<{ currency: string; total: number; n: number }>(
+      `SELECT currency, SUM(total) AS total, COUNT(*) AS n FROM ${invoices.table}
+       WHERE org_id = ? AND ${open} AND due_date IS NOT NULL AND due_date < ? GROUP BY currency`, ORG, app.ctx.now());
+    assert.ok(overdue.length, 'no invoice in this workspace is past its due date, so this test proves nothing.');
+    const outstandingRows = outstanding.reduce((sum, row) => sum + row.n, 0);
+    const overdueRows = overdue.reduce((sum, row) => sum + row.n, 0);
+    assert.notEqual(outstandingRows, overdueRows, 'outstanding and overdue are the same set here, so nothing is being told apart.');
+
+    for (const question of ['How many overdue invoices are there?', 'How much do we have in past due invoices?', 'How much is in arrears?']) {
+      const answer = await ask(question);
+      assertLedgerSettled(answer);
+      assert.equal(answer.analysis.refusal, null, `"${question}" is answerable from the invoice book:\n${answer.content}`);
+      const stated = statedNumbers(answer.content);
+      for (const book of overdue) {
+        assert.ok(stated.includes(book.total / 100),
+          `"${question}" must state ${cash(book.total)} — the ${book.currency.toUpperCase()} book that is actually late:\n${answer.content}`);
+      }
+      for (const book of outstanding) {
+        if (overdue.some((late) => late.currency === book.currency && late.total === book.total)) continue;
+        assert.ok(!stated.includes(book.total / 100),
+          `"${question}" states the ${book.currency.toUpperCase()} outstanding book, which is money nobody is late on:\n${answer.content}`);
+      }
+    }
+
+    // …and the outstanding question keeps its own, wider answer.
+    const owed = await ask('What is our outstanding balance?');
+    const stated = statedNumbers(owed.content);
+    for (const book of outstanding) {
+      assert.ok(stated.includes(book.total / 100),
+        `outstanding is every open invoice, including the ones inside their terms:\n${owed.content}`);
+    }
+  });
+
+  /**
+   * A currency book exists for money and for nothing else.
+   *
+   * The waiver said "restricting it to one currency book would change nothing"
+   * and printed every deal in the workspace — two false claims in one sentence,
+   * because a deal here is not raised in a currency book at all.
+   */
+  test('a currency on a measure that has no currency book is refused, not waived and answered wider', async () => {
+    for (const question of ['How many deals are in EUR?', 'How many tickets did we raise in GBP?']) {
+      const answer = await ask(question);
+      assertLedgerSettled(answer);
+      assert.ok(answer.analysis.refusal, `"${question}" names a book this measure does not keep:\n${answer.content}`);
+      assert.ok(!/would change nothing/i.test(answer.content),
+        `the refusal claims the restriction is a no-op; it is unavailable, which is a different thing:\n${answer.content}`);
+      assert.ok(!statedNumbers(answer.content).includes(openDeals().length),
+        `"${question}" came back with the unqualified count:\n${answer.content}`);
+    }
+  });
+
+  /**
+   * A word sitting on the measure belongs to the measure that ran.
+   *
+   * "The total annual revenue of our customers" is the Annual revenue column on
+   * the accounts — $53,986,000,000 across 48 companies. It was answered with
+   * collected invoice revenue, three orders of magnitude out, because "annual"
+   * is a word of Annual recurring revenue, which nothing in that plan computed.
+   */
+  test('a measure the plan never ran does not spend the word in front of the measure it did run', async () => {
+    const columns = app.ctx.db.all<{ properties: string }>(
+      `SELECT properties FROM crm_records WHERE org_id = ? AND object_type = 'company' AND archived = 0 AND merged_into IS NULL`, ORG,
+    ).map((row) => Number((JSON.parse(row.properties) as { annual_revenue?: unknown }).annual_revenue ?? 0));
+    const expected = columns.reduce((sum, value) => sum + value, 0);
+    const answer = await ask('What is the total annual revenue of our customers?');
+    assertLedgerSettled(answer);
+    assert.equal(answer.analysis.refusal, null, `this workspace keeps an Annual revenue column:\n${answer.content}`);
+    assert.ok(statedNumbers(answer.content).includes(expected / 100),
+      `the Annual revenue column adds up to ${cash(expected)} across ${columns.length} companies:\n${answer.content}`);
+    assert.match(answer.content, new RegExp(`\\b${columns.length}\\b`));
+  });
+
+  test('a column named in full beats a measure that matched one word of it', () => {
+    const found = columnMeasureIn(app.ctx, ORG, 'What is the total annual revenue of our customers?', ['customer'],
+      { metric: { id: 'revenue', label: 'Revenue', unit: 'money' }, matched: 'revenue', score: 1, alternatives: [] } as never);
+    assert.deepEqual(found && { objectType: found.objectType, property: found.property },
+      { objectType: 'company', property: 'annual_revenue' });
+    // One word of the column's name is not the column.
+    assert.equal(columnMeasureIn(app.ctx, ORG, 'How much revenue did we collect?', ['invoice'],
+      { metric: { id: 'revenue', label: 'Revenue', unit: 'money' }, matched: 'revenue', score: 1, alternatives: [] } as never), null);
+  });
+});
+
+describe('a breakdown is by the column the reader named, in the currency the money is in', () => {
+  test('a dimension this workspace enumerates can be the breakdown, and each row carries its own total', async () => {
+    const answer = await ask('Break down open pipeline by forecast category');
+    assertLedgerSettled(answer);
+    assert.equal(answer.analysis.refusal, null,
+      `record_aggregate groups by any property there is, and this is one of them:\n${answer.content}`);
+    const stated = statedNumbers(answer.content);
+    for (const option of propertyOptions('deal', 'forecast_category')) {
+      const rows = openDeals().filter((deal) => deal.forecast === option.value);
+      if (!rows.length) continue;
+      assert.ok(stated.includes(total(rows) / 100),
+        `${option.label} is ${cash(total(rows))} of open pipeline and the breakdown does not carry it:\n${answer.content}`);
+    }
+  });
+
+  test('a grouping phrase names one of this workspace’s own columns, or none', () => {
+    const deals = dimensionsOf(app.ctx, ORG, 'deal', new Set());
+    assert.equal(groupingDimensionIn('Break down open pipeline by forecast category', deals)?.property, 'forecast_category');
+    assert.equal(groupingDimensionIn('Break down open pipeline by competitor', deals)?.property, 'competitor');
+    // A row noun is the object type, never the column whose label contains it.
+    assert.equal(groupingDimensionIn('Total amount by deal', deals), null);
+    assert.equal(groupingDimensionIn('How much open pipeline do we have?', deals), null);
+  });
+
+  test('a grouped money figure is written as money, not as its own minor units', async () => {
+    const answer = await ask('Break down open pipeline by deal type');
+    assertLedgerSettled(answer);
+    for (const option of propertyOptions('deal', 'deal_type')) {
+      const rows = openDeals().filter((deal) => deal.dealType === option.value);
+      if (!rows.length) continue;
+      assert.ok(answer.content.includes(cash(total(rows))),
+        `${option.label} is ${cash(total(rows))}; a breakdown printing ${total(rows)} is the cents with no currency on them:\n${answer.content}`);
+    }
   });
 });

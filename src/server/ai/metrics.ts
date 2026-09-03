@@ -421,7 +421,10 @@ export function meteringCustomerIds(ctx: Ctx, orgId: string, subject: MetricSubj
 }
 
 /** Sum invoices from whichever billing schema this workspace actually has. */
-export function invoiceFacts(input: MetricInput, opts: { paidOnly?: boolean; outstanding?: boolean } = {}): InvoiceFacts {
+export function invoiceFacts(
+  input: MetricInput,
+  opts: { paidOnly?: boolean; outstanding?: boolean; overdue?: boolean } = {},
+): InvoiceFacts {
   const { ctx, workspace, window, subject } = input;
   const sources = billingSources(ctx.db);
   const invoices = sources.invoices;
@@ -437,6 +440,17 @@ export function invoiceFacts(input: MetricInput, opts: { paidOnly?: boolean; out
   const windowed = !opts.outstanding;
   const where: string[] = [`org_id = ?`];
   const params: unknown[] = [workspace.orgId];
+  // Overdue is a date test, not a status one. "How many overdue invoices are
+  // there?" was answered with the whole open book — 7 invoices in three
+  // currencies — when 1 of them was actually late; the other 6 are inside their
+  // terms and calling them overdue is a claim about the customers who owe them.
+  if (opts.overdue) {
+    if (!invoices.dueDateColumn) {
+      return { available: false, total: 0, count: 0, ids: [], groups: [], books: [], label: 'no due date on invoices in this workspace' };
+    }
+    where.push(`${invoices.dueDateColumn} IS NOT NULL`, `${invoices.dueDateColumn} < ?`);
+    params.push(workspace.now);
+  }
   if (windowed) {
     where.push(`${dateColumn} >= ?`, `${dateColumn} < ?`);
     params.push(window.start, window.end);
@@ -493,7 +507,7 @@ export function invoiceFacts(input: MetricInput, opts: { paidOnly?: boolean; out
     groups = grouped(invoices.statusColumn, 'v DESC');
   }
 
-  const kind = opts.outstanding ? 'outstanding' : opts.paidOnly ? 'paid' : 'issued';
+  const kind = opts.overdue ? 'overdue' : opts.outstanding ? 'outstanding' : opts.paidOnly ? 'paid' : 'issued';
   return {
     available: true,
     // Only ever the workspace's own book: a caller that wants the rest reads
@@ -732,7 +746,7 @@ function ratioGroups(
 
 function moneyIn(
   input: MetricInput,
-  opts: { paidOnly?: boolean; outstanding?: boolean },
+  opts: { paidOnly?: boolean; outstanding?: boolean; overdue?: boolean },
   def: Pick<MetricDefinition, 'id' | 'label' | 'unit'> & { snapshot?: boolean },
 ): MetricResult {
   const invoices = invoiceFacts(input, opts);
@@ -754,7 +768,9 @@ function moneyIn(
       ids: invoices.ids,
       books,
       note: def.snapshot
-        ? 'Outstanding balance is what is owed right now — every invoice still open, whenever it was raised — so it ignores the reporting period.'
+        ? opts.overdue
+          ? 'Overdue is what is late right now — every open invoice whose due date has passed — so it ignores the reporting period, and it is a smaller set than the outstanding book.'
+          : 'Outstanding balance is what is owed right now — every invoice still open, whenever it was raised — so it ignores the reporting period.'
         : null,
       groups: invoices.groups.map((g) => ({
         key: g.key,
@@ -896,9 +912,22 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'outstanding', label: 'Outstanding balance', unit: 'money', supportsSubject: true, snapshot: true,
-    patterns: [/\b(outstanding|unpaid|past\s+due|overdue|owed?|owes?|owing|receivables?|ar\s+balance)\b/i],
-    keywords: ['outstanding', 'overdue', 'unpaid'],
+    // "Overdue" and "past due" are not here, and the omission is the measure.
+    // They select the invoices whose due date has passed; this one selects
+    // every invoice still open. Answering the first question with the second
+    // called six invoices inside their terms late, and quoted €1,007 and £1,560
+    // of money nobody is late on.
+    patterns: [/\b(outstanding|unpaid|owed?|owes?|owing|receivables?|ar\s+balance)\b/i],
+    keywords: ['outstanding', 'unpaid', 'receivables'],
     compute: (input) => moneyIn(input, { outstanding: true }, { id: 'outstanding', label: 'Outstanding balance', unit: 'money', snapshot: true }),
+  },
+  {
+    id: 'overdue', label: 'Overdue balance', unit: 'money', supportsSubject: true, snapshot: true,
+    phrases: ['overdue', 'past due', 'in arrears'],
+    patterns: [/\b(overdue|past\s+due|pastdue|in\s+arrears|arrears|delinquent)\b/i,
+      /\b(late|behind)\s+(?:on\s+)?(?:their\s+|its\s+|the\s+)?(?:invoices?|bills?|payments?)\b/i],
+    keywords: ['overdue', 'past due', 'arrears', 'delinquent'],
+    compute: (input) => moneyIn(input, { outstanding: true, overdue: true }, { id: 'overdue', label: 'Overdue balance', unit: 'money', snapshot: true }),
   },
   {
     id: 'pipeline', label: 'Open pipeline', unit: 'money', supportsSubject: true, snapshot: true,
@@ -1315,15 +1344,33 @@ export const metricUndefinedWhenEmpty = (id: string | null | undefined): boolean
   !!id && UNDEFINED_AT_ZERO.has(id);
 
 /**
- * Every word the measure catalogue answers to.
+ * Every word a set of measures answers to — the whole catalogue by default.
  *
  * A modifier in front of a measure is only unknown when nothing in the
  * catalogue knows it either: "recurring revenue" is MRR by another name, and
  * refusing it as an unresolvable narrowing of Revenue would be its own wrong
- * answer.
+ * answer. That is the comprehension check, and it wants every word here.
+ *
+ * The coverage gate wants the opposite: only the measures a run *computed*.
+ * "What is the total annual revenue of our customers?" was answered with
+ * $83,826.29 of collected invoice revenue because "annual" is a word of Annual
+ * recurring revenue — a measure nothing in that plan ran — and the catalogue
+ * spending a word for a measure that never executed is the same substitution
+ * this file's own guards exist to stop, one list wider.
  */
 let MEASURE_WORDS: Set<string> | null = null;
-export function measureWords(): Set<string> {
+export function measureWords(ids?: readonly string[]): Set<string> {
+  if (ids) {
+    const only = new Set<string>();
+    for (const id of ids) {
+      const def = DEFS.find((d) => d.id === id);
+      if (!def) continue;
+      for (const phrase of [def.label, ...(def.phrases ?? []), ...(def.keywords ?? [])]) {
+        for (const token of normalise(phrase).split(' ')) if (token.length > 1) only.add(token);
+      }
+    }
+    return only;
+  }
   if (MEASURE_WORDS) return MEASURE_WORDS;
   const out = new Set<string>();
   for (const def of DEFS) {

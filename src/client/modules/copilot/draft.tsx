@@ -24,7 +24,7 @@ import {
   humanize, useFormat, useToast, type ComboOption, type SelectOption,
 } from '@/client/design';
 import {
-  EMPTY_LEDGER, checkDunning, draftsFromAccount, ledgerFrom, ledgerTotal, type LedgerRead,
+  EMPTY_LEDGER, chaseVerdict, draftsFromAccount, ledgerFrom, ledgerTotal, type LedgerRead,
 } from './draft-core';
 
 /** What each kind actually produces, so the control that steers is legible. */
@@ -235,7 +235,22 @@ export function DraftDialog({
     return ledgerFrom(invoices.data?.data ?? [], session.now());
   }, [chasing, account, customers.error, customers.data, invoices.error, invoices.data, customerId, ledgerLoading, session]);
   const owed = ledgerTotal(ledger);
-  const verdict = chasing && draft ? checkDunning(draft, ledger) : null;
+  /**
+   * What the Log button will send — one value, so nothing can check one text
+   * and log another.
+   *
+   * The check read `checkDunning(draft, ledger)`, the engine's own draft, under
+   * a banner promising the figures had been checked before logging. Every word
+   * of that letter is editable: `NR-000032` could be retyped as an invoice this
+   * account does not hold and `$127,840.00` as `$127,480.00`, and the edited
+   * letter went onto the timeline with the promise still on screen and no check
+   * behind it.
+   */
+  const outgoing = useMemo(
+    () => ({ subject: editSubject.trim(), body: editBody.trim() }),
+    [editSubject, editBody],
+  );
+  const verdict = chaseVerdict(kind, draft, outgoing, ledger, (minor, currency) => f.money(minor, { currency }));
 
   const searchDeals = useMemo(() => async (query: string): Promise<ComboOption[]> => {
     const page = await api.get<ListEnvelope<RecordRow>>('/v1/records/deal', { q: query, limit: 8 });
@@ -278,8 +293,8 @@ export function DraftDialog({
   const log = useMutation<void, { id: string }>(
     () => api.post<{ id: string }>(`/v1/records/${logType}/${encodeURIComponent(logId)}/activities`, {
       type: 'email',
-      subject: editSubject.trim() || undefined,
-      body: editBody.trim() || undefined,
+      subject: outgoing.subject || undefined,
+      body: outgoing.body || undefined,
     }),
     {
       invalidates: ['/v1/records', '/v1/events'],
@@ -314,7 +329,7 @@ export function DraftDialog({
             <Button
               variant="primary"
               loading={log.loading}
-              disabled={!editBody.trim() || blockedByLedger}
+              disabled={!outgoing.body || blockedByLedger}
               title={blockedByLedger ? 'This draft contradicts the ledger, so it cannot be logged.' : undefined}
               iconLeft={<Icons.note size={14} />}
               onClick={() => { void log.run().catch(() => undefined); }}
@@ -401,8 +416,9 @@ export function DraftDialog({
                   ))}
                 </ul>
                 <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
-                  Read from the billing ledger just now. The draft is checked against these figures
-                  before it can be logged.
+                  Read from the billing ledger just now. Every invoice number and every amount in the
+                  draft — including anything you type into it — is checked against these before it can
+                  be logged.
                 </p>
               </Banner>
             )}

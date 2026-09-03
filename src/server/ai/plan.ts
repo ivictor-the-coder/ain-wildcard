@@ -144,6 +144,29 @@ export interface PlanInput {
    * questions were answered with their own inverse, under the word "largest".
    */
   order?: RankingOrder | null;
+  /**
+   * A numeric column of this workspace's own records that the question named in
+   * full, when the measure catalogue only matched part of its name.
+   *
+   * "The total annual revenue of our customers" is the Annual revenue column on
+   * the accounts. Reading it as the Revenue measure answered with collected
+   * invoice revenue — a different table, three orders of magnitude out.
+   */
+  columnMeasure?: { objectType: string; property: string; noun: string; matched: string } | null;
+  /**
+   * The column a breakdown was asked for, when `GroupBy` does not enumerate it.
+   *
+   * "Break down open pipeline by forecast category" is five rows this workspace
+   * holds; the enum knows stage, pipeline, industry, owner and account, and the
+   * rest of the columns reached no argument at all.
+   */
+  groupDimension?: { objectType: string; property: string; noun: string; matched: string } | null;
+}
+
+/** The breakdown column, when it belongs to the rows this measure is computed over. */
+function groupDimensionFor(input: PlanInput, objectType: string): PlanInput['groupDimension'] {
+  const group = input.groupDimension;
+  return group && group.objectType === objectType ? group : null;
 }
 
 /** The currency book a plan runs in: what the ledger admitted, or the sentence. */
@@ -1269,11 +1292,13 @@ function scopedAggregate(
   const dateProperty = closing
     ? input.dateProperty
     : shape.dateProperty ?? (outcome.length && input.windows.length ? 'close_date' : null);
+  const group = groupDimensionFor(input, shape.objectType);
   const step = builtin('record_aggregate', {
     object_type: shape.objectType,
     measure: shape.measure,
     ...(shape.property ? { property: shape.property } : {}),
     conditions,
+    ...(group ? { group_by: group.property } : {}),
     ...(owner ? { owner_id: owner.entity.id } : {}),
     ...(cross ? { associated_to_any: cross.ids } : {}),
     ...(dateProperty ? { date_property: dateProperty, start: input.window.start, end: input.window.end } : {}),
@@ -1287,6 +1312,9 @@ function scopedAggregate(
       : '',
     outcome.length
       ? `The question names an outcome, so the stage set is ${listPhrase(outcome)} rather than the open book ${metric.metric.label} is defined over.`
+      : '',
+    group
+      ? `"${group.matched}" is the ${group.noun} column on ${shape.objectType} records, so the measure is grouped by it — the catalogue measure enumerates a handful of breakdowns and this is not one of them.`
       : '',
   ].filter(Boolean).join(' '));
   // The measure is real but it is not an argument called `metric`, so the
@@ -1450,7 +1478,13 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
   // vocabulary the sentence borrows.
   const misrouted = input.intent === 'troubleshoot' && !!metric
     && input.types.length > 0 && !input.types.includes('ticket');
-  const intent: TaskIntent = misrouted ? 'aggregate' : input.intent;
+  // A breakdown is an aggregate, whatever the classifier called the sentence.
+  // "Break down open tickets by category" was read as a lookup at 30%
+  // confidence and answered with ten ticket rows — the reader asked for nine
+  // numbers and got a list with the instruction dropped out of it.
+  const breakdown = !!metric && input.intent === 'lookup'
+    && !!groupDimensionFor(input, MONEY_METRIC_SHAPE[metric.metric.id]?.objectType ?? '');
+  const intent: TaskIntent = misrouted || breakdown ? 'aggregate' : input.intent;
 
   // A price question is not a volume question. "How much would 50 million
   // telemetry events cost?" was answered with 52.1 million events metered — a
@@ -1464,6 +1498,29 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
   if (intent !== 'act' && intent !== 'draft') {
     const vocabulary = vocabularyPlan(input);
     if (vocabulary) return [vocabulary];
+  }
+
+  // A column this workspace keeps, asked for by its whole name, is added up
+  // over the records that carry it — never handed to a measure that recognised
+  // one word of it.
+  const column = input.columnMeasure;
+  if (column && (intent === 'aggregate' || intent === 'lookup' || intent === 'compare') && !subject) {
+    const averaged = /\b(average|avg|mean|typical|per\s+(?:company|account|customer|deal|contact|ticket))\b/i.test(input.question);
+    // The measure qualifier the catalogue raised is settled here: the column is
+    // what the reader named, and this step is where it is measured.
+    const named = input.qualifiers?.first('metric');
+    if (named) {
+      input.qualifiers?.bindEntry(named, {
+        tool: 'record_aggregate',
+        args: { property: column.property },
+        note: `"${column.matched}" is the ${column.noun} column on ${column.objectType} records, measured there rather than from the invoice book.`,
+      });
+    }
+    return [builtin('record_aggregate', {
+      object_type: column.objectType,
+      measure: averaged ? 'avg' : 'sum',
+      property: column.property,
+    }, `"${column.matched}" names the ${column.noun} column this workspace keeps on every ${column.objectType}; ${averaged ? 'averaging' : 'adding'} that column is the question.`)];
   }
 
   // A ranking cut-off over records is a request for rows, and `business_metric`
@@ -1486,7 +1543,13 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
     entities.filter((e) => ['company', 'contact', 'customer'].includes(e.entity.type)),
   ).slice(0, 3);
 
-  const currency = plannedCurrency(input);
+  // A currency book only exists for money. `business_metric` takes the argument
+  // for every measure and ignores it for the ones whose rows are not raised in
+  // a currency, so passing it on a count made the ledger record a scope that
+  // was never applied — "how many deals are in EUR?" bound the currency and
+  // printed all 38 open deals. An argument the capability will ignore is not
+  // passed, and the ledger then refuses the currency by name.
+  const currency = metric && metric.metric.unit !== 'money' ? null : plannedCurrency(input);
   // Whatever the metric is, it is measured over the pipeline, the stage and the
   // ranking cut-off the question named — or `business_metric` errors, which is
   // the point. The one thing it must never do is compute the workspace figure
@@ -1519,7 +1582,7 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
       start: window.start,
       end: window.end,
       window_label: window.label,
-      ...(plannedCurrency(input) ? { currency: plannedCurrency(input)! } : {}),
+      ...(currency ? { currency } : {}),
       ...scopeArgs,
       group_by: groupBy,
       // Which end of the ranking the question asked for. Without it "who has
@@ -1625,6 +1688,9 @@ function canonicalPlan(input: PlanInput, blocked: BlockedCapability[]): PlannedS
           // phrasing away from "which open deals are worth over $400,000?",
           // which it answers.
           || !!metricThreshold(input, metric.metric.id)
+          // A breakdown by one of this workspace's own columns. The catalogue
+          // measure groups by the handful `GroupBy` names and drops the rest.
+          || !!groupDimensionFor(input, MONEY_METRIC_SHAPE[metric.metric.id].objectType)
           || crossScopeFilter(input, MONEY_METRIC_SHAPE[metric.metric.id].objectType))) {
         // The catalogue measure takes no lead source, no competitor and no
         // industry. Running it anyway is how "how much open pipeline came from
