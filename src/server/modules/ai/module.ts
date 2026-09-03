@@ -16,13 +16,14 @@ import {
 import { accountUsage, describeUsage } from '../../ai/usage';
 import { entityIndex, workspaceProfile } from '../../ai/grounding';
 import { resolveEntities } from '../../ai/resolve';
-import { stageSets } from '../../ai/metrics';
 import { invalidateIndex } from '../../ai/grounding';
-import { accountProfile, recordSearch, recordTimeline, type AccountProfileResult } from '../../ai/functions';
+import { accountProfile, recordTimeline, type AccountProfileResult } from '../../ai/functions';
 import { recordStanding, type RecordStanding } from '../../ai/query';
 import { composeDraft, detectDraftKind, detectTone, DRAFT_KINDS, TONES, type DraftKind, type DraftResult, type OutstandingInvoice, type Tone } from '../../ai/draft';
 import { truncate } from '../../ai/text';
 import { normaliseResponseSchema, schemaNamesNoFields } from '../../ai/extract';
+import { vocabulary } from '../../ai/slots';
+import { publishTemplates, TEMPLATES } from '../../ai/templates';
 
 /**
  * Argument fields that name a record a write will land on.
@@ -222,87 +223,18 @@ function describeAnalysis(completion: AinCompletion) {
   const analysis = completion.analysis;
   if (!analysis) return null;
   return {
-    intent: analysis.intent.intent,
-    confidence: analysis.intent.confidence,
-    runner_up: analysis.intent.runnerUp,
-    signals: analysis.intent.signals.map((signal) => ({
-      id: signal.id, intent: signal.intent, matched: signal.matched,
-      weight: signal.weight, applied: signal.applied, negated: signal.negated,
-    })),
-    negations: analysis.intent.negations,
-    window: {
-      label: analysis.window.label,
-      start: analysis.window.start,
-      end: analysis.window.end,
-      grain: analysis.window.grain,
-      partial: analysis.window.partial,
-      from_question: analysis.windowFromQuestion,
-    },
-    windows: analysis.windows.map((w) => ({
-      label: w.label, start: w.start, end: w.end, grain: w.grain, partial: w.partial, matched: w.matched.trim(),
-    })),
-    comparison: analysis.comparison
-      ? {
-          source: analysis.comparison.source,
-          a: { label: analysis.comparison.a.label, start: analysis.comparison.a.start, end: analysis.comparison.a.end },
-          b: { label: analysis.comparison.b.label, start: analysis.comparison.b.start, end: analysis.comparison.b.end },
-        }
-      : null,
+    engine: analysis.engine,
+    intent: analysis.intent,
+    template: analysis.template,
+    slots: analysis.slots,
     refusal: analysis.refusal,
+    nearest: analysis.nearest,
+    plan: analysis.plan,
+    steps: analysis.steps,
     write_blocked: analysis.writeBlocked,
     scoped_tools: analysis.scopedTools,
     budget_exhausted: analysis.budgetExhausted,
-    entities: analysis.entities,
-    subject: analysis.subject,
-    metric: analysis.metric,
-    group_by: analysis.groupBy,
-    object_types: analysis.types,
-    tone: analysis.tone,
-    draft_kind: analysis.draftKind,
-    plan: analysis.plan,
-    skipped: analysis.skipped,
-    // Capabilities the question asked for that this run would not fake, and
-    // what became of every result it did get. Both are the difference between
-    // an answer and a confident answer to a different question.
-    blocked: analysis.blocked.map((entry) => ({
-      object_type: entry.objectType,
-      scope: entry.scope,
-      reason: entry.reason,
-      tool: entry.tool,
-      other_scope: entry.otherScope,
-      missing: entry.missing,
-      options: entry.options ?? [],
-      ambiguous: !!entry.ambiguous,
-      matched: entry.matched ?? null,
-    })),
-    // Every qualifier the question named and what became of it. A caller can
-    // read this and see, field by field, which words of their own sentence
-    // reached the query — the one field that makes a silent substitution
-    // impossible to ship unnoticed.
-    qualifiers: analysis.qualifiers.map((entry) => ({
-      kind: entry.kind,
-      text: entry.text,
-      state: entry.state,
-      resolved: entry.resolved ? {
-        value: entry.resolved.value,
-        label: entry.resolved.label,
-        // The column the value narrows, and the table it narrows. One ledger
-        // kind covers every record filter — a ticket's status, a deal's
-        // competitor, a company's industry — so a caller checking that a scope
-        // reached the query needs the property rather than a map from kinds to
-        // columns, which is the per-qualifier guard in a different file.
-        property: entry.resolved.property ?? null,
-        object_type: entry.resolved.objectType ?? null,
-        values: entry.resolved.values ?? null,
-        op: entry.resolved.op ?? null,
-      } : null,
-      bound_to: entry.binding ? { tool: entry.binding.tool, note: entry.binding.note ?? null } : null,
-      detail: entry.detail,
-    })),
-    results: analysis.results,
-    carried_subject: analysis.carriedSubject,
-    steps: analysis.steps,
-    passes: analysis.passes,
+    facts: analysis.facts,
   };
 }
 
@@ -538,52 +470,26 @@ export default defineModule({
       },
 
       suggestions(orgId) {
+        // Every starter question is a template example rendered from this
+        // workspace's own values, so every one of them is a question the
+        // engine can answer.
+        const vocab = vocabulary(ctx, orgId, { tools: runtime.tools().map((t) => t.name), actorId: null });
+        const wanted: [string, string, string][] = [
+          ['pipeline-worth', 'The open value of one pipeline, from its deals.', 'aggregate'],
+          ['metric-period', 'A ledger measure over a period you name.', 'aggregate'],
+          ['rank-accounts', 'The accounts with the most on the books, all time.', 'aggregate'],
+          ['deals-closing-period', 'Open deals by close date, from the CRM.', 'lookup'],
+          ['customers-past-due', 'Customers with invoices past their due date, from the ledger.', 'lookup'],
+          ['metric-snapshot', 'A snapshot measure as it stands now.', 'aggregate'],
+          ['account-profile', 'Everything on one account, in one paragraph.', 'lookup'],
+        ];
         const out: { question: string; why: string; intent: string }[] = [];
-        const openDeals = recordSearch(ctx, orgId, {
-          object_type: 'deal',
-          conditions: [{ property: 'deal_stage', op: 'in', values: stageSets(ctx, orgId).open }],
-          order_by: 'amount', limit: 3,
-        });
-        const biggest = openDeals.records[0];
-        if (biggest) {
-          const account = biggest.name.split('—')[0].trim();
-          out.push({
-            question: `Where does ${account} stand right now?`,
-            why: `${biggest.name} is the largest open deal in the pipeline.`,
-            intent: 'lookup',
-          });
+        for (const [id, why, intent] of wanted) {
+          const template = TEMPLATES.find((t) => t.id === id);
+          if (!template || !template.tools.every((tool) => vocab.tools.has(tool))) continue;
+          const question = template.example(vocab);
+          if (question) out.push({ question, why, intent });
         }
-        const stale = recordSearch(ctx, orgId, {
-          object_type: 'company',
-          conditions: [{ property: 'type', op: 'eq', value: 'customer' }],
-          date_property: 'last_activity_at',
-          start: 0,
-          end: ctx.now() - 45 * DAY,
-          limit: 1,
-        }).records[0];
-        if (stale) {
-          out.push({
-            question: `Draft a check-in email to ${stale.name}`,
-            why: `Nobody has logged activity on ${stale.name} in over 45 days.`,
-            intent: 'draft',
-          });
-        }
-        const escalated = recordSearch(ctx, orgId, {
-          object_type: 'ticket',
-          conditions: [{ property: 'status', op: 'in', values: ['escalated', 'waiting_on_us'] }],
-          limit: 1,
-        });
-        if (escalated.total) {
-          out.push({
-            question: 'Which support tickets need attention today?',
-            why: `${escalated.total} ${escalated.total === 1 ? 'ticket is' : 'tickets are'} escalated or waiting on us.`,
-            intent: 'troubleshoot',
-          });
-        }
-        out.push(
-          { question: 'What is our open pipeline by stage?', why: 'Reads every open deal and groups it by stage.', intent: 'aggregate' },
-          { question: 'How did bookings last quarter compare with the quarter before?', why: 'Closed-won value with a like-for-like comparison.', intent: 'compare' },
-        );
         return out.slice(0, 5);
       },
     };
@@ -978,6 +884,18 @@ export default defineModule({
     router.get('/v1/ai/metrics', () => list(metricCatalogue().map((m) => ({ object: 'ai_metric' as const, ...m }))),
       { summary: 'The metric catalogue the engine can compute', tags: ['ai'] });
 
+    router.get('/v1/ai/templates', (req: Req) => {
+      const vocab = vocabulary(ctx, req.auth.orgId, { tools: runtime.tools().map((t) => t.name), actorId: actorFor(ctx, req.auth) });
+      const rows = publishTemplates(vocab);
+      return list(rows.map((t) => ({ object: 'ai_template' as const, ...t })), { totalCount: rows.length });
+    }, {
+      summary: 'Every question shape the built-in engine answers, each with an example from this workspace',
+      description:
+        'Without an ANTHROPIC_API_KEY the copilot answers exactly these shapes and refuses everything else. '
+        + 'Each shape lists its typed slots and an example question rendered from real values in this workspace; `available` is false when a tool the shape needs is not registered.',
+      tags: ['ai'],
+    });
+
     router.get('/v1/ai/suggestions', (req: Req) =>
       list(svc().suggestions(req.auth.orgId).map((s) => ({ object: 'ai_suggestion' as const, ...s }))),
       { summary: 'Starter questions computed from this workspace', tags: ['ai'] });
@@ -1258,6 +1176,8 @@ export default defineModule({
       return {
         object: 'ai_status',
         provider: { id: active.id, label: active.label, hosted: active.id === 'anthropic' },
+        engine: active.id === 'anthropic' ? 'anthropic' : 'template',
+        templates: TEMPLATES.length,
         providers: c.ai.providers.map((p) => ({ id: p.id, label: p.label, available: p.available() })),
         tools: c.ai.tools().length,
         metrics: metricCatalogue().length,

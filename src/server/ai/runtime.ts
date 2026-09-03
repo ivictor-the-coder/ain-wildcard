@@ -580,8 +580,11 @@ export function createAiRuntime(config: Config): AinAiRuntime {
           finishedAt: call.ctx.now(),
           error: null,
           pendingApprovals: call.pendingApprovals,
-          intent: analysis?.intent.intent ?? null,
-          confidence: analysis?.intent.confidence ?? null,
+          // A template match is exact, so a matched question is read with
+          // certainty and a refused one with none; the hosted model reports
+          // neither.
+          intent: analysis?.intent ?? null,
+          confidence: analysis ? (analysis.refusal ? 0 : 1) : null,
         };
         try { sink?.runFinished(finish); }
         catch (e) { call.ctx.log.warn('ai.run_sink_failed', { error: (e as Error).message }); }

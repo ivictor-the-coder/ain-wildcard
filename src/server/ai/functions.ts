@@ -15,7 +15,7 @@ import { billingSources, entityIndex, hasTable, workspaceProfile, type Workspace
 import { crmVocabulary, stageLabelIn } from './qualifiers';
 import { resolveEntities, type ResolvedEntity } from './resolve';
 import {
-  accountSnapshot, detectGrouping, metricById, metricIds, stageSets, topAccounts,
+  accountSnapshot, metricById, metricIds, stageSets, topAccounts,
   type GroupBy, type MetricResult, type MetricSubject,
 } from './metrics';
 import { aggregate, associatedRecords, fetchRecords, getRecord, propertyMap, type Condition, type RecordSummary } from './query';
@@ -828,7 +828,8 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
   if (args.property && !properties.has(args.property)) {
     return { error: `"${args.property}" is not a property of ${args.object_type}. Try: ${[...properties.keys()].slice(0, 12).join(', ')}.` };
   }
-  if (args.group_by && !properties.has(args.group_by)) {
+  const byOwner = args.group_by === 'owner_id';
+  if (args.group_by && !byOwner && !properties.has(args.group_by)) {
     return { error: `Cannot group by "${args.group_by}" — no such property on ${args.object_type}.` };
   }
 
@@ -837,7 +838,7 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
     conditions: args.conditions ?? [],
     window: datedWindow(args),
     measure: measure === 'count' ? undefined : { property: args.property!, fn: measure },
-    groupBy: args.group_by,
+    groupBy: byOwner ? undefined : args.group_by,
     associatedTo: args.associated_to,
     associatedToAny: args.associated_to_any,
     // A rep named in the question is a filter on the count. Without it "how
@@ -863,22 +864,89 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
     ? formatMoney({ amount: Math.round(value), currency: workspace.currency }, { locale: workspace.locale, trimZeroFraction: true })
     : Number(value.toFixed(2)).toLocaleString(workspace.locale));
 
-  const optionLabels = new Map((args.group_by ? properties.get(args.group_by)?.options ?? [] : []).map((o) => [o.value, o.label]));
+  const optionLabels = new Map((args.group_by && !byOwner ? properties.get(args.group_by)?.options ?? [] : []).map((o) => [o.value, o.label]));
+  // Owners live on the record row rather than in a property, so "by owner" is
+  // grouped here from the rows themselves.
+  const groups = byOwner
+    ? (() => {
+        const rows = fetchRecords(ctx, orgId, {
+          objectType: args.object_type, conditions: args.conditions ?? [], window: datedWindow(args),
+          associatedTo: args.associated_to, associatedToAny: args.associated_to_any, ownerId: args.owner_id, limit: 5000,
+        });
+        const tally = new Map<string, { value: number; count: number }>();
+        for (const row of rows) {
+          const key = row.owner_id ?? 'unassigned';
+          const entry = tally.get(key) ?? { value: 0, count: 0 };
+          entry.count += 1;
+          entry.value += args.property ? Number(row.properties[args.property] ?? 0) : 1;
+          tally.set(key, entry);
+        }
+        return [...tally.entries()].map(([key, v]) => ({ key, value: v.value, count: v.count })).sort((a, b) => b.count - a.count);
+      })()
+    : result.groups;
   return {
     object_type: args.object_type,
     measure: measure === 'count' ? 'count of records' : `${measure} of ${definition?.label ?? args.property}`,
     value: measure === 'count' ? result.count : result.value,
     formatted: measure === 'count' ? String(result.count) : format(result.value),
     matched_records: result.count,
-    groups: result.groups.map((g) => ({
+    groups: groups.map((g) => ({
       key: g.key,
-      label: optionLabels.get(g.key) ?? humanise(g.key),
+      label: byOwner ? (personName(workspace, g.key) ?? 'Unassigned') : optionLabels.get(g.key) ?? humanise(g.key),
       value: measure === 'count' ? g.count : g.value,
       count: g.count,
       formatted: measure === 'count' ? g.count.toLocaleString(workspace.locale) : format(g.value),
     })),
     sample_ids: result.ids,
     samples: labelIds(ctx, orgId, result.ids, args.object_type).map((row) => ({ id: row.id, label: row.label })),
+  };
+}
+
+/* ------------------------- subscriptions by product ----------------------- */
+
+export interface SubscriptionsOnProductResult {
+  object: 'subscriptions_on_plan';
+  product: { id: string; name: string } | null;
+  total: number;
+  subscriptions: { id: string; customer: string; customer_name: string | null; status: string; currency: string; items: string[] }[];
+}
+
+/**
+ * Every subscription carrying an item priced on one product.
+ *
+ * "Which subscriptions are on the Growth plan?" is a question about the
+ * product a price belongs to, not about a price id — and a product is sold
+ * through several prices (monthly, annual, per seat). Read through the price
+ * book so every one of them counts. Cancelled and expired subscriptions are
+ * not "on" anything, so they are left out and the answer says so.
+ */
+export function subscriptionsOnProduct(ctx: Ctx, orgId: string, args: { product_id: string; limit?: number }): SubscriptionsOnProductResult | { error: string } {
+  for (const table of ['billing_subscriptions', 'billing_subscription_items', 'catalog_prices', 'catalog_products']) {
+    if (!hasTable(ctx.db, table)) return { error: `No ${table.includes('catalog') ? 'catalogue' : 'subscription ledger'} in this workspace.` };
+  }
+  const product = ctx.db.get<{ id: string; name: string }>(
+    `SELECT id, name FROM catalog_products WHERE org_id = ? AND id = ?`, orgId, args.product_id);
+  if (!product) return { error: `No product with id ${args.product_id} in this workspace.` };
+  const rows = ctx.db.all<{ id: string; customer_id: string; status: string; currency: string; nm: string | null; items: string }>(
+    `SELECT s.id, s.customer_id, s.status, s.currency,
+            (SELECT name FROM billing_customers c WHERE c.id = s.customer_id) AS nm,
+            (SELECT GROUP_CONCAT(COALESCE(p.nickname, p.id), '|') FROM billing_subscription_items i
+               JOIN catalog_prices p ON p.id = i.price_id
+              WHERE i.subscription_id = s.id AND p.product_id = ?) AS items
+     FROM billing_subscriptions s
+     WHERE s.org_id = ? AND s.status NOT IN ('canceled', 'incomplete_expired')
+       AND EXISTS (SELECT 1 FROM billing_subscription_items i JOIN catalog_prices p ON p.id = i.price_id
+                   WHERE i.subscription_id = s.id AND p.product_id = ?)
+     ORDER BY nm, s.id`, args.product_id, orgId, args.product_id);
+  const limit = Math.min(args.limit ?? 25, 100);
+  return {
+    object: 'subscriptions_on_plan',
+    product,
+    total: rows.length,
+    subscriptions: rows.slice(0, limit).map((row) => ({
+      id: row.id, customer: row.customer_id, customer_name: row.nm, status: row.status, currency: row.currency,
+      items: row.items ? row.items.split('|') : [],
+    })),
   };
 }
 
@@ -917,4 +985,3 @@ export function describeRecord(workspace: WorkspaceProfile, record: RecordSummar
 export const daysBetween = (from: number, to: number): number => Math.round((to - from) / DAY);
 
 export type { GroupBy, MetricSubject, ResolvedEntity, RecordSummary };
-export { detectGrouping };

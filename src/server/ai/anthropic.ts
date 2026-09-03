@@ -258,7 +258,8 @@ export function anthropicProvider(config: Config): AiProvider {
         ...req.messages,
       ]);
 
-      const reasoning: string[] = [`Provider: Claude ${model} (hosted).`];
+      const reasoning: string[] = [`Engine: Claude ${model} (hosted), answering free text over ${tools.length} ${tools.length === 1 ? 'tool' : 'tools'}.`];
+      runtime?.note(call, 'provider', 'anthropic', `Free text over ${tools.length} tools with ${model}`);
       const toolCalls: AiToolCall[] = [];
       let inputTokens = 0;
       let outputTokens = 0;

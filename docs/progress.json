@@ -1,11 +1,11 @@
 {
-  "updated": "2026-09-02T12:24:11.689122",
-  "headline": "One change closed all four reported substitutions at once. Nine defects across two independent critics were one defect \u2014 a qualifier the question named, dropped, and the unqualified answer stated confidently. It is now structurally impossible: every qualifier must be bound, refused, or waived by name.",
+  "updated": "2026-09-03T03:28:02.094969",
+  "headline": "The template engine is live: 91 templates, every slot typed and bound or no match. Every P0 the last critic priced is closed \u2014 \"how many won deals in total\" answers 25 where it answered 1, \"biggest customer\" refuses with the exact template that would answer instead of stating a falsehood, ARR is ARR. The 12,000 lines of free-text heuristics are gone from the answer path.",
   "stats": {
     "server modules": 10,
     "client modules": 8,
-    "tests passing": 1420,
-    "lines of code": "159,978"
+    "ai templates": 91,
+    "lines of code": "163,448"
   },
   "waves": [
     {
@@ -290,13 +290,39 @@
         },
         {
           "id": "qualifier-invariant",
-          "title": "One invariant for every qualifier",
+          "title": "The built-in engine",
+          "status": "rework",
+          "rounds": 7,
+          "operability": 0.6,
+          "debt": 93,
+          "note": "Nine claim paths gated on the plan\u2019s actual actions, each with a fail-before-pass test \u2014 and a fresh critic still priced 28 substitutions in 156 questions.",
+          "verdict": "\"How many won deals are there in total?\" \u2192 1, when the answer is 25, because a default period was injected. \"Who is my biggest customer?\" states a falsehood about a workspace with 25 closed-won accounts. The approach does not converge; the design is being replaced."
+        }
+      ]
+    },
+    {
+      "name": "Wave 8 \u00b7 Templates",
+      "status": "active",
+      "note": "The built-in engine answers only questions that match a template exactly, with every slot bound to a typed value; everything else is refused with the three nearest templates. Free text is the model provider\u2019s job when a key is present.",
+      "pieces": [
+        {
+          "id": "template-engine",
+          "title": "The template whitelist engine",
           "status": "critique",
-          "rounds": 4,
+          "rounds": 1,
+          "note": "91 templates from the 50-metric catalogue, the CRM object types and every enumerated dimension. clarify.ts, coverage.ts and dimensions.ts deleted; the tree is 8k lines smaller. Verified against the database: 25 closed-won, 39 closed, $1,463,440 Renewal.",
           "operability": 0.9,
-          "debt": 20,
-          "note": "A ledger carried through the plan: bound to the query that ran, refused out loud, or waived by name in the first sentence. No fourth state.",
-          "verdict": "Verified against the database rather than the engine\u2019s own prose \u2014 \"What is the Renewal pipeline worth?\" now answers $1,463,440 across 6 deals, matching the CRM exactly, where it used to return the $9.0M workspace total. Remaining: structured extraction fusing several records into one, and unit credits rendered as dollars."
+          "debt": 0,
+          "verdict": "The old 7,588-line suite still imports the deleted modules and is being retired for a property suite \u2014 every template \u00d7 two phrasings priced independently, plus 60 near-misses that must refuse."
+        },
+        {
+          "id": "copilot-templates",
+          "title": "A copilot that shows what it can answer",
+          "status": "critique",
+          "rounds": 1,
+          "note": "103/103 copilot tests green. The scope-guessing banners are gone; slot chips render from the plan.",
+          "operability": 0.85,
+          "debt": 3
         }
       ]
     }

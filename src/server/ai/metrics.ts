@@ -112,17 +112,7 @@ export interface MetricDefinition {
   id: string;
   label: string;
   unit: MetricUnit;
-  /** Phrases that select this metric, strongest first. */
-  patterns: RegExp[];
-  /**
-   * The exact names people write for this measure.
-   *
-   * Checked before the pattern scorer and longest-first, because scoring made
-   * "weighted pipeline" tie with "pipeline" and hand the question to whichever
-   * definition came first in this array — which answered a forecast question
-   * with the unweighted book, roughly twice the real figure.
-   */
-  phrases?: string[];
+  /** The words people use for this measure, published with the catalogue. */
   keywords: string[];
   supportsSubject: boolean;
   /**
@@ -893,20 +883,16 @@ const DEFS: MetricDefinition[] = [
     id: 'spend', label: 'Customer spend', unit: 'money', supportsSubject: true,
     // "How much did <account> pay us last year?" is customer spend, and it was
     // refused by a sentence that then offered "customer spend" one line later.
-    patterns: [/\b(spend|spent|spending)\b/i, /\bpa(?:y|id|ys)\s+us\b/i, /\brevenue\s+from\b/i,
-      /\bbilled\s+(?:to|for)\b/i, /\bspend(?:s|ing)?\s+with\s+us\b/i, /\bhow\s+much\s+(?:has|have|did|do|does)\s+.{0,60}?\bpa(?:y|id)\b/i],
     keywords: ['spend', 'spent', 'paid', 'pay us', 'billed'],
     compute: (input) => moneyIn(input, { paidOnly: true }, { id: 'spend', label: 'Customer spend', unit: 'money' }),
   },
   {
     id: 'revenue', label: 'Revenue', unit: 'money', supportsSubject: true,
-    patterns: [/\b(revenue|billings?|income|collected|top\s?line)\b/i, /\bhow\s+much\s+(?:did\s+we\s+)?(?:make|earn|collect)\b/i],
     keywords: ['revenue', 'billings', 'collected'],
     compute: (input) => moneyIn(input, { paidOnly: true }, { id: 'revenue', label: 'Revenue', unit: 'money' }),
   },
   {
     id: 'invoiced', label: 'Invoiced', unit: 'money', supportsSubject: true,
-    patterns: [/\binvoiced?\b/i, /\bissued\s+invoices?\b/i],
     keywords: ['invoiced', 'invoices'],
     compute: (input) => moneyIn(input, {}, { id: 'invoiced', label: 'Invoiced', unit: 'money' }),
   },
@@ -917,36 +903,17 @@ const DEFS: MetricDefinition[] = [
     // every invoice still open. Answering the first question with the second
     // called six invoices inside their terms late, and quoted €1,007 and £1,560
     // of money nobody is late on.
-    patterns: [/\b(outstanding|unpaid|owed?|owes?|owing|receivables?|ar\s+balance)\b/i],
     keywords: ['outstanding', 'unpaid', 'receivables'],
     compute: (input) => moneyIn(input, { outstanding: true }, { id: 'outstanding', label: 'Outstanding balance', unit: 'money', snapshot: true }),
   },
   {
     id: 'overdue', label: 'Overdue balance', unit: 'money', supportsSubject: true, snapshot: true,
-    phrases: ['overdue', 'past due', 'in arrears'],
-    patterns: [/\b(overdue|past\s+due|pastdue|in\s+arrears|arrears|delinquent)\b/i,
-      /\b(late|behind)\s+(?:on\s+)?(?:their\s+|its\s+|the\s+)?(?:invoices?|bills?|payments?)\b/i],
     keywords: ['overdue', 'past due', 'arrears', 'delinquent'],
     compute: (input) => moneyIn(input, { outstanding: true, overdue: true }, { id: 'overdue', label: 'Overdue balance', unit: 'money', snapshot: true }),
   },
   {
     id: 'pipeline', label: 'Open pipeline', unit: 'money', supportsSubject: true, snapshot: true,
     scope: 'deal', stageFilter: true,
-    phrases: ['open pipeline', 'pipeline', 'open deals', 'open deal value', 'pipeline value'],
-    patterns: [/\bpipelines?\b/i, /\bopen\s+deals?\b/i, /\bcoverage\b/i, /\bin\s+flight\b/i,
-      // "The Renewal book" is the noun: a book of business is the open value
-      // of the deals in it, which is this measure and not closed-won bookings.
-      /\b(?:the|our|their|its|this|whole|entire|full)\s+(?:[a-z-]+\s+)?book\b/i,
-      // "How much is sitting in Proposal sent?" is the open value at a stage.
-      // With no measure behind it the question was refused as unreadable, in a
-      // sentence that denied two words of a stage this workspace lists.
-      /\b(?:sitting|sits|sat|stuck|parked)\s+in\b/i,
-      // "What are our open deals worth?" is the pipeline number. It used to
-      // fall through to a list of eight deals with no total under it. Bare
-      // "worth" is deliberately not here: "how much is <account> worth" names
-      // no measure, and guessing pipeline for it would be a substitution.
-      /\bdeals?\s+(?:are\s+)?worth\b/i, /\b(?:they|them|these|those)\s+worth\b/i,
-      /\bvalue\s+of\s+(?:our\s+|the\s+|all\s+)?(?:open\s+)?(?:deals?|pipeline|opportunities)\b/i],
     keywords: ['pipeline', 'open deals', 'worth'],
     compute: (input) => {
       const scope = subjectScope(input);
@@ -969,11 +936,9 @@ const DEFS: MetricDefinition[] = [
   {
     id: 'weighted_pipeline', label: 'Weighted pipeline', unit: 'money', supportsSubject: true, snapshot: true,
     scope: 'deal', stageFilter: true,
-    phrases: ['weighted pipeline', 'weighted pipeline value', 'pipeline forecast', 'forecast', 'expected value', 'probability weighted pipeline'],
     // "What is our forecast for this quarter?" is the question a sales leader
     // asks most often. It was refused as an unrecognised measure — in a
     // sentence that offered "weighted pipeline" by name two lines below.
-    patterns: [/\bweighted\b/i, /\bforecast(?:ed|ing)?\b/i, /\bexpected\s+value\b/i, /\bcommit(?:ted)?\s+number\b/i],
     keywords: ['weighted', 'forecast'],
     compute: (input) => {
       const scope = subjectScope(input);
@@ -992,20 +957,11 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'closed_won', label: 'Closed-won bookings', unit: 'money', supportsSubject: true, scope: 'deal',
-    phrases: ['closed won', 'closed-won bookings', 'bookings', 'won deals', 'new business closed'],
     // "Book" is a verb here and a noun three lines down: "how much did we
     // book" is closed-won bookings, "the Renewal book" is a pipeline's open
     // value. Matching the bare token either way scored 0.72 on "how much is
     // the Renewal book worth?", flipped the measure to bookings and dropped
     // the scope — so the verb has to have a subject in front of it.
-    patterns: [/\bclosed[\s-]?won\b/i, /\bbookings?\b/i, /\bwon\s+deals?\b/i, /\bnew\s+business\s+closed\b/i,
-      /\bbooked\b/i, /\b(?:did|do|does|will|can|should|we|they|i|you|he|she|who)\s+(?:\w+\s+)?book\b/i,
-      // "How much did we win in Q2 2026?" is this measure. The status extractor
-      // already maps win → closed_won for a count question, and the money half
-      // of the same verb was refused with the answer sitting in the catalogue
-      // list the refusal printed.
-      /\bhow\s+much\s+(?:\w+\s+){0,3}?\b(?:win|won)\b/i,
-      /\b(?:did|do|does|have|has|we|they|you|i)\s+(?:\w+\s+){0,2}?(?:win|won)\b/i],
     keywords: ['closed won', 'bookings', 'won'],
     compute: (input) => {
       const scope = subjectScope(input);
@@ -1026,12 +982,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'closed_lost', label: 'Closed-lost value', unit: 'money', supportsSubject: true, scope: 'deal',
-    phrases: ['closed lost', 'closed-lost value', 'lost deals', 'lost revenue', 'lost business'],
-    patterns: [/\bclosed[\s-]?lost\b/i, /\blost\s+(?:deals?|revenue|business)\b/i, /\blosses\b/i,
-      // The mirror of the win verb: "how much did we lose in Q2 2026?" was
-      // refused with 'I do not hold anything called "lose"'.
-      /\bhow\s+much\s+(?:\w+\s+){0,3}?\b(?:lose|lost)\b/i,
-      /\b(?:did|do|does|have|has|we|they|you|i)\s+(?:\w+\s+){0,2}?(?:lose|lost)\b/i],
     keywords: ['lost'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
@@ -1050,8 +1000,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'win_rate', label: 'Win rate', unit: 'percent', supportsSubject: true, scope: 'deal',
-    phrases: ['win rate', 'close rate', 'conversion rate', 'hit rate'],
-    patterns: [/\bwin\s+rate\b/i, /\bclose\s+rate\b/i, /\bconversion\s+rate\b/i, /\bhit\s+rate\b/i],
     keywords: ['win rate'],
     compute: (input) => {
       const window = { property: 'close_date', start: input.window.start, end: input.window.end };
@@ -1072,8 +1020,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'avg_deal_size', label: 'Average deal size', unit: 'money', supportsSubject: true, scope: 'deal',
-    phrases: ['average deal size', 'deal size', 'acv', 'average contract value'],
-    patterns: [/\b(average|avg|mean|typical)\s+(?:deal|contract|acv|order)\b/i, /\bdeal\s+size\b/i, /\bacv\b/i],
     keywords: ['average deal', 'deal size'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
@@ -1090,8 +1036,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'sales_cycle', label: 'Average sales cycle', unit: 'days', supportsSubject: true, scope: 'deal',
-    phrases: ['sales cycle', 'average sales cycle', 'days to close', 'time to close'],
-    patterns: [/\bsales\s+cycle\b/i, /\bdays?\s+to\s+close\b/i, /\btime\s+to\s+close\b/i],
     keywords: ['sales cycle'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
@@ -1111,8 +1055,6 @@ const DEFS: MetricDefinition[] = [
     scope: 'deal', stageFilter: true,
     // "How many open deals does Priya have" names this metric, not open
     // pipeline: the longest phrase written wins, so the count beats the money.
-    phrases: ['deal count', 'number of open deals', 'number of deals', 'how many open deals', 'how many deals'],
-    patterns: [/\bhow\s+many\s+(?:open\s+)?deals?\b/i, /\bnumber\s+of\s+deals?\b/i, /\bdeal\s+count\b/i],
     keywords: ['deals'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
@@ -1129,7 +1071,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'new_customers', label: 'New customers', unit: 'count', supportsSubject: false,
-    patterns: [/\bnew\s+(?:customers?|logos?|accounts?)\b/i, /\bcustomers?\s+(?:added|won|signed)\b/i],
     keywords: ['new customers', 'new logos'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
@@ -1146,7 +1087,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'customers', label: 'Customers', unit: 'count', supportsSubject: false, snapshot: true,
-    patterns: [/\bhow\s+many\s+(?:customers|accounts|logos)\b/i, /\b(?:customer|logo|account)\s+count\b/i, /\btotal\s+(?:customers|accounts)\b/i, /\bcustomer\s+base\b/i],
     keywords: ['customers', 'accounts'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
@@ -1161,7 +1101,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'open_tickets', label: 'Open tickets', unit: 'count', supportsSubject: true, snapshot: true,
-    patterns: [/\bopen\s+tickets?\b/i, /\bsupport\s+backlog\b/i, /\bunresolved\b/i, /\btickets?\s+open\b/i],
     keywords: ['open tickets', 'backlog'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
@@ -1178,7 +1117,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'tickets_created', label: 'Tickets raised', unit: 'count', supportsSubject: true,
-    patterns: [/\btickets?\s+(?:created|opened|raised|logged|filed)\b/i, /\bhow\s+many\s+tickets?\b/i],
     keywords: ['tickets'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
@@ -1195,7 +1133,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'resolution_time', label: 'Average time to resolution', unit: 'hours', supportsSubject: true,
-    patterns: [/\bresolution\s+time\b/i, /\btime\s+to\s+resolve\b/i, /\bhow\s+long\s+.*\bresolve\b/i, /\bfirst\s+response\b/i],
     keywords: ['resolution time'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
@@ -1211,7 +1148,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'csat', label: 'Customer satisfaction', unit: 'score', supportsSubject: true,
-    patterns: [/\bcsat\b/i, /\bsatisfaction\b/i, /\bhappiness\b/i],
     keywords: ['csat', 'satisfaction'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
@@ -1228,7 +1164,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'activities', label: 'Logged activity', unit: 'count', supportsSubject: true,
-    patterns: [/\bactivit(?:y|ies)\b/i, /\btouch(?:es|points?)\b/i, /\bengagement\b/i, /\bhow\s+often\s+.*\b(?:spoke|talked|met)\b/i],
     keywords: ['activity', 'touches'],
     compute: (input) => {
       const types = ['call', 'meeting', 'email', 'note', 'task'];
@@ -1253,7 +1188,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'meetings', label: 'Meetings held', unit: 'count', supportsSubject: true,
-    patterns: [/\bmeetings?\b/i, /\bqbrs?\b/i, /\bdemos?\b/i],
     keywords: ['meetings'],
     compute: (input) => {
       const agg = aggregate(input.ctx, input.workspace.orgId, {
@@ -1268,7 +1202,6 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'connected_assets', label: 'Connected assets', unit: 'count', supportsSubject: true, snapshot: true,
-    patterns: [/\bconnected\s+assets?\b/i, /\bmachines?\b/i, /\brobots?\b/i, /\basset\s+count\b/i],
     keywords: ['assets', 'machines'],
     compute: (input) => {
       const subject = input.subject;
@@ -1294,32 +1227,26 @@ const DEFS: MetricDefinition[] = [
   },
   {
     id: 'churn', label: 'Logo churn', unit: 'percent', supportsSubject: false,
-    patterns: [/\bchurn\s*rate\b/i, /\blogo\s+churn\b/i, /\bchurn(?:ed|ing)?\b/i, /\battrition\b/i, /\bcancellation\s+rate\b/i],
     keywords: ['churn', 'logo churn', 'attrition'],
     compute: (input) => retentionMetric(input, 'churn'),
   },
   {
     id: 'net_revenue_retention', label: 'Net revenue retention', unit: 'percent', supportsSubject: false,
-    patterns: [/\bnet\s+revenue\s+retention\b/i, /\bnrr\b/i, /\bnet\s+retention\b/i, /\bnet\s+dollar\s+retention\b/i, /\bndr\b/i],
     keywords: ['nrr', 'net revenue retention'],
     compute: (input) => retentionMetric(input, 'nrr'),
   },
   {
     id: 'gross_revenue_retention', label: 'Gross revenue retention', unit: 'percent', supportsSubject: false,
-    patterns: [/\bgross\s+revenue\s+retention\b/i, /\bgrr\b/i, /\bgross\s+retention\b/i, /\bretention\s+rate\b/i, /\bretention\b/i],
     keywords: ['grr', 'gross revenue retention', 'retention'],
     compute: (input) => retentionMetric(input, 'grr'),
   },
   {
     id: 'mrr', label: 'Monthly recurring revenue', unit: 'money', supportsSubject: true, snapshot: true,
-    patterns: [/\bmrr\b/i, /\bmonthly\s+recurring\b/i, /\bmonthly\s+run\s?rate\b/i, /\brecurring\s+revenue\b/i,
-      /\bpay(?:s|ing)?\s+(?:us\s+)?(?:each|per|a)\s+month\b/i, /\bmonthly\s+(?:spend|fee|bill|subscription)\b/i],
     keywords: ['mrr'],
     compute: (input) => recurringRevenue(input, 1),
   },
   {
     id: 'arr', label: 'Annual recurring revenue', unit: 'money', supportsSubject: true, snapshot: true,
-    patterns: [/\barr\b/i, /\bannual(?:ised|ized)?\s+recurring\b/i, /\bannual\s+run\s?rate\b/i, /\bannualised\s+revenue\b/i],
     keywords: ['arr'],
     compute: (input) => recurringRevenue(input, 12),
   },
@@ -1343,314 +1270,9 @@ const UNDEFINED_AT_ZERO = new Set([
 export const metricUndefinedWhenEmpty = (id: string | null | undefined): boolean =>
   !!id && UNDEFINED_AT_ZERO.has(id);
 
-/**
- * Every word a set of measures answers to — the whole catalogue by default.
- *
- * A modifier in front of a measure is only unknown when nothing in the
- * catalogue knows it either: "recurring revenue" is MRR by another name, and
- * refusing it as an unresolvable narrowing of Revenue would be its own wrong
- * answer. That is the comprehension check, and it wants every word here.
- *
- * The coverage gate wants the opposite: only the measures a run *computed*.
- * "What is the total annual revenue of our customers?" was answered with
- * $83,826.29 of collected invoice revenue because "annual" is a word of Annual
- * recurring revenue — a measure nothing in that plan ran — and the catalogue
- * spending a word for a measure that never executed is the same substitution
- * this file's own guards exist to stop, one list wider.
- */
-let MEASURE_WORDS: Set<string> | null = null;
-export function measureWords(ids?: readonly string[]): Set<string> {
-  if (ids) {
-    const only = new Set<string>();
-    for (const id of ids) {
-      const def = DEFS.find((d) => d.id === id);
-      if (!def) continue;
-      for (const phrase of [def.label, ...(def.phrases ?? []), ...(def.keywords ?? [])]) {
-        for (const token of normalise(phrase).split(' ')) if (token.length > 1) only.add(token);
-      }
-    }
-    return only;
-  }
-  if (MEASURE_WORDS) return MEASURE_WORDS;
-  const out = new Set<string>();
-  for (const def of DEFS) {
-    for (const phrase of [def.label, ...(def.phrases ?? []), ...(def.keywords ?? [])]) {
-      for (const token of normalise(phrase).split(' ')) if (token.length > 1) out.add(token);
-    }
-  }
-  MEASURE_WORDS = out;
-  return out;
-}
-
 export const METRICS: MetricDefinition[] = DEFS;
 export const metricById = (id: string): MetricDefinition | undefined => DEFS.find((d) => d.id === id);
 export const metricIds = (): string[] => DEFS.map((d) => d.id);
-
-export interface MetricDetection {
-  metric: MetricDefinition;
-  matched: string;
-  score: number;
-  alternatives: { id: string; score: number }[];
-}
-
-/**
- * Every measure name in the catalogue, longest first.
- *
- * The pattern scorer weighs a regex hit by its length and its position in the
- * definition's list, which made "weighted pipeline" score exactly what
- * "pipeline" scores — a tie broken by array order, so a forecast question was
- * answered with the unweighted book. An exact phrase is not a score: if the
- * question writes a measure's name, that is the measure, and the longest name
- * written wins so "weighted pipeline" beats the "pipeline" inside it.
- */
-const PHRASE_INDEX: { phrase: string; def: MetricDefinition }[] = [];
-
-function phraseIndex(): { phrase: string; def: MetricDefinition }[] {
-  if (PHRASE_INDEX.length) return PHRASE_INDEX;
-  for (const def of DEFS) {
-    for (const phrase of new Set(def.phrases ?? [])) {
-      const normalised = normalise(phrase);
-      if (normalised) PHRASE_INDEX.push({ phrase: normalised, def });
-    }
-  }
-  PHRASE_INDEX.sort((a, b) => b.phrase.length - a.phrase.length);
-  return PHRASE_INDEX;
-}
-
-/** A whole-word phrase hit, so "arr" never matches inside "arrears". */
-function phraseHit(haystack: string, needle: string): boolean {
-  const at = haystack.indexOf(needle);
-  if (at < 0) return false;
-  const before = at === 0 ? ' ' : haystack[at - 1];
-  const after = at + needle.length >= haystack.length ? ' ' : haystack[at + needle.length];
-  return before === ' ' && after === ' ';
-}
-
-/** The words the reader actually wrote, so an answer quotes them back. */
-function surfaceOf(message: string, phrase: string): string {
-  const pattern = new RegExp(`\\b${phrase.split(' ').map((w) => w.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')).join('[\\s-]+')}\\b`, 'i');
-  return message.match(pattern)?.[0] ?? phrase;
-}
-
-/**
- * Measures people ask for that this platform does not define.
- *
- * Naming one has to be a refusal that says what the catalogue holds. The
- * failure it replaces is worse than an apology: "weighted pipeline" answered
- * with open pipeline, "pipeline coverage" answered with the same, both stated
- * as the figure the reader asked for.
- */
-const UNKNOWN_MEASURES: [string, RegExp][] = [
-  ['customer acquisition cost', /\b(cac|customer\s+acquisition\s+costs?)\b/i],
-  ['lifetime value', /\b(ltv|cltv|lifetime\s+value)\b/i],
-  ['pipeline coverage', /\bpipeline\s+coverage\b|\bcoverage\s+ratio\b/i],
-  ['quota attainment', /\bquota\s+attainment\b|\battainment\s+against\s+quota\b/i],
-  ['burn rate', /\bburn\s+rate\b|\bcash\s+burn\b/i],
-  ['runway', /\b(?:cash\s+)?runway\b/i],
-  ['gross margin', /\bgross\s+margins?\b/i],
-  ['EBITDA', /\bebitda\b/i],
-  ['ARPU', /\b(arpu|arpa|average\s+revenue\s+per\s+(?:user|account))\b/i],
-  ['CAC payback', /\bpayback\s+period\b|\bcac\s+payback\b/i],
-  ['the magic number', /\bmagic\s+number\b/i],
-  ['NPS', /\b(nps|net\s+promoter\s+scores?)\b/i],
-  ['the Rule of 40', /\brule\s+of\s+40\b/i],
-];
-
-/**
- * A measure the question named that the catalogue does not hold.
- *
- * Returned before the scorer gets a chance to land on a near neighbour, which
- * is the substitution this file exists to refuse — "pipeline coverage" is not
- * open pipeline, and answering it with open pipeline is worse than saying so.
- */
-export function unknownMeasure(message: string): string | null {
-  for (const [label, pattern] of UNKNOWN_MEASURES) {
-    if (pattern.test(message)) return label;
-  }
-  return null;
-}
-
-/** Choose the metric a question is asking for, and say what matched. */
-export function detectMetric(message: string): MetricDetection | null {
-  const text = ` ${normalise(message)} `;
-  const named = phraseIndex().filter((row) => phraseHit(text, row.phrase));
-  if (named.length) {
-    const top = named[0];
-    return {
-      metric: top.def,
-      matched: surfaceOf(message, top.phrase),
-      score: 1,
-      alternatives: [...new Set(named.slice(1).map((row) => row.def.id))]
-        .filter((id) => id !== top.def.id).slice(0, 3).map((id) => ({ id, score: 0.9 })),
-    };
-  }
-  const scored: { def: MetricDefinition; score: number; matched: string }[] = [];
-  for (const def of DEFS) {
-    let best = 0;
-    let matched = '';
-    def.patterns.forEach((pattern, index) => {
-      const hit = message.match(pattern);
-      if (!hit) return;
-      // Earlier patterns are the canonical phrasing; later ones are synonyms.
-      const weight = 1 - index * 0.08 + Math.min(hit[0].length, 24) / 100;
-      if (weight > best) { best = weight; matched = hit[0]; }
-    });
-    if (best > 0) scored.push({ def, score: best, matched });
-  }
-  if (!scored.length) return null;
-  scored.sort((a, b) => b.score - a.score);
-  const top = scored[0];
-  return {
-    metric: top.def,
-    matched: top.matched,
-    score: Number(top.score.toFixed(3)),
-    alternatives: scored.slice(1, 4).map((s) => ({ id: s.def.id, score: Number(s.score.toFixed(3)) })),
-  };
-}
-
-/**
- * The "by <dimension>" phrase a grouping instruction is written as.
- *
- * It has to come out of the sentence before the measure is read out of it:
- * "break down bookings by pipeline" contains the measure name "pipeline" only
- * because of the grouping, and scoring the whole sentence answered a bookings
- * question with open pipeline.
- */
-const GROUPING_PREFIX = /\b(?:split|splits|broken\s+(?:down|out)|break\s+(?:down|out)|grouped|group|bucketed|segmented|sliced)\s+(?:up\s+)?by\b/gi;
-const GROUPING_PHRASE =
-  /\b(?:by|per|each)\s+(?:pipelines?|stages?|owners?|reps?|sellers?|aes?|salespe(?:rson|ople)|teammates?|people|accounts?|customers?|companies|logos?|industr(?:y|ies)|verticals?|segments?|status(?:es)?|priorit(?:y|ies)|sources?|channels?|months?|quarters?|weeks?|days?|years?)\b/gi;
-
-export function withoutGroupingPhrase(message: string): string {
-  return message.replace(GROUPING_PREFIX, 'by').replace(GROUPING_PHRASE, ' ');
-}
-
-/** Which grouping the question asked for, if any. */
-export function detectGrouping(message: string): GroupBy {
-  // "split by stage" and "broken out by stage" are "by stage". Only the last
-  // spelling was read, so the other two returned an ungrouped total with no
-  // sign that half the sentence had been dropped.
-  const text = message.toLowerCase()
-    .replace(/\b(?:split|splits|broken\s+(?:down|out)|break\s+(?:down|out)|grouped|group|bucketed|segmented|sliced)\s+(?:up\s+)?by\b/g, 'by');
-  if (/\bby\s+(month|quarter|week|day|year)\b|\bover\s+time\b|\btrend(?:ed|ing|line)?\b|\bmonth\s+by\s+month\b/.test(text)) return 'time';
-  // "each rep" and "per rep" are the same instruction as "by rep". Reading only
-  // the third dropped the breakdown out of "how much open pipeline does each
-  // rep own in the Expansion pipeline?" and answered with one number.
-  if (/\bby\s+(rep|owner|ae|seller|person|teammate)\b|\b(?:per|each)\s+(rep|owner|ae|seller|person|teammate|salesperson|account\s+executive)\b|\bwho\s+(?:closed|sold|won)\b/.test(text)) return 'owner';
-  if (/\b(top|biggest|largest|highest|best|worst|lowest)\s+\d*\s*(reps?|owners?|sellers?|aes?|salespeople|people)\b/.test(text)) return 'owner';
-  // "Which rep has the most pipeline?" is a per-rep question. Without this it
-  // fell through to a list of the eight biggest deals and no rep total at all.
-  if (/\b(which|what|who)\s+(reps?|owners?|sellers?|aes?|salespe(?:rson|ople)|teammates?|account\s+executives?)\b/.test(text)) return 'owner';
-  if (/\bby\s+stage\b|\bstage\s+by\s+stage\b|\bfunnel\b/.test(text)) return 'stage';
-  // "Break down open pipeline by pipeline" is a real question with three rows
-  // for an answer. Without this it fell through to a plan that had nothing to
-  // do with deals at all, and "split by pipeline" quietly returned one total.
-  if (/\bby\s+pipelines?\b|\bper\s+pipeline\b|\bpipeline\s+by\s+pipeline\b|\bacross\s+(?:the\s+)?pipelines\b/.test(text)) return 'pipeline';
-  if (/\bby\s+industr(?:y|ies)\b|\bby\s+vertical\b|\bby\s+segment\b/.test(text)) return 'industry';
-  if (/\bby\s+(account|customer|company|logo)\b/.test(text)) return 'account';
-  if (/\b(top|biggest|largest|highest|best|worst|lowest)\s+\d*\s*(accounts?|customers?|companies|logos)\b/.test(text)) return 'account';
-  if (/\bwhich\s+(accounts?|customers?|companies)\b/.test(text)) return 'account';
-  // "Who has the most pipeline?" is a question about people. It came back as
-  // "38 open deals. The 8 largest of them:" with no rep named anywhere in it,
-  // while "which rep closed the most" — the same question, spelt out — was
-  // answered with a ranked list of reps. A superlative over a record type is
-  // still about the records ("who owns the biggest open deal"), so the noun
-  // after the superlative decides, and the account rules above run first.
-  if (/\bwho\b/.test(text)
-    && /\b(?:most|least|biggest|largest|highest|lowest|smallest|fewest|best|worst)\b/.test(text)
-    && !/\b(?:most|least|biggest|largest|highest|lowest|smallest|fewest|best|worst)\s+(?:\d+\s+)?(?:open\s+|closed\s+|won\s+|lost\s+|active\s+)*(?:deals?|opportunit(?:y|ies)|invoices?|tickets?|accounts?|customers?|companies|logos?|contacts?)\b/.test(text)) {
-    return 'owner';
-  }
-  if (/\bby\s+status\b/.test(text)) return 'status';
-  if (/\bby\s+priorit(?:y|ies)\b/.test(text)) return 'priority';
-  if (/\bby\s+source\b|\bby\s+channel\b/.test(text)) return 'source';
-  return 'none';
-}
-
-/**
- * The one currency a question restricted itself to.
- *
- * A workspace with three books can be asked about one of them, and "what is our
- * MRR in USD only?" is a question with a single number for an answer. Only an
- * unambiguous name counts: "$" alone is several currencies and does not.
- */
-const CURRENCY_WORDS: [string, RegExp][] = [
-  ['usd', /\b(usd|us\s?dollars?|american\s+dollars?)\b/i],
-  ['eur', /\b(eur|euros?)\b/i],
-  ['gbp', /\b(gbp|sterling|pounds?\s+sterling|british\s+pounds?)\b/i],
-  ['jpy', /\b(jpy|yen)\b/i],
-  ['cad', /\b(cad|canadian\s+dollars?)\b/i],
-  ['aud', /\b(aud|australian\s+dollars?)\b/i],
-  ['chf', /\b(chf|swiss\s+francs?)\b/i],
-  ['sek', /\b(sek|swedish\s+krona|kronor)\b/i],
-];
-
-/** The currency a question names, with the words that named it. */
-export function currencyMention(message: string): { code: string; matched: string } | null {
-  const hits = CURRENCY_WORDS
-    .map(([code, re]) => ({ code, matched: message.match(re)?.[0] ?? '' }))
-    .filter((hit) => hit.matched);
-  return hits.length === 1 ? hits[0] : null;
-}
-
-export function detectCurrency(message: string): string | null {
-  return currencyMention(message)?.code ?? null;
-}
-
-/**
- * Whether a currency word is written as a currency rather than as a name.
- *
- * "How much pipeline does Sterling own?" traced `currency "gbp" → pending` off
- * a word that is three companies in this workspace. Nothing leaked, because the
- * owner refused first — but a question that also bound an owner would have
- * carried a GBP scope nobody asked for. A code, a symbol or an explicit "in
- * <currency>" is a currency; a capitalised name in a subject slot is a name.
- */
-export function currencyShaped(message: string, matched: string): boolean {
-  if (/^[a-z]{3}$/i.test(matched)) return true;
-  const word = matched.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
-  return new RegExp(`\\b(?:in|into|to|denominated\\s+in|book|books|of)\\s+(?:the\\s+)?${word}\\b`, 'i').test(message)
-    || new RegExp(`\\b${word}\\s+(?:book|books|only|terms|denominated|revenue|invoices?)\\b`, 'i').test(message);
-}
-
-/**
- * Does the question ask what something is worth?
- *
- * "What are our open deals worth?" came back as eight bullets and no sum, while
- * the same workspace answered "what is our open pipeline?" with the exact
- * total. The head of the sentence is a value question, so the answer has to
- * lead with a value.
- */
-export function isValueQuestion(message: string): boolean {
-  const text = normalise(message);
-  return /\bworth\b/.test(text)
-    || /\b(?:total|combined|aggregate)\s+value\b/.test(text)
-    || /\bvalue\s+of\s+(?:our|the|these|those|all)\b/.test(text)
-    || /\bhow\s+much\s+(?:is|are)\s+(?:our|the|these|those|all|that|it|they)\b/.test(text);
-}
-
-/**
- * Does the question ask for a ranking rather than a total?
- *
- * "Which accounts booked the most in 2025" is the single most common question a
- * revenue leader asks, and it used to fall through to a list of company records
- * ordered by recency with no money in it at all. A ranking question routes to
- * the grouped metric and the answer leads with the order.
- */
-export function isRankingQuestion(message: string): boolean {
-  const text = normalise(message);
-  return (
-    // Bounded to eight words so a later sentence in a long prompt cannot turn
-    // an unrelated "which" into a ranking request.
-    // Both ends of the ranking. "Who has the least pipeline?" is the same
-    // question as "who has the most" with one word changed, and reading only
-    // the "most" half answered it with the largest rows and the word "biggest".
-    /\b(?:which|what|who)\b(?:\s+[a-z0-9]+){0,8}?\s+(?:most|biggest|largest|highest|best|top|greatest|least|fewest|lowest|smallest|worst)\b/.test(text)
-    || /\btop\s+\d{1,3}\b/.test(text)
-    || /\b(?:top|biggest|largest|highest|best|bottom|lowest|smallest|worst|fewest)\s+\d*\s*(?:accounts?|customers?|companies|logos?|deals?|reps?|owners?)\b/.test(text)
-    || /\b(?:rank(?:ed)?|order(?:ed)?|sort(?:ed)?)\s+(?:by|on)\b/.test(text)
-    || /\bwho\s+(?:is|are|was|were)\s+(?:my|our|the)\s+(?:biggest|largest|best|top)\b/.test(text)
-  );
-}
 
 /** Top accounts for a metric — the "who" behind an aggregate. */
 export function topAccounts(input: MetricInput, metric: MetricDefinition, limit = 5): MetricGroup[] {

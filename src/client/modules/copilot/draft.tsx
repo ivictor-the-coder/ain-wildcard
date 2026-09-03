@@ -24,7 +24,7 @@ import {
   humanize, useFormat, useToast, type ComboOption, type SelectOption,
 } from '@/client/design';
 import {
-  EMPTY_LEDGER, chaseVerdict, draftsFromAccount, ledgerFrom, ledgerTotal, type LedgerRead,
+  EMPTY_LEDGER, canLog, chaseVerdict, draftsFromAccount, ledgerFrom, ledgerPromise, ledgerTotal, type LedgerRead,
 } from './draft-core';
 
 /** What each kind actually produces, so the control that steers is legible. */
@@ -250,7 +250,17 @@ export function DraftDialog({
     () => ({ subject: editSubject.trim(), body: editBody.trim() }),
     [editSubject, editBody],
   );
-  const verdict = chaseVerdict(kind, draft, outgoing, ledger, (minor, currency) => f.money(minor, { currency }));
+  const money = (minor: number, currency: string) => f.money(minor, { currency });
+  const verdict = chaseVerdict(kind, draft, outgoing, ledger, money);
+  /**
+   * The one gate the Log button and the mutation both read.
+   *
+   * A verdict computed at render time and a button that was enabled a render
+   * ago are two different things; the mutation asks again on the text it is
+   * about to post, so the answer is the same whichever of them a person
+   * reaches first.
+   */
+  const gate = canLog(kind, draft, outgoing, ledger, money);
 
   const searchDeals = useMemo(() => async (query: string): Promise<ComboOption[]> => {
     const page = await api.get<ListEnvelope<RecordRow>>('/v1/records/deal', { q: query, limit: 8 });
@@ -291,11 +301,15 @@ export function DraftDialog({
   const logName = chasing && account?.display_name ? account.display_name : targetName;
 
   const log = useMutation<void, { id: string }>(
-    () => api.post<{ id: string }>(`/v1/records/${logType}/${encodeURIComponent(logId)}/activities`, {
-      type: 'email',
-      subject: outgoing.subject || undefined,
-      body: outgoing.body || undefined,
-    }),
+    () => {
+      const check = canLog(kind, draft, outgoing, ledger, money);
+      if (!check.ok) return Promise.reject(new Error(check.why));
+      return api.post<{ id: string }>(`/v1/records/${logType}/${encodeURIComponent(logId)}/activities`, {
+        type: 'email',
+        subject: outgoing.subject || undefined,
+        body: outgoing.body || undefined,
+      });
+    },
     {
       invalidates: ['/v1/records', '/v1/events'],
       onSuccess: () => {
@@ -312,7 +326,6 @@ export function DraftDialog({
   // letter that tells a delinquent customer they are square is worse than no
   // letter, and the only way to be sure it does not is to have read the ledger.
   const canWrite = !!targetId && (!chasing || ledger.state === 'read');
-  const blockedByLedger = chasing && verdict?.state === 'contradicted';
 
   return (
     <Modal
@@ -329,8 +342,8 @@ export function DraftDialog({
             <Button
               variant="primary"
               loading={log.loading}
-              disabled={!outgoing.body || blockedByLedger}
-              title={blockedByLedger ? 'This draft contradicts the ledger, so it cannot be logged.' : undefined}
+              disabled={!gate.ok}
+              title={gate.ok ? undefined : gate.why}
               iconLeft={<Icons.note size={14} />}
               onClick={() => { void log.run().catch(() => undefined); }}
             >
@@ -406,7 +419,7 @@ export function DraftDialog({
                   ? `${ledger.bills.length} invoices outstanding on ${account?.display_name ?? 'this account'}`
                   : `${f.money(owed, { currency: ledger.currencies[0] })} outstanding on ${account?.display_name ?? 'this account'}`}
               >
-                <ul className="cp-scope__reasons">
+                <ul className="cp-reasons">
                   {ledger.bills.slice(0, 4).map((bill) => (
                     <li key={bill.number}>
                       {bill.number} — {f.money(bill.amountDue, { currency: bill.currency })}
@@ -416,9 +429,7 @@ export function DraftDialog({
                   ))}
                 </ul>
                 <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
-                  Read from the billing ledger just now. Every invoice number and every amount in the
-                  draft — including anything you type into it — is checked against these before it can
-                  be logged.
+                  {ledgerPromise()}
                 </p>
               </Banner>
             )}
@@ -510,7 +521,7 @@ export function DraftDialog({
             {verdict?.state === 'contradicted' && (
               <Banner tone="danger" bar title="This draft contradicts the ledger">
                 <p>{verdict.why} It cannot be logged.</p>
-                <ul className="cp-scope__reasons">
+                <ul className="cp-reasons">
                   {ledger.bills.slice(0, 4).map((bill) => (
                     <li key={bill.number}>
                       {bill.number} — {f.money(bill.amountDue, { currency: bill.currency })}

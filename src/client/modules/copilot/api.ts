@@ -8,9 +8,9 @@
 import { useMemo } from 'react';
 import { useQuery, type ApiClientError, type ListEnvelope, type QueryResult } from '@/client/kernel/api';
 import { refusalOf } from './answer-core';
-import { propertyVocabulary } from './scope-core';
 import type { Vocabulary } from './scope-core';
 import type { Citation } from './citations';
+import type { AiTemplate, Engine, NearestOnWire } from './templates-core';
 
 export { CITATION_ICON, citationHref, dedupeCitations, recordLink, writeTargetLabel, writeTargets } from './citations';
 export type { Citation } from './citations';
@@ -92,6 +92,14 @@ export interface AiRun {
   finished: number | null;
   duration_ms: number;
   trace?: AiSpan[];
+  /**
+   * What the template engine records about a run, when it does. `provider`
+   * and `model` are read when these are absent, so a run written by the old
+   * engine still says which engine answered it.
+   */
+  engine?: Engine | null;
+  nearest?: NearestOnWire[] | null;
+  template?: unknown;
 }
 
 export interface AiApproval {
@@ -123,8 +131,6 @@ export interface ThreadDetail extends AiThread {
   runs: AiRun[];
 }
 
-export interface AiSuggestion { object: 'ai_suggestion'; question: string; why: string; intent: string }
-
 export interface AiTool {
   object: 'ai_tool';
   name: string;
@@ -144,16 +150,35 @@ export interface AiStatus {
   pending_approvals: number;
 }
 
-export interface AiReply {
-  object: 'ai_reply';
-  thread_id: string;
+/**
+ * `POST /v1/ai/complete`, as the conversation reads it.
+ *
+ * The one route that says which engine answered and, on a refusal, which
+ * shapes come closest — so the conversation posts its turns here (with the
+ * thread id, which makes the completion a turn of that thread) and remembers
+ * `engine`, `nearest` and `template` by run id for the session.
+ */
+export interface AiCompletion {
+  object: 'ai_completion';
   run_id: string;
-  message: AiMessage;
+  provider: string;
+  model: string;
+  content: string;
+  finish_reason: string;
+  engine?: Engine | null;
+  nearest?: NearestOnWire[] | null;
+  template?: unknown;
+  /** The engine's working notes in structure; `qualifiers` lists every slot it bound. */
+  analysis?: unknown;
+  tool_calls: ToolCall[];
   citations: Citation[];
   reasoning: string[];
   pending_approvals: { tool: string; args: Record<string, unknown>; reason: string }[];
-  usage: { input_tokens: number; output_tokens: number; credits: number };
+  usage: { input_tokens: number; output_tokens: number; credits: number; cost_cents: number };
+  duration_ms: number;
 }
+
+export type { AiTemplate } from './templates-core';
 
 /* --------------------------------- reads --------------------------------- */
 
@@ -166,8 +191,9 @@ export const useThread = (id: string | null): QueryResult<ThreadDetail> =>
 export const useRun = (id: string | null, enabled = true): QueryResult<RunDetail> =>
   useQuery<RunDetail>(id ? `/v1/ai/runs/${encodeURIComponent(id)}` : null, undefined, { enabled });
 
-export const useSuggestions = (): QueryResult<ListEnvelope<AiSuggestion>> =>
-  useQuery<ListEnvelope<AiSuggestion>>('/v1/ai/suggestions');
+/** The whitelist: every question shape the built-in engine answers, with workspace values. */
+export const useTemplates = (): QueryResult<ListEnvelope<AiTemplate>> =>
+  useQuery<ListEnvelope<AiTemplate>>('/v1/ai/templates');
 
 /**
  * The queue answers 50 rows unless asked otherwise, and this is the only read
@@ -399,59 +425,30 @@ interface PipelinePayload {
 }
 interface UserPayload { id: string; name: string }
 interface MetricPayload { id: string; label: string; unit: string; keywords: string[]; snapshot: boolean }
-interface PropertyPayload {
-  name: string;
-  label: string;
-  type: string;
-  options: { value: string; label: string }[] | null;
-}
 
 /**
- * The words this workspace uses for the things a question can narrow to.
+ * The words this workspace uses for the things a slot can be bound to.
  *
- * Three reads the copilot did not make before — the deal pipelines with their
- * stages, the teammates, and the platform's own metric catalogue — because
- * checking that an answer was measured over what was asked for is impossible
- * without knowing what "Renewal", "Negotiation", "Marcus Ilori" and "weighted
- * pipeline" name here. All three are small, cached by the query layer and
- * shared with the board, so the conversation pays for them once.
+ * The pipelines with their stages, the teammates, and the metric catalogue:
+ * what turns `owner_id: usr_seed02` into "Marcus Ilori" and `pipeline:
+ * renewal` into "Renewal" on a slot chip, and what the approval card reads a
+ * stage change's consequences from. All three are small, cached by the query
+ * layer and shared with the board.
  */
 export interface VocabularyRead {
   vocab: Vocabulary;
   loading: boolean;
-  /** The reads every chip depends on failed: nothing below is checked. */
   error: ApiClientError | null;
-  /** A narrower read failed: the dimensions it carries were not checked. */
-  partial: string[];
 }
 
 export function useVocabulary(): VocabularyRead {
   const pipelines = useQuery<ListEnvelope<PipelinePayload>>('/v1/pipelines/deal');
   const users = useQuery<ListEnvelope<UserPayload>>('/v1/users', { limit: 100 });
   const metrics = useQuery<ListEnvelope<MetricPayload>>('/v1/ai/metrics');
-  // The pipelines this engine cannot measure over, so an answer that says one
-  // of them does not exist can be contradicted with the workspace's own data.
-  const tickets = useQuery<ListEnvelope<PipelinePayload>>('/v1/pipelines/ticket');
-  // The CRM's own enumerated properties — lead source, deal type, competitor,
-  // forecast category. Without them a question can name a dimension the
-  // qualifier ledger has no slot for, and "How many open deals came from a
-  // trade show?" is answered 38 against a true 7 with the words "trade show"
-  // appearing nowhere on the card.
-  const properties = useQuery<ListEnvelope<PropertyPayload>>('/v1/objects/deal/properties');
-  // Every read, for the wait. A check that has not run is not a check, and the
-  // ticket pipelines and the enumerated properties are what let this surface
-  // contradict "no pipeline is called Support" and "38 open deals" over a
-  // question about a trade show. Waiting for them costs a moment.
-  const loading = pipelines.loading || users.loading || metrics.loading
-    || tickets.loading || properties.loading;
-  // Only the three the whole scope row is drawn from, for the failure. Without
-  // pipelines, teammates or measures there is nothing true to say about any
-  // answer; without the ticket pipelines there is nothing true to say about one
-  // narrow class of question, and blanking every chip on the card over that
-  // would be a second, wider, silence.
+  const loading = pipelines.loading || users.loading || metrics.loading;
   const error = pipelines.error ?? users.error ?? metrics.error;
-  const vocab = useMemo<Vocabulary>(() => {
-    const deal = (pipelines.data?.data ?? []).map((pipeline) => ({
+  const vocab = useMemo<Vocabulary>(() => ({
+    pipelines: (pipelines.data?.data ?? []).map((pipeline) => ({
       name: pipeline.name,
       label: pipeline.label,
       stages: (pipeline.stages ?? []).map((stage) => ({
@@ -461,47 +458,23 @@ export function useVocabulary(): VocabularyRead {
         label: stage.label,
         isClosed: stage.is_closed,
         isWon: stage.is_won,
-        // What the column restamps on a deal that lands in it. The approval
-        // card states the forecast a write moves, and it cannot do that from
-        // the write's own arguments — they carry one stage name.
         probability: stage.probability ?? null,
         forecastCategory: stage.forecast_category ?? null,
       })),
-    }));
-    const catalogue = (metrics.data?.data ?? []).map((metric) => ({
+    })),
+    people: (users.data?.data ?? []).map((user) => ({ id: user.id, name: user.name })),
+    metrics: (metrics.data?.data ?? []).map((metric) => ({
       id: metric.id, label: metric.label, unit: metric.unit, keywords: metric.keywords ?? [], snapshot: !!metric.snapshot,
-    }));
-    return {
-      pipelines: deal,
-      people: (users.data?.data ?? []).map((user) => ({ id: user.id, name: user.name })),
-      metrics: catalogue,
-      otherPipelines: (tickets.data?.data ?? []).map((pipeline) => ({
-        name: pipeline.name, label: pipeline.label, objectType: 'ticket',
-      })),
-      properties: propertyVocabulary(
-        (properties.data?.data ?? [])
-          .filter((property) => property.type === 'enum')
-          .map((property) => ({ name: property.name, label: property.label, options: property.options ?? [] })),
-        deal,
-        catalogue,
-      ),
-    };
-  }, [pipelines.data, users.data, metrics.data, tickets.data, properties.data]);
-  const partial = useMemo(() => [
-    ...(tickets.error ? ['the pipelines that hold tickets'] : []),
-    ...(properties.error ? ['this workspace’s own record properties'] : []),
-  ], [tickets.error, properties.error]);
-  return { vocab, loading, error, partial };
+    })),
+  }), [pipelines.data, users.data, metrics.data]);
+  return { vocab, loading, error };
 }
 
 /* -------------------------------- helpers -------------------------------- */
 
 
-export {
-  carriedScope, confidenceBand, confidenceChip, contradictsCarried, noWritePrepared, parseBlocks,
-  propertyAsked, refusalOf, splitToolEcho,
-} from './answer-core';
-export type { Block, CarriedScope, ConfidenceBand, StepNote, ToolEcho } from './answer-core';
+export { confidenceBand, noWritePrepared, parseBlocks, propertyAsked, refusalOf, splitToolEcho } from './answer-core';
+export type { Block, ConfidenceBand, StepNote, ToolEcho } from './answer-core';
 
 export {
   consequenceLines, dealNamedIn, editHref, linkedTargetOf, needsAcknowledgement, stageConsequences,
@@ -509,27 +482,24 @@ export {
 } from './write-core';
 export type { Consequence, DealNow, StageConsequences, StageWrite } from './write-core';
 
+/**
+ * What is left of the scope machinery on the answer path: the two rules the
+ * approval card uses to say a write was prepared against a sibling of the
+ * record that was named. The reconciliation, the banners and the rephrasings
+ * are unplugged — a template answer is scoped by construction.
+ */
+export { EMPTY_VOCABULARY, humanizeName, isWiderName, recordPhraseMismatch } from './scope-core';
+export type { RecordMismatch, VocabMetric, VocabPipeline, VocabStage, Vocabulary } from './scope-core';
+
+export { answerCard } from './card-core';
+export type { AnswerCard, CardBanner, Refusal, Remembered, RunFacts } from './card-core';
+export { slotChips, windowText } from './slots-core';
+export type { SlotChip, SlotFormat } from './slots-core';
 export {
-  EMPTY_VOCABULARY, MONEY_TOTAL, QUALIFIER_KINDS, UNMEASURED, agreeWithTheCount, boardHref, boundScopeOf,
-  carriedThrough, comparisonRephrase, correctPipelineDenial, correctedProse,
-  countedObject, currencyAsked, currencyOfFigure, figureSpeaks, figureUnits, groupAsked, humanizeName,
-  isWiderName, isWriteRequest, labelOfPipeline, labelOfStage, lastInstantOf, looksLikeRecordId,
-  lookupObject, measurementsOf,
-  questionHeadNoun,
-  metricAsked, metricsMeasured, misreadRefusal, namedQualifiers, openStagesOf, parseBreakdown,
-  parseLedger, refusalDisprovedByThread,
-  inventedFilters, propertyVocabulary, reconcileBreakdown,
-  deniedPipeline, reconcileScope, recordPhraseMismatch, rephraseAsBreakdown, scopeChips, unknownMeasure,
-  warningSentence, windowText, withoutCurrencyClaim, withoutRefusedQualifier, withoutWriteParameter,
-  withoutBreakdown,
-} from './scope-core';
-export type {
-  BoundScope, BreakdownBucket, BreakdownReport, BucketVerdict, DisprovedRefusal, Evidence,
-  InventedFilter, LedgerEntry, Measurement, MisreadRefusal,
-  NamedQualifier, QualifierKind, QualifierState, QualifierVerdict, RecordMismatch, ScopeChip,
-  ScopeReport, VocabMetric, VocabOtherPipeline, VocabPipeline, VocabPropertyDef, VocabPropertyValue,
-  VocabStage, Vocabulary, WindowFormat,
-} from './scope-core';
+  API_KEYS_HREF, TEMPLATE_GROUPS, engineLine, engineOf, filterTemplates, groupTemplates, nearestTemplates,
+  starterTemplates,
+} from './templates-core';
+export type { Engine, EngineLine, NearestChip, NearestOnWire, TemplateGroup } from './templates-core';
 
 export const SPAN_TONE: Record<AiSpan['kind'], 'brand' | 'info' | 'teal' | 'purple' | 'neutral'> = {
   plan: 'purple',

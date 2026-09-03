@@ -16,12 +16,12 @@ import {
   type DataTableColumn, type SelectOption,
 } from '@/client/design';
 import {
-  OUTCOME_LABEL, OUTCOME_TONE, boardHref, reconcileScope, refusalOf, runOutcome, useAllApprovals, useApprovals,
-  rephraseAsBreakdown, useFeatureCatalogue, useRun, useVocabulary,
+  OUTCOME_LABEL, OUTCOME_TONE, answerCard, runOutcome, useAiStatus, useAllApprovals, useApprovals,
+  useFeatureCatalogue, useRun, useTemplates, useVocabulary, windowText,
   type AiRun, type RunDetail, type RunOutcome,
 } from './api';
 import { ApprovalQueue, CitationChips, ReasoningList, RunFacts, TraceSteps } from './trace';
-import { RephraseLink, ScopeBar, ScopeWarning } from './scope';
+import { EngineIndicator, RefusalHelp, SlotChips } from './card';
 
 /** How many runs one read of the log brings back, and how far each “show more” goes. */
 const PAGE = 100;
@@ -427,6 +427,8 @@ export function RunDetailPage({ id }: { id: string }) {
   const { navigate } = useRouter();
   const run = useRun(id);
   const vocabulary = useVocabulary();
+  const templates = useTemplates();
+  const ai = useAiStatus();
   const [showAnswer, setShowAnswer] = useState(true);
 
   if (run.error) {
@@ -455,10 +457,6 @@ export function RunDetailPage({ id }: { id: string }) {
   }
 
   const detail: RunDetail = run.data;
-  const refusal = refusalOf(detail);
-  // The phrasing of the same question the engine does answer, offered as one
-  // press rather than left to the reader to guess at.
-  const rephrase = rephraseAsBreakdown(detail.question, vocabulary.vocab);
   const outcome = runOutcome(detail, detail.approvals);
   // The header and the panel below it are counting the same array. They used to
   // read `span_count`, which is stamped when the run finishes and never sees the
@@ -466,22 +464,30 @@ export function RunDetailPage({ id }: { id: string }) {
   const steps = detail.trace.length;
 
   /**
-   * The scope this run measured at, from the trace rather than the message.
-   *
-   * A run's own page has the spans, so the arguments each tool really ran with
-   * are first-hand here — the same reconciliation the conversation does, from a
-   * better source.
+   * What the run's own page says about the answer — from the trace rather than
+   * the message. The spans carry the arguments each tool really ran with, so
+   * the slot chips here are first-hand; the engine and the nearest shapes are
+   * read off the run.
    */
-  const scope = reconcileScope({
+  const card = answerCard({
     question: detail.question,
-    prose: detail.answer ?? '',
     toolCalls: detail.trace.filter((span) => span.kind === 'tool').map((span) => ({ name: span.name, arguments: span.args })),
-    reasoning: detail.reasoning,
+    run: detail,
+    remembered: null,
+    templates: templates.data?.data ?? [],
+    hosted: ai.data ? ai.data.provider.hosted : true,
     vocab: vocabulary.vocab,
-    resolveId: (recordId) => detail.citations.find((c) => c.id === recordId)?.label
-      ?? vocabulary.vocab.people.find((person) => person.id === recordId)?.name
-      ?? null,
+    format: {
+      window: (w) => windowText(w, {
+        dateRange: (start, end) => f.dateRange(start, end, { timeZone: 'UTC' }),
+        date: (ts) => f.date(ts, { timeZone: 'UTC' }),
+      }),
+      name: (recordId) => detail.citations.find((c) => c.id === recordId)?.label
+        ?? vocabulary.vocab.people.find((person) => person.id === recordId)?.name
+        ?? recordId,
+    },
   });
+  const askAgain = (next: string) => navigate(`/copilot?new=1&ask=${encodeURIComponent(next)}`);
 
   return (
     <Page
@@ -517,15 +523,12 @@ export function RunDetailPage({ id }: { id: string }) {
         </>
       }
     >
-      {refusal && (
+      {card.refusal && (
         <Banner tone="warning" title="This run refused to answer" bar>
-          {refusal.message} <span className="cp-mono">({refusal.code})</span>
-          {rephrase && (
-            <RephraseLink
-              question={rephrase}
-              onAsk={(next) => navigate(`/copilot?new=1&ask=${encodeURIComponent(next)}`)}
-            />
+          {card.refusal.message && (
+            <p>{card.refusal.message} <span className="cp-mono">({card.refusal.code})</span></p>
           )}
+          <RefusalHelp refusal={card.refusal} onAsk={askAgain} />
         </Banner>
       )}
       {detail.status === 'failed' && detail.error && (
@@ -548,8 +551,10 @@ export function RunDetailPage({ id }: { id: string }) {
           </Button>
         }
       >
-        <ScopeWarning report={scope} board={boardHref(detail.question, vocabulary.vocab)} />
-        <ScopeBar report={scope} vocab={vocabulary.vocab} loading={vocabulary.loading} />
+        <div className="cp-answer__head" style={{ marginBottom: 'var(--space-4)' }}>
+          <EngineIndicator line={card.indicator} onOpen={navigate} />
+        </div>
+        <SlotChips slots={card.slots} />
         {showAnswer && (
           detail.answer
             ? <pre className="cp-code" style={{ whiteSpace: 'pre-wrap' }}>{detail.answer}</pre>

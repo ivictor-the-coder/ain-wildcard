@@ -12,24 +12,6 @@ export type ConfidenceBand = 'high' | 'medium' | 'low';
 export const confidenceBand = (confidence: number | null): ConfidenceBand =>
   confidence === null ? 'low' : confidence >= 0.8 ? 'high' : confidence >= 0.55 ? 'medium' : 'low';
 
-/**
- * What the confidence chip says.
- *
- * The percentage is the intent classifier's margin, and it was highest exactly
- * where the answer was worst: 99% on the write that moved the wrong deal, 98%
- * on a named-deal question answered for the whole account, 98% on a CSAT
- * refusal — against 79% and 67% on two correct, fully scoped answers. Printing
- * it first put the anti-correlated number in the biggest type on the card. The
- * unbound count is the half of this chip that is accurate, so where there is
- * one it is the whole chip, and the margin moves to the tooltip.
- */
-export const confidenceChip = (percent: number, unbound: number): string => {
-  if (unbound <= 0) return `intent read at ${percent}%`;
-  return unbound === 1
-    ? '1 qualifier of this question is unbound'
-    : `${unbound} qualifiers of this question are unbound`;
-};
-
 /** Assistant prose arrives as paragraphs, some of them bullet lists. */
 export interface Block { kind: 'text' | 'list'; lines: string[] }
 
@@ -117,69 +99,6 @@ export function parseBlocks(content: string): Block[] {
  * between an honest "I did not answer that" and a confident-looking paragraph
  * that happens to contain no numbers.
  */
-/* ------------------------- what the thread carried ------------------------ */
-
-/**
- * A scope this answer inherited from an earlier question rather than from this
- * one.
- *
- * The engine writes it in its own notes — `"this turn" names nothing on its
- * own; carried Marcus Barnes from the previous turn, and the answer is scoped
- * to it.` — and then answers "What is our open pipeline?" with $315,900, one
- * contact's single deal, against a workspace total of $9,010,960. The prose
- * mentions it in a closing sentence under the number, and the scope row draws a
- * calm grey `ACCOUNT · Marcus Barnes` chip that reads as a scope the reader
- * asked for.
- *
- * A thread that narrows every later question to an earlier question's subject
- * has to say so where the reader is looking, and let them take it off.
- */
-export interface CarriedScope {
-  /** The record the answer was scoped to. */
-  subject: string | null;
-  /** True when it came from the record the conversation is pinned to. */
-  pinned: boolean;
-  /** A measure carried forward from the question this one follows. */
-  measure: string | null;
-  /** The earlier question a carried measure came from. */
-  from: string | null;
-}
-
-const CARRIED_SUBJECT = /names nothing on its own; carried (.+?) from (the previous turn|the record this conversation is pinned to), and the answer is scoped to it\.?$/;
-const CARRIED_MEASURE = /names no measure of its own; carried (.+?) forward from "(.*)", the question it follows\.?$/;
-
-export function carriedScope(run: { reasoning?: string[] } | undefined | null): CarriedScope | null {
-  let subject: string | null = null;
-  let pinned = false;
-  let measure: string | null = null;
-  let from: string | null = null;
-  for (const line of run?.reasoning ?? []) {
-    const held = CARRIED_SUBJECT.exec(line.trim());
-    if (held) { subject = held[1].trim(); pinned = held[2].startsWith('the record'); continue; }
-    const inherited = CARRIED_MEASURE.exec(line.trim());
-    if (inherited) { measure = inherited[1].trim(); from = inherited[2].trim(); }
-  }
-  return subject || measure ? { subject, pinned, measure, from } : null;
-}
-
-/**
- * Words that ask about the whole workspace, so a carried record contradicts them.
- *
- * "What is our open pipeline?" is a question about Northwind Robotics. Answered
- * $315,900 for a contact carried in from two questions ago, it is wrong by
- * 28×, and the only thing on the card that says which set it counted is a chip
- * the size of a postage stamp.
- */
-const WHOLE_WORKSPACE = /(^|[^a-z])(our|the workspace|across the workspace|company[ -]wide|overall|in total|altogether)([^a-z]|$)/i;
-
-/** Whether this question's own words contradict a scope carried into it. */
-export function contradictsCarried(question: string, carried: CarriedScope | null): boolean {
-  if (!carried?.subject) return false;
-  const text = question.toLowerCase();
-  if (text.includes(carried.subject.toLowerCase())) return false;
-  return WHOLE_WORKSPACE.test(text);
-}
-
 /* --------------------------- a write not prepared ------------------------- */
 
 /**

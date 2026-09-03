@@ -13,7 +13,7 @@ import v from '../../../shared/validate';
 import { DAY } from '../../../shared/time';
 import {
   accountProfile, businessMetric, delinquentCustomers, meteredUsage, recordAggregate, recordSearch, recordTimeline,
-  staleAccounts, workspaceSearch,
+  staleAccounts, subscriptionsOnProduct, workspaceSearch,
 } from '../../ai/functions';
 import { metricById, metricIds } from '../../ai/metrics';
 import { composeDraft, DRAFT_KINDS, TONES, detectDraftKind, detectTone, type DraftKind, type Tone } from '../../ai/draft';
@@ -155,6 +155,19 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
       tags: ['ai', 'billing', 'collections'],
       input: v.object({ limit: v.optional(v.int({ min: 1, max: 50 })) }),
       run: (args: { limit?: number }, _c, meta) => delinquentCustomers(ctx, meta.orgId, args),
+    },
+    {
+      name: 'subscriptions_on_plan',
+      description:
+        'Every subscription carrying an item priced on one product — "who is on Growth?" answered through the price book, so monthly, annual and per-seat prices of the same plan all count. '
+        + 'Cancelled and expired subscriptions are left out. Pass the product id.',
+      readOnly: true,
+      tags: ['ai', 'billing'],
+      input: v.object({
+        product_id: v.string({ min: 3, max: 80, description: 'The catalogue product id.' }),
+        limit: v.optional(v.int({ min: 1, max: 100 })),
+      }),
+      run: (args: { product_id: string; limit?: number }, _c, meta) => subscriptionsOnProduct(ctx, meta.orgId, args),
     },
     {
       name: 'stale_accounts',

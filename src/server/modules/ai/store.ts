@@ -8,7 +8,7 @@
  */
 import type { Ctx } from '../../kernel/context';
 import { parseJson } from '../../kernel/db';
-import { describeWrite } from '../../ai/synth';
+import { describeWrite } from '../../ai/writes';
 import { newId } from '../../../shared/ids';
 import { dayKey } from '../../../shared/time';
 import { maskSecrets } from '../../ai/runtime';

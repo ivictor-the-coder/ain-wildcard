@@ -217,14 +217,6 @@
 }
 .cp-answer__body p { margin: 0; white-space: pre-wrap; }
 .cp-answer__body ul { margin: 0; padding-left: var(--space-7); display: flex; flex-direction: column; gap: var(--space-2); }
-/* The gap between the answer landing and the workspace vocabulary that
-   corrects it landing. Nothing of the engine's prose is drawn here: a sentence
-   this surface is about to replace must not be read first. */
-.cp-answer__waiting {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-}
 .cp-answer__caret {
   display: inline-block;
   width: 2px;
@@ -276,18 +268,21 @@ a.cp-chip { text-decoration: none; }
 .cp-chip--flat { cursor: default; border-style: dashed; color: var(--text-tertiary); }
 .cp-chip--flat:hover { border-color: var(--border-default); color: var(--text-tertiary); background: var(--bg-surface); }
 
-/* ------------------------------- answer scope ----------------------------- */
+/* ------------------------------- slot chips ------------------------------- */
 
-.cp-scope { display: flex; flex-direction: column; gap: var(--space-2); }
-.cp-scope__row { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
-.cp-scope__label {
+/*
+ * The slot values a template bound, read off the plan the engine ran. Calm by
+ * design: there is nothing to warn about, because there is nothing guessed.
+ */
+.cp-slots { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
+.cp-slots__label {
   font-size: var(--text-2xs);
   text-transform: uppercase;
   letter-spacing: var(--tracking-wide);
   color: var(--text-tertiary);
   margin-right: var(--space-2);
 }
-.cp-scope__chip {
+.cp-slot {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
@@ -299,58 +294,154 @@ a.cp-chip { text-decoration: none; }
   font-size: var(--text-xs);
   color: var(--text-secondary);
 }
-.cp-scope__key {
+.cp-slot__key {
   font-size: var(--text-2xs);
   text-transform: uppercase;
   letter-spacing: var(--tracking-wide);
   color: var(--text-tertiary);
 }
-/* The dimension the question named and the query left wide open. */
-.cp-scope__chip.is-wide {
-  border-color: var(--border-danger-subtle);
-  background: var(--surface-danger);
-  color: var(--text-danger);
-}
-.cp-scope__chip.is-wide .cp-scope__key { color: var(--text-danger); }
-/* A dimension drawn from a tool argument that nothing in the answer confirms. */
-.cp-scope__chip.is-unchecked {
-  border-style: dashed;
-  border-color: var(--border-warning);
-  background: var(--bg-surface);
-  color: var(--text-tertiary);
-}
-.cp-scope__unchecked {
-  font-size: var(--text-2xs);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-wide);
-  color: var(--text-warning);
-}
-.cp-scope__reasons { margin: var(--space-2) 0 0; padding-left: var(--space-6); display: grid; gap: var(--space-2); list-style: disc; }
-.cp-scope__reasons > li { display: list-item; }
-.cp-answer.is-unscoped { border-color: var(--border-danger); }
+.cp-reasons { margin: var(--space-2) 0 0; padding-left: var(--space-6); display: grid; gap: var(--space-2); list-style: disc; }
+.cp-reasons > li { display: list-item; }
 
-/* ------------------------------- breakdown -------------------------------- */
+/* ----------------------------- engine indicator --------------------------- */
 
-.cp-breakdown { display: grid; gap: var(--space-2); }
-.cp-breakdown__list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-1); }
-.cp-breakdown__list--plain li { grid-template-columns: minmax(0, 1fr) auto; }
-.cp-breakdown__list li {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  gap: var(--space-3);
+/*
+ * "answered from a template" / "answered by the model". Small, in the head of
+ * the card beside the model badge, and honest about what it would take to ask
+ * more: with no key the line carries the link to Settings › API keys.
+ */
+.cp-engine {
+  display: inline-flex;
   align-items: center;
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border-default);
   background: var(--bg-subtle);
-  font-size: var(--text-sm);
-}
-.cp-breakdown__figure { font-variant-numeric: tabular-nums; font-weight: var(--weight-medium); }
-.cp-chip__type {
   font-size: var(--text-2xs);
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  max-width: 100%;
+}
+.cp-engine--anthropic { border-color: var(--border-brand); color: var(--text-brand); background: var(--accent-subtle); }
+.cp-engine__link {
+  color: var(--text-link, var(--text-brand));
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  white-space: normal;
+}
+.cp-engine__link:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
+
+/* ------------------------------ refusal help ------------------------------ */
+
+/*
+ * The nearest shapes the engine does answer, directly under the refusal. Each
+ * chip carries the whole question — nobody presses a sentence they cannot read
+ * — so the row wraps rather than truncates.
+ */
+.cp-help {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+  padding: var(--space-4);
+  border: 1px dashed var(--border-brand);
+  border-radius: var(--radius-md);
+  background: var(--accent-subtle);
+}
+.cp-help__label {
+  flex-basis: 100%;
+  font-size: var(--text-2xs);
   text-transform: uppercase;
   letter-spacing: var(--tracking-wide);
+  color: var(--text-tertiary);
 }
+.cp-help__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 100%;
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--border-brand);
+  border-radius: var(--radius-full);
+  background: var(--bg-surface);
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+.cp-help__chip:hover { background: var(--accent-subtle); color: var(--text-brand); }
+.cp-help__chip:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.cp-help__more {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-full);
+  background: transparent;
+  font: inherit;
+  font-size: var(--text-xs);
+  color: var(--text-link, var(--text-secondary));
+  cursor: pointer;
+}
+.cp-help__more:hover { background: var(--bg-hover); }
+.cp-help__more:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.cp-answer.is-refused > .cp-answer__body { color: var(--text-secondary); }
+
+/* ------------------------------ what can I ask ---------------------------- */
+
+.cp-templates { display: grid; gap: var(--space-6); }
+.cp-templates__filter { margin-bottom: var(--space-5); }
+.cp-templates__group { display: grid; gap: var(--space-3); }
+.cp-templates__title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+}
+.cp-templates__count {
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+  color: var(--text-tertiary);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+}
+.cp-templates__blurb { margin: 0; font-size: var(--text-xs); color: var(--text-tertiary); }
+.cp-templates__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--space-2);
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+.cp-templates__empty { margin: 0; font-size: var(--text-sm); color: var(--text-secondary); }
+.cp-template {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.cp-template:hover { border-color: var(--border-brand); background: var(--accent-subtle); }
+.cp-template:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.cp-template__q { font-size: var(--text-sm); font-weight: var(--weight-medium); color: var(--text-primary); }
+.cp-template__why { font-size: var(--text-xs); color: var(--text-tertiary); }
+.cp-starters { display: grid; gap: var(--space-4); }
+.cp-starters > .cp-help__more { justify-self: start; }
 
 /* -------------------------------- trace ----------------------------------- */
 
@@ -605,82 +696,4 @@ a.cp-chip { text-decoration: none; }
   text-transform: uppercase;
   letter-spacing: var(--tracking-wide);
   color: var(--text-tertiary);
-}
-
-/* -------------------------- carried thread scope -------------------------- */
-
-/*
- * The scope a thread puts on questions that name none of their own.
- *
- * It is drawn as a row rather than folded into the scope bar because it is not
- * something the query decided: it is something the conversation decided, and
- * the only control over it is here.
- */
-.cp-carried {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  flex-wrap: wrap;
-  padding: var(--space-2) var(--space-3);
-  border: 1px dashed var(--border-warning, var(--border-strong));
-  border-radius: var(--radius-sm);
-  background: var(--bg-sunken);
-}
-.cp-carried--composer {
-  margin-bottom: var(--space-3);
-}
-.cp-carried__label {
-  font-size: var(--text-2xs);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-wide);
-  color: var(--text-tertiary);
-}
-.cp-carried__chip {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  min-width: 0;
-  max-width: 100%;
-  padding: var(--space-1) var(--space-3);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-full);
-  background: var(--bg-surface);
-  font-size: var(--text-xs);
-  color: var(--text-primary);
-}
-.cp-carried__from {
-  color: var(--text-tertiary);
-  font-size: var(--text-2xs);
-}
-.cp-carried__drop {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-1) var(--space-3);
-  border: 1px solid transparent;
-  border-radius: var(--radius-full);
-  background: transparent;
-  color: var(--text-link, var(--text-secondary));
-  font: inherit;
-  font-size: var(--text-xs);
-  cursor: pointer;
-}
-.cp-carried__drop:hover { background: var(--bg-hover); }
-.cp-carried__drop:focus-visible {
-  outline: 2px solid var(--border-focus);
-  outline-offset: 2px;
-}
-
-/* --------------------------- a quarantined answer ------------------------- */
-
-/*
- * A figure measured with a filter nobody asked for is not printed in the
- * answer slot. It is kept — throwing away what the engine returned would be
- * worse — behind a summary that says what it actually is.
- */
-.cp-quarantine > summary {
-  color: var(--text-danger, var(--text-secondary));
-}
-.cp-quarantine[open] > summary {
-  margin-bottom: var(--space-3);
 }

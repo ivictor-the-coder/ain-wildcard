@@ -2,28 +2,29 @@
  * A chase, checked against the ledger it is a claim about.
  *
  * `POST /v1/ai/draft` reads the outstanding invoices of the record it is given
- * — and it can only read them for a *billing* account. Handed a deal id, which
- * is the only kind of id this dialog has ever sent, it finds no customer, finds
- * no invoices, and composes the honest sentence for that state: "the billing
- * ledger shows no invoice with an amount still due on that account — every
- * issued invoice is paid, void or draft."
+ * — and it can only read them for a *billing* account. Handed a deal id, it
+ * finds no customer, finds no invoices, and composes the honest sentence for
+ * that state: "the billing ledger shows no invoice with an amount still due on
+ * that account". Brightline Foods owes $127,840 on NR-000032, 56 days late,
+ * and that letter was offered for logging over a real signature.
  *
- * Brightline Foods owes $127,840 on invoice NR-000032, due 56 days ago. Every
- * dunning draft this dialog produced said the opposite, over a real signature,
- * to the customer who owes it.
+ * So the chase is composed from the account, and the letter is read back
+ * against the same ledger this client can see. The check runs on the text as
+ * it stands when it is logged — edits included — and it is mechanical, so the
+ * dialog can print exactly what it does and nothing more:
  *
- * Two things follow, and both live here so they can be tested without a
- * browser. The chase is drafted on the account, because that is the record the
- * ledger hangs off. And the draft is read back against the same ledger this
- * client can see: a chase that names no invoice the ledger holds, that declares
- * an account square while money is due on it, or that puts a figure to the
- * customer which no open invoice carries, is refused rather than shown for
- * logging.
+ *   - every invoice number in the text, whatever its case, must be one the
+ *     ledger holds;
+ *   - every figure with a currency sign or code, and every number written with
+ *     decimals, must be an open invoice's balance or their total;
+ *   - a chase on an account with money due must name at least one of its
+ *     invoices, and a chase on an account with nothing due may name no figure.
  *
- * "The draft" means the text at the moment it is logged, edits included. The
- * dialog hands the reader an editable body under a banner that says the figures
- * were checked, and a check that only ever ran on the engine's first draft made
- * that banner a lie the instant anybody typed in the box.
+ * What it does not do is read the sentence around a figure. A letter that
+ * quotes the right invoice at the right amount and then says it is settled is
+ * a letter only a person can catch, and the banner says so rather than
+ * claiming a four-phrase word list is a guarantee. Never a promise the code
+ * does not keep.
  */
 
 import { formatMoney, parseMoney } from '../../../shared/money';
@@ -58,7 +59,7 @@ interface InvoiceRow {
   status?: string | null;
 }
 
-/** The bills with money still on them, newest debt last, as the draft cites them. */
+/** The bills with money still on them, oldest debt first, as the draft cites them. */
 export function ledgerFrom(rows: InvoiceRow[], now: number): LedgerRead {
   const bills = rows
     .filter((row) => typeof row.amount_due === 'number' && row.amount_due > 0)
@@ -79,59 +80,80 @@ export function ledgerFrom(rows: InvoiceRow[], now: number): LedgerRead {
 export const ledgerTotal = (ledger: LedgerRead): number | null =>
   (ledger.currencies.length === 1 ? ledger.bills.reduce((sum, bill) => sum + bill.amountDue, 0) : null);
 
-/**
- * The sentence the engine writes when it found no unpaid invoice.
- *
- * It is the right sentence for an account that owes nothing and a false one for
- * an account whose ledger the engine could not reach, and only the caller — who
- * has read the ledger itself — can tell those two apart.
- */
-const DECLARES_SQUARE = /(no unpaid invoice|no invoice with an amount still due|nothing to chase|every issued invoice is paid)/i;
-
 export type DunningVerdict =
   | { state: 'ok' }
   | { state: 'unresolved'; why: string }
   | { state: 'contradicted'; why: string };
 
-/** A money figure exactly as a draft writes it, and what it is worth. */
+/** A money figure exactly as a draft writes it. */
 export interface DraftFigure {
   /** Verbatim, so the reader is shown the words they typed — "$127,480.00". */
   text: string;
-  /** Integer minor units. */
-  minor: number;
-  currency: string;
+  /** The digits alone — "127,480.00". */
+  digits: string;
+  /**
+   * The book the figure named, or null for a bare decimal, which is in
+   * whichever book the ledger keeps.
+   */
+  currency: string | null;
 }
 
 /** The books a bare glyph can only mean one of. */
 const SYMBOL_BOOK: Record<string, string> = { $: 'usd', '€': 'eur', '£': 'gbp', '¥': 'jpy' };
 
-const GLYPH_FIGURE = /([$€£¥])\s?(\d[\d,]*(?:\.\d+)?)/g;
-const CODED_FIGURE = /(\d[\d,]*(?:\.\d+)?)\s*([A-Za-z]{3})(?![A-Za-z])/g;
+const NUMBER = '\\d[\\d,]*(?:\\.\\d+)?';
+const GLYPH_FIGURE = new RegExp(`([$€£¥])\\s?(${NUMBER})`, 'g');
+const CODE_BEFORE = new RegExp(`(?<![A-Za-z])([A-Za-z]{3})\\s?(${NUMBER})(?![\\d.%A-Za-z])`, 'g');
+const CODE_AFTER = new RegExp(`(${NUMBER})\\s?([A-Za-z]{3})(?![A-Za-z])`, 'g');
+/**
+ * A number with a decimal fraction and no book beside it — "127,480.00".
+ *
+ * Not preceded by a sign, a code, a letter or another digit; not followed by
+ * a percent sign, more of a dotted date, or a letter. "6,400 employees" and
+ * "56 days" are whole numbers and are not read as money, and the banner says
+ * so in as many words.
+ */
+const BARE_DECIMAL = /(?<![\d.,$€£¥A-Za-z])(\d[\d,]*\.\d{1,2})(?![\d.%A-Za-z])/g;
+
+/** The currency codes a letter may write a figure in and have it read as one. */
+export const booksReadable = (currencies: readonly string[]): Set<string> =>
+  new Set([...Object.values(SYMBOL_BOOK), ...currencies.map((code) => code.toLowerCase())]);
 
 /**
- * Every money figure in a piece of writing, in minor units.
+ * Every money figure in a piece of writing.
  *
- * A glyph names its book on its own. A trailing code is only read as one when
- * the ledger itself is kept in that book — otherwise "3,100 employees" and
- * "56 days" become currency, and a guard that reads noise as money is a guard
- * nobody can leave switched on.
+ * A glyph names its book. A three-letter code before or after the number
+ * names its book when it is one of the books this ledger, or a glyph, can be
+ * written in — so "Jul 8" and "56 days" are not money and "USD 127,480.00" and
+ * "127,480.00 usd" are, whatever their case. A number written with decimals
+ * and nothing beside it is money too.
  */
 export function figuresIn(text: string, currencies: readonly string[]): DraftFigure[] {
+  const books = booksReadable(currencies);
   const out: DraftFigure[] = [];
-  const push = (raw: string, digits: string, currency: string) => {
-    try {
-      out.push({ text: raw, minor: parseMoney(digits, currency).amount, currency });
-    } catch { /* not a number this product can hold */ }
+  const spans: [number, number][] = [];
+  const claim = (start: number, raw: string, digits: string, currency: string | null) => {
+    const end = start + raw.length;
+    if (spans.some(([s, e]) => start < e && end > s)) return;
+    spans.push([start, end]);
+    out.push({ text: raw, digits, currency });
   };
-  for (const match of text.matchAll(GLYPH_FIGURE)) {
-    push(match[0], match[2], SYMBOL_BOOK[match[1]] ?? 'usd');
+  for (const match of text.matchAll(GLYPH_FIGURE)) claim(match.index ?? 0, match[0], match[2], SYMBOL_BOOK[match[1]]);
+  for (const match of text.matchAll(CODE_BEFORE)) {
+    const code = match[1].toLowerCase();
+    if (books.has(code)) claim(match.index ?? 0, match[0], match[2], code);
   }
-  const books = new Set(currencies.map((code) => code.toLowerCase()));
-  for (const match of text.matchAll(CODED_FIGURE)) {
+  for (const match of text.matchAll(CODE_AFTER)) {
     const code = match[2].toLowerCase();
-    if (books.has(code)) push(match[0], match[1], code);
+    if (books.has(code)) claim(match.index ?? 0, match[0], match[1], code);
   }
-  return out;
+  for (const match of text.matchAll(BARE_DECIMAL)) claim(match.index ?? 0, match[0], match[1], null);
+  return out.sort((a, b) => text.indexOf(a.text) - text.indexOf(b.text));
+}
+
+/** What a figure is worth in a given book, in minor units — or null when it does not parse. */
+export function amountIn(figure: Pick<DraftFigure, 'digits'>, currency: string): number | null {
+  try { return parseMoney(figure.digits, currency).amount; } catch { return null; }
 }
 
 /**
@@ -139,30 +161,25 @@ export function figuresIn(text: string, currencies: readonly string[]): DraftFig
  *
  * The shape is taken from the ledger rather than typed here: Northwind's
  * invoices read `NR-000032`, so the prefix is whatever sits before the digits
- * on the bills this account actually holds. A workspace numbering its invoices
- * some other way gets its own pattern for free, and one numbering them with
- * bare digits gets none — which is the honest outcome, because a bare number in
- * a letter is as likely to be a date as a bill.
+ * on the bills this account actually holds, matched whatever its case and
+ * returned upper-cased so `nr-000099` and `NR-000099` are one number.
  */
 export function invoiceNumbersIn(text: string, bills: readonly OutstandingBill[]): string[] {
   const prefixes = new Set(
-    bills.map((bill) => /^([^0-9]{2,})/.exec(bill.number)?.[1] ?? '').filter(Boolean),
+    bills.map((bill) => (/^([^0-9]{2,})/.exec(bill.number)?.[1] ?? '').toUpperCase()).filter(Boolean),
   );
   const out: string[] = [];
   for (const prefix of prefixes) {
-    const pattern = new RegExp(`${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\d+`, 'g');
-    for (const match of text.matchAll(pattern)) if (!out.includes(match[0])) out.push(match[0]);
+    const pattern = new RegExp(`${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\d+`, 'gi');
+    for (const match of text.matchAll(pattern)) {
+      const number = match[0].toUpperCase();
+      if (!out.includes(number)) out.push(number);
+    }
   }
   return out;
 }
 
-/**
- * The figures this account's ledger will stand behind.
- *
- * Each open invoice's own balance, and — where every bill is in one book — the
- * total, because "you owe us $5,060.00 across two invoices" is a true sentence
- * a person is entitled to write.
- */
+/** The figures this ledger will stand behind: each open balance, and their total in one book. */
 const figuresHeld = (ledger: LedgerRead): Set<string> => {
   const held = new Set(ledger.bills.map((bill) => `${bill.currency}:${bill.amountDue}`));
   const total = ledgerTotal(ledger);
@@ -170,21 +187,24 @@ const figuresHeld = (ledger: LedgerRead): Set<string> => {
   return held;
 };
 
+const isHeld = (figure: DraftFigure, ledger: LedgerRead, held: Set<string>): boolean => {
+  const books = figure.currency ? [figure.currency] : ledger.currencies;
+  return books.some((book) => {
+    const minor = amountIn(figure, book);
+    return minor !== null && held.has(`${book}:${minor}`);
+  });
+};
+
+const invoiceWord = (n: number): string => (n === 1 ? 'the invoice' : `${n} invoices`);
+
 /**
- * Whether a chase may be shown to a person to send.
+ * Whether a chase may be logged, decided on the text that will be logged.
  *
- * A dunning letter is a claim about money made to a customer, so the bar is not
- * "probably right": either this client has read the ledger and the draft agrees
- * with it, or there is no letter.
- *
- * Every rule here runs on the text as it stands *now*, not on the text the
- * engine composed. The dialog prints "the draft is checked against these
- * figures before it can be logged" over an editable body, and that sentence was
- * true of the engine's draft and false of every edit made to it: the invoice
- * number could be changed to one the ledger does not hold, the $127,840.00
- * could be retyped as $127,480.00, and the letter went onto the timeline under
- * a banner promising it had been checked. A guarantee about money either holds
- * for the text that is logged or it is not a guarantee.
+ * A dunning letter is a claim about money made to a customer, so the bar is
+ * not "probably right": either this client has read the ledger and every
+ * number in the letter agrees with it, or there is no letter. Each rule names
+ * the mismatch in the reader's own words and what the ledger holds against it,
+ * which is the difference between "blocked" and something a person can fix.
  */
 export function checkDunning(
   draft: { subject: string; body: string },
@@ -195,49 +215,34 @@ export function checkDunning(
     return { state: 'unresolved', why: ledger.why ?? 'This account’s billing ledger could not be read.' };
   }
   const text = `${draft.subject}\n${draft.body}`;
-  const held = figuresHeld(ledger);
-  const stray = figuresIn(text, ledger.currencies).find((figure) => !held.has(`${figure.currency}:${figure.minor}`));
+  const figures = figuresIn(text, ledger.currencies);
   if (!ledger.bills.length) {
-    // Nothing is owed, so the engine's "nothing to chase" is the truth. A draft
-    // that chases anyway would be the same defect pointing the other way.
-    if (stray) {
-      return {
-        state: 'contradicted',
-        why: `This draft puts ${stray.text} to the customer. The ledger holds no invoice with an amount still due on this account.`,
-      };
-    }
-    return DECLARES_SQUARE.test(text)
-      ? { state: 'ok' }
-      : { state: 'contradicted', why: 'The ledger shows nothing due on this account, and this draft chases a payment.' };
+    // Nothing is owed, so a letter that puts a figure to the customer is
+    // chasing money the ledger does not hold — the same defect the other way.
+    const stray = figures[0];
+    return stray
+      ? { state: 'contradicted', why: `This draft puts ${stray.text} to the customer. The ledger holds no invoice with an amount still due on this account.` }
+      : { state: 'ok' };
   }
-  if (DECLARES_SQUARE.test(text)) {
-    return {
-      state: 'contradicted',
-      why: `This draft tells the customer nothing is owed. The ledger has ${ledger.bills.length === 1 ? 'an invoice' : `${ledger.bills.length} invoices`} still due.`,
-    };
-  }
-  const cited = ledger.bills.filter((bill) => bill.number && text.includes(bill.number));
-  if (!cited.length) {
-    return {
-      state: 'contradicted',
-      why: `This draft names none of the ${ledger.bills.length === 1 ? 'invoice' : `${ledger.bills.length} invoices`} still due on this account.`,
-    };
-  }
-  // One held number is not enough once the text can be edited: the subject can
-  // keep NR-000032 while the paragraph the customer reads chases NR-000099.
-  const numbers = new Set(ledger.bills.map((bill) => bill.number));
-  const strayNumber = invoiceNumbersIn(text, ledger.bills).find((number) => !numbers.has(number));
+  const numbers = new Set(ledger.bills.map((bill) => bill.number.toUpperCase()));
+  const written = invoiceNumbersIn(text, ledger.bills);
+  const strayNumber = written.find((number) => !numbers.has(number));
   if (strayNumber) {
     return {
       state: 'contradicted',
       why: `This draft chases ${strayNumber}. There is no invoice by that number outstanding here: the ledger holds `
-        + `${[...numbers].join(', ')}.`,
+        + `${[...ledger.bills.map((bill) => bill.number)].join(', ')}.`,
     };
   }
-  // The amounts last, because a draft that cites the right invoice and the
-  // wrong figure is the one a customer argues with. Naming both halves — the
-  // figure as it is written and what the ledger holds against it — is the
-  // difference between "this is blocked" and a reader who can fix it.
+  if (!written.length) {
+    return {
+      state: 'contradicted',
+      why: `This draft names none of ${invoiceWord(ledger.bills.length)} still due on this account`
+        + ` — ${ledger.bills.map((bill) => bill.number).join(', ')}.`,
+    };
+  }
+  const held = figuresHeld(ledger);
+  const stray = figures.find((figure) => !isHeld(figure, ledger, held));
   if (stray) {
     return {
       state: 'contradicted',
@@ -251,17 +256,10 @@ export function checkDunning(
 /**
  * The verdict the dialog acts on, computed from the text that will be sent.
  *
- * The dialog holds two versions of the same letter: the one the engine
- * composed, and the one in the two editable boxes under it. It checked the
- * first and logged the second, under a banner reading "the draft is checked
- * against these figures before it can be logged" — so the guarantee held for
- * exactly as long as nobody typed. `outgoing` is the same value the Log button
- * posts, which is what makes that sentence true.
- *
- * `drafted` is only the engine's answer having arrived: there is nothing to
- * check before it does. It is taken rather than a flag because the shape of the
- * defect was reading it here instead of `outgoing`, and a signature that can
- * still express the mistake is one a test can hold this to.
+ * `outgoing` is the same value the Log button posts. `drafted` is only the
+ * engine's answer having arrived: there is nothing to check before it does,
+ * and the signature keeps the two apart so a test can hold this to checking
+ * the edited text rather than the delivered one.
  */
 export function chaseVerdict(
   kind: string,
@@ -275,6 +273,25 @@ export function chaseVerdict(
 }
 
 /**
+ * Whether the Log button may post, and why not when it may not.
+ *
+ * The one gate both the button's disabled state and the mutation itself read,
+ * so a stale render cannot log a letter the check has already refused.
+ */
+export function canLog(
+  kind: string,
+  drafted: { subject: string; body: string } | null,
+  outgoing: { subject: string; body: string },
+  ledger: LedgerRead,
+  money?: (minor: number, currency: string) => string,
+): { ok: true } | { ok: false; why: string } {
+  if (!outgoing.body.trim()) return { ok: false, why: 'There is nothing to log: the body is empty.' };
+  const verdict = chaseVerdict(kind, drafted, outgoing, ledger, money);
+  if (!verdict || verdict.state === 'ok') return { ok: true };
+  return { ok: false, why: verdict.why };
+}
+
+/**
  * Which record a draft of this kind has to be composed from.
  *
  * Everything else is written from the deal — its next step, its amount, its
@@ -282,3 +299,19 @@ export function chaseVerdict(
  * a deal id resolves to no billing customer at all.
  */
 export const draftsFromAccount = (kind: string): boolean => kind === 'dunning';
+
+/**
+ * The one sentence the dialog prints about what it checks — kept beside the
+ * check so the two cannot drift apart. Every clause of `checks` is a rule in
+ * `checkDunning`; `limit` is what no rule here does.
+ */
+export const LEDGER_PROMISE = {
+  checks: [
+    'every invoice number, whatever its case, must be one of these',
+    'every figure with a currency sign or code, and every number written with decimals, must be one of these amounts or their total',
+  ],
+  limit: 'A whole number with no sign and no decimals is not read as money, and the words around a figure are not read at all — whether the letter says the money is owed or settled is yours to check.',
+} as const;
+
+export const ledgerPromise = (): string =>
+  `Read from the billing ledger just now. Before this draft can be logged — edits included — ${LEDGER_PROMISE.checks.join('; ')}. ${LEDGER_PROMISE.limit}`;

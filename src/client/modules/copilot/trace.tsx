@@ -16,8 +16,8 @@ import {
   iconByName, useFormat, useToast,
 } from '@/client/design';
 import {
-  CITATION_ICON, OUTCOME_LABEL, OUTCOME_TONE, SPAN_ICON, SPAN_TONE, approvalOutcome, citationHref,
-  confidenceBand, confidenceChip, consequenceLines,
+  CITATION_ICON, OUTCOME_LABEL, SPAN_ICON, SPAN_TONE, approvalOutcome, citationHref,
+  consequenceLines,
   humanTool, isWiderName, linkedTargetOf, needsAcknowledgement, outcomeSummary, recordLink,
   recordPhraseMismatch,
   runOutcome, stageConsequences, stageWriteOf, useRun, useVocabulary, writeTargetLabel, writeTargets,
@@ -288,7 +288,7 @@ function WriteConsequences({ consequences, unread, onRetry }: {
           approving this will fail and nothing will be written.
         </p>
       )}
-      <ul className="cp-scope__reasons">
+      <ul className="cp-reasons">
         {lines.map((line) => <li key={line.text}>{line.text}</li>)}
       </ul>
     </Banner>
@@ -729,45 +729,6 @@ export function ApprovalQueue({ approvals, question, onDecided }: {
 }
 
 /* --------------------------------- run bits ------------------------------- */
-
-/**
- * The engine's confidence is in its *reading of the question*, not in the
- * answer — so the chip says so, and no longer says it in the words "question
- * read at". That label was highest exactly where the question had been read
- * worst: 98% on a CSAT question answered with a company card, 98% on an
- * outstanding-balance question answered with a deal list, 99% on the write that
- * moved the wrong deal. It measures the intent classifier's margin, so it is
- * named after that.
- *
- * And where a qualifier of the question went unbound the percentage does not
- * appear at all. Printing "intent read at 99%" beside "1 unbound" put the
- * number that is anti-correlated with trustworthiness first, in the biggest
- * type on the card, on exactly the answers that answered something else. The
- * count is the accurate half; the classifier's margin moves to the tooltip,
- * where it is still readable and no longer the headline.
- */
-export function ConfidenceBadge({ run, refused, unbound = 0 }: {
-  run: AiRun;
-  refused?: boolean;
-  /** Qualifiers the question named that the answer did not narrow to. */
-  unbound?: number;
-}) {
-  if (run.confidence === null || refused) return null;
-  const band = confidenceBand(run.confidence);
-  const percent = Math.round(run.confidence * 100);
-  const tone = unbound > 0 ? 'danger' : band === 'high' ? 'success' : band === 'medium' ? 'warning' : 'danger';
-  return (
-    <Badge
-      size="sm"
-      tone={tone}
-      title={unbound > 0
-        ? `The intent classifier was ${percent}% sure this is a ${humanize(run.intent ?? 'question').toLowerCase()} question, and ${unbound === 1 ? 'one qualifier of it was' : `${unbound} qualifiers of it were`} left unbound. It is not a claim about the answer.`
-        : `The intent classifier was ${percent}% sure it read this as a ${humanize(run.intent ?? 'question').toLowerCase()} question. It is not a claim about the answer.`}
-    >
-      {confidenceChip(percent, unbound)}
-    </Badge>
-  );
-}
 
 export function RunFacts({ run, toolMs, approvals, steps }: {
   run: AiRun;
