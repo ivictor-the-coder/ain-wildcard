@@ -167,16 +167,11 @@ export const nav: NavItem[] = [
   { id: 'pipeline.deals', label: 'Deals', to: '/deals', group: 'crm', order: 30, icon: 'deals' },
 ];
 
+/**
+ * "Go to Deals" and "Create New deal" come from the nav and the create menu,
+ * so the palette only gets the views the sidebar cannot express.
+ */
 export const commands: CommandDef[] = [
-  {
-    id: 'pipeline.board',
-    title: 'Deal board',
-    subtitle: 'Your default pipeline, by stage, with the weighted forecast',
-    group: 'Go to',
-    keywords: ['deals', 'pipeline', 'kanban', 'forecast', 'opportunities'],
-    icon: 'deals',
-    run: (go) => go('/deals'),
-  },
   {
     id: 'pipeline.all',
     title: 'Every pipeline on one board',
@@ -194,15 +189,6 @@ export const commands: CommandDef[] = [
     keywords: ['deals', 'list', 'grid'],
     icon: 'table',
     run: (go) => go('/deals?display=table'),
-  },
-  {
-    id: 'pipeline.new-deal',
-    title: 'New deal',
-    subtitle: 'Open an opportunity on a pipeline',
-    group: 'Create',
-    keywords: ['deal', 'opportunity', 'add'],
-    icon: 'plus',
-    run: (go) => go('/deals?new=1'),
   },
   {
     id: 'pipeline.closing',

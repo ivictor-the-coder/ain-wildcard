@@ -12,6 +12,7 @@ import { useCallback, useMemo, useState } from 'react';
 import { api, useQuery, type ApiClientError, type ListEnvelope } from '../../kernel/api';
 import { useNavigate, useParams, useSearchParam } from '../../kernel/router';
 import { usePlatform } from '../../kernel/platform';
+import { useCurrentCrumb } from '../../kernel/shell';
 import {
   Badge, Banner, Button, Card, DataTable, EmptyState, Field, Grid, GridItem, Icons, Inline, Input,
   Modal, Page, Section, Select, Stack, Tabs, Textarea, Tooltip, humanize, useToast,
@@ -307,7 +308,7 @@ export function CustomersPage() {
           rowTone={(row) => (row.delinquent ? 'danger' : 'default')}
           maxHeight={640}
           toolbar={
-            <Inline gap={3}>
+            <Inline gap={3} wrap>
               <TableSearch view={view} onChange={setView} label="Search name, email or id" />
               <Select
                 size="sm"
@@ -557,6 +558,7 @@ export function CustomerDetailPage() {
   const [dialog, setDialog] = useState<null | 'credit' | 'subscription' | 'bill'>(null);
 
   const { data, error, loading, refetch } = useRecord<CustomerSummary>(`/v1/customers/${id}/summary`);
+  useCurrentCrumb(data?.customer.name);
 
   if (loading) return <Page title="Customer"><Loading label="Loading this account…" /></Page>;
   if (error || !data) {
@@ -610,7 +612,6 @@ export function CustomerDetailPage() {
       eyebrow="Customer"
       badge={customer.delinquent ? <span style={{ marginLeft: 'var(--space-4)' }}><Badge tone="danger" dot pill>Delinquent</Badge></span> : undefined}
       subtitle={accountHeadline(data, f)}
-      breadcrumbs={<RecordLink to="/billing/customers">Customers</RecordLink>}
       actions={
         <Inline gap={3}>
           <Button variant="secondary" iconLeft={<Icons.invoice size={15} />} onClick={() => setDialog('bill')}>Bill now</Button>

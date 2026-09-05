@@ -17,7 +17,10 @@ export const NAV_GROUP_ORDER: NavGroup[] = [
 /** An empty label means the group runs straight on without a heading. */
 export const NAV_GROUP_LABEL: Record<NavGroup, string> = {
   workspace: '',
-  crm: 'Customers',
+  // Not "Customers": that word is the billing account under Revenue, and a
+  // sidebar that headed Contacts and Companies with it had the same noun
+  // meaning two different records four rows apart.
+  crm: 'CRM',
   engage: 'Engage',
   revenue: 'Revenue',
   automation: 'Automation',
@@ -90,6 +93,27 @@ export function activeNavItem(items: NavItem[], path: string): NavItem | null {
 
 /* ============================== breadcrumbs =============================== */
 
+/**
+ * Path → label for every nav destination, parents before children.
+ *
+ * A section whose first child shares its own path — Copilot's "Conversations"
+ * at `/copilot` — must not rename the section: the crumb for `/copilot/runs`
+ * read "Home › Conversations › Runs & traces" with no "Copilot" anywhere in
+ * it. The first label written for a path is the one that stands.
+ */
+export function navLabelIndex(items: readonly NavItem[]): Map<string, string> {
+  const map = new Map<string, string>();
+  const put = (to: string, label: string) => {
+    const path = normalizePath(to);
+    if (!map.has(path)) map.set(path, label);
+  };
+  for (const item of items) {
+    put(item.to, item.label);
+    for (const child of item.children ?? []) put(child.to, child.label);
+  }
+  return map;
+}
+
 const ID_LIKE = /^[a-z][a-z0-9]{1,14}_[A-Za-z0-9]{4,}$/;
 
 /** `invoice-drafts` → "Invoice drafts". Object ids are left exactly as they are. */
@@ -128,6 +152,20 @@ export function crumbsFor(
   });
   delete crumbs[crumbs.length - 1].to;
   return crumbs;
+}
+
+/**
+ * The current crumb, named by the screen rather than the route.
+ *
+ * A route only knows its object type — "Deal", "Invoice", "Customer" — so
+ * three open tabs all read the same trail. Once a record has answered, the
+ * screen hands its name up through `useCurrentCrumb` and it replaces the last
+ * crumb here. Nothing else about the trail changes, so the parents stay links.
+ */
+export function withCurrentLabel(crumbs: CrumbSpec[], label: string | null | undefined): CrumbSpec[] {
+  const name = label?.trim();
+  if (!name || !crumbs.length) return crumbs;
+  return [...crumbs.slice(0, -1), { ...crumbs[crumbs.length - 1], label: name }];
 }
 
 /* ============================ palette ranking ============================= */
@@ -308,6 +346,36 @@ export const TIME_JUMPS: TimeJump[] = [
     at: (now) => addInterval(now, { unit: 'month', count: 3 }),
   },
 ];
+
+/** Midnight UTC of the civil day `now` falls on in `timeZone`. */
+export function civilDayStart(now: number, timeZone: string): number {
+  try {
+    const iso = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+    const parsed = Date.parse(`${iso}T00:00:00.000Z`);
+    if (Number.isFinite(parsed)) return parsed;
+  } catch { /* an unknown zone falls through to UTC */ }
+  const d = new Date(now);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+/**
+ * The instant a picked calendar day means for the clock.
+ *
+ * A date picker hands back midnight UTC of the day that was clicked. Jumping
+ * the clock to that instant lands a New York workspace at 8pm the *previous*
+ * evening: the picker read "Sep 4", the chip then read "Sep 3", and the button
+ * between them offered "Run 0 days of work". The day picked is kept, at the
+ * wall-clock time the workspace is at now, so a jump to tomorrow is exactly one
+ * day of work and the clock reads the day that was chosen.
+ */
+export function jumpTarget(pickedDay: number, now: number, timeZone: string): number {
+  return pickedDay + (now - civilDayStart(now, timeZone));
+}
+
+/** Whole civil days between now and a jump target, for "Run 3 days of work". */
+export function jumpDays(target: number, now: number, timeZone: string): number {
+  return Math.round((civilDayStart(target, timeZone) - civilDayStart(now, timeZone)) / DAY);
+}
 
 /**
  * What a clock move actually did, in the operator's language.

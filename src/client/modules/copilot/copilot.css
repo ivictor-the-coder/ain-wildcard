@@ -308,7 +308,7 @@ a.cp-chip { text-decoration: none; }
 /*
  * "answered from a template" / "answered by the model". Small, in the head of
  * the card beside the model badge, and honest about what it would take to ask
- * more: with no key the line carries the link to Settings › API keys.
+ * more: with no hosted model the line says which variable the server reads.
  */
 .cp-engine {
   display: inline-flex;
@@ -324,13 +324,10 @@ a.cp-chip { text-decoration: none; }
   max-width: 100%;
 }
 .cp-engine--anthropic { border-color: var(--border-brand); color: var(--text-brand); background: var(--accent-subtle); }
-.cp-engine__link {
-  color: var(--text-link, var(--text-brand));
-  text-decoration: underline;
-  text-underline-offset: 2px;
+.cp-engine__note {
+  color: var(--text-tertiary);
   white-space: normal;
 }
-.cp-engine__link:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
 
 /* ------------------------------ refusal help ------------------------------ */
 

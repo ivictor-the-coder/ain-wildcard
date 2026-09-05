@@ -912,14 +912,5 @@ export const nav: NavItem[] = [
   { id: 'home', label: 'Home', to: '/', group: 'workspace', order: 0, icon: 'dashboard' },
 ];
 
-export const commands: CommandDef[] = [
-  {
-    id: 'home.open',
-    title: 'Dashboard',
-    subtitle: 'Where the workspace stands right now',
-    group: 'Go to',
-    keywords: ['home', 'overview', 'dashboard'],
-    icon: 'dashboard',
-    run: (nav) => nav('/'),
-  },
-];
+/** "Go to Home" comes from the nav entry above; a second name for it does not. */
+export const commands: CommandDef[] = [];

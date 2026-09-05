@@ -10,6 +10,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, useMutation, useQuery, type ApiClientError, type ListEnvelope } from '../../kernel/api';
 import { useNavigate, useParams, useSearchParam } from '../../kernel/router';
+import { useCurrentCrumb } from '../../kernel/shell';
 import {
   AreaChart, Badge, Banner, Button, Card, ConfirmDialog, DataTable, DatePicker, DescriptionList,
   EmptyState, Field, Grid, Icons, Inline, Input, Modal, Page, RadioGroup, Section,
@@ -1143,6 +1144,7 @@ export function MeterDetailPage() {
   const [recording, setRecording] = useState(false);
 
   const meter = useQuery<MeterDetail>(`/v1/meters/${id}`);
+  useCurrentCrumb(meter.data?.name);
   // Rounded up to the hour so the request URL — which is the cache key — stops
   // changing on every render. Reading `now()` raw made each render ask for a
   // window one millisecond wider than the last, and the panel never resolved.

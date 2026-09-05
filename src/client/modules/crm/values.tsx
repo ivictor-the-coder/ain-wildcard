@@ -122,10 +122,10 @@ export function ValueView({ property, value, users, compact }: ValueViewProps) {
   switch (type) {
     case 'currency': {
       const currency = property?.currency ?? session.currency;
-      // In a grid the cents on a firmographic — "$2,460,000,000.00" — are pure
-      // noise, and they eat width the text columns beside them need. The record
-      // page and the CSV keep the exact figure.
-      return <span className="crm-num">{f.money(Number(value), { currency, trimZeroFraction: compact })}</span>;
+      // Money reads the same way it does on the board, the invoice and the
+      // dashboard — cents included. A grid that trimmed them printed "$96,520"
+      // beside a deal record and a billing screen saying "$96,520.00".
+      return <span className="crm-num">{f.money(Number(value), { currency })}</span>;
     }
     case 'number':
       return (

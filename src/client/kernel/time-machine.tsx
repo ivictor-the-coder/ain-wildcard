@@ -17,7 +17,7 @@ import {
   Banner, Button, ChevronsRightIcon, DatePicker, Divider, Icons, Popover, RotateCcwIcon,
   useFormat, useLocalStorage, useToast,
 } from '../design';
-import { TIME_JUMPS, clockOutcome, describeOffset, type ClockAftermath } from './shell-core';
+import { TIME_JUMPS, clockOutcome, describeOffset, jumpDays, jumpTarget, type ClockAftermath } from './shell-core';
 import { useTimeMachine, type ClockMove } from './platform';
 import { ApiClientError } from './api';
 import { DAY } from '../../shared/time';
@@ -48,8 +48,6 @@ interface RewindRefusal {
   message: string;
   requestId: string | null;
 }
-
-const roundDays = (ms: number): number => Math.round(ms / DAY);
 
 export const aftermathOf = (move: ClockMove): ClockAftermath | null =>
   move.aftermath
@@ -123,6 +121,11 @@ export function TimeMachine({ open, onOpenChange, now, offsetMs, clockKind, canA
   };
 
   const rewindDisabled = !virtual || !canAdvance || busy || !shifted;
+  // The picker hands back a UTC calendar day; the clock is jumped to that day
+  // at the workspace's current wall-clock time, so the chip reads the day that
+  // was chosen and the button counts whole days.
+  const target = chosen !== null ? jumpTarget(chosen, now, f.timeZone) : null;
+  const daysAhead = target !== null ? jumpDays(target, now, f.timeZone) : 0;
 
   return (
     <>
@@ -206,15 +209,15 @@ export function TimeMachine({ open, onOpenChange, now, offsetMs, clockKind, canA
             disabled={!virtual || !canAdvance || busy}
             aria-label="Jump the workspace clock to a date"
           />
-          {chosen !== null && chosen > now && (
+          {target !== null && daysAhead >= 1 && (
             <Button
               variant="primary"
               block
               loading={busy}
               iconLeft={<Icons.zap size={14} />}
-              onClick={() => jump(chosen, `Jumped ${roundDays(chosen - now)} days forward`)}
+              onClick={() => jump(target, `Jumped ${f.plural(daysAhead, 'day')} forward`)}
             >
-              Run {roundDays(chosen - now)} days of work
+              Run {f.plural(daysAhead, 'day')} of work
             </Button>
           )}
 

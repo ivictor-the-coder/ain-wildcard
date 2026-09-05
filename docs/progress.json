@@ -1,11 +1,11 @@
 {
-  "updated": "2026-09-03T15:16:50.686Z",
-  "headline": "CI is green again. The pre-template AI suite is retired: its live paths — approvals, gates, extraction, drafting, provider degradation, per-currency ledger figures — now run as 76 property tests in a new file, and the whole tree passes 1,574 tests. Next: a fresh critic prices the template engine on a corpus it writes itself, and the server modules carrying un-judged fixes are re-judged.",
+  "updated": "2026-09-05T01:51:42.412Z",
+  "headline": "Wave 9 re-judged the server against the database. The template engine’s only P0 in 458 questions was one optional word; revenue’s history was being rewritten by un-prorated plan changes; payments wrote off a 3DS card in a millisecond; billing billed usage a cycle late. All fixed with fail-before-pass tests, and a coherence pass removed every duplicated screen, trail and palette entry. Next: re-judge the fixes, then the client surfaces.",
   "stats": {
     "server modules": 10,
     "client modules": 8,
-    "ai templates": 91,
-    "tests": "1,574/1,574",
+    "ai templates": 94,
+    "tests": "1,644/1,644",
     "ci": "green"
   },
   "waves": [
@@ -144,19 +144,21 @@
           "id": "invoicing-tax",
           "title": "Invoicing, credit notes & tax",
           "status": "critique",
-          "rounds": 2,
-          "note": "Both verdicts fixed with fail-before-pass tests: an invoice whose tax location cannot be resolved is held at finalize and at pay with customer_tax_location_invalid, and a country-wide rate stacks under a state one. Awaiting a fresh critic.",
-          "operability": 0.85,
-          "debt": 0
+          "rounds": 3,
+          "note": "Every one of 43 invoices reconciled to the cent across stacked, inclusive, reverse-charged, prorated and credited cases. Two P1s fixed: metered usage now lands on the renewal that names its window (the bill waits for the settlement it says it settles), and a cancellation sweeps every pending proration into a final invoice. Open: the subscriptions overview still adds euros to dollars in its headline — a change that crosses three owners.",
+          "operability": 0.9,
+          "debt": 6,
+          "verdict": "The invoice arithmetic is Stripe-grade, but usage billed a month late, cancelled subscriptions left prorations unbilled, and the overview added euros to dollars."
         },
         {
           "id": "payments",
           "title": "Payments, retries & dunning",
           "status": "critique",
-          "rounds": 2,
-          "note": "An overpayment is now a negative ledger row on the customer’s account — the Stripe convention — and a refund of it returns that row, not a second payment. Awaiting a fresh critic.",
-          "operability": 0.8,
-          "debt": 0
+          "rounds": 3,
+          "note": "199 invoices, every ledger and every schedule reconciled to the row. Three P1s fixed: a card that needs its holder is held in past_due for the window the retries would have run in, not written off in a millisecond; a refund that reopens a paid bill hands it to a campaign; the do-not-retry family (stolen, lost, pickup, fraudulent, restricted) exists and is never presented twice.",
+          "operability": 0.96,
+          "debt": 4,
+          "verdict": "The money never lies here, but the recovery policy was harsher and narrower than Stripe’s: a 3DS card written off in a millisecond, a refunded bill owed by nobody, and no card-stolen family of declines."
         },
         {
           "id": "entitlements",
@@ -171,10 +173,11 @@
           "id": "revenue",
           "title": "Revenue reporting",
           "status": "critique",
-          "rounds": 2,
-          "note": "MRR aggregates over every subscription, bucketed per currency, and the cross-currency sum is never printed. Awaiting a fresh critic.",
-          "operability": 0.7,
-          "debt": 0
+          "rounds": 3,
+          "note": "Three P0s fixed: contract history is read from the event log so a schedule phase no longer rewrites closed months (Halstead’s April stays 9,900); credit notes reduce recognised and deferred from the day they are issued; usage \"charged\" is invoice money, not settlement-ledger money. A collection pause is a pause, not churn. Open: the module’s three copilot tools are not reachable from any template.",
+          "operability": 0.67,
+          "debt": 6,
+          "verdict": "The arithmetic on today’s book is exact, but the history underneath it was not durable: one un-prorated plan change rewrote five closed months, credit notes never reached recognition, and usage \"charged\" was money no invoice carried."
         }
       ]
     },
@@ -307,11 +310,11 @@
           "id": "template-engine",
           "title": "The template whitelist engine",
           "status": "critique",
-          "rounds": 2,
-          "note": "91 templates from the 50-metric catalogue, the CRM object types and every enumerated dimension; the tree is 8k lines smaller. Verified against the database: 25 closed-won, 39 closed, $1,463,440 Renewal. Property suite 282/282. Next: a fresh critic prices substitutions on its own corpus; zero is the pass.",
-          "operability": 0.92,
-          "debt": 0,
-          "verdict": "Sixteen suite failures turned out to be two test defects and one engine defect: list ordinals counted as figures; a refusal’s own reason (\"Q4 2026 has not started yet\") counted as a claim; and \"show me\" wired into value templates, so \"Show me our customers\" answered a count. Fixed; 282/282."
+          "rounds": 3,
+          "note": "458 questions priced by a fresh critic against the database: one substitution class, not 28. \"How many tickets does Rheinwerk have?\" answered the open subset because \"(open|)\" was optional in two patterns. Fixed as a literal with three whole-count shapes; four P1s (truncated breakdowns, \"in the last quarter\", \"carries\", \"by industry\") fixed with corpus rows. Nine P2s open.",
+          "operability": 0.95,
+          "debt": 9,
+          "verdict": "117 engine windows matched an independently resolved window, and \"last quarter\" moved after time travel. Zero period substitutions, zero cross-currency sums. The one P0 was a single optional word."
         },
         {
           "id": "copilot-templates",
@@ -330,6 +333,22 @@
           "operability": 1,
           "debt": 0,
           "note": "7,588 lines and 91 describes read one by one: 17 live suites ported as 76 property tests with expected values computed from the database; the rest tested deleted modules and went with them. One engine defect surfaced: the workspace clock was cached with the vocabulary, so “last quarter” stayed put after time travel."
+        }
+      ]
+    },
+    {
+      "name": "Wave 9 · Re-judged against the database",
+      "status": "active",
+      "note": "Four fresh critics, each with its own harness under .artifacts/, recomputed every figure from raw rows and named the single biggest gap. The builders fixed that gap and every P0 with fail-before-pass tests; a fifth agent walked the whole product for one working day and removed every seam it found.",
+      "pieces": [
+        {
+          "id": "coherence",
+          "title": "One product, not eight",
+          "status": "done",
+          "rounds": 1,
+          "operability": 1,
+          "debt": 0,
+          "note": "Two deal screens became one, two tax screens became one, four breadcrumb mechanisms became one, three \"New deal\" palette entries became one. Revenue’s status chips are billing’s pills; error and loading panels are shared; money shows cents everywhere; the notification read-marker and the time-machine picker follow the workspace clock. Eight static guards keep the seams from returning. Two more found while moving its e2e tests: the client cache forgot every answer on invalidation, so a screen blanked and its controls went disabled for the round trip after its own mutation — the tax hold switch could be toggled by space bar once and never again — and a seeded goodwill grant named an account that did not exist."
         }
       ]
     }

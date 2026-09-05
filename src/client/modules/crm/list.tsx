@@ -50,8 +50,16 @@ const RECORD_FIELD_INDEX = new Map(RECORD_FIELDS.map((f) => [f.name, f]));
 export const definitionFor = (index: Map<string, PropertyDef>, name: string): PropertyDef | undefined =>
   index.get(name) ?? RECORD_FIELD_INDEX.get(name);
 
+/**
+ * Where an object type's list lives. Deals belong to the pipeline module — the
+ * board and its table are the one deal screen — so a deal link from a company
+ * or a contact lands there, and `/records/deal` hands over to it.
+ */
 export const listHref = (objectType: string): string =>
-  objectType === 'contact' ? '/contacts' : objectType === 'company' ? '/companies' : `/records/${objectType}`;
+  objectType === 'contact' ? '/contacts'
+    : objectType === 'company' ? '/companies'
+      : objectType === 'deal' ? '/deals'
+        : `/records/${objectType}`;
 
 export const recordHref = (objectType: string, id: string): string => `${listHref(objectType)}/${id}`;
 
@@ -399,7 +407,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
   /** Pixels the widest figure in a numeric column needs, in tabular digits. */
   const numericWidth = useCallback((property: PropertyDef, rows: CrmRecord[]): number => {
     const render = (n: number) => (property.type === 'currency'
-      ? f.money(n, { currency: property.currency ?? session.currency, trimZeroFraction: true })
+      ? f.money(n, { currency: property.currency ?? session.currency })
       : f.number(n));
     let longest = 0;
     let sum = 0;
@@ -469,7 +477,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
           ? <UserChip id={row.owner_id} user={row.owner_id ? userIndex.get(row.owner_id) : undefined} />
           : <ValueView property={property} value={fieldValue(row, name)} users={userIndex} compact />),
         ...(property.type === 'currency'
-          ? { total: (rows: CrmRecord[]) => <span className="crm-num">{f.money(rows.reduce((n, r) => n + Number(fieldValue(r, name) ?? 0), 0), { currency: property.currency ?? session.currency, trimZeroFraction: true })}</span> }
+          ? { total: (rows: CrmRecord[]) => <span className="crm-num">{f.money(rows.reduce((n, r) => n + Number(fieldValue(r, name) ?? 0), 0), { currency: property.currency ?? session.currency })}</span> }
           : {}),
       });
     }

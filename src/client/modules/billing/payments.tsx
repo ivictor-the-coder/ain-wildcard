@@ -20,8 +20,8 @@ import {
 import { CreditCardIcon, XCircleIcon } from '../../design';
 import { useSession } from '../../kernel/session';
 import {
-  DialogFields, Loading, MoneyField, SectionError, StatusPill, idem, statusLabel, useAction, useBillingFormat,
-  useDialogForm,
+  DialogFields, Loading, MoneyField, SectionError, StatusPill, TaxIdStatusPill, idem, statusLabel, useAction,
+  useBillingFormat, useDialogForm,
 } from './common';
 import type { CreditBalance, CreditGrant, Customer, PaymentMethod, TaxId } from './types';
 
@@ -997,7 +997,7 @@ export function TaxRegistrationsCard({ customer }: { customer: Customer }) {
               </div>
             )}
           </div>
-          <div className="bl-row__aside"><StatusPill status={taxId.verification.status} /></div>
+          <div className="bl-row__aside"><TaxIdStatusPill status={taxId.verification.status} /></div>
           <div className="bl-row__act">
             <RowMenu sections={menuFor(taxId)} label={`Actions for ${taxId.value}`} />
           </div>

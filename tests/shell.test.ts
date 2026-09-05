@@ -1,11 +1,13 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 
 import {
-  NAV_GROUP_ORDER, TIME_JUMPS, activeNavItem, avatarSrc, crumbsFor, describeOffset, eventSubject,
+  NAV_GROUP_ORDER, TIME_JUMPS, activeNavItem, avatarSrc, civilDayStart, crumbsFor, describeOffset, eventSubject,
   eventTitle, fillParams, firstRegistered, fuzzyScore, greetingFor, groupNav, humanizeSegment,
-  isPathActive, jumpBindings, normalizePath, orderSetup, pushRecent, rankEntries,
-  pluralType, recordRouteCandidates, routeSetFrom, scoreEntry, serves, setupProgress, shortcutSheet,
+  isPathActive, jumpBindings, jumpDays, jumpTarget, navLabelIndex, normalizePath, orderSetup, pushRecent, rankEntries,
+  pluralType, recordRouteCandidates, routeSetFrom, scoreEntry, serves, setupProgress, shortcutSheet, withCurrentLabel,
   type SetupStep,
 } from '../src/client/kernel/shell-core';
 import {
@@ -485,5 +487,141 @@ describe('top-bar typeahead', () => {
   it('has no page to offer when nothing was typed', () => {
     assert.deepEqual(typeaheadTargets(groups, '   ').map((t) => t.id), ['company:cmp_1', 'invoice:in_9']);
     assert.deepEqual(typeaheadTargets([], ''), []);
+  });
+});
+
+/* ============================ one product, one seam ======================== */
+
+describe('record screens name the crumb through the shell', () => {
+  it('a child that shares its section’s path does not rename the section', () => {
+    const copilot: NavItem = {
+      ...nav('copilot', 'Copilot', '/copilot', 'automation'),
+      children: [
+        { id: 'threads', label: 'Conversations', to: '/copilot' },
+        { id: 'runs', label: 'Runs & traces', to: '/copilot/runs' },
+      ],
+    };
+    const index = navLabelIndex([copilot, nav('revenue', 'Revenue', '/revenue', 'insights')]);
+    // The old shell wrote children after parents into one map, so `/copilot`
+    // read "Conversations" and the trail for the runs screen lost "Copilot".
+    assert.equal(index.get('/copilot'), 'Copilot');
+    assert.equal(index.get('/copilot/runs'), 'Runs & traces');
+    assert.equal(index.get('/revenue'), 'Revenue');
+  });
+
+  it('the record’s name replaces only the current crumb, and a blank name changes nothing', () => {
+    const trail = crumbsFor('/deals/deal_nw_58', () => null);
+    const named = withCurrentLabel(trail, 'Kaskade Pharma Group — pilot');
+    assert.deepEqual(named.map((c) => c.label), ['Home', 'Deals', 'Kaskade Pharma Group — pilot']);
+    assert.equal(named[1].to, '/deals', 'the parents stay links');
+    assert.equal(named[2].to, undefined, 'you are already there');
+    assert.deepEqual(withCurrentLabel(trail, '  '), trail);
+    assert.deepEqual(withCurrentLabel(trail, null), trail);
+    assert.deepEqual(withCurrentLabel([], 'x'), []);
+  });
+});
+
+describe('time machine date picker', () => {
+  const NY = 'America/New_York';
+  const inNy = (ts: number) => new Intl.DateTimeFormat('en-CA', { timeZone: NY, year: 'numeric', month: '2-digit', day: '2-digit' }).format(ts);
+
+  it('lands on the day that was picked, at the workspace’s own time of day', () => {
+    const now = Date.UTC(2026, 8, 3, 15, 33); // Sep 3, 11:33 in New York
+    const picked = Date.UTC(2026, 8, 4); // what the calendar hands back for "Sep 4"
+    const target = jumpTarget(picked, now, NY);
+    // Jumping to the raw midnight-UTC instant read "Sep 3" on the chip and
+    // offered "Run 0 days of work" beside a picker showing Sep 4.
+    assert.equal(inNy(target), '2026-09-04');
+    assert.equal(target - now, DAY);
+    assert.equal(jumpDays(target, now, NY), 1);
+    assert.equal(jumpDays(jumpTarget(Date.UTC(2026, 8, 10), now, NY), now, NY), 7);
+  });
+
+  it('holds across the UTC midnight that New York evenings sit past', () => {
+    const now = Date.UTC(2026, 8, 4, 2, 0); // still Sep 3, 10pm in New York
+    assert.equal(inNy(now), '2026-09-03');
+    // The civil-day marker is a UTC calendar day — the currency the picker deals in.
+    assert.equal(new Date(civilDayStart(now, NY)).toISOString().slice(0, 10), '2026-09-03');
+    const target = jumpTarget(Date.UTC(2026, 8, 5), now, NY);
+    assert.equal(inNy(target), '2026-09-05');
+    assert.equal(jumpDays(target, now, NY), 2);
+  });
+});
+
+/**
+ * Seams that were closed by hand are kept closed by reading the modules'
+ * source. Every check below failed on the code it replaced.
+ */
+describe('the modules stay one product', () => {
+  const root = join(process.cwd(), 'src', 'client');
+  const modulesDir = join(root, 'modules');
+  const walk = (dir: string): string[] => readdirSync(dir).flatMap((name) => {
+    const full = join(dir, name);
+    return statSync(full).isDirectory() ? walk(full) : /\.(tsx?|css)$/.test(name) ? [full] : [];
+  });
+  // The style guide renders the kit for its own sake; it is not a screen.
+  const moduleFiles = walk(modulesDir).filter((file) => !file.includes(`${join('modules', 'design-lab')}`));
+  const routeFiles = moduleFiles.filter((file) => file.endsWith('routes.tsx'));
+  const source = (file: string) => readFileSync(file, 'utf8');
+  const rel = (file: string) => file.slice(root.length + 1);
+
+  it('no screen draws its own breadcrumb or reaches into the shell’s', () => {
+    // Each record page used to solve the crumb on its own — a DOM patch, a
+    // second trail inside the page, a slash-separated line. `useCurrentCrumb`
+    // is the one way; anything else is the seam coming back.
+    const offenders = moduleFiles.filter((file) => {
+      const text = source(file);
+      return /\bBreadcrumbs\b/.test(text) || /aria-label="Breadcrumb"/.test(text) || /\bbreadcrumbs=/.test(text);
+    });
+    assert.deepEqual(offenders.map(rel), []);
+  });
+
+  it('palette commands only use the three verbs the palette groups by', () => {
+    // A command in a group called "Revenue" sat under a noun heading beside
+    // "Go to", "Create" and "Run", and ranked by a rule the palette did not know.
+    const bad: string[] = [];
+    for (const file of routeFiles) {
+      const block = /export const commands[\s\S]*?\n\];/.exec(source(file))?.[0] ?? '';
+      for (const match of block.matchAll(/group:\s*'([^']+)'/g)) {
+        if (!['Go to', 'Create', 'Run'].includes(match[1])) bad.push(`${rel(file)}: ${match[1]}`);
+      }
+    }
+    assert.deepEqual(bad, []);
+  });
+
+  it('no module registers a "Go to" command for a destination the nav already lists', () => {
+    // The shell derives "Go to <label>" for every nav item and child, so a
+    // module command for the same address put the destination in the palette
+    // twice under two names — "Go to Deals" and "Deals", "Go to Tax" and "Tax".
+    const destinations = new Set<string>();
+    for (const file of routeFiles) {
+      const block = /export const nav[\s\S]*?\n\];/.exec(source(file))?.[0] ?? '';
+      for (const match of block.matchAll(/\bto:\s*'([^']+)'/g)) destinations.add(normalizePath(match[1]));
+    }
+    assert.ok(destinations.has('/deals') && destinations.has('/billing'), 'the nav was read');
+    const duplicates: string[] = [];
+    for (const file of routeFiles) {
+      const block = /export const commands[\s\S]*?\n\];/.exec(source(file))?.[0] ?? '';
+      const goTo = /group:\s*'Go to'[\s\S]*?run:\s*\(\s*\w+\s*\)\s*=>\s*\w+\(\s*['`]([^'`?]+)(\?[^'`]*)?['`]\s*\)/g;
+      for (const match of block.matchAll(goTo)) {
+        if (!match[2] && destinations.has(normalizePath(match[1]))) duplicates.push(`${rel(file)}: ${match[1]}`);
+      }
+    }
+    assert.deepEqual(duplicates, []);
+  });
+
+  it('activity is marked read on the workspace clock, never the machine’s', () => {
+    // Events are stamped on the workspace clock; after a jump forward, a
+    // read-marker taken from `Date.now()` left every one of them unread.
+    const shell = readFileSync(join(root, 'kernel', 'shell.tsx'), 'utf8');
+    assert.doesNotMatch(shell, /setReadAt\(\s*Date\.now\(\)/);
+  });
+
+  it('every status pill the revenue screens draw comes from the one map', () => {
+    // Revenue used to carry its own tone table, so a "Scheduled" grant was an
+    // amber chip on Credits and a neutral pill on the customer's page.
+    const revenueCommon = source(join(modulesDir, 'revenue', 'common.tsx'));
+    assert.doesNotMatch(revenueCommon, /function StatusChip/);
+    assert.match(revenueCommon, /StatusPill as StatusChip.*from '\.\.\/billing\/common'/);
   });
 });

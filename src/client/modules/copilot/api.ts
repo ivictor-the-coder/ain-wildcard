@@ -496,8 +496,8 @@ export type { AnswerCard, CardBanner, Refusal, Remembered, RunFacts } from './ca
 export { slotChips, windowText } from './slots-core';
 export type { SlotChip, SlotFormat } from './slots-core';
 export {
-  API_KEYS_HREF, TEMPLATE_GROUPS, engineLine, engineOf, filterTemplates, groupTemplates, nearestTemplates,
-  starterTemplates,
+  MODEL_KEY_NOTE, MODEL_KEY_VAR, TEMPLATE_GROUPS, engineLine, engineOf, filterTemplates, groupTemplates,
+  nearestTemplates, starterTemplates,
 } from './templates-core';
 export type { Engine, EngineLine, NearestChip, NearestOnWire, TemplateGroup } from './templates-core';
 

@@ -552,7 +552,7 @@ export function RunDetailPage({ id }: { id: string }) {
         }
       >
         <div className="cp-answer__head" style={{ marginBottom: 'var(--space-4)' }}>
-          <EngineIndicator line={card.indicator} onOpen={navigate} />
+          <EngineIndicator line={card.indicator} />
         </div>
         <SlotChips slots={card.slots} />
         {showAnswer && (

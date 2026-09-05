@@ -6,23 +6,38 @@
  * derived from a constant, and a read that fails renders as a failure with the
  * request id support can grep for — never as a zero.
  */
-import { useMemo } from 'react';
-import type { CommandDef, NavItem, RouteDef, SettingsPage, WidgetDef } from '../../kernel/registry-types';
+import { useEffect, useMemo } from 'react';
+import type { CommandDef, NavItem, RouteDef, WidgetDef } from '../../kernel/registry-types';
 import { useQuery, type ListEnvelope } from '../../kernel/api';
-import { useNavigate } from '../../kernel/router';
+import { useNavigate, useRouter } from '../../kernel/router';
 import {
   Badge, Banner, Button, Card, EmptyState, Icons, Inline, Page, Section, Skeleton, Stack, Stat,
   humanize,
 } from '../../design';
 import {
-  Loading, RecordLink, SectionError, StatusPill, calendarDay, customerHref, daysOverdue, invoiceHref,
+  Loading, MoneyTotals, RecordLink, SectionError, StatusPill, calendarDay, customerHref, daysOverdue, invoiceHref,
   invoiceStatusDetail, statusLabel, totalsByCurrency, useBillingFormat,
 } from './common';
 import { CustomersPage, CustomerDetailPage } from './customers';
 import { SubscriptionsPage, SubscriptionDetailPage } from './subscriptions';
 import { InvoicesPage, InvoiceDetailPage } from './invoices';
-import { TaxRatesPage } from './taxes';
 import type { BillingOverview, Invoice, RevenueAccount, Subscription } from './types';
+
+/**
+ * Tax is configured once, under Settings › Tax — the registrations, the hold on
+ * bills with no location and the numbers customers supplied all live there.
+ * This module used to draw a second register at `/billing/taxes` with its own
+ * column names and its own wording for the same switch. The address survives
+ * for whatever learned it — a bookmark, a note, an old link — and hands over.
+ */
+function TaxRedirect() {
+  const navigate = useNavigate();
+  const { location } = useRouter();
+  useEffect(() => {
+    navigate(`/settings/tax${location.search}`, { replace: true });
+  }, [navigate, location.search]);
+  return null;
+}
 
 interface RevenueGroup { currency: string; accounts: number; mrr: number; arr: number; largest: string | null }
 
@@ -377,13 +392,16 @@ function ReceivablesWidget() {
   const f = useBillingFormat();
   const navigate = useNavigate();
   const { data, error, loading, refetch } = useQuery<ListEnvelope<Invoice>>('/v1/invoices', { status: 'open_like', limit: 200 });
-  // Same ordering as the billing card: what is owed longest, first.
-  const rows = useMemo(() => {
+  // Same rules as the billing card: a draft nobody has sent is not owed, and
+  // what is owed longest comes first.
+  const owed = useMemo(() => {
     const dueAt = (invoice: Invoice) => invoice.due_date ?? invoice.created;
-    return [...(data?.data ?? [])].sort((a, b) => dueAt(a) - dueAt(b)).slice(0, 5);
+    return (data?.data ?? []).filter((invoice) => invoice.status === 'open').sort((a, b) => dueAt(a) - dueAt(b));
   }, [data]);
-  const currencies = new Set(rows.map((row) => row.currency));
-  const total = rows.reduce((sum, row) => sum + row.amount_due, 0);
+  const rows = owed.slice(0, 5);
+  // One figure per currency, over everything open — never a sum across books,
+  // and never a count of rows standing in for an amount.
+  const totals = useMemo(() => totalsByCurrency(owed, (row) => row.amount_due, (row) => row.currency), [owed]);
   return (
     <Card
       title="Owed right now"
@@ -398,9 +416,11 @@ function ReceivablesWidget() {
       {!error && rows.length > 0 && (
         <Stack gap={4}>
           <Stat
-            label={`Open on ${f.plural(data?.total_count ?? rows.length, 'invoice')}`}
-            value={currencies.size === 1 ? f.money(total, { currency: rows[0].currency }) : `${rows.length} shown`}
-            caption={currencies.size === 1 ? 'Across the five oldest shown below' : 'Mixed currencies — nothing is added across them'}
+            label={`Owed on ${f.plural(owed.length, 'open invoice')}`}
+            value={<MoneyTotals totals={totals} />}
+            caption={totals.length > 1
+              ? `${f.list(totals.map((total) => total.currency.toUpperCase()))} — nothing is converted across them`
+              : owed.length > rows.length ? `The ${rows.length} owed longest are below` : 'Everything still owed is below'}
           />
           <div className="bl-rows">
             {rows.map((invoice) => (
@@ -434,7 +454,7 @@ export const routes: RouteDef[] = [
   { path: '/billing/subscriptions/:id', element: SubscriptionDetailPage, title: 'Subscription' },
   { path: '/billing/invoices', element: InvoicesPage, title: 'Invoices' },
   { path: '/billing/invoices/:id', element: InvoiceDetailPage, title: 'Invoice' },
-  { path: '/billing/taxes', element: TaxRatesPage, title: 'Tax' },
+  { path: '/billing/taxes', element: TaxRedirect, title: 'Tax' },
 ];
 
 export const nav: NavItem[] = [
@@ -442,55 +462,15 @@ export const nav: NavItem[] = [
   { id: 'billing.customers.nav', label: 'Customers', to: '/billing/customers', group: 'revenue', order: 12, icon: 'wallet' },
   { id: 'billing.subscriptions.nav', label: 'Subscriptions', to: '/billing/subscriptions', group: 'revenue', order: 14, icon: 'repeat' },
   { id: 'billing.invoices.nav', label: 'Invoices', to: '/billing/invoices', group: 'revenue', order: 16, icon: 'invoice' },
-  { id: 'billing.taxes.nav', label: 'Tax', to: '/billing/taxes', group: 'revenue', order: 18, icon: 'percent' },
 ];
 
+/**
+ * The nav puts "Go to" for every screen above in the palette, and the create
+ * menu offers a new customer and a new invoice, so none of those is repeated
+ * here. What is left is the filtered views and the one create the menu cannot
+ * derive — a subscription needs an account chosen first.
+ */
 export const commands: CommandDef[] = [
-  {
-    id: 'billing.overview',
-    title: 'Billing overview',
-    subtitle: 'MRR, what is owed and what renews next',
-    group: 'Go to',
-    keywords: ['billing', 'revenue', 'mrr', 'arr'],
-    icon: 'gauge',
-    run: (nav) => nav('/billing'),
-  },
-  {
-    id: 'billing.customers.open',
-    title: 'Billing customers',
-    subtitle: 'Every account this workspace bills',
-    group: 'Go to',
-    keywords: ['customer', 'account', 'billing'],
-    icon: 'wallet',
-    run: (nav) => nav('/billing/customers'),
-  },
-  {
-    id: 'billing.subscriptions.open',
-    title: 'Subscriptions',
-    subtitle: 'The recurring book, by status',
-    group: 'Go to',
-    keywords: ['subscription', 'plan', 'renewal', 'mrr'],
-    icon: 'repeat',
-    run: (nav) => nav('/billing/subscriptions'),
-  },
-  {
-    id: 'billing.invoices.open',
-    title: 'Invoices',
-    subtitle: 'Every bill raised, and what is still owed',
-    group: 'Go to',
-    keywords: ['invoice', 'bill', 'receivable', 'owed'],
-    icon: 'invoice',
-    run: (nav) => nav('/billing/invoices'),
-  },
-  {
-    id: 'billing.customer.new',
-    title: 'New billing customer',
-    subtitle: 'Create the account that carries a currency, a balance and invoices',
-    group: 'Create',
-    keywords: ['new customer', 'create account'],
-    icon: 'plus',
-    run: (nav) => nav('/billing/customers?new=1'),
-  },
   {
     id: 'billing.subscription.new',
     title: 'New subscription',
@@ -501,37 +481,19 @@ export const commands: CommandDef[] = [
     run: (nav) => nav('/billing/subscriptions?new=1'),
   },
   {
-    id: 'billing.invoice.new',
-    title: 'Bill an account now',
-    subtitle: 'Sweep every proration and settled usage onto one invoice',
-    group: 'Create',
-    keywords: ['invoice now', 'bill', 'charge'],
-    icon: 'invoice',
-    run: (nav) => nav('/billing/invoices?new=1'),
-  },
-  {
     id: 'billing.open.receivables',
     title: 'What is owed right now',
     subtitle: 'Every invoice still open',
-    group: 'Revenue',
+    group: 'Go to',
     keywords: ['outstanding', 'receivable', 'overdue', 'unpaid'],
     icon: 'coins',
     run: (nav) => nav('/billing/invoices?status=open_like'),
   },
   {
-    id: 'billing.taxes.open',
-    title: 'Tax registrations',
-    subtitle: 'Where this workspace collects, and what happens to a bill it cannot place',
-    group: 'Go to',
-    keywords: ['tax', 'vat', 'gst', 'sales tax', 'rate', 'jurisdiction'],
-    icon: 'percent',
-    run: (nav) => nav('/billing/taxes'),
-  },
-  {
     id: 'billing.tax.missing',
     title: 'Bills with no tax location',
     subtitle: 'Invoices raised for an account whose country nothing could match',
-    group: 'Revenue',
+    group: 'Go to',
     keywords: ['tax missing', 'no country', 'untaxed', 'held'],
     icon: 'alert-triangle',
     run: (nav) => nav('/billing/invoices?tax=missing'),
@@ -540,7 +502,7 @@ export const commands: CommandDef[] = [
     id: 'billing.open.past_due',
     title: 'Past-due subscriptions',
     subtitle: 'Accounts in arrears',
-    group: 'Revenue',
+    group: 'Go to',
     keywords: ['past due', 'dunning', 'arrears', 'delinquent'],
     icon: 'alert-triangle',
     run: (nav) => nav('/billing/subscriptions?status=past_due'),
@@ -567,15 +529,3 @@ export const widgets: WidgetDef[] = [
 ];
 
 export { humanize as billingHumanize, statusLabel };
-
-export const settings: SettingsPage[] = [
-  {
-    id: 'billing.taxes',
-    label: 'Tax registrations',
-    group: 'Revenue',
-    order: 20,
-    path: '/billing/taxes',
-    element: TaxRatesPage,
-    description: 'The rates every invoice is taxed from, and the hold on bills with no location',
-  },
-];

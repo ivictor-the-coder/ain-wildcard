@@ -215,49 +215,18 @@ export const nav: NavItem[] = [
   },
 ];
 
+/**
+ * The board, Usage, Credits and Recovery are nav destinations and the shell
+ * already lists them, so the palette gets only what the sidebar cannot say: a
+ * filtered queue, a dialog, a create.
+ */
 export const commands: CommandDef[] = [
-  {
-    id: 'revenue.board',
-    title: 'Revenue board',
-    subtitle: 'MRR, movement, retention and receivables with the basis behind each',
-    group: 'Go to',
-    keywords: ['revenue', 'mrr', 'arr', 'nrr', 'retention', 'cohort', 'waterfall'],
-    icon: 'chart-line',
-    run: (nav) => nav('/revenue'),
-  },
-  {
-    id: 'revenue.usage.open',
-    title: 'Usage and meters',
-    subtitle: 'Event volume, top customers and the ingestion record',
-    group: 'Go to',
-    keywords: ['usage', 'meter', 'metering', 'events', 'ingestion'],
-    icon: 'gauge',
-    run: (nav) => nav('/revenue/usage'),
-  },
-  {
-    id: 'revenue.credits.open',
-    title: 'Prepaid credit',
-    subtitle: 'Grants, the ledger, burn-down and settlements',
-    group: 'Go to',
-    keywords: ['credit', 'grant', 'prepaid', 'ledger', 'burn', 'top-up'],
-    icon: 'coins',
-    run: (nav) => nav('/revenue/credits'),
-  },
-  {
-    id: 'revenue.dunning.open',
-    title: 'Recovery queue',
-    subtitle: 'Every bill the bank refused, and what to do about each',
-    group: 'Revenue',
-    keywords: ['dunning', 'recovery', 'retry', 'decline', 'failed payment', 'past due'],
-    icon: 'refresh',
-    run: (nav) => nav('/revenue/dunning'),
-  },
   {
     id: 'revenue.dunning.needs_human',
     title: 'Payments that need a person',
     subtitle: 'Declines no retry schedule can satisfy',
-    group: 'Revenue',
-    keywords: ['expired card', 'needs human', 'authentication required', 'stuck payment'],
+    group: 'Go to',
+    keywords: ['expired card', 'needs human', 'authentication required', 'stuck payment', 'dunning', 'recovery'],
     icon: 'alert-triangle',
     run: (nav) => nav('/revenue/dunning?status=all'),
   },
@@ -265,7 +234,7 @@ export const commands: CommandDef[] = [
     id: 'revenue.dunning.policy',
     title: 'Change the retry policy',
     subtitle: 'The schedule every failed charge is chased on',
-    group: 'Revenue',
+    group: 'Run',
     keywords: ['dunning policy', 'retry schedule', 'smart retries', 'give up codes'],
     icon: 'sliders',
     run: (nav) => nav('/revenue/dunning?policy=1'),

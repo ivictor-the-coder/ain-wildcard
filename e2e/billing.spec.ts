@@ -1138,67 +1138,10 @@ test('a subscription already under a schedule says so before anyone changes it',
   }
 });
 
-/* ================================== tax =================================== */
+/* =============================== tax queue ================================ */
 
-test('a tax rate can be registered and retired, and the invoice it taxed is untouched', async ({ page }) => {
-  const jurisdiction = `Playwright County ${Date.now()}`;
-  await page.goto('/billing/taxes', { waitUntil: 'networkidle' });
 
-  await page.getByRole('button', { name: 'Register a rate' }).click();
-  const dialog = page.getByRole('dialog');
-  await dialog.getByLabel('What appears on the invoice').fill('PW sales tax');
-  await dialog.getByLabel('Jurisdiction').fill(jurisdiction);
-  await dialog.getByLabel('Country', { exact: true }).fill('US');
-  await dialog.getByLabel('State or region').fill(jurisdiction);
-  await dialog.getByLabel('Kind').selectOption('sales_tax');
-  await dialog.getByLabel('Percentage').fill('7.125');
-  await dialog.getByRole('button', { name: 'Register it' }).click();
-  await expect(page.getByText('PW sales tax registered')).toBeVisible();
 
-  const rates = await json(page, '/v1/tax_rates?limit=500');
-  const rate = rates.data.find((row: { jurisdiction: string }) => row.jurisdiction === jurisdiction);
-  expect(rate, 'the rate reached the server').toBeTruthy();
-  // The percentage is stored exactly as typed — a float would have rounded it.
-  expect(rate.percentage).toBe('7.125');
-  expect(rate.active).toBe(true);
-
-  const row = page.locator('tbody tr', { hasText: jurisdiction }).first();
-  await expect(row).toContainText('7.125%');
-  await row.getByRole('button', { name: 'Row actions' }).click();
-  await page.getByRole('menuitem', { name: /Retire this rate/ }).click();
-  await page.getByRole('dialog').getByRole('button', { name: 'Retire it' }).click();
-
-  await expect(page.getByText('PW sales tax retired')).toBeVisible();
-  await expect.poll(async () => (await json(page, `/v1/tax_rates/${rate.id}`)).active).toBe(false);
-});
-
-test('a refused registration is explained under the field the server named', async ({ page }) => {
-  await page.goto('/billing/taxes', { waitUntil: 'networkidle' });
-  await page.getByRole('button', { name: 'Register a rate' }).click();
-  const dialog = page.getByRole('dialog');
-  await dialog.getByLabel('What appears on the invoice').fill('VAT');
-  await dialog.getByLabel('Jurisdiction').fill('Germany');
-  // Germany already carries an active rate, and one address may never match two.
-  await dialog.getByLabel('Country', { exact: true }).fill('DE');
-  await dialog.getByLabel('Percentage').fill('19');
-  await dialog.getByRole('button', { name: 'Register it' }).click();
-
-  await expect(dialog.getByText(/already/i).first()).toBeVisible();
-  await expect(dialog).toBeVisible();
-});
-
-test('the hold on bills with no tax location can be turned on and off', async ({ page }) => {
-  const before = await json(page, '/v1/billing/automatic_tax');
-  await page.goto('/billing/taxes', { waitUntil: 'networkidle' });
-
-  const toggle = page.getByRole('switch', { name: /Hold them as drafts|Hold bills with no tax location/ });
-  await expect(toggle).toHaveAttribute('aria-checked', String(before.enabled));
-  await toggle.click();
-  await expect.poll(async () => (await json(page, '/v1/billing/automatic_tax')).enabled).toBe(!before.enabled);
-
-  await toggle.click();
-  await expect.poll(async () => (await json(page, '/v1/billing/automatic_tax')).enabled).toBe(before.enabled);
-});
 
 test('the invoice grid has a queue for bills nothing could place', async ({ page }) => {
   const missing = await json(page, '/v1/invoices?tax=missing&limit=100');
@@ -1277,38 +1220,6 @@ test('metadata can be added, re-valued and emptied on an account', async ({ page
   await expect.poll(async () => (await json(page, `/v1/customers/${customer.id}`)).metadata.e2e_contract_id).toBe('');
 });
 
-test('the new screens are operable from the keyboard alone', async ({ page }) => {
-  await page.goto('/billing/taxes', { waitUntil: 'networkidle' });
-
-  // Tab to the primary action rather than clicking it, and open it with Enter.
-  const register = page.getByRole('button', { name: 'Register a rate' });
-  await register.focus();
-  await expect(register).toBeFocused();
-  await page.keyboard.press('Enter');
-
-  const dialog = page.getByRole('dialog');
-  await expect(dialog).toBeVisible();
-  // Focus is inside the dialog, not left behind on the page under it.
-  await expect(dialog.locator(':focus')).toHaveCount(1);
-  await page.keyboard.press('Escape');
-  await expect(dialog).toBeHidden();
-  await expect(register).toBeFocused();
-
-  // The status filter is a native select, so it is a keyboard control for free.
-  const filter = page.getByLabel('Which registrations');
-  await filter.focus();
-  await filter.selectOption('all');
-  await expect.poll(async () => page.locator('tbody tr[data-index]').count()).toBeGreaterThan(0);
-
-  // And the hold is a real switch: focusable, and toggled with the space bar.
-  const toggle = page.getByRole('switch', { name: /Hold them as drafts|Hold bills with no tax location/ });
-  const before = await toggle.getAttribute('aria-checked');
-  await toggle.focus();
-  await page.keyboard.press(' ');
-  await expect.poll(async () => toggle.getAttribute('aria-checked')).not.toBe(before);
-  await page.keyboard.press(' ');
-  await expect.poll(async () => toggle.getAttribute('aria-checked')).toBe(before);
-});
 
 /* ============================ the whole book ============================== */
 

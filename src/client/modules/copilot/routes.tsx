@@ -81,16 +81,12 @@ export const nav: NavItem[] = [
   },
 ];
 
+/**
+ * The nav already puts "Copilot" and "Runs & traces" in the palette, so these
+ * are the actions the sidebar cannot express: a fresh thread, a draft, the
+ * approval queue.
+ */
 export const commands: CommandDef[] = [
-  {
-    id: 'copilot.open',
-    title: 'Copilot',
-    subtitle: 'Ask the workspace a question and get cited answers',
-    group: 'Go to',
-    keywords: ['ai', 'ask', 'assistant', 'chat', 'breeze', 'agent'],
-    icon: 'sparkles',
-    run: (go) => go('/copilot'),
-  },
   {
     id: 'copilot.new',
     title: 'New copilot conversation',
@@ -108,15 +104,6 @@ export const commands: CommandDef[] = [
     keywords: ['ai', 'draft', 'email', 'write', 'follow up', 'compose'],
     icon: 'edit',
     run: (go) => go('/copilot?draft=1'),
-  },
-  {
-    id: 'copilot.runs',
-    title: 'Agent runs and traces',
-    subtitle: 'Every run, its steps, timings and cost',
-    group: 'Go to',
-    keywords: ['ai', 'observability', 'trace', 'tokens', 'debug'],
-    icon: 'activity',
-    run: (go) => go('/copilot/runs'),
   },
   {
     id: 'copilot.approvals',

@@ -15,6 +15,7 @@ import v from '../src/shared/validate';
 import {
   ApiClientError, currentAuthLoss, currentNetworkFailure, currentRateLimit, request,
 } from '../src/client/kernel/api';
+import { invalidate, peekCache, primeCache } from '../src/client/kernel/api';
 
 function queue() {
   const db = new Db(':memory:');
@@ -1229,5 +1230,31 @@ describe('the navigation registry cannot advertise a dead end', () => {
       !known.includes(to) && !prefixes.some((prefix) => to.startsWith(prefix)));
 
     assert.deepEqual(broken, [], `nav points at routes nothing registers: ${broken.join(', ')}`);
+  });
+});
+
+/**
+ * An invalidation asks again; it does not forget. Dropping the cached answer
+ * blanked every screen for the round trip after its own mutation: numbers went
+ * to zero, and a control whose `disabled` follows the data went disabled under
+ * the keyboard and dropped focus — the tax hold switch could be toggled once
+ * by space bar and never again.
+ */
+describe('the client cache revalidates behind what is on screen', () => {
+  test('an invalidated answer stays readable, marked stale, until the reload lands', () => {
+    primeCache('/api/v1/billing/automatic_tax', { enabled: false });
+    primeCache('/api/v1/invoices?limit=50', { object: 'list', data: [] });
+    primeCache('/api/v1/me', { id: 'usr_1' });
+
+    invalidate('/v1/billing/automatic_tax', '/v1/invoices');
+
+    assert.deepEqual(peekCache('/api/v1/billing/automatic_tax'), { data: { enabled: false }, stale: true },
+      'the answer a screen is showing survives its own invalidation');
+    assert.deepEqual(peekCache('/api/v1/invoices?limit=50'), { data: { object: 'list', data: [] }, stale: true });
+    assert.deepEqual(peekCache('/api/v1/me'), { data: { id: 'usr_1' }, stale: false },
+      'a key outside the prefixes is untouched');
+
+    invalidate();
+    assert.equal(peekCache('/api/v1/me')?.stale, true, 'an invalidation with no prefix marks everything, and forgets nothing');
   });
 });

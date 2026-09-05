@@ -33,6 +33,7 @@ import {
   CheckCircleIcon, XCircleIcon,
 } from '../../design';
 import { ListFailure, SettingsShell, idem, useAction } from './common';
+import { TaxIdStatusPill, taxIdStatusLabel } from '../billing/common';
 import type { AutomaticTaxSettings, CustomerLite, CustomerTaxId, TaxRate } from './types';
 
 const TAX_TYPES = ['vat', 'gst', 'sales_tax', 'hst', 'pst', 'qst', 'jct', 'igst', 'service_tax', 'other'] as const;
@@ -42,13 +43,6 @@ const TAX_TYPE_LABEL: Record<string, string> = {
   qst: 'QST', jct: 'JCT', igst: 'IGST', service_tax: 'Service tax', other: 'Other',
 };
 
-const VERIFICATION_TONE: Record<string, 'success' | 'warning' | 'danger' | 'neutral'> = {
-  verified: 'success', pending: 'neutral', unverified: 'warning', unavailable: 'neutral',
-};
-
-const VERIFICATION_LABEL: Record<string, string> = {
-  verified: 'Verified', pending: 'Not checked', unverified: 'Register said no', unavailable: 'Register silent',
-};
 
 interface CustomerRegistration {
   key: string;
@@ -200,13 +194,10 @@ export function TaxPage() {
       width: 190,
       filter: 'set',
       accessor: (row) => row.taxId.verification?.status ?? 'pending',
-      filterOptionLabel: (value) => VERIFICATION_LABEL[value] ?? humanize(value),
-      cell: (row) => {
-        const status = row.taxId.verification?.status ?? 'pending';
-        const note = row.taxId.verification?.note;
-        const badge = <Badge tone={VERIFICATION_TONE[status] ?? 'neutral'} pill dot>{VERIFICATION_LABEL[status] ?? humanize(status)}</Badge>;
-        return note ? <Tooltip content={note}><span>{badge}</span></Tooltip> : badge;
-      },
+      filterOptionLabel: taxIdStatusLabel,
+      cell: (row) => (
+        <TaxIdStatusPill status={row.taxId.verification?.status ?? 'pending'} title={row.taxId.verification?.note ?? undefined} />
+      ),
     },
     {
       id: 'checked_at',
@@ -252,6 +243,10 @@ export function TaxPage() {
   }];
 
   const toggleHold = async (enabled: boolean) => {
+    // A second press while the first save is in flight is ignored here rather
+    // than by disabling the switch: a control that goes disabled under the
+    // keyboard drops focus, and the person pressing space is left nowhere.
+    if (action.busy) return;
     await action.run(
       api.post<AutomaticTaxSettings>('/v1/billing/automatic_tax', { enabled }),
       {
@@ -325,7 +320,8 @@ export function TaxPage() {
           <Stack gap={4}>
             <Switch
               checked={!!hold.data?.enabled}
-              disabled={!admin || !hold.data || action.busy}
+              disabled={!admin || !hold.data}
+              aria-busy={action.busy || undefined}
               onChange={(next) => void toggleHold(next)}
               label="Hold an invoice as a draft when the account’s address cannot be placed"
               hint={hold.data?.detail}
@@ -656,7 +652,7 @@ function VerifyDialog({ registration, action, onClose }: {
         ...(status === 'verified' && verifiedName.trim() ? { verified_name: verifiedName.trim() } : {}),
       }),
       {
-        success: `${registration.taxId.value} is recorded as ${VERIFICATION_LABEL[status].toLowerCase()}`,
+        success: `${registration.taxId.value} is recorded as ${taxIdStatusLabel(status).toLowerCase()}`,
         description: status === 'verified'
           ? 'Supplies to this account under a reverse-charge rate now move the tax onto them.'
           : 'Anything but verified is charged as normal — the supplier is who the authority collects from.',

@@ -24,7 +24,8 @@ import { COMMANDS, NAV, ROUTES, SETTINGS_PAGES } from '../generated/registry';
 import type { NavItem, RouteDef } from './registry-types';
 import {
   TIME_JUMPS, activeNavItem, avatarSrc, clockOutcome, crumbsFor, eventSubject, eventTitle, fillParams,
-  firstRegistered, groupNav, isPathActive, jumpBindings, railState, recordRouteCandidates, shortcutSheet,
+  firstRegistered, groupNav, isPathActive, jumpBindings, navLabelIndex, railState, recordRouteCandidates,
+  shortcutSheet, withCurrentLabel,
 } from './shell-core';
 import { usePlatform, useCreateActions, useGlobalSearch, useSearchSources, useTimeMachine } from './platform';
 import { typeaheadTargets, type SearchSource, type TypeaheadTarget } from './search-core';
@@ -46,15 +47,38 @@ export interface ShellApi {
   openShortcuts: () => void;
   /** Drop the client cache so every panel re-reads from the API. */
   refresh: () => void;
+  /**
+   * Name the current crumb and the tab after the record on screen. A route only
+   * knows its object type; the screen knows who it is once the record answers.
+   * `null` hands the crumb back to the route's title.
+   */
+  setCurrent: (label: string | null) => void;
 }
 
 const NOOP_SHELL: ShellApi = {
   openPalette: () => {}, openSearch: () => {}, openTimeMachine: () => {},
-  openShortcuts: () => {}, refresh: () => {},
+  openShortcuts: () => {}, refresh: () => {}, setCurrent: () => {},
 };
 
 const ShellContext = createContext<ShellApi>(NOOP_SHELL);
 export const useShell = (): ShellApi => useContext(ShellContext);
+
+/**
+ * The one way a record screen names itself in the shell.
+ *
+ * Every detail page used to solve this on its own — one patched the crumb's
+ * text node through `document.querySelector`, one drew a second breadcrumb
+ * inside the page, two wrote "Invoices / Name" with a slash — and a person
+ * moving between a deal, a company and an invoice met three different trails.
+ * Pass the record's name once it is known; the shell does the rest.
+ */
+export function useCurrentCrumb(label: string | null | undefined): void {
+  const { setCurrent } = useShell();
+  useEffect(() => {
+    setCurrent(label ?? null);
+    return () => setCurrent(null);
+  }, [label, setCurrent]);
+}
 
 const isTypingTarget = (el: EventTarget | null): boolean => {
   const node = el as HTMLElement | null;
@@ -355,23 +379,33 @@ function SignedInShell() {
 
   /* ------------------------------ breadcrumbs ----------------------------- */
 
-  const navByPath = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const item of NAV) {
-      map.set(item.to.split('?')[0], item.label);
-      for (const child of item.children ?? []) map.set(child.to.split('?')[0], child.label);
-    }
-    return map;
-  }, []);
+  const navByPath = useMemo(() => navLabelIndex(NAV), []);
 
-  const crumbs = useMemo(() => crumbsFor(location.path, (prefix, _segment, isLast) => {
+  // The record's own name, handed up by the screen. It is remembered with the
+  // path it was set for, so a stale name can never label the next screen while
+  // that screen is still loading its own.
+  const [current, setCurrentState] = useState<{ path: string; label: string } | null>(null);
+  const pathRef = useRef(location.path);
+  pathRef.current = location.path;
+  const setCurrent = useCallback((label: string | null) => {
+    setCurrentState(label ? { path: pathRef.current, label } : null);
+  }, []);
+  const currentLabel = current && current.path === location.path ? current.label : null;
+
+  const crumbs = useMemo(() => withCurrentLabel(crumbsFor(location.path, (prefix, _segment, isLast) => {
     const label = navByPath.get(prefix);
     if (label) return label;
     if (isLast && route?.title) return typeof route.title === 'function' ? route.title(params) : route.title;
     const matched = matchRoute(ROUTES, prefix);
     const title = matched?.route.title;
     return typeof title === 'string' ? title : null;
-  }), [location.path, navByPath, route, params]);
+  }), currentLabel), [location.path, navByPath, route, params, currentLabel]);
+
+  // The tab follows the crumb. The router names it after the route on every
+  // navigation; this only runs afterwards, once a screen has said who it is.
+  useEffect(() => {
+    if (currentLabel) document.title = `${currentLabel} · Ain`;
+  }, [currentLabel]);
 
   /* --------------------- navigation: focus and announce -------------------- */
 
@@ -416,7 +450,8 @@ function SignedInShell() {
     openTimeMachine: () => setClockOpen(true),
     openShortcuts: () => setShortcutsOpen(true),
     refresh: refreshAll,
-  }), [navigate, refreshAll]);
+    setCurrent,
+  }), [navigate, refreshAll, setCurrent]);
 
   const activeItem = activeNavItem(flatNav, location.path);
   const clock = session.me?.clock;
@@ -1162,6 +1197,10 @@ function Notifications() {
   const { data, error, loading, refetch } = useQuery<{ data: EventRow[] }>('/v1/events', { limit: 25 });
   const f = useFormat();
   const { navigate } = useRouter();
+  // Events are stamped on the workspace clock. Marking them read at the
+  // machine's own time left every event written after a jump forward unread
+  // for as long as the simulation stayed ahead of real time.
+  const now = useSession().now;
 
   const events = data?.data ?? [];
   const unread = events.filter((event) => event.created > readAt).length;
@@ -1241,7 +1280,7 @@ function Notifications() {
             })}
           </div>
           <div className="notif__foot">
-            <Button size="sm" variant="secondary" disabled={!unread} onClick={() => setReadAt(Date.now())}>
+            <Button size="sm" variant="secondary" disabled={!unread} onClick={() => setReadAt(now())}>
               Mark all as read
             </Button>
             <span className="tm__sub" style={{ alignSelf: 'center' }}>

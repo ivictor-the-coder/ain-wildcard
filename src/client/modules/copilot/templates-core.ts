@@ -224,7 +224,14 @@ export function engineOf(
   return 'template';
 }
 
-export const API_KEYS_HREF = '/settings/api-keys';
+/**
+ * What it takes to ask free text: a hosted model, which the server reads from
+ * this variable at boot. There is no screen for it — Settings › API keys mints
+ * Ain's own credentials, and sending someone there for a model key was a link
+ * to the wrong drawer.
+ */
+export const MODEL_KEY_VAR = 'ANTHROPIC_API_KEY';
+export const MODEL_KEY_NOTE = `free text needs a hosted model — set ${MODEL_KEY_VAR} where the API runs`;
 
 export interface EngineLine {
   engine: Engine;
@@ -232,7 +239,7 @@ export interface EngineLine {
   label: string;
   /** What that means, in the tooltip and the panel. */
   detail: string;
-  /** True when the only way to ask free text is to configure a model key. */
+  /** True when the only way to ask free text is to configure a hosted model. */
   needsKey: boolean;
 }
 
@@ -257,7 +264,7 @@ export function engineLine(engine: Engine, hosted: boolean, model?: string | nul
   return {
     engine,
     label: 'answered from a template',
-    detail: 'No model key is configured, so every answer comes from the fixed list of shapes the built-in engine answers. A free-text question needs a key — add one under Settings › API keys.',
+    detail: `No hosted model is configured, so every answer comes from the fixed list of shapes the built-in engine answers. A free-text question needs one: set ${MODEL_KEY_VAR} where the API runs and restart it.`,
     needsKey: true,
   };
 }

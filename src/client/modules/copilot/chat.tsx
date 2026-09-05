@@ -23,7 +23,7 @@ import {
   humanize, useFormat, useHotkey, usePrefersReducedMotion, useToast, type MenuSection, type SelectOption,
 } from '@/client/design';
 import {
-  API_KEYS_HREF, answerCard, dealNamedIn, decidedBadge, dedupeCitations, editHref, filterTemplates,
+  MODEL_KEY_VAR, answerCard, dealNamedIn, decidedBadge, dedupeCitations, editHref, filterTemplates,
   groupTemplates, parseBlocks, propertyAsked, splitToolEcho, starterTemplates, useAiStatus, useAllApprovals,
   useRun, useTemplates, useThread, useThreads, useTools, useVocabulary, windowText,
   type AiApproval, type AiCompletion, type AiMessage, type AiRun, type AiTemplate, type AiThread,
@@ -246,7 +246,7 @@ function AssistantMessage({
           <Badge tone="brand" size="sm" icon={<Icons.sparkles size={11} />}>
             {run ? run.model : 'Copilot'}
           </Badge>
-          <EngineIndicator line={card.indicator} onOpen={onOpenRecords} />
+          <EngineIndicator line={card.indicator} />
           {card.refusal && <Badge tone="warning" size="sm">refused</Badge>}
           {(waiting.length > 0 || (run?.status === 'needs_approval' && approvals.length === 0))
             && <Badge tone="warning" size="sm">waiting for approval</Badge>}
@@ -1002,17 +1002,8 @@ export function CopilotPage() {
         title="What can I ask?"
         description={hosted
           ? 'Every question shape the built-in engine answers, with this workspace’s own values in it. Pick one to ask it. A hosted model is configured, so free-text questions are answered too.'
-          : 'Every question shape the built-in engine answers, with this workspace’s own values in it. Pick one to ask it. No model key is configured, so these are the only questions it answers.'}
-        footer={
-          <>
-            {!hosted && (
-              <Button variant="ghost" iconLeft={<Icons.key size={14} />} onClick={() => { setAsking(false); navigate(API_KEYS_HREF); }}>
-                Free text needs a model key — Settings › API keys
-              </Button>
-            )}
-            <Button onClick={() => setAsking(false)}>Close</Button>
-          </>
-        }
+          : `Every question shape the built-in engine answers, with this workspace’s own values in it. Pick one to ask it. No hosted model is configured, so these are the only questions it answers — free text needs ${MODEL_KEY_VAR} set where the API runs.`}
+        footer={<Button onClick={() => setAsking(false)}>Close</Button>}
       >
         <div className="cp-templates__filter">
           <SearchInput

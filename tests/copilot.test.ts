@@ -42,7 +42,7 @@ import {
   approvalOutcome, decidedBadge, runOutcome, type AiApproval,
 } from '../src/client/modules/copilot/api';
 import {
-  API_KEYS_HREF, TEMPLATE_GROUPS, engineLine, engineOf, filterTemplates, groupOf, groupTemplates,
+  MODEL_KEY_NOTE, TEMPLATE_GROUPS, engineLine, engineOf, filterTemplates, groupOf, groupTemplates,
   nearestFromWire, nearestTemplates, starterTemplates, type AiTemplate,
 } from '../src/client/modules/copilot/templates-core';
 import {
@@ -254,12 +254,15 @@ describe('which engine answered', () => {
     assert.equal(engineOf(null), 'template');
   });
 
-  it('explains, with no key, that free text needs one — and where', () => {
+  it('explains, with no hosted model, what free text takes — and never sends anyone to the wrong drawer', () => {
     const line = engineLine('template', false);
     assert.equal(line.label, 'answered from a template');
     assert.equal(line.needsKey, true);
-    assert.match(line.detail, /Settings › API keys/);
-    assert.equal(API_KEYS_HREF, '/settings/api-keys');
+    // The hosted model is read from the server's environment. Settings › API
+    // keys mints Ain's own credentials, so a link there was a dead end.
+    assert.match(line.detail, /ANTHROPIC_API_KEY/);
+    assert.doesNotMatch(line.detail, /Settings › API keys/);
+    assert.match(MODEL_KEY_NOTE, /ANTHROPIC_API_KEY/);
   });
 
   it('does not ask for a key that is already there, and names the model when it answered', () => {
@@ -648,18 +651,18 @@ describe('the surface, rendered', () => {
     assert.match(html, /Some questions it can answer/);
   });
 
-  it('says which engine answered, and with no key, where to get one', () => {
-    const open: string[] = [];
-    const noKey = renderToStaticMarkup(createElement(EngineIndicator, { line: engineLine('template', false), onOpen: (href) => open.push(href) }));
+  it('says which engine answered, and with no hosted model, what one takes', () => {
+    const noKey = renderToStaticMarkup(createElement(EngineIndicator, { line: engineLine('template', false) }));
     assert.match(noKey, /answered from a template/);
-    assert.match(noKey, /Settings › API keys/);
-    assert.match(noKey, /href="\/settings\/api-keys"/);
+    assert.match(noKey, /ANTHROPIC_API_KEY/);
+    // A note, not a link: nothing in the product can set the variable.
+    assert.doesNotMatch(noKey, /href=/);
     assert.match(noKey, /data-engine="template"/);
 
-    const keyed = renderToStaticMarkup(createElement(EngineIndicator, { line: engineLine('template', true), onOpen: () => undefined }));
-    assert.doesNotMatch(keyed, /Settings › API keys/);
+    const keyed = renderToStaticMarkup(createElement(EngineIndicator, { line: engineLine('template', true) }));
+    assert.doesNotMatch(keyed, /ANTHROPIC_API_KEY/);
 
-    const model = renderToStaticMarkup(createElement(EngineIndicator, { line: engineLine('anthropic', true, 'claude-sonnet-4-5'), onOpen: () => undefined }));
+    const model = renderToStaticMarkup(createElement(EngineIndicator, { line: engineLine('anthropic', true, 'claude-sonnet-4-5') }));
     assert.match(model, /answered by the model/);
     assert.match(model, /data-engine="anthropic"/);
     assert.doesNotMatch(model, /Settings › API keys/);

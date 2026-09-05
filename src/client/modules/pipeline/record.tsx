@@ -11,8 +11,9 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api, invalidate, useMutation, useQuery, type ApiClientError, type ListEnvelope } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import { useSession } from '@/client/kernel/session';
+import { useCurrentCrumb } from '@/client/kernel/shell';
 import {
-  Avatar, Badge, Banner, Breadcrumbs, Button, Card, ChevronLeftIcon, ChevronRightIcon, ConfirmDialog,
+  Avatar, Badge, Banner, Button, Card, ChevronLeftIcon, ChevronRightIcon, ConfirmDialog,
   DescriptionList, EmptyState, ErrorState, GitBranchIcon, humanize, iconByName, IconButton, Icons,
   MenuButton, Page, Skeleton, SkeletonText, Split, Timeline, useToast,
   type DescriptionItem, type MenuSection, type TimelineEntry,
@@ -156,6 +157,7 @@ export function DealRecordPage({ id }: { id: string }) {
   const lastRead = useRef<DealDetail | null>(null);
   if (record.data) lastRead.current = record.data;
   const deal = record.data ?? lastRead.current;
+  useCurrentCrumb(deal?.display_name);
   const pipeline = useMemo(
     () => (pipelines.data?.data ?? []).find((p) => p.name === str(deal?.properties.pipeline)),
     [pipelines.data, deal],
@@ -452,7 +454,6 @@ export function DealRecordPage({ id }: { id: string }) {
     <Page
       width="wide"
       eyebrow={pipeline ? `Deal · ${pipeline.label}` : 'Deal'}
-      breadcrumbs={<Breadcrumbs items={[{ label: 'Deals', onClick: () => navigate('/deals') }, { label: deal.display_name }]} />}
       title={deal.display_name}
       badge={stage ? <Badge tone={stage.is_won ? 'success' : stage.is_closed ? 'neutral' : 'info'} size="sm">{stage.label}</Badge> : undefined}
       subtitle={[

@@ -35,7 +35,14 @@ const BASE = '/api';
 
 /* ---------------------------- cache + invalidation ------------------------ */
 
-type CacheEntry = { data: unknown; error: ApiClientError | null; at: number; promise?: Promise<unknown> };
+/**
+ * `stale` marks an answer that is still on screen but no longer trusted: an
+ * invalidation keeps the data and asks again, so a screen revalidates behind
+ * its numbers instead of blanking them. Dropping the entry outright made every
+ * control that needs the data go disabled for the round trip — and a control
+ * that goes disabled under the keyboard drops focus.
+ */
+type CacheEntry = { data: unknown; error: ApiClientError | null; at: number; promise?: Promise<unknown>; stale?: boolean };
 const cache = new Map<string, CacheEntry>();
 const listeners = new Set<() => void>();
 const notify = () => { for (const l of [...listeners]) l(); };
@@ -51,14 +58,26 @@ const subscribe = (fn: () => void) => { listeners.add(fn); return () => { listen
 let version = 0;
 const getVersion = (): number => version;
 
-/** Drop cached responses whose key matches any prefix, then reload them. */
+/**
+ * Mark cached responses whose key matches any prefix (every key when none is
+ * given) as stale, then reload them. What is on screen stays on screen, with
+ * `validating` true, until the fresh answer replaces it; an entry that never
+ * had an answer is simply dropped.
+ */
 export function invalidate(...prefixes: string[]): void {
-  if (!prefixes.length) cache.clear();
-  for (const key of [...cache.keys()]) {
-    if (prefixes.some((p) => key.includes(p))) cache.delete(key);
+  for (const [key, entry] of [...cache.entries()]) {
+    if (prefixes.length && !prefixes.some((p) => key.includes(p))) continue;
+    if (entry.data === undefined) cache.delete(key);
+    else cache.set(key, { data: entry.data, error: entry.error, at: entry.at, stale: true });
   }
   version += 1;
   notify();
+}
+
+/** What the cache holds for a key right now — for tests of the cache's own contract. */
+export function peekCache(key: string): { data: unknown; stale: boolean } | undefined {
+  const entry = cache.get(key);
+  return entry ? { data: entry.data, stale: !!entry.stale } : undefined;
 }
 
 export function primeCache(key: string, data: unknown): void {
@@ -391,7 +410,7 @@ export function useQuery<T = unknown>(
     if (!key) return;
     const existing = cache.get(key);
     if (existing?.promise) return;
-    if (existing && !bypass) return;
+    if (existing && !bypass && !existing.stale) return;
     if (authLoss && !PUBLIC_PATH.test(key)) {
       // Asking again only collects another 401. Say what happened instead of
       // spinning, so the panel can render the failure rather than an empty box.

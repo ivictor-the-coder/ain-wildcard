@@ -20,14 +20,14 @@ import { invalidate, useQuery, type ListEnvelope } from '../../kernel/api';
 import { useSession } from '../../kernel/session';
 import { useTimeMachine, type ClockMove } from '../../kernel/platform';
 import { aftermathOf } from '../../kernel/time-machine';
-import { TIME_JUMPS, clockOutcome, describeOffset } from '../../kernel/shell-core';
+import { TIME_JUMPS, civilDayStart, clockOutcome, describeOffset, jumpDays, jumpTarget } from '../../kernel/shell-core';
 import {
   Badge, Banner, Button, Card, ConfirmDialog, DatePicker, Divider, EmptyState, Icons, Inline,
   KeyValue, Stat, Stack, Tooltip,
   useFormat, useToast,
   ChevronDownIcon, ChevronUpIcon, RotateCcwIcon,
 } from '../../design';
-import { DAY, startOfDay } from '../../../shared/time';
+import { DAY } from '../../../shared/time';
 import { ListFailure, Loading, SettingsShell, useActorName } from './common';
 import type { AuditEntry, JobRow } from './types';
 
@@ -78,11 +78,15 @@ export function TimeMachinePage() {
   const now = session.now();
   const shifted = Math.abs(offset) > 60_000;
 
-  // Tomorrow, in workspace time: the first instant a jump can be aimed at, and
-  // the day the calendar opens on so its grid is reachable from the keyboard.
-  const earliest = startOfDay(now + DAY);
-  const target = chosen !== null && chosen > now ? chosen : earliest;
-  const daysAhead = Math.round((target - now) / DAY);
+  // Tomorrow on the workspace's own calendar — the first day the picker offers,
+  // and the day it opens on so its grid is reachable from the keyboard. The
+  // picker speaks in UTC calendar days; the jump itself lands on that day at
+  // the wall-clock time the workspace is at now, so the chip reads the day
+  // that was chosen and the button counts whole days.
+  const earliest = civilDayStart(now, f.timeZone) + DAY;
+  const picked = chosen !== null && chosen >= earliest ? chosen : earliest;
+  const target = jumpTarget(picked, now, f.timeZone);
+  const daysAhead = Math.max(1, jumpDays(target, now, f.timeZone));
 
   const settle = useCallback(() => { invalidate(); session.refresh(); }, [session]);
   const { advance, reset, busy } = useTimeMachine(settle);
@@ -262,7 +266,7 @@ export function TimeMachinePage() {
 
             <Inline gap={4} wrap>
               <DatePicker
-                value={target}
+                value={picked}
                 min={earliest}
                 clearable={false}
                 onChange={(ts) => setChosen(ts)}
@@ -279,14 +283,9 @@ export function TimeMachinePage() {
                 loading={busy}
                 disabled={!admin || !virtual || busy}
                 iconLeft={<Icons.zap size={15} />}
-                onClick={() => void jump(
-                  target,
-                  daysAhead >= 1 ? `Jumped ${daysAhead} days forward` : `Jumped to ${f.date(target)}`,
-                )}
+                onClick={() => void jump(target, `Jumped ${f.plural(daysAhead, 'day')} forward`)}
               >
-                {daysAhead >= 1
-                  ? `Run ${f.plural(daysAhead, 'day')} of work`
-                  : `Run everything due by ${f.date(target)}`}
+                {`Run ${f.plural(daysAhead, 'day')} of work`}
               </Button>
             </Inline>
 

@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { api, useQuery, type ApiClientError, type ListEnvelope } from '../../kernel/api';
 import { useNavigate, useParams, useSearchParam } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
+import { useCurrentCrumb } from '../../kernel/shell';
 import {
   Badge, Banner, Button, Card, Checkbox, Combobox, DataTable, DatePicker, Divider, EmptyState, Field,
   Grid, GridItem, Icons, Inline, Input, Menu, Modal, NumberInput, Page, Section, Select,
@@ -1682,7 +1683,7 @@ export function SubscriptionsPage() {
         maxHeight={640}
         stickyFooter
         toolbar={
-          <Inline gap={3}>
+          <Inline gap={3} wrap>
             <TableSearch view={view} onChange={setView} label="Search account, plan or id" />
             <Select
               size="sm"
@@ -1805,6 +1806,7 @@ export function SubscriptionDetailPage() {
   const [dialog, setDialog] = useState<null | 'change' | 'cancel' | 'pause' | 'resume' | 'credit' | 'schedule'>(null);
 
   const { data: sub, error, loading, refetch } = useRecord<Subscription>(`/v1/subscriptions/${id}`, { expand: 'customer' });
+  useCurrentCrumb(sub ? sub.customer_detail?.name ?? sub.customer : null);
 
   if (loading) return <Page title="Subscription"><Loading label="Loading this subscription…" /></Page>;
   if (error || !sub) {
@@ -1896,13 +1898,6 @@ export function SubscriptionDetailPage() {
       eyebrow="Subscription"
       badge={<span style={{ marginLeft: 'var(--space-4)' }}><StatusPill status={sub.status} title={sub.status_detail} /></span>}
       subtitle={headline}
-      breadcrumbs={
-        <Inline gap={3}>
-          <RecordLink to="/billing/subscriptions">Subscriptions</RecordLink>
-          <span className="bl-muted">/</span>
-          <RecordLink to={customerHref(sub.customer)}>{customerName}</RecordLink>
-        </Inline>
-      }
       actions={
         <Inline gap={3}>
           <Button variant="secondary" iconLeft={<Icons.wallet size={15} />} onClick={() => navigate(customerHref(sub.customer))}>
@@ -1939,7 +1934,11 @@ export function SubscriptionDetailPage() {
               label="MRR"
               value={money(sub.mrr)}
               caption={sub.mrr === 0 && sub.recurring_subtotal > 0
-                ? `${sub.pause_collection ? 'Excluded while collection is paused' : 'Excluded — this agreement is no longer billing'} · the fee is still ${money(sub.recurring_subtotal)} per ${sub.interval_display}`
+                ? `${sub.pause_collection
+                  ? 'Excluded while collection is paused'
+                  : sub.status === 'trialing'
+                    ? 'Excluded until the trial ends — nothing has been charged yet'
+                    : 'Excluded — this agreement is no longer billing'} · the fee is ${money(sub.recurring_subtotal)} per ${sub.interval_display}`
                 : `${money(sub.recurring_subtotal)} per ${sub.interval_display}`}
             />
             <Headline

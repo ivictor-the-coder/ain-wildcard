@@ -14,9 +14,9 @@ import { useQuery, type ApiClientError, type ListEnvelope, type QueryResult } fr
 import { useRouter, useSearchParam } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
 import {
-  Badge, Button, DateRangePicker, ErrorState, IconButton, Icons, Inline, Input, Popover,
+  Badge, Button, DateRangePicker, IconButton, Icons, Inline, Input, Popover,
   SegmentedControl, Select, Skeleton, Spinner, Stack, currencySymbol, decodeTableState,
-  encodeTableState, filterRows, formatMoney, formatNumber, humanize, niceTicks, parseMoneyInput,
+  encodeTableState, filterRows, formatMoney, formatNumber, niceTicks, parseMoneyInput,
   pluralize, searchRows, sortRows, useFormat, useToast,
   AlertTriangleIcon, ChevronDownIcon, ChevronUpIcon,
   type CellValue, type DateRange, type Formatter, type InputProps, type SortState, type TableState,
@@ -101,37 +101,21 @@ export const unitNoun = (count: number, label: string | null | undefined): strin
 
 /* --------------------------------- states --------------------------------- */
 
-export function Loading({ label }: { label: string }) {
-  return (
-    <Inline gap={4} className="rv-loading" justify="center">
-      <Spinner size={16} />
-      <span className="rv-sub">{label}</span>
-    </Inline>
-  );
-}
+/**
+ * The loading figure, the failed-read panel and the status pill are the
+ * billing module's. This surface used to draw its own three — "This did not
+ * load" beside billing's "That did not load", the request path in the sentence
+ * rather than under it, a small square chip where every other revenue screen
+ * shows a pill — and a person reading a grant on the customer page and again
+ * on Credits met two products.
+ */
+export { Loading, SectionError, StatusPill as StatusChip } from '../billing/common';
 
 export function ChartSkeleton({ height = 240 }: { height?: number }) {
   return (
     <div className="rv-chartskel">
       <Skeleton height={height} />
     </div>
-  );
-}
-
-/**
- * A failed read, rendered as a failure. The address and the request id are
- * quoted verbatim, because "something went wrong" is not something support can
- * grep for.
- */
-export function SectionError({ error, path, onRetry }: { error: ApiClientError; path: string; onRetry: () => void }) {
-  return (
-    <ErrorState
-      title="This did not load"
-      message={`${error.body?.message ?? error.message} (${path})`}
-      code={error.body?.code ?? null}
-      requestId={error.body?.request_id ?? null}
-      action={<Button variant="secondary" size="sm" iconLeft={<Icons.refresh size={14} />} onClick={onRetry}>Try again</Button>}
-    />
   );
 }
 
@@ -453,17 +437,6 @@ export function CustomerName({ id, names }: { id: string | null | undefined; nam
 export function useDefaultCurrency(): string {
   const { currency } = useSession();
   return currency;
-}
-
-export function StatusChip({ status }: { status: string }) {
-  const tone = status === 'active' || status === 'settled' || status === 'recovered' || status === 'succeeded'
-    ? 'success'
-    : status === 'expired' || status === 'voided' || status === 'canceled' || status === 'failed' || status === 'exhausted'
-      ? 'danger'
-      : status === 'scheduled' || status === 'pending' || status === 'open' || status === 'recovering'
-        ? 'warning'
-        : 'neutral';
-  return <Badge tone={tone} dot size="sm">{humanize(status)}</Badge>;
 }
 
 /** A labelled figure with its own provenance button, used across the tiles. */

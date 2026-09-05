@@ -13,6 +13,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, useQuery, type ApiClientError, type ListEnvelope } from '../../kernel/api';
 import { useNavigate, useParams, useSearchParam } from '../../kernel/router';
 import { usePlatform } from '../../kernel/platform';
+import { useCurrentCrumb } from '../../kernel/shell';
 import {
   Badge, Banner, Button, Card, Checkbox, ConfirmDialog, DataTable, Divider, Drawer, EmptyState, Field, Grid,
   GridItem, Icons, Inline, Input, Modal, Page, Select, Stack, Tabs, Textarea, Tooltip, humanize, useToast,
@@ -290,7 +291,7 @@ export function InvoicesPage() {
         maxHeight={640}
         stickyFooter
         toolbar={
-          <Inline gap={3}>
+          <Inline gap={3} wrap>
             <TableSearch view={view} onChange={setView} label="Search number, account or id" />
             <Select
               size="sm"
@@ -646,6 +647,7 @@ export function InvoiceDetailPage() {
 
   const { data: invoice, error, loading, refetch } = useRecord<Invoice>(`/v1/invoices/${id}`);
   const notes = useQuery<ListEnvelope<CreditNote>>('/v1/credit_notes', { invoice: id, status: 'all', limit: 50 });
+  useCurrentCrumb(invoice?.number);
 
   if (loading) return <Page title="Invoice"><Loading label="Loading this invoice…" /></Page>;
   if (error || !invoice) {
@@ -763,13 +765,6 @@ export function InvoiceDetailPage() {
       eyebrow="Invoice"
       badge={<span style={{ marginLeft: 'var(--space-4)' }}><StatusPill status={invoice.status} title={invoiceStatusDetail(invoice, f)} /></span>}
       subtitle={invoiceStatusDetail(invoice, f)}
-      breadcrumbs={
-        <Inline gap={3}>
-          <RecordLink to="/billing/invoices">Invoices</RecordLink>
-          <span className="bl-muted">/</span>
-          <RecordLink to={customerHref(invoice.customer)}>{invoice.customer_name ?? invoice.customer}</RecordLink>
-        </Inline>
-      }
       actions={
         <Inline gap={3}>
           {/* The bulk bar exposes Finalise and Void as first-class buttons on
@@ -840,8 +835,9 @@ export function InvoiceDetailPage() {
               caption={invoice.paid_at
                 // The one figure on this card that is about the operator's day
                 // rather than the document's, so it is the one that carries a
-                // clock and names the zone.
-                ? `${f.dateTime(invoice.paid_at)} · ${f.timeZone.replace(/_/g, ' ')} time`
+                // clock and names the zone — in the same words the Details
+                // block uses for the same kind of instant.
+                ? invoiceClockNote(invoice.paid_at, f)
                 : invoice.amount_paid > 0 ? 'Part paid — the rest is still owed' : 'Nothing collected yet'}
             />
             <Headline

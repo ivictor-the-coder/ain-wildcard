@@ -7,7 +7,7 @@
  * from data that actually exists rather than typed in by hand.
  */
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { NavItem, RouteDef } from '../../kernel/registry-types';
+import type { CommandDef, RouteDef } from '../../kernel/registry-types';
 import { useSession } from '../../kernel/session';
 import { useRouter } from '../../kernel/router';
 import {
@@ -2709,6 +2709,19 @@ export const routes: RouteDef[] = [
   { path: '/design', element: DesignSystemPage, title: 'Design system' },
 ];
 
-export const nav: NavItem[] = [
-  { id: 'design-system', label: 'Design system', to: '/design', group: 'settings', order: 90, icon: Icons.sparkles },
+/**
+ * The style guide is a builder's reference, not a screen an operator runs the
+ * business from — a sidebar entry under Settings put it beside Workspace and
+ * Team for everyone who signed in. It stays one palette query away.
+ */
+export const commands: CommandDef[] = [
+  {
+    id: 'design-lab.open',
+    title: 'Design system',
+    subtitle: 'Every component, token and chart the product is built from, rendered live',
+    group: 'Go to',
+    keywords: ['style guide', 'components', 'tokens', 'storybook', 'ui kit'],
+    icon: 'sparkles',
+    run: (go) => go('/design'),
+  },
 ];

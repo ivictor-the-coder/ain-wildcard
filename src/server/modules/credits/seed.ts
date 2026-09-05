@@ -24,6 +24,16 @@ export function seedCredits(ctx: Ctx, orgId: string): void {
   // index is the link back to the account these grants were written for.
   const resolved = resolveMeteredCustomers(ctx, orgId);
   const byRosterId = new Map<string, SeedCustomer>(METERED_CUSTOMERS.map((c, i) => [c.id, resolved[i]]));
+  /**
+   * A grant names a customer, so it can only go to a roster entry that resolved
+   * to a real invoicing customer. An unresolved entry keeps its roster id, and a
+   * grant written against that id is a balance on an account that does not
+   * exist — the credits screen showed one as "Unknown account".
+   */
+  const grantee = (rosterId: string): SeedCustomer | undefined => {
+    const customer = byRosterId.get(rosterId);
+    return customer?.billable ? customer : undefined;
+  };
   const now = ctx.now();
 
   const packPrice = ctx.svc.catalog.price(orgId, CREDIT_PACK_PRICE);
@@ -38,12 +48,12 @@ export function seedCredits(ctx: Ctx, orgId: string): void {
   const canBuyPacks = (customer: SeedCustomer | undefined): customer is SeedCustomer =>
     !!customer && !!customer.billable && packCurrencies.includes(customer.currency);
 
-  const meridian = byRosterId.get('cus_nw_meridianforge');
-  const whitcombe = byRosterId.get('cus_nw_whitcombe');
-  const aldergate = byRosterId.get('cus_nw_aldergate');
-  const kestrel = byRosterId.get('cus_nw_kestrel');
-  const sableworks = byRosterId.get('cus_nw_sableworks');
-  const ironwood = byRosterId.get('cus_nw_ironwood');
+  const meridian = grantee('cus_nw_meridianforge');
+  const whitcombe = grantee('cus_nw_whitcombe');
+  const aldergate = grantee('cus_nw_aldergate');
+  const kestrel = grantee('cus_nw_kestrel');
+  const sableworks = grantee('cus_nw_sableworks');
+  const ironwood = grantee('cus_nw_ironwood');
 
   /* Meridian Forge prepaid five packs in the spring and signed for six more
      that start next quarter, so only the first five are spendable today. */

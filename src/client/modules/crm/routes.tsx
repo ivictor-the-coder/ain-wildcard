@@ -21,12 +21,10 @@ import './crm.css';
 
 const ContactsPage = () => <ObjectListPage objectType="contact" />;
 const CompaniesPage = () => <ObjectListPage objectType="company" />;
-const DealsPage = () => <ObjectListPage objectType="deal" />;
 const TicketsPage = () => <ObjectListPage objectType="ticket" />;
 
 const ContactRecord = () => { const { params } = useRouter(); return <RecordPage objectType="contact" id={params.id} />; };
 const CompanyRecord = () => { const { params } = useRouter(); return <RecordPage objectType="company" id={params.id} />; };
-const DealRecord = () => { const { params } = useRouter(); return <RecordPage objectType="deal" id={params.id} />; };
 const TicketRecord = () => { const { params } = useRouter(); return <RecordPage objectType="ticket" id={params.id} />; };
 
 /**
@@ -34,6 +32,10 @@ const TicketRecord = () => { const { params } = useRouter(); return <RecordPage 
  * reading "Data model › company", with the nav highlighting the wrong entry
  * and the tab titled with the raw slug. An object type that has a screen of
  * its own has one address; everything else keeps the generic one.
+ *
+ * Deals are the same story one module over: the pipeline owns the board, the
+ * table and the deal record, so `/records/deal` no longer draws a second deal
+ * list with its own columns and its own money format — it hands over.
  */
 const DEDICATED = new Set(['contact', 'company', 'deal', 'ticket']);
 
@@ -171,7 +173,7 @@ function NewestContacts() {
             <span className="crm-widgetrow__sub u-truncate">{String(row.properties.job_title ?? '—')}</span>
           </span>
           {row.properties.lifecycle_stage
-            ? <Badge tone="info" size="sm">{String(row.properties.lifecycle_stage).replace(/_/g, ' ')}</Badge>
+            ? <Badge tone="info" size="sm">{humanize(String(row.properties.lifecycle_stage))}</Badge>
             : null}
           <span className="crm-widgetrow__when">{f.relative(row.created)}</span>
         </button>
@@ -188,8 +190,6 @@ export const routes: RouteDef[] = [
   { path: '/companies', element: CompaniesPage, title: 'Companies' },
   { path: '/companies/:id', element: CompanyRecord, title: 'Company' },
   { path: '/records', element: DataModelPage, title: 'Data model' },
-  { path: '/records/deal', element: DealsPage, title: 'Deals' },
-  { path: '/records/deal/:id', element: DealRecord, title: 'Deal' },
   { path: '/records/ticket', element: TicketsPage, title: 'Tickets' },
   { path: '/records/ticket/:id', element: TicketRecord, title: 'Ticket' },
   // A custom object's slug is the only name the route knows before the schema
@@ -204,18 +204,15 @@ export const nav: NavItem[] = [
   { id: 'crm.model', label: 'Data model', to: '/records', group: 'crm', order: 90, icon: 'layers', minRole: 'admin' },
 ];
 
+/**
+ * The shell already offers "Go to" for every nav destination and "Create" for
+ * every object type the workspace can store, so nothing here repeats those.
+ * What is left is the screens the sidebar does not list.
+ */
 export const commands: CommandDef[] = [
-  { id: 'crm.contacts', title: 'Contacts', subtitle: 'Every person in the book', group: 'Go to', keywords: ['people', 'crm', 'leads'], icon: 'contacts', run: (go) => go('/contacts') },
-  { id: 'crm.companies', title: 'Companies', subtitle: 'Accounts, with their pipeline', group: 'Go to', keywords: ['accounts', 'crm'], icon: 'building', run: (go) => go('/companies') },
-  { id: 'crm.deals', title: 'Deals', subtitle: 'Every opportunity, filterable', group: 'Go to', keywords: ['pipeline', 'opportunities'], icon: 'deals', run: (go) => go('/records/deal') },
   { id: 'crm.tickets', title: 'Tickets', subtitle: 'The support queue', group: 'Go to', keywords: ['support', 'queue'], icon: 'tickets', run: (go) => go('/records/ticket') },
   { id: 'crm.tasks', title: 'Tasks', subtitle: 'Everything anyone still owes a customer', group: 'Go to', keywords: ['todo', 'follow up', 'queue'], icon: 'check-circle', run: (go) => go('/records/task') },
   { id: 'crm.calls', title: 'Calls', subtitle: 'Every call logged, newest first', group: 'Go to', keywords: ['phone', 'dials', 'activity'], icon: 'phone', run: (go) => go('/records/call') },
-  { id: 'crm.model', title: 'Data model', subtitle: 'Objects, properties and associations', group: 'Go to', keywords: ['schema', 'properties', 'custom object'], icon: 'layers', run: (go) => go('/records') },
-  { id: 'crm.new-contact', title: 'New contact', subtitle: 'Add a person', group: 'Create', keywords: ['add', 'person', 'lead'], icon: 'plus', run: (go) => go('/contacts?new=1') },
-  { id: 'crm.new-company', title: 'New company', subtitle: 'Add an account', group: 'Create', keywords: ['add', 'account'], icon: 'plus', run: (go) => go('/companies?new=1') },
-  { id: 'crm.new-deal', title: 'New deal', subtitle: 'Open an opportunity', group: 'Create', keywords: ['add', 'opportunity'], icon: 'plus', run: (go) => go('/records/deal?new=1') },
-  { id: 'crm.new-object', title: 'New custom object', subtitle: 'Extend the object model', group: 'Create', keywords: ['schema', 'custom', 'object'], icon: 'layers', run: (go) => go('/records') },
 ];
 
 export const widgets: WidgetDef[] = [

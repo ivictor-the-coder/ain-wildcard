@@ -16,6 +16,7 @@ import {
 } from '@/client/design';
 import { useRouter } from '@/client/kernel/router';
 import { useSession } from '@/client/kernel/session';
+import { useCurrentCrumb } from '@/client/kernel/shell';
 import type { ApiClientError } from '@/client/kernel/api';
 import {
   archiveRecord, associate, crmChanged, destroyRecord, disassociate, mergeRecords, patchRecord,
@@ -58,26 +59,6 @@ const KIND_TONE: Record<TimelineItem['kind'], 'brand' | 'info' | 'purple' | 'neu
 };
 
 const ACTIVITY_KINDS = ['note', 'call', 'meeting', 'email', 'task'] as const;
-
-/**
- * The shell labels the last breadcrumb from the route's static title, which is
- * all a route knows before its record has answered — so three open tabs all
- * read "Home › Contacts › Contact". The record's own name is the crumb worth
- * having, and it is only knowable here. The shell owns that node, so this
- * writes the text and puts the type label back on the way out; React leaves it
- * alone in between, because it only touches a text node whose value changed.
- */
-function useRecordCrumb(name: string | null | undefined, fallback: string): void {
-  useEffect(() => {
-    const current = document.querySelector<HTMLElement>('nav[aria-label="Breadcrumb"] [aria-current="page"]');
-    if (!current) return;
-    const label = name || fallback;
-    if (current.textContent !== label) current.textContent = label;
-    return () => {
-      if (current.isConnected && current.textContent === label) current.textContent = fallback;
-    };
-  }, [name, fallback]);
-}
 
 /**
  * `/similar` scores 0–100 already. Clamping is cheap insurance: a percentage
@@ -158,17 +139,7 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
 
   const data = record.data;
 
-  // The route can only name the tab after the object type. Once the record has
-  // answered, the tab carries who it is — queued behind the router's own title
-  // effect, which runs after this one on the commit that matched the route.
-  useEffect(() => {
-    if (!data) return;
-    let live = true;
-    queueMicrotask(() => { if (live) document.title = `${data.display_name} · Ain`; });
-    return () => { live = false; };
-  }, [data]);
-
-  useRecordCrumb(data?.display_name, objectDef?.label ?? humanize(objectType));
+  useCurrentCrumb(data?.display_name);
 
   /**
    * Who this person works for. It was only in the right-hand rail, which on a

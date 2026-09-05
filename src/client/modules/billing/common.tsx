@@ -11,7 +11,7 @@ import { api, invalidate, useQuery, type ApiClientError, type ListEnvelope, type
 import { Link, useRouter, useSearchParam } from '../../kernel/router';
 import {
   Badge, Button, EmptyState, ErrorState, Field, Icons, Inline, Input, MoneyInput, Popover, SearchInput, Select,
-  Stack, Tooltip,
+  Spinner, Stack, Tooltip,
   currencySymbol, decodeTableState, encodeTableState, filterRows, humanize, parseMoneyInput, searchRows,
   useFormat, useToast,
   type CellValue, type DateOptions, type Formatter, type TableState, type SortState,
@@ -242,8 +242,12 @@ export function RecordLink({ to, children, mono }: { to: string; children: React
 /* -------------------------------- statuses ------------------------------- */
 
 /**
- * One label map for every status this module shows — subscriptions, invoices,
- * credit notes, dunning campaigns and grants alike.
+ * One label map for every status the revenue side of the product shows —
+ * subscriptions, invoices, credit notes, dunning campaigns, grants, meters,
+ * settlements and late arrivals alike. The revenue screens read it too, so a
+ * grant that is "Scheduled" on the customer's page is "Scheduled" in the same
+ * tone on the Credits screen, rather than a neutral pill there and an amber
+ * chip here.
  *
  * Two rules it exists to keep. Casing is uniform, so a credit note never reads
  * a lowercase "void" beside an invoice's title-cased "Void". And the record's
@@ -253,10 +257,12 @@ export function RecordLink({ to, children, mono }: { to: string; children: React
 const STATUS_COPY: Record<string, string> = {
   trialing: 'Trialing', active: 'Active', past_due: 'Past due', paused: 'Paused',
   canceled: 'Canceled', unpaid: 'Unpaid', incomplete: 'Incomplete', incomplete_expired: 'Expired',
-  draft: 'Draft', open: 'Open', paid: 'Paid', void: 'Voided', uncollectible: 'Written off',
+  draft: 'Draft', open: 'Open', paid: 'Paid', void: 'Voided', voided: 'Voided', uncollectible: 'Written off',
   issued: 'Issued', recovering: 'Recovering', recovered: 'Recovered', exhausted: 'Given up',
-  succeeded: 'Succeeded', failed: 'Failed', skipped: 'Skipped', pending: 'Not checked',
-  verified: 'Verified', unverified: 'Unverified', unavailable: 'Register silent',
+  succeeded: 'Succeeded', failed: 'Failed', skipped: 'Skipped', pending: 'Pending',
+  scheduled: 'Scheduled', expired: 'Expired', settled: 'Settled', invoiced: 'Invoiced',
+  inactive: 'Inactive', archived: 'Archived',
+  credited: 'Credited', ignored: 'Ignored', rebilled: 'Rebilled', withdrawn: 'Withdrawn',
   // A payment instruction's own states. `requires_payment_method` is where a
   // declined intent goes — "Declined" is what happened, and calling it
   // "Requires payment method" hides that money was refused.
@@ -274,12 +280,37 @@ export function StatusPill({ status, title }: { status: string; title?: string }
 /** The billing words the shared status ramp does not already carry. */
 function toneFor(status: string): 'neutral' | 'success' | 'warning' | 'danger' | 'info' {
   switch (status) {
-    case 'active': case 'paid': case 'succeeded': return 'success';
-    case 'trialing': case 'open': case 'issued': case 'processing': return 'info';
-    case 'past_due': case 'paused': case 'incomplete': case 'requires_action': return 'warning';
-    case 'unpaid': case 'canceled': case 'uncollectible': case 'requires_payment_method': return 'danger';
+    case 'active': case 'paid': case 'succeeded': case 'recovered': case 'settled': case 'credited': case 'rebilled':
+      return 'success';
+    case 'trialing': case 'open': case 'issued': case 'processing': case 'scheduled': case 'invoiced':
+      return 'info';
+    case 'past_due': case 'paused': case 'incomplete': case 'requires_action': case 'recovering': case 'pending':
+      return 'warning';
+    case 'unpaid': case 'canceled': case 'uncollectible': case 'requires_payment_method': case 'failed':
+    case 'exhausted': case 'expired': case 'voided':
+      return 'danger';
     default: return 'neutral';
   }
+}
+
+/**
+ * What a register said about a customer's tax number — a different vocabulary
+ * from a record's lifecycle, and shared by the account page and Settings › Tax
+ * so the same number never reads "Unverified" on one and "Register said no"
+ * on the other.
+ */
+export const TAX_ID_STATUS: Record<string, { label: string; tone: 'success' | 'warning' | 'danger' | 'neutral' }> = {
+  verified: { label: 'Verified', tone: 'success' },
+  pending: { label: 'Not checked', tone: 'neutral' },
+  unverified: { label: 'Register said no', tone: 'warning' },
+  unavailable: { label: 'Register silent', tone: 'neutral' },
+};
+
+export const taxIdStatusLabel = (status: string): string => TAX_ID_STATUS[status]?.label ?? humanize(status);
+
+export function TaxIdStatusPill({ status, title }: { status: string; title?: string }) {
+  const pill = <Badge tone={TAX_ID_STATUS[status]?.tone ?? 'neutral'} dot pill>{taxIdStatusLabel(status)}</Badge>;
+  return title ? <Tooltip content={title}><span className="bl-pill">{pill}</span></Tooltip> : pill;
 }
 
 /* ------------------------------ presentation ----------------------------- */
@@ -616,10 +647,11 @@ export async function post<T>(path: string, body: unknown): Promise<T> {
   return api.post<T>(path, body);
 }
 
+/** The one loading figure the revenue screens share: the kit's spinner and a sentence. */
 export function Loading({ label }: { label: string }) {
   return (
-    <Stack gap={4} align="center" className="bl-loading">
-      <Icons.refresh size={18} className="bl-spin" />
+    <Stack gap={4} align="center" className="bl-loading" role="status">
+      <Spinner size={18} />
       <span className="bl-loading__label">{label}</span>
     </Stack>
   );

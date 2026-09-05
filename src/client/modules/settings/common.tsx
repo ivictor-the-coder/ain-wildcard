@@ -492,7 +492,9 @@ const csvCell = (value: string | number | null | undefined): string => {
 export function toCsv<T>(rows: readonly T[], columns: readonly CsvColumn<T>[]): string {
   const lines = [columns.map((column) => csvCell(column.header)).join(',')];
   for (const row of rows) lines.push(columns.map((column) => csvCell(column.value(row))).join(','));
-  return `${lines.join('\n')}\n`;
+  // The same file shape every other export in the product hands over: a BOM so
+  // Excel reads the € and £ signs, and CRLF so it reads the rows on Windows.
+  return `﻿${lines.join('\r\n')}\r\n`;
 }
 
 export const fileStamp = (at: number, timeZone: string): string => {

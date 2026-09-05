@@ -2385,3 +2385,31 @@ describe('a top-up charges first and grants second', () => {
     }
   });
 });
+
+/**
+ * A whole-product walk found a seeded goodwill grant whose customer did not
+ * exist: the metering roster names accounts by company, and one of them never
+ * resolved to an invoicing customer, so the grant was written against the
+ * roster's placeholder id and the credits screen showed "Unknown account". A
+ * balance on an account nobody can open is a falsehood on screen.
+ *
+ * Checked on a workspace nothing else has touched: the tests above grant to
+ * synthetic customer ids on purpose, and only the seed is under judgement.
+ */
+describe('every seeded grant names an account that exists', () => {
+  test('each credit grant in the demo workspace resolves to a customer', async () => {
+    const fresh = await createApp({ db: 'memory', clock: frozenClock(T0), config: { env: 'test' } });
+    try {
+      const grants: CreditGrant[] = (await expectOk('GET', '/v1/credit-grants?limit=200', undefined, fresh)).data;
+      assert.ok(grants.length >= 5, 'the seed still writes its grants');
+      const missing: string[] = [];
+      for (const grant of grants) {
+        const res = await call('GET', `/v1/customers/${grant.customer}`, undefined, fresh);
+        if (res.status !== 200) missing.push(`${grant.name} → ${grant.customer} (${res.status})`);
+      }
+      assert.deepEqual(missing, [], 'a grant written against an account that cannot be opened');
+    } finally {
+      fresh.close();
+    }
+  });
+});

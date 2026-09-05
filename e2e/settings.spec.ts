@@ -259,6 +259,68 @@ test('a tax rate is registered from the UI and retired again', async ({ page }) 
   expect(retired.active).toBe(false);
 });
 
+test('a refused registration is explained under the field the server named', async ({ page }) => {
+  await signIn(page);
+  await openSettings(page, '/settings/tax', 'Tax');
+  await page.getByRole('button', { name: 'Register a rate' }).click();
+  await dialog(page).getByLabel('What appears on the invoice').fill('VAT');
+  await dialog(page).getByLabel('Jurisdiction').fill('Germany');
+  // Germany already carries an active rate, and one address may never match two.
+  await dialog(page).getByLabel('Country', { exact: true }).fill('DE');
+  await dialog(page).getByLabel('Percentage').fill('19');
+  await dialog(page).getByRole('button', { name: 'Register it' }).click();
+
+  await expect(dialog(page).getByText(/already/i).first()).toBeVisible();
+  await expect(dialog(page)).toBeVisible();
+});
+
+test('the hold on bills with no tax location can be turned on and off', async ({ page }) => {
+  await signIn(page);
+  const before = await json(page, '/v1/billing/automatic_tax');
+  await openSettings(page, '/settings/tax', 'Tax');
+
+  const toggle = page.getByRole('switch', { name: /Hold an invoice as a draft/ });
+  await expect(toggle).toHaveAttribute('aria-checked', String(before.enabled));
+  await toggle.click();
+  await expect.poll(async () => (await json(page, '/v1/billing/automatic_tax')).enabled).toBe(!before.enabled);
+
+  await toggle.click();
+  await expect.poll(async () => (await json(page, '/v1/billing/automatic_tax')).enabled).toBe(before.enabled);
+});
+
+test('the tax screen is operable from the keyboard alone', async ({ page }) => {
+  await signIn(page);
+  await openSettings(page, '/settings/tax', 'Tax');
+
+  // Tab to the primary action rather than clicking it, and open it with Enter.
+  const register = page.getByRole('button', { name: 'Register a rate' });
+  await register.focus();
+  await expect(register).toBeFocused();
+  await page.keyboard.press('Enter');
+
+  await expect(dialog(page)).toBeVisible();
+  // Focus is inside the dialog, not left behind on the page under it.
+  await expect(dialog(page).locator(':focus')).toHaveCount(1);
+  await page.keyboard.press('Escape');
+  await expect(dialog(page)).toBeHidden();
+  await expect(register).toBeFocused();
+
+  // The search is a plain text box, so it narrows the grid from the keyboard.
+  const search = page.getByPlaceholder('Search by jurisdiction, country or name');
+  await search.focus();
+  await page.keyboard.type('DE');
+  await expect.poll(async () => page.locator('tbody tr').count()).toBeGreaterThan(0);
+
+  // And the hold is a real switch: focusable, and toggled with the space bar.
+  const toggle = page.getByRole('switch', { name: /Hold an invoice as a draft/ });
+  const before = await toggle.getAttribute('aria-checked');
+  await toggle.focus();
+  await page.keyboard.press(' ');
+  await expect.poll(async () => toggle.getAttribute('aria-checked')).not.toBe(before);
+  await page.keyboard.press(' ');
+  await expect.poll(async () => toggle.getAttribute('aria-checked')).toBe(before);
+});
+
 /* =========================== features & entitlements ===================== */
 
 test('a feature is defined, granted to one account as an override, and revoked', async ({ page }) => {

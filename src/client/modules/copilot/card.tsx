@@ -8,14 +8,14 @@
 import { Icons } from '@/client/design';
 import type { Refusal } from './card-core';
 import type { SlotChip } from './slots-core';
-import { API_KEYS_HREF, type EngineLine } from './templates-core';
+import { MODEL_KEY_NOTE, type EngineLine } from './templates-core';
 
-/** "answered from a template" / "answered by the model", with the honest footnote. */
-export function EngineIndicator({ line, onOpen }: {
-  line: EngineLine;
-  /** Opens Settings › API keys in the app's own router. */
-  onOpen: (href: string) => void;
-}) {
+/**
+ * "answered from a template" / "answered by the model", with the honest
+ * footnote. With no hosted model the footnote says what one takes; it is not a
+ * link, because nothing in the product can set it.
+ */
+export function EngineIndicator({ line }: { line: EngineLine }) {
   const Glyph = line.engine === 'anthropic' ? Icons.sparkles : Icons.bolt;
   return (
     <span className={`cp-engine cp-engine--${line.engine}`} title={line.detail} data-engine={line.engine}>
@@ -24,18 +24,7 @@ export function EngineIndicator({ line, onOpen }: {
       {line.needsKey && (
         <>
           <span aria-hidden>·</span>
-          <a
-            className="cp-engine__link"
-            href={API_KEYS_HREF}
-            title={line.detail}
-            onClick={(e) => {
-              if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
-              e.preventDefault();
-              onOpen(API_KEYS_HREF);
-            }}
-          >
-            free text needs a model key — Settings › API keys
-          </a>
+          <span className="cp-engine__note" title={line.detail}>{MODEL_KEY_NOTE}</span>
         </>
       )}
     </span>
