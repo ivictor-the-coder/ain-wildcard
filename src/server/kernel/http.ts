@@ -5,6 +5,16 @@ import { randomId } from '../../shared/ids';
 
 export type Role = 'owner' | 'admin' | 'member' | 'analyst' | 'readonly' | 'system';
 
+/**
+ * The one ladder every authority check in the platform reads. It lives here,
+ * beside `Role`, so a module can enforce a role on a *field* of a request —
+ * `allow_writes` on the copilot, say — without importing `app.ts` and closing
+ * an import cycle through the generated module registry.
+ */
+const ROLE_RANK: Record<Role, number> = { system: 100, owner: 90, admin: 80, member: 60, analyst: 40, readonly: 20 };
+
+export const roleAtLeast = (role: Role, min: Role): boolean => ROLE_RANK[role] >= ROLE_RANK[min];
+
 export interface Auth {
   kind: 'session' | 'api_key' | 'system' | 'anonymous';
   orgId: string;

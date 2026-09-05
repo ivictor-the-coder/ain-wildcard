@@ -1,0 +1,354 @@
+/* Revenue, usage, credits and recovery surfaces.
+
+   Layout and rhythm only. Every colour, size, radius and duration below is a
+   token, so light and dark come out of one set of rules and the design system
+   stays the only place a value is decided. */
+
+/* -------------------------------- tiles ---------------------------------- */
+
+.rv-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(196px, 100%), 1fr));
+  gap: var(--space-5);
+}
+.rv-tiles--wide { grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)); }
+.rv-tiles--tight { grid-template-columns: repeat(auto-fit, minmax(min(158px, 100%), 1fr)); }
+
+.rv-tile { position: relative; }
+.rv-tile__basis { position: absolute; inset-block-start: var(--space-3); inset-inline-end: var(--space-3); }
+
+/* -------------------------------- columns -------------------------------- */
+
+.rv-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: var(--space-6);
+  align-items: start;
+}
+.rv-cols--even { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+@media (max-width: 1120px) {
+  .rv-cols, .rv-cols--even { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* -------------------------------- toolbar -------------------------------- */
+
+.rv-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4);
+}
+.rv-toolbar__spacer { flex: 1 1 auto; }
+
+/* ------------------------------ basis note ------------------------------- */
+
+.rv-basis { max-width: 460px; }
+.rv-basis__summary {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  line-height: var(--leading-relaxed);
+  margin: 0 0 var(--space-5);
+}
+.rv-basis__list {
+  margin: 0;
+  padding-inline-start: var(--space-7);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.rv-basis__list li { font-size: var(--text-xs); color: var(--text-secondary); line-height: var(--leading-normal); }
+.rv-basis__sources {
+  margin-block-start: var(--space-5);
+  padding-block-start: var(--space-4);
+  border-block-start: 1px solid var(--border-subtle);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+}
+.rv-basis__source {
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.rv-basis__source b { color: var(--text-secondary); font-weight: var(--weight-semibold); }
+
+/* --------------------------------- cells --------------------------------- */
+
+.rv-num { font-variant-numeric: tabular-nums; }
+.rv-num--pos { color: var(--text-success); }
+.rv-num--neg { color: var(--text-danger); }
+.rv-muted { color: var(--text-tertiary); }
+.rv-sub { color: var(--text-tertiary); font-size: var(--text-xs); }
+.rv-mono { font-family: var(--font-mono); font-size: var(--text-xs); }
+.rv-nowrap { white-space: nowrap; }
+.rv-wrap { white-space: normal; display: block; line-height: var(--leading-snug); }
+/* Three lines of advice, with the whole sentence in the cell's title. A row
+   that grows to ten lines buries the queue it is meant to help work. */
+.rv-clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.rv-cell { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.rv-cell__top { font-weight: var(--weight-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-cell__sub { color: var(--text-tertiary); font-size: var(--text-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.rv-link {
+  color: var(--text-primary);
+  text-decoration: none;
+  font-weight: var(--weight-medium);
+  border-radius: var(--radius-xs);
+}
+.rv-link:hover { color: var(--text-link); text-decoration: underline; }
+.rv-link:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+/* ------------------------------- books strip ----------------------------- */
+
+.rv-books { display: flex; flex-wrap: wrap; gap: var(--space-4); }
+.rv-book {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-4) var(--space-6);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: start;
+  min-width: 150px;
+}
+.rv-book:hover { border-color: var(--border-strong); background: var(--bg-hover); }
+.rv-book:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.rv-book.is-active { border-color: var(--border-brand); background: var(--bg-selected); }
+.rv-book__code {
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  font-weight: var(--weight-semibold);
+}
+.rv-book__amount { font-size: var(--text-lg); font-weight: var(--weight-semibold); font-variant-numeric: tabular-nums; }
+.rv-book__meta { font-size: var(--text-xs); color: var(--text-tertiary); }
+
+/* -------------------------------- rows ----------------------------------- */
+
+.rv-rows { display: flex; flex-direction: column; }
+.rv-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-2);
+  border-block-end: 1px solid var(--border-subtle);
+  min-width: 0;
+}
+.rv-row:last-child { border-block-end: 0; }
+.rv-row__main { flex: 1 1 auto; min-width: 0; }
+.rv-row__title { font-size: var(--text-sm); font-weight: var(--weight-medium); }
+.rv-row__sub { font-size: var(--text-xs); color: var(--text-tertiary); }
+.rv-row__aside { flex: none; text-align: end; font-variant-numeric: tabular-nums; font-size: var(--text-sm); }
+
+/* ------------------------------ description ------------------------------ */
+
+.rv-fieldrow {
+  display: grid;
+  grid-template-columns: minmax(130px, 36%) minmax(0, 1fr);
+  gap: var(--space-5);
+  padding: var(--space-4) 0;
+  border-block-end: 1px solid var(--border-subtle);
+  align-items: start;
+}
+.rv-fieldrow:last-child { border-block-end: 0; }
+.rv-fieldrow__label { color: var(--text-secondary); font-size: var(--text-sm); }
+.rv-fieldrow__value { font-size: var(--text-sm); min-width: 0; overflow-wrap: anywhere; }
+
+/* -------------------------------- cohort --------------------------------- */
+
+.rv-cohort { overflow-x: auto; }
+.rv-cohort table { border-collapse: separate; border-spacing: 2px; font-variant-numeric: tabular-nums; }
+.rv-cohort th {
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+  padding: var(--space-2) var(--space-3);
+  text-align: center;
+  white-space: nowrap;
+}
+.rv-cohort th[scope='row'] { text-align: start; text-transform: none; letter-spacing: 0; color: var(--text-secondary); font-size: var(--text-xs); }
+.rv-cohort td {
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-xs);
+  font-size: var(--text-xs);
+  text-align: center;
+  min-width: 56px;
+  color: var(--text-primary);
+}
+.rv-cohort td.is-empty { background: var(--bg-sunken); color: var(--text-placeholder); }
+.rv-cohort__legend {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+  margin-block-start: var(--space-4);
+}
+.rv-cohort__swatch { inline-size: 22px; block-size: 10px; border-radius: var(--radius-xs); }
+
+/* ------------------------------- ledger ---------------------------------- */
+
+.rv-ledger { font-variant-numeric: tabular-nums; }
+.rv-ledger__delta--in { color: var(--text-success); }
+.rv-ledger__delta--out { color: var(--text-danger); }
+
+/* -------------------------------- payload -------------------------------- */
+
+.rv-payload {
+  margin: 0;
+  padding: var(--space-4);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--text-secondary);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------- loading --------------------------------- */
+
+.rv-loading { padding: var(--space-10) 0; color: var(--text-secondary); }
+.rv-chartskel { padding: var(--space-6) 0; }
+
+/* -------------------------------- form ----------------------------------- */
+
+.rv-form { display: flex; flex-direction: column; gap: var(--space-6); }
+.rv-form__pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr));
+  gap: var(--space-5);
+}
+.rv-hint { font-size: var(--text-xs); color: var(--text-tertiary); line-height: var(--leading-normal); }
+
+/* An empty state inside a table sits in the table's horizontal scroller, which
+   is as wide as the columns — so its prose has to be given a reading measure of
+   its own or it runs off the edge of the card. */
+.rv-emptybody { display: block; max-inline-size: 62ch; margin-inline: auto; }
+
+/* ------------------------------ waterfall -------------------------------- */
+
+.rv-waterlegend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3) var(--space-6);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+.rv-waterlegend__item { display: inline-flex; align-items: baseline; gap: var(--space-3); }
+.rv-waterlegend__value { font-variant-numeric: tabular-nums; font-weight: var(--weight-medium); color: var(--text-primary); }
+
+/* ------------------------- stale-while-revalidate ------------------------ */
+
+/* A range change is the most frequent interaction on a reporting screen, so
+   the previous answer stays legible while the next one is fetched. Dimmed,
+   never blanked — a skeleton here would throw away numbers that are still
+   almost right. */
+.rv-stale {
+  opacity: 0.5;
+  transition: opacity var(--dur-normal) var(--ease-out);
+}
+@media (prefers-reduced-motion: reduce) {
+  .rv-stale { transition: none; }
+}
+
+.rv-refreshing {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+/* ---------------------------- unknown account ---------------------------- */
+
+/* An id where every neighbouring row carries a company name is a broken
+   reference, not a name. It is marked as one. */
+.rv-unknown {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-warning);
+  font-size: var(--text-xs);
+  min-width: 0;
+}
+.rv-unknown code {
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* -------------------------------- preview -------------------------------- */
+
+/* Every dialog that moves money states the amount before the button is
+   pressed. This is where it is stated. */
+.rv-preview {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-5);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-sunken);
+}
+.rv-preview__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+.rv-preview__label {
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  font-weight: var(--weight-semibold);
+}
+.rv-preview__amount {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+.rv-preview__lines { display: flex; flex-direction: column; gap: var(--space-2); }
+.rv-preview__line {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-4);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+.rv-preview__line span:last-child { font-variant-numeric: tabular-nums; }
+
+/* ------------------------------- chip row -------------------------------- */
+
+.rv-chiprow { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); }
+
+/* The give-up list: one checkbox per decline code, in two columns where there
+   is room, so a policy of nine codes does not become a nine-deep stack. */
+.rv-codes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--space-4) var(--space-6);
+  max-height: 280px;
+  overflow-y: auto;
+  padding-inline-end: var(--space-3);
+}

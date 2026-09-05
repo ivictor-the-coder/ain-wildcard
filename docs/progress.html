@@ -1,0 +1,759 @@
+<title>Ain Build Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Source+Sans+3:wght@400;600&display=swap">
+<style>
+/* Light is the base palette; both dark paths redefine only tokens. */
+:root {
+  --ground:#f2f4f7; --panel:#ffffff; --panel-2:#f7f8fa; --sunk:#e9ecf1;
+  --line:#dfe4ec; --line-2:#c6cedb;
+  --ink:#141b2a; --ink-2:#4d576b; --ink-3:#78829a;
+  --ours:#3d4fc4;          /* our side of the duel */
+  --ours-soft:#e7e9fb;
+  --theirs:#b8532f;        /* the reference product's side */
+  --theirs-soft:#fbeae3;
+  --good:#1f7a52; --good-soft:#e2f2ea;
+  --warn:#9a6510; --warn-soft:#faefdc;
+  --shadow:0 1px 2px rgba(20,27,42,.06), 0 8px 20px -14px rgba(20,27,42,.28);
+  --font-display:"Archivo","Helvetica Neue",Arial,sans-serif;
+  --font-body:"Source Sans 3",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --font-mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:#0d1220; --panel:#141a2a; --panel-2:#182031; --sunk:#0a0f1a;
+    --line:#242e44; --line-2:#36425c;
+    --ink:#e7ebf4; --ink-2:#a2adc2; --ink-3:#7684a0;
+    --ours:#8a95f0; --ours-soft:rgba(138,149,240,.16);
+    --theirs:#e08b64; --theirs-soft:rgba(224,139,100,.16);
+    --good:#57c294; --good-soft:rgba(87,194,148,.15);
+    --warn:#d9a94f; --warn-soft:rgba(217,169,79,.15);
+    --shadow:0 1px 2px rgba(0,0,0,.5), 0 10px 28px -18px rgba(0,0,0,.8);
+  }
+}
+:root[data-theme="dark"] {
+  --ground:#0d1220; --panel:#141a2a; --panel-2:#182031; --sunk:#0a0f1a;
+  --line:#242e44; --line-2:#36425c;
+  --ink:#e7ebf4; --ink-2:#a2adc2; --ink-3:#7684a0;
+  --ours:#8a95f0; --ours-soft:rgba(138,149,240,.16);
+  --theirs:#e08b64; --theirs-soft:rgba(224,139,100,.16);
+  --good:#57c294; --good-soft:rgba(87,194,148,.15);
+  --warn:#d9a94f; --warn-soft:rgba(217,169,79,.15);
+  --shadow:0 1px 2px rgba(0,0,0,.5), 0 10px 28px -18px rgba(0,0,0,.8);
+}
+
+* { box-sizing:border-box; }
+body {
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:var(--font-body); font-size:15px; line-height:1.55;
+  -webkit-font-smoothing:antialiased; font-variant-numeric:tabular-nums;
+}
+h1,h2,h3 { font-family:var(--font-display); margin:0; text-wrap:balance; }
+
+.board { max-width:1180px; margin:0 auto; padding:40px 24px 80px; display:grid; grid-template-columns:264px 1fr; gap:40px; align-items:start; }
+@media (max-width:900px){ .board{ grid-template-columns:1fr; gap:28px; padding:28px 18px 60px; } .rail{ position:static !important; } }
+
+/* ---------------------------------------------------------------- rail */
+.rail { position:sticky; top:28px; display:flex; flex-direction:column; gap:22px; }
+.brand { display:flex; align-items:center; gap:11px; }
+.brand__mark { width:34px; height:34px; border-radius:9px; background:var(--ours); color:#fff; display:grid; place-items:center; font-family:var(--font-display); font-weight:700; font-size:17px; flex:none; }
+.brand__name { font-family:var(--font-display); font-weight:700; font-size:20px; letter-spacing:-.015em; line-height:1.1; }
+.brand__sub { font-size:12.5px; color:var(--ink-3); letter-spacing:.01em; }
+
+.live { display:flex; align-items:center; gap:7px; font-family:var(--font-mono); font-size:11.5px; color:var(--ink-2); }
+.live__dot { width:7px; height:7px; border-radius:50%; background:var(--ours); box-shadow:0 0 0 3px var(--ours-soft); animation:breathe 2.4s ease-in-out infinite; }
+@keyframes breathe { 50% { opacity:.35; } }
+@media (prefers-reduced-motion: reduce){ .live__dot{ animation:none; } }
+
+.counts { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); border:1px solid var(--line); border-radius:11px; overflow:hidden; }
+.count { background:var(--panel); padding:12px 13px; }
+.count b { display:block; font-family:var(--font-display); font-size:24px; font-weight:600; letter-spacing:-.02em; line-height:1.15; }
+.count span { font-size:11px; color:var(--ink-3); text-transform:uppercase; letter-spacing:.07em; }
+.count.wide { grid-column:1 / -1; }
+.count.cleared b { color:var(--good); }
+.count.flight b { color:var(--ours); }
+
+.legend { border:1px solid var(--line); border-radius:11px; background:var(--panel); padding:14px; }
+.legend h4 { font-family:var(--font-display); font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.08em; color:var(--ink-3); margin:0 0 9px; }
+.legend ul { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:7px; }
+.legend li { display:flex; align-items:center; gap:9px; font-size:12.5px; color:var(--ink-2); }
+.rule { font-size:12.5px; color:var(--ink-2); line-height:1.5; border-left:2px solid var(--ours); padding-left:11px; }
+.rule b { color:var(--ink); font-weight:600; }
+
+/* ---------------------------------------------------------------- main */
+.headline { font-family:var(--font-display); font-size:19px; font-weight:500; line-height:1.42; letter-spacing:-.01em; margin:0 0 22px; max-width:62ch; }
+.headline em { font-style:normal; color:var(--ours); }
+
+.strip { margin-bottom:8px; }
+.strip__bar { display:flex; gap:2px; height:26px; }
+.seg { flex:1 1 0; min-width:3px; border-radius:2px; background:var(--sunk); border:1px solid var(--line); }
+.seg.done { background:var(--good); border-color:var(--good); }
+.seg.building { background:var(--ours); border-color:var(--ours); }
+.seg.critique { background:var(--ours-soft); border-color:var(--ours); }
+.seg.rework { background:var(--warn); border-color:var(--warn); }
+.strip__meta { display:flex; justify-content:space-between; font-family:var(--font-mono); font-size:11.5px; color:var(--ink-3); margin-top:7px; }
+
+.wave { margin-top:34px; }
+.wave__head { display:flex; align-items:baseline; gap:12px; }
+.wave__rule { width:10px; height:10px; border-radius:2px; background:var(--line-2); flex:none; align-self:center; }
+.wave.active .wave__rule { background:var(--ours); }
+.wave.done .wave__rule { background:var(--good); }
+.wave__title { font-size:15px; font-weight:600; letter-spacing:-.005em; }
+.wave__count { margin-left:auto; font-family:var(--font-mono); font-size:12.5px; color:var(--ink-2); }
+.wave__of { color:var(--ink-3); }
+.wave__note { margin:6px 0 0 22px; font-size:13.5px; color:var(--ink-2); max-width:70ch; }
+
+.rows { list-style:none; margin:12px 0 0; padding:0; border:1px solid var(--line); border-radius:12px; background:var(--panel); box-shadow:var(--shadow); overflow:hidden; }
+.row { display:flex; gap:12px; padding:13px 16px; }
+.row + .row { border-top:1px solid var(--line); }
+.row__dot { width:8px; height:8px; border-radius:50%; margin-top:8px; flex:none; background:var(--line-2); }
+.row.done .row__dot { background:var(--good); }
+.row.building .row__dot { background:var(--ours); box-shadow:0 0 0 4px var(--ours-soft); }
+.row.critique .row__dot { background:var(--ours); box-shadow:0 0 0 4px var(--ours-soft); }
+.row.rework .row__dot { background:var(--warn); box-shadow:0 0 0 4px var(--warn-soft); }
+.row__main { min-width:0; flex:1; }
+.row__head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.row__title { font-size:14.5px; font-weight:600; letter-spacing:-.005em; }
+.row__note { margin:3px 0 0; font-size:13px; color:var(--ink-2); max-width:78ch; }
+.row__verdict { margin:9px 0 0; padding:9px 12px; background:var(--panel-2); border:1px solid var(--line); border-left:2px solid var(--theirs); border-radius:0 7px 7px 0; font-size:13px; color:var(--ink-2); max-width:78ch; }
+.row__verdictlabel { display:block; font-family:var(--font-display); font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.09em; color:var(--theirs); margin-bottom:2px; }
+
+.chip { font-family:var(--font-mono); font-size:10.5px; padding:2px 7px; border-radius:5px; border:1px solid var(--line-2); color:var(--ink-3); background:var(--panel-2); white-space:nowrap; }
+.chip.done { color:var(--good); border-color:var(--good); background:var(--good-soft); }
+.chip.building, .chip.critique { color:var(--ours); border-color:var(--ours); background:var(--ours-soft); }
+.chip.rework { color:var(--warn); border-color:var(--warn); background:var(--warn-soft); }
+
+.meter { display:inline-flex; align-items:center; gap:6px; }
+.meter__track { width:54px; height:5px; border-radius:99px; background:var(--sunk); border:1px solid var(--line); overflow:hidden; display:block; }
+.meter__track i { display:block; height:100%; background:var(--ours); }
+.meter__num { font-family:var(--font-mono); font-size:11px; color:var(--ink-2); }
+.debt { font-family:var(--font-mono); font-size:10.5px; padding:1px 6px; border-radius:5px; border:1px solid var(--line-2); color:var(--ink-3); }
+.debt.clear { color:var(--good); border-color:var(--good); background:var(--good-soft); }
+.debt.some { color:var(--warn); border-color:var(--warn); background:var(--warn-soft); }
+.debt.high { color:var(--theirs); border-color:var(--theirs); background:var(--theirs-soft); }
+
+footer { margin-top:44px; padding-top:18px; border-top:1px solid var(--line); font-size:12.5px; color:var(--ink-3); max-width:74ch; }
+footer code { font-family:var(--font-mono); font-size:11.5px; color:var(--ink-2); }
+</style>
+
+<div class="board">
+  <aside class="rail">
+    <div class="brand">
+      <div class="brand__mark">A</div>
+      <div>
+        <div class="brand__name">Ain</div>
+        <div class="brand__sub">Build board</div>
+      </div>
+    </div>
+    <div class="live"><span class="live__dot"></span>updated 2026-09-05 01:51 UTC</div>
+
+    <div class="counts">
+      <div class="count cleared"><b>25</b><span>cleared</span></div>
+      <div class="count flight"><b>8</b><span>in flight</span></div>
+      <div class="count"><b>0</b><span>queued</span></div>
+      <div class="count"><b>70</b><span>critic rounds</span></div>
+      <div class="count wide"><b>10</b><span>server modules</span></div><div class="count wide"><b>8</b><span>client modules</span></div><div class="count wide"><b>94</b><span>ai templates</span></div><div class="count wide"><b>1,644/1,644</b><span>tests</span></div><div class="count wide"><b>green</b><span>ci</span></div>
+    </div>
+
+    <div class="legend">
+      <h4>How a piece clears</h4>
+      <ul>
+        <li><b>Operability</b> &ge; 80% drivable</li>
+        <li><b>Zero P0</b> defects open</li>
+        <li>at most <b>two P1</b>, each owned</li>
+        <li>every fix has a test that <b>fails without it</b></li>
+      </ul>
+    </div>
+
+    <p class="rule">The first gate asked a critic to pick us over Stripe with <b>zero</b> blocking issues. That is unsatisfiable for real software, so it printed "reference wins" 25 times running and told us nothing. It now measures <b>Operability</b> &mdash; can a human actually complete the job on screen &mdash; and <b>Defect Debt</b>, both of which move.</p>
+  </aside>
+
+  <main>
+    <h1 class="headline">Wave 9 re-judged the server against the database. The template engine’s only P0 in 458 questions was one optional word; revenue’s history was being rewritten by un-prorated plan changes; payments wrote off a 3DS card in a millisecond; billing billed usage a cycle late. All fixed with fail-before-pass tests, and a coherence pass removed every duplicated screen, trail and palette entry. Next: re-judge the fixes, then the client surfaces.</h1>
+
+    <div class="strip">
+      <div class="strip__bar" role="img" aria-label="25 of 33 pieces cleared"><i class="seg done" title="Data layer &amp; migrations — Cleared"></i><i class="seg done" title="Exact money arithmetic — Cleared"></i><i class="seg done" title="Billing-grade time — Cleared"></i><i class="seg done" title="API kernel — Cleared"></i><i class="seg done" title="Event log &amp; jobs — Cleared"></i><i class="seg done" title="Workspace core — Cleared"></i><i class="seg done" title="Design tokens — Cleared"></i><i class="seg done" title="Design system — Cleared"></i><i class="seg done" title="Smart CRM data model — Cleared"></i><i class="seg done" title="AI engine &amp; tool runtime — Cleared"></i><i class="seg done" title="Product catalog &amp; pricing — Cleared"></i><i class="seg done" title="App shell &amp; navigation — Cleared"></i><i class="seg done" title="Customers, subscriptions &amp; proration — Cleared"></i><i class="seg done" title="Usage metering &amp; prepaid credits — Cleared"></i><i class="seg critique" title="Invoicing, credit notes &amp; tax — In review"></i><i class="seg critique" title="Payments, retries &amp; dunning — In review"></i><i class="seg done" title="Entitlements &amp; feature gating — Cleared"></i><i class="seg critique" title="Revenue reporting — In review"></i><i class="seg critique" title="Subscriptions, customers &amp; invoices — In review"></i><i class="seg critique" title="Contacts, companies &amp; record pages — In review"></i><i class="seg critique" title="Deals board &amp; copilot — In review"></i><i class="seg done" title="Revenue, usage, credits &amp; dunning — Cleared"></i><i class="seg done" title="Atomic job claim — Cleared"></i><i class="seg done" title="Rollups excluded from record merge — Cleared"></i><i class="seg done" title="Refunds, overpayment &amp; presentment — Cleared"></i><i class="seg done" title="Untaxed invoices &amp; MRR truncation — Cleared"></i><i class="seg done" title="Privilege, tenancy &amp; client resilience — Cleared"></i><i class="seg done" title="Settings &amp; administration — Cleared"></i><i class="seg done" title="The built-in engine — Cleared"></i><i class="seg critique" title="The template whitelist engine — In review"></i><i class="seg critique" title="A copilot that shows what it can answer — In review"></i><i class="seg done" title="The old suite retired — Cleared"></i><i class="seg done" title="One product, not eight — Cleared"></i></div>
+      <div class="strip__meta"><span>25 of 33 pieces cleared</span><span>70 critic rounds</span></div>
+    </div>
+
+    <section class="wave done">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 0 · Foundation</h2>
+        <span class="wave__count">7<span class="wave__of">/7</span></span>
+      </header>
+      <p class="wave__note">Kernel, contracts and the demo workspace. Built directly, not delegated.</p>
+      <ul class="rows"><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Data layer &amp; migrations</h3>
+          <span class="chip done">Cleared</span>
+          
+          
+          
+        </div>
+        <p class="row__note">node:sqlite, namespaced migrations, savepoint transactions</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Exact money arithmetic</h3>
+          <span class="chip done">Cleared</span>
+          
+          
+          
+        </div>
+        <p class="row__note">integer minor units, BigInt rationals, largest-remainder allocation</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Billing-grade time</h3>
+          <span class="chip done">Cleared</span>
+          
+          
+          
+        </div>
+        <p class="row__note">anchor-day period maths, virtual clock, replayable job queue</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">API kernel</h3>
+          <span class="chip done">Cleared</span>
+          
+          
+          
+        </div>
+        <p class="row__note">router, validation, idempotency, rate limits, generated OpenAPI</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Event log &amp; jobs</h3>
+          <span class="chip done">Cleared</span>
+          
+          
+          
+        </div>
+        <p class="row__note">one event stream feeding webhooks, automation, timeline and audit</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Workspace core</h3>
+          <span class="chip done">Cleared</span>
+          
+          
+          
+        </div>
+        <p class="row__note">orgs, people, auth, API keys, audit trail, time machine</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Design tokens</h3>
+          <span class="chip done">Cleared</span>
+          
+          
+          
+        </div>
+        <p class="row__note">full light and dark palettes, type scale, elevation, motion</p>
+        
+      </div>
+    </li></ul>
+    </section><section class="wave done">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 1 · The spine</h2>
+        <span class="wave__count">5<span class="wave__of">/5</span></span>
+      </header>
+      <p class="wave__note">Everything downstream depends on these. The app shell follows immediately after the design system lands.</p>
+      <ul class="rows"><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Design system</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">4 rounds</span>
+        </div>
+        <p class="row__note">86 components, a hand-rolled SVG chart kit, 138 icons, contrast measured and published at runtime. An auditor rated the theming above Stripe, which has no dark mode at all.</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Smart CRM data model</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">5 rounds</span>
+        </div>
+        <p class="row__note">Typed properties, associations, rollups, property history, a filter compiler that held under 2,128 injection payloads, and a custom object built end to end in six API calls.</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">AI engine &amp; tool runtime</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">4 rounds</span>
+        </div>
+        <p class="row__note">Replaced. The free-text interpreter could not be made honest by adding guards; Wave 8 swapped it for a template whitelist. Its live paths (runs, traces, extraction, drafting, approvals) survive under the new engine.</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Product catalog &amp; pricing</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">3 rounds</span>
+        </div>
+        <p class="row__note">Graduated, volume, package, per-seat, usage and multi-currency prices, each line carrying the tier maths that produced its number.</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">App shell &amp; navigation</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 90% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:90%"></i></span>
+      <span class="meter__num">90%</span>
+    </span>
+          <span class="debt some" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 3</span>
+          <span class="rounds">3 rounds</span>
+        </div>
+        <p class="row__note">Command palette, global search, the shortcut model, real sign-in, and the time machine one click from the top bar.</p>
+        
+      </div>
+    </li></ul>
+    </section><section class="wave active">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 2 · Revenue</h2>
+        <span class="wave__count">3<span class="wave__of">/6</span></span>
+      </header>
+      <p class="wave__note">Two dependency chains in parallel: customers/subscriptions to invoicing to payments to revenue, alongside metering/credits to entitlements. Every critic attacks the arithmetic first.</p>
+      <ul class="rows"><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Customers, subscriptions &amp; proration</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">6 rounds</span>
+        </div>
+        <p class="row__note">Anchor-day cycles, trials, schedules, and one proration function shared by preview and charge — so a preview cannot drift from the bill. An auditor could not make it lose a cent across 800 days and four currencies.</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Usage metering &amp; prepaid credits</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">5 rounds</span>
+        </div>
+        <p class="row__note">Exactly-once ingestion, incremental rollups, an append-only credit ledger, and a documented burn-down order.</p>
+        
+      </div>
+    </li><li class="row critique">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Invoicing, credit notes &amp; tax</h3>
+          <span class="chip critique">In review</span>
+          <span class="meter" title="Operability: 90% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:90%"></i></span>
+      <span class="meter__num">90%</span>
+    </span>
+          <span class="debt some" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 6</span>
+          <span class="rounds">3 rounds</span>
+        </div>
+        <p class="row__note">Every one of 43 invoices reconciled to the cent across stacked, inclusive, reverse-charged, prorated and credited cases. Two P1s fixed: metered usage now lands on the renewal that names its window (the bill waits for the settlement it says it settles), and a cancellation sweeps every pending proration into a final invoice. Open: the subscriptions overview still adds euros to dollars in its headline — a change that crosses three owners.</p>
+        <blockquote class="row__verdict"><span class="row__verdictlabel">Critic</span>The invoice arithmetic is Stripe-grade, but usage billed a month late, cancelled subscriptions left prorations unbilled, and the overview added euros to dollars.</blockquote>
+      </div>
+    </li><li class="row critique">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Payments, retries &amp; dunning</h3>
+          <span class="chip critique">In review</span>
+          <span class="meter" title="Operability: 96% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:96%"></i></span>
+      <span class="meter__num">96%</span>
+    </span>
+          <span class="debt some" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 4</span>
+          <span class="rounds">3 rounds</span>
+        </div>
+        <p class="row__note">199 invoices, every ledger and every schedule reconciled to the row. Three P1s fixed: a card that needs its holder is held in past_due for the window the retries would have run in, not written off in a millisecond; a refund that reopens a paid bill hands it to a campaign; the do-not-retry family (stolen, lost, pickup, fraudulent, restricted) exists and is never presented twice.</p>
+        <blockquote class="row__verdict"><span class="row__verdictlabel">Critic</span>The money never lies here, but the recovery policy was harsher and narrower than Stripe’s: a 3DS card written off in a millisecond, a refunded bill owed by nobody, and no card-stolen family of declines.</blockquote>
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Entitlements &amp; feature gating</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">2 rounds</span>
+        </div>
+        <p class="row__note">Features, limits and live usage-backed checks with a real upgrade path.</p>
+        
+      </div>
+    </li><li class="row critique">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Revenue reporting</h3>
+          <span class="chip critique">In review</span>
+          <span class="meter" title="Operability: 67% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:67%"></i></span>
+      <span class="meter__num">67%</span>
+    </span>
+          <span class="debt some" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 6</span>
+          <span class="rounds">3 rounds</span>
+        </div>
+        <p class="row__note">Three P0s fixed: contract history is read from the event log so a schedule phase no longer rewrites closed months (Halstead’s April stays 9,900); credit notes reduce recognised and deferred from the day they are issued; usage &quot;charged&quot; is invoice money, not settlement-ledger money. A collection pause is a pause, not churn. Open: the module’s three copilot tools are not reachable from any template.</p>
+        <blockquote class="row__verdict"><span class="row__verdictlabel">Critic</span>The arithmetic on today’s book is exact, but the history underneath it was not durable: one un-prorated plan change rewrote five closed months, credit notes never reached recognition, and usage &quot;charged&quot; was money no invoice carried.</blockquote>
+      </div>
+    </li></ul>
+    </section><section class="wave active">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 3 · The product surface</h2>
+        <span class="wave__count">1<span class="wave__of">/4</span></span>
+      </header>
+      <p class="wave__note">The audit’s central finding: 224 of 228 API routes had no screen. This is where the effort now goes, judged on whether a human can finish the job.</p>
+      <ul class="rows"><li class="row critique">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Subscriptions, customers &amp; invoices</h3>
+          <span class="chip critique">In review</span>
+          <span class="meter" title="Operability: 85% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:85%"></i></span>
+      <span class="meter__num">85%</span>
+    </span>
+          <span class="debt some" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 4</span>
+          <span class="rounds">2 rounds</span>
+        </div>
+        <p class="row__note">Live: 35 subscriptions with status pills, currency-bucketed totals and cancel-at-period-end badges. The proration preview is the centrepiece — the exact credit and charge lines before you commit.</p>
+        
+      </div>
+    </li><li class="row critique">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Contacts, companies &amp; record pages</h3>
+          <span class="chip critique">In review</span>
+          <span class="meter" title="Operability: 85% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:85%"></i></span>
+      <span class="meter__num">85%</span>
+    </span>
+          <span class="debt some" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 4</span>
+          <span class="rounds">2 rounds</span>
+        </div>
+        <p class="row__note">Live: 148 contacts under saved views, the full filter builder, coloured lifecycle stages, owner avatars and CSV export.</p>
+        
+      </div>
+    </li><li class="row critique">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Deals board &amp; copilot</h3>
+          <span class="chip critique">In review</span>
+          <span class="meter" title="Operability: 81% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:81%"></i></span>
+      <span class="meter__num">81%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">4 rounds</span>
+        </div>
+        <p class="row__note">A deal board a critic said they would happily use daily. The copilot it is welded to now runs on the template engine; the six phrasings that returned the workspace total answer $1,463,440 or refuse.</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Revenue, usage, credits &amp; dunning</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 90% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:90%"></i></span>
+      <span class="meter__num">90%</span>
+    </span>
+          <span class="debt some" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 4</span>
+          <span class="rounds">1 round</span>
+        </div>
+        <p class="row__note">Per-currency books with an honest banner explaining that nothing is converted or added across them, an MRR movement waterfall carrying its reconciliation status, NRR, GRR, DSO, deferred balance, and a Who-moved panel naming the churned account.</p>
+        
+      </div>
+    </li></ul>
+    </section><section class="wave done">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave P0 · Criticals &amp; blast radius</h2>
+        <span class="wave__count">5<span class="wave__of">/5</span></span>
+      </header>
+      <p class="wave__note">Every fix is now followed by an agent whose job is not to confirm it, but to hunt the same mistake in the reverse operation, the sibling call and the undo — because twice now a fix has created its own mirror image.</p>
+      <ul class="rows"><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Atomic job claim</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">1 round</span>
+        </div>
+        <p class="row__note">Two concurrent drains could both run one renewal, billing a period twice. Now UPDATE … WHERE status = pending; 3 of 4 new tests fail on the old code.</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Rollups excluded from record merge</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">1 round</span>
+        </div>
+        <p class="row__note">Defining any max rollup broke dedupe permanently. The first regression test I wrote passed with and without the fix and proved nothing; the second one fails correctly.</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Refunds, overpayment &amp; presentment</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">1 round</span>
+        </div>
+        <p class="row__note">Overpayment is a ledger credit, not a second charge; a direct debit is presented once and settles days later; an idempotency key is scoped to its key’s owner.</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Untaxed invoices &amp; MRR truncation</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">1 round</span>
+        </div>
+        <p class="row__note">An invoice with no resolvable tax location is held in draft and refuses to finalize or pay; US jurisdictions stack; MRR aggregates over every subscription rather than the first page.</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Privilege, tenancy &amp; client resilience</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">1 round</span>
+        </div>
+        <p class="row__note">The copilot carries no more authority than its caller; the time machine is per workspace and one drain cannot run another’s jobs; one failed fetch no longer blanks the app.</p>
+        
+      </div>
+    </li></ul>
+    </section><section class="wave done">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 4 · Reach</h2>
+        <span class="wave__count">2<span class="wave__of">/2</span></span>
+      </header>
+      <p class="wave__note">The surfaces that were still unreachable, and the last falsehood-class defect in the engine.</p>
+      <ul class="rows"><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">Settings &amp; administration</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 93% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:93%"></i></span>
+      <span class="meter__num">93%</span>
+    </span>
+          <span class="debt some" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 10</span>
+          <span class="rounds">2 rounds</span>
+        </div>
+        <p class="row__note">Team and roles, API keys with the secret shown exactly once, the audit trail, the event stream, the job queue, tax rates, entitlements — and the time machine as a screen rather than an API call.</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">The built-in engine</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">7 rounds</span>
+        </div>
+        <p class="row__note">Replaced. Seven rounds of claim-path gating still left 28 substitutions in 156 questions; the design was abandoned for the template whitelist in Wave 8 rather than patched an eighth time.</p>
+        
+      </div>
+    </li></ul>
+    </section><section class="wave active">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 8 · Templates</h2>
+        <span class="wave__count">1<span class="wave__of">/3</span></span>
+      </header>
+      <p class="wave__note">The built-in engine answers only questions that match a template exactly, with every slot bound to a typed value; everything else is refused with the three nearest templates. Free text is the model provider’s job when a key is present.</p>
+      <ul class="rows"><li class="row critique">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">The template whitelist engine</h3>
+          <span class="chip critique">In review</span>
+          <span class="meter" title="Operability: 95% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:95%"></i></span>
+      <span class="meter__num">95%</span>
+    </span>
+          <span class="debt some" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 9</span>
+          <span class="rounds">3 rounds</span>
+        </div>
+        <p class="row__note">458 questions priced by a fresh critic against the database: one substitution class, not 28. &quot;How many tickets does Rheinwerk have?&quot; answered the open subset because &quot;(open|)&quot; was optional in two patterns. Fixed as a literal with three whole-count shapes; four P1s (truncated breakdowns, &quot;in the last quarter&quot;, &quot;carries&quot;, &quot;by industry&quot;) fixed with corpus rows. Nine P2s open.</p>
+        <blockquote class="row__verdict"><span class="row__verdictlabel">Critic</span>117 engine windows matched an independently resolved window, and &quot;last quarter&quot; moved after time travel. Zero period substitutions, zero cross-currency sums. The one P0 was a single optional word.</blockquote>
+      </div>
+    </li><li class="row critique">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">A copilot that shows what it can answer</h3>
+          <span class="chip critique">In review</span>
+          <span class="meter" title="Operability: 85% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:85%"></i></span>
+      <span class="meter__num">85%</span>
+    </span>
+          <span class="debt some" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 3</span>
+          <span class="rounds">1 round</span>
+        </div>
+        <p class="row__note">103/103 copilot tests green. The scope-guessing banners are gone; slot chips render from the plan.</p>
+        
+      </div>
+    </li><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">The old suite retired</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">1 round</span>
+        </div>
+        <p class="row__note">7,588 lines and 91 describes read one by one: 17 live suites ported as 76 property tests with expected values computed from the database; the rest tested deleted modules and went with them. One engine defect surfaced: the workspace clock was cached with the vocabulary, so “last quarter” stayed put after time travel.</p>
+        
+      </div>
+    </li></ul>
+    </section><section class="wave active">
+      <header class="wave__head">
+        <span class="wave__rule" aria-hidden="true"></span>
+        <h2 class="wave__title">Wave 9 · Re-judged against the database</h2>
+        <span class="wave__count">1<span class="wave__of">/1</span></span>
+      </header>
+      <p class="wave__note">Four fresh critics, each with its own harness under .artifacts/, recomputed every figure from raw rows and named the single biggest gap. The builders fixed that gap and every P0 with fail-before-pass tests; a fifth agent walked the whole product for one working day and removed every seam it found.</p>
+      <ul class="rows"><li class="row done">
+      <span class="row__dot" aria-hidden="true"></span>
+      <div class="row__main">
+        <div class="row__head">
+          <h3 class="row__title">One product, not eight</h3>
+          <span class="chip done">Cleared</span>
+          <span class="meter" title="Operability: 100% of claimed capabilities are drivable end to end">
+      <span class="meter__track"><i style="width:100%"></i></span>
+      <span class="meter__num">100%</span>
+    </span>
+          <span class="debt clear" title="Defect debt: 10 x P0 + 3 x P1 + 1 x P2">debt 0</span>
+          <span class="rounds">1 round</span>
+        </div>
+        <p class="row__note">Two deal screens became one, two tax screens became one, four breadcrumb mechanisms became one, three &quot;New deal&quot; palette entries became one. Revenue’s status chips are billing’s pills; error and loading panels are shared; money shows cents everywhere; the notification read-marker and the time-machine picker follow the workspace clock. Eight static guards keep the seams from returning. Two more found while moving its e2e tests: the client cache forgot every answer on invalidation, so a screen blanked and its controls went disabled for the round trip after its own mutation — the tax hold switch could be toggled by space bar once and never again — and a seeded goodwill grant named an account that did not exist.</p>
+        
+      </div>
+    </li></ul>
+    </section>
+
+    <footer>
+      Regenerated from <code>docs/progress.json</code> by <code>scripts/progress.mjs</code> on every wave.
+      Each piece is owned by one builder working a disjoint set of directories, then handed to a critic
+      that runs <code>scripts/verify.ts</code>, exercises the API, screenshots the UI in both themes, and
+      writes a verdict. Losing sends the builder back with the single biggest gap named.
+    </footer>
+  </main>
+</div>

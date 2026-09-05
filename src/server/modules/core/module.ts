@@ -1,7 +1,7 @@
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { defineModule } from '../../kernel/module';
 import type { Ctx } from '../../kernel/context';
-import { buildOpenApi, created, list, noContent, status as httpStatus, type Req, type Role } from '../../kernel/http';
+import { buildOpenApi, created, list, noContent, roleAtLeast, status as httpStatus, type Req, type Role } from '../../kernel/http';
 import { badRequest, forbidden, notFound, unauthorized } from '../../../shared/errors';
 import { newId, randomId } from '../../../shared/ids';
 import { parseJson } from '../../kernel/db';
@@ -23,6 +23,74 @@ export function verifyPassword(password: string, stored: string): boolean {
   return candidate.length === expected.length && timingSafeEqual(candidate, expected);
 }
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+
+/* ------------------------ who is behind a credential ---------------------- */
+
+/**
+ * The human this call is being made by, whichever door it came through.
+ *
+ * A session carries its user. An API key does not — and treating "no user id"
+ * as "no person" is what made a key an immortal credential: minting a key
+ * through a key dropped the author, and `authenticate` has nobody to ask about
+ * a key with no author, so the child outlived the removal of the human who
+ * created its parent. A key's principal is its author, transitively, because
+ * that is who is acting.
+ */
+function principalOf(c: Ctx, auth: Req['auth']): string | null {
+  if (auth.userId) return auth.userId;
+  if (!auth.keyId) return null;
+  return c.db.pluck<string>(`SELECT created_by FROM api_keys WHERE id = ? AND org_id = ?`, auth.keyId, auth.orgId) ?? null;
+}
+
+/* --------------------------- the authority ladder ------------------------- */
+
+/**
+ * Nobody hands out authority they do not hold.
+ *
+ * `boundedByAuthor` in `app.ts` states this for API keys — "a credential may
+ * never carry authority its author does not currently hold" — and the
+ * membership table is the *primary* grant path that mirror was written
+ * against. Only the mirror was guarded: `roles: ['admin']` let any admin PATCH
+ * themselves to `owner` and the owner down to `readonly`, in two calls, with
+ * no way back. A key minted by that admin is capped at `admin` by the bound;
+ * the seat the key hangs off was not capped at all.
+ */
+function assertMayGrant(req: Req, role: Role): void {
+  if (roleAtLeast(req.auth.role, role)) return;
+  throw forbidden(
+    `Your role (${req.auth.role}) cannot grant the ${role} role — nobody may hand out more authority than they hold. `
+    + `Ask ${role === 'owner' ? 'an owner' : 'someone with the ' + role + ' role or higher'} to make this change.`,
+  );
+}
+
+/** Memberships at `admin` or above that would survive this seat changing. */
+function adminsBesides(c: Ctx, orgId: string, userId: string): number {
+  return c.db.count(
+    `SELECT COUNT(*) FROM memberships WHERE org_id = ? AND user_id <> ? AND role IN ('owner', 'admin')`,
+    orgId, userId,
+  );
+}
+
+/**
+ * The floor under the ceiling: a workspace always keeps someone who can
+ * administer it.
+ *
+ * Now that every credential is resolved against a live membership, the last
+ * admin demoting or removing themselves is not a recoverable mistake — the
+ * session does not survive as `member`, the key they hold is bounded by the
+ * role they no longer have, and there is nobody left who can undo either.
+ */
+function assertKeepsAnAdmin(c: Ctx, orgId: string, userId: string, nextRole: Role | null): void {
+  const current = c.db.pluck<Role>(`SELECT role FROM memberships WHERE org_id = ? AND user_id = ?`, orgId, userId);
+  if (!current || !roleAtLeast(current, 'admin')) return;
+  if (nextRole && roleAtLeast(nextRole, 'admin')) return;
+  if (adminsBesides(c, orgId, userId)) return;
+  throw forbidden(
+    nextRole
+      ? `This is the workspace's last ${current}, so the role cannot be lowered to ${nextRole}. Promote another teammate to admin first, then come back.`
+      : `This is the workspace's last ${current}, so they cannot be removed. Promote another teammate to admin first, then come back.`,
+  );
+}
 
 /* -------------------------------- service -------------------------------- */
 
@@ -78,12 +146,25 @@ export default defineModule({
       setSetting(orgId, key, value) {
         ctx.db.upsert('settings', { org_id: orgId, key, value: JSON.stringify(value), updated: ctx.now() }, ['org_id', 'key']);
       },
+      /**
+       * A sign-in is good for 30 *real* days — the one thing in the platform
+       * measured on the wall clock rather than `ctx.now()`.
+       *
+       * `ctx.now()` is the workspace's business time, which any admin moves a
+       * year with `POST /v1/time/advance`. Minting against it made the session
+       * cookie's own `Max-Age` (already real seconds) disagree with the row,
+       * and expiring against it meant the platform's headline feature signed
+       * out the operator who pressed it: advance 35 days and every following
+       * call is a 401. A credential's lifetime is a fact about the person who
+       * walked away from their desk, not about the ledger they were replaying.
+       */
       createSession(orgId, userId, meta = {}) {
         const token = randomId('sess', 32);
-        const expires = ctx.now() + 30 * DAY;
+        const at = Date.now();
+        const expires = at + 30 * DAY;
         ctx.db.insert('sessions', {
           id: newId('session'), org_id: orgId, user_id: userId, token_hash: sha(token),
-          expires, created: ctx.now(), ip: meta.ip ?? null, user_agent: meta.userAgent ?? null,
+          expires, created: at, ip: meta.ip ?? null, user_agent: meta.userAgent ?? null,
         });
         return { token, expires };
       },
@@ -93,12 +174,31 @@ export default defineModule({
     };
     ctx.provide('core', service);
 
-    ctx.jobs.handle('core.cleanup', () => {
+    /**
+     * Housekeeping for one workspace, on that workspace's clock.
+     *
+     * `ctx.now()` is per workspace and an operator moves it years at a time, so
+     * an unscoped sweep is a lever every tenant holds over every other: org_b
+     * advancing 60 days deleted org_a's live sessions, org_a's idempotency keys
+     * — so org_a's next retry of a charge executed a second time instead of
+     * replaying — and org_a's job history. The recurring job also re-enqueued
+     * itself against the *default* org rather than its own, so after one run by
+     * any other tenant the job emigrated: that tenant never cleaned up again,
+     * and the default workspace's next run was scheduled on a clock that was
+     * not its own.
+     *
+     * Sessions are the exception to `ctx.now()`: a sign-in is good for 30 real
+     * days (see `createSession`), so business time must not decide when one
+     * dies — otherwise the time machine's own advance button logs the operator
+     * who pressed it out of the workspace.
+     */
+    ctx.jobs.handle('core.cleanup', (_payload, job) => {
       const now = ctx.now();
-      ctx.db.run(`DELETE FROM sessions WHERE expires < ?`, now);
-      ctx.db.run(`DELETE FROM idempotency_keys WHERE expires < ?`, now);
-      ctx.db.run(`DELETE FROM jobs WHERE status IN ('done','cancelled') AND updated < ?`, now - 7 * DAY);
-      ctx.enqueue(ctx.config.defaultOrgId, 'core.cleanup', {}, { runAt: now + DAY, idemKey: 'core.cleanup' });
+      const orgId = job.org_id;
+      ctx.db.run(`DELETE FROM sessions WHERE org_id = ? AND expires < ?`, orgId, Date.now());
+      ctx.db.run(`DELETE FROM idempotency_keys WHERE org_id = ? AND expires < ?`, orgId, now);
+      ctx.db.run(`DELETE FROM jobs WHERE org_id = ? AND status IN ('done','cancelled') AND updated < ?`, orgId, now - 7 * DAY);
+      ctx.enqueue(orgId, 'core.cleanup', {}, { runAt: now + DAY, idemKey: 'core.cleanup' });
     });
   },
 
@@ -254,6 +354,7 @@ export default defineModule({
 
     router.post('/v1/users', (req: Req, c: Ctx) => {
       const body = req.body as { email: string; name: string; role: Role; title?: string };
+      assertMayGrant(req, body.role);
       const existing = c.db.get<UserRow>(`SELECT * FROM users WHERE email = ?`, body.email);
       const now = c.now();
       const userId = existing?.id ?? newId('user');
@@ -263,7 +364,7 @@ export default defineModule({
       const member = c.db.get<any>(`SELECT id FROM memberships WHERE org_id = ? AND user_id = ?`, req.auth.orgId, userId);
       if (member) throw badRequest('member_exists', `${body.email} is already a member of this workspace.`, 'email');
       c.db.insert('memberships', { id: newId('user'), org_id: req.auth.orgId, user_id: userId, role: body.role, teams: '[]', created: now });
-      c.audit({ orgId: req.auth.orgId, actorId: req.auth.userId, actorType: 'user', action: 'user.invited', targetType: 'user', targetId: userId, summary: `Invited ${body.email} as ${body.role}`, requestId: req.requestId });
+      c.audit({ orgId: req.auth.orgId, actorId: principalOf(c, req.auth), actorType: 'user', action: 'user.invited', targetType: 'user', targetId: userId, summary: `Invited ${body.email} as ${body.role}`, requestId: req.requestId });
       c.emit(req.auth.orgId, 'user.invited', { id: userId, email: body.email, role: body.role }, { objectId: userId, objectType: 'user' });
       return created({ ...publicUser(c.svc.core.user(userId)!), role: body.role });
     }, {
@@ -279,6 +380,16 @@ export default defineModule({
       const body = req.body as { role?: Role; name?: string; title?: string; teams?: string[] };
       const member = c.db.get<any>(`SELECT * FROM memberships WHERE org_id = ? AND user_id = ?`, req.auth.orgId, req.params.id);
       if (!member) throw notFound('user', req.params.id);
+      if (body.role) {
+        // The ceiling: an admin may not seat an owner, including themselves.
+        assertMayGrant(req, body.role);
+        // …and may not take a role away from someone above them either, which
+        // is the same rule read from the other end. Without it an admin could
+        // not promote themselves to owner but could still demote the owner to
+        // readonly and be the highest rung left.
+        assertMayGrant(req, member.role as Role);
+        assertKeepsAnAdmin(c, req.auth.orgId, req.params.id, body.role);
+      }
       if (body.role || body.teams) {
         c.db.patch('memberships', 'id', member.id, {
           ...(body.role ? { role: body.role } : {}),
@@ -286,6 +397,15 @@ export default defineModule({
         });
       }
       if (body.name || body.title) c.db.patch('users', 'id', req.params.id, { ...(body.name ? { name: body.name } : {}), ...(body.title ? { title: body.title } : {}), updated: c.now() });
+      if (body.role && body.role !== member.role) {
+        c.audit({
+          orgId: req.auth.orgId, actorId: principalOf(c, req.auth), actorType: 'user', action: 'user.role_changed',
+          targetType: 'user', targetId: req.params.id, summary: `Role changed from ${member.role} to ${body.role}`,
+          before: { role: member.role }, after: { role: body.role }, requestId: req.requestId,
+        });
+        c.emit(req.auth.orgId, 'user.role_changed', { id: req.params.id, role: body.role, previous: member.role },
+          { objectId: req.params.id, objectType: 'user' });
+      }
       return { ...publicUser(c.svc.core.user(req.params.id)!), role: body.role ?? member.role };
     }, {
       summary: 'Update a teammate', tags: ['settings'], roles: ['admin'],
@@ -297,29 +417,95 @@ export default defineModule({
       }),
     });
 
+    /**
+     * Removing a teammate ends every credential they hold. It is not a hold.
+     *
+     * The live-membership check in `authenticate` refuses both doors the
+     * moment the membership row goes, which reads exactly like revocation —
+     * until the seat comes back. A different admin re-inviting the same
+     * address as `readonly`, believing they are creating a fresh minimal seat,
+     * revived the departed employee's laptop cookie and their never-revoked
+     * `['*']` CI key against it, and promoting that seat later handed the key
+     * `admin` again with `revoked_at` still NULL. So the sessions are deleted
+     * and the keys are revoked here, and the door check goes back to being
+     * defence in depth rather than the only defence.
+     */
     router.del('/v1/users/:id', (req: Req, c: Ctx) => {
-      const changed = c.db.run(`DELETE FROM memberships WHERE org_id = ? AND user_id = ?`, req.auth.orgId, req.params.id).changes;
-      if (!changed) throw notFound('user', req.params.id);
-      c.audit({ orgId: req.auth.orgId, actorId: req.auth.userId, actorType: 'user', action: 'user.removed', targetType: 'user', targetId: req.params.id, summary: 'Removed from workspace', requestId: req.requestId });
+      const member = c.db.get<{ role: Role }>(`SELECT role FROM memberships WHERE org_id = ? AND user_id = ?`, req.auth.orgId, req.params.id);
+      if (!member) throw notFound('user', req.params.id);
+      // Removing yourself is instantly unrecoverable now that a session is only
+      // as live as its membership — and through a key it is not even obvious
+      // that is what you are doing, so the principal is resolved either way.
+      if (req.params.id === principalOf(c, req.auth)) {
+        throw forbidden('You cannot remove your own membership — you would be signed out of this workspace with no way back in. Ask another admin to remove you.');
+      }
+      assertMayGrant(req, member.role);
+      assertKeepsAnAdmin(c, req.auth.orgId, req.params.id, null);
+
+      c.atomic(() => {
+        c.db.run(`DELETE FROM memberships WHERE org_id = ? AND user_id = ?`, req.auth.orgId, req.params.id);
+        const sessions = c.db.run(`DELETE FROM sessions WHERE org_id = ? AND user_id = ?`, req.auth.orgId, req.params.id).changes;
+        const keys = c.db.run(
+          `UPDATE api_keys SET revoked_at = ? WHERE org_id = ? AND created_by = ? AND revoked_at IS NULL`,
+          c.now(), req.auth.orgId, req.params.id,
+        ).changes;
+        c.audit({
+          orgId: req.auth.orgId, actorId: principalOf(c, req.auth), actorType: 'user', action: 'user.removed',
+          targetType: 'user', targetId: req.params.id,
+          summary: `Removed from workspace — ${sessions} ${sessions === 1 ? 'session' : 'sessions'} ended, ${keys} API ${keys === 1 ? 'key' : 'keys'} revoked`,
+          before: { role: member.role }, after: { sessions_ended: sessions, api_keys_revoked: keys },
+          requestId: req.requestId,
+        });
+        c.emit(req.auth.orgId, 'user.removed', {
+          id: req.params.id, role: member.role, sessions_ended: sessions, api_keys_revoked: keys,
+        }, { objectId: req.params.id, objectType: 'user' });
+      });
       return noContent();
-    }, { summary: 'Remove a teammate', tags: ['settings'], roles: ['admin'] });
+    }, { summary: 'Remove a teammate, ending their sessions and revoking their API keys', tags: ['settings'], roles: ['admin'] });
 
     /* ------------------------------ API keys ----------------------------- */
     router.get('/v1/api-keys', (req: Req, c: Ctx) =>
       list(c.db.all<any>(`SELECT * FROM api_keys WHERE org_id = ? ORDER BY created DESC`, req.auth.orgId).map(publicKey)),
       { summary: 'List API keys', tags: ['developers'], roles: ['admin'] });
 
+    /**
+     * A key inherits the principal and the reach of whatever minted it.
+     *
+     * `created_by` used to be `auth.userId`, which an API key has not got, so
+     * one ordinary call — mint a key, then mint a key *with* it — produced an
+     * unattributed credential, and `authenticate` has no membership to ask
+     * about a key with no author. `DELETE /v1/users/:id` was one API call away
+     * from meaning nothing: the departing admin's grandchild key kept
+     * answering `role: admin`, moved the workspace clock and seated a new
+     * owner. Authorship is transitive because authority is: every key
+     * descended from a human dies with that human's membership, and only a key
+     * with genuinely no person behind it — one a migration or a fixture puts
+     * there — stays a workspace credential whose kill switch is `revoked_at`.
+     *
+     * The scopes are bounded the same way. `keyRole` reads the ladder off what
+     * a key asked for, so a key that could mint a wider child than itself
+     * would be a promotion by another name.
+     */
     router.post('/v1/api-keys', (req: Req, c: Ctx) => {
       const body = req.body as { name: string; livemode: boolean; scopes: string[] };
+      const minter = req.auth.keyId
+        ? parseJson<string[]>(c.db.pluck<string>(`SELECT scopes FROM api_keys WHERE id = ? AND org_id = ?`, req.auth.keyId, req.auth.orgId) ?? '["*"]', ['*'])
+        : null;
+      if (minter && !minter.includes('*')) {
+        const wider = body.scopes.filter((scope) => !minter.includes(scope));
+        if (wider.length) {
+          throw forbidden(`This API key holds ${minter.join(', ')}, so it cannot mint a key with ${wider.join(', ')}. A key may never issue more reach than it has.`);
+        }
+      }
       const prefix = body.livemode ? 'sk_live' : 'sk_test';
       const secret = `${prefix}_${randomBytes(24).toString('base64url')}`;
       const row = {
         id: newId('apikey'), org_id: req.auth.orgId, name: body.name, prefix,
         token_hash: sha(secret), last4: secret.slice(-4), scopes: JSON.stringify(body.scopes),
-        livemode: body.livemode ? 1 : 0, created_by: req.auth.userId ?? null, created: c.now(), last_used: null, revoked_at: null,
+        livemode: body.livemode ? 1 : 0, created_by: principalOf(c, req.auth), created: c.now(), last_used: null, revoked_at: null,
       };
       c.db.insert('api_keys', row);
-      c.audit({ orgId: req.auth.orgId, actorId: req.auth.userId, actorType: 'user', action: 'api_key.created', targetType: 'api_key', targetId: row.id, summary: `Created API key "${body.name}"`, requestId: req.requestId });
+      c.audit({ orgId: req.auth.orgId, actorId: row.created_by, actorType: 'user', action: 'api_key.created', targetType: 'api_key', targetId: row.id, summary: `Created API key "${body.name}"`, requestId: req.requestId });
       return created({ ...publicKey(row), secret });
     }, {
       summary: 'Create an API key (the secret is returned exactly once)', tags: ['developers'], roles: ['admin'],
@@ -333,7 +519,7 @@ export default defineModule({
     router.del('/v1/api-keys/:id', (req: Req, c: Ctx) => {
       const changed = c.db.run(`UPDATE api_keys SET revoked_at = ? WHERE org_id = ? AND id = ? AND revoked_at IS NULL`, c.now(), req.auth.orgId, req.params.id).changes;
       if (!changed) throw notFound('api key', req.params.id);
-      c.audit({ orgId: req.auth.orgId, actorId: req.auth.userId, actorType: 'user', action: 'api_key.revoked', targetType: 'api_key', targetId: req.params.id, summary: 'Revoked API key', requestId: req.requestId });
+      c.audit({ orgId: req.auth.orgId, actorId: principalOf(c, req.auth), actorType: 'user', action: 'api_key.revoked', targetType: 'api_key', targetId: req.params.id, summary: 'Revoked API key', requestId: req.requestId });
       return noContent();
     }, { summary: 'Revoke an API key', tags: ['developers'], roles: ['admin'] });
 
@@ -385,9 +571,11 @@ export default defineModule({
       if (c.clock.kind !== 'virtual') throw badRequest('clock_not_virtual', 'This workspace runs on the real clock.');
       const body = req.body as { days?: number; hours?: number; to?: number };
       const before = c.now();
-      if (body.to) c.clock.set(body.to);
-      else c.clock.advance((body.days ?? 0) * DAY + (body.hours ?? 0) * 3_600_000);
-      const worked = await drainUntil(c, c.now());
+      // The clock is moved *by* the replay, not before it. Jumping straight to
+      // the target and draining once ran every job that had been waiting with
+      // `ctx.now()` reading the far end of the jump — see `drainUntil`.
+      const target = body.to ? body.to : before + (body.days ?? 0) * DAY + (body.hours ?? 0) * 3_600_000;
+      const worked = await drainUntil(c, target);
       c.audit({ orgId: req.auth.orgId, actorId: req.auth.userId, actorType: 'user', action: 'time.advanced', summary: `Advanced the workspace clock to ${new Date(c.now()).toISOString()}`, before: { now: before }, after: { now: c.now() }, requestId: req.requestId });
       return { object: 'clock', now: c.now(), previous: before, offset_ms: c.clock.offset, jobs_run: worked.ran, jobs_failed: worked.failed };
     }, {
@@ -409,16 +597,52 @@ export default defineModule({
   },
 });
 
+/**
+ * Replay one workspace's queue up to `target`, the way it would have happened.
+ *
+ * Two things have to hold, and this is the only place the *product's* time
+ * machine can hold them — `app.travel` is the harness the tests drive, not the
+ * button an operator presses.
+ *
+ * 1. Every job runs at its own `run_at`, so the clock is stepped forward to
+ *    each due batch before that batch is drained. Setting the clock to the
+ *    target first and draining once made `ctx.now()` read the far end of the
+ *    jump for work that came due on day 1: a year of renewals, credit
+ *    settlements and usage rollups were priced and dated a year late, and every
+ *    job that books its own next attempt relative to `now` — a dunning retry, a
+ *    grant expiry — landed *past* the target and was left pending, so the
+ *    advance under-ran the work it reported having run.
+ * 2. The question "what is due next" is asked of the caller's own workspace.
+ *    `ctx.jobs` is already narrowed by `withAuth`; asking the whole `jobs`
+ *    table instead let another tenant's pending row decide where this
+ *    workspace's clock stopped next.
+ *
+ * A target in the past is still honoured — `to` may point backwards — but no
+ * step ever moves the clock backwards to get there: the loop only walks
+ * forward, and the final `set` lands exactly on the target.
+ */
 async function drainUntil(ctx: Ctx, target: number): Promise<{ ran: number; failed: number }> {
   let ran = 0, failed = 0, guard = 0;
   while (guard++ < 5000) {
-    const next = ctx.db.pluck<number>(`SELECT MIN(run_at) FROM jobs WHERE status = 'pending'`);
-    if (next === undefined || next === null || next > target) break;
+    const next = ctx.jobs.nextRunAt();
+    if (next === null || next > target) break;
+    // One read of the clock decides both the step and whether there was one:
+    // `ctx.now()` tracks wall time under the offset, so asking twice can answer
+    // twice and turn "no step" into a step of a millisecond.
+    const now = ctx.now();
+    const at = Math.max(next, now);
+    if (at > target) break;
+    const stepped = at > now;
+    if (stepped) ctx.clock.set(at);
     const r = await ctx.jobs.drain(() => ctx.now());
     ran += r.ran; failed += r.failed;
-    if (r.ran === 0 && r.failed === 0) break;
+    // Nothing ran and the clock did not move: the queue cannot make progress
+    // toward the target, so stop rather than spin to the guard.
+    if (!stepped && r.ran === 0 && r.failed === 0) break;
   }
-  return { ran, failed };
+  ctx.clock.set(target);
+  const r = await ctx.jobs.drain(() => ctx.now());
+  return { ran: ran + r.ran, failed: failed + r.failed };
 }
 
 const sessionCookie = (token: string, expires: number): Record<string, string> => ({

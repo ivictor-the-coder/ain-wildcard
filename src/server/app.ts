@@ -4,7 +4,8 @@ import { EventBus, type EmitOptions } from './kernel/events';
 import { JobQueue, type EnqueueOptions } from './kernel/jobs';
 import { createLogger, type Logger } from './kernel/logger';
 import { offsetClock, frozenClock, type Clock } from './kernel/clock';
-import { Router, type Auth, type Req, type Role, isRaw, parseQuery, newRequestId, errorToResponse, SYSTEM_AUTH } from './kernel/http';
+import { Router, type Auth, type Req, type Role, isRaw, parseQuery, newRequestId, errorToResponse, roleAtLeast, SYSTEM_AUTH } from './kernel/http';
+import { runInOrgScope, currentOrgScope, type OrgScope } from './kernel/org-scope';
 import type { Ctx, Config, AuditEntry } from './kernel/context';
 import { withAuth } from './kernel/context';
 import type { ModuleDef } from './kernel/module';
@@ -50,14 +51,93 @@ export interface App {
   close(): void;
 }
 
-const ROLE_RANK: Record<Role, number> = { system: 100, owner: 90, admin: 80, member: 60, analyst: 40, readonly: 20 };
-export const roleAtLeast = (role: Role, min: Role) => ROLE_RANK[role] >= ROLE_RANK[min];
-
 export const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
 
 function safeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a), bb = Buffer.from(b);
   return ab.length === bb.length && timingSafeEqual(ab, bb);
+}
+
+/** A scope that asks to change something: `crm:write`, `billing:*`, `write`. */
+const WRITE_SCOPE = /(^|:)(write|admin|\*)$/;
+
+/**
+ * How much of the role ladder an API key's own scopes justify.
+ *
+ * `route.meta.scopes` is the only thing that ever reads `auth.scopes`, and no
+ * route in the platform declares it, so the scopes a customer chooses are
+ * enforced nowhere else — the ladder is what has to carry them. Both ends of
+ * that have been wrong in turn, and the failure is symmetric:
+ *
+ * - Every key authenticating as `admin` meant a key minted `["crm:read"]`
+ *   could move the workspace clock, revoke the workspace's other credentials
+ *   and hand an agent `allow_writes`.
+ * - Every restricted key then authenticating as `readonly` meant a key minted
+ *   `["metering:write"]` — the telemetry ingest path this whole product is
+ *   priced on — got `403 Your role (readonly) cannot perform this action` on
+ *   `POST /v1/meter-events`, and `["crm:write"]` the same on every record it
+ *   was issued to create. The integration surface was closed instead of the
+ *   escalation.
+ *
+ * So the role is read off what the key asked for: everything (`*`) stays
+ * `admin`; anything that names a write is a `member`, which is exactly the
+ * rung every mutating route in the platform is gated at; anything else is
+ * `readonly`. Nothing but `*` reaches `admin`, so a restricted credential can
+ * still never travel time, revoke keys or delete an object type.
+ *
+ * What this deliberately does not claim is per-domain enforcement: until
+ * routes declare `meta.scopes`, a `["crm:write"]` key is a member everywhere,
+ * not only in CRM. That is a narrowing the platform still owes its customers,
+ * and it belongs on the routes rather than in a guess made here.
+ *
+ * Nor is what the key asked for the whole answer: it is a ceiling the key's
+ * author still has to reach. `authenticate` applies `boundedByAuthor` below.
+ */
+function keyRole(scopes: string[]): Role {
+  if (scopes.includes('*')) return 'admin';
+  return scopes.some((s) => WRITE_SCOPE.test(s.trim().toLowerCase())) ? 'member' : 'readonly';
+}
+
+/**
+ * A key may never carry authority its author does not currently hold.
+ *
+ * Minting a key is gated at `admin`, so at the moment of issue the author
+ * outranks anything `keyRole` can return and this changes nothing — it is only
+ * a later demotion that bites, and then it bites in exactly the direction the
+ * demotion meant. It takes the lower of the two rungs and never the higher, so
+ * a `["crm:read"]` key minted by the owner stays `readonly` instead of
+ * inheriting `owner` — the mirror-image bug of the one this closes.
+ */
+function boundedByAuthor(scoped: Role, author: Role | undefined): Role {
+  if (author === undefined) return scoped;
+  return roleAtLeast(scoped, author) ? author : scoped;
+}
+
+/**
+ * What an idempotency key is a key *for*: the whole request, not the part of
+ * it that happened to be hashed.
+ *
+ * `idempotency_key_in_use` is the promise that reusing a key on a different
+ * request is refused rather than answered. Hashing only the path and the body
+ * broke that promise for every route whose meaning lives in the query string
+ * or the verb: `DELETE /v1/records/company/:id` and
+ * `DELETE /v1/records/company/:id?permanent=true` carry no body and hash the
+ * same, so the permanent delete replayed the archive's `204` — the operator
+ * was told a record had been destroyed for good while it sat there archived.
+ *
+ * It is the same identity `requestApproval` and `schedule_followup` were
+ * re-keyed on one wave ago, at the outermost door: what identifies a write is
+ * the write, so a key names a method, a path, a query and a body together. The
+ * query is canonicalised — keys sorted, repeats sorted within a key — so a
+ * genuine retry that reorders `?a=1&b=2` still replays rather than conflicting.
+ */
+function canonicalRequest(method: string, path: string, query: Record<string, string[]>, body: unknown): unknown {
+  return {
+    m: method,
+    p: path,
+    q: Object.keys(query).sort().map((key) => [key, [...query[key]].sort()]),
+    b: body,
+  };
 }
 
 export async function createApp(options: AppOptions = {}): Promise<App> {
@@ -77,15 +157,34 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
   const modules = (options.modules || MODULES).slice();
   const ordered = topoSort(modules);
 
-  // --- clock: persisted per-org offset so the demo "time machine" survives restarts
-  let clockOffset = 0;
-  const readOffset = () => clockOffset;
-  const writeOffset = (ms: number) => {
-    clockOffset = ms;
-    try { db.run(`UPDATE orgs SET clock_offset = ?, updated = ? WHERE id = ?`, ms, Date.now() + ms, config.defaultOrgId); }
+  /* --- clock ------------------------------------------------------------
+   * The offset belongs to a workspace, not to the process. It is read and
+   * written against whichever org is in scope for the call being served, and
+   * persisted on that org's row, so a second workspace advancing a year cannot
+   * move the first one's clock — or, through `withAuth`'s scoped queue, run the
+   * first one's renewals, dunning and credit expiry a year early.
+   */
+  const offsets = new Map<string, number>();
+  const readOffset = (orgId: string): number => {
+    const cached = offsets.get(orgId);
+    if (cached !== undefined) return cached;
+    try {
+      const row = db.get<{ clock_offset: number }>(`SELECT clock_offset FROM orgs WHERE id = ?`, orgId);
+      // An org that does not exist yet gets no cache entry: the offset it is
+      // seeded or migrated with must still be picked up on the next read.
+      if (!row) return 0;
+      offsets.set(orgId, row.clock_offset || 0);
+      return row.clock_offset || 0;
+    } catch { return 0; /* orgs table not migrated yet */ }
+  };
+  const writeOffset = (orgId: string, ms: number): void => {
+    offsets.set(orgId, ms);
+    try { db.run(`UPDATE orgs SET clock_offset = ?, updated = ? WHERE id = ?`, ms, Date.now() + ms, orgId); }
     catch { /* orgs table not migrated yet */ }
   };
-  const clock: Clock = options.clock || offsetClock(readOffset, writeOffset);
+  const scopedOrgId = (): string => currentOrgScope()?.orgId ?? config.defaultOrgId;
+  const clock: Clock = options.clock
+    || offsetClock(() => readOffset(scopedOrgId()), (ms) => writeOffset(scopedOrgId(), ms));
 
   const bootLog = log.child({ scope: 'boot' });
   const events = new EventBus(db, (e, evt, sub) => log.error('event.handler_failed', { event: evt.type, subscriber: sub, error: e.message }));
@@ -95,9 +194,6 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
   const migrations = [...CORE_MIGRATIONS, ...ordered.flatMap((m) => m.migrations ?? [])];
   const ran = db.migrate(migrations, Date.now());
   if (ran.length) bootLog.info('migrations.applied', { count: ran.length });
-
-  const persisted = db.get<{ clock_offset: number }>(`SELECT clock_offset FROM orgs WHERE id = ?`, config.defaultOrgId);
-  if (persisted && clock.kind === 'virtual' && !options.clock) clockOffset = persisted.clock_offset || 0;
 
   const svc: any = {};
   const ai = createAiRuntime(config);
@@ -146,9 +242,27 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
   const rateBuckets = new Map<string, { tokens: number; last: number }>();
   const RATE_LIMIT = Number(process.env.AIN_RATE_LIMIT || 600); // requests/minute per key
 
+  /**
+   * The budget is "requests per real minute", so it is measured on real
+   * minutes. `clock.now()` is a workspace's *business* time: an operator moves
+   * it a year with `POST /v1/time/advance` and back again with
+   * `POST /v1/time/reset`, and the buckets are keyed by principal, not by
+   * workspace — so a person who belongs to two workspaces shares one bucket
+   * between two clocks that disagree by a year.
+   *
+   * A token bucket cannot survive time going backwards. `refill` goes negative
+   * by `elapsed × RATE_LIMIT`, the bucket drops to some hugely negative number,
+   * and every later request is refused until real time makes that back — a year
+   * of business time drains a year of real budget. Raising `AIN_RATE_LIMIT`
+   * does not help, because the deficit scales with it.
+   *
+   * So the limiter reads the wall clock, which no route can move, and clamps
+   * `elapsed` at zero besides: whatever the source, a bucket may only ever be
+   * refilled by time passing, never emptied by it.
+   */
   function checkRateLimit(key: string, now: number): void {
     const bucket = rateBuckets.get(key) || { tokens: RATE_LIMIT, last: now };
-    const refill = ((now - bucket.last) / 60_000) * RATE_LIMIT;
+    const refill = (Math.max(0, now - bucket.last) / 60_000) * RATE_LIMIT;
     bucket.tokens = Math.min(RATE_LIMIT, bucket.tokens + refill);
     bucket.last = now;
     if (bucket.tokens < 1) { rateBuckets.set(key, bucket); throw new ApiError('rate_limit_error', 'rate_limit', 'Too many requests. Retry with exponential backoff.'); }
@@ -156,7 +270,7 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
     rateBuckets.set(key, bucket);
   }
 
-  function authenticate(headers: Record<string, string>, isPublic: boolean): Auth {
+  function authenticate(headers: Record<string, string>, isPublic: boolean, scope: OrgScope): Auth {
     const header = headers['authorization'] || '';
     const bearer = header.toLowerCase().startsWith('bearer ') ? header.slice(7).trim() : '';
     const cookieHeader = headers['cookie'] || '';
@@ -164,27 +278,96 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
       cookieHeader.split(';').map((c) => c.trim().split('=')).filter((p) => p.length === 2).map(([k, ...v]) => [k, decodeURIComponent(v.join('='))]),
     );
     const sessionToken = cookies['ain_session'] || headers['x-ain-session'] || '';
+    let removedFromWorkspace = false;
 
     if (bearer) {
       const row = db.get<any>(`SELECT * FROM api_keys WHERE token_hash = ? AND revoked_at IS NULL`, hashToken(bearer));
       if (!row) throw unauthorized('Invalid API key provided.');
+      // The clock is per workspace and `last_used` is stamped from it, so the
+      // scope is set the moment the credential names an org — before the first
+      // clock read, not after.
+      scope.orgId = row.org_id;
+      // A membership is the authority at *both* credential entry points, or at
+      // neither. Asking it only of the cookie left "Remove a teammate" meaning
+      // nothing: Marcus's session was refused here while, in the same breath,
+      // the key he had minted answered `GET /v1/me` with `role: admin`, listed
+      // the workspace's credentials, moved its clock and seated a new owner —
+      // and could mint him a replacement cookie's worth of authority whenever
+      // he liked. It is the same split answer the session branch below was
+      // written to close: `actorFor` in the AI module already resolves this
+      // exact caller to `null` "because they are not a live member", so the two
+      // halves of one question said "nobody" and "an admin" at once.
+      //
+      // A key with no `created_by` has no human principal to ask about, and is
+      // a workspace credential whose only kill switch is `revoked_at`. That
+      // used to be the one way authority outlived a removal — an admin minted
+      // a key *through* a key, the child lost its author, and the grandchild
+      // survived the removal its parent died of. `POST /v1/api-keys` now
+      // inherits the minting credential's own principal, so the only keys that
+      // reach here unattributed are the ones a migration or a fixture put
+      // there. Nothing a person creates escapes this question any more.
+      const author = row.created_by
+        ? db.get<{ role: Role }>(`SELECT role FROM memberships WHERE org_id = ? AND user_id = ?`, row.org_id, row.created_by)
+        : undefined;
+      if (row.created_by && !author) {
+        throw unauthorized('The account that created this API key is no longer a member of this workspace.');
+      }
+      // Stamped only once the credential is known to be live, so a dead key
+      // cannot keep reporting "last used a moment ago" in the key list.
       db.patch('api_keys', 'id', row.id, { last_used: clock.now() });
-      return { kind: 'api_key', orgId: row.org_id, keyId: row.id, role: 'admin', scopes: parseJson<string[]>(row.scopes, ['*']), livemode: !!row.livemode };
+      const scopes = parseJson<string[]>(row.scopes, ['*']);
+      const role: Role = boundedByAuthor(keyRole(scopes), author?.role);
+      return { kind: 'api_key', orgId: row.org_id, keyId: row.id, role, scopes, livemode: !!row.livemode };
     }
     if (sessionToken) {
       const row = db.get<any>(`SELECT * FROM sessions WHERE token_hash = ?`, hashToken(sessionToken));
-      if (row && row.expires > clock.now()) {
-        const member = db.get<any>(`SELECT role FROM memberships WHERE org_id = ? AND user_id = ?`, row.org_id, row.user_id);
-        return { kind: 'session', orgId: row.org_id, userId: row.user_id, role: (member?.role as Role) || 'member', scopes: ['*'], livemode: true };
+      if (row) scope.orgId = row.org_id;
+      // A session lasts 30 real days, so it is judged on real time — the same
+      // reasoning as the rate limiter above, one trust boundary further in.
+      // `clock.now()` is a number this workspace's own admin sets: reading the
+      // expiry off it meant `POST /v1/time/advance { days: 365 }` walked past
+      // the expiry of the very session that authorised it, and every following
+      // call from that operator was a 401. The time machine is the product's
+      // headline feature; it must not be able to sign anyone out. `expires` is
+      // minted on the wall clock (`core.createSession`), so the two agree.
+      if (row && row.expires > Date.now()) {
+        // The membership *is* the identity, and its role is the authority.
+        // `POST /v1/auth/login` already refuses an account that belongs to no
+        // workspace; `DELETE /v1/users/:id` removes the membership and leaves
+        // the session row, so the same question has to be asked again here.
+        //
+        // Defaulting a missing membership to `member` did not merely fail to
+        // sign a removed teammate out — it *promoted* them. Nina is an analyst,
+        // refused `allow_writes` on the copilot by the `member` bar the
+        // approvals route is gated at; the moment she was removed from the
+        // workspace her still-live session authenticated as `member` and the
+        // identical write landed. It is the sign-flip of the actor rule one
+        // module over, which already resolves exactly this caller to `null`
+        // because they are "not a live member": the two halves of one question
+        // answered "nobody" and "a member" at the same time.
+        const member = db.get<{ role: Role }>(`SELECT role FROM memberships WHERE org_id = ? AND user_id = ?`, row.org_id, row.user_id);
+        if (member) {
+          return { kind: 'session', orgId: row.org_id, userId: row.user_id, role: member.role, scopes: ['*'], livemode: true };
+        }
+        // Not a hard throw: the browser holding this cookie still has to reach
+        // the public surface — `/v1/health` to see the API is up, and
+        // `POST /v1/auth/logout` to put the dead cookie down.
+        removedFromWorkspace = true;
       }
     }
     if (isPublic) return { kind: 'anonymous', orgId: config.defaultOrgId, role: 'readonly', scopes: [], livemode: true };
-    throw unauthorized();
+    throw unauthorized(removedFromWorkspace
+      ? 'This account is no longer a member of this workspace.'
+      : undefined);
   }
 
   function idempotencyGuard(req: Req, key: string, hash: string): HandleResponse | null {
     const now = clock.now();
-    db.run(`DELETE FROM idempotency_keys WHERE expires < ?`, now);
+    // The sweep runs on the caller's clock, so it may only reach the caller's
+    // own workspace. Unscoped, one workspace advancing a day deleted every
+    // other workspace's live keys, and the next retry of a charge that had
+    // already been made ran a second time instead of replaying the first.
+    db.run(`DELETE FROM idempotency_keys WHERE org_id = ? AND expires < ?`, req.auth.orgId, now);
     const existing = db.get<any>(`SELECT * FROM idempotency_keys WHERE org_id = ? AND key = ?`, req.auth.orgId, key);
     if (existing) {
       if (existing.request_hash !== hash) {
@@ -203,6 +386,13 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
   }
 
   async function handle(input: HandleRequest): Promise<HandleResponse> {
+    // Everything this request touches — its clock reads, the jobs it drains,
+    // the jobs those jobs enqueue — runs inside one workspace's scope.
+    const scope: OrgScope = { orgId: input.auth?.orgId ?? config.defaultOrgId };
+    return runInOrgScope(scope, () => serve(input, scope));
+  }
+
+  async function serve(input: HandleRequest, scope: OrgScope): Promise<HandleResponse> {
     const requestId = newRequestId();
     const started = Date.now();
     const headers = Object.fromEntries(Object.entries(input.headers || {}).map(([k, v]) => [k.toLowerCase(), String(v)]));
@@ -222,8 +412,9 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
       if (!matched) throw new ApiError('not_found_error', 'unknown_endpoint', `Unrecognised request URL (${input.method.toUpperCase()} ${path}).`);
       const { route, params } = matched;
 
-      if (!input.auth) auth = authenticate(headers, route.meta.auth === 'public');
-      checkRateLimit(auth.keyId || auth.userId || input.ip || 'anon', clock.now());
+      if (!input.auth) auth = authenticate(headers, route.meta.auth === 'public', scope);
+      scope.orgId = auth.orgId;
+      checkRateLimit(auth.keyId || auth.userId || input.ip || 'anon', Date.now());
 
       if (route.meta.roles && !route.meta.roles.some((r) => roleAtLeast(auth.role, r))) {
         throw forbidden(`Your role (${auth.role}) cannot perform this action.`);
@@ -241,7 +432,7 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
 
       idemKey = headers['idempotency-key'] || '';
       if (idemKey && (req.method === 'POST' || req.method === 'DELETE')) {
-        const hash = createHash('sha256').update(JSON.stringify({ p: path, b: input.body ?? {} })).digest('hex');
+        const hash = createHash('sha256').update(JSON.stringify(canonicalRequest(req.method, path, parsedQuery.all, input.body ?? {}))).digest('hex');
         const replay = idempotencyGuard(req, idemKey, hash);
         if (replay) return { ...replay, headers: { ...replay.headers, 'request-id': requestId } };
       }
@@ -268,22 +459,51 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
     }
   }
 
+  /**
+   * The queue `travel` steps through. `travel` *moves* a clock, and outside a
+   * request there is no caller to say whose — so it moves the default
+   * workspace's and steps only that workspace's queue. An explicit
+   * `options.clock` is one clock for the whole process, so there every org's
+   * time moved and every org's queue is due.
+   */
+  const harnessQueue = options.clock ? jobs : jobs.forOrg(config.defaultOrgId);
+
   const app: App = {
     ctx, db, handle,
-    async tick() { return jobs.drain(() => clock.now()); },
+    /**
+     * `tick` is the opposite case, and must not share `travel`'s answer.
+     * `main.ts` calls it on a one-second timer and it is the only thing that
+     * runs durable work in a deployed server: renewals, dunning retries, credit
+     * expiry, invoice collection, scheduled agent runs. It moves no clock — it
+     * only runs what has already come due — so scoping it to the default
+     * workspace does not protect anyone, it just stops every other workspace's
+     * business dead, with the work piling up `pending` forever.
+     *
+     * Whether a job is due is still a question about its own workspace's clock,
+     * so the ticker asks it once per workspace, inside that workspace's scope.
+     */
+    async tick() {
+      if (options.clock) return jobs.drain(() => clock.now());
+      let ran = 0, failed = 0;
+      for (const orgId of jobs.pendingOrgIds()) {
+        const r = await runInOrgScope({ orgId }, () => jobs.forOrg(orgId).drain(() => clock.now()));
+        ran += r.ran; failed += r.failed;
+      }
+      return { ran, failed };
+    },
     async travel(ms: number) {
       const target = clock.now() + ms;
       // Step through pending work chronologically so renewals and dunning fire in order.
       let ran = 0, failed = 0, guard = 0;
       while (guard++ < 10_000) {
-        const next = db.pluck<number>(`SELECT MIN(run_at) FROM jobs WHERE status = 'pending'`);
-        if (next === undefined || next === null || next > target) break;
+        const next = harnessQueue.nextRunAt();
+        if (next === null || next > target) break;
         clock.set(Math.max(next, clock.now()));
-        const r = await jobs.drain(() => clock.now());
+        const r = await harnessQueue.drain(() => clock.now());
         ran += r.ran; failed += r.failed;
       }
       clock.set(target);
-      const r = await jobs.drain(() => clock.now());
+      const r = await harnessQueue.drain(() => clock.now());
       return { ran: ran + r.ran, failed: failed + r.failed, now: clock.now() };
     },
     close() { db.close(); },
@@ -312,4 +532,4 @@ export function topoSort(modules: ModuleDef[]): ModuleDef[] {
   return out;
 }
 
-export { frozenClock, SYSTEM_AUTH, badRequest, notFound, randomId };
+export { frozenClock, SYSTEM_AUTH, roleAtLeast, badRequest, notFound, randomId };

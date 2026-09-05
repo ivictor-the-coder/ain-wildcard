@@ -1,0 +1,131 @@
+/* ================================= Field ================================== */
+.ain-field { display: flex; flex-direction: column; gap: var(--space-3); min-width: 0; }
+.ain-field--horizontal { display: grid; grid-template-columns: minmax(140px, 220px) 1fr; gap: var(--space-4) var(--space-7); align-items: start; }
+.ain-field__labelrow { display: flex; align-items: baseline; gap: var(--space-3); }
+.ain-field__label { font-size: var(--text-md); font-weight: var(--weight-medium); color: var(--text-primary); letter-spacing: var(--tracking-snug); }
+.ain-field__req { color: var(--text-danger); }
+.ain-field__opt { font-size: var(--text-xs); color: var(--text-tertiary); }
+.ain-field__aside { margin-inline-start: auto; font-size: var(--text-xs); }
+.ain-field__hint { font-size: var(--text-sm); color: var(--text-secondary); line-height: var(--leading-snug); }
+.ain-field__error { display: flex; align-items: flex-start; gap: var(--space-2); font-size: var(--text-sm); color: var(--text-danger); line-height: var(--leading-snug); }
+.ain-field__count { margin-inline-start: auto; font-size: var(--text-xs); color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+.ain-field__foot { display: flex; align-items: baseline; gap: var(--space-4); }
+
+/* ================================= Input ================================== */
+.ain-input {
+  display: flex; align-items: center; gap: var(--space-3); min-width: 0;
+  height: var(--control-height); padding: 0 var(--space-4);
+  background: var(--bg-surface); border: 1px solid var(--border-default);
+  border-radius: var(--radius-md); color: var(--text-primary);
+  transition: border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+}
+.ain-input--sm { height: var(--control-height-sm); padding: 0 var(--space-3); border-radius: var(--radius-sm); }
+.ain-input--lg { height: var(--control-height-lg); padding: 0 var(--space-5); }
+.ain-input:hover:not(.is-disabled):not(.is-readonly) { border-color: var(--border-strong); }
+.ain-input:focus-within { border-color: var(--border-focus); box-shadow: var(--focus-ring); }
+.ain-input.is-invalid { border-color: var(--border-danger); }
+.ain-input.is-invalid:focus-within { box-shadow: 0 0 0 3px color-mix(in srgb, var(--red-500) 24%, transparent); }
+.ain-input.is-disabled { background: var(--bg-sunken); color: var(--text-tertiary); cursor: not-allowed; }
+.ain-input.is-readonly { background: var(--bg-sunken); }
+.ain-input__field {
+  flex: 1 1 auto; min-width: 0; border: none; outline: none; background: none;
+  font-size: var(--text-md); color: inherit; height: 100%; padding: 0;
+}
+.ain-input__field::placeholder { color: var(--text-placeholder); }
+.ain-input__field:disabled { cursor: not-allowed; }
+.ain-input__field[type='number']::-webkit-outer-spin-button,
+.ain-input__field[type='number']::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.ain-input__field[type='number'] { -moz-appearance: textfield; }
+.ain-input__affix { display: inline-flex; align-items: center; gap: var(--space-3); align-self: center; flex: 0 0 auto; color: var(--text-tertiary); font-size: var(--text-md); white-space: nowrap; user-select: none; }
+.ain-input__affix--boxed { align-self: stretch; display: flex; align-items: center; padding: 0 var(--space-4); margin-block: 0; margin-inline: calc(-1 * var(--space-4)) var(--space-4); background: var(--bg-sunken); border-inline-end: 1px solid var(--border-default); border-start-start-radius: var(--radius-md); border-end-start-radius: var(--radius-md); }
+.ain-input__affix--suffix-boxed { margin-block: 0; margin-inline: var(--space-4) calc(-1 * var(--space-4)); border-inline-end: none; border-inline-start: 1px solid var(--border-default); border-start-end-radius: var(--radius-md); border-end-end-radius: var(--radius-md); }
+.ain-input__icon { flex: 0 0 auto; color: var(--text-tertiary); display: inline-flex; }
+.ain-input__clear { flex: 0 0 auto; }
+.ain-input--mono .ain-input__field { font-family: var(--font-mono); font-size: var(--text-sm); }
+.ain-input--number .ain-input__field { text-align: end; font-variant-numeric: tabular-nums; }
+.ain-input__stepper { display: flex; flex-direction: column; justify-content: center; margin-inline-end: calc(-1 * var(--space-2)); }
+.ain-input__step { display: grid; place-items: center; width: 18px; height: 12px; color: var(--text-tertiary); border-radius: var(--radius-xs); }
+.ain-input__step:hover { background: var(--bg-hover); color: var(--text-primary); }
+.ain-input__step:focus-visible { box-shadow: var(--focus-ring); outline: none; }
+
+/* =============================== Textarea ================================= */
+.ain-textarea { height: auto; padding: var(--space-4); align-items: stretch; }
+.ain-textarea .ain-input__field { resize: none; line-height: var(--leading-normal); height: auto; min-height: 3.6em; overflow-y: auto; }
+.ain-textarea--fixed .ain-input__field { resize: vertical; }
+
+/* ================================ Select ================================== */
+.ain-select { position: relative; display: flex; align-items: center; }
+.ain-select__native {
+  appearance: none; -webkit-appearance: none; width: 100%; height: var(--control-height);
+  padding: 0 var(--space-9) 0 var(--space-4);
+  background: var(--bg-surface); border: 1px solid var(--border-default); border-radius: var(--radius-md);
+  font-size: var(--text-md); color: var(--text-primary); cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out);
+}
+.ain-select--sm .ain-select__native { height: var(--control-height-sm); font-size: var(--text-sm); padding-inline-end: var(--space-8); }
+.ain-select__native:hover:not(:disabled) { border-color: var(--border-strong); }
+.ain-select__native:focus-visible { outline: none; border-color: var(--border-focus); box-shadow: var(--focus-ring); }
+.ain-select__native:disabled { background: var(--bg-sunken); color: var(--text-tertiary); cursor: not-allowed; }
+.ain-select.is-invalid .ain-select__native { border-color: var(--border-danger); }
+.ain-select__chevron { position: absolute; inset-inline-end: var(--space-4); pointer-events: none; color: var(--text-tertiary); }
+.ain-select__icon { position: absolute; inset-inline-start: var(--space-4); pointer-events: none; color: var(--text-tertiary); }
+.ain-select--hasicon .ain-select__native { padding-inline-start: var(--space-9); }
+
+/* =============================== Combobox ================================= */
+.ain-combo { position: relative; min-width: 0; }
+.ain-combo__control { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; min-height: var(--control-height); height: auto; padding: var(--space-2) var(--space-4); }
+.ain-combo__input { flex: 1 1 80px; min-width: 60px; border: none; outline: none; background: none; font-size: var(--text-md); color: inherit; height: 22px; }
+.ain-combo__input::placeholder { color: var(--text-placeholder); }
+.ain-combo__list { padding: var(--space-2); overflow-y: auto; }
+.ain-combo__option {
+  display: flex; align-items: center; gap: var(--space-4); padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-sm); font-size: var(--text-md); color: var(--text-primary); cursor: pointer;
+}
+.ain-combo__option.is-active { background: var(--bg-hover); }
+.ain-combo__option[aria-selected='true'] { color: var(--text-brand); }
+.ain-combo__option[aria-disabled='true'] { color: var(--text-placeholder); cursor: not-allowed; }
+.ain-combo__optiontext { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ain-combo__optionsub { font-size: var(--text-xs); color: var(--text-tertiary); }
+.ain-combo__group { padding: var(--space-3) var(--space-4) var(--space-2); font-size: var(--text-2xs); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-wide); text-transform: uppercase; color: var(--text-tertiary); }
+.ain-combo__status { padding: var(--space-6); text-align: center; font-size: var(--text-sm); color: var(--text-secondary); }
+.ain-combo__create { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); border-top: 1px solid var(--border-subtle); font-size: var(--text-sm); color: var(--text-brand); cursor: pointer; border-radius: var(--radius-sm); }
+.ain-combo__create.is-active { background: var(--bg-hover); }
+.ain-combo__mark { background: color-mix(in srgb, var(--amber-500) 34%, transparent); border-radius: 2px; color: inherit; }
+
+/* =============================== TagInput ================================= */
+.ain-taginput { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; min-height: var(--control-height); height: auto; padding: var(--space-2) var(--space-3); }
+.ain-taginput__input { flex: 1 1 100px; min-width: 80px; border: none; outline: none; background: none; font-size: var(--text-md); color: inherit; height: 22px; }
+
+/* ============================= SearchInput ================================ */
+.ain-search { min-width: 200px; }
+.ain-search .ain-input__field { font-size: var(--text-md); }
+
+/* ============================== DatePicker ================================ */
+.ain-cal { padding: var(--space-5); user-select: none; width: 268px; }
+.ain-cal__head { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-4); }
+.ain-cal__month { flex: 1 1 auto; text-align: center; font-size: var(--text-md); font-weight: var(--weight-semibold); color: var(--text-primary); }
+.ain-cal__grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+.ain-cal__dow { text-align: center; font-size: var(--text-2xs); font-weight: var(--weight-semibold); color: var(--text-tertiary); text-transform: uppercase; letter-spacing: var(--tracking-wide); padding-bottom: var(--space-3); }
+.ain-cal__day {
+  display: grid; place-items: center; height: 32px; border-radius: var(--radius-sm);
+  font-size: var(--text-sm); color: var(--text-primary); font-variant-numeric: tabular-nums; position: relative;
+}
+.ain-cal__day:hover:not(:disabled) { background: var(--bg-hover); }
+.ain-cal__day:focus-visible { box-shadow: var(--focus-ring); outline: none; z-index: 1; }
+.ain-cal__day.is-outside { color: var(--text-placeholder); }
+.ain-cal__day.is-today { font-weight: var(--weight-bold); color: var(--text-brand); }
+.ain-cal__day.is-today::after { content: ''; position: absolute; bottom: 4px; width: 3px; height: 3px; border-radius: 50%; background: currentColor; }
+.ain-cal__day.is-selected { background: var(--accent); color: var(--accent-contrast); }
+.ain-cal__day.is-selected.is-today { color: var(--accent-contrast); }
+.ain-cal__day.is-inrange { background: var(--bg-selected); border-radius: 0; color: var(--text-brand); }
+.ain-cal__day.is-start { border-radius: 0; border-start-start-radius: var(--radius-sm); border-end-start-radius: var(--radius-sm); }
+.ain-cal__day.is-end { border-radius: 0; border-start-end-radius: var(--radius-sm); border-end-end-radius: var(--radius-sm); }
+.ain-cal__day:disabled { color: var(--text-placeholder); cursor: not-allowed; text-decoration: line-through; }
+.ain-cal__foot { display: flex; align-items: center; gap: var(--space-3); margin-top: var(--space-4); padding-top: var(--space-4); border-top: 1px solid var(--border-subtle); }
+.ain-cal--range { width: 100%; }
+.ain-cal__months { display: flex; gap: var(--space-6); }
+.ain-daterange__presets { display: flex; flex-direction: column; gap: 1px; padding-inline-end: var(--space-5); border-inline-end: 1px solid var(--border-subtle); min-width: 132px; }
+.ain-daterange__preset { text-align: start; padding: var(--space-3) var(--space-4); border-radius: var(--radius-sm); font-size: var(--text-sm); color: var(--text-secondary); }
+.ain-daterange__preset:hover { background: var(--bg-hover); color: var(--text-primary); }
+.ain-daterange__preset.is-active { background: var(--bg-selected); color: var(--text-brand); font-weight: var(--weight-medium); }
+.ain-daterange__body { display: flex; gap: var(--space-6); }

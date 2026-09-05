@@ -1,0 +1,474 @@
+/*
+ * CRM surfaces. Tokens only — every colour, radius, space and type size below
+ * is a design-system variable, so both themes and both densities follow the
+ * rest of the product without this file knowing which one is on.
+ */
+
+/* -------------------------------- primitives ------------------------------ */
+
+.crm-muted { color: var(--text-tertiary); }
+.crm-num { font-variant-numeric: tabular-nums; }
+.crm-longtext { white-space: pre-wrap; }
+
+.crm-link {
+  color: var(--text-link);
+  text-decoration: none;
+  border-radius: var(--radius-xs);
+}
+.crm-link:hover { text-decoration: underline; }
+.crm-link:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
+
+.crm-code {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  background: var(--bg-code);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-xs);
+}
+
+.crm-chips { display: inline-flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
+
+.crm-userchip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.crm-boot { display: flex; flex-direction: column; gap: var(--space-5); }
+
+/* ----------------------------------- list --------------------------------- */
+
+.crm-views {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+  overflow-x: auto;
+  padding-bottom: var(--space-2);
+}
+
+.crm-activefilter {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-4) 0 var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  min-width: 0;
+}
+.crm-filter__summary { flex: 1; min-width: 0; }
+
+.crm-cell__link {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  color: inherit;
+  text-decoration: none;
+}
+.crm-cell__link:hover .crm-cell__name { color: var(--text-link); text-decoration: underline; }
+.crm-cell__link:focus-visible { outline: var(--focus-ring); outline-offset: 2px; border-radius: var(--radius-xs); }
+.crm-cell__name { font-weight: var(--weight-medium); color: var(--text-primary); }
+.crm-cell__sub { color: var(--text-tertiary); font-size: var(--text-xs); }
+
+.crm-tablefoot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+/* --------------------------------- filters -------------------------------- */
+
+.crm-filter { display: flex; flex-direction: column; gap: var(--space-4); }
+
+.crm-filter__group {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  background: var(--bg-surface);
+}
+.crm-filter__group--d1 { background: var(--bg-subtle); }
+.crm-filter__group--d2 { background: var(--bg-sunken); }
+.crm-filter__group--d3 { background: var(--bg-subtle); }
+
+.crm-filter__grouphead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.crm-filter__match { color: var(--text-secondary); font-size: var(--text-sm); }
+.crm-filter__hint { color: var(--text-tertiary); font-size: var(--text-sm); margin: 0; }
+
+.crm-filter__rows { display: flex; flex-direction: column; gap: var(--space-3); }
+
+.crm-filter__row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1.2fr) minmax(120px, 0.9fr) minmax(160px, 1.4fr) auto;
+  gap: var(--space-3);
+  align-items: start;
+}
+.crm-filter__row > * { min-width: 0; }
+.crm-filter__novalue { font-size: var(--text-sm); line-height: var(--control-height); }
+.crm-filter__duration { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: var(--space-3); }
+.crm-filter__between { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: var(--space-3); align-items: center; }
+.crm-filter__date { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-2); align-items: center; }
+
+.crm-filter__assoc {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+/* An association row has four to six controls depending on the aggregate, so it
+   flows rather than being pinned to a column count that only fits one shape. */
+.crm-filter__assoc .crm-filter__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.crm-filter__assoc .crm-filter__field { flex: 1 1 150px; min-width: 130px; }
+.crm-filter__assoc .crm-filter__op { flex: 1 1 140px; min-width: 130px; }
+.crm-filter__assoc .crm-filter__value { flex: 1 1 130px; min-width: 110px; }
+.crm-filter__assocfoot { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+.crm-filter__nested { padding-left: var(--space-5); border-left: 2px solid var(--border-subtle); }
+
+@media (max-width: 900px) {
+  .crm-filter__row { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ---------------------------------- forms --------------------------------- */
+
+.crm-form { display: flex; flex-direction: column; gap: var(--space-5); }
+.crm-form--split {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--space-5);
+  align-items: start;
+}
+.crm-form--split > .crm-form__wide,
+.crm-form--split > .ain-field:first-child { grid-column: 1 / -1; }
+.crm-form__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--space-5); }
+.crm-form__more { margin-top: var(--space-5); padding-top: var(--space-4); border-top: 1px solid var(--border-subtle); }
+.crm-form__label { font-size: var(--text-sm); font-weight: var(--weight-medium); color: var(--text-secondary); }
+.crm-viewsummary { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+
+.crm-options { display: flex; flex-direction: column; gap: var(--space-3); }
+.crm-options__row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) 130px auto auto;
+  gap: var(--space-3);
+  align-items: center;
+}
+@media (max-width: 760px) { .crm-options__row { grid-template-columns: minmax(0, 1fr); } }
+
+.crm-rollup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+}
+
+.crm-checkgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--space-2) var(--space-4);
+  max-height: 168px;
+  overflow-y: auto;
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+}
+
+.crm-iconpick { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.crm-iconpick__btn {
+  width: 34px; height: 34px;
+  display: grid; place-items: center;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.crm-iconpick__btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.crm-iconpick__btn:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
+.crm-iconpick__btn.is-active {
+  background: var(--accent-subtle);
+  border-color: var(--border-brand);
+  color: var(--text-brand);
+}
+
+.crm-mergepair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: center;
+}
+.crm-mergepair__side {
+  display: flex; flex-direction: column; gap: var(--space-2);
+  padding: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  min-width: 0;
+}
+.crm-mergepair__side strong { color: var(--text-primary); overflow-wrap: anywhere; }
+.crm-mergepair__side span { font-size: var(--text-xs); overflow-wrap: anywhere; }
+
+/* ------------------------------- record page ------------------------------ */
+
+.crm-record {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr) 300px;
+  gap: var(--space-6);
+  align-items: start;
+}
+.crm-record__col { display: flex; flex-direction: column; gap: var(--space-5); min-width: 0; }
+.crm-record__col--mid { gap: var(--space-4); }
+
+/*
+ * Below three columns the rail must not fall under the timeline: "who do we
+ * know at this account?" is the second thing anyone asks, and a long timeline
+ * pushed it thousands of pixels down the page. It moves to the top of the
+ * right-hand column instead, so relationships stay within a screen of the
+ * header at laptop widths.
+ */
+@media (max-width: 1280px) {
+  .crm-record { grid-template-columns: 300px minmax(0, 1fr); }
+  .crm-record__col:nth-child(1) { grid-column: 1; grid-row: 1 / span 2; }
+  .crm-record__col:nth-child(3) { grid-column: 2; grid-row: 1; }
+  .crm-record__col:nth-child(2) { grid-column: 2; grid-row: 2; }
+}
+@media (max-width: 900px) {
+  .crm-record { grid-template-columns: minmax(0, 1fr); }
+  .crm-record__col:nth-child(1) { grid-column: 1; grid-row: 1; }
+  .crm-record__col:nth-child(3) { grid-column: 1; grid-row: 2; }
+  .crm-record__col:nth-child(2) { grid-column: 1; grid-row: 3; }
+}
+
+.crm-identity { display: flex; flex-direction: column; }
+.crm-identity__head { display: flex; align-items: center; gap: var(--space-4); min-width: 0; }
+.crm-identity__text { min-width: 0; }
+.crm-identity__name { font-size: var(--text-md); font-weight: var(--weight-semibold); color: var(--text-primary); }
+.crm-identity__sub { font-size: var(--text-sm); color: var(--text-tertiary); }
+/* The employer, under the job title, the way the company card carries its domain. */
+.crm-identity__at {
+  display: inline-flex; align-items: center; gap: var(--space-2); max-width: 100%;
+  margin-top: var(--space-1); font-size: var(--text-sm); font-weight: var(--weight-medium);
+  color: var(--text-link); text-decoration: none; border-radius: var(--radius-xs);
+}
+.crm-identity__at:hover { text-decoration: underline; }
+.crm-identity__at:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
+.crm-identity__at svg { flex: 0 0 auto; color: var(--text-tertiary); }
+.crm-identity__at svg:last-child { color: var(--text-warning); }
+.crm-identity__owner {
+  display: flex; flex-direction: column; gap: var(--space-2);
+  margin-top: var(--space-4); padding-top: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+}
+.crm-identity__ownerctl { display: flex; align-items: center; gap: var(--space-3); }
+.crm-identity__meta {
+  display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap;
+  margin-top: var(--space-4);
+  font-size: var(--text-xs); color: var(--text-tertiary);
+}
+
+.crm-props { display: flex; flex-direction: column; gap: var(--space-2); }
+.crm-props__head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); }
+.crm-props__title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+.crm-props__list { display: flex; flex-direction: column; gap: var(--space-1); }
+
+.crm-prop { display: flex; flex-direction: column; gap: var(--space-1); padding: var(--space-2) 0; }
+.crm-prop__label {
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  font-size: var(--text-xs); color: var(--text-tertiary);
+}
+.crm-prop__badge { display: inline-flex; color: var(--text-tertiary); }
+.crm-prop__badge:focus-visible { outline: var(--focus-ring); outline-offset: 2px; border-radius: var(--radius-xs); }
+.crm-prop__value {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  min-height: 22px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  overflow-wrap: anywhere;
+}
+button.crm-prop__value {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  margin-inline: calc(var(--space-3) * -1);
+  cursor: text;
+  font: inherit;
+}
+button.crm-prop__value:hover { background: var(--bg-hover); border-color: var(--border-subtle); }
+button.crm-prop__value:focus-visible { outline: var(--focus-ring); outline-offset: 1px; }
+.crm-prop__pencil { opacity: 0; color: var(--text-tertiary); margin-left: auto; flex: none; }
+button.crm-prop__value:hover .crm-prop__pencil,
+button.crm-prop__value:focus-visible .crm-prop__pencil { opacity: 1; }
+.crm-prop--editing { gap: var(--space-3); }
+.crm-prop__editor { display: flex; flex-direction: column; gap: var(--space-3); }
+.crm-prop__actions { display: flex; gap: var(--space-2); }
+.crm-prop__error { margin: 0; color: var(--text-danger); font-size: var(--text-xs); }
+
+/* --------------------------------- timeline ------------------------------- */
+
+.crm-timeline__toolbar {
+  display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap;
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.crm-timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.crm-timeline__loading { padding: var(--space-4) 0; }
+.crm-timeline__more { display: flex; justify-content: center; padding-top: var(--space-4); }
+
+.crm-tl { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: var(--space-4); position: relative; }
+.crm-tl::before {
+  content: '';
+  position: absolute;
+  left: 13px; top: 28px; bottom: 0;
+  width: 1px;
+  background: var(--border-subtle);
+}
+.crm-tl:last-child::before { display: none; }
+
+.crm-tl__icon {
+  width: 27px; height: 27px;
+  display: grid; place-items: center;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  z-index: 1;
+  margin-top: var(--space-3);
+}
+.crm-tl__icon--activity { background: var(--accent-subtle); color: var(--text-brand); border-color: var(--border-brand); }
+.crm-tl__icon--property_change { background: var(--surface-info); color: var(--text-info); border-color: var(--border-info); }
+.crm-tl__icon--association { background: var(--bg-subtle); color: var(--text-purple); }
+
+.crm-tl__body { padding: var(--space-3) 0 var(--space-5); min-width: 0; }
+.crm-tl__head { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+.crm-tl__title { font-weight: var(--weight-medium); color: var(--text-primary); font-size: var(--text-sm); }
+.crm-tl__when { color: var(--text-tertiary); font-size: var(--text-xs); white-space: nowrap; }
+.crm-tl__text {
+  margin: var(--space-2) 0 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.crm-tl__foot {
+  display: flex; align-items: center; gap: var(--space-3);
+  margin-top: var(--space-3);
+  font-size: var(--text-xs); color: var(--text-tertiary);
+}
+
+/* ------------------------------- associations ----------------------------- */
+
+.crm-assoc { display: flex; flex-direction: column; gap: var(--space-2); padding-bottom: var(--space-4); }
+.crm-assoc + .crm-assoc { border-top: 1px solid var(--border-subtle); padding-top: var(--space-4); }
+.crm-assoc__head {
+  display: flex; align-items: center; gap: var(--space-2);
+  font-size: var(--text-xs); text-transform: uppercase;
+  letter-spacing: var(--tracking-wide); color: var(--text-tertiary);
+}
+.crm-assoc__row {
+  display: flex; align-items: center; gap: var(--space-2);
+  font-size: var(--text-sm); min-width: 0;
+}
+.crm-assoc__primary {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; flex: none;
+  padding: 0; border: none; border-radius: var(--radius-sm);
+  background: transparent; color: var(--text-tertiary); cursor: pointer;
+  opacity: 0.25;
+  transition: opacity var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+}
+.crm-assoc__primary:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-warning); opacity: 1; }
+.crm-assoc__primary:focus-visible { box-shadow: var(--focus-ring); outline: none; opacity: 1; }
+.crm-assoc__primary:disabled { cursor: progress; opacity: 1; }
+.crm-assoc__primary.is-primary { opacity: 1; color: var(--text-warning); }
+/* An unfilled star is an affordance, not a fact: it stays quiet until the row
+   is reachable, so at rest only the marked link asserts anything. */
+.crm-assoc__row:hover .crm-assoc__primary,
+.crm-assoc__row:focus-within .crm-assoc__primary { opacity: 1; }
+
+.crm-dupe { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3) 0; }
+.crm-dupe + .crm-dupe { border-top: 1px solid var(--border-subtle); }
+.crm-dupe__head { display: flex; align-items: center; gap: var(--space-3); min-width: 0; }
+.crm-dupe__why { margin: 0; font-size: var(--text-xs); color: var(--text-tertiary); }
+
+/* ------------------------------- data model ------------------------------- */
+
+.crm-objcard { display: flex; flex-direction: column; gap: var(--space-3); }
+.crm-objcard.is-active { border-color: var(--border-brand); box-shadow: 0 0 0 1px var(--border-brand) inset; }
+.crm-objcard__pick {
+  display: flex; align-items: center; gap: var(--space-3);
+  background: none; border: 0; padding: 0; margin: 0;
+  font: inherit; color: var(--text-primary); cursor: pointer;
+  min-width: 0; text-align: left; width: 100%;
+}
+.crm-objcard__pick:focus-visible { outline: var(--focus-ring); outline-offset: 3px; border-radius: var(--radius-sm); }
+.crm-objcard__icon {
+  width: 28px; height: 28px; flex: none;
+  display: grid; place-items: center;
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+}
+.crm-objcard__name { font-weight: var(--weight-semibold); }
+.crm-objcard__stats { display: flex; gap: var(--space-2); font-size: var(--text-xs); color: var(--text-tertiary); }
+.crm-objcard__foot { display: flex; align-items: center; gap: var(--space-2); }
+
+/* --------------------------------- widgets -------------------------------- */
+
+.crm-widgetrow {
+  display: flex; align-items: center; gap: var(--space-3);
+  width: 100%; padding: var(--space-3);
+  margin-inline: calc(var(--space-3) * -1);
+  width: calc(100% + var(--space-3) * 2);
+  background: none; border: 0; border-radius: var(--radius-sm);
+  font: inherit; color: inherit; text-align: left; cursor: pointer;
+}
+.crm-widgetrow:hover { background: var(--bg-hover); }
+.crm-widgetrow:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
+.crm-widgetrow__text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.crm-widgetrow__title { font-size: var(--text-sm); font-weight: var(--weight-medium); color: var(--text-primary); }
+.crm-widgetrow__sub { font-size: var(--text-xs); color: var(--text-tertiary); }
+.crm-widgetrow__when { font-size: var(--text-xs); color: var(--text-tertiary); white-space: nowrap; }
+
+.crm-toolsearch { min-width: 220px; }
+/* The component paints its own circled clear button; Chromium paints a second
+   one inside a focused `type=search`, so the field grew two X glyphs side by
+   side the moment anyone typed in it. */
+.crm-toolsearch input[type='search']::-webkit-search-cancel-button,
+.crm-toolsearch input[type='search']::-webkit-search-decoration { -webkit-appearance: none; appearance: none; display: none; }
