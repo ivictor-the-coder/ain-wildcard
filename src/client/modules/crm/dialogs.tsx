@@ -8,17 +8,21 @@
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
-  Badge, Banner, Button, CheckCircleIcon, Checkbox, Field, Icons, Input, Modal, Select, Switch,
-  Textarea, Tooltip, humanize, useToast, type Tone,
+  Badge, Banner, Button, CheckCircleIcon, Checkbox, EmptyState, Field, Icons, IconButton, Input, Modal, Select,
+  SkeletonText, Switch, Textarea, Tooltip, humanize, useFormat, useToast, type Tone,
 } from '@/client/design';
 import type { ApiClientError } from '@/client/kernel/api';
+import { useRouter } from '@/client/kernel/router';
 import { useSession } from '@/client/kernel/session';
 import {
   associate, batchUpdate, createRecord, crmChanged, logActivity, patchRecord, saveView, updateView,
-  type CrmRecord, type FilterNode, type ObjectTypeDef, type PropertyDef, type PropertyValue,
+  useProperties, usePropertyHistory, useRecordSearch, useSchema,
+  type CrmRecord, type FilterNode, type ObjectTypeDef, type PropertyDef, type PropertyRollup, type PropertyValue,
   type SortSpec, type ViewDef, type WorkspaceUser,
 } from './api';
-import { PropertyEditor, RecordPicker, ValueView } from './values';
+import { describeFilterNode } from './filter-builder';
+import { encodeFilterParam, listHref } from './links';
+import { PropertyEditor, RecordPicker, SlaBadge, UserChip, ValueView, isClosedRecord, isDueProperty } from './values';
 import { fromZonedInput, toZonedInput, zoneLabel } from './time';
 
 /* --------------------------- validation plumbing -------------------------- */
@@ -317,7 +321,12 @@ export function SaveViewDialog({ open, onClose, objectType, mode, existing, colu
         <Field label="Description" optional>
           <Textarea value={description} onChange={(e) => setDescription(e.target.value)} minRows={2} placeholder="What this view is for" />
         </Field>
-        <Checkbox checked={shared} onChange={setShared} label="Share with the workspace" hint="Everyone sees it in the view bar." />
+        <Checkbox
+          checked={shared}
+          onChange={setShared}
+          label="Share with the workspace"
+          hint={shared ? 'Everyone sees it in the view bar.' : 'Only you see it in the view bar; teammates who already hold a link to it can still open it.'}
+        />
         {error && !error.body.param && <Banner tone="danger" compact>{errorMessage(error)}</Banner>}
         {mode !== 'rename' && (
           <div className="crm-viewsummary">
@@ -690,6 +699,156 @@ export function LogActivityDialog({ open, onClose, kind, record, properties, use
   );
 }
 
+/* ------------------------------ rollup basis ------------------------------ */
+
+const AGGREGATE_WORD: Record<PropertyRollup['aggregate'], string> = {
+  count: 'Number of', sum: 'Sum of', avg: 'Average of', min: 'Smallest', max: 'Largest',
+};
+
+interface RollupBasis {
+  /** "Sum of Amount over deals where Deal status is Open" */
+  text: string;
+  /** How many records the aggregate is standing on right now. */
+  count: number | null;
+  /** The list of exactly those records, when a list can take the filter. */
+  href: string | null;
+  targetLabel: string;
+  targetSingular: string;
+}
+
+/**
+ * What a rollup is a rollup *of*, in the operator's words and with its filter:
+ * "Rollup · sum of amount across deal" told a reader the mechanism and hid
+ * the one clause — open deals only — that decides whether the number is right.
+ */
+function useRollupBasis(record: CrmRecord, property: PropertyDef): RollupBasis | null {
+  const f = useFormat();
+  const schema = useSchema();
+  const rollup = property.rollup;
+  const target = useMemo(() => {
+    if (!rollup || !schema.data) return null;
+    if (schema.data.object_types.some((t) => t.name === rollup.association)) return rollup.association;
+    const link = schema.data.association_types.find((t) => t.name === rollup.association);
+    if (!link) return null;
+    const far = link.from_object === record.object_type ? link.to_object : link.from_object;
+    return far === '*' ? null : far;
+  }, [rollup, schema.data, record.object_type]);
+  const farProps = useProperties(target);
+  const farIndex = useMemo(() => new Map((farProps.data?.data ?? []).map((p) => [p.name, p])), [farProps.data]);
+
+  // The exact rows the aggregate stands on: the rollup's own filter, and the
+  // far side linked back to this record.
+  const filter = useMemo<FilterNode | null>(() => {
+    if (!rollup || !target) return null;
+    const mine: FilterNode = { association: record.object_type, where: { property: 'id', operator: 'eq', value: record.id }, operator: 'gt', value: 0 };
+    return rollup.filter ? { op: 'and', filters: [rollup.filter, mine] } : mine;
+  }, [rollup, target, record.object_type, record.id]);
+  const body = useMemo(() => ({ ...(filter ? { filter } : {}), limit: 1 }), [filter]);
+  const count = useRecordSearch(target && filter ? target : null, body);
+
+  if (!rollup || !schema.data) return null;
+  const targetDef = target ? schema.data.object_types.find((t) => t.name === target) : undefined;
+  const targetLabel = (targetDef?.plural_label ?? humanize(rollup.association)).toLowerCase();
+  const targetSingular = (targetDef?.label ?? humanize(rollup.association)).toLowerCase();
+  const measured = rollup.property ? (farIndex.get(rollup.property)?.label ?? humanize(rollup.property)) : null;
+  const where = rollup.filter
+    ? describeFilterNode(
+      rollup.filter, farIndex, new Map(),
+      (minor, currency) => f.money(minor, currency ? { currency } : undefined),
+      (ts) => f.date(ts, { timeZone: 'UTC' }),
+    )
+    : '';
+  const text = `${AGGREGATE_WORD[rollup.aggregate]} ${measured ? `${measured} over ` : ''}${targetLabel}${where ? ` where ${where}` : ''}`;
+  const href = !target ? null
+    // The pipeline's board takes a search, not a filter tree; deals are named
+    // after their account, so this lands on the right ones. Every other list
+    // takes the exact filter.
+    : target === 'deal' ? `${listHref('deal')}?q=${encodeURIComponent(record.display_name)}`
+      : `${listHref(target)}?f=${encodeFilterParam(filter)}`;
+  return {
+    text,
+    count: count.loading || count.stale || count.error ? null : count.total,
+    href,
+    targetLabel,
+    targetSingular,
+  };
+}
+
+/* ------------------------------ property history -------------------------- */
+
+const SOURCE_LABEL: Record<string, string> = {
+  api: 'API', import: 'Import', merge: 'Merge', system: 'Platform', workflow: 'Workflow', agent: 'Agent', user: 'User',
+};
+
+export function PropertyHistoryDialog({ open, onClose, record, property, userIndex }: {
+  open: boolean;
+  onClose: () => void;
+  record: CrmRecord;
+  property: PropertyDef;
+  userIndex: Map<string, WorkspaceUser>;
+}) {
+  const f = useFormat();
+  const history = usePropertyHistory(open ? record.object_type : null, open ? record.id : null, open ? property.name : null);
+  const rows = history.data?.data ?? [];
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="md"
+      title={`${property.label} — history`}
+      description={`Every value ${record.display_name}'s ${property.label.toLowerCase()} has held, newest first, with who changed it and how.`}
+    >
+      {history.error && (
+        <Banner tone="danger" compact title="The history could not be read">{history.error.body.message}</Banner>
+      )}
+      {!history.error && history.loading && <SkeletonText lines={4} />}
+      {!history.error && !history.loading && rows.length === 0 && (
+        <EmptyState
+          size="sm"
+          inline
+          illustration={null}
+          title="No recorded changes"
+          body={`${property.label} has held its current value since before history was kept for this record.`}
+        />
+      )}
+      {rows.length > 0 && (
+        <div className="crm-history__wrap">
+          <table className="crm-history">
+            <thead>
+              <tr><th scope="col">When</th><th scope="col">Who</th><th scope="col">Change</th></tr>
+            </thead>
+            <tbody>
+              {rows.map((entry) => (
+                <tr key={entry.id}>
+                  <td className="crm-history__when">
+                    <Tooltip content={f.dateTime(entry.changed_at)}><span>{f.dateTime(entry.changed_at)}</span></Tooltip>
+                  </td>
+                  <td>
+                    {entry.actor_id
+                      ? <UserChip id={entry.actor_id} user={userIndex.get(entry.actor_id)} size={16} />
+                      : <span className="crm-muted">{SOURCE_LABEL[entry.source] ?? humanize(entry.source)}</span>}
+                    {entry.actor_id && entry.source !== 'user' && entry.source !== 'api' && (
+                      <Badge tone="neutral" size="sm">{SOURCE_LABEL[entry.source] ?? humanize(entry.source)}</Badge>
+                    )}
+                  </td>
+                  <td className="crm-history__change">
+                    <span className="crm-history__from"><ValueView property={property} value={entry.from_value} users={userIndex} compact /></span>
+                    <span className="crm-muted" aria-hidden>→</span>
+                    <span className="crm-history__to"><ValueView property={property} value={entry.to_value} users={userIndex} compact /></span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {history.data?.has_more && (
+        <p className="crm-history__more">Only the most recent {rows.length} changes are shown.</p>
+      )}
+    </Modal>
+  );
+}
+
 /* ------------------------------ inline property --------------------------- */
 
 export interface InlinePropertyProps {
@@ -703,17 +862,24 @@ export interface InlinePropertyProps {
 /**
  * A property row that turns into its own editor. Read-only, calculated and
  * rollup properties never do — they say where their value comes from instead,
- * which is the difference between "you may not" and "nothing happened".
+ * which is the difference between "you may not" and "nothing happened". Every
+ * row opens its own history, so "who changed this and from what" is one click
+ * on the value, not a scroll through the timeline's property-change filter.
  */
 export function InlineProperty({ record, property, users, userIndex, onSaved }: InlinePropertyProps) {
   const toast = useToast();
+  const f = useFormat();
+  const schema = useSchema();
+  const { navigate } = useRouter();
   const [editing, setEditing] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
   const [draft, setDraft] = useState<PropertyValue>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<ApiClientError | null>(null);
   const stored = record.properties[property.name] ?? null;
   const derived = !!property.calculated || !!property.rollup;
   const locked = property.read_only || derived || property.type === 'computed';
+  const basis = useRollupBasis(record, property);
 
   const start = () => {
     if (locked) return;
@@ -753,10 +919,30 @@ export function InlineProperty({ record, property, users, userIndex, onSaved }: 
   };
 
   const hint = property.rollup
-    ? `Rollup · ${property.rollup.aggregate} of ${property.rollup.property ?? 'records'} across ${property.rollup.association}`
+    ? (basis?.text ?? 'Rolled up from associated records')
     : property.calculated
       ? `Calculated · ${property.calculated}`
       : property.read_only ? 'Maintained by the platform' : null;
+
+  const historyButton = (
+    <IconButton
+      size="sm"
+      variant="ghost"
+      className="crm-prop__history"
+      label={`History of ${property.label}`}
+      icon={<Icons.clock size={12} />}
+      onClick={() => setShowHistory(true)}
+    />
+  );
+
+  const value = isDueProperty(property) && typeof stored === 'number'
+    ? (
+      <span className="crm-prop__sla">
+        <SlaBadge dueAt={stored} closed={isClosedRecord(record.object_type, record.properties, schema.data)} />
+        <span className="crm-muted">{f.dateTime(stored)}</span>
+      </span>
+    )
+    : <ValueView property={property} value={stored} users={userIndex} />;
 
   if (editing) {
     return (
@@ -795,11 +981,11 @@ export function InlineProperty({ record, property, users, userIndex, onSaved }: 
             </span>
           </Tooltip>
         )}
+        <span className="u-spacer" />
+        {historyButton}
       </span>
       {locked ? (
-        <span className="crm-prop__value">
-          <ValueView property={property} value={stored} users={userIndex} />
-        </span>
+        <span className="crm-prop__value">{value}</span>
       ) : (
         <button
           type="button"
@@ -807,10 +993,40 @@ export function InlineProperty({ record, property, users, userIndex, onSaved }: 
           onClick={start}
           aria-label={`Edit ${property.label}`}
         >
-          <ValueView property={property} value={stored} users={userIndex} />
+          {value}
           <Icons.edit size={12} className="crm-prop__pencil" />
         </button>
       )}
+      {basis && (
+        <span className="crm-prop__basis">
+          {basis.text}
+          {basis.count !== null && (
+            <>
+              {' · '}
+              {basis.href ? (
+                <a
+                  className="crm-link"
+                  href={basis.href}
+                  onClick={(e) => {
+                    if (e.metaKey || e.ctrlKey || e.shiftKey || !basis.href) return;
+                    e.preventDefault();
+                    navigate(basis.href);
+                  }}
+                >
+                  {f.number(basis.count)} {f.plural(basis.count, basis.targetSingular, { hideCount: true })}
+                </a>
+              ) : `${f.number(basis.count)} ${f.plural(basis.count, basis.targetSingular, { hideCount: true })}`}
+            </>
+          )}
+        </span>
+      )}
+      <PropertyHistoryDialog
+        open={showHistory}
+        onClose={() => setShowHistory(false)}
+        record={record}
+        property={property}
+        userIndex={userIndex}
+      />
     </div>
   );
 }

@@ -207,6 +207,11 @@ test('an API key is minted, its secret shown exactly once, and revoked', async (
   const keys = (await json(page, '/v1/api-keys')).data;
   const minted = keys.find((row: any) => row.name === name); // eslint-disable-line @typescript-eslint/no-explicit-any
   expect(minted, 'the key exists on the workspace').toBeTruthy();
+
+  // The row says when it was created and by whom — the minter is read off the
+  // audit entry the mint wrote, since the key itself carries no created_by.
+  const mintedRow = page.locator('tr').filter({ hasText: name }).first();
+  await expect(mintedRow.getByTestId('key-minter')).toContainText('by Dana Whitfield', { timeout: 15_000 });
   expect(minted.scopes).toEqual(['read']);
   expect(minted.revoked_at).toBeNull();
   // The list never carries the secret again — only a mask.
@@ -451,33 +456,65 @@ test('the time machine moves the clock, runs the queue and logs what it ran', as
   const before = await json(page, '/v1/me');
   test.skip(before.clock.kind !== 'virtual', 'this build runs on the real clock');
 
-  await page.getByRole('button', { name: /A billing cycle/ }).click();
+  const answers: { previous: number; jobs_run: number; jobs_failed: number }[] = [];
+  page.on('response', async (res) => {
+    if (res.url().includes('/v1/time/advance') && res.request().method() === 'POST') {
+      try { answers.push(await res.json()); } catch { /* not JSON */ }
+    }
+  });
 
-  await expect.poll(async () => (await json(page, '/v1/me')).clock.now, { timeout: 60_000 })
-    .toBeGreaterThan(before.clock.now + 20 * 24 * 3600 * 1000);
+  try {
+    await page.getByRole('button', { name: /A billing cycle/ }).click();
 
-  // Work actually ran, and it ran *inside the window the jump opened* — not
-  // simply "there are completed jobs", which was already true. Counting rows
-  // would not have shown it either: `core.cleanup` runs during the jump and
-  // deletes completed jobs older than seven workspace days, so the total can
-  // come out flat while a month of billing has just been executed.
-  const done = (await json(page, '/v1/jobs?status=done&limit=200')).data;
-  const ranInWindow = done.filter((job: any) => job.updated > before.clock.now); // eslint-disable-line @typescript-eslint/no-explicit-any
-  expect(ranInWindow.length, 'jobs completed inside the jump').toBeGreaterThan(0);
+    await expect.poll(async () => (await json(page, '/v1/me')).clock.now, { timeout: 60_000 })
+      .toBeGreaterThan(before.clock.now + 20 * 24 * 3600 * 1000);
+    await expect.poll(() => answers.length).toBe(1);
+    const move = answers[0];
 
-  // And the move is on the screen's own log, with what ran inside its window.
-  await expect(page.getByText('What ran when it moved')).toBeVisible();
-  const move = page.locator('.st-row').filter({ hasText: 'moved by Dana Whitfield' }).first();
-  await expect(move).toBeVisible({ timeout: 20_000 });
-  await move.getByRole('button', { name: 'What ran' }).click();
-  await expect(move.locator('.st-diffrow').first()).toBeVisible();
+    // What the server said it ran is what the screen says it ran. On a fresh
+    // workspace a month of billing comes due; on one that has already been
+    // jumped through this month, nothing does — and the row must say *that*,
+    // not borrow the count of the move that did run it.
+    const trail = await json(page, '/v1/audit-log?limit=500');
+    const entry = trail.data.find((row: any) => row.action === 'time.advanced' && row.before?.now === move.previous); // eslint-disable-line @typescript-eslint/no-explicit-any
+    expect(entry, 'the move is on the audit trail with before.now = previous').toBeTruthy();
 
-  // Returning to now confirms first, and then actually returns.
-  await page.getByRole('button', { name: 'Return to now' }).click();
-  await page.getByRole('dialog').getByRole('button', { name: 'Return to now' }).click();
+    await expect(page.getByText('What ran when it moved')).toBeVisible();
+    const row = page.locator('.st-row').filter({ hasText: entry.request_id }).first();
+    await expect(row).toBeVisible({ timeout: 20_000 });
+    await expect(row).toContainText('moved by Dana Whitfield');
+    await expect(row.getByTestId('move-count')).toHaveText(`${move.jobs_run} ${move.jobs_run === 1 ? 'job' : 'jobs'}`);
 
-  await expect.poll(async () => Math.abs((await json(page, '/v1/me')).clock.offset_ms), { timeout: 60_000 })
-    .toBeLessThan(60_000);
+    if (move.jobs_run > 0) {
+      // Work actually ran, and it ran *inside the window the jump opened* — not
+      // simply "there are completed jobs", which was already true. Counting rows
+      // would not have shown it either: `core.cleanup` runs during the jump and
+      // deletes completed jobs older than seven workspace days, so the total can
+      // come out flat while a month of billing has just been executed.
+      const done = (await json(page, '/v1/jobs?status=done&limit=200')).data;
+      const ranInWindow = done.filter((job: any) => job.updated > before.clock.now); // eslint-disable-line @typescript-eslint/no-explicit-any
+      expect(ranInWindow.length, 'jobs completed inside the jump').toBeGreaterThan(0);
+
+      await row.getByRole('button', { name: 'What ran' }).click();
+      await expect(row.locator('.st-diffrow').first()).toBeVisible();
+    } else {
+      // Nothing to open: the button says so by being disabled rather than
+      // offering a list it would have to invent.
+      await expect(row.getByRole('button', { name: 'What ran' })).toBeDisabled();
+    }
+  } finally {
+    // Returning to now confirms first, and then actually returns — even when an
+    // assertion above failed, so a broken run does not leave the clock ahead
+    // for every test after it.
+    await page.goto('/settings/time', { waitUntil: 'networkidle' });
+    const back = page.getByRole('button', { name: 'Return to now' });
+    if (await back.isEnabled()) {
+      await back.click();
+      await page.getByRole('dialog').getByRole('button', { name: 'Return to now' }).click();
+      await expect.poll(async () => Math.abs((await json(page, '/v1/me')).clock.offset_ms), { timeout: 60_000 })
+        .toBeLessThan(60_000);
+    }
+  }
 });
 
 /* ================================== jobs ================================= */
@@ -491,6 +528,10 @@ test('the job queue screen reports exactly what the queue holds', async ({ page 
     .filter({ has: page.locator('.ain-stat__label', { hasText: /^Waiting$/ }) })
     .locator('.ain-stat__value');
   await expect(waiting).toHaveText(new Intl.NumberFormat('en-US').format(pending.total_count), { timeout: 15_000 });
+
+  // The card says the order the rows are actually in: pending work soonest first.
+  await expect(page.getByText('soonest first')).toBeVisible();
+  await expect(page.getByText('furthest ahead first')).toHaveCount(0);
 
   // Every status the route serves is a tab, and each one reads its own page.
   const done = await json(page, '/v1/jobs?status=done&limit=200');
@@ -543,10 +584,11 @@ test('an analyst sees the surface, is told what is locked, and every refusal it 
   await expect(locked).toHaveCount(2);
   await expect(locked.first()).toHaveAttribute('title', /needs the admin role/);
 
-  // The workspace form is filled in and read-only, and says why.
+  // The workspace form is filled in and read-only, and says why. A role that
+  // cannot PATCH /v1/org is shown no Save button — not a disabled one.
   await expect(page.getByText('You can read these, not change them')).toBeVisible();
   await expect(page.getByLabel('Workspace name')).toBeDisabled();
-  await expect(page.getByRole('button', { name: /^Save|^Saved/ })).toBeDisabled();
+  await expect(page.getByRole('button', { name: /^Save|^Saved/ })).toHaveCount(0);
 
   // An admin-only read is refused by the server, so the screen says so instead
   // of rendering an empty table that looks like an empty workspace.
@@ -801,4 +843,384 @@ test('the palette lists each settings destination once, and Create opens the dia
   await create.click();
   await expect(page).toHaveURL(/\/settings\/api-keys/);
   await expect(dialog(page).getByLabel('What is this key for')).toBeVisible({ timeout: 15_000 });
+});
+
+/* =================== the time machine's history, honestly ================== */
+
+/**
+ * The shape that produced the fabricated counts: a day-jump, a return to real
+ * time, a second day-jump over the same span. The second move ran a different
+ * number of jobs from the first — usually none, since the first already ran
+ * everything due — and its row has to say what the server said, not what the
+ * first move did.
+ */
+test('each move in the time machine history reads the count the server answered for it', async ({ page }) => {
+  await signIn(page);
+  await openSettings(page, '/settings/time', 'Time machine');
+  const before = await json(page, '/v1/me');
+  test.skip(before.clock.kind !== 'virtual', 'this build runs on the real clock');
+
+  const answers: { previous: number; jobs_run: number }[] = [];
+  page.on('response', async (res) => {
+    if (res.url().includes('/v1/time/advance') && res.request().method() === 'POST') {
+      try { answers.push(await res.json()); } catch { /* not JSON */ }
+    }
+  });
+
+  const jumpADay = async () => {
+    const seen = answers.length;
+    await page.getByRole('button', { name: /^A day/ }).click();
+    await expect.poll(() => answers.length, { timeout: 60_000 }).toBe(seen + 1);
+    await expect(page.getByText(/Workspace time is now/).first()).toBeVisible({ timeout: 20_000 });
+  };
+  const returnToNow = async () => {
+    await page.getByRole('button', { name: 'Return to now' }).click();
+    await page.getByRole('dialog').getByRole('button', { name: 'Return to now' }).click();
+    await expect.poll(async () => Math.abs((await json(page, '/v1/me')).clock.offset_ms), { timeout: 60_000 }).toBeLessThan(60_000);
+  };
+
+  await jumpADay();
+  await returnToNow();
+  await jumpADay();
+  const [first, second] = answers.slice(-2);
+
+  // Every row in the history that describes one of these two moves carries
+  // exactly the count the server answered for it — the second is not credited
+  // with what the first ran, and neither is credited with the sum.
+  await page.getByRole('button', { name: 'Refresh' }).click();
+  const rows = page.locator('.ain-card').filter({ hasText: 'What ran when it moved' }).locator('.st-row');
+  await expect(rows.first()).toBeVisible({ timeout: 20_000 });
+
+  const trail = await json(page, '/v1/audit-log?limit=500');
+  const rowFor = (answer: { previous: number }) => {
+    const entry = trail.data.find((row: any) => row.action === 'time.advanced' && row.before?.now === answer.previous); // eslint-disable-line @typescript-eslint/no-explicit-any
+    expect(entry, 'the move is on the audit trail with before.now = previous').toBeTruthy();
+    return rows.filter({ hasText: entry.request_id });
+  };
+  // The count badge is the one whose text ends in "job" or "jobs" — the same
+  // element before and after this fix, so the comparison is against the number.
+  const badge = (answer: { previous: number }) => rowFor(answer).locator('.ain-badge').filter({ hasText: /\bjobs?$/ });
+  const said = (answer: { jobs_run: number }) => `${answer.jobs_run} ${answer.jobs_run === 1 ? 'job' : 'jobs'}`;
+  await expect(badge(second)).toHaveText(said(second));
+  await expect(badge(first)).toHaveText(said(first));
+  await expect(rowFor(second)).toHaveAttribute('data-tally', 'recorded');
+
+  // The presets say what they will run before they are pressed, from the queue.
+  const pending = (await json(page, '/v1/jobs?status=pending&limit=200')).data;
+  const now = (await json(page, '/v1/me')).clock.now;
+  const dueInADay = pending.filter((job: any) => job.run_at <= now + 24 * 3600 * 1000).length; // eslint-disable-line @typescript-eslint/no-explicit-any
+  await expect(page.getByTestId('due-day')).toHaveText(dueInADay === 0
+    ? 'Nothing is due — the clock moves, no job runs'
+    : new RegExp(`^${dueInADay} jobs? runs? on the way$`));
+
+  await returnToNow();
+});
+
+/* ===================== ids that open the record they name ================= */
+
+test('an audit entry links its target to the screen that shows it, and the screen answers with that record', async ({ page }) => {
+  await signIn(page);
+  await openSettings(page, '/settings/audit', 'Audit log');
+
+  const trail = await json(page, '/v1/audit-log?limit=500');
+  const roleChange = trail.data.find((row: any) => row.action === 'user.role_changed'); // eslint-disable-line @typescript-eslint/no-explicit-any
+  expect(roleChange, 'a role change is on the trail from the team test').toBeTruthy();
+  const revoked = trail.data.find((row: any) => row.action === 'api_key.revoked'); // eslint-disable-line @typescript-eslint/no-explicit-any
+  expect(revoked, 'a key revocation is on the trail from the keys test').toBeTruthy();
+  const key = (await json(page, '/v1/api-keys')).data.find((row: any) => row.id === revoked.target_id); // eslint-disable-line @typescript-eslint/no-explicit-any
+  expect(key, 'the revoked key is still listed').toBeTruthy();
+
+  const search = page.getByPlaceholder('Search summaries, targets and request ids');
+
+  // The search reaches the request id even though its column is hidden, so
+  // the one row left is the entry. The teammate target is a link to the
+  // roster, labelled in English.
+  const body = page.locator('tbody tr');
+  await search.fill(roleChange.request_id);
+  await expect(body).toHaveCount(1, { timeout: 15_000 });
+  const roleRow = body.first();
+  await expect(roleRow.getByRole('link')).toHaveAttribute('href', `/settings/team?member=${roleChange.target_id}`);
+  await expect(roleRow).toContainText('Teammate');
+
+  // The key target is named after the key, not its id — and never "Api key".
+  await search.fill(revoked.request_id);
+  await expect(body).toHaveCount(1, { timeout: 15_000 });
+  const keyRow = body.first();
+  const link = keyRow.getByRole('link', { name: key.name });
+  await expect(link).toHaveAttribute('href', `/settings/api-keys?key=${key.id}`);
+  await expect(keyRow).toContainText('API key');
+  await expect(keyRow).not.toContainText('Api key');
+
+  // The drawer links it too.
+  await keyRow.click();
+  const drawer = page.getByRole('dialog');
+  await expect(drawer.getByRole('link', { name: key.name })).toHaveAttribute('href', `/settings/api-keys?key=${key.id}`);
+  await page.keyboard.press('Escape');
+
+  // A clock move's summary is a workspace date, not an ISO string.
+  await search.fill('time.advanced');
+  const move = page.locator('tr').filter({ hasText: 'time.advanced' }).first();
+  await expect(move).toBeVisible({ timeout: 15_000 });
+  await expect(move).not.toContainText(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
+  await expect(move).toContainText('Advanced the workspace clock to');
+
+  // Following the key link lands on the keys screen with that key on top —
+  // revoked keys shown, because this one is.
+  await search.fill(revoked.request_id);
+  await link.click();
+  await expect(page).toHaveURL(/\/settings\/api-keys$/);
+  await expect(page.locator('tbody tr')).toHaveCount(1, { timeout: 15_000 });
+  await expect(page.locator('tbody')).toContainText(key.name);
+  await expect(page.locator('tbody')).toContainText('Revoked');
+
+  // And the roster answers a teammate deep link with that one seat.
+  await page.goto('/settings/team?member=usr_seed06', { waitUntil: 'networkidle' });
+  await expect(page.locator('tbody tr')).toHaveCount(1, { timeout: 15_000 });
+  await expect(page.locator('tbody')).toContainText('nina@northwind.io');
+  await expect(page).toHaveURL(/\/settings\/team$/);
+});
+
+test('an event links the object it is about, and a feature deep link opens the account it names', async ({ page }) => {
+  await signIn(page);
+
+  const events = (await json(page, '/v1/events?type=subscription.created&limit=5')).data;
+  const event = events.find((row: any) => row.object_id); // eslint-disable-line @typescript-eslint/no-explicit-any
+  expect(event, 'the seed emitted a subscription event').toBeTruthy();
+
+  await openSettings(page, '/settings/events', 'Events');
+  await page.getByLabel('Every event about one object — paste an id').fill(event.object_id);
+  const item = page.locator('.st-event').filter({ hasText: 'subscription.created' }).first();
+  await expect(item).toBeVisible({ timeout: 15_000 });
+  await item.click();
+  const payload = page.locator('.ain-card').filter({ hasText: 'Event id' });
+  const link = payload.getByRole('link', { name: event.object_id });
+  await expect(link).toHaveAttribute('href', `/billing/subscriptions/${event.object_id}`);
+  await expect(payload).toContainText('Subscription ·');
+
+  // The URL the features screen writes for an account is honoured on load.
+  const customer = (await json(page, '/v1/customers?limit=1')).data[0];
+  await page.goto(`/settings/features?customer=${customer.id}`, { waitUntil: 'networkidle' });
+  await expect(page.getByRole('tab', { name: 'What an account holds' })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('.st-body')).toContainText(customer.name, { timeout: 15_000 });
+  // …and leaving the tab drops the parameter, so the address names the screen.
+  await page.getByRole('tab', { name: 'The catalogue' }).click();
+  await expect(page).toHaveURL(/\/settings\/features$/);
+});
+
+test('a readonly teammate who runs a Create command is told why nothing opens', async ({ page }) => {
+  await signInAs(page, 'nina@northwind.io');
+  await page.waitForSelector('.ain-stat');
+  await page.goto('/settings/api-keys?new=1', { waitUntil: 'networkidle' });
+  await expect(page.getByText('Creating an API key needs the admin role').first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page).toHaveURL(/\/settings\/api-keys$/);
+
+  await page.goto('/settings/team?invite=1', { waitUntil: 'networkidle' });
+  await expect(page.getByText('Inviting a teammate needs the admin role').first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+});
+
+/* ==================== what the critic found, fixed and held =============== */
+
+test('Enter on a row’s “Row actions” opens its menu, and only its menu', async ({ page }) => {
+  await signIn(page);
+  await openSettings(page, '/settings/team', 'Team');
+
+  // The grid's own Enter handler used to fire the row action — the first
+  // teammate's change-role dialog — and swallow the button's click, so the menu
+  // never appeared. Enter and Space must do the same thing here.
+  const first = page.locator('tbody tr').first().getByRole('button', { name: 'Row actions' });
+  await first.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('menu')).toBeVisible();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.getByRole('menuitem', { name: 'Change role…' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('menu')).toHaveCount(0);
+
+  // The sibling screen with a row menu behaves the same way.
+  await openSettings(page, '/settings/tax', 'Tax');
+  const rate = page.locator('tbody tr').first().getByRole('button', { name: 'Row actions' });
+  await rate.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('menu')).toBeVisible();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await page.keyboard.press('Escape');
+});
+
+test('the invitation says the seat cannot sign in, and Enter in any field submits it', async ({ page }) => {
+  await signIn(page);
+  await openSettings(page, '/settings/team', 'Team');
+
+  const email = `e2e.enter.${stamp()}@northwind.io`;
+  await page.getByRole('button', { name: 'Invite a teammate' }).click();
+
+  // No promise the platform cannot keep: there is no invitation link, no
+  // password route and no accept step, and the dialog says so before the button.
+  await expect(dialog(page)).toContainText('they cannot sign in');
+  await expect(dialog(page)).toContainText('no invitation link, no password route');
+  await expect(dialog(page)).not.toContainText('immediately');
+
+  // Enter in the second field — not only the first — submits the form.
+  await dialog(page).getByLabel('Work email').fill(email);
+  await page.keyboard.press('Tab');
+  await page.keyboard.type('E2E Enter Fixture');
+  await page.keyboard.press('Enter');
+  await expect(dialog(page)).toBeHidden({ timeout: 15_000 });
+
+  const seated = (await json(page, '/v1/users')).data.find((row: any) => row.email === email); // eslint-disable-line @typescript-eslint/no-explicit-any
+  expect(seated, 'Enter submitted the invitation').toBeTruthy();
+  // …and the toast tells the same truth the dialog did.
+  await expect(page.locator('.ain-toast').filter({ hasText: 'cannot sign in yet' })).toBeVisible();
+
+  await page.request.delete(`/api/v1/users/${seated.id}`);
+});
+
+test('a list read that fails renders its tiles as a dash, never as a zero', async ({ page }) => {
+  await signIn(page);
+  const refuse = (message: string) => (route: import('@playwright/test').Route) => route.fulfill({
+    status: 500,
+    contentType: 'application/json',
+    body: JSON.stringify({ error: { type: 'api_error', code: 'internal', message, request_id: 'req_e2e_forced' } }),
+  });
+  const tile = (label: string) => page.locator('.ain-stat').filter({ has: page.locator('.ain-stat__label', { hasText: new RegExp(`^${label}$`) }) });
+
+  // Tax: the register did not answer, so the register's tiles say so — while
+  // the tile whose read did answer still counts.
+  await page.route('**/api/v1/tax_rates*', refuse('The register could not be read.'));
+  await openSettings(page, '/settings/tax', 'Tax');
+  await expect(tile('Active registrations').locator('.ain-stat__value')).toHaveText('—');
+  await expect(tile('Active registrations')).toContainText('not a count of zero');
+  await expect(tile('Active registrations')).toContainText('GET /v1/tax_rates');
+  await expect(tile('Reverse charged').locator('.ain-stat__value')).toHaveText('—');
+  await expect(tile('Customer registrations').locator('.ain-stat__value')).not.toHaveText('—');
+  await expect(page.getByRole('button', { name: 'Try again' }).first()).toBeVisible();
+  await page.unroute('**/api/v1/tax_rates*');
+
+  // Jobs: every tile reads its own status page, and none of them is a zero.
+  await page.route('**/api/v1/jobs*', refuse('The queue could not be read.'));
+  await openSettings(page, '/settings/jobs', 'Jobs');
+  for (const label of ['Waiting', 'Due right now', 'Failed', 'Completed']) {
+    await expect(tile(label).locator('.ain-stat__value')).toHaveText('—');
+    await expect(tile(label)).toContainText('not a count of zero');
+  }
+  await page.unroute('**/api/v1/jobs*');
+
+  // Features: the catalogue did not answer; the overview did.
+  await page.route('**/api/v1/features*', refuse('Features could not be read.'));
+  await openSettings(page, '/settings/features', 'Features & entitlements');
+  await expect(tile('Features defined').locator('.ain-stat__value')).toHaveText('—');
+  await expect(tile('Features defined')).toContainText('GET /v1/features');
+  await expect(tile('Live overrides').locator('.ain-stat__value')).not.toHaveText('—');
+  await page.unroute('**/api/v1/features*');
+});
+
+test('the roster lists the owner first and the readers last', async ({ page }) => {
+  await signIn(page);
+  await openSettings(page, '/settings/team', 'Team');
+
+  const roster = (await json(page, '/v1/users')).data;
+  await expect(page.locator('tbody tr')).toHaveCount(roster.length, { timeout: 15_000 });
+
+  // Sorted on the role's name the owner came last — admin, analyst, member,
+  // member, member, owner. The default order is the ladder.
+  const rank: Record<string, number> = { owner: 0, admin: 1, member: 2, analyst: 3, readonly: 4 };
+  const roles = await page.locator('tbody tr td:nth-child(3)').allInnerTexts();
+  expect(roles[0].trim()).toBe('owner');
+  for (let i = 1; i < roles.length; i++) {
+    expect(rank[roles[i].trim()], `${roles[i]} follows ${roles[i - 1]}`).toBeGreaterThanOrEqual(rank[roles[i - 1].trim()]);
+  }
+});
+
+test('a domain that is not a hostname is refused under the field, and nothing is written', async ({ page }) => {
+  await signIn(page);
+  await openSettings(page, '/settings', 'Workspace');
+  const before = await json(page, '/v1/me');
+
+  // PATCH /v1/org would store this and the shell header would read it back.
+  await page.getByLabel('Primary domain').fill('not a domain!!');
+  await expect(page.getByText(/^A hostname, e\.g\. northwind\.io/)).toBeVisible();
+  await expect(page.getByRole('button', { name: /^Save \d+ change/ })).toBeDisabled();
+  expect((await json(page, '/v1/me')).org.domain).toBe(before.org.domain);
+
+  // A real hostname lifts the refusal.
+  await page.getByLabel('Primary domain').fill('billing.northwind.io');
+  await expect(page.getByText(/^A hostname, e\.g\. northwind\.io/)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /^Save \d+ change/ })).toBeEnabled();
+  await page.getByRole('button', { name: 'Discard' }).click();
+  await expect(page.getByRole('button', { name: 'Saved' })).toBeVisible();
+});
+
+test('the trail names a removed teammate, and their link lands on a roster that says they are gone', async ({ page }) => {
+  await signIn(page);
+
+  // Seat and remove a teammate through the API, so the trail holds the pair.
+  const email = `e2e.gone.${stamp()}@northwind.io`;
+  const created = await (await page.request.post('/api/v1/users', { data: { email, name: 'E2E Departed', role: 'analyst' } })).json();
+  expect(created.id, 'the seat was created').toBeTruthy();
+  expect((await page.request.delete(`/api/v1/users/${created.id}`)).status()).toBe(204);
+
+  // The width the critic read "Workspace setti…" at.
+  await page.setViewportSize({ width: 1440, height: 960 });
+  await openSettings(page, '/settings/audit', 'Audit log');
+  await page.getByPlaceholder('Search summaries, targets and request ids').fill(created.id);
+  const removed = page.locator('tbody tr').filter({ hasText: 'user.removed' }).first();
+  await expect(removed).toBeVisible({ timeout: 15_000 });
+
+  // Named off the invitation the trail itself recorded, and marked as removed —
+  // not a bare usr_… with a link to a roster search that finds nobody.
+  await expect(removed).toContainText(email);
+  await expect(removed).toContainText('removed');
+
+  // The summary is why the row exists: it gets the flexible width, so it is the
+  // widest cell in the row and reads in full at this width.
+  const summary = removed.getByTestId('audit-summary');
+  await expect(summary).toContainText('Removed from workspace');
+  const widths = await removed.locator('td').evaluateAll((cells) => cells.map((cell) => cell.clientWidth));
+  const summaryWidth = await summary.evaluate((el) => el.closest('td')!.clientWidth);
+  expect(summaryWidth, `the summary cell (${summaryWidth}px) is the widest of ${widths.join(', ')}`).toBe(Math.max(...widths));
+  expect(await summary.evaluate((el) => el.scrollWidth > el.clientWidth + 1), 'the summary is not truncated').toBe(false);
+
+  await removed.getByRole('link', { name: email }).click();
+  await expect(page).toHaveURL(/\/settings\/team$/);
+  await expect(page.getByText('That teammate is no longer on the roster')).toBeVisible({ timeout: 15_000 });
+  // The roster is still the whole roster, not an empty search.
+  await expect(page.locator('tbody tr')).toHaveCount((await json(page, '/v1/users')).data.length);
+
+  // And the way back lands on the trail with that id already searched.
+  await page.getByRole('button', { name: 'What the trail says' }).click();
+  await expect(page).toHaveURL(/\/settings\/audit$/);
+  await expect(page.getByPlaceholder('Search summaries, targets and request ids')).toHaveValue(created.id);
+  await expect(page.locator('tbody tr').first()).toContainText(email, { timeout: 15_000 });
+});
+
+test('the workspace facts read the clock as it stands, and the stream does not credit the platform with a person’s change', async ({ page }) => {
+  await signIn(page);
+  const me = await json(page, '/v1/me');
+  await openSettings(page, '/settings', 'Workspace');
+
+  // "Virtual" said what kind of clock it was; the fact now says what it reads.
+  const clock = page.locator('.ain-kv').filter({ hasText: 'Clock' });
+  await expect(clock).not.toContainText('Virtual');
+  if (Math.abs(me.clock.offset_ms) <= 60_000) await expect(clock).toContainText('In step with real time');
+  else await expect(clock).toContainText(/Simulated.*(ahead of|behind) real time/);
+
+  // user.invited is emitted with actor_type system, no actor and no request id
+  // for a change only a signed-in admin can make. The stream must not say the
+  // platform did it — it does not know who did.
+  const email = `e2e.actor.${stamp()}@northwind.io`;
+  const seat = await (await page.request.post('/api/v1/users', { data: { email, name: 'E2E Actor Fixture', role: 'analyst' } })).json();
+  expect(seat.id, 'the seat was created').toBeTruthy();
+  await page.request.delete(`/api/v1/users/${seat.id}`);
+
+  await openSettings(page, '/settings/events', 'Events');
+  await page.getByLabel('Every event about one object — paste an id').fill(seat.id);
+  const item = page.locator('.st-event').filter({ hasText: 'user.invited' }).first();
+  await expect(item).toBeVisible({ timeout: 15_000 });
+  await expect(item).not.toContainText('The platform');
+  await expect(item).toContainText('Unattributed');
+  await item.click();
+  const detail = page.locator('.ain-card').filter({ hasText: 'Event id' });
+  await expect(detail).toContainText('Unattributed');
+  await expect(detail).toContainText('cannot be read as either');
 });

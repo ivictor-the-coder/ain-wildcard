@@ -17,16 +17,44 @@
  * stamps, so they keep their confirmation; this row links to it rather than
  * quietly writing the most consequential field on the record.
  */
-import { useEffect, useRef, useState } from 'react';
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api, invalidate, useMutation } from '@/client/kernel/api';
 import {
-  Badge, Button, GitBranchIcon, Icons, useToast,
+  Badge, Button, GitBranchIcon, Icons, focusableWithin, useToast,
 } from '@/client/design';
 import { emptyValue, type DealRecord, type PropertyDef } from './api';
 import { PropertyInput, errorFor } from './dialogs';
 
 /** Properties whose write is a stage move, and therefore a confirmation. */
 export const STAGE_OWNED = new Set(['pipeline', 'deal_stage']);
+
+/* ------------------------------ one row at a time ------------------------- */
+
+interface InlineScope {
+  /** The property whose row is open, or null. */
+  active: string | null;
+  open: (name: string) => void;
+  close: (name: string) => void;
+}
+
+const InlineScopeContext = createContext<InlineScope | null>(null);
+
+/**
+ * The rows of one record share this, so opening a second editor closes the
+ * first. Without it every row kept its own flag and a keyboard user who
+ * pressed Enter on Deal type, then on Close date, had two editors open, two
+ * "Enter saves" hints, and no way to know which one a keystroke would land in.
+ * A row that opens outside a scope still works; it just cannot close anyone.
+ */
+export function InlineEditingScope({ children }: { children: ReactNode }) {
+  const [active, setActive] = useState<string | null>(null);
+  const value = useMemo<InlineScope>(() => ({
+    active,
+    open: (name) => setActive(name),
+    close: (name) => setActive((current) => (current === name ? null : current)),
+  }), [active]);
+  return <InlineScopeContext.Provider value={value}>{children}</InlineScopeContext.Provider>;
+}
 
 export interface InlinePropertyProps {
   deal: DealRecord;
@@ -44,7 +72,13 @@ export function InlineProperty({
   deal, property, currency, display, onSaved, onMoveStage, onMovePipeline,
 }: InlinePropertyProps) {
   const toast = useToast();
-  const [editing, setEditing] = useState(false);
+  const scope = useContext(InlineScopeContext);
+  const [editingAlone, setEditingAlone] = useState(false);
+  const editing = scope ? scope.active === property.name : editingAlone;
+  const setEditing = (next: boolean) => {
+    if (scope) { if (next) scope.open(property.name); else scope.close(property.name); }
+    else setEditingAlone(next);
+  };
   const [value, setValue] = useState<unknown>(deal.properties[property.name]);
   const [saved, setSaved] = useState(false);
   const readButton = useRef<HTMLButtonElement>(null);
@@ -68,6 +102,25 @@ export function InlineProperty({
     const timer = window.setTimeout(() => setSaved(false), 2400);
     return () => window.clearTimeout(timer);
   }, [saved]);
+
+  /**
+   * The caret goes into the editor the moment it opens, whatever the editor
+   * is. `autoFocus` covers the text and money fields; the native `<select>`
+   * and the date picker's button ignore it, so pressing Enter on "Edit Close
+   * date" opened the editor and dropped the keyboard on `<body>` — where
+   * Escape reached nobody and the row could only be closed by tabbing back
+   * from the top of the page.
+   */
+  useEffect(() => {
+    if (!editing) return;
+    const frame = requestAnimationFrame(() => {
+      const root = editor.current;
+      if (!root) return;
+      if (root.contains(document.activeElement)) return;
+      focusableWithin(root)[0]?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [editing]);
 
   const save = useMutation<unknown, DealRecord>(
     (next) => api.patch<DealRecord>(`/v1/records/deal/${encodeURIComponent(deal.id)}`, {
@@ -97,6 +150,9 @@ export function InlineProperty({
     save.reset();
     setEditing(true);
   };
+
+  // Another row opening closes this one through the scope; the way the
+  // keyboard is handed over there is the other row's own focus effect.
 
   const cancel = () => {
     setEditing(false);

@@ -10,19 +10,23 @@
 import { useRef, useState } from 'react';
 import { api, invalidate, useMutation, useQuery } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
+import { useSession } from '@/client/kernel/session';
 import {
   AlertTriangleIcon,
   Badge, Banner, Button, Card, Checkbox, ChevronDownIcon, ChevronUpIcon, EmptyState, Icons, humanize,
   iconByName, useFormat, useToast,
 } from '@/client/design';
 import {
-  CITATION_ICON, OUTCOME_LABEL, SPAN_ICON, SPAN_TONE, approvalOutcome, citationHref,
-  consequenceLines,
-  humanTool, isWiderName, linkedTargetOf, needsAcknowledgement, outcomeSummary, recordLink,
+  CITATION_ICON, OUTCOME_LABEL, SPAN_ICON, SPAN_TONE, approvalOutcome, citationResolution,
+  consequenceLines, decidedByWords,
+  humanReason, humanTool, isWiderName, linkedTargetOf, needsAcknowledgement, needsProbe, outcomeSummary, recordLink,
   recordPhraseMismatch,
-  runOutcome, stageConsequences, stageWriteOf, useRun, useVocabulary, writeTargetLabel, writeTargets,
-  type AiApproval, type AiRun, type AiSpan, type Citation, type StageConsequences,
+  runOutcome, scheduledFollowup, spokenPreview, stageConsequences, stageLabelIn, stageWriteOf, useRun, useVocabulary,
+  writeTargetLabel, writeTargets, writtenToLabel,
+  type AiApproval, type AiRun, type AiSpan, type Citation, type OutcomeContext, type StageConsequences,
+  type Vocabulary, type WriteOutcome,
 } from './api';
+import { spanDigest } from './trace-core';
 
 /* ------------------------------- citations -------------------------------- */
 
@@ -38,52 +42,67 @@ import {
  * carrying the reason in its accessible name instead of a tooltip.
  */
 export function CitationChips({ citations, label = 'Sources' }: { citations: Citation[]; label?: string }) {
-  const { navigate } = useRouter();
   if (!citations.length) return null;
   return (
     <div className="cp-chips">
       <span className="cp-chips__label">{label}</span>
-      {citations.map((citation) => {
-        const href = citationHref(citation);
-        const Glyph = iconByName(CITATION_ICON[citation.type] ?? 'link');
-        const body = (
-          <>
-            <Glyph size={12} />
-            <span className="u-truncate">{citation.label}</span>
-            <span className="cp-chip__type">{humanize(citation.type)}</span>
-          </>
-        );
-        if (!href) {
-          return (
-            <span
-              key={`${citation.type}:${citation.id}`}
-              className="cp-chip cp-chip--flat"
-              tabIndex={0}
-              role="note"
-              aria-label={`${citation.label} — ${humanize(citation.type)} ${citation.id}. No screen in this workspace opens it.`}
-              title={`${citation.label} — ${citation.id} has no screen in this workspace`}
-            >
-              {body}
-            </span>
-          );
-        }
-        return (
-          <a
-            key={`${citation.type}:${citation.id}`}
-            className="cp-chip"
-            href={href}
-            title={`Open ${citation.label} (${citation.id})`}
-            onClick={(e) => {
-              if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
-              e.preventDefault();
-              navigate(href);
-            }}
-          >
-            {body}
-          </a>
-        );
-      })}
+      {citations.map((citation) => <CitationChip key={`${citation.type}:${citation.id}`} citation={citation} />)}
     </div>
+  );
+}
+
+/**
+ * One cited record, as a link when its screen will answer.
+ *
+ * A billing customer is asked about before the chip becomes a link: the
+ * metering module cites the id its events carry, and two of Northwind's
+ * metered accounts have no billing customer behind them — the link opened
+ * "No such account". Until the probe answers the chip is a link, and a probe
+ * that fails for any reason but 404 leaves it one.
+ */
+function CitationChip({ citation }: { citation: Citation }) {
+  const { navigate } = useRouter();
+  const probe = useQuery<{ id: string }>(
+    needsProbe(citation) ? `/v1/customers/${encodeURIComponent(citation.id)}` : null,
+  );
+  const { href, note } = citationResolution(citation, probe.error ? { status: probe.error.status } : null);
+  const Glyph = iconByName(CITATION_ICON[citation.type] ?? 'link');
+  const body = (
+    <>
+      <Glyph size={12} />
+      <span className="u-truncate">{citation.label}</span>
+      <span className="cp-chip__type">{humanize(citation.type)}</span>
+    </>
+  );
+  if (!href) {
+    return (
+      <span
+        className="cp-chip cp-chip--flat"
+        tabIndex={0}
+        role="note"
+        data-citation={citation.id}
+        data-unresolved="true"
+        aria-label={note ?? `${citation.label} — ${humanize(citation.type)} ${citation.id}. No screen in this workspace opens it.`}
+        title={note ?? `${citation.label} — ${citation.id} has no screen in this workspace`}
+      >
+        {body}
+      </span>
+    );
+  }
+  return (
+    <a
+      className="cp-chip"
+      href={href}
+      data-citation={citation.id}
+      title={`Open ${citation.label} (${citation.id})`}
+      onClick={(e) => {
+        if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+        e.preventDefault();
+        navigate(href);
+      }}
+    >
+      {body}
+    </a>
   );
 }
 
@@ -126,6 +145,9 @@ function Step({ span, slowest }: { span: AiSpan; slowest: number }) {
   const Glyph = iconByName(SPAN_ICON[span.kind] ?? 'terminal');
   const share = slowest > 0 ? Math.max(4, Math.round((span.duration_ms / slowest) * 100)) : 0;
   const hasArgs = Object.keys(span.args ?? {}).length > 0;
+  // The row says what the step found in words; the wire line it was read from
+  // is the Result underneath, verbatim.
+  const digest = span.ok ? spanDigest(span.summary, { when: (ts) => f.dateTime(ts), plural: (n, word) => f.plural(n, word) }) : null;
 
   return (
     <>
@@ -142,7 +164,9 @@ function Step({ span, slowest }: { span: AiSpan; slowest: number }) {
         </Badge>
         <span style={{ display: 'grid', gap: 'var(--space-1)', minWidth: 0 }}>
           <span className="cp-step__name">{span.name}</span>
-          <span className="cp-step__summary">{span.ok ? span.summary : span.error?.message ?? 'failed'}</span>
+          <span className="cp-step__summary" title={span.ok && digest !== span.summary ? span.summary : undefined}>
+            {span.ok ? digest : span.error?.message ?? 'failed'}
+          </span>
         </span>
         <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
           <span className="cp-bar cp-bar--step">
@@ -301,6 +325,36 @@ function WriteConsequences({ consequences, unread, onRetry }: {
  * It shows the exact arguments the engine prepared, not a paraphrase, because
  * approving a summary of a write is not approving the write.
  */
+/**
+ * The words around an outcome that only the screen can supply.
+ *
+ * The day a follow-up lands, in the workspace's calendar with how far off it
+ * is; who it is assigned to and who decided, as "you" for the reader and by
+ * name for a teammate; and a stage's label on the board.
+ */
+function useOutcomeContext(approval: AiApproval, vocab: Vocabulary, pipeline?: string | null): OutcomeContext {
+  const f = useFormat();
+  const session = useSession();
+  const me = session.me?.user?.id ?? null;
+  const assigneeId = typeof approval.args.assignee_id === 'string' && approval.args.assignee_id
+    ? approval.args.assignee_id
+    : approval.decided_by ?? approval.requested_by;
+  return {
+    when: (ts) => `${f.date(ts)} (${f.relative(ts)})`,
+    assignee: decidedByWords(assigneeId, me, vocab.people),
+    decidedBy: decidedByWords(approval.decided_by, me, vocab.people),
+    stage: (name) => stageLabelIn(vocab, name, pipeline),
+  };
+}
+
+/** The badge a decided write wears, and the tone of everything around it. */
+const OUTCOME_WORDS: Record<Exclude<WriteOutcome, 'pending'>, { label: string; tone: 'success' | 'danger' | 'neutral' | 'info' }> = {
+  written: { label: 'Approved and written', tone: 'success' },
+  scheduled: { label: 'Approved and scheduled', tone: 'info' },
+  failed: { label: 'Approved — the write failed', tone: 'danger' },
+  declined: { label: 'Declined', tone: 'neutral' },
+};
+
 export function ApprovalCard({ approval, question, onDecided }: {
   approval: AiApproval;
   /** The sentence this write was prepared from, so the target can be checked against it. */
@@ -351,6 +405,10 @@ export function ApprovalCard({ approval, question, onDecided }: {
   const consequences = stageWrite && dealRead.data && vocabulary.vocab.pipelines.length
     ? stageConsequences(dealNow(dealRead.data), stageWrite.stage, vocabulary.vocab)
     : null;
+  const words = useOutcomeContext(approval, vocabulary.vocab, consequences?.from?.pipeline ?? null);
+  // `Deal stage → negotiation` is the database value; the board calls it
+  // "Negotiation", and this card already holds the board.
+  const preview = spokenPreview(approval.preview, words.stage ?? (() => null));
   // A stage write whose deal or board could not be read is the one case where
   // silence is not available: this surface cannot say whether the write reopens
   // a closed deal, and saying nothing would let it through unseen.
@@ -422,9 +480,14 @@ export function ApprovalCard({ approval, question, onDecided }: {
           // gets the same sentence the card above it is written in — and a write
           // the tool refused is not announced as one that landed.
           const decided = { ...approval, status: 'approved', outcome: result.outcome };
-          const { text } = outcomeSummary(decided);
-          if (approvalOutcome(decided) === 'failed') {
+          const { text } = outcomeSummary(decided, words);
+          const landed = approvalOutcome(decided);
+          if (landed === 'failed') {
             toast.error('Approved — and the write failed', `${text} Nothing changed.`, { duration: 0 });
+          } else if (landed === 'scheduled') {
+            // Not "written to the workspace": nothing is on the record until
+            // the job fires, and the toast is the first thing that says so.
+            toast.info('Follow-up scheduled', text);
           } else if (undoTo.current) {
             toast.success('Written to the workspace', text, {
               action: { label: 'Undo', onClick: () => { void undo.run().catch(() => undefined); } },
@@ -444,7 +507,7 @@ export function ApprovalCard({ approval, question, onDecided }: {
 
   const pending = approval.status === 'pending';
   const landed = approvalOutcome(approval);
-  const summary = pending ? null : outcomeSummary(approval);
+  const summary = pending ? null : outcomeSummary(approval, words);
   const blocked = mismatch
     ? `This write targets ${mismatch.used}, not ${mismatch.asked}.`
     : consequencesUnread
@@ -466,7 +529,7 @@ export function ApprovalCard({ approval, question, onDecided }: {
           {pending ? 'Waiting for your approval' : `${humanize(approval.status)} ${approval.decided_at ? f.relative(approval.decided_at) : ''}`}
         </span>
       }
-      description={approval.reason}
+      description={humanReason(approval.reason, approval.tool)}
     >
       <div style={{ display: 'grid', gap: 'var(--space-5)' }}>
         {pending && mismatch && (
@@ -493,7 +556,7 @@ export function ApprovalCard({ approval, question, onDecided }: {
         )}
 
         <div className="cp-approval__preview">
-          {approval.preview.map((line, i) => <span key={i}>{line}</span>)}
+          {preview.map((line, i) => <span key={i}>{line}</span>)}
         </div>
 
         {pending && (
@@ -522,9 +585,9 @@ export function ApprovalCard({ approval, question, onDecided }: {
           <Banner tone="danger" title="The decision was refused">{decide.error.body.message}</Banner>
         )}
 
-        {summary && (
+        {summary && landed !== 'pending' && (
           <Banner
-            tone={landed === 'written' ? 'success' : landed === 'failed' ? 'danger' : 'neutral'}
+            tone={OUTCOME_WORDS[landed].tone}
             compact
             title={landed === 'failed' ? 'Approved — the write failed' : undefined}
           >
@@ -532,10 +595,10 @@ export function ApprovalCard({ approval, question, onDecided }: {
           </Banner>
         )}
 
-        {landed === 'written' && <WrittenTo approval={approval} />}
+        {(landed === 'written' || landed === 'scheduled') && <WrittenTo approval={approval} />}
 
         <div className="cp-approval__actions">
-          <Badge tone="neutral" size="sm" icon={<Icons.terminal size={11} />}>{approval.tool}</Badge>
+          <Badge tone="neutral" size="sm" icon={<Icons.terminal size={11} />} title={approval.tool}>{humanTool(approval.tool)}</Badge>
           <Button size="sm" variant="ghost" onClick={() => setShowArgs((value) => !value)} aria-expanded={showArgs}>
             {showArgs ? 'Hide the exact arguments' : 'Show the exact arguments'}
           </Button>
@@ -572,6 +635,9 @@ export function ApprovalCard({ approval, question, onDecided }: {
 
         {showArgs && (
           <>
+            <p className="cp-note">
+              Tool <span className="cp-mono">{approval.tool}</span>, called with:
+            </p>
             <pre className="cp-code">{pretty(approval.args)}</pre>
             {summary?.raw && (
               <>
@@ -586,23 +652,26 @@ export function ApprovalCard({ approval, question, onDecided }: {
   );
 }
 
-/** The records a landed write is now on, as links. */
+/**
+ * The records a landed write is now on, as links — or, for a booking, the
+ * record the note will land on, labelled as what it is.
+ */
 export function WrittenTo({ approval }: { approval: AiApproval }) {
   const { navigate } = useRouter();
+  const f = useFormat();
   const targets = writeTargets(approval.args);
+  const booked = scheduledFollowup(approval);
   if (!targets.length) return null;
   return (
-    <div className="cp-chips">
-      <span className="cp-chips__label">Written to</span>
+    <div className="cp-chips" data-written={booked ? 'scheduled' : 'written'}>
+      <span className="cp-chips__label">{booked ? 'Scheduled on' : 'Written to'}</span>
       {targets.map((id) => {
         const link = recordLink(id);
         const Glyph = iconByName(CITATION_ICON[link?.type ?? ''] ?? 'link');
-        // "Note on Ferro Norte Siderurgia" names the record; with more than one
-        // target there is no way to tell which name belongs to which id, so the
-        // id stands rather than a wrong name.
-        const name = targets.length === 1
-          ? / on (.+)$/.exec(approval.preview[0] ?? '')?.[1] ?? id
-          : id;
+        const name = writtenToLabel(approval, id, targets.length);
+        const opens = booked
+          ? `Open ${name} — the follow-up note lands on its timeline on ${f.date(booked.due)}`
+          : `Open ${name}`;
         const body = (
           <>
             <Glyph size={12} />
@@ -615,7 +684,7 @@ export function WrittenTo({ approval }: { approval: AiApproval }) {
             key={id}
             className="cp-chip"
             href={link.href}
-            title={`Open ${name}`}
+            title={opens}
             onClick={(e) => {
               if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
               e.preventDefault();
@@ -652,19 +721,23 @@ export function WrittenTo({ approval }: { approval: AiApproval }) {
 export function ApprovalResolution({ approval }: { approval: AiApproval }) {
   const f = useFormat();
   const [showArgs, setShowArgs] = useState(false);
+  const vocabulary = useVocabulary();
+  const words = useOutcomeContext(approval, vocabulary.vocab);
   // The decision a person made is not the same fact as what the tool did with
   // it. A write refused by the tool — `Failed: "commercial_terms" belongs to
   // the Renewal pipeline` — wore a green "Approved and written" badge and a
   // link to the record it had not written to, above the sentence saying so.
+  // And a follow-up the tool *booked* wore the same badge over a record with
+  // nothing on it: scheduled is its own outcome, in its own words.
   const landed = approvalOutcome(approval);
+  const decided: Exclude<WriteOutcome, 'pending'> = landed === 'pending' ? 'declined' : landed;
   const written = landed === 'written';
-  const summary = outcomeSummary(approval);
-  const label = landed === 'written' ? 'Approved and written'
-    : landed === 'failed' ? 'Approved — the write failed'
-      : 'Declined';
+  const scheduled = landed === 'scheduled';
+  const summary = outcomeSummary(approval, words);
+  const { label, tone } = OUTCOME_WORDS[decided];
   return (
     <div
-      className={`cp-resolution${written ? ' is-written' : ''}${landed === 'failed' ? ' is-failed' : ''}`}
+      className={`cp-resolution${written ? ' is-written' : ''}${scheduled ? ' is-scheduled' : ''}${landed === 'failed' ? ' is-failed' : ''}`}
       data-approval={approval.id}
       data-outcome={landed}
       tabIndex={-1}
@@ -673,11 +746,12 @@ export function ApprovalResolution({ approval }: { approval: AiApproval }) {
     >
       <div className="cp-resolution__head">
         <Badge
-          tone={landed === 'written' ? 'success' : landed === 'failed' ? 'danger' : 'neutral'}
+          tone={tone}
           size="sm"
-          icon={landed === 'written'
+          icon={written
             ? <Icons.check size={11} />
-            : landed === 'failed' ? <AlertTriangleIcon size={11} /> : <Icons.shield size={11} />}
+            : scheduled ? <Icons.calendar size={11} />
+              : landed === 'failed' ? <AlertTriangleIcon size={11} /> : <Icons.shield size={11} />}
         >
           {label}
         </Badge>
@@ -686,7 +760,7 @@ export function ApprovalResolution({ approval }: { approval: AiApproval }) {
         </span>
       </div>
       <p className="cp-resolution__line">{summary.text}</p>
-      {written && <WrittenTo approval={approval} />}
+      {(written || scheduled) && <WrittenTo approval={approval} />}
       <div className="cp-chips">
         <Button size="sm" variant="ghost" aria-expanded={showArgs} onClick={() => setShowArgs((v) => !v)}>
           {showArgs ? 'Hide what ran' : 'Show what ran'}
@@ -702,20 +776,35 @@ export function ApprovalResolution({ approval }: { approval: AiApproval }) {
   );
 }
 
-export function ApprovalQueue({ approvals, question, onDecided }: {
+export function ApprovalQueue({ approvals, question, onDecided, onAsk, onShowDecided }: {
   approvals: AiApproval[];
   /** The question every one of these was prepared from, where they share one. */
   question?: string;
   onDecided?: () => void;
+  /** Opens a fresh conversation with the writes switch on — the way to put something in this queue. */
+  onAsk?: () => void;
+  /** Shows the writes already decided, where the screen has that filter. */
+  onShowDecided?: () => void;
 }) {
   if (!approvals.length) {
+    // Every other empty state on the surface has a way forward; this one had a
+    // sentence. The thing that fills the queue is a question with the writes
+    // switch on, so that is the button.
     return (
       <EmptyState
         size="sm"
         inline
         illustration={null}
         title="Nothing is waiting on you"
-        body="Write tools stop here before they run. When an agent prepares one, its exact arguments appear on this screen."
+        body="Write tools stop here before they run. Ask the copilot to add a note, move a deal or schedule a follow-up, and the write appears here with its exact arguments."
+        action={onAsk && (
+          <Button size="sm" variant="primary" iconLeft={<Icons.sparkles size={13} />} onClick={onAsk}>
+            Ask the copilot to write something
+          </Button>
+        )}
+        secondaryAction={onShowDecided && (
+          <Button size="sm" variant="ghost" onClick={onShowDecided}>Show decided writes</Button>
+        )}
       />
     );
   }
@@ -745,7 +834,10 @@ export function RunFacts({ run, toolMs, approvals, steps }: {
     {
       label: 'Outcome',
       value: OUTCOME_LABEL[outcome],
-      hint: run.error ?? (outcome === 'written' ? 'A person approved the write and it ran' : outcome === 'declined' ? 'A person declined it; nothing was written' : undefined),
+      hint: run.error ?? (
+        outcome === 'written' ? 'A person approved the write and it ran'
+          : outcome === 'scheduled' ? 'A person approved it; the note lands on the record when it comes due'
+            : outcome === 'declined' ? 'A person declined it; nothing was written' : undefined),
     },
     { label: 'Answered by', value: run.model, hint: humanize(run.provider) },
     { label: 'Intent', value: run.intent ? humanize(run.intent) : '—', hint: run.confidence === null ? undefined : `intent read at ${Math.round(run.confidence * 100)}%` },

@@ -14,7 +14,7 @@ import {
   Badge, Banner, Button, Card, DataTable, Drawer, EmptyState, Grid, Icons, Inline, LineChart, Page, Section,
   SegmentedControl, Skeleton, Stack, Stat, Tooltip, WaterfallChart, formatNumber, humanize,
   toMajorUnits, useFormat, waterfallLayout,
-  type DataTableColumn, type SortState, type WaterfallInput,
+  type DataTableColumn, type SortState,
 } from '../../design';
 import {
   BasisNote, ChartSkeleton, CurrencyControl, EmptyBody, ExportCsvButton, NotePopover, RangeControl,
@@ -22,7 +22,9 @@ import {
   csvDay, moneyAxis, monthLabel, moneyIn, rateFraction, rateText, ratioText, signedMoneyIn,
   useDefaultCurrency, useRevenueRange, useSticky, useTabParam, useUrlTableState, visibleRows,
   type CsvColumn, type RevenueRange, type Sticky,
+  useScrollToHash,
 } from './common';
+import { MOVER_TONE, NOTHING_MOVED, monthMoved, movementCsv, moverDelta, waterfallOf } from './movement';
 import type {
   OpenInvoice, RevenueAccountRow, RevenueChurn, RevenueCohorts, RevenueCollections, RevenueMovement,
   RevenueMrr, RevenueSummary, MovementMonth, Mover, AgeingBucket,
@@ -64,48 +66,14 @@ const bucketFor = (invoice: OpenInvoice, at: number): string => {
 /* ------------------------------ movement bars ----------------------------- */
 
 /**
- * Contraction and churn come back as magnitudes — the amount lost, stated
- * positively — so they are negated here. A waterfall drawn from the raw
- * response climbs on churn.
+ * The seven movement classes, the "nothing moved" test and the export columns
+ * live in `movement.ts`: the same list feeds the waterfall, the table and the
+ * CSV, so no one of them can drop a class the other two show. The columns
+ * below are wide enough to print a five-figure amount with its sign; a table
+ * that cannot fit them scrolls inside its card behind the pinned month rather
+ * than squeezing every cell to "$3…".
  */
-function waterfallOf(month: MovementMonth): WaterfallInput[] {
-  return [
-    { label: 'Opening', value: month.opening ?? 0, kind: 'total' },
-    { label: 'New', value: month.new_business ?? 0 },
-    { label: 'Expansion', value: month.expansion ?? 0 },
-    { label: 'Reactivation', value: month.reactivation ?? 0 },
-    // `|| 0` normalises negative zero: a month with no contraction would
-    // otherwise label its bar "-$0".
-    { label: 'Contraction', value: -(month.contraction ?? 0) || 0 },
-    { label: 'Churn', value: -(month.churn ?? 0) || 0 },
-    { label: 'Closing', value: month.closing ?? 0, kind: 'total' },
-  ];
-}
-
-/** Did anything at all happen to the book in this month? */
-const monthMoved = (m: MovementMonth): boolean =>
-  (m.new_business ?? 0) + (m.expansion ?? 0) + (m.reactivation ?? 0) + (m.contraction ?? 0) + (m.churn ?? 0) > 0;
-
-const movementCsv = (currency: string): CsvColumn<MovementMonth>[] => [
-  { header: 'Month', value: (row) => row.month },
-  { header: 'Currency', value: () => currency.toUpperCase() },
-  { header: 'Opening', value: (row) => csvAmount(row.opening, currency) },
-  { header: 'New', value: (row) => csvAmount(row.new_business, currency) },
-  { header: 'Expansion', value: (row) => csvAmount(row.expansion, currency) },
-  { header: 'Reactivation', value: (row) => csvAmount(row.reactivation, currency) },
-  { header: 'Contraction', value: (row) => csvAmount(row.contraction === null ? null : -row.contraction, currency) },
-  { header: 'Churn', value: (row) => csvAmount(row.churn === null ? null : -row.churn, currency) },
-  { header: 'Net', value: (row) => csvAmount(row.net, currency) },
-  { header: 'Closing', value: (row) => csvAmount(row.closing, currency) },
-  { header: 'Accounts at open', value: (row) => row.counts.accounts_at_open },
-  { header: 'Accounts at close', value: (row) => row.counts.accounts_at_close },
-  { header: 'Complete month', value: (row) => (row.complete ? 'yes' : 'no') },
-  { header: 'Reconciled', value: (row) => (row.reconciliation.balanced ? 'yes' : 'no') },
-];
-
-const MOVER_TONE: Record<string, 'success' | 'danger' | 'brand' | 'neutral'> = {
-  new: 'brand', expansion: 'success', reactivation: 'success', contraction: 'danger', churn: 'danger',
-};
+const MONEY_COLUMN = 116;
 
 /* ---------------------------------- page ---------------------------------- */
 
@@ -114,6 +82,8 @@ export function RevenueBoardPage() {
   const navigate = useNavigate();
   const defaultCurrency = useDefaultCurrency();
   const range = useRevenueRange(defaultCurrency);
+  // `/revenue/movement` and `/revenue/collections` land here with a fragment.
+  useScrollToHash();
 
   // Unscoped: the only read that can say which books exist, because every
   // scoped read has already narrowed to one of them.
@@ -148,6 +118,7 @@ export function RevenueBoardPage() {
 
   return (
     <Page
+      className="rv-page"
       title="Revenue"
       eyebrow="Insights"
       subtitle="Recurring revenue, how it moved, what it retains and what is still owed — each figure with the basis it was computed on."
@@ -259,7 +230,14 @@ export function RevenueBoardPage() {
               <Stat
                 label="Deferred balance"
                 value={moneyIn(f, head.deferred_balance, currency)}
-                caption="Invoiced, not yet recognised"
+                caption={(
+                  <>
+                    Invoiced, not yet recognised —{' '}
+                    <button type="button" className="rv-link rv-link--inline" onClick={() => navigate(`/revenue/deferred?currency=${currency}`)}>
+                      open the schedule
+                    </button>
+                  </>
+                )}
               />
             </Card>
             <Card padding="tight" className="rv-tile">
@@ -403,14 +381,16 @@ function MovementSection({ movement, range }: { movement: Sticky<RevenueMovement
       ),
       width: 180,
     },
-    { id: 'opening', header: 'Opening', align: 'right', accessor: (row) => row.opening ?? 0, cell: (row) => <span className="rv-num">{moneyIn(f, row.opening, range.currency)}</span> },
-    { id: 'new_business', header: 'New', align: 'right', accessor: (row) => row.new_business ?? 0, cell: (row) => (row.new_business ? <span className="rv-num rv-num--pos">{signedMoneyIn(f, row.new_business, range.currency)}</span> : <span className="rv-num rv-muted">—</span>) },
-    { id: 'expansion', header: 'Expansion', align: 'right', accessor: (row) => row.expansion ?? 0, cell: (row) => (row.expansion ? <span className="rv-num rv-num--pos">{signedMoneyIn(f, row.expansion, range.currency)}</span> : <span className="rv-num rv-muted">—</span>) },
-    { id: 'reactivation', header: 'Reactivation', align: 'right', accessor: (row) => row.reactivation ?? 0, cell: (row) => (row.reactivation ? <span className="rv-num rv-num--pos">{signedMoneyIn(f, row.reactivation, range.currency)}</span> : <span className="rv-num rv-muted">—</span>), defaultHidden: false },
-    { id: 'contraction', header: 'Contraction', align: 'right', accessor: (row) => row.contraction ?? 0, cell: (row) => (row.contraction ? <span className="rv-num rv-num--neg">{signedMoneyIn(f, -row.contraction, range.currency)}</span> : <span className="rv-num rv-muted">—</span>) },
-    { id: 'churn', header: 'Churn', align: 'right', accessor: (row) => row.churn ?? 0, cell: (row) => (row.churn ? <span className="rv-num rv-num--neg">{signedMoneyIn(f, -row.churn, range.currency)}</span> : <span className="rv-num rv-muted">—</span>) },
-    { id: 'net', header: 'Net', align: 'right', accessor: (row) => row.net ?? 0, cell: (row) => <span className="rv-num">{signedMoneyIn(f, row.net, range.currency)}</span> },
-    { id: 'closing', header: 'Closing', align: 'right', accessor: (row) => row.closing ?? 0, cell: (row) => <span className="rv-num">{moneyIn(f, row.closing, range.currency)}</span> },
+    { id: 'opening', header: 'Opening', align: 'right', width: MONEY_COLUMN, accessor: (row) => row.opening ?? 0, cell: (row) => <span className="rv-num">{moneyIn(f, row.opening, range.currency)}</span> },
+    { id: 'new_business', header: 'New', align: 'right', width: MONEY_COLUMN, accessor: (row) => row.new_business ?? 0, cell: (row) => (row.new_business ? <span className="rv-num rv-num--pos">{signedMoneyIn(f, row.new_business, range.currency)}</span> : <span className="rv-num rv-muted">—</span>) },
+    { id: 'expansion', header: 'Expansion', align: 'right', width: MONEY_COLUMN, accessor: (row) => row.expansion ?? 0, cell: (row) => (row.expansion ? <span className="rv-num rv-num--pos">{signedMoneyIn(f, row.expansion, range.currency)}</span> : <span className="rv-num rv-muted">—</span>) },
+    { id: 'reactivation', header: 'Reactivation', align: 'right', width: MONEY_COLUMN, accessor: (row) => row.reactivation ?? 0, cell: (row) => (row.reactivation ? <span className="rv-num rv-num--pos">{signedMoneyIn(f, row.reactivation, range.currency)}</span> : <span className="rv-num rv-muted">—</span>) },
+    { id: 'resumed', header: 'Resumed', align: 'right', width: MONEY_COLUMN, headerTitle: 'Collection resumed on a paused contract', accessor: (row) => row.resumed ?? 0, cell: (row) => (row.resumed ? <span className="rv-num rv-num--pos">{signedMoneyIn(f, row.resumed, range.currency)}</span> : <span className="rv-num rv-muted">—</span>) },
+    { id: 'contraction', header: 'Contraction', align: 'right', width: MONEY_COLUMN, accessor: (row) => row.contraction ?? 0, cell: (row) => (row.contraction ? <span className="rv-num rv-num--neg">{signedMoneyIn(f, -row.contraction, range.currency)}</span> : <span className="rv-num rv-muted">—</span>) },
+    { id: 'churn', header: 'Churn', align: 'right', width: MONEY_COLUMN, accessor: (row) => row.churn ?? 0, cell: (row) => (row.churn ? <span className="rv-num rv-num--neg">{signedMoneyIn(f, -row.churn, range.currency)}</span> : <span className="rv-num rv-muted">—</span>) },
+    { id: 'paused', header: 'Paused', align: 'right', width: MONEY_COLUMN, headerTitle: 'Collection paused — the contract survives, so this is not churn', accessor: (row) => row.paused ?? 0, cell: (row) => (row.paused ? <span className="rv-num rv-num--warn">{signedMoneyIn(f, -row.paused, range.currency)}</span> : <span className="rv-num rv-muted">—</span>) },
+    { id: 'net', header: 'Net', align: 'right', width: MONEY_COLUMN, accessor: (row) => row.net ?? 0, cell: (row) => <span className="rv-num">{signedMoneyIn(f, row.net, range.currency)}</span> },
+    { id: 'closing', header: 'Closing', align: 'right', width: MONEY_COLUMN, accessor: (row) => row.closing ?? 0, cell: (row) => <span className="rv-num">{moneyIn(f, row.closing, range.currency)}</span> },
     {
       id: 'reconciled',
       header: 'Reconciled',
@@ -430,8 +410,9 @@ function MovementSection({ movement, range }: { movement: Sticky<RevenueMovement
 
   return (
     <Section
+      id="movement"
       title="MRR movement"
-      description="New, expansion, contraction, churn and reactivation, classified per customer and reconciled against the closing balance."
+      description="New, expansion, reactivation and resumed against contraction, churn and paused — classified per customer and reconciled against the closing balance. A pause is its own class: the contract is intact, so it is not churn."
       actions={<BasisNote basis={data?.basis} sources={data?.sources} label="How movement was computed" />}
     >
       {movement.error && <Card><SectionError error={movement.error} path="GET /v1/revenue/movement" onRetry={movement.refetch} /></Card>}
@@ -475,12 +456,12 @@ function MovementSection({ movement, range }: { movement: Sticky<RevenueMovement
                       </Button>
                     )}
                   >
-                    {`No account started, grew, shrank or left in this month. The last month with movement was ${monthLabel(moved.month, f, true)}.`}
+                    {`${NOTHING_MOVED} The last month with movement was ${monthLabel(moved.month, f, true)}.`}
                   </Banner>
                 )}
                 <WaterfallChart
                   title={`MRR movement in ${monthLabel(month.month, f, true)}`}
-                  description="Opening balance, each classified movement, and the closing balance it adds up to."
+                  description="Opening balance, each of the seven classified movements — pauses and resumptions included — and the closing balance they add up to."
                   items={waterfallOf(month)}
                   height={280}
                   valueFormat={moneyAxis(f, range.currency, waterfallLayout(waterfallOf(month)).flatMap((bar) => [bar.start, bar.end]))}
@@ -505,7 +486,7 @@ function MovementSection({ movement, range }: { movement: Sticky<RevenueMovement
 
           <Card title="Who moved" description={`Largest movements in ${monthLabel(month.month, f, true)}, biggest first.`}>
             {month.top_movers.length === 0
-              ? <EmptyState size="sm" inline title="Nobody moved" body="No account started, grew, shrank or left in this month." illustration={null} />
+              ? <EmptyState size="sm" inline title="Nobody moved" body={NOTHING_MOVED} illustration={null} />
               : (
                 <div className="rv-rows">
                   {month.top_movers.map((mover: Mover) => (
@@ -521,7 +502,7 @@ function MovementSection({ movement, range }: { movement: Sticky<RevenueMovement
                       <div className="rv-row__aside">
                         <Inline gap={3} justify="end">
                           <Badge tone={MOVER_TONE[mover.kind] ?? 'neutral'} size="sm">{humanize(mover.kind)}</Badge>
-                          <span className="rv-num">{signedMoneyIn(f, mover.kind === 'contraction' || mover.kind === 'churn' ? -Math.abs(mover.amount) : mover.amount, mover.currency)}</span>
+                          <span className="rv-num">{signedMoneyIn(f, moverDelta(mover), mover.currency)}</span>
                         </Inline>
                       </div>
                     </div>
@@ -585,6 +566,7 @@ function RetentionSection({
 
   return (
     <Section
+      id="retention"
       title="Retention"
       description="What the book keeps month over month, and what each signup cohort is still worth."
       actions={<BasisNote basis={data?.basis} sources={data?.sources} label="How retention was computed" />}
@@ -823,6 +805,7 @@ function ReceivablesSection({ collections, range }: { collections: Sticky<Revenu
 
   return (
     <Section
+      id="collections"
       title="Receivables"
       description="What is owed, how old it is, and what recovery is getting back."
       actions={(

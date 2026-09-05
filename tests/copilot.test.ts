@@ -28,31 +28,42 @@ register(
 import {
   inventedFilters, isWiderName, reconcileScope, recordPhraseMismatch, type Vocabulary,
 } from '../src/client/modules/copilot/scope-core';
-import { noWritePrepared, propertyAsked, refusalOf } from '../src/client/modules/copilot/answer-core';
-import { dedupeCitations, writeTargetLabel } from '../src/client/modules/copilot/citations';
 import {
-  consequenceLines, dealNamedIn, editHref, linkedTargetOf, needsAcknowledgement, stageConsequences,
-  stageWriteOf, type DealNow,
+  nearestFromReasoning, noWritePrepared, propertyAsked, refusalOf, splitRefusalOffer, withoutApiInstruction, writeNeedsSwitch,
+} from '../src/client/modules/copilot/answer-core';
+import { citationHref, citationResolution, dedupeCitations, needsProbe, writeTargetLabel } from '../src/client/modules/copilot/citations';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { filterTools, tagLabel, toolSummary } from '../src/client/modules/copilot/tools-core';
+import { everyDay, integerTickCount } from '../src/client/modules/copilot/usage-core';
+import { threadErrorCopy } from '../src/client/modules/copilot/thread-core';
+import { spanDigest } from '../src/client/modules/copilot/trace-core';
+import {
+  consequenceLines, dealNamedIn, editHref, linkedTargetOf, needsAcknowledgement, spokenPreview, stageConsequences,
+  stageLabelIn, stageWriteOf, type DealNow,
 } from '../src/client/modules/copilot/write-core';
 import {
-  EMPTY_LEDGER, LEDGER_PROMISE, canLog, chaseVerdict, checkDunning, draftsFromAccount, figuresIn,
-  invoiceNumbersIn, ledgerFrom, ledgerPromise, ledgerTotal,
+  EMPTY_LEDGER, LEDGER_PROMISE, canLog, chaseVerdict, checkDunning, dealOptionDescription, draftsFromAccount, figuresIn,
+  invoiceNumbersIn, ledgerFrom, ledgerPromise, ledgerTotal, recipientField,
 } from '../src/client/modules/copilot/draft-core';
 import {
-  approvalOutcome, decidedBadge, runOutcome, type AiApproval,
+  OUTCOME_LABEL, OUTCOME_TONE, approvalOutcome, decidedBadge, decidedByWords, humanReason, outcomeSummary, propertyChanges,
+  runOutcome, scheduledFollowup, writtenToLabel,
+  type AiApproval,
 } from '../src/client/modules/copilot/api';
 import {
   MODEL_KEY_NOTE, TEMPLATE_GROUPS, engineLine, engineOf, filterTemplates, groupOf, groupTemplates,
-  nearestFromWire, nearestTemplates, starterTemplates, type AiTemplate,
+  nearestFromWire, nearestTemplates, recordAsk, renderPattern, starterTemplates, stemOf, templatesAbout, type AiTemplate,
 } from '../src/client/modules/copilot/templates-core';
 import {
-  bindingOf, slotChips, slotChipsFromPlan, windowText, type SlotFormat,
+  bindingOf, numberAsked, rawRecordIds, slotChips, slotChipsFromPlan, windowText, type SlotFormat,
 } from '../src/client/modules/copilot/slots-core';
-import { answerCard, type TurnInput } from '../src/client/modules/copilot/card-core';
+import { answerCard, nearestOf, type TurnInput } from '../src/client/modules/copilot/card-core';
 
 const ui = {
   card: await import('../src/client/modules/copilot/card.tsx'),
   templates: await import('../src/client/modules/copilot/templates.tsx'),
+  trace: await import('../src/client/modules/copilot/trace.tsx'),
 };
 
 /* ============================ the workspace ============================== */
@@ -307,7 +318,10 @@ const RIGHT: Probe[] = [
   {
     question: 'Who is my biggest customer?',
     toolCalls: [{ name: 'business_metric', arguments: { metric: 'closed_won', group_by: 'account', top: 1 } }],
-    slots: { metric: 'Closed-won bookings', group: 'Account', limit: '1' },
+    slots: { metric: 'Closed-won bookings', group: 'Account' },
+    // "biggest" is a superlative, not a number: the `top: 1` is how the plan
+    // fetches, and "TOP 1" on the card was a claim the person never made.
+    never: ['limit'],
     truth: 'the account with the most closed-won bookings, ranked over all 25 that have any',
   },
   {
@@ -319,7 +333,8 @@ const RIGHT: Probe[] = [
   {
     question: 'Which deals are closing in the next 90 days?',
     toolCalls: [{ name: 'record_search', arguments: { object_type: 'deal', conditions: [{ property: 'deal_stage', op: 'in', values: OPEN_STAGES }], date_property: 'close_date', start: NOW, end: NOW + 90 * 86_400_000, window_label: 'the next 90 days', order_by: 'close_date', limit: 50 } }],
-    slots: { status: 'open', period: 'the next 90 days', object: 'Deal', limit: '50' },
+    slots: { status: 'open', period: 'the next 90 days', object: 'Deal' },
+    never: ['limit'],
     truth: '~30 open deals; the old engine turned the bare number 90 into a filter and answered 0',
   },
   {
@@ -360,7 +375,8 @@ const RIGHT: Probe[] = [
   {
     question: 'Which support tickets need attention?',
     toolCalls: [{ name: 'record_search', arguments: { object_type: 'ticket', conditions: [{ property: 'status', op: 'in', values: ['open', 'pending'] }], order_by: 'created', limit: 20 } }],
-    slots: { object: 'Ticket', limit: '20' },
+    slots: { object: 'Ticket' },
+    never: ['limit'],
     truth: 'the open and pending tickets',
   },
   {
@@ -373,7 +389,18 @@ const RIGHT: Probe[] = [
     question: 'How many invoices are open?',
     toolCalls: [{ name: 'record_search', arguments: { object_type: 'invoice', conditions: [{ property: 'status', op: 'eq', value: 'open' }], limit: 50 } }],
     slots: { object: 'Invoice' },
+    never: ['limit'],
     truth: '7 open invoices',
+  },
+  {
+    question: 'Top 5 customers by revenue',
+    toolCalls: [{ name: 'business_metric', arguments: { metric: 'closed_won', group_by: 'account', limit: 5, direction: 'desc' } }],
+    remembered: {
+      engine: 'template', nearest: null, template: null,
+      analysis: { slots: [{ name: 'number', kind: 'number', text: '5', label: '5', qualifier: 'limit' }, { name: 'metric', kind: 'rank-metric', text: 'revenue', label: 'Revenue' }] },
+    },
+    slots: { metric: 'Closed-won bookings', group: 'Account', limit: '5' },
+    truth: 'the one shape where the number is the person’s own: the plan cuts to the 5 that was typed',
   },
 ];
 
@@ -651,10 +678,16 @@ describe('the surface, rendered', () => {
     assert.match(html, /Some questions it can answer/);
   });
 
-  it('says which engine answered, and with no hosted model, what one takes', () => {
+  it('says which engine answered, and keeps what free text takes in the tooltip, not on every card', () => {
     const noKey = renderToStaticMarkup(createElement(EngineIndicator, { line: engineLine('template', false) }));
     assert.match(noKey, /answered from a template/);
-    assert.match(noKey, /ANTHROPIC_API_KEY/);
+    // The env var is said once — in the empty state and the panel — and is
+    // one hover away here. Thirty cards, thirty times "set ANTHROPIC_API_KEY
+    // where the API runs" was a developer's footnote on a salesperson's answer.
+    const visible = noKey.replace(/<[^>]+>/g, ' ');
+    assert.doesNotMatch(visible, /ANTHROPIC_API_KEY|free text needs a hosted model/);
+    assert.match(noKey, /title="[^"]*ANTHROPIC_API_KEY/);
+    assert.match(noKey, /data-needs-key="true"/);
     // A note, not a link: nothing in the product can set the variable.
     assert.doesNotMatch(noKey, /href=/);
     assert.match(noKey, /data-engine="template"/);
@@ -1305,5 +1338,699 @@ describe('the one guarantee the draft surface prints about money', () => {
     };
     assert.deepEqual(chaseVerdict('dunning', ACCOUNT_DRAFT, settled, BRIGHTLINE_LEDGER), { state: 'ok' });
     assert.match(LEDGER_PROMISE.limit, /owed or settled is yours to check/);
+  });
+});
+
+/* ================ P1 · every billing citation chip was a dead link ========= */
+
+const MODULES = join(import.meta.dirname, '..', 'src', 'client', 'modules');
+
+/** Every `path: '…'` a client module registers, as a matcher. */
+const registeredRoutes = (): RegExp[] => {
+  const out: RegExp[] = [];
+  for (const module of readdirSync(MODULES)) {
+    let source = '';
+    try { source = readFileSync(join(MODULES, module, 'routes.tsx'), 'utf8'); } catch { continue; }
+    for (const match of source.matchAll(/path:\s*'([^']+)'/g)) {
+      const pattern = match[1].split('/').map((seg) => (seg.startsWith(':') ? '[^/]+' : seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).join('/');
+      out.push(new RegExp(`^${pattern}$`));
+    }
+  }
+  return out;
+};
+
+describe('where a cited record opens', () => {
+  const routes = registeredRoutes();
+  const opens = (href: string | null) => href !== null && routes.some((route) => route.test(href));
+
+  const CITED = [
+    { id: 'in_XQS7eOo09q5NJDSG', label: 'NR-000032', type: 'invoice' },
+    { id: 'sub_WR2n7EikSifk5nfr', label: 'Ferrante Meccanica — Telemetry Cloud Growth', type: 'subscription' },
+    { id: 'cus_kPpK0Zm5VckZzJag', label: 'Brightline Foods', type: 'customer' },
+    { id: 'deal_nw_71', label: 'Aconcagua Alimentos — pilot expansion to 3 lines', type: 'deal' },
+    { id: 'cmp_nw_42', label: 'Aconcagua Alimentos', type: 'company' },
+    { id: 'con_nw_101', label: 'Someone', type: 'contact' },
+    { id: 'tkt_nw_09', label: 'Dashboard loads slowly', type: 'ticket' },
+    { id: 'mtr_events', label: 'Telemetry events', type: 'meter' },
+    { id: 'note_9ZwSFIG5A6L7sA', label: 'A note', type: 'note' },
+  ];
+
+  it('is a screen this product registers, for every type the engine cites', () => {
+    assert.ok(routes.length > 20, 'the route registry was read');
+    const dead = CITED.filter((citation) => !opens(citationHref(citation))).map((c) => `${c.type} → ${citationHref(c)}`);
+    assert.deepEqual(dead, [], 'a Sources chip that opens the 404 page');
+  });
+
+  it('sends invoices, subscriptions and customers to billing’s own screens', () => {
+    assert.equal(citationHref(CITED[0]), '/billing/invoices/in_XQS7eOo09q5NJDSG');
+    assert.equal(citationHref(CITED[1]), '/billing/subscriptions/sub_WR2n7EikSifk5nfr');
+    assert.equal(citationHref(CITED[2]), '/billing/customers/cus_kPpK0Zm5VckZzJag');
+  });
+});
+
+/* ============ P1 · the refusal chips were not the engine’s nearest ========= */
+
+describe('the nearest shapes, wherever the engine put them', () => {
+  const ENGINE_NEAREST = [
+    { id: 'usage.credit_balance', example: 'What is the prepaid credit balance for Brightline Foods?', overlap: 0.163 },
+    { id: 'revenue.bookings_period', example: 'How much did we book in Q3 2026?', overlap: 0.157 },
+    { id: 'pipeline.open_total', example: 'What is our open pipeline?', overlap: 0.157 },
+  ];
+
+  it('reads `analysis.nearest` — the field the completion actually sends — when `nearest` is absent', () => {
+    const wire = nearestOf({ analysis: { nearest: ENGINE_NEAREST, refusal: { code: 'slot_unbound', why: '…' } } });
+    assert.ok(wire);
+    assert.deepEqual(wire.map((row) => row.id), ['usage.credit_balance', 'revenue.bookings_period', 'pipeline.open_total']);
+    const chips = nearestFromWire(wire, TEMPLATES);
+    assert.deepEqual(chips.map((chip) => chip.templateId), ['usage.credit_balance', 'revenue.bookings_period', 'pipeline.open_total']);
+    assert.equal(chips[0].question, 'What is the prepaid credit balance for Brightline Foods?');
+  });
+
+  it('reads them back off the run’s working notes for a thread redrawn later', () => {
+    const notes = [
+      'Engine: template whitelist (ain-engine-1); 100 question shapes reachable with 51 tools.',
+      'Refused (slot_unbound): "weather in Lisbon" is not a measure this workspace knows.',
+      'Nearest shapes: "What is the prepaid credit balance for Brightline Foods?"; "How much did we book in Q3 2026?"; "What is our open pipeline?".',
+      'Usage: 3533 input + 76 output tokens, 4 credits, no marginal cost (local engine); 13ms.',
+    ];
+    assert.deepEqual(nearestFromReasoning(notes).map((row) => row.example), ENGINE_NEAREST.map((row) => row.example));
+    assert.deepEqual(nearestFromReasoning(['Refused (x): y']), []);
+    const card = answerCard(turn(RIGHT[0], {
+      question: 'What is the weather in Lisbon today?',
+      toolCalls: [],
+      run: { ...TEMPLATE_RUN, reasoning: notes },
+    }));
+    assert.ok(card.refusal);
+    assert.deepEqual(
+      card.refusal.nearest.map((chip) => chip.question),
+      ENGINE_NEAREST.map((row) => row.example),
+      'a redraw offered three shapes ranked by wording instead of the three the engine named',
+    );
+    assert.deepEqual(card.refusal.nearest.map((chip) => chip.templateId), ['usage.credit_balance', 'revenue.bookings_period', 'pipeline.open_total'], 'the examples were matched back to their templates');
+    assert.equal(card.refusal.matched, true);
+  });
+
+  it('prefers what the completion remembered over a guess, in the engine’s order', () => {
+    const card = answerCard(turn(RIGHT[0], {
+      question: 'What is the weather in Lisbon today?',
+      toolCalls: [],
+      run: { ...TEMPLATE_RUN, reasoning: ['Refused (slot_unbound): no.'] },
+      remembered: { engine: 'template', nearest: nearestOf({ analysis: { nearest: ENGINE_NEAREST } }), template: null, analysis: { nearest: ENGINE_NEAREST } },
+    }));
+    assert.deepEqual(card.refusal?.nearest.map((chip) => chip.templateId), ['usage.credit_balance', 'revenue.bookings_period', 'pipeline.open_total']);
+  });
+
+  it('reads the offer at the foot of the prose, once, and hands the prose back without it', () => {
+    const content = 'I can\'t answer that as asked. "weather in Lisbon" is not a measure this workspace knows.\n\nTry one of these:\n\n• What is the prepaid credit balance for Brightline Foods?\n• How much did we book in Q3 2026?\n• What is our open pipeline?';
+    const split = splitRefusalOffer(content);
+    assert.equal(split.prose, 'I can\'t answer that as asked. "weather in Lisbon" is not a measure this workspace knows.');
+    assert.deepEqual(split.offered, ENGINE_NEAREST.map((row) => row.example));
+    assert.deepEqual(splitRefusalOffer('A plain answer.\n\n• with\n• bullets'), { prose: 'A plain answer.\n\n• with\n• bullets', offered: [] });
+    const card = answerCard(turn(RIGHT[0], { question: 'What is the weather?', content, toolCalls: [], run: { ...TEMPLATE_RUN, reasoning: [] } }));
+    assert.ok(card.refusal, 'the offer alone marks a refusal');
+    assert.deepEqual(card.refusal.nearest.map((chip) => chip.question), split.offered);
+  });
+});
+
+/* ========= P1 · the deal page’s entry always ended in a refusal =========== */
+
+/** The deal shapes exactly as `GET /v1/ai/templates` publishes them. */
+const DEAL_SHAPES: AiTemplate[] = [
+  { id: 'deal-stage', kind: 'lookup', shape: 'What stage is {deal} at?', example: 'What stage is Aconcagua Alimentos — pilot expansion to 3 lines at?', description: 'The stage one deal is in.', slots: [{ name: 'deal', kind: 'deal', values: null }], patterns: ['(what|which) stage is {deal} (in|at)', 'where is {deal} (in the pipeline|at)'] },
+  { id: 'deal-close-date', kind: 'lookup', shape: 'When does {deal} close?', example: 'When does Aconcagua Alimentos — pilot expansion to 3 lines close?', description: 'The close date on one deal.', slots: [{ name: 'deal', kind: 'deal', values: null }], patterns: ['when (does|will|is|did) {deal} (close|closing|due to close|expected to close|set to close)'] },
+  { id: 'deal-owner', kind: 'lookup', shape: 'Who owns {deal}?', example: 'Who owns Aconcagua Alimentos — pilot expansion to 3 lines?', description: 'The teammate carrying one deal.', slots: [{ name: 'deal', kind: 'deal', values: null }], patterns: ['who owns {deal}', 'whose deal is {deal}'] },
+  { id: 'deal-amount', kind: 'lookup', shape: 'How much is {deal} worth?', example: 'How much is Aconcagua Alimentos — pilot expansion to 3 lines worth?', description: 'The amount on one deal.', slots: [{ name: 'deal', kind: 'deal', values: null }], patterns: ['how much is {deal} worth'] },
+  { id: 'write-stage', kind: 'write', shape: 'Move {deal} to the {stage} stage', example: 'Move Aconcagua Alimentos — pilot expansion to 3 lines to the Negotiation stage', description: 'Prepares a stage change.', slots: [{ name: 'deal', kind: 'deal', values: null }, { name: 'stage', kind: 'stage', values: null }], patterns: ['(move|advance|push|set|put) {deal} to (the|) {stage} (stage|)'] },
+  { id: 'account-profile', kind: 'profile', shape: 'Where does {account} stand?', example: 'Where does Aconcagua Alimentos stand?', description: 'The account.', slots: [{ name: 'account', kind: 'account', values: null }], patterns: ['tell me about {account}', 'where does {account} stand (right now|now|today|)'] },
+];
+
+describe('a question about one record, in the engine’s own words', () => {
+  const DEAL = 'Sakamoto Seiki — packaging line uplift';
+
+  it('renders a pattern with the slot filled and the first option of every choice', () => {
+    assert.equal(renderPattern('(what|which) stage is {deal} (in|at)', { deal: DEAL }), `What stage is ${DEAL} in?`);
+    assert.equal(renderPattern('who owns {deal}', { deal: DEAL }), `Who owns ${DEAL}?`);
+    assert.equal(renderPattern('tell me about {account}', { account: 'Aconcagua Alimentos' }), 'Tell me about Aconcagua Alimentos', 'not a question, so no question mark');
+    assert.equal(renderPattern('where does {account} stand (right now|now|today|)', { account: 'Aconcagua Alimentos' }), 'Where does Aconcagua Alimentos stand right now?');
+    assert.equal(renderPattern('(what is|what are) the {metric:snapshot-metric} (of|for) {account}', { account: 'X', metric: 'ARR' }), 'What is the ARR of X?');
+  });
+
+  it('offers the four read shapes about a deal, worded for it, and not the write', () => {
+    const offered = templatesAbout([...TEMPLATES, ...DEAL_SHAPES], 'deal', DEAL);
+    assert.deepEqual(offered.map((row) => row.template.id), ['deal-stage', 'deal-close-date', 'deal-owner', 'deal-amount']);
+    assert.deepEqual(offered.map((row) => row.question), [
+      `What stage is ${DEAL} in?`,
+      `When does ${DEAL} close?`,
+      `Who owns ${DEAL}?`,
+      `How much is ${DEAL} worth?`,
+    ]);
+    assert.deepEqual(templatesAbout(TEMPLATES, 'deal', DEAL), [], 'a whitelist with no deal shape offers nothing');
+  });
+
+  it('reads the deal screen’s composed sentence as the record it names', () => {
+    assert.deepEqual(recordAsk(`Where does ${DEAL} stand right now?`), { name: DEAL });
+    assert.deepEqual(recordAsk('Where does Aconcagua Alimentos stand?'), { name: 'Aconcagua Alimentos' });
+    assert.equal(recordAsk('What is our ARR?'), null);
+    assert.equal(recordAsk(''), null);
+    assert.equal(recordAsk(undefined), null);
+  });
+});
+
+/* ========= P1 · no screen for usage or the tool catalogue ================= */
+
+describe('the usage and tool screens the surface advertises', () => {
+  const runsSource = readFileSync(join(MODULES, 'copilot', 'runs.tsx'), 'utf8');
+
+  it('draws every breakdown `/v1/ai/usage` answers — by day, feature, teammate and model', () => {
+    for (const field of ['by_day', 'by_feature', 'by_user', 'by_model', 'tool_calls', 'cost_cents']) {
+      assert.ok(runsSource.includes(field), `runs.tsx never reads usage.${field}`);
+    }
+    assert.match(runsSource, /useAiUsage\(/, 'the usage report is read');
+    assert.match(runsSource, /value: 'usage', label: 'Usage'/, 'a Usage tab beside Runs and Approvals');
+    assert.match(runsSource, /value: 'tools', label: 'Tools'/, 'a Tools tab beside them');
+    assert.match(runsSource, /useTools\(\)/, 'the catalogue is read');
+  });
+
+  it('filters the catalogue by name, description or tag, in any casing', () => {
+    const tools = [
+      { name: 'account_profile', description: 'The full picture of one account.', read_only: true, tags: ['ai', 'crm'] },
+      { name: 'add_note', description: 'Write a note onto the timeline of one or more CRM records.', read_only: false, tags: ['crm'] },
+      { name: 'invoice_list', description: 'Open invoices with what is owed.', read_only: true, tags: ['billing'] },
+    ];
+    assert.deepEqual(filterTools(tools, '').map((t) => t.name), ['account_profile', 'add_note', 'invoice_list']);
+    assert.deepEqual(filterTools(tools, 'Billing').map((t) => t.name), ['invoice_list']);
+    assert.deepEqual(filterTools(tools, 'add note').map((t) => t.name), ['add_note'], 'the human name matches too');
+    assert.deepEqual(filterTools(tools, 'crm timeline').map((t) => t.name), ['add_note']);
+    assert.deepEqual(['ai', 'crm', 'billing', 'entitlements'].map(tagLabel), ['AI', 'CRM', 'Billing', 'Entitlements']);
+  });
+});
+
+/* ============== P2 · /copilot/approvals was a breadcrumb over a 404 ======= */
+
+describe('the approval queue’s own address', () => {
+  const routesSource = readFileSync(join(MODULES, 'copilot', 'routes.tsx'), 'utf8');
+  const registered = [...routesSource.matchAll(/path:\s*'([^']+)'/g)].map((m) => m[1]);
+
+  it('is registered', () => {
+    assert.ok(registered.includes('/copilot/approvals'), `registered: ${registered.join(', ')}`);
+  });
+
+  it('is where the nav, the palette and the dashboard card all go', () => {
+    const destinations = [...routesSource.matchAll(/(?:to:\s*'|go\('|navigate\(')([^']+)'/g)].map((m) => m[1]);
+    assert.ok(destinations.includes('/copilot/approvals'), 'nothing points at the queue');
+    assert.equal(destinations.includes('/copilot/runs?tab=approvals'), false, 'something still points at the tab instead');
+    const routeMatchers = registeredRoutes();
+    for (const to of destinations) {
+      const path = to.split('?')[0];
+      assert.ok(routeMatchers.some((route) => route.test(path)), `${to} is not a registered screen`);
+    }
+  });
+});
+
+/* ============ P2 · raw ids and tool names in chips, pickers and prose ====== */
+
+const STAGE_WRITE: AiApproval = {
+  object: 'ai_approval',
+  id: 'apr_1',
+  run_id: 'run_1',
+  thread_id: 'thr_1',
+  tool: 'update_record',
+  args: { object_type: 'deal', id: 'deal_nw_71', properties: { deal_stage: 'negotiation' } },
+  preview: ['Deal Aconcagua Alimentos — pilot expansion to 3 lines', 'Deal stage → negotiation'],
+  reason: 'update_record changes workspace data, so a person approves it before it runs.',
+  status: 'approved',
+  outcome: 'object=record id=deal_nw_71 object_type=deal display_name=Aconcagua Alimentos — pilot expansion to 3 lines',
+  requested_by: 'usr_seed01',
+  decided_by: 'usr_seed01',
+  decided_at: 1,
+  created: 0,
+};
+
+const NOTE_WRITE: AiApproval = {
+  ...STAGE_WRITE,
+  id: 'apr_2',
+  tool: 'add_note',
+  args: { record_ids: ['cmp_nw_42'], body: 'Called about the SOW.' },
+  preview: ['Note on Aconcagua Alimentos', 'Called about the SOW.'],
+  reason: 'add_note changes workspace data, so a person approves it before it runs.',
+  outcome: 'object=record id=note_9ZwSFIG5A6L7sA object_type=note display_name=Called about the SOW.',
+};
+
+describe('what an approved write says about itself', () => {
+  it('states the change a property write made, not the note sentence', () => {
+    const { text } = outcomeSummary(STAGE_WRITE);
+    assert.equal(text, 'Deal stage → Negotiation on Aconcagua Alimentos — pilot expansion to 3 lines.');
+    assert.deepEqual(propertyChanges(STAGE_WRITE.preview), ['Deal stage → Negotiation']);
+    assert.deepEqual(propertyChanges(['Note on X', 'Body text']), []);
+  });
+
+  it('still says a note is on the record', () => {
+    assert.equal(outcomeSummary(NOTE_WRITE).text, 'Note on Aconcagua Alimentos — the note “Called about the SOW.” is on the record.');
+  });
+
+  it('names the tool as a person does in the card’s reason', () => {
+    assert.equal(humanReason(NOTE_WRITE.reason, 'add_note'), 'Add note changes workspace data, so a person approves it before it runs.');
+    assert.equal(humanReason(STAGE_WRITE.reason, 'update_record'), 'Update record changes workspace data, so a person approves it before it runs.');
+    assert.equal(humanReason('A reason with no tool in it.', 'add_note'), 'A reason with no tool in it.');
+    assert.equal(humanReason('add_note_v2 is not add_note', 'add_note'), 'add_note_v2 is not Add note', 'a longer identifier is left alone');
+  });
+
+  it('names the deal on the Written-to chip of a stage write', () => {
+    assert.equal(writtenToLabel(STAGE_WRITE, 'deal_nw_71', 1), 'Aconcagua Alimentos — pilot expansion to 3 lines');
+    assert.equal(writtenToLabel(NOTE_WRITE, 'cmp_nw_42', 1), 'Aconcagua Alimentos');
+    assert.equal(writtenToLabel(NOTE_WRITE, 'cmp_nw_42', 2), 'cmp_nw_42', 'two targets, no way to match a name to an id');
+  });
+});
+
+describe('the deal picker’s rows', () => {
+  const money = (minor: number, currency?: string) => `${currency ?? 'USD'} ${(minor / 100).toFixed(2)}`;
+
+  it('describes a deal by its stage and amount, never its id', () => {
+    const text = dealOptionDescription({ properties: { deal_stage: 'closed_won', amount: 9_348_000, currency: 'usd' } }, money);
+    assert.equal(text, 'Closed won · usd 93480.00');
+    assert.doesNotMatch(text, /deal_nw/);
+    assert.equal(dealOptionDescription({ properties: { amount: 100 } }, money), 'USD 1.00');
+    assert.equal(dealOptionDescription({ properties: {} }, money), '');
+  });
+});
+
+describe('the ids a slot chip is still wearing', () => {
+  it('finds the account id a citation-less answer left on the chip', () => {
+    const chips = slotChipsFromPlan(
+      [{ name: 'business_metric', arguments: { metric: 'outstanding_balance', subject_id: 'cmp_nw_42', group_by: 'none' } }],
+      VOCAB,
+      FORMAT,
+    );
+    assert.deepEqual(rawRecordIds(chips), ['cmp_nw_42']);
+    assert.deepEqual(rawRecordIds([{ kind: 'account', label: 'Account', value: 'Brightline Foods' }]), []);
+    assert.deepEqual(rawRecordIds([{ kind: 'owner', label: 'Owner', value: 'usr_seed02' }]), [], 'teammates are named by the vocabulary');
+  });
+});
+
+/* ======== P2 · a write asked with the switch off, answered with a flag ===== */
+
+describe('a write asked with “Let it prepare writes” off', () => {
+  const NOTES = ['No write prepared: the request looks like update_record, but this run is read-only. Send `allow_writes: true` and I will prepare it for your approval.'];
+
+  it('is read as the switch, not as a limit of the engine', () => {
+    assert.deepEqual(writeNeedsSwitch({ reasoning: NOTES }), { tool: 'update_record' });
+    // The template engine's own note for the same thing, and its structured form.
+    assert.deepEqual(writeNeedsSwitch({ reasoning: [
+      'Matched "write-stage": {deal} = Aconcagua Alimentos — pilot expansion to 3 lines, {stage} = Negotiation.',
+      'Plan: update_record — Set Aconcagua Alimentos — pilot expansion to 3 lines to the Negotiation stage.',
+      'Ran update_record in 1ms → write_not_permitted: "update_record" changes data and this run is read-only.',
+    ] }), { tool: 'update_record' });
+    assert.deepEqual(writeNeedsSwitch({ analysis: { write_blocked: { wanted: 'add_note', reason: '"add_note" changes data and this run is read-only.' } } }), { tool: 'add_note' });
+    assert.equal(writeNeedsSwitch({ reasoning: ['Ran update_record in 3ms → ok.'] }), null);
+    assert.equal(noWritePrepared({ reasoning: NOTES }), null);
+    assert.equal(writeNeedsSwitch({ reasoning: ['No write prepared: the request looks like update_record, but I could not tell which property to set.'] }), null);
+  });
+
+  it('drops the request-body instruction from the sentence a person reads', () => {
+    assert.equal(
+      withoutApiInstruction('I changed nothing. This run is read-only — send `allow_writes: true` and I will prepare the stage change for your approval.'),
+      'I changed nothing. This run is read-only. The stage change was not prepared.',
+    );
+    assert.equal(
+      withoutApiInstruction('I changed nothing. This run is read-only — send `allow_writes: true` and I will prepare the Aconcagua Alimentos — pilot expansion to 3 lines moved to Negotiation for your approval.'),
+      'I changed nothing. This run is read-only. The Aconcagua Alimentos — pilot expansion to 3 lines moved to Negotiation was not prepared.',
+    );
+    assert.equal(withoutApiInstruction('A plain answer.'), 'A plain answer.');
+  });
+
+  it('is the one banner the card draws for it', () => {
+    const card = answerCard(turn(RIGHT[0], { question: 'Move the Aconcagua deal to Negotiation', toolCalls: [], run: { ...TEMPLATE_RUN, reasoning: NOTES } }));
+    assert.deepEqual(card.switchOff, { tool: 'update_record' });
+    assert.deepEqual(card.banners, ['switch_off']);
+    assert.equal(card.noWrite, null);
+  });
+});
+
+/* ============ P2 · the filter suggested “owed” and found nothing =========== */
+
+describe('the panel’s filter, on an inflected word', () => {
+  const OWES = t('account-owes', 'What does {account} owe?', 'What does Aconcagua Alimentos owe?', 'Open invoices on one account.', ['account']);
+
+  it('stems what was typed', () => {
+    assert.equal(stemOf('owed'), 'owe');
+    assert.equal(stemOf('owes'), 'owe');
+    assert.equal(stemOf('invoices'), 'invoice');
+    assert.equal(stemOf('companies'), 'company');
+    assert.equal(stemOf('deals'), 'deal');
+    assert.equal(stemOf('ARR'), 'arr');
+  });
+
+  it('finds “owe” for “owed” — the word its own placeholder proposes', () => {
+    assert.deepEqual(filterTemplates([...TEMPLATES, OWES], 'owed').map((row) => row.id), ['account-owes']);
+    const invoiced = filterTemplates([...TEMPLATES, OWES], 'invoiced').map((row) => row.id);
+    assert.ok(invoiced.includes('revenue.invoiced_to_customers') && invoiced.includes('q_015'), `“invoiced” finds the invoices too: ${invoiced.join(', ')}`);
+    assert.deepEqual(filterTemplates([...TEMPLATES, OWES], 'xyzzy'), []);
+  });
+
+  it('quotes example words that hit', () => {
+    const chat = readFileSync(join(MODULES, 'copilot', 'chat.tsx'), 'utf8');
+    const panel = readFileSync(join(MODULES, 'copilot', 'templates.tsx'), 'utf8');
+    for (const source of [chat, panel]) {
+      const quoted = [...source.matchAll(/“([a-z]+)”/gi)].map((m) => m[1]).filter((w) => /^[a-z]+$/i.test(w) && w !== 'Growth');
+      for (const word of quoted) {
+        assert.ok(filterTemplates([...TEMPLATES, OWES], word).length > 0, `the copy proposes “${word}” and the filter finds nothing for it`);
+      }
+    }
+  });
+});
+
+describe('the usage chart’s days', () => {
+  it('draws one bar per day of the window, quiet days at zero, in the engine’s UTC days', () => {
+    const days = everyDay({ since: '2026-08-30', until: '2026-09-02' }, [{ key: '2026-09-01', credits: 20, runs: 5 }]);
+    assert.deepEqual(days, [
+      { key: '2026-08-30', credits: 0, runs: 0 },
+      { key: '2026-08-31', credits: 0, runs: 0 },
+      { key: '2026-09-01', credits: 20, runs: 5 },
+      { key: '2026-09-02', credits: 0, runs: 0 },
+    ]);
+    assert.deepEqual(everyDay({ since: 'garbage', until: '2026-09-02' }, [{ key: '2026-09-01', credits: 1, runs: 1 }]), [{ key: '2026-09-01', credits: 1, runs: 1 }], 'an unreadable window falls back to the days that ran');
+    assert.equal(everyDay({ since: '2025-09-05', until: '2026-09-05' }, []).length, 366, 'a year is every day of it');
+  });
+});
+
+/* ======== P1 · a follow-up the copilot booked was reported as written ====== */
+
+const FOLLOWUP: AiApproval = {
+  ...approval({}),
+  id: 'appr_fu',
+  tool: 'schedule_followup',
+  args: { record_id: 'cmp_nw_42', in_days: 7, note: 'Chase the signed MSA.' },
+  preview: ['Follow-up on Aconcagua Alimentos', 'Due in 7 days', 'Assigned to you', 'Chase the signed MSA.'],
+  reason: 'schedule_followup changes workspace data, so a person approves it before it runs.',
+  outcome: 'scheduled=true record_id=cmp_nw_42 due=1789219881805 note=Chase the signed MSA. idempotency_key=ai.followup:cmp_nw_42:1789219881805:1fe7ed30f32e8ae0',
+};
+
+describe('a follow-up the copilot booked, not wrote', () => {
+  it('is scheduled — its own outcome, neither written nor pending', () => {
+    assert.equal(approvalOutcome(FOLLOWUP), 'scheduled');
+    assert.deepEqual(scheduledFollowup(FOLLOWUP), { recordId: 'cmp_nw_42', due: 1789219881805, note: 'Chase the signed MSA.' });
+    assert.equal(scheduledFollowup(NOTE_WRITE), null, 'a note that landed is not a booking');
+    assert.equal(scheduledFollowup({ ...FOLLOWUP, status: 'pending', outcome: null }), null);
+    assert.equal(approvalOutcome(NOTE_WRITE), 'written', 'a landed note is still written');
+  });
+
+  it('says the day, the assignee, and that nothing is on the record yet', () => {
+    const { text, raw } = outcomeSummary(FOLLOWUP, { when: () => 'Sep 12, 2026 (in 7 days)', assignee: 'you' });
+    assert.equal(
+      text,
+      'Follow-up on Aconcagua Alimentos is booked for Sep 12, 2026 (in 7 days), assigned to you. '
+      + 'Nothing is on Aconcagua Alimentos’s timeline yet: the note “Chase the signed MSA.” is written there when it comes due.',
+    );
+    assert.doesNotMatch(text, /— written\./, 'the sentence the critic read');
+    assert.equal(raw, FOLLOWUP.outcome, 'the wire line stays under “Show what ran”');
+    assert.match(outcomeSummary(FOLLOWUP).text, /booked for 2026-09-12/, 'with no formatter the day is still a day, not a timestamp');
+  });
+
+  it('badges the turn and the run as scheduled, in the info tone', () => {
+    assert.deepEqual(decidedBadge([FOLLOWUP]), { label: 'decided — scheduled', tone: 'info' });
+    assert.equal(runOutcome({ status: 'succeeded', reasoning: [] }, [FOLLOWUP]), 'scheduled');
+    assert.equal(runOutcome({ status: 'succeeded', reasoning: [] }, [FOLLOWUP, NOTE_WRITE]), 'written', 'a run that also wrote is written');
+    assert.equal(OUTCOME_LABEL.scheduled, 'Approved and scheduled');
+    assert.equal(OUTCOME_TONE.scheduled, 'info');
+  });
+
+  it('is announced as scheduled on the resolution card, with the record it lands on', () => {
+    const source = readFileSync(join(MODULES, 'copilot', 'trace.tsx'), 'utf8');
+    assert.match(source, /scheduled: \{ label: 'Approved and scheduled', tone: 'info' \}/);
+    assert.match(source, /booked \? 'Scheduled on' : 'Written to'/, 'the chip is labelled for what it is');
+  });
+});
+
+/* ============ P2 · “Declined by an operator.” — Dana declined it =========== */
+
+describe('who declined, in the reader’s own terms', () => {
+  it('is “you” for the reader, a name for a teammate, and nobody for an id off the roster', () => {
+    assert.equal(decidedByWords('usr_seed01', 'usr_seed01', VOCAB.people), 'you');
+    assert.equal(decidedByWords('usr_seed02', 'usr_seed01', VOCAB.people), 'Marcus Ilori');
+    assert.equal(decidedByWords('usr_gone', 'usr_seed01', VOCAB.people), null);
+    assert.equal(decidedByWords(null, 'usr_seed01', VOCAB.people), null);
+  });
+
+  it('replaces the route’s stand-in sentence and leaves a real reason alone', () => {
+    const declined = approval({ status: 'declined', outcome: 'Declined by an operator.' });
+    assert.equal(outcomeSummary(declined, { decidedBy: 'you' }).text, 'Declined by you. Nothing was written.');
+    assert.equal(outcomeSummary(declined, { decidedBy: 'Marcus Ilori' }).text, 'Declined by Marcus Ilori. Nothing was written.');
+    assert.equal(outcomeSummary(declined, {}).text, 'Declined by an operator. Nothing was written.', 'with nobody to name, the stand-in stands');
+    const blocked = approval({ status: 'declined', outcome: 'Blocked: Aconcagua Alimentos was archived while this waited.' });
+    assert.equal(outcomeSummary(blocked, { decidedBy: 'you' }).text, 'Blocked: Aconcagua Alimentos was archived while this waited.');
+  });
+});
+
+/* ============== P2 · the preview printed the stage’s database value ======= */
+
+describe('the stage a write names, as the board writes it', () => {
+  it('labels the stage from the deal’s own pipeline, and refuses a contested one', () => {
+    assert.equal(stageLabelIn(VOCAB, 'negotiation', 'new_business'), 'Negotiation');
+    assert.equal(stageLabelIn(VOCAB, 'proposal', 'new_business'), 'Proposal sent');
+    assert.equal(stageLabelIn(VOCAB, 'negotiation'), 'Negotiation', 'every pipeline agrees, so the label stands without one');
+    assert.equal(stageLabelIn(VOCAB, 'qualification'), null, '“Qualification” on one board, “Expansion identified” on another — nobody’s');
+    assert.equal(stageLabelIn(VOCAB, 'qualification', 'expansion'), 'Expansion identified');
+    assert.equal(stageLabelIn(VOCAB, 'nowhere'), null);
+  });
+
+  it('rewrites the preview’s stage line and leaves every other line alone', () => {
+    const stage = (name: string) => stageLabelIn(VOCAB, name, 'new_business');
+    assert.deepEqual(spokenPreview(STAGE_WRITE.preview, stage), ['Deal Aconcagua Alimentos — pilot expansion to 3 lines', 'Deal stage → Negotiation']);
+    assert.deepEqual(spokenPreview(['Deal X', 'Deal stage → proposal'], stage), ['Deal X', 'Deal stage → Proposal sent']);
+    assert.deepEqual(spokenPreview(['Deal X', 'Deal stage → nowhere'], stage), ['Deal X', 'Deal stage → nowhere'], 'an unknown stage is not invented');
+    assert.deepEqual(spokenPreview(['Note on X', 'Priority → high'], stage), ['Note on X', 'Priority → high']);
+    assert.deepEqual(propertyChanges(['Deal stage → proposal'], stage), ['Deal stage → Proposal sent']);
+    assert.deepEqual(propertyChanges(['Deal stage → proposal']), ['Deal stage → Proposal'], 'without a board, the id is at least humanised');
+    const moved = { ...STAGE_WRITE, preview: ['Deal Aconcagua Alimentos — pilot expansion to 3 lines', 'Deal stage → proposal'] };
+    assert.equal(outcomeSummary(moved, { stage }).text, 'Deal stage → Proposal sent on Aconcagua Alimentos — pilot expansion to 3 lines.');
+  });
+});
+
+/* ============ P2 · “TOP 25” — a page size drawn as a scope the person set == */
+
+describe('a page size is not a scope', () => {
+  const probe = (question: string, toolCalls: TurnInput['toolCalls'], over: Partial<TurnInput> = {}) =>
+    answerCard(turn({ question, toolCalls, slots: {}, truth: '' }, over));
+
+  it('draws no Top chip for a limit the person never asked for', () => {
+    const overdue = probe('Which invoices are overdue?', [{ name: 'billing_list_invoices', arguments: { status: 'open_like', due_before: NOW, limit: 25 } }]);
+    assert.equal(overdue.slots.some((slot) => slot.kind === 'limit'), false, JSON.stringify(overdue.slots));
+    const open = probe('How many invoices are open?', [{ name: 'billing_list_invoices', arguments: { status: 'open', limit: 1 } }]);
+    assert.equal(open.slots.some((slot) => slot.kind === 'limit'), false, JSON.stringify(open.slots));
+    const closing = probe('Which deals are closing in the next 90 days?', RIGHT[3].toolCalls);
+    assert.equal(closing.slots.some((slot) => slot.kind === 'limit'), false, JSON.stringify(closing.slots));
+  });
+
+  it('draws the Top chip when the engine bound the number the plan cut to', () => {
+    const calls: TurnInput['toolCalls'] = [{ name: 'business_metric', arguments: { metric: 'closed_won', group_by: 'account', limit: 5, direction: 'desc' } }];
+    const bound = probe('Top 5 customers by revenue', calls, {
+      remembered: { engine: 'template', nearest: null, template: null, analysis: { slots: [{ name: 'number', kind: 'number', text: '5', label: '5', qualifier: 'limit' }] } },
+    });
+    assert.equal(bound.slots.find((slot) => slot.kind === 'limit')?.value, '5');
+    // A conversation re-read next week has no completion; the run's own note
+    // records the binding, and the chip is drawn from that.
+    const reread = probe('Top 5 customers by revenue', calls, {
+      run: { ...TEMPLATE_RUN, reasoning: ['Matched "top-n-accounts": {number} = 5, {metric} = revenue.', 'Plan: business_metric — rank accounts.'] },
+    });
+    assert.equal(reread.slots.find((slot) => slot.kind === 'limit')?.value, '5');
+    // A number that is not the cut — 60 days of quiet, fetched 50 at a time — is not a Top.
+    const quiet = probe('Which accounts have had no activity in 60 days?', [{ name: 'record_search', arguments: { object_type: 'company', limit: 50 } }], {
+      remembered: { engine: 'template', nearest: null, template: null, analysis: { slots: [{ name: 'number', kind: 'number', text: '60', label: '60', qualifier: 'limit' }] } },
+    });
+    assert.equal(quiet.slots.some((slot) => slot.kind === 'limit'), false, JSON.stringify(quiet.slots));
+  });
+
+  it('reads the number off the engine’s own records and never off the wording', () => {
+    assert.equal(numberAsked({ analysis: { slots: [{ name: 'number', kind: 'number', text: '7', label: '7', qualifier: 'limit' }] } }), 7);
+    assert.equal(numberAsked({ analysis: { slots: [{ name: 'period', kind: 'period', text: '2025', label: '2025' }] } }), null);
+    assert.equal(numberAsked({ reasoning: ['Matched "top-n-deals": {number} = 3, {superlative} = biggest, {state} = open.'] }), 3);
+    assert.equal(numberAsked({ reasoning: ['Matched "invoices-status": {status} = overdue.'] }), null);
+    assert.equal(numberAsked(null), null);
+    assert.equal(slotChipsFromPlan([{ name: 'business_metric', arguments: { metric: 'closed_won', group_by: 'account', top: 3 } }], VOCAB, FORMAT).some((c) => c.kind === 'limit'), false);
+    assert.equal(slotChipsFromPlan([{ name: 'business_metric', arguments: { metric: 'closed_won', group_by: 'account', top: 3 } }], VOCAB, FORMAT, 3).find((c) => c.kind === 'limit')?.value, '3');
+  });
+});
+
+/* ========= P1 · a Sources chip opened “No such account” for a meter’s customer */
+
+describe('a cited billing customer the ledger does not hold', () => {
+  const pemberton = { id: 'cus_nw_pemberton', label: 'Pemberton Auto Systems', type: 'customer' };
+  const aconcagua = { id: 'cmp_nw_42', label: 'Aconcagua Alimentos', type: 'company' };
+
+  it('is asked about before it is a link, and only a customer is', () => {
+    assert.equal(needsProbe(pemberton), true);
+    assert.equal(needsProbe(aconcagua), false);
+    assert.equal(needsProbe({ id: 'in_1', label: 'NR-000032', type: 'invoice' }), false);
+  });
+
+  it('is a flat chip with the reason once billing has answered 404, and a link otherwise', () => {
+    assert.deepEqual(citationResolution(pemberton, null), { href: '/billing/customers/cus_nw_pemberton', note: null }, 'unprobed, it links');
+    const dead = citationResolution(pemberton, { status: 404 });
+    assert.equal(dead.href, null);
+    assert.match(dead.note ?? '', /Pemberton Auto Systems — the meter knows this account, but billing has no customer cus_nw_pemberton\. Nothing opens it\./);
+    assert.equal(citationResolution(pemberton, { status: 500 }).href, '/billing/customers/cus_nw_pemberton', 'an outage is not a missing account');
+    assert.equal(citationResolution(pemberton, { status: 200 }).href, '/billing/customers/cus_nw_pemberton');
+    assert.equal(citationResolution(aconcagua, { status: 404 }).href, '/companies/cmp_nw_42', 'a CRM record is not probed, so a stray 404 does not flatten it');
+    const nowhere = citationResolution({ id: 'x_1', label: 'X', type: 'unknown' }, null);
+    assert.equal(nowhere.href, null);
+    assert.match(nowhere.note ?? '', /No screen in this workspace opens it/);
+  });
+});
+
+/* ============ P2 · the run log’s headers truncated at the default width ==== */
+
+describe('the run log’s columns', () => {
+  const runsSource = readFileSync(join(MODULES, 'copilot', 'runs.tsx'), 'utf8');
+  const columns = runsSource.slice(runsSource.indexOf('useMemo<DataTableColumn<AiRun>[]>'), runsSource.indexOf('], [f, outcomeOf]);'));
+
+  it('gives every column but the question a width, so “Feature” never reads “Feat…”', () => {
+    for (const id of ['started', 'feature', 'status', 'intent', 'confidence', 'steps', 'duration', 'tokens', 'credits']) {
+      assert.match(columns, new RegExp(`id: '${id}',\\s*header: '[^']+',\\s*width: \\d+`), `${id} has no width`);
+    }
+  });
+
+  it('hides Confidence by default — every template run reads 100%', () => {
+    const confidence = columns.slice(columns.indexOf("id: 'confidence'"), columns.indexOf("id: 'steps'"));
+    assert.match(confidence, /defaultHidden: true/);
+  });
+});
+
+/* ====== P2 · the Tools tab printed the prompt text and a cut-off placeholder */
+
+describe('a tool, described for a person', () => {
+  it('keeps the first sentence and puts the instructions to the engine behind a disclosure', () => {
+    const profile = toolSummary({
+      name: 'account_profile',
+      description: 'The full picture of one account: firmographics, owner, buying committee, open and won deals with amounts and close dates, open tickets, lifetime value and how long since anyone touched it. Pass a company id, or a contact id to get the company behind it.',
+      read_only: true,
+      tags: ['ai', 'crm'],
+    });
+    assert.equal(profile.summary, 'The full picture of one account: firmographics, owner, buying committee, open and won deals with amounts and close dates, open tickets, lifetime value and how long since anyone touched it.');
+    assert.equal(profile.guidance, 'Pass a company id, or a contact id to get the company behind it.');
+
+    const invoices = toolSummary({
+      name: 'billing_list_invoices',
+      description: 'List invoices — the whole book, one account, or only what is still owed. Use status=open_like to answer "what is outstanding?" and due_before to answer "what is overdue?".',
+      read_only: true,
+      tags: ['billing', 'revenue', 'support'],
+    });
+    assert.equal(invoices.summary, 'List invoices — the whole book, one account, or only what is still owed.');
+    assert.match(invoices.guidance, /^Use status=open_like to answer "what is outstanding\?"/);
+  });
+
+  it('writes its own line when the description opens with an instruction, and none when there is nothing left', () => {
+    const bare = toolSummary({ name: 'set_thing', description: 'Use this to set a thing on a record.', read_only: false, tags: ['crm'] });
+    assert.equal(bare.summary, 'Writes to the CRM; stops for a person’s approval before it runs.');
+    assert.equal(bare.guidance, 'Use this to set a thing on a record.');
+    const read = toolSummary({ name: 'get_thing', description: 'Pass an id.', read_only: true, tags: ['billing'] });
+    assert.equal(read.summary, 'Reads billing; changes nothing.');
+    const note = toolSummary({ name: 'add_note', description: 'Write a note onto the timeline of one or more CRM records.', read_only: false, tags: ['crm'] });
+    assert.equal(note.summary, 'Write a note onto the timeline of one or more CRM records.');
+    assert.equal(note.guidance, '');
+  });
+
+  it('has a placeholder that ends', () => {
+    const runsSource = readFileSync(join(MODULES, 'copilot', 'runs.tsx'), 'utf8');
+    const placeholder = /placeholder="(Filter the tools[^"]*)"/.exec(runsSource)?.[1] ?? '';
+    assert.ok(placeholder, 'the tools filter has a placeholder');
+    assert.ok(placeholder.length <= 24, `“${placeholder}” is cut off in the box the critic saw`);
+    assert.match(runsSource, /toolSummary\(/, 'the tab draws the summary, not the prompt');
+  });
+});
+
+/* ============ P2 · the approvals empty state had no way forward =========== */
+
+describe('the approval queue with nothing in it', () => {
+  it('offers the one thing that fills it, and the decided writes', () => {
+    const { ApprovalQueue } = ui.trace;
+    const html = renderToStaticMarkup(createElement(ApprovalQueue, { approvals: [], onAsk: () => undefined, onShowDecided: () => undefined }));
+    assert.match(html, /Nothing is waiting on you/);
+    assert.match(html, /Ask the copilot to write something/);
+    assert.match(html, /Show decided writes/);
+    const widget = renderToStaticMarkup(createElement(ApprovalQueue, { approvals: [], onAsk: () => undefined }));
+    assert.match(widget, /Ask the copilot to write something/);
+    assert.doesNotMatch(widget, /Show decided writes/, 'the dashboard card has no status filter to show them in');
+  });
+
+  it('sends people to a fresh conversation with the writes switch on', () => {
+    const runs = readFileSync(join(MODULES, 'copilot', 'runs.tsx'), 'utf8');
+    const routes = readFileSync(join(MODULES, 'copilot', 'routes.tsx'), 'utf8');
+    const chat = readFileSync(join(MODULES, 'copilot', 'chat.tsx'), 'utf8');
+    assert.match(runs, /onAsk=\{\(\) => navigate\('\/copilot\?new=1&writes=1'\)\}/);
+    assert.match(routes, /onAsk=\{\(\) => navigate\('\/copilot\?new=1&writes=1'\)\}/);
+    assert.match(chat, /location\.query\.writes === '1'/, 'the conversation reads the flag and turns the switch on');
+  });
+});
+
+/* ======== P2 · “No contact linked” said before any deal was chosen ======== */
+
+describe('the “Write it to” field, in each state it can be in', () => {
+  it('asks for a deal first, says when it is reading, and only then judges the record', () => {
+    assert.deepEqual(recipientField({ hasTarget: false, loading: false, contacts: 0 }), {
+      placeholder: 'Choose a deal first', hint: 'The contacts come from the deal you pick.', disabled: true,
+    });
+    assert.equal(recipientField({ hasTarget: true, loading: true, contacts: 0 }).hint, 'Reading this record’s contacts…');
+    assert.equal(recipientField({ hasTarget: true, loading: false, contacts: 0 }).placeholder, 'No contact linked');
+    const three = recipientField({ hasTarget: true, loading: false, contacts: 3 });
+    assert.equal(three.placeholder, 'The primary contact');
+    assert.equal(three.disabled, false);
+    assert.match(three.hint, /primary contact/);
+  });
+});
+
+/* ============ NIT · “No such ai thread: thr_doesnotexist” ================= */
+
+describe('a conversation that cannot be read', () => {
+  it('says what happened in the screen’s words and offers a way out', () => {
+    const gone = threadErrorCopy({ status: 404, message: 'No such ai thread: thr_doesnotexist' });
+    assert.equal(gone.title, 'This conversation no longer exists');
+    assert.doesNotMatch(gone.message, /ai thread|thr_/);
+    assert.equal(gone.action, 'start_new');
+    assert.equal(threadErrorCopy({ status: 403, message: 'Forbidden' }).action, 'start_new');
+    const down = threadErrorCopy({ status: 503, message: 'The database was locked.' });
+    assert.equal(down.title, 'This conversation could not be read');
+    assert.equal(down.message, 'The database was locked.');
+    assert.equal(down.action, 'try_again');
+    const chat = readFileSync(join(MODULES, 'copilot', 'chat.tsx'), 'utf8');
+    assert.match(chat, /threadErrorCopy\(/, 'the conversation screen uses it');
+  });
+});
+
+/* ============ NIT · trace rows printed raw key=value tool output =========== */
+
+describe('a trace step, in words', () => {
+  const words = { when: (ts: number) => `day ${new Date(ts).toISOString().slice(0, 10)}`, plural: (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}` };
+
+  it('reads the formatted value, the record, the count or the booking off the wire line', () => {
+    assert.equal(spanDigest('metric=mrr label=Monthly recurring revenue unit=money value=1527917 formatted=€15,279.17', words), 'Monthly recurring revenue · €15,279.17');
+    assert.equal(spanDigest('object=metered_usage scope=workspace value=100423639 formatted=100,423,639 events event_count=719', words), '100,423,639 events');
+    assert.equal(spanDigest('object_type=deal measure=count of records value=77 formatted=77 matched_records=77', words), 'Count of records · 77');
+    assert.equal(spanDigest('object=record id=note_K8hWfFzDaghWHV object_type=note display_name=Revised SOW went out today owner_id=usr_seed01', words), 'Note “Revised SOW went out today”');
+    assert.equal(spanDigest('object_type=deal total=31 records=10', words), '31 deals matched · 10 read');
+    assert.equal(spanDigest('total=1 outstanding_by_currency=1 outstanding_display=$127,840.00 invoices=1', words), '1 invoice matched · $127,840.00 outstanding');
+    assert.equal(spanDigest('object=delinquent_customers total=2 customers=2', words), '2 past-due customers matched');
+    assert.equal(spanDigest(FOLLOWUP.outcome!, words), 'Follow-up booked for day 2026-09-12 — “Chase the signed MSA.”');
+  });
+
+  it('leaves prose as prose', () => {
+    assert.equal(spanDigest('Matching against 100 shapes', words), 'Matching against 100 shapes');
+    assert.equal(spanDigest('rank: Rheinwerk Antriebstechnik is the biggest customer by closed-won bookings all time, at $583,200.', words), 'rank: Rheinwerk Antriebstechnik is the biggest customer by closed-won bookings all time, at $583,200.');
+    assert.equal(spanDigest('approval_required: "update_record" is waiting for approval before it can run.', words), 'approval_required: "update_record" is waiting for approval before it can run.');
+  });
+});
+
+/* ============ NIT · the usage chart’s ticks read 0, 3, 5, 8, 10, 13 ======== */
+
+describe('the usage chart’s ticks', () => {
+  it('asks for a count whose step is a whole credit', () => {
+    // 12 credits on five ticks steps at 2.5 — 0, 2.5, 5, 7.5, 10, 12.5 — and
+    // the axis rounds each to "0, 3, 5, 8, 10, 13". Four ticks step at 5.
+    assert.equal(integerTickCount(12), 4);
+    assert.equal(integerTickCount(20), 5);
+    assert.equal(integerTickCount(7), 5);
+    assert.equal(integerTickCount(9), 3);
+    assert.equal(integerTickCount(0), 5, 'nothing charged, the default');
+    const runsSource = readFileSync(join(MODULES, 'copilot', 'runs.tsx'), 'utf8');
+    assert.match(runsSource, /yTickCount=\{integerTickCount\(/, 'the chart is asked for it');
   });
 });

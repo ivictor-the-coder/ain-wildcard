@@ -35,6 +35,12 @@
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: var(--space-5);
 }
+/* Four tiles at 180px wrap 3+1 below the toolbar's own breakpoint, leaving
+   Stalled alone on a row of its own; two by two is the grid that reads. After
+   the base rule, because at equal specificity the later one wins. */
+@media (max-width: 1180px) {
+  .pl-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 
 .pl-statlabel {
   display: inline-flex;
@@ -141,10 +147,16 @@
 }
 .pl-col__money {
   display: flex;
-  align-items: baseline;
-  gap: var(--space-3);
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
 }
+/* A closed column's header says how it counts instead of quoting a weighted
+   figure, and the median line is always drawn, so every header on a strip has
+   the same rows and the cards below them start on the same line. Before, a
+   header whose weighted figure wrapped onto a second line pushed its "Median …
+   days here" and its first card a row below its neighbours'. */
+.pl-col__weighted { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pl-col__amount {
   font-size: var(--text-md);
   font-weight: var(--weight-semibold);
@@ -575,4 +587,176 @@
   outline: none;
   box-shadow: var(--focus-ring);
   border-radius: var(--radius-lg);
+}
+
+/* ------------------------- a drop that cannot land ------------------------ */
+
+/* A card dragged over another pipeline's column: the column says so while the
+   pointer is over it, instead of doing nothing and leaving the person to
+   wonder whether the drop was refused or never noticed. */
+.pl-col.is-blocked {
+  border-style: dashed;
+  border-color: var(--border-danger-subtle);
+  background: var(--surface-danger);
+  cursor: not-allowed;
+}
+.pl-col__blocked {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-4) var(--space-4) 0;
+  padding: var(--space-3) var(--space-4);
+  border: 1px dashed var(--border-danger-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-danger);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+/* ------------------------------- forecast --------------------------------- */
+
+.pl-forecast-tile.is-won .ain-stat__value { color: var(--text-success); }
+.pl-forecast-tile.is-commit .ain-stat__value { color: var(--text-brand); }
+
+.pl-forecast__scroll { overflow-x: auto; scrollbar-width: thin; }
+
+.pl-forecast {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+.pl-forecast th,
+.pl-forecast td {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  text-align: left;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.pl-forecast thead th {
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-tertiary);
+  border-bottom: 1px solid var(--border-default);
+}
+.pl-forecast th.is-num,
+.pl-forecast td.is-num { text-align: right; }
+.pl-forecast tbody th {
+  font-weight: var(--weight-medium);
+  color: var(--text-primary);
+  max-width: 220px;
+}
+.pl-forecast tbody tr:hover { background: var(--bg-hover); }
+.pl-forecast tfoot th,
+.pl-forecast tfoot td {
+  border-top: 1px solid var(--border-default);
+  border-bottom: 0;
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+  background: var(--bg-subtle);
+}
+.pl-forecast__who { display: inline-flex; align-items: center; gap: var(--space-3); min-width: 0; max-width: 100%; }
+.pl-forecast__cell {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  margin: calc(var(--space-1) * -1) calc(var(--space-2) * -1);
+  border-radius: var(--radius-sm);
+  color: inherit;
+  text-decoration: none;
+}
+.pl-forecast__cell--link:hover { background: var(--accent-subtle); color: var(--text-brand); }
+.pl-forecast__cell--link:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.pl-forecast__amount { display: block; color: var(--text-primary); }
+.pl-forecast__count { display: block; font-size: var(--text-2xs); color: var(--text-tertiary); }
+.pl-forecast__cell--link:hover .pl-forecast__amount { color: var(--text-brand); }
+.pl-forecast td.is-num .pl-forecast__count { text-align: right; }
+.pl-forecast__weighted { color: var(--text-secondary); }
+.pl-forecast__mixhead { min-width: 140px; }
+
+.pl-mix {
+  display: flex;
+  width: 140px;
+  height: 8px;
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  background: var(--bg-track);
+}
+.pl-mix__part { display: block; height: 100%; }
+.pl-mix__part.is-won { background: var(--viz-6); }
+.pl-mix__part.is-commit { background: var(--viz-1); }
+.pl-mix__part.is-best_case { background: var(--viz-5); }
+.pl-mix__part.is-pipeline { background: var(--viz-2); opacity: 0.6; }
+
+.pl-forecast__notes {
+  margin: var(--space-4) 0 0;
+  padding-left: var(--space-5);
+  display: grid;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+.pl-forecast__notes a { color: var(--text-link); }
+
+.pl-propgroup__flag { margin-left: var(--space-3); text-transform: none; letter-spacing: normal; }
+
+/* The empty board draws its stages so the first deal has somewhere to go. */
+.pl-board--empty .pl-col__body { min-height: var(--space-14); }
+
+/* Narrowed to won or lost, each pipeline is one closed column; left to the
+   grid's 1fr it would be a single card-wide list stretched across the page. */
+.pl-board--outcome .pl-board { grid-auto-columns: minmax(220px, 360px); }
+
+/* A pipeline with nothing matching the filter is one line, not five columns of
+   "Add a deal here" pushing the matches below the fold. */
+.pl-strip--collapsed .pl-strip__head { border-bottom: 0; padding-bottom: 0; }
+.pl-strip--collapsed + .pl-strip { margin-top: var(--space-4); }
+
+/* The outcome a closed card leads with, in place of a stage timer. */
+.pl-card__outcome { display: inline-flex; align-items: center; gap: var(--space-1); font-weight: var(--weight-medium); }
+.pl-card__outcome.is-won { color: var(--text-success); }
+.pl-card__outcome.is-lost { color: var(--text-secondary); }
+
+/* The record's outcome fact: the reason as the hint, the notes under it. */
+.pl-fact__note {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  line-height: var(--leading-snug);
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------ typed dates ------------------------------- */
+
+.pl-datefield {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.pl-datefield > .ain-input { min-width: 0; }
+.pl-datefield__hint {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-danger);
+}
+.pl-datefield__foot {
+  display: flex;
+  gap: var(--space-2);
+  padding: 0 var(--space-5) var(--space-5);
+}
+
+/* The mix bar is a reading aid, not a figure: below this width it is the
+   column that gets clipped off the right of the grid, so it steps aside and
+   every money column stays in view. */
+@media (max-width: 1100px) {
+  .pl-forecast__mixhead,
+  .pl-forecast td:last-child { display: none; }
 }

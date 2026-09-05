@@ -44,3 +44,37 @@ export function downloadCsv(filename: string, content: string): void {
 export function exportFilename(label: string, at: number, timeZone: string): string {
   return `${label.replace(/[^\w -]+/g, '').trim() || 'records'} ${zonedDay(at, timeZone)}.csv`;
 }
+
+/**
+ * CSV in. RFC 4180 the way spreadsheets actually write it: quoted cells with
+ * doubled quotes inside them, CRLF or LF, an optional byte-order mark, and a
+ * trailing newline that is not an extra empty row.
+ */
+export function parseCsv(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = '';
+  let quoted = false;
+  const source = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (quoted) {
+      if (ch === '"') {
+        if (source[i + 1] === '"') { cell += '"'; i++; } else { quoted = false; }
+      } else {
+        cell += ch;
+      }
+      continue;
+    }
+    if (ch === '"') { quoted = true; continue; }
+    if (ch === ',') { row.push(cell); cell = ''; continue; }
+    if (ch === '\r') { continue; }
+    if (ch === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; continue; }
+    cell += ch;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  // The export's own leading-quote guard, undone on the way back in.
+  return rows
+    .filter((cells) => cells.some((value) => value.trim() !== ''))
+    .map((cells) => cells.map((value) => (/^'[=+\-@\t\r]/.test(value) ? value.slice(1) : value)));
+}

@@ -10,22 +10,24 @@
  * and leaving the reader to compare them by eye. Both blobs are still there,
  * underneath, because a diff is an opinion and the payload is the record.
  */
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useQuery, type ListEnvelope } from '../../kernel/api';
 import {
   Badge, Banner, Button, Card, DataTable, DateRangePicker, Drawer, EmptyState, Icons, Inline, KeyValue,
   Stack, Tooltip,
-  filterRows, humanize, searchRows, sortRows, useFormat, useToast,
+  filterRows, searchRows, sortRows, useFormat, useMediaQuery, useToast,
   type CellValue, type DataTableColumn, type DateRange, type TableState,
   ArrowRightIcon,
 } from '../../design';
 import { DAY } from '../../../shared/time';
 import {
-  JsonBlock, ListFailure, NeedsAdmin, SettingsShell, downloadFile, fileStamp, toCsv, useActorName,
+  JsonBlock, ListFailure, NeedsAdmin, SettingsShell, TargetLink, downloadFile, fileStamp, toCsv, useActorName,
+  useConsumeQuery,
   type CsvColumn,
 } from './common';
+import { seatsFromTrail } from './audit-core';
 import { useSession } from '../../kernel/session';
-import type { AuditEntry } from './types';
+import type { ApiKey, AuditEntry } from './types';
 
 /** The page the server will serve at most. Named, so the count never lies. */
 const PAGE = 500;
@@ -65,6 +67,13 @@ function changesBetween(before: unknown, after: unknown): Change[] {
   return changes;
 }
 
+/** `{ now: 123 }` off a clock move's payload, or null. */
+const instant = (value: unknown): number | null => {
+  if (typeof value !== 'object' || value === null) return null;
+  const now = (value as { now?: unknown }).now;
+  return typeof now === 'number' && Number.isFinite(now) ? now : null;
+};
+
 const show = (value: unknown): string => {
   if (value === undefined) return '—';
   if (value === null) return 'null';
@@ -87,8 +96,59 @@ export function AuditLogPage() {
   const [view, setView] = useState<TableState>({ query: '', sort: { columnId: 'created', direction: 'desc' }, filters: {} });
 
   const admin = session.me?.role === 'owner' || session.me?.role === 'admin';
+  // At 1024 the card is about 500px wide; the fixed columns yield so the
+  // sentence keeps the room, and the ids under the target truncate with a title.
+  const narrow = useMediaQuery('(max-width: 1100px)');
   const log = useQuery<ListEnvelope<AuditEntry>>('/v1/audit-log', { limit: PAGE }, { enabled: admin });
+  // The one target type the session cannot name. Same gate as the trail itself.
+  const keys = useQuery<ListEnvelope<ApiKey>>('/v1/api-keys', undefined, { enabled: admin });
   const rows = log.data?.data ?? [];
+  /**
+   * What each target is called. Keys are named off the key list; a teammate
+   * the roster no longer holds is named off the invitation the trail itself
+   * recorded, and marked as removed when the trail says so — the row for a
+   * removal is the one an auditor reads most carefully, and it used to read a
+   * bare `usr_…` linking to a roster search that found nobody.
+   */
+  const seats = useMemo(() => seatsFromTrail(rows), [rows]);
+  const names = useMemo(() => {
+    const map = new Map((keys.data?.data ?? []).map((key) => [key.id, key.name]));
+    for (const [id, seat] of seats) if (seat.email) map.set(id, seat.email);
+    return map;
+  }, [keys.data, seats]);
+  const notes = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const [id, seat] of seats) if (seat.removed) map.set(id, 'removed');
+    return map;
+  }, [seats]);
+  const now = session.now();
+
+  /**
+   * `?target=usr_…` is the address the team screen writes when a deep link
+   * names a seat the roster no longer holds: the trail answers with every entry
+   * about that id, through the same search box, and then drops the parameter.
+   */
+  const [wantedTarget, setWantedTarget] = useState<string | null>(null);
+  useConsumeQuery('target', setWantedTarget);
+  useEffect(() => {
+    if (!wantedTarget) return;
+    setView((current) => ({ ...current, query: wantedTarget }));
+    setWantedTarget(null);
+  }, [wantedTarget]);
+
+  /**
+   * The server's summary for a clock move quotes the new instant as a raw ISO
+   * string, which no other sentence on this surface does. The instant is also
+   * in `after.now`, so the sentence is rebuilt from that in the workspace's own
+   * format; every other summary is shown as written.
+   */
+  const summaryOf = useCallback((row: AuditEntry): string => {
+    if (row.action === 'time.advanced') {
+      const to = instant(row.after);
+      if (to !== null) return `Advanced the workspace clock to ${f.dateTime(to)}`;
+    }
+    return row.summary;
+  }, [f]);
   /**
    * `created` is the *workspace* clock, not wall time — which is the honest
    * thing to record, and the reason a trail can look out of order. Anything
@@ -96,7 +156,8 @@ export function AuditLogPage() {
    * timestamp a month ahead, and sorts above everything done since. Saying so
    * is better than a reader deciding the trail is unreliable.
    */
-  const fromTheFuture = rows.filter((row) => row.created > session.now() + 60_000).length;
+  const ahead = (row: AuditEntry) => row.created > now + 60_000;
+  const fromTheFuture = rows.filter(ahead).length;
 
   const bounded = range.start !== null || range.end !== null;
   // The picker hands back day starts; an entry written at 16:40 on the closing
@@ -106,17 +167,50 @@ export function AuditLogPage() {
       && (range.end === null || row.created < range.end + DAY))
     : rows), [rows, range, bounded]);
 
+  /**
+   * The summary is why the row exists, so it gets the flexible width. Actor and
+   * action ride under it as a second line, and their own columns start hidden
+   * — still there for the filter menu and the column toggle, but not taking
+   * 370px from the sentence, which at 1440 wide had been cut to "Workspace
+   * setti…" and at 1024 was off the edge of the grid's own scroll.
+   */
   const columns = useMemo<DataTableColumn<AuditEntry>[]>(() => [
     {
       id: 'created',
       header: 'When',
       pinned: true,
-      width: 190,
+      width: narrow ? 128 : 170,
       accessor: (row) => row.created,
+      // A change already made cannot be "in 24 hours". An entry the shifted
+      // clock stamped ahead of now reads as the absolute instant it carries,
+      // marked as such, rather than as a relative phrase about the future.
+      cell: (row) => (ahead(row)
+        ? (
+          <Tooltip content="Recorded while the time machine had the workspace clock ahead of real time — this is the instant the clock read.">
+            <span className="u-num" style={{ display: 'block' }}>
+              <span style={{ display: 'block' }}>{f.dateTime(row.created)}</span>
+              <span className="st-sub">clock was ahead</span>
+            </span>
+          </Tooltip>
+        )
+        : (
+          <Tooltip content={f.dateTime(row.created)}>
+            <span className="u-num">{f.when(row.created)}</span>
+          </Tooltip>
+        )),
+    },
+    {
+      id: 'summary',
+      header: 'What happened',
+      accessor: (row) => summaryOf(row),
       cell: (row) => (
-        <Tooltip content={f.dateTime(row.created)}>
-          <span className="u-num">{f.when(row.created)}</span>
-        </Tooltip>
+        <span style={{ display: 'block', minWidth: 0 }}>
+          <span className="u-truncate" style={{ display: 'block' }} data-testid="audit-summary">{summaryOf(row)}</span>
+          <span className="st-sub u-truncate" style={{ display: 'block' }}>
+            {`${actorName(row.actor_id, row.actor_type)} · `}
+            <Badge tone={actionTone(row.action)} size="sm">{row.action}</Badge>
+          </span>
+        </span>
       ),
     },
     {
@@ -125,6 +219,7 @@ export function AuditLogPage() {
       width: 190,
       filter: 'set',
       filterLabel: 'Actor',
+      defaultHidden: true,
       accessor: (row) => actorName(row.actor_id, row.actor_type),
       cell: (row) => (
         <span>
@@ -138,29 +233,19 @@ export function AuditLogPage() {
       header: 'Action',
       width: 180,
       filter: 'set',
+      defaultHidden: true,
       accessor: (row) => row.action,
       cell: (row) => <Badge tone={actionTone(row.action)} pill>{row.action}</Badge>,
     },
     {
-      id: 'summary',
-      header: 'What happened',
-      accessor: (row) => row.summary,
-      cell: (row) => <span className="u-truncate" style={{ display: 'block' }}>{row.summary}</span>,
-    },
-    {
       id: 'target',
       header: 'Target',
-      width: 220,
+      width: narrow ? 170 : 240,
       filter: 'text',
       filterLabel: 'Target id',
       accessor: (row) => row.target_id ?? '',
       cell: (row) => (row.target_id
-        ? (
-          <span>
-            <span className="st-mono" style={{ display: 'block' }}>{row.target_id}</span>
-            <span className="st-sub">{humanize(row.target_type ?? '')}</span>
-          </span>
-        )
+        ? <TargetLink type={row.target_type} id={row.target_id} names={names} notes={notes} compact />
         : <span className="st-sub">The workspace</span>),
     },
     {
@@ -171,7 +256,7 @@ export function AuditLogPage() {
       cell: (row) => (row.request_id ? <span className="st-mono">{row.request_id}</span> : <span className="st-sub">—</span>),
       defaultHidden: true,
     },
-  ], [f, actorName]);
+  ], [f, actorName, names, notes, summaryOf, now, narrow]);
 
   /**
    * The same three passes the grid runs, over the same accessors, so what is
@@ -198,7 +283,7 @@ export function AuditLogPage() {
       { header: 'actor_id', value: (row) => row.actor_id },
       { header: 'actor_type', value: (row) => row.actor_type },
       { header: 'action', value: (row) => row.action },
-      { header: 'summary', value: (row) => row.summary },
+      { header: 'summary', value: (row) => summaryOf(row) },
       { header: 'target_type', value: (row) => row.target_type },
       { header: 'target_id', value: (row) => row.target_id },
       { header: 'request_id', value: (row) => row.request_id },
@@ -344,7 +429,7 @@ export function AuditLogPage() {
         open={!!open}
         onClose={() => setOpen(null)}
         size="lg"
-        title={open?.summary ?? ''}
+        title={open ? summaryOf(open) : ''}
         description={open ? `${open.action} · ${f.dateTime(open.created)}` : undefined}
       >
         {open && (
@@ -355,11 +440,14 @@ export function AuditLogPage() {
                 <KeyValue label="Action" value={<Badge tone={actionTone(open.action)} pill>{open.action}</Badge>} />
                 <KeyValue
                   label="Target"
-                  value={open.target_id
-                    ? <span className="st-mono">{`${humanize(open.target_type ?? 'object')} · ${open.target_id}`}</span>
-                    : 'The workspace itself'}
+                  value={<TargetLink type={open.target_type} id={open.target_id} names={names} notes={notes} />}
                 />
-                <KeyValue label="When" value={f.dateTime(open.created)} />
+                <KeyValue
+                  label="When"
+                  value={ahead(open)
+                    ? `${f.dateTime(open.created)} — the workspace clock was ahead of real time when this was recorded`
+                    : f.dateTime(open.created)}
+                />
                 <KeyValue
                   label="Request id"
                   value={open.request_id

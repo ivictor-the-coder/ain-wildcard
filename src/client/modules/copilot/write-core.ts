@@ -260,3 +260,38 @@ export function dealNamedIn(
  */
 export const editHref = (dealId: string, group: string): string =>
   `/deals/${encodeURIComponent(dealId)}?edit=${encodeURIComponent(group || '1')}`;
+
+/**
+ * A stage's label on this board, for a stage id a write names.
+ *
+ * `negotiation` is a column of three pipelines here and it happens to read
+ * "Negotiation" on all of them, but `proposal` is "Proposal sent" on New
+ * business and `qualification` is "Expansion identified" on Expansion. The
+ * deal's own pipeline decides when it is known; when it is not, a label every
+ * pipeline agrees on is still the label, and a contested one is nobody's.
+ */
+export function stageLabelIn(vocab: Vocabulary, stage: string, pipeline?: string | null): string | null {
+  const stages = vocab.pipelines.flatMap((row) => row.stages).filter((row) => row.name === stage);
+  if (!stages.length) return null;
+  if (pipeline) return stages.find((row) => row.pipeline === pipeline)?.label ?? null;
+  const labels = new Set(stages.map((row) => row.label));
+  return labels.size === 1 ? stages[0].label : null;
+}
+
+/**
+ * The preview as a person reads it: every `Property → id` line with the id
+ * written as the board writes it.
+ *
+ * The card printed `Deal stage → negotiation` — the database value — above a
+ * consequences banner that named the same stage "Negotiation" from the
+ * vocabulary it already held. Only stage lines are looked up; anything else
+ * after the arrow is the engine's own wording and stays.
+ */
+export function spokenPreview(preview: readonly string[], stageLabel: (name: string) => string | null): string[] {
+  return preview.map((line) => {
+    const match = /^(.+?)\s*→\s*([a-z][a-z0-9_]*)\s*$/.exec(line.trim());
+    if (!match || !/stage/i.test(match[1])) return line;
+    const label = stageLabel(match[2]);
+    return label ? `${match[1].trim()} → ${label}` : line;
+  });
+}

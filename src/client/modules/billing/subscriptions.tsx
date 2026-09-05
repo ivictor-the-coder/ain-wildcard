@@ -11,7 +11,7 @@
  * by the seconds the operator spent reading it.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { api, useQuery, type ApiClientError, type ListEnvelope } from '../../kernel/api';
+import { api, buildUrl, invalidate, primeCache, useQuery, type ApiClientError, type ListEnvelope } from '../../kernel/api';
 import { useNavigate, useParams, useSearchParam } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
 import { useCurrentCrumb } from '../../kernel/shell';
@@ -25,18 +25,23 @@ import { AlertTriangleIcon, ArrowDownIcon, ArrowRightIcon, ArrowUpIcon, ArrowUpR
 import {
   Amount, BookFooter, DialogFields, EmptyList, ExportCsvButton, FieldRow, FixedQuantity, InlineEdit, ListFailure, ListFooter,
   LoadFailedEmpty, Loading, MoneyField, MoneyRangeFilter, MoneyTotals, PreviewFailure, QuantityField, RecordLink,
-  RecordMissing, SectionError, StatusPill, TableSearch, breakdownLabel, customerHref, decodeRange, encodeRange, idem,
-  invoiceHref, lineWhy, matchesRange, moneyRank, prorationCopy, rangeActive, statusLabel, subscriptionHref,
+  RecordMissing, SectionError, StatusPill, TableSearch, breakdownLabel, copyFormat, customerHref, decodeRange, encodeRange, idem,
+  invoiceHref, keepRowMenuKeys, lineWhy, matchesRange, moneyRank, prorationCopy, rangeActive, readUntilSettled, statusLabel,
+  subscriptionHref,
   csvAmount, csvDay, totalsByCurrency, useAction, useBillingFormat, useBookList, useBookTotal, useCurrencyChoices, useDebounced,
   useDialogForm,
   useOpenOnQuery, usePricedPreview, useRecord, useRecordTab, useTableView, visibleRows,
 } from './common';
+import {
+  balanceDrawn, billedTotal, collectionSettled, describeAppliedChange, describeCreatedSubscription, firstInvoiceSettled,
+} from './copy';
 import type { CsvColumn } from './common';
 import type {
   BilledPeriod, CatalogEstimate, ChangePreview, Customer, CustomUnitAmount, EstimateLine, Invoice,
-  InvoiceLine, PauseBehavior, Price, ProrationLine, Subscription, SubscriptionItem, SubscriptionSchedule,
+  InvoiceLine, InvoicePayments, PauseBehavior, Price, ProrationLine, Subscription, SubscriptionItem,
 } from './types';
 import { ScheduleBanner, ScheduleChangeDialog, ScheduleTab } from './schedules';
+import { BillNowDialog } from './invoices';
 
 /**
  * The recurring book as a file: what each agreement bills, on what cadence, and
@@ -143,6 +148,10 @@ export function ProrationPreview({ preview, pending, onBillNow }: {
   // of that, `next_period` is the period the subscription is already in.
   const rebased = preview.next_period.start !== preview.current_period.start
     || preview.next_period.end !== preview.current_period.end;
+  // An immediate bill draws the credit the account holds before it asks a card
+  // for anything. The invoice raised will print "Account balance applied", so
+  // the preview says the same thing, in the same place, before it is raised.
+  const drawn = balanceDrawn(preview);
 
   return (
     <div className="bl-preview" style={{ opacity: pending ? 0.55 : 1 }} aria-busy={pending}>
@@ -208,11 +217,29 @@ export function ProrationPreview({ preview, pending, onBillNow }: {
               : `${money(preview.customer_balance)} carried forward`}
           </span>
         </div>
+        {drawn && (
+          <>
+            <div className="bl-total" data-testid="bl-balance-drawn">
+              <span className="bl-total__label">Paid from the balance now</span>
+              <span className="bl-total__value">{`−${money(drawn.drawn)}`}</span>
+            </div>
+            <div className="bl-total">
+              <span className="bl-total__label">Balance after this bill</span>
+              <span className="bl-total__value">
+                {drawn.after < 0 ? `${money(-drawn.after)} of credit` : drawn.after === 0 ? 'Used up' : `${money(drawn.after)} carried forward`}
+              </span>
+            </div>
+          </>
+        )}
       </div>
 
       <div className="bl-duenow">
         <span className="bl-duenow__label">
-          {preview.amount_due_now > 0 ? 'Collected now' : 'Nothing is collected now'}
+          {preview.amount_due_now > 0
+            ? 'Collected now'
+            : drawn
+              ? 'Nothing is collected from the method on file — the balance covers it'
+              : 'Nothing is collected now'}
         </span>
         <span className="bl-duenow__value">{money(preview.amount_due_now)}</span>
       </div>
@@ -442,6 +469,8 @@ function itemsPayload(draft: DraftItem[]): { id?: string; price?: string; quanti
 export function ChangeDialog({ sub, open, onClose }: { sub: Subscription; open: boolean; onClose: () => void }) {
   const f = useBillingFormat();
   const action = useAction();
+  const toast = useToast();
+  const [settling, setSettling] = useState(false);
   const { prices } = useActivePrices();
   const [draft, setDraft] = useState<DraftItem[]>(() => toDraft(sub));
   const [behavior, setBehavior] = useState(sub.proration_behavior);
@@ -487,6 +516,14 @@ export function ChangeDialog({ sub, open, onClose }: { sub: Subscription; open: 
     ? draft.find((item) => previewError.body.message.includes(item.price))?.key ?? null
     : null;
 
+  /**
+   * Apply, then say what happened — from the invoice the server raised, not
+   * from the behaviour that was asked for. "The proration is waiting on the
+   * next invoice" was printed over a bill that had been raised and settled
+   * from the balance in the same request. An immediate bill on a card is
+   * presented by the collector a tick later, so that one is read again until
+   * the issuer has answered before the sentence is chosen.
+   */
   const apply = async () => {
     if (!preview) return;
     const result = await action.run(
@@ -496,19 +533,38 @@ export function ChangeDialog({ sub, open, onClose }: { sub: Subscription; open: 
         // identical to the quote rather than merely close to it.
         proration_date: preview.proration_date,
       }),
-      {
-        success: 'Subscription changed',
-        description: preview.amount_due_now > 0
-          ? `${f.money(preview.amount_due_now, { currency: preview.currency })} was collected now.`
-          : 'The proration is waiting on the next invoice.',
-        failure: 'The change was refused',
-      },
-      ['/v1/subscriptions', '/v1/invoices', '/v1/customers', '/v1/revenue'],
+      { success: 'Subscription changed', silent: true, failure: 'The change was refused' },
+      ['/v1/subscriptions', '/v1/invoices', '/v1/customers', '/v1/revenue', '/v1/subscription-schedules'],
     );
-    if (result) onClose();
+    if (!result) return;
+    // The subscription carries only a brief of its newest bill. The full
+    // record says what was raised and what paid it — and only a bill raised by
+    // this change, after the preview was priced, counts as its invoice.
+    let raised: Invoice | null = null;
+    if (behavior === 'always_invoice' && result.latest_invoice) {
+      const id = result.latest_invoice.id;
+      setSettling(true);
+      try {
+        const first = await api.get<Invoice>(`/v1/invoices/${id}`);
+        const ours = first.billing_reason === 'subscription_update' && first.created >= preview.proration_date;
+        raised = ours
+          ? (collectionSettled(first)
+            ? first
+            : await readUntilSettled(() => api.get<Invoice>(`/v1/invoices/${id}`), collectionSettled, { tries: 12, gapMs: 750 }))
+          : null;
+      } catch {
+        // The change landed; the sentence says no invoice could be confirmed.
+      } finally {
+        setSettling(false);
+      }
+      invalidate('/v1/invoices', '/v1/subscriptions', '/v1/customers');
+    }
+    const copy = describeAppliedChange(preview, behavior, raised, copyFormat(f));
+    toast[copy.tone](copy.title, copy.description, copy.tone === 'warning' ? { duration: 0 } : undefined);
+    onClose();
   };
 
-  const form = useDialogForm(open, dirty && !!preview && !pending && !action.busy, () => { void apply(); });
+  const form = useDialogForm(open, dirty && !!preview && !pending && !action.busy && !settling, () => { void apply(); });
 
   return (
     <Modal
@@ -522,13 +578,16 @@ export function ChangeDialog({ sub, open, onClose }: { sub: Subscription; open: 
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
           <Button
             variant="primary"
-            loading={action.busy}
+            loading={action.busy || settling}
+            loadingLabel={settling ? 'Waiting for the issuer to answer…' : undefined}
             disabled={!dirty || !preview || pending}
             onClick={() => { void apply(); }}
           >
-            {preview && preview.amount_due_now > 0
-              ? `Apply and collect ${f.money(preview.amount_due_now, { currency: preview.currency })}`
-              : 'Apply change'}
+            {settling
+              ? 'Waiting for the issuer…'
+              : preview && preview.amount_due_now > 0
+                ? `Apply and collect ${f.money(preview.amount_due_now, { currency: preview.currency })}`
+                : 'Apply change'}
           </Button>
         </>
       }
@@ -693,7 +752,9 @@ function CancelDialog({ sub, open, onClose }: { sub: Subscription; open: boolean
         description: atPeriodEnd ? `It runs until ${f.day(sub.current_period_end)}.` : 'It stopped immediately.',
         failure: 'The cancellation was refused',
       },
-      ['/v1/subscriptions', '/v1/customers', '/v1/invoices', '/v1/revenue'],
+      // A schedule managing this subscription is canceled with it; the banner
+      // that reads the schedule has to learn that too.
+      ['/v1/subscriptions', '/v1/customers', '/v1/invoices', '/v1/revenue', '/v1/subscription-schedules'],
     );
     if (result) onClose();
   };
@@ -752,6 +813,263 @@ function CancelDialog({ sub, open, onClose }: { sub: Subscription; open: boolean
             onChange={(e) => setComment(e.target.value)}
             placeholder="What the customer said, for whoever reads this in a year."
             maxLength={1000}
+          />
+        </Field>
+      </Stack>
+      </DialogFields>
+    </Modal>
+  );
+}
+
+/**
+ * The subscriptions a bulk cancellation would actually change.
+ *
+ * One already booked to end, or already ended, is left exactly as it is — the
+ * write would be refused or redundant, and the count the button quotes has to
+ * be the count the book moves by.
+ */
+export function cancellable(subs: Subscription[]): { targets: Subscription[]; skipped: Subscription[] } {
+  const targets: Subscription[] = [];
+  const skipped: Subscription[] = [];
+  for (const sub of subs) {
+    const ended = sub.status === 'canceled' || sub.status === 'incomplete_expired';
+    if (ended || sub.cancel_at_period_end || sub.cancel_at !== null) skipped.push(sub);
+    else targets.push(sub);
+  }
+  return { targets, skipped };
+}
+
+/**
+ * Cancelling several subscriptions at once, confirmed with the facts.
+ *
+ * The bulk bar used to fire the write on the click: tick two rows, press the
+ * button, and two accounts were set to end with no dialog, no reason and no
+ * note — while the record page asked all three for one. This is the record
+ * page's dialog for many: every account named, the date each stops, the MRR
+ * that leaves the book, and the same Reason and Note the single cancellation
+ * records. When is fixed to the period end, because that is what the button
+ * says; cancelling now, with the remainder credited, is a decision per account
+ * and stays on the record page.
+ */
+function BulkCancelDialog({ subs, open, onClose, onDone }: {
+  subs: Subscription[]; open: boolean; onClose: () => void; onDone: () => void;
+}) {
+  const f = useBillingFormat();
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const [reason, setReason] = useState('cancellation_requested');
+  const [comment, setComment] = useState('');
+  const { targets, skipped } = useMemo(() => cancellable(subs), [subs]);
+  const leaving = useMemo(() => totalsByCurrency(targets, (row) => row.mrr, (row) => row.currency), [targets]);
+
+  const submit = async () => {
+    setBusy(true);
+    let ok = 0;
+    const refused: string[] = [];
+    for (const sub of targets) {
+      try {
+        await api.post(`/v1/subscriptions/${sub.id}/cancel`, {
+          at_period_end: true,
+          cancellation_reason: reason,
+          ...(comment.trim() ? { comment: comment.trim() } : {}),
+        }, { idempotencyKey: idem() });
+        ok++;
+      } catch {
+        refused.push(sub.customer_detail?.name ?? sub.customer);
+      }
+    }
+    setBusy(false);
+    invalidate('/v1/subscriptions', '/v1/customers', '/v1/revenue');
+    if (refused.length === 0) {
+      toast.success(
+        `${f.plural(ok, 'subscription')} set to cancel at the period end`,
+        'Each runs until its paid period ends, and any of them can be withdrawn from its record until then.',
+      );
+    } else {
+      toast.warning(
+        `Scheduled ${ok} of ${targets.length}`,
+        `Refused for ${f.list(refused)} — open the account to see why.`,
+        { duration: 0 },
+      );
+    }
+    onDone();
+  };
+
+  const form = useDialogForm(open, targets.length > 0 && !busy, () => { void submit(); });
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="lg"
+      title={`Cancel ${f.plural(subs.length, 'subscription')} at the period end`}
+      icon={<AlertTriangleIcon size={18} />}
+      iconTone="danger"
+      description="Each one keeps billing until its paid period ends, then stops. Nothing is refunded and nothing is charged now."
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose} disabled={busy}>Keep them running</Button>
+          <Button variant="danger" loading={busy} disabled={targets.length === 0} onClick={() => { void submit(); }}>
+            {`Cancel ${f.number(targets.length)} at period end`}
+          </Button>
+        </>
+      }
+    >
+      <DialogFields form={form}>
+      <Stack gap={5}>
+        <div className="bl-tablewrap">
+          <table className="bl-lines">
+            <thead>
+              <tr><th>Account</th><th>Plan</th><th>Stops</th><th className="bl-num">MRR leaving</th></tr>
+            </thead>
+            <tbody>
+              {targets.map((sub) => (
+                <tr key={sub.id}>
+                  <td>{sub.customer_detail?.name ?? sub.customer}</td>
+                  <td>{sub.items[0]?.description ?? '—'}{sub.items.length > 1 ? ` + ${sub.items.length - 1} more` : ''}</td>
+                  <td className="bl-nowrap">{f.day(sub.current_period_end, { withYear: true })}</td>
+                  <td className="bl-num">{f.money(sub.mrr, { currency: sub.currency })}</td>
+                </tr>
+              ))}
+              {skipped.map((sub) => (
+                <tr key={sub.id} className="bl-lines__row--skipped">
+                  <td>{sub.customer_detail?.name ?? sub.customer}</td>
+                  <td>{sub.items[0]?.description ?? '—'}</td>
+                  <td colSpan={2} className="bl-sub">
+                    {sub.status === 'canceled' || sub.status === 'incomplete_expired'
+                      ? 'Already ended — left as it is'
+                      : `Already set to end ${f.day(sub.cancel_at ?? sub.current_period_end)} — left as it is`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {targets.length > 0 && (
+          <div className="bl-totals">
+            <div className="bl-total bl-total--grand">
+              <span className="bl-total__label">Leaves the book</span>
+              <span className="bl-total__value"><MoneyTotals totals={leaving} /></span>
+            </div>
+          </div>
+        )}
+        {targets.length === 0 && (
+          <Banner tone="info" compact>Everything selected is already ending or has ended. There is nothing to cancel.</Banner>
+        )}
+        <Field label="Reason">
+          <Select
+            value={reason}
+            onChange={setReason}
+            options={[
+              'cancellation_requested', 'too_expensive', 'missing_features', 'lost_to_competitor',
+              'downgraded', 'switched_to_annual', 'went_out_of_business', 'payment_failed', 'other',
+            ].map((value) => ({ value, label: humanize(value) }))}
+          />
+        </Field>
+        <Field label="Note" optional hint="Recorded on every subscription in the list.">
+          <Textarea
+            value={comment}
+            onChange={(e) => setComment(e.target.value)}
+            placeholder="What the customer said, for whoever reads this in a year."
+            maxLength={1000}
+          />
+        </Field>
+      </Stack>
+      </DialogFields>
+    </Modal>
+  );
+}
+
+/**
+ * Pausing several subscriptions at once, with the same choice the single pause
+ * asks for. The bulk bar used to hold every selected account's invoices as
+ * drafts on the click — a decision about money, made with no dialog — while
+ * the record page asked what should happen to those invoices first.
+ */
+function BulkPauseDialog({ subs, open, onClose, onDone }: {
+  subs: Subscription[]; open: boolean; onClose: () => void; onDone: () => void;
+}) {
+  const f = useBillingFormat();
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const [behavior, setBehavior] = useState<PauseBehavior>('keep_as_draft');
+  const targets = useMemo(() => subs.filter((sub) => sub.status !== 'paused' && sub.status !== 'canceled' && sub.status !== 'incomplete_expired'), [subs]);
+  const skipped = useMemo(() => subs.filter((sub) => !targets.includes(sub)), [subs, targets]);
+
+  const submit = async () => {
+    setBusy(true);
+    let ok = 0;
+    const refused: string[] = [];
+    for (const sub of targets) {
+      try {
+        await api.post(`/v1/subscriptions/${sub.id}/pause`, { behavior }, { idempotencyKey: idem() });
+        ok++;
+      } catch {
+        refused.push(sub.customer_detail?.name ?? sub.customer);
+      }
+    }
+    setBusy(false);
+    invalidate('/v1/subscriptions', '/v1/invoices', '/v1/customers', '/v1/revenue');
+    if (refused.length === 0) {
+      toast.success(`Paused collection on ${f.plural(ok, 'subscription')}`, `The cycles keep advancing; the invoices they raise are ${PAUSE_BEHAVIOR_COPY[behavior]}.`);
+    } else {
+      toast.warning(`Paused ${ok} of ${targets.length}`, `Refused for ${f.list(refused)} — open the account to see why.`, { duration: 0 });
+    }
+    onDone();
+  };
+
+  const form = useDialogForm(open, targets.length > 0 && !busy, () => { void submit(); });
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={`Pause collection on ${f.plural(subs.length, 'subscription')}`}
+      description="Each billing cycle keeps running. What happens to the invoices it raises while paused is up to you, and applies to every account below."
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
+          <Button variant="primary" loading={busy} disabled={targets.length === 0} onClick={() => { void submit(); }}>
+            {`Pause ${f.number(targets.length)}`}
+          </Button>
+        </>
+      }
+    >
+      <DialogFields form={form}>
+      <Stack gap={5}>
+        <div className="bl-tablewrap">
+          <table className="bl-lines">
+            <thead><tr><th>Account</th><th>Plan</th><th>Next invoice</th></tr></thead>
+            <tbody>
+              {targets.map((sub) => (
+                <tr key={sub.id}>
+                  <td>{sub.customer_detail?.name ?? sub.customer}</td>
+                  <td>{sub.items[0]?.description ?? '—'}</td>
+                  <td className="bl-nowrap">{f.day(sub.current_period_end, { withYear: true })}</td>
+                </tr>
+              ))}
+              {skipped.map((sub) => (
+                <tr key={sub.id} className="bl-lines__row--skipped">
+                  <td>{sub.customer_detail?.name ?? sub.customer}</td>
+                  <td>{sub.items[0]?.description ?? '—'}</td>
+                  <td className="bl-sub">{sub.status === 'paused' ? 'Already paused — left as it is' : 'Ended — nothing to pause'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {targets.length === 0 && (
+          <Banner tone="info" compact>Everything selected is already paused or has ended. There is nothing to pause.</Banner>
+        )}
+        <Field label="What happens to invoices raised while paused">
+          <Select
+            value={behavior}
+            onChange={(value) => setBehavior(value as PauseBehavior)}
+            options={[
+              { value: 'keep_as_draft', label: 'Hold them as drafts — finalise them later' },
+              { value: 'mark_uncollectible', label: 'Write them off as they are raised' },
+              { value: 'void', label: 'Void them as they are raised' },
+            ]}
           />
         </Field>
       </Stack>
@@ -1011,6 +1329,8 @@ export function SubscriptionCreateDialog({ open, onClose, customer }: {
   const f = useBillingFormat();
   const navigate = useNavigate();
   const action = useAction();
+  const toast = useToast();
+  const [settling, setSettling] = useState(false);
   const { prices, loading: pricesLoading } = useActivePrices();
   const [customerId, setCustomerId] = useState(customer ?? '');
   const [rows, setRows] = useState<{ key: string; price: string; quantity: number; custom: number | null }[]>([]);
@@ -1149,6 +1469,17 @@ export function SubscriptionCreateDialog({ open, onClose, customer }: {
     : 0;
   const cadenceWord = cadences[0] ?? '';
 
+  /**
+   * Create, then wait for the money before saying anything about it.
+   *
+   * `POST /v1/subscriptions` answers `active` with the first invoice `open`;
+   * the collector presents the card a tick later, and the record becomes
+   * `past_due` or the invoice `paid`. The toast used to be written from the
+   * request — "The first period is open and billed" over a declined card — and
+   * the screen it landed on kept the pre-collection answer until a reload. The
+   * record is read again until the issuer has answered, that reading is what
+   * the detail page opens on, and the sentence is worded from it.
+   */
   const submit = async () => {
     const created = await action.run(
       api.post<Subscription>('/v1/subscriptions', {
@@ -1158,19 +1489,45 @@ export function SubscriptionCreateDialog({ open, onClose, customer }: {
         ...(trialDays ? { trial_period_days: trialDays } : {}),
         ...(anchorDay ? { billing_cycle_anchor_day: anchorDay } : {}),
       }, { idempotencyKey: idem() }),
-      {
-        success: 'Subscription created',
-        description: trialDays
-          ? `The trial runs ${f.plural(trialDays, 'day')}; nothing has been billed yet.`
-          : `The first period is open and billed. ${f.money(recurring?.monthly_equivalent ?? 0, { currency })} a month of recurring revenue.`,
-        failure: 'The subscription was refused',
-      },
+      { success: 'Subscription created', silent: true, failure: 'The subscription was refused' },
       ['/v1/subscriptions', '/v1/customers', '/v1/invoices', '/v1/revenue'],
     );
-    if (created) { onClose(); navigate(subscriptionHref(created.id)); }
+    if (!created) return;
+    setSettling(true);
+    const detail = { expand: 'customer' };
+    let settled: Subscription = created;
+    let bill: Invoice | null = null;
+    let payments: InvoicePayments | null = null;
+    try {
+      // The collector runs on the next tick of the job runner — a second on a
+      // quiet server, longer under load — so the patience here is generous.
+      settled = await readUntilSettled(
+        () => api.get<Subscription>(`/v1/subscriptions/${created.id}`, detail),
+        firstInvoiceSettled,
+        { tries: 12, gapMs: 750 },
+      );
+      if (settled.latest_invoice) {
+        bill = await api.get<Invoice>(`/v1/invoices/${settled.latest_invoice.id}`).catch(() => null);
+        if (settled.latest_invoice.status === 'open') {
+          payments = await api.get<InvoicePayments>(`/v1/invoices/${settled.latest_invoice.id}/payments`).catch(() => null);
+        }
+      }
+    } catch {
+      // The create landed. What the POST returned is the best available reading.
+    } finally {
+      setSettling(false);
+    }
+    // Everything that counts this subscription has moved since the create
+    // returned, and the record the next screen opens on is the settled one.
+    invalidate('/v1/subscriptions', '/v1/customers', '/v1/invoices', '/v1/revenue');
+    primeCache(buildUrl(`/v1/subscriptions/${created.id}`, detail), settled);
+    const copy = describeCreatedSubscription(settled, copyFormat(f), bill, payments);
+    toast[copy.tone](copy.title, copy.description, copy.tone === 'success' ? undefined : { duration: 0 });
+    onClose();
+    navigate(subscriptionHref(created.id));
   };
 
-  const form = useDialogForm(open, ready && !action.busy, () => { void submit(); });
+  const form = useDialogForm(open, ready && !action.busy && !settling, () => { void submit(); });
 
   return (
     <Modal
@@ -1185,12 +1542,20 @@ export function SubscriptionCreateDialog({ open, onClose, customer }: {
           {/* The label carries a price, so it must never carry a stale one:
               while the basket is being re-priced it says so instead of quoting
               the figure the last quantity produced. */}
-          <Button variant="primary" loading={action.busy} disabled={!ready} onClick={() => { void submit(); }}>
-            {estimate.loading && basket.length > 0
-              ? 'Pricing…'
-              : ready && recurring
-                ? `Create · ${f.money(perPeriod, { currency })}${cadenceWord ? ` per ${cadenceWord}` : ''}`
-                : 'Create subscription'}
+          <Button
+            variant="primary"
+            loading={action.busy || settling}
+            loadingLabel={settling ? 'Waiting for the first charge to be answered…' : undefined}
+            disabled={!ready}
+            onClick={() => { void submit(); }}
+          >
+            {settling
+              ? 'Waiting for the first charge…'
+              : estimate.loading && basket.length > 0
+                ? 'Pricing…'
+                : ready && recurring
+                  ? `Create · ${f.money(perPeriod, { currency })}${cadenceWord ? ` per ${cadenceWord}` : ''}`
+                  : 'Create subscription'}
           </Button>
         </>
       }
@@ -1505,6 +1870,11 @@ export function SubscriptionsPage() {
   const [view, setView] = useTableView({ columnId: 'mrr', direction: 'desc' });
   const [selected, setSelected] = useState<string[]>([]);
   const [creating, setCreating] = useState(false);
+  // A lifecycle write from a row goes through the record page's own dialog —
+  // the one that asks when and why — rather than firing on the click.
+  const [lifecycle, setLifecycle] = useState<{ sub: Subscription; kind: 'cancel' | 'pause' | 'resume' } | null>(null);
+  const [bulkCancel, setBulkCancel] = useState<Subscription[] | null>(null);
+  const [bulkPause, setBulkPause] = useState<Subscription[] | null>(null);
   useOpenOnQuery('new', useCallback(() => setCreating(true), []));
 
   const [rangeParam, setRangeParam] = useSearchParam('amount', '');
@@ -1662,7 +2032,7 @@ export function SubscriptionsPage() {
       }
     >
       {book.error && <ListFailure error={book.error} path="GET /v1/subscriptions" onRetry={book.retry} />}
-      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'}>
+      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'} onKeyDownCapture={keepRowMenuKeys}>
       <DataTable
         rows={rows}
         columns={columns}
@@ -1679,7 +2049,7 @@ export function SubscriptionsPage() {
         selected={selected}
         onSelectionChange={setSelected}
         onRowClick={(row) => navigate(subscriptionHref(row.id))}
-        rowActions={(row) => rowMenu(row, navigate, action)}
+        rowActions={(row) => rowMenu(row, navigate, action, (kind) => setLifecycle({ sub: row, kind }))}
         maxHeight={640}
         stickyFooter
         toolbar={
@@ -1723,14 +2093,14 @@ export function SubscriptionsPage() {
         }
         bulkActions={(ids) => (
           <Inline gap={3}>
-            <Button size="sm" variant="secondary" onClick={() => { void bulk('Paused', (id) => `/v1/subscriptions/${id}/pause`, { behavior: 'keep_as_draft' }); }}>
-              Pause {ids.length}
+            <Button size="sm" variant="secondary" onClick={() => setBulkPause(rows.filter((row) => ids.includes(row.id)))}>
+              Pause {ids.length}…
             </Button>
             <Button size="sm" variant="secondary" onClick={() => { void bulk('Resumed', (id) => `/v1/subscriptions/${id}/resume`, { billing_cycle_anchor: 'unchanged' }); }}>
               Resume
             </Button>
-            <Button size="sm" variant="danger-ghost" onClick={() => { void bulk('Scheduled cancellation on', (id) => `/v1/subscriptions/${id}/cancel`, { at_period_end: true, cancellation_reason: 'cancellation_requested' }); }}>
-              Cancel at period end
+            <Button size="sm" variant="danger-ghost" onClick={() => setBulkCancel(rows.filter((row) => ids.includes(row.id)))}>
+              Cancel {ids.length} at period end…
             </Button>
           </Inline>
         )}
@@ -1751,11 +2121,43 @@ export function SubscriptionsPage() {
         nothing here is converted and no figure is added across two books.
       </p>
       <SubscriptionCreateDialog open={creating} onClose={() => setCreating(false)} />
+      {/* Mounted per row rather than kept open: each dialog seeds its fields
+          from the subscription it is handed, so a fresh mount is what stops the
+          reason typed for one account being offered for the next. */}
+      {lifecycle?.kind === 'cancel' && <CancelDialog sub={lifecycle.sub} open onClose={() => setLifecycle(null)} />}
+      {lifecycle?.kind === 'pause' && <PauseDialog sub={lifecycle.sub} open onClose={() => setLifecycle(null)} />}
+      {lifecycle?.kind === 'resume' && <ResumeDialog sub={lifecycle.sub} open onClose={() => setLifecycle(null)} />}
+      {bulkCancel && (
+        <BulkCancelDialog
+          subs={bulkCancel}
+          open
+          onClose={() => setBulkCancel(null)}
+          onDone={() => { setBulkCancel(null); setSelected([]); book.retry(); }}
+        />
+      )}
+      {bulkPause && (
+        <BulkPauseDialog
+          subs={bulkPause}
+          open
+          onClose={() => setBulkPause(null)}
+          onDone={() => { setBulkPause(null); setSelected([]); book.retry(); }}
+        />
+      )}
     </Page>
   );
 }
 
-function rowMenu(row: Subscription, navigate: (to: string) => void, action: ReturnType<typeof useAction>): MenuSection[] {
+/**
+ * The row's menu. Opening and un-cancelling run on the click — one is a
+ * navigation and the other undoes a booking. Everything that changes what an
+ * account is billed opens the dialog the record page uses for the same step.
+ */
+function rowMenu(
+  row: Subscription,
+  navigate: (to: string) => void,
+  action: ReturnType<typeof useAction>,
+  onLifecycle: (kind: 'cancel' | 'pause' | 'resume') => void,
+): MenuSection[] {
   return [{
     id: 'sub',
     items: [
@@ -1763,32 +2165,32 @@ function rowMenu(row: Subscription, navigate: (to: string) => void, action: Retu
       { id: 'customer', label: 'Open the account', icon: <Icons.wallet size={14} />, onSelect: () => navigate(customerHref(row.customer)) },
       {
         id: 'pause',
-        label: row.status === 'paused' ? 'Resume collection' : 'Pause collection',
+        label: row.status === 'paused' ? 'Resume collection…' : 'Pause collection…',
         icon: row.status === 'paused' ? <Icons.play size={14} /> : <Icons.pause size={14} />,
         disabled: row.status === 'canceled',
-        onSelect: () => {
-          void action.run(
-            api.post(`/v1/subscriptions/${row.id}/${row.status === 'paused' ? 'resume' : 'pause'}`,
-              row.status === 'paused' ? { billing_cycle_anchor: 'unchanged' } : { behavior: 'keep_as_draft' }),
-            { success: row.status === 'paused' ? 'Resumed' : 'Paused', failure: 'That was refused' },
-            ['/v1/subscriptions'],
-          );
-        },
+        onSelect: () => onLifecycle(row.status === 'paused' ? 'resume' : 'pause'),
       },
-      {
-        id: 'cancel',
-        label: 'Cancel at period end',
-        icon: <XCircleIcon size={14} />,
-        danger: true,
-        disabled: row.status === 'canceled' || row.cancel_at_period_end,
-        onSelect: () => {
-          void action.run(
-            api.post(`/v1/subscriptions/${row.id}/cancel`, { at_period_end: true, cancellation_reason: 'cancellation_requested' }),
-            { success: 'Set to cancel at the period end', failure: 'The cancellation was refused' },
-            ['/v1/subscriptions', '/v1/revenue'],
-          );
+      row.cancel_at_period_end && row.status !== 'canceled'
+        ? {
+          id: 'uncancel',
+          label: 'Don’t cancel — keep it running',
+          icon: <Icons.refresh size={14} />,
+          onSelect: () => {
+            void action.run(
+              api.patch(`/v1/subscriptions/${row.id}`, { cancel_at_period_end: false }),
+              { success: 'Cancellation withdrawn', description: 'It renews as it did before.', failure: 'That was refused' },
+              ['/v1/subscriptions', '/v1/revenue'],
+            );
+          },
+        }
+        : {
+          id: 'cancel',
+          label: 'Cancel at period end…',
+          icon: <XCircleIcon size={14} />,
+          danger: true,
+          disabled: row.status === 'canceled',
+          onSelect: () => onLifecycle('cancel'),
         },
-      },
     ],
   }];
 }
@@ -1803,10 +2205,16 @@ export function SubscriptionDetailPage() {
   const navigate = useNavigate();
   const action = useAction();
   const [rawTab, setTab] = useRecordTab(SUBSCRIPTION_TABS, 'overview');
-  const [dialog, setDialog] = useState<null | 'change' | 'cancel' | 'pause' | 'resume' | 'credit' | 'schedule'>(null);
+  const [dialog, setDialog] = useState<null | 'change' | 'cancel' | 'pause' | 'resume' | 'credit' | 'schedule' | 'bill'>(null);
 
   const { data: sub, error, loading, refetch } = useRecord<Subscription>(`/v1/subscriptions/${id}`, { expand: 'customer' });
   useCurrentCrumb(sub ? sub.customer_detail?.name ?? sub.customer : null);
+  // A subscription whose first bill the collector has not yet presented is
+  // still changing. Reading it again every second or so, for the two minutes
+  // after it was created, is what stops the screen saying "Active" over a card
+  // that was declined a moment after this page opened.
+  const unsettled = !!sub && !firstInvoiceSettled(sub) && f.now() - sub.created < 120_000;
+  useQuery<Subscription>(unsettled ? `/v1/subscriptions/${id}` : null, { expand: 'customer' }, { refreshMs: 1500 });
 
   if (loading) return <Page title="Subscription"><Loading label="Loading this subscription…" /></Page>;
   if (error || !sub) {
@@ -1842,15 +2250,34 @@ export function SubscriptionDetailPage() {
   ).then((result) => { if (!result) throw new Error('refused'); return result; });
   // A link to ?tab=schedule on a subscription that never had one lands somewhere.
   const tab = rawTab === 'schedule' && !sub.schedule ? 'overview' : rawTab;
+  // Ended for good. Nothing about it can be changed, and nothing on it bills again.
+  const ended = sub.status === 'canceled' || sub.status === 'incomplete_expired';
+  // Booked to end, but still running — the one state that can be reversed.
+  const scheduledToEnd = !ended && (sub.cancel_at_period_end || sub.cancel_at !== null);
+  const endsOn = sub.cancel_at ?? sub.current_period_end;
+  const keepRunning = () => {
+    void action.run(
+      api.patch<Subscription>(`/v1/subscriptions/${sub.id}`, sub.cancel_at !== null ? { cancel_at: null } : { cancel_at_period_end: false }),
+      {
+        success: 'Cancellation withdrawn',
+        description: `${customerName} keeps running and renews on ${f.day(sub.current_period_end)} as before.`,
+        failure: 'That was refused',
+      },
+      ['/v1/subscriptions', '/v1/customers', '/v1/revenue'],
+    );
+  };
 
   const actions: MenuSection[] = [
     {
       id: 'lifecycle',
       label: 'Lifecycle',
       items: [
-        { id: 'pause', label: 'Pause collection', icon: <Icons.pause size={14} />, disabled: sub.status === 'paused' || sub.status === 'canceled', onSelect: () => setDialog('pause') },
+        { id: 'pause', label: 'Pause collection', icon: <Icons.pause size={14} />, disabled: sub.status === 'paused' || ended, onSelect: () => setDialog('pause') },
         { id: 'resume', label: 'Resume', icon: <Icons.play size={14} />, disabled: sub.status !== 'paused', onSelect: () => setDialog('resume') },
-        { id: 'cancel', label: 'Cancel…', icon: <XCircleIcon size={14} />, danger: true, disabled: sub.status === 'canceled', onSelect: () => setDialog('cancel') },
+        ...(scheduledToEnd
+          ? [{ id: 'uncancel', label: 'Don’t cancel — keep it running', icon: <Icons.refresh size={14} />, onSelect: keepRunning }]
+          : []),
+        { id: 'cancel', label: scheduledToEnd ? 'Cancel now instead…' : 'Cancel…', icon: <XCircleIcon size={14} />, danger: true, disabled: ended, onSelect: () => setDialog('cancel') },
       ],
     },
     {
@@ -1877,16 +2304,13 @@ export function SubscriptionDetailPage() {
       items: [
         { id: 'credit', label: 'Discount or credit the account…', icon: <Icons.percent size={14} />, onSelect: () => setDialog('credit') },
         {
+          // The customer page prices this before it runs — the exact lines
+          // the bill would sweep up, and the refusal when there are none.
+          // This menu used to raise the invoice on the click.
           id: 'invoice',
-          label: 'Bill what is owed now',
+          label: 'Bill what is owed now…',
           icon: <Icons.invoice size={14} />,
-          onSelect: () => {
-            void action.run(
-              api.post<Invoice>('/v1/invoices', { customer: sub.customer, subscription: sub.id }, { idempotencyKey: idem() }),
-              { success: 'Invoice raised', description: 'Everything waiting was swept onto one bill.', failure: 'Nothing could be billed' },
-              ['/v1/invoices', '/v1/customers', '/v1/subscriptions'],
-            ).then((invoice) => { if (invoice) navigate(invoiceHref(invoice.id)); });
-          },
+          onSelect: () => setDialog('bill'),
         },
       ],
     },
@@ -1903,9 +2327,14 @@ export function SubscriptionDetailPage() {
           <Button variant="secondary" iconLeft={<Icons.wallet size={15} />} onClick={() => navigate(customerHref(sub.customer))}>
             Account
           </Button>
-          <Button variant="primary" iconLeft={<Icons.edit size={15} />} onClick={() => setDialog('change')}>
-            Change plan or quantity
-          </Button>
+          {/* A canceled subscription has nothing left to change: the server
+              refuses the PATCH, so the door is closed here rather than after a
+              priced dialog has been filled in. */}
+          {!ended && (
+            <Button variant="primary" iconLeft={<Icons.edit size={15} />} onClick={() => setDialog('change')}>
+              Change plan or quantity
+            </Button>
+          )}
           <ActionMenu sections={actions} />
         </Inline>
       }
@@ -1946,11 +2375,23 @@ export function SubscriptionDetailPage() {
               value={f.dayRange(sub.current_period_start, sub.current_period_end)}
               caption={statusCaption(sub, f)}
             />
-            <Headline
-              label={sub.cancel_at_period_end ? 'Ends' : 'Next invoice'}
-              value={f.day(sub.current_period_end)}
-              caption={sub.cancel_at_period_end ? 'Set to cancel at the period end' : humanize(sub.collection_method)}
-            />
+            {ended
+              ? (
+                <Headline
+                  label="Ended"
+                  value={f.day(sub.ended_at ?? sub.canceled_at ?? sub.current_period_end)}
+                  caption="It will not bill again."
+                />
+              )
+              : (
+                <Headline
+                  label={scheduledToEnd ? 'Ends' : 'Next invoice'}
+                  value={f.day(endsOn)}
+                  caption={scheduledToEnd
+                    ? sub.cancel_at !== null ? 'Set to cancel on that date' : 'Set to cancel at the period end'
+                    : humanize(sub.collection_method)}
+                />
+              )}
             <Headline
               label="Trial"
               value={sub.trial_end ? f.day(sub.trial_end) : '—'}
@@ -1959,13 +2400,22 @@ export function SubscriptionDetailPage() {
           </div>
         </Card>
 
-        {sub.cancel_at_period_end && (
-          <Banner tone="warning" title="Scheduled to cancel">
-            {`This subscription stops on ${f.day(sub.current_period_end)}. `}
+        {scheduledToEnd && (
+          <Banner
+            tone="warning"
+            title="Scheduled to cancel"
+            actions={
+              <Button size="sm" variant="secondary" loading={action.busy} onClick={keepRunning}>
+                Keep it running
+              </Button>
+            }
+          >
+            {`This subscription stops on ${f.day(endsOn)}. `}
             {sub.cancellation_comment ?? 'No note was recorded with the cancellation.'}
+            {' Until then it bills as normal, and the cancellation can be withdrawn.'}
           </Banner>
         )}
-        {sub.schedule && <ScheduleBanner sub={sub} onOpen={() => setTab('schedule')} />}
+        {sub.schedule && !ended && <ScheduleBanner sub={sub} onOpen={() => setTab('schedule')} />}
 
         {sub.pause_collection && (
           <Banner tone="warning" title="Collection is paused">
@@ -1977,7 +2427,7 @@ export function SubscriptionDetailPage() {
           </Banner>
         )}
 
-        {tab === 'overview' && <OverviewTab sub={sub} onChange={() => setDialog('change')} onPatch={patch} />}
+        {tab === 'overview' && <OverviewTab sub={sub} ended={ended} onChange={() => setDialog('change')} onPatch={patch} />}
         {tab === 'upcoming' && <UpcomingTab sub={sub} />}
         {tab === 'periods' && <PeriodsTab sub={sub} />}
         {tab === 'schedule' && sub.schedule && <ScheduleTab scheduleId={sub.schedule} subscription={sub} />}
@@ -1995,6 +2445,7 @@ export function SubscriptionDetailPage() {
         open={dialog === 'credit'}
         onClose={() => setDialog(null)}
       />
+      <BillNowDialog open={dialog === 'bill'} onClose={() => setDialog(null)} customer={sub.customer} subscription={sub.id} />
     </Page>
   );
 }
@@ -2045,6 +2496,8 @@ export function ActionMenu({ sections, label = 'More actions' }: { sections: Men
  * cycle" underneath a tile reading "Set to cancel at the period end".
  */
 function statusCaption(sub: Subscription, f: ReturnType<typeof useBillingFormat>): string {
+  if (sub.status === 'canceled') return sub.status_detail;
+  if (sub.cancel_at !== null) return `Set to stop on ${f.day(sub.cancel_at)}.`;
   if (sub.cancel_at_period_end) return `The last period — it stops on ${f.day(sub.current_period_end)}.`;
   if (sub.pause_collection) return 'The cycle runs; collection on it is paused.';
   return sub.status_detail;
@@ -2057,8 +2510,16 @@ function itemNaming(item: SubscriptionItem, price: Price | undefined): { name: s
   return { name: stripQuantity(item.description), detail: null };
 }
 
-function OverviewTab({ sub, onChange, onPatch }: {
-  sub: Subscription; onChange: () => void; onPatch: (body: Record<string, unknown>) => Promise<unknown>;
+const NET_TERMS = [
+  { value: '0', label: 'Due on receipt' },
+  { value: '14', label: 'Net 14' },
+  { value: '30', label: 'Net 30' },
+  { value: '45', label: 'Net 45' },
+  { value: '60', label: 'Net 60' },
+];
+
+function OverviewTab({ sub, ended, onChange, onPatch }: {
+  sub: Subscription; ended: boolean; onChange: () => void; onPatch: (body: Record<string, unknown>) => Promise<unknown>;
 }) {
   const f = useBillingFormat();
   const { prices } = useActivePrices();
@@ -2067,9 +2528,13 @@ function OverviewTab({ sub, onChange, onPatch }: {
   return (
     <div className="bl-cols">
       <Stack gap={6}>
-      <Card title="Items" description="What this subscription bills for, every period." actions={
-        <Button size="sm" variant="secondary" iconLeft={<Icons.edit size={13} />} onClick={onChange}>Change</Button>
-      }>
+      <Card
+        title="Items"
+        description={ended ? 'What this subscription billed for, every period, until it ended.' : 'What this subscription bills for, every period.'}
+        actions={ended ? undefined : (
+          <Button size="sm" variant="secondary" iconLeft={<Icons.edit size={13} />} onClick={onChange}>Change</Button>
+        )}
+      >
         <div className="bl-tablewrap">
           <table className="bl-lines">
             <thead>
@@ -2083,7 +2548,6 @@ function OverviewTab({ sub, onChange, onPatch }: {
                   <td>
                     <div>{naming.name}</div>
                     {naming.detail && <div className="bl-lines__why">{naming.detail}</div>}
-                    <div className="bl-lines__why u-mono">{item.price}</div>
                   </td>
                   <td>{item.metered ? <Badge tone="info">metered</Badge> : f.number(item.quantity)}</td>
                   <td className="bl-num">{item.amount === null ? <span className="bl-muted">from usage</span> : money(item.amount)}</td>
@@ -2103,58 +2567,75 @@ function OverviewTab({ sub, onChange, onPatch }: {
       </Stack>
 
       <Stack gap={6}>
-      <Card title="Terms" description="Collection, net terms and the note below are editable here; the items and the money are changed through the priced dialog.">
+      <Card
+        title="Terms"
+        description={ended
+          ? 'This agreement has ended, so its terms are a record rather than settings — nothing here can be changed.'
+          : 'Collection, net terms and the note below are editable here; the items and the money are changed through the priced dialog.'}
+      >
         <FieldRow label="Status">{statusCaption(sub, f)}</FieldRow>
         <FieldRow label="Cadence">{`Every ${cadencePhrase(sub.interval_count, sub.interval)}`}</FieldRow>
-        <FieldRow label="Billing day" hint="The day of the month every future period lands on.">
+        <FieldRow label="Billing day" hint={ended ? undefined : 'The day of the month every future period lands on.'}>
           {sub.billing_cycle_anchor_day}
         </FieldRow>
         <FieldRow label="Collection">
-          <InlineEdit
-            label="Collection"
-            value={sub.collection_method}
-            options={[
-              { value: 'charge_automatically', label: 'Charge automatically' },
-              { value: 'send_invoice', label: 'Send an invoice' },
-            ]}
-            onSave={(value) => onPatch({ collection_method: value })}
-          />
+          {ended
+            ? humanize(sub.collection_method)
+            : (
+              <InlineEdit
+                label="Collection"
+                value={sub.collection_method}
+                options={[
+                  { value: 'charge_automatically', label: 'Charge automatically' },
+                  { value: 'send_invoice', label: 'Send an invoice' },
+                ]}
+                onSave={(value) => onPatch({ collection_method: value })}
+              />
+            )}
         </FieldRow>
         <FieldRow
           label="Net terms"
-          hint={sub.collection_method === 'charge_automatically'
-            ? 'Applies to invoices sent for payment. This subscription charges the card on file the moment a bill is raised, so nothing on it waits for a due date.'
-            : 'Days until an invoice raised on this subscription is due. Empty follows the account.'}
+          hint={ended
+            ? undefined
+            : sub.collection_method === 'charge_automatically'
+              ? 'Applies to invoices sent for payment. This subscription charges the card on file the moment a bill is raised, so nothing on it waits for a due date.'
+              : 'Days until an invoice raised on this subscription is due. Empty follows the account.'}
         >
-          <InlineEdit
-            label="Net terms"
-            value={String(sub.days_until_due ?? 0)}
-            options={[
-              { value: '0', label: 'Due on receipt' },
-              { value: '14', label: 'Net 14' },
-              { value: '30', label: 'Net 30' },
-              { value: '45', label: 'Net 45' },
-              { value: '60', label: 'Net 60' },
-            ]}
-            onSave={(value) => onPatch({ days_until_due: Number(value) })}
-          />
+          {ended
+            ? (NET_TERMS.find((term) => term.value === String(sub.days_until_due ?? 0))?.label ?? `Net ${f.number(sub.days_until_due ?? 0)}`)
+            : (
+              <InlineEdit
+                label="Net terms"
+                value={String(sub.days_until_due ?? 0)}
+                options={NET_TERMS}
+                onSave={(value) => onPatch({ days_until_due: Number(value) })}
+              />
+            )}
         </FieldRow>
-        <FieldRow label="Note" hint="What this agreement is, for whoever opens it next.">
-          <InlineEdit
-            label="Note"
-            value={sub.description ?? ''}
-            empty="No note on this subscription"
-            onSave={(value) => onPatch({ description: value })}
-          />
+        <FieldRow label="Note" hint={ended ? undefined : 'What this agreement is, for whoever opens it next.'}>
+          {ended
+            ? (sub.description || <span className="bl-muted">No note on this subscription</span>)
+            : (
+              <InlineEdit
+                label="Note"
+                value={sub.description ?? ''}
+                empty="No note on this subscription"
+                onSave={(value) => onPatch({ description: value })}
+              />
+            )}
         </FieldRow>
         <FieldRow label="Default proration">{humanize(sub.proration_behavior)}</FieldRow>
         <FieldRow label="Started">{f.day(sub.start_date, { withYear: true })}</FieldRow>
         {sub.canceled_at && <FieldRow label="Canceled">{f.dateTime(sub.canceled_at)}</FieldRow>}
+        {sub.ended_at && <FieldRow label="Ended">{f.dateTime(sub.ended_at)}</FieldRow>}
+        {sub.cancellation_reason && (sub.canceled_at || sub.cancel_at_period_end || sub.cancel_at !== null) && (
+          <FieldRow label="Reason">{humanize(sub.cancellation_reason)}</FieldRow>
+        )}
         <FieldRow label="Latest invoice">
           {sub.latest_invoice
             ? (
               <RecordLink to={invoiceHref(sub.latest_invoice.id)}>
-                {`${sub.latest_invoice.number} · ${f.money(sub.latest_invoice.total, { currency: sub.latest_invoice.currency })}`}
+                {`${sub.latest_invoice.number} · ${f.money(sub.latest_invoice.total, { currency: sub.currency })}`}
               </RecordLink>
             )
             : <span className="bl-muted">Nothing billed yet</span>}
@@ -2195,7 +2676,7 @@ function SubscriptionInvoices({ sub }: { sub: Subscription }) {
             <div className="bl-row__sub">{invoice.period_display}</div>
           </div>
           <div className="bl-row__aside">
-            <div>{invoice.total_display}</div>
+            <div>{f.money(billedTotal(invoice), { currency: invoice.currency })}</div>
             <div className="bl-sub"><StatusPill status={invoice.status} /></div>
           </div>
         </div>
@@ -2255,10 +2736,16 @@ function UpcomingTab({ sub }: { sub: Subscription }) {
       <div className="bl-totals">
         <div className="bl-total"><span className="bl-total__label">Subtotal</span><span className="bl-total__value">{invoice.subtotal_display}</span></div>
         <div className="bl-total"><span className="bl-total__label">Tax</span><span className="bl-total__value">{invoice.tax_display}</span></div>
+        {/* The bill first, then what the balance takes off it, then what the
+            account will be asked for — the same three lines the invoice
+            itself prints, so the estimate and the document agree. */}
+        <div className="bl-total bl-total--grand"><span className="bl-total__label">Estimated total</span><span className="bl-total__value">{f.money(billedTotal(invoice), { currency: invoice.currency })}</span></div>
         {invoice.balance_applied !== 0 && (
-          <div className="bl-total"><span className="bl-total__label">Account balance applied</span><span className="bl-total__value">{invoice.balance_applied_display}</span></div>
+          <>
+            <div className="bl-total"><span className="bl-total__label">Account balance applied</span><span className="bl-total__value">{invoice.balance_applied_display}</span></div>
+            <div className="bl-total bl-total--grand"><span className="bl-total__label">Estimated amount due</span><span className="bl-total__value">{invoice.amount_due_display}</span></div>
+          </>
         )}
-        <div className="bl-total bl-total--grand"><span className="bl-total__label">Estimated total</span><span className="bl-total__value">{invoice.total_display}</span></div>
       </div>
     </Card>
   );

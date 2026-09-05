@@ -14,7 +14,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, useMutation } from '@/client/kernel/api';
 import { useSession } from '@/client/kernel/session';
 import {
-  Badge, Banner, Button, DatePicker, Field, Modal, Select, useFormat, useToast,
+  Badge, Banner, Button, Field, Modal, Select, useFormat, useToast,
   type SelectOption,
 } from '@/client/design';
 import {
@@ -27,6 +27,7 @@ import {
   PropertyInput, errorFor, unboundError, useFirstControl, useUndoBulkMove, useUndoBulkReassign,
   type Draft,
 } from './dialogs';
+import { DateField } from './date-field';
 
 interface BatchRow {
   index: number;
@@ -298,7 +299,7 @@ export function BulkStageDialog({
               : `${f.calendarDate(closeDate)} — written to every deal that is not already closed.`}
             error={errorFor(move.error, 'close_date')}
           >
-            <DatePicker value={closeDate} onChange={setCloseDate} aria-label="Close date" />
+            <DateField value={closeDate} onChange={setCloseDate} aria-label="Close date" />
           </Field>
         )}
       </div>

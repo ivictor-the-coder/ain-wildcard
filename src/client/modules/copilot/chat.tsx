@@ -24,8 +24,10 @@ import {
 } from '@/client/design';
 import {
   MODEL_KEY_VAR, answerCard, dealNamedIn, decidedBadge, dedupeCitations, editHref, filterTemplates,
-  groupTemplates, parseBlocks, propertyAsked, splitToolEcho, starterTemplates, useAiStatus, useAllApprovals,
-  useRun, useTemplates, useThread, useThreads, useTools, useVocabulary, windowText,
+  groupTemplates, humanTool, nearestOf, parseBlocks, propertyAsked, rawRecordIds, recordAsk, recordLink,
+  splitRefusalOffer, splitToolEcho, starterTemplates, templatesAbout, threadErrorCopy, useAiStatus, useAllApprovals,
+  useRecordName, useRun, useTemplates, useThread, useThreads, useTools, useVocabulary, windowText,
+  withoutApiInstruction,
   type AiApproval, type AiCompletion, type AiMessage, type AiRun, type AiTemplate, type AiThread,
   type Remembered, type StepNote, type ThreadDetail, type ToolEcho, type Vocabulary,
 } from './api';
@@ -150,7 +152,7 @@ function TracePanel({ runId }: { runId: string }) {
 
 function AssistantMessage({
   message, run, approvals, newest, question, remembered, templates, hosted, vocab,
-  onDecided, onOpenRun, onAsk, onSeeAll, onOpenRecords,
+  onDecided, onOpenRun, onAsk, onSeeAll, onOpenRecords, onGrew, onAllowWrites,
 }: {
   message: AiMessage;
   run: AiRun | undefined;
@@ -172,9 +174,20 @@ function AssistantMessage({
   onSeeAll: () => void;
   /** Opens a screen this answer pointed at. */
   onOpenRecords: (href: string) => void;
+  /** The card grew after it landed — the reveal finished, chips or a write appeared — so the stream can follow. */
+  onGrew?: () => void;
+  /** Turns "Let it prepare writes" on and puts the question again. */
+  onAllowWrites?: (question: string) => void;
 }) {
   const f = useFormat();
   const [showTrace, setShowTrace] = useState(false);
+  /**
+   * Record names this card has looked up for ids the plan carried.
+   *
+   * Only ever added to: a name that was found stays found, so the chips are
+   * not redrawn with the id the moment the lookup that named it goes quiet.
+   */
+  const [known, setKnown] = useState<Record<string, string>>({});
   // The tool echo is not prose and is not typed out as prose: the answer is
   // what gets revealed, and what the tools returned beyond it sits under it.
   const { prose, echoes, notes } = useMemo(() => splitToolEcho(message.content), [message.content]);
@@ -197,6 +210,7 @@ function AssistantMessage({
    */
   const card = useMemo(() => answerCard({
     question,
+    content: prose,
     toolCalls: message.tool_calls ?? [],
     run,
     remembered,
@@ -211,11 +225,19 @@ function AssistantMessage({
         dateRange: (start, end) => f.dateRange(start, end, { timeZone: 'UTC' }),
         date: (ts) => f.date(ts, { timeZone: 'UTC' }),
       }),
-      name: (id) => citations.find((c) => c.id === id)?.label
+      name: (id) => known[id]
+        ?? citations.find((c) => c.id === id)?.label
         ?? vocab.people.find((person) => person.id === id)?.name
         ?? id,
     },
-  }), [question, message.tool_calls, run, remembered, templates, hosted, vocab, citations, f]);
+  }), [question, prose, message.tool_calls, run, remembered, templates, hosted, vocab, citations, f, known]);
+
+  // A chip still wearing an id is read once from the record it names.
+  const unnamed = rawRecordIds(card.slots)[0] ?? null;
+  const named = useRecordName(unnamed);
+  useEffect(() => {
+    if (unnamed && named) setKnown((current) => (current[unnamed] === named ? current : { ...current, [unnamed]: named }));
+  }, [unnamed, named]);
 
   // A request to set a property the engine's write extractor cannot read. The
   // deal is found on the account it did cite, so the dead end becomes a link
@@ -230,7 +252,11 @@ function AssistantMessage({
     ? dealNamedIn(question, accountDeals.data.data)
     : null;
 
-  const { shown, done } = useReveal(prose, newest);
+  // A refusal's closing "Try one of these" list is drawn as the chips below,
+  // once; and an answer written for a caller with a request body is told to a
+  // person with a switch.
+  const spoken = card.refusal ? splitRefusalOffer(prose).prose : card.switchOff ? withoutApiInstruction(prose) : prose;
+  const { shown, done } = useReveal(spoken, newest);
 
   // The prose was composed when the engine stopped: it says "Nothing has been
   // written" and always will. Once a decision has been made it is history, not
@@ -238,6 +264,13 @@ function AssistantMessage({
   const waiting = approvals.filter((approval) => approval.status === 'pending');
   const decided = approvals.filter((approval) => approval.status !== 'pending');
   const superseded = decided.length > 0 && waiting.length === 0;
+
+  // The stream scrolled when the message arrived and not when the card grew:
+  // the reveal, the refusal chips and the approval card all land after that,
+  // and on a short window they landed below the fold.
+  useEffect(() => {
+    if (newest && done) onGrew?.();
+  }, [newest, done, waiting.length, onGrew]);
 
   return (
     <div className="cp-msg cp-msg--assistant">
@@ -297,6 +330,28 @@ function AssistantMessage({
           <Banner tone="danger" title="This run failed">{card.failed}</Banner>
         )}
 
+        {card.switchOff && (
+          <Banner tone="info" bar title="Asked with “Let it prepare writes” off">
+            <p>
+              The copilot read this as a write — {humanTool(card.switchOff.tool).toLowerCase()} — and stopped before
+              preparing it. Nothing changed.
+              {onAllowWrites ? ' Turn the switch on and it prepares the write for your approval.' : ''}
+            </p>
+            {onAllowWrites && (
+              <p className="cp-chips" style={{ marginTop: 'var(--space-3)' }}>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  iconLeft={<Icons.edit size={13} />}
+                  onClick={() => onAllowWrites(question)}
+                >
+                  Turn it on and ask again
+                </Button>
+              </p>
+            )}
+          </Banner>
+        )}
+
         <SlotChips slots={card.slots} />
 
         <div className={superseded ? 'cp-superseded' : undefined}>
@@ -309,9 +364,7 @@ function AssistantMessage({
         {card.refusal && done && (
           <>
             {card.refusal.message && !prose.includes(card.refusal.message) && (
-              <p className="cp-note">
-                {card.refusal.message} <span className="cp-mono">({card.refusal.code})</span>
-              </p>
+              <p className="cp-note">{card.refusal.message}</p>
             )}
             <RefusalHelp refusal={card.refusal} onAsk={onAsk} onSeeAll={onSeeAll} />
           </>
@@ -364,6 +417,19 @@ function AssistantMessage({
 
 /* ================================== page ================================== */
 
+/** The key the writes switch is remembered under for a thread that does not exist yet. */
+const NEW_THREAD = 'new';
+
+const writesKey = (threadId: string) => `ain.copilot.writes.${threadId}`;
+
+function readWritesSwitch(threadId: string): boolean {
+  try { return window.sessionStorage.getItem(writesKey(threadId)) === '1'; } catch { return false; }
+}
+
+function writeWritesSwitch(threadId: string, on: boolean): void {
+  try { window.sessionStorage.setItem(writesKey(threadId), on ? '1' : '0'); } catch { /* a private window with storage off still has the switch for the sitting */ }
+}
+
 export function CopilotPage() {
   const session = useSession();
   const f = useFormat();
@@ -383,8 +449,29 @@ export function CopilotPage() {
   // in a plan's arguments into the names on a slot chip.
   const vocabulary = useVocabulary();
 
-  const [draft, setDraft] = useState(location.query.ask ?? '');
-  const [allowWrites, setAllowWrites] = useState(false);
+  const [draft, setDraft] = useState(() => (recordAsk(location.query.ask) ? '' : location.query.ask ?? ''));
+  /**
+   * "Let it prepare writes", kept per conversation for the sitting.
+   *
+   * It was component state: open the record a write landed on, come back, and
+   * the switch was off again — and the next write request came back as a
+   * read-only run telling the person to send a request-body flag. The switch
+   * is the control, so it remembers itself by thread. The ref is what the
+   * request reads, so "turn it on and ask again" can do both in one press.
+   */
+  const [allowWrites, setAllowWritesState] = useState(() => location.query.writes === '1' || readWritesSwitch(selected || NEW_THREAD));
+  const allowWritesRef = useRef(allowWrites);
+  const setAllowWrites = useCallback((on: boolean, threadId: string = selected || NEW_THREAD) => {
+    allowWritesRef.current = on;
+    setAllowWritesState(on);
+    writeWritesSwitch(threadId, on);
+  }, [selected]);
+  useEffect(() => {
+    const remembered = readWritesSwitch(selected || NEW_THREAD);
+    allowWritesRef.current = remembered;
+    setAllowWritesState(remembered);
+  }, [selected]);
+  const [railOpen, setRailOpen] = useState(false);
   const [pendingQuestion, setPendingQuestion] = useState<string | null>(null);
   const [newestRun, setNewestRun] = useState<string | null>(null);
   const [drafting, setDrafting] = useState(location.query.draft === '1');
@@ -419,13 +506,57 @@ export function CopilotPage() {
     if (location.query.draft === '1') { setDrafting(true); setQuery({ draft: undefined }, { replace: true }); }
   }, [location.query.draft, setQuery]);
 
+  // The approval queue's empty state sends people here to put something in it,
+  // so the switch that does that arrives already on.
   useEffect(() => {
-    if (location.query.ask) {
-      setDraft(location.query.ask);
+    if (location.query.writes === '1') { setAllowWrites(true, NEW_THREAD); setQuery({ writes: undefined }, { replace: true }); }
+  }, [location.query.writes, setAllowWrites, setQuery]);
+
+  /**
+   * A question another screen composed.
+   *
+   * Most go straight into the box. The deal screen's "Ask the copilot about
+   * this deal" composes "Where does <deal> stand right now?", which no shape
+   * answers for a deal — so that one is read as the record it names, and the
+   * thread opens on the deal's own questions instead of a refusal. A name that
+   * is not a deal (an account's, say) goes into the box as typed, where the
+   * account shapes answer it.
+   */
+  useEffect(() => {
+    const asked = location.query.ask;
+    if (!asked) return;
+    const intoTheBox = () => {
+      setDraft(asked);
       setQuery({ ask: undefined }, { replace: true });
       composerRef.current?.focus();
-    }
+    };
+    const wanted = recordAsk(asked);
+    if (!wanted) { intoTheBox(); return; }
+    let cancelled = false;
+    api.get<ListEnvelope<{ id: string; display_name: string }>>('/v1/records/deal', { q: wanted.name, limit: 5 })
+      .then((page) => {
+        if (cancelled) return;
+        const hit = page.data.find((row) => row.display_name === wanted.name);
+        if (hit) setQuery({ about: hit.id, ask: undefined, thread: undefined, new: '1' }, { replace: true });
+        else intoTheBox();
+      })
+      .catch(() => { if (!cancelled) intoTheBox(); });
+    return () => { cancelled = true; };
   }, [location.query.ask, setQuery]);
+
+  /**
+   * The record an empty thread was opened about.
+   *
+   * `?about=deal_nw_71` is the copilot's own entry from a record: the deal is
+   * read once, and the starters become the shapes the engine answers about a
+   * deal, each worded with this deal's name.
+   */
+  const about = location.query.about ?? '';
+  const aboutLink = about ? recordLink(about) : null;
+  const aboutRecord = useQuery<{ id: string; display_name: string }>(
+    aboutLink ? `/v1/records/${aboutLink.type}/${encodeURIComponent(about)}` : null,
+  );
+  const aboutName = aboutRecord.data?.display_name ?? '';
 
   const messages = thread.data?.messages ?? [];
   const runsById = useMemo(
@@ -449,10 +580,11 @@ export function CopilotPage() {
     return '';
   }, [messages, runsById]);
 
-  useEffect(() => {
+  const scrollToEnd = useCallback(() => {
     const node = streamRef.current;
     if (node) node.scrollTop = node.scrollHeight;
-  }, [messages.length, pendingQuestion]);
+  }, []);
+  useEffect(scrollToEnd, [scrollToEnd, messages.length, pendingQuestion]);
 
   /**
    * Where the keyboard is on this screen, which was nowhere.
@@ -476,8 +608,16 @@ export function CopilotPage() {
     return () => cancelAnimationFrame(frame);
   }, []);
 
-  // On mount, and again each time an answer lands.
-  useEffect(landFocus, [landFocus, newestRun]);
+  const approvalsFor = useCallback(
+    (runId: string | null) => (runId ? approvals.byRun.get(runId) ?? [] : []),
+    [approvals],
+  );
+  // The approvals are read after the answer, so the card that outranks the
+  // composer appears a moment after focus has already landed in the box.
+  const pendingForNewest = approvalsFor(newestRun).some((approval) => approval.status === 'pending');
+
+  // On mount, again each time an answer lands, and again when its write appears.
+  useEffect(landFocus, [landFocus, newestRun, pendingForNewest]);
 
   // The way back to the box from anywhere on the screen. `allowInInput` is off,
   // so typing the letter C into the composer or the filter box types a C.
@@ -490,6 +630,10 @@ export function CopilotPage() {
 
   const templateRows = useMemo(() => templates.data?.data ?? [], [templates.data]);
   const starters = useMemo(() => starterTemplates(templateRows, 5), [templateRows]);
+  const aboutQuestions = useMemo(
+    () => (aboutLink && aboutName ? templatesAbout(templateRows, aboutLink.type === 'company' ? 'account' : aboutLink.type, aboutName) : []),
+    [templateRows, aboutLink, aboutName],
+  );
   const groups = useMemo(
     () => groupTemplates(filterTemplates(templateRows, templateQuery)),
     [templateRows, templateQuery],
@@ -514,7 +658,7 @@ export function CopilotPage() {
       thread_id: threadId,
       prompt: content,
       feature: 'copilot',
-      ...(allowWrites ? { allow_writes: true } : {}),
+      ...(allowWritesRef.current ? { allow_writes: true } : {}),
     });
 
   const send = useMutation<{ content: string }, { threadId: string; completion: AiCompletion }>(
@@ -544,7 +688,8 @@ export function CopilotPage() {
           const next = new Map(current);
           next.set(completion.run_id, {
             engine: completion.engine ?? null,
-            nearest: completion.nearest ?? null,
+            // Documented at the top level, sent inside `analysis`: read wherever it is.
+            nearest: nearestOf(completion),
             template: completion.template ?? null,
             analysis: completion.analysis ?? null,
           });
@@ -552,7 +697,11 @@ export function CopilotPage() {
         });
         setNewestRun(completion.run_id);
         refreshAfterAnswer(threadId);
-        if (threadId !== selected) setQuery({ thread: threadId, new: undefined });
+        if (threadId !== selected) {
+          // The switch travels with the question into the thread it opened.
+          writeWritesSwitch(threadId, allowWritesRef.current);
+          setQuery({ thread: threadId, new: undefined, about: undefined });
+        }
       },
       onError: (e: ApiClientError) => {
         setPendingQuestion(null);
@@ -672,13 +821,17 @@ export function CopilotPage() {
   }, [send]);
 
   const startNew = () => {
-    setQuery({ thread: undefined, new: '1' });
+    setQuery({ thread: undefined, new: '1', about: undefined });
     setDraft('');
     setPendingQuestion(null);
     composerRef.current?.focus();
   };
 
-  const approvalsFor = (runId: string | null) => (runId ? approvals.byRun.get(runId) ?? [] : []);
+  /** "Turn it on and ask again": the switch and the question, in one press. */
+  const allowAndAsk = useCallback((question: string) => {
+    setAllowWrites(true);
+    ask(question);
+  }, [setAllowWrites, ask]);
 
   const provider = ai.data?.provider;
   // Until the status has answered nothing is claimed about a key either way.
@@ -731,9 +884,37 @@ export function CopilotPage() {
       title="Copilot"
       width="wide"
       subtitle={
-        ai.data
-          ? `${provider?.label} · ${f.number(ai.data.tools)} tools · ${f.plural(ai.data.runs_today, 'run')} today${ai.data.pending_approvals ? ` · ${ai.data.pending_approvals} waiting for approval` : ''}`
-          : 'Answers grounded in this workspace’s own records'
+        <>
+          {/* One key over the whole rail, and the first stop inside the page:
+              Tabbing to the composer used to cost 26 shell stops plus two more
+              for every conversation in the list, and the link that skipped
+              them sat after the four buttons beside it. Clipped until focused,
+              so it takes no room in the subtitle it leads. */}
+          <a
+            className="cp-skip"
+            href="#cp-composer"
+            onClick={(e) => { e.preventDefault(); composerRef.current?.focus(); }}
+          >
+            Skip to the message box (C)
+          </a>
+          {ai.data
+          ? (
+            <>
+              {provider?.label} ·{' '}
+              <Button
+                variant="link"
+                size="sm"
+                title="Every tool the copilot reads and writes the workspace through"
+                onClick={() => navigate('/copilot/runs?tab=tools')}
+              >
+                {f.number(ai.data.tools)} tools
+              </Button>
+              {' '}· {f.plural(ai.data.runs_today, 'run')} today
+              {ai.data.pending_approvals ? ` · ${ai.data.pending_approvals} waiting for approval` : ''}
+            </>
+          )
+          : 'Answers grounded in this workspace’s own records'}
+        </>
       }
       actions={
         <>
@@ -758,30 +939,32 @@ export function CopilotPage() {
         </Banner>
       )}
 
-      {/* One key over the whole rail. Tabbing to the composer used to cost 26
-          shell stops plus two more for every conversation in the list, and the
-          tunnel grew with the thread count. */}
-      <a
-        className="cp-skip"
-        href="#cp-composer"
-        onClick={(e) => { e.preventDefault(); composerRef.current?.focus(); }}
-      >
-        Skip to the message box (C)
-      </a>
-
       <div className="cp-shell" ref={shellRef}>
         <Card
-          className="cp-rail"
+          className={`cp-rail${railOpen ? '' : ' is-collapsed'}`}
           padding="tight"
           title="Conversations"
           actions={
-            <Select
-              value={status}
-              onChange={setStatus}
-              size="sm"
-              aria-label="Conversation status"
-              options={[{ value: 'open', label: 'Open' }, { value: 'archived', label: 'Archived' }] as SelectOption[]}
-            />
+            <>
+              <Select
+                value={status}
+                onChange={setStatus}
+                size="sm"
+                aria-label="Conversation status"
+                options={[{ value: 'open', label: 'Open' }, { value: 'archived', label: 'Archived' }] as SelectOption[]}
+              />
+              {/* Only drawn below the breakpoint, where the rail stacks over the
+                  stream and would otherwise push the box you type in off-screen. */}
+              <Button
+                size="sm"
+                variant="ghost"
+                className="cp-rail__toggle"
+                aria-expanded={railOpen}
+                onClick={() => setRailOpen((value) => !value)}
+              >
+                {railOpen ? 'Hide the list' : `Show ${f.plural(visibleThreads.length, 'conversation')}`}
+              </Button>
+            </>
           }
         >
           <SearchInput
@@ -862,15 +1045,25 @@ export function CopilotPage() {
             aria-live="polite"
             aria-busy={send.loading}
           >
-            {thread.error && (
-              <ErrorState
-                title="This conversation could not be read"
-                message={thread.error.body.message}
-                code={`${thread.error.status} /v1/ai/threads/${selected}`}
-                requestId={thread.error.body.request_id ?? null}
-                action={<Button size="sm" variant="primary" onClick={thread.refetch}>Try again</Button>}
-              />
-            )}
+            {thread.error && (() => {
+              // "No such ai thread: thr_…" is the API's line; the screen's is
+              // what happened and where to go. The code stays for a bug report.
+              const copy = threadErrorCopy({ status: thread.error.status, message: thread.error.body.message });
+              return (
+                <ErrorState
+                  title={copy.title}
+                  message={copy.message}
+                  code={`${thread.error.status} /v1/ai/threads/${selected}`}
+                  requestId={thread.error.body.request_id ?? null}
+                  action={copy.action === 'start_new'
+                    ? <Button size="sm" variant="primary" iconLeft={<Icons.plus size={13} />} onClick={startNew}>Start a new conversation</Button>
+                    : <Button size="sm" variant="primary" onClick={thread.refetch}>Try again</Button>}
+                  secondaryAction={copy.action === 'start_new'
+                    ? <Button size="sm" onClick={() => navigate('/copilot/runs')}>Open the run log</Button>
+                    : undefined}
+                />
+              );
+            })()}
 
             {!thread.error && selected && thread.loading && (
               <>
@@ -879,7 +1072,65 @@ export function CopilotPage() {
               </>
             )}
 
-            {composing && !pendingQuestion && (
+            {composing && !pendingQuestion && about && (
+              <div style={{ display: 'grid', gap: 'var(--space-6)' }}>
+                {aboutRecord.error && (
+                  <ErrorState
+                    title="That record could not be read"
+                    message={aboutRecord.error.body.message}
+                    code={`${aboutRecord.error.status} /v1/records/${aboutLink?.type ?? 'record'}/${about}`}
+                    requestId={aboutRecord.error.body.request_id ?? null}
+                    action={<Button size="sm" variant="primary" onClick={aboutRecord.refetch}>Try again</Button>}
+                    secondaryAction={<Button size="sm" onClick={startNew}>Ask about anything</Button>}
+                  />
+                )}
+                {!aboutRecord.error && !aboutRecord.data && <SkeletonText lines={4} />}
+                {aboutRecord.data && (
+                  <>
+                    <div className="cp-about" data-about={about}>
+                      <Icons.sparkles size={16} />
+                      <span>About</span>
+                      <span className="cp-about__name">{aboutName}</span>
+                      <span className="cp-note">· every answer below is read from its own record</span>
+                    </div>
+                    {templatesState}
+                    {templates.data && aboutQuestions.length > 0 && (
+                      <div className="cp-suggest" data-about-questions={aboutQuestions.length}>
+                        {aboutQuestions.map((row) => (
+                          <button
+                            key={row.template.id}
+                            type="button"
+                            className="cp-suggest__item"
+                            data-template-id={row.template.id}
+                            title={row.template.shape}
+                            onClick={() => ask(row.question)}
+                          >
+                            <span className="cp-suggest__q">{row.question}</span>
+                            <span className="cp-suggest__why">{row.template.description}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    {templates.data && aboutQuestions.length === 0 && (
+                      <EmptyState
+                        size="sm"
+                        inline
+                        illustration={null}
+                        title={`No question shape takes a ${humanize(aboutLink?.type ?? 'record').toLowerCase()}`}
+                        body="The engine answers a fixed list of shapes, and none of them is about this kind of record. Ask about the workspace instead."
+                        action={<Button size="sm" variant="primary" onClick={() => setAsking(true)}>See what it can answer</Button>}
+                      />
+                    )}
+                    <button type="button" className="cp-help__more" onClick={() => setAsking(true)}>
+                      <Icons.list size={12} />
+                      Or ask anything else it can answer
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+
+            {composing && !pendingQuestion && !about && (
               <div style={{ display: 'grid', gap: 'var(--space-6)' }}>
                 <EmptyState
                   title="Ask about this workspace"
@@ -898,6 +1149,12 @@ export function CopilotPage() {
                     onAsk={ask}
                     onSeeAll={() => setAsking(true)}
                   />
+                )}
+                {tools.data && (
+                  <button type="button" className="cp-help__more" onClick={() => navigate('/copilot/runs?tab=tools')}>
+                    <Icons.terminal size={12} />
+                    See the {f.plural(tools.data.data.length, 'tool')} it reads and writes through
+                  </button>
                 )}
               </div>
             )}
@@ -927,6 +1184,8 @@ export function CopilotPage() {
                   onAsk={ask}
                   onSeeAll={() => setAsking(true)}
                   onOpenRecords={navigate}
+                  onGrew={scrollToEnd}
+                  onAllowWrites={allowAndAsk}
                 />
               )
             ))}
@@ -966,7 +1225,13 @@ export function CopilotPage() {
               }}
               minRows={2}
               maxRows={8}
-              placeholder={selected && !composing ? 'Ask a follow-up — the thread keeps the context' : 'Ask anything about Northwind Robotics'}
+              placeholder={
+                selected && !composing
+                  ? 'Ask a follow-up — the thread keeps the context'
+                  : about && aboutName
+                    ? `Ask about ${aboutName}`
+                    : 'Ask anything about Northwind Robotics'
+              }
               aria-label="Ask the copilot"
               disabled={send.loading}
             />
@@ -1009,7 +1274,7 @@ export function CopilotPage() {
           <SearchInput
             value={templateQuery}
             onChange={setTemplateQuery}
-            placeholder="Filter the questions — “deals”, “owed”, “Growth”"
+            placeholder="Filter the questions — “deals”, “owe”, “Growth”"
             aria-label="Filter the questions"
           />
         </div>

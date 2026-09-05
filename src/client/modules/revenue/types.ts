@@ -121,8 +121,12 @@ export interface MovementMonth {
   new_business: number | null;
   expansion: number | null;
   reactivation: number | null;
+  /** MRR that came back out of the paused pool — a collection resumed, not a reactivation. */
+  resumed: number | null;
   contraction: number | null;
   churn: number | null;
+  /** MRR whose collection was paused this month, as a positive magnitude. The contract survives. */
+  paused: number | null;
   net: number | null;
   closing: number | null;
   counts: {
@@ -133,6 +137,8 @@ export interface MovementMonth {
     expanded_accounts: number;
     contracted_accounts: number;
     churned_accounts: number;
+    paused_accounts: number;
+    resumed_accounts: number;
   };
   top_movers: Mover[];
   reconciliation: Reconciliation;
@@ -143,8 +149,10 @@ export interface MovementTotals {
   new_business: number | null;
   expansion: number | null;
   reactivation: number | null;
+  resumed: number | null;
   contraction: number | null;
   churn: number | null;
+  paused: number | null;
   net: number | null;
   closing: number | null;
 }
@@ -207,6 +215,108 @@ export interface RevenueCohorts extends RevenueEnvelope {
   totals: { cohorts: number; accounts: number; by_offset: { offset: number; accounts: number; retained: number; logo_retention: Rate }[] };
 }
 
+/* ------------------------------ recognition ------------------------------- */
+
+/** One month of the recognition series. Money is null when the scope is mixed. */
+export interface DeferredMonth {
+  month: string;
+  period: { start: number; end: number };
+  complete: boolean;
+  read_at: number;
+  in_scope: boolean;
+  currency: string | null;
+  /** Billed this month, net of credit notes issued this month. */
+  invoiced: number | null;
+  /** Credit notes issued this month, as a positive magnitude. */
+  credited: number | null;
+  /** Earned this month, net of any contra revenue booked in it. */
+  recognised: number | null;
+  invoiced_to_date: number | null;
+  recognised_to_date: number | null;
+  /** `invoiced_to_date - recognised_to_date` at the close of the month. */
+  deferred_balance: number | null;
+  /** Earned but not yet billed at the close of the month, gross. */
+  unbilled_balance: number | null;
+}
+
+/** One day of a line's straight-line schedule. */
+export interface RecognitionDay {
+  day: string;
+  start: number;
+  end: number;
+  booked_at: number;
+  amount: number;
+  recognised: boolean;
+}
+
+export interface DeferredLine {
+  invoice: string;
+  invoice_number: string;
+  invoice_status: string;
+  line: string;
+  customer: string;
+  customer_name: string;
+  subscription: string | null;
+  kind: string;
+  description: string;
+  currency: string;
+  /** Negative for a credit note line. */
+  amount: number;
+  invoiced_at: number;
+  period: { start: number; end: number };
+  credit_note: string | null;
+  credit_note_number: string | null;
+  reduces_line: string | null;
+  reduces_amount: number | null;
+  days: number;
+  recognised_to_date: number;
+  deferred: number;
+  unbilled: number;
+  /** Present when the report was asked for one invoice or `schedule=true`. */
+  schedule?: RecognitionDay[];
+}
+
+export interface RecognitionCheck {
+  name: string;
+  description: string;
+  expected: number;
+  actual: number;
+  difference: number;
+  ok: boolean;
+}
+
+export interface DeferredTotals {
+  lines: number;
+  invoice_lines: number;
+  credit_note_lines: number;
+  invoiced: number | null;
+  invoiced_gross: number | null;
+  credited: number | null;
+  recognised: number | null;
+  deferred_balance: number | null;
+  unbilled_balance: number | null;
+  unbilled_usage: number | null;
+  currency: string | null;
+}
+
+export interface RevenueDeferred extends RevenueEnvelope {
+  as_of_recognition: number;
+  series: DeferredMonth[];
+  totals: DeferredTotals;
+  by_currency: { currency: string; totals: DeferredTotals; reconciliation: { balanced: boolean; note: string | null } }[];
+  reconciliation: {
+    invoiced: number | null;
+    recognised: number | null;
+    deferred: number | null;
+    difference: number | null;
+    balanced: boolean;
+    note: string | null;
+    checks: RecognitionCheck[];
+  };
+  balanced: boolean;
+  lines: DeferredLine[];
+}
+
 export interface AgeingBucket {
   bucket: string;
   label: string;
@@ -264,6 +374,24 @@ export interface RevenueCollections extends RevenueEnvelope {
   exposure: { failed_payments: number | null; campaigns: number; over_90_days: number | null; note: string | null };
 }
 
+/**
+ * What the settlement ledger recorded for a set of windows — as opposed to the
+ * `credit_covered` / `charged` fields beside it, which count only the lines
+ * that have reached a finalised invoice.
+ */
+export interface SettledSplit {
+  /** Absorbed by prepaid credit when the windows were priced. */
+  credit_covered: number;
+  /** Charged when the windows were priced. */
+  charged: number;
+  /** Late arrivals and withdrawals since, signed. */
+  true_ups: number;
+  /** `charged + true_ups`: what the customer owes for the windows, net. */
+  net_charged: number;
+  /** The part of `net_charged` on a finalised invoice, at the amount the invoice carries. */
+  invoiced: number;
+}
+
 export interface UsageMeterRow {
   meter: string;
   name: string;
@@ -272,8 +400,14 @@ export interface UsageMeterRow {
   settlements: number;
   quantity_micro: number;
   metered_value: number;
+  /** On invoices finalised in the range — not the settled figure. */
   credit_covered: number;
+  /** On invoices finalised in the range — not the settled figure. */
   charged: number;
+  /** Settled for a window in the range and not on a finalised invoice by its end. */
+  unbilled: number;
+  settled: SettledSplit;
+  /** `settled.net_charged / metered_value`. */
   charged_share: Rate;
   revenue_per_unit: Ratio;
 }
@@ -282,9 +416,14 @@ export interface UsageMonth {
   month: string;
   complete: boolean;
   settlements: number;
+  /** Windows that closed this month, at the value they priced at. */
   metered_value: number | null;
+  /** On invoices finalised this month. */
   credit_covered: number | null;
+  /** On invoices finalised this month. */
   charged: number | null;
+  /** Settled usage with no finalised invoice at the close of this month. */
+  unbilled_balance: number;
 }
 
 export interface CreditFlow {
@@ -310,8 +449,16 @@ export interface RevenueUsage extends RevenueEnvelope {
   series: UsageMonth[];
   totals: {
     metered_value: number | null;
+    /** Credit-covered value on invoices finalised in the range. */
     credit_covered: number | null;
+    /** Usage and true-up lines on invoices finalised in the range. */
     charged: number | null;
+    /** Settled for a window in the range and still not on a finalised invoice at its end. */
+    unbilled: number;
+    /** Every settled window, whenever it closed, not on a finalised invoice at the end of the range. */
+    unbilled_balance: number;
+    /** The range's windows as the settlement ledger recorded them. */
+    settled: SettledSplit;
     settlements: number;
     skipped_settlements: number;
     invoiced: number | null;
@@ -515,11 +662,51 @@ export interface MeterPeriodClosure {
   aggregation: string;
   total: number;
   event_count: number;
+  /** Late arrivals since the freeze, signed, whether or not resolved. */
   adjustment: number;
+  /** The part of `adjustment` already resolved into a true-up. */
+  settled_adjustment: number;
   late_event_count: number;
   price: string | null;
   currency: string | null;
+  /** What billed the period — a credit settlement, when one did. */
+  ref_type: string | null;
+  ref_id: string | null;
   closed_at: number;
+}
+
+/** `GET /v1/meter-period-closures/:id`: the frozen period against what the meter reads today. */
+export interface MeterPeriodClosureDetail extends MeterPeriodClosure {
+  /** The meter re-aggregated over the window now. */
+  live_total: number;
+  /** Signed money the invoice still has to move by — zero when meter and bill agree. */
+  outstanding_amount: number | null;
+  /** `live_total` less what has been billed, resolved true-ups included. */
+  outstanding_quantity: number;
+  open_entries: MeterLateArrival[];
+}
+
+/**
+ * `detail` on the 409 `POST /v1/credit-settlements` answers when the window
+ * overlaps one already settled — the figures the message spells out with raw
+ * ids and ISO timestamps, so the dialog can say the same thing in words.
+ */
+export interface SettlementClashDetail {
+  settlement: string;
+  period_start: number;
+  period_end: number;
+  requested_start: number;
+  requested_end: number;
+  covered_amount: number;
+  charged_amount: number;
+  drift: {
+    settled_quantity: number;
+    live_quantity: number;
+    delta: number;
+    closure: string | null;
+    open_late_arrivals: string[];
+    outstanding_amount: number | null;
+  } | null;
 }
 
 export interface SummaryBucket {

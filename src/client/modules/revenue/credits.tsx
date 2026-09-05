@@ -20,15 +20,20 @@ import {
 import {
   BasisNote, ChartSkeleton, CurrencyControl, CustomerName, EmptyBody, ExportCsvButton, LiveMoneyInput,
   LiveNumberInput, Loading, RangeControl, SectionError, StatusChip, boundaryDate, boundaryRange,
-  csvAmount, csvDay, csvInstant, moneyAxis, monthLabel, moneyIn, rateText, unitNoun,
+  csvAmount, csvDay, csvInstant, moneyAxis, monthLabel, moneyIn, rateText, signedMoneyIn, unitNoun,
   units, useCustomerNames, useDefaultCurrency, useRevenueRange, useSticky, useTabParam,
   useUrlTableState, visibleRows,
-  type CsvColumn,
+  type CsvColumn, type Formatter,
 } from './common';
+import { unitPotValue, type UnitPotValue } from './credit-value';
+import {
+  CREDIT_WRITE_INVALIDATES, burnDownChart, burnDownFigures, checkPhrases, formatReasonDates, movementLabel,
+  shareText, splitReconciles,
+} from './credits-math';
 import type {
   CreditBalance, CreditGrant, CreditLedgerEntry, CreditLedgerResponse, CreditRefund, CreditSettlement,
   CreditBillableItem, CreditsOverview, CreditTopUp, Meter, MeterUsage, OpenInvoice, PriceLite,
-  PricePreview, RevenueMrr, RevenueUsage,
+  PricePreview, RevenueMrr, RevenueUsage, SettlementClashDetail,
 } from './types';
 
 const DAY_MS = 86_400_000;
@@ -73,6 +78,25 @@ function grantBreakdown(grants: CreditGrant[], total: number): string {
 type CreditsTab = 'ledger' | 'settlements' | 'pending';
 const CREDITS_TABS = ['ledger', 'settlements', 'pending'] as const;
 
+/**
+ * The pots beside the money, valued. Stripe's credit balance is always a
+ * currency amount; a unit pot bought as a pack has a price too, and the tile
+ * states the unused remainder at that price rather than "$0.00" over a customer
+ * holding four million prepaid events.
+ */
+function unitPotCaption(
+  f: Formatter, row: CreditsOverview['outstanding'][number], pots: UnitPotValue, loading: boolean,
+): string {
+  if (!row.unit_pots) return 'monetary credit only';
+  const noun = f.plural(row.unit_pots, 'unit pot');
+  if (loading && pots.priced === 0) return `${noun} alongside it`;
+  if (pots.priced === 0) return `${noun} alongside it, none bought as a pack — unpriced`;
+  const worth = `${moneyIn(f, pots.value, row.currency)} of prepaid usage at pack price`;
+  return pots.unpriced
+    ? `${noun} alongside it — ${worth}, ${f.plural(pots.unpriced, 'promotional pot')} unpriced`
+    : `${noun} alongside it — ${worth}`;
+}
+
 export function CreditsPage() {
   const f = useFormat();
   const toast = useToast();
@@ -82,6 +106,8 @@ export function CreditsPage() {
 
   const overview = useQuery<CreditsOverview>('/v1/credits/overview');
   const grants = useQuery<ListEnvelope<CreditGrant>>('/v1/credit-grants', { limit: 500 });
+  // The purchase lines behind every sold pack: what a unit pot is worth in money.
+  const purchases = useQuery<ListEnvelope<CreditBillableItem>>('/v1/credit-billable-items', { kind: 'topup', limit: 200 });
   const usage = useSticky(useQuery<RevenueUsage>('/v1/revenue/usage', range.query));
   const books = useQuery<RevenueMrr>('/v1/revenue/mrr', { months: range.months });
 
@@ -216,7 +242,7 @@ export function CreditsPage() {
                   <Stat
                     label={`Outstanding · ${row.currency.toUpperCase()}`}
                     value={row.monetary_outstanding_display}
-                    caption={row.unit_pots ? `${f.plural(row.unit_pots, 'unit pot')} alongside it` : 'monetary credit only'}
+                    caption={unitPotCaption(f, row, unitPotValue(rows, purchases.data?.data ?? [], row.currency), purchases.loading)}
                   />
                 </Card>
               ))}
@@ -339,72 +365,114 @@ export function CreditsPage() {
 
 /* ================================ burn-down =============================== */
 
-/** What share of the metered value the customer actually paid for. */
-function chargedShare(charged: number | null, meteredValue: number | null): string {
-  if (charged === null || !meteredValue) return 'nothing metered in this window';
-  return `${((charged / meteredValue) * 100).toFixed(2)}% of the metered value`;
-}
+/**
+ * A reason as the ledger wrote it, with its calendar days in the workspace's
+ * words. "Expired unused on 2026-08-31" is the server naming a boundary.
+ */
+const reasonText = (f: Formatter, reason: string): string =>
+  formatReasonDates(reason, (day) => boundaryDate(f, day, true));
 
 function BurnDown({ usage, currency }: { usage: ReturnType<typeof useSticky<RevenueUsage>>; currency: string }) {
   const f = useFormat();
   const data = usage.data;
-  const months = useMemo(() => (data?.series ?? []).filter((row) => (row.metered_value ?? 0) > 0), [data]);
+  const chart = useMemo(() => (data ? burnDownChart(data) : null), [data]);
 
   if (usage.error) return <Card><SectionError error={usage.error} path="GET /v1/revenue/usage" onRetry={usage.refetch} /></Card>;
-  if (!data) return <Card><ChartSkeleton /></Card>;
+  if (!data || !chart) return <Card><ChartSkeleton /></Card>;
+
+  const figures = burnDownFigures(data);
+  const money = (amount: number) => moneyIn(f, amount, currency);
+  const checks = checkPhrases(data.reconciliation.checks);
+  // The identity the card is built on, checked here as well as on the server:
+  // a card that prints "every check balances" over figures that do not add up
+  // is the defect this card had.
+  const splitHolds = splitReconciles(figures);
 
   return (
     <div className="rv-cols">
-      <Card title="Covered against charged" description="Each month of settled usage, split into the part credit absorbed and the part the customer paid for.">
-        {months.length === 0
-          ? (
-            <EmptyState
-              size="sm"
-              title="No usage has been settled in this window"
-              body={<EmptyBody>A settlement prices a metered period, draws credit against it and freezes the meter window. Settle one and the split appears here.</EmptyBody>}
-            />
-          )
-          : (
-            <BarChart
-              title="Credit burn-down"
-              description="Credit-covered and charged usage by month."
-              stacked
-              categories={months.map((row) => monthLabel(row.month, f))}
-              series={[
-                { id: 'covered', label: 'Covered by credit', values: months.map((row) => row.credit_covered ?? 0) },
-                { id: 'charged', label: 'Charged', values: months.map((row) => row.charged ?? 0) },
-              ]}
-              height={260}
-              valueFormat={moneyAxis(f, currency, months.map((row) => (row.credit_covered ?? 0) + (row.charged ?? 0)))}
-            />
-          )}
+      <Card title="Covered against charged" description="Each month's finalised invoices, split into the part credit absorbed and the part the customer paid for.">
+        {chart.state === 'nothing_metered' && (
+          <EmptyState
+            size="sm"
+            title="No usage has been settled in this window"
+            body={<EmptyBody>A settlement prices a metered period, draws credit against it and freezes the meter window. Settle one and the split appears here.</EmptyBody>}
+          />
+        )}
+        {chart.state === 'nothing_invoiced' && (
+          <EmptyState
+            size="sm"
+            title="Nothing settled in this window has reached a finalised invoice yet"
+            body={(
+              <EmptyBody>
+                {`${money(chart.unbilled)} of settled usage is awaiting a bill. The month its invoice is finalised, the split lands here; until then the card beside this states what the settlement priced.`}
+              </EmptyBody>
+            )}
+          />
+        )}
+        {chart.state === 'draw' && (
+          <BarChart
+            title="Credit burn-down"
+            description="Credit-covered and charged usage on invoices finalised each month."
+            stacked
+            categories={chart.months.map((row) => monthLabel(row.month, f))}
+            series={[
+              { id: 'covered', label: 'Covered by credit', values: chart.months.map((row) => row.credit_covered ?? 0) },
+              { id: 'charged', label: 'Charged', values: chart.months.map((row) => row.charged ?? 0) },
+            ]}
+            height={260}
+            valueFormat={moneyAxis(f, currency, chart.months.map((row) => (row.credit_covered ?? 0) + (row.charged ?? 0)))}
+          />
+        )}
       </Card>
-      <Card title="Over the window">
-        <Stack gap={5}>
-          <Grid minColumnWidth={130} gap={5}>
-            <Stat size="sm" label="Metered value" value={moneyIn(f, data.totals.metered_value, currency)} caption={f.plural(data.totals.settlements, 'settlement')} />
-            <Stat size="sm" label="Covered by credit" value={moneyIn(f, data.totals.credit_covered, currency)} caption="never reached an invoice" />
-            {/* The caption under a figure has to be a statement about that
-                figure. `overage_share_of_invoiced` counts only the charged
-                usage that reached a finalised invoice, which is a different
-                numerator from the one above it — so it gets its own tile and
-                this one is captioned from the split it belongs to. */}
-            <Stat
-              size="sm"
-              label="Charged"
-              value={moneyIn(f, data.totals.charged, currency)}
-              caption={chargedShare(data.totals.charged, data.totals.metered_value)}
-            />
-            <Stat
-              size="sm"
-              label="Reached an invoice"
-              value={rateText(data.totals.overage_share_of_invoiced)}
-              caption={data.totals.overage_share_of_invoiced && !data.totals.overage_share_of_invoiced.undefined_rate
-                ? `${moneyIn(f, data.totals.overage_share_of_invoiced.numerator, currency)} of ${moneyIn(f, data.totals.overage_share_of_invoiced.denominator, currency)} invoiced`
-                : 'nothing was invoiced in this window'}
-            />
-            <Stat size="sm" label="Credit bought" value={moneyIn(f, data.credit.purchased, currency)} caption={f.plural(data.credit.purchase_lines, 'purchase line')} />
-          </Grid>
+      <Card title="Over the window" description="What the settlement ledger priced when each window closed — and where that charge stands now.">
+        <Stack gap={6}>
+          <div className="rv-group">
+            <span className="rv-kicker">Priced when the windows closed</span>
+            <Grid minColumnWidth={170} gap={5}>
+              <Stat size="sm" label="Metered value" value={money(figures.metered)} caption={f.plural(figures.settlements, 'settlement')} />
+              <Stat size="sm" label="Covered by credit" value={money(figures.covered)} caption="drawn from prepaid grants" />
+              <Stat
+                size="sm"
+                label="Charged"
+                value={money(figures.charged)}
+                caption={shareText(figures.charged, figures.metered) ? `${shareText(figures.charged, figures.metered)} of the metered value` : 'nothing metered in this window'}
+              />
+              <Stat
+                size="sm"
+                label="True-ups"
+                value={signedMoneyIn(f, figures.trueUps, currency)}
+                caption={figures.trueUps === 0
+                  ? 'no late arrivals or withdrawals'
+                  : figures.trueUps < 0 ? 'usage withdrawn after billing, net' : 'usage that arrived after billing, net'}
+              />
+            </Grid>
+          </div>
+          <div className="rv-group">
+            <span className="rv-kicker">Where the charge stands</span>
+            <Grid minColumnWidth={170} gap={5}>
+              <Stat
+                size="sm"
+                label="Owed for usage"
+                value={money(figures.owed)}
+                caption={shareText(figures.owed, figures.metered) ? `${shareText(figures.owed, figures.metered)} of the metered value, after true-ups` : 'nothing owed'}
+              />
+              <Stat
+                size="sm"
+                label="On finalised invoices"
+                value={money(figures.invoiced)}
+                caption={figures.invoiced === 0
+                  ? 'nothing settled here has been billed yet'
+                  : `${shareText(figures.invoiced, figures.owed) ?? '—'} of what is owed`}
+              />
+              <Stat
+                size="sm"
+                label="Awaiting an invoice"
+                value={money(figures.unbilled)}
+                caption={figures.unbilled === 0 ? 'every settled charge is on a bill' : 'settled, not yet on a bill'}
+              />
+              <Stat size="sm" label="Credit bought" value={money(figures.purchased)} caption={f.plural(figures.purchaseLines, 'purchase line')} />
+            </Grid>
+          </div>
           {data.meters.length > 0 && (
             <div className="rv-rows">
               {data.meters.map((meter) => (
@@ -412,7 +480,8 @@ function BurnDown({ usage, currency }: { usage: ReturnType<typeof useSticky<Reve
                   <div className="rv-row__main">
                     <div className="rv-row__title">{meter.name}</div>
                     <div className="rv-row__sub">
-                      {moneyIn(f, meter.credit_covered, meter.currency)} covered · {rateText(meter.charged_share)} charged
+                      {moneyIn(f, meter.settled.credit_covered, meter.currency)} covered · {moneyIn(f, meter.settled.net_charged, meter.currency)} owed ({rateText(meter.charged_share)})
+                      {meter.unbilled > 0 ? ` · ${moneyIn(f, meter.unbilled, meter.currency)} awaiting an invoice` : ''}
                     </div>
                   </div>
                   <div className="rv-row__aside">{moneyIn(f, meter.metered_value, meter.currency)}</div>
@@ -420,10 +489,18 @@ function BurnDown({ usage, currency }: { usage: ReturnType<typeof useSticky<Reve
               ))}
             </div>
           )}
-          <Banner tone={data.reconciliation.balanced ? 'success' : 'danger'} compact title={data.reconciliation.balanced ? 'Every check balances' : 'A check failed'}>
-            {data.reconciliation.balanced
-              ? `${f.plural(data.reconciliation.checks.length, 'reconciliation')} passed: covered plus charged equals the metered value, and the ledger's own components equal its balance.`
-              : (data.reconciliation.note ?? f.list(data.reconciliation.checks.filter((c) => !c.ok).map((c) => c.description)))}
+          <Banner
+            tone={data.reconciliation.balanced && splitHolds ? 'success' : 'danger'}
+            compact
+            title={data.reconciliation.balanced && splitHolds
+              ? `${f.plural(checks.passed.length, 'check')} passed`
+              : 'A check failed'}
+          >
+            {data.reconciliation.balanced && splitHolds
+              ? <ul className="rv-basis__list">{checks.passed.map((phrase) => <li key={phrase}>{phrase}</li>)}</ul>
+              : !splitHolds
+                ? `${money(figures.covered)} covered plus ${money(figures.charged)} charged does not equal the ${money(figures.metered)} metered — the settlement ledger and this card disagree. Do not read the split until it is investigated.`
+                : (data.reconciliation.note ?? <ul className="rv-basis__list">{checks.failed.map((phrase) => <li key={phrase}>{phrase}</li>)}</ul>)}
           </Banner>
         </Stack>
       </Card>
@@ -460,7 +537,7 @@ function WorkspaceLedger({
       width: 190,
     },
     { id: 'customer', header: 'Customer', accessor: (row) => names.name(row.customer), cell: (row) => <CustomerName id={row.customer} names={names} />, width: 200 },
-    { id: 'type', header: 'Movement', accessor: (row) => row.type, filter: 'set', cell: (row) => <Badge tone={row.delta >= 0 ? 'success' : 'neutral'} size="sm">{humanize(row.type)}</Badge>, width: 140 },
+    { id: 'type', header: 'Movement', accessor: (row) => movementLabel(row), filter: 'set', cell: (row) => <Badge tone={row.delta >= 0 ? 'success' : 'neutral'} size="sm">{movementLabel(row)}</Badge>, width: 140 },
     {
       id: 'delta', header: 'Change', align: 'right', accessor: (row) => row.delta, filter: 'number',
       cell: (row) => (
@@ -479,7 +556,7 @@ function WorkspaceLedger({
         </span>
       ),
     },
-    { id: 'reason', header: 'Reason', accessor: (row) => row.reason, cell: (row) => <span className="rv-sub">{row.reason}</span> },
+    { id: 'reason', header: 'Reason', accessor: (row) => reasonText(f, row.reason), cell: (row) => <span className="rv-sub">{reasonText(f, row.reason)}</span> },
   ], [f, names, unitOf]);
 
   const shown = visibleRows(rows, columns, table.state);
@@ -515,7 +592,7 @@ function WorkspaceLedger({
               { header: 'Sequence', value: (row) => row.seq },
               { header: 'Customer', value: (row) => names.name(row.customer) },
               { header: 'Grant', value: (row) => row.grant },
-              { header: 'Movement', value: (row) => row.type },
+              { header: 'Movement', value: (row) => movementLabel(row) },
               { header: 'Denomination', value: (row) => (row.kind === 'monetary' ? 'money' : unitNoun(2, unitOf(row))) },
               { header: 'Change', value: (row) => (row.kind === 'monetary' ? csvAmount(row.delta, row.currency) : row.delta) },
               { header: 'Balance after', value: (row) => (row.kind === 'monetary' ? csvAmount(row.balance_after, row.currency) : row.balance_after) },
@@ -596,7 +673,7 @@ function GrantLedgerDrawer({
                   <tr key={entry.id}>
                     <td style={{ padding: 'var(--space-4) var(--space-5)', borderBlockEnd: '1px solid var(--border-subtle)', color: 'var(--text-tertiary)', fontSize: 'var(--text-xs)' }}>{entry.seq}</td>
                     <td style={{ padding: 'var(--space-4) var(--space-5)', borderBlockEnd: '1px solid var(--border-subtle)', whiteSpace: 'nowrap', fontSize: 'var(--text-sm)' }}>{f.dateTime(entry.created)}</td>
-                    <td style={{ padding: 'var(--space-4) var(--space-5)', borderBlockEnd: '1px solid var(--border-subtle)' }}><Badge size="sm" tone={entry.delta >= 0 ? 'success' : 'neutral'}>{humanize(entry.type)}</Badge></td>
+                    <td style={{ padding: 'var(--space-4) var(--space-5)', borderBlockEnd: '1px solid var(--border-subtle)' }}><Badge size="sm" tone={entry.delta >= 0 ? 'success' : 'neutral'}>{movementLabel(entry)}</Badge></td>
                     <td className={entry.delta >= 0 ? 'rv-ledger__delta--in' : 'rv-ledger__delta--out'} style={{ padding: 'var(--space-4) var(--space-5)', borderBlockEnd: '1px solid var(--border-subtle)', textAlign: 'end', fontSize: 'var(--text-sm)' }}>
                       {grant.kind === 'monetary'
                         ? moneyIn(f, entry.delta, entry.currency)
@@ -605,7 +682,7 @@ function GrantLedgerDrawer({
                     <td style={{ padding: 'var(--space-4) var(--space-5)', borderBlockEnd: '1px solid var(--border-subtle)', textAlign: 'end', fontSize: 'var(--text-sm)', fontWeight: 'var(--weight-medium)' }}>
                       {grantAmount(f, grant, entry.balance_after)}
                     </td>
-                    <td style={{ padding: 'var(--space-4) var(--space-5)', borderBlockEnd: '1px solid var(--border-subtle)', color: 'var(--text-secondary)', fontSize: 'var(--text-xs)' }}>{entry.reason}</td>
+                    <td style={{ padding: 'var(--space-4) var(--space-5)', borderBlockEnd: '1px solid var(--border-subtle)', color: 'var(--text-secondary)', fontSize: 'var(--text-xs)' }}>{reasonText(f, entry.reason)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -957,7 +1034,7 @@ function InvoicePendingModal({
       });
     },
     {
-      invalidates: ['/v1/credit-billable-items', '/v1/credits/overview', '/v1/credit-grants', '/v1/invoices', '/v1/revenue'],
+      invalidates: [...CREDIT_WRITE_INVALIDATES, '/v1/invoices', '/v1/revenue'],
       onSuccess: (outcome) => {
         setResults(outcome);
         const raised = outcome.filter((row) => row.invoice).length;
@@ -1122,7 +1199,7 @@ function GrantModal({ open, onClose, onSaved }: { open: boolean; onClose: () => 
       priority: priority ?? 0,
       reason: reason || undefined,
     }),
-    { invalidates: ['/v1/credit-grants', '/v1/credits/overview', '/v1/credit-ledger'], onSuccess: onSaved },
+    { invalidates: [...CREDIT_WRITE_INVALIDATES], onSuccess: onSaved },
   );
 
   const params = ['customer', 'name', 'amount', 'meter', 'currency', 'expires_at', 'effective_at', 'priority', 'kind'];
@@ -1327,7 +1404,7 @@ function TopUpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
       ...(expires ? { expires_at: expires } : {}),
     }),
     {
-      invalidates: ['/v1/credit-grants', '/v1/credits/overview', '/v1/credit-ledger', '/v1/credit-billable-items'],
+      invalidates: [...CREDIT_WRITE_INVALIDATES],
       onSuccess: (result, args) => {
         // The server's own figure, not the quote — and if the two ever differ,
         // the toast says so rather than repeating what the button promised.
@@ -1434,6 +1511,48 @@ function TopUpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   );
 }
 
+/** A price by the name the catalogue gives it, never by its id. */
+const priceName = (price: PriceLite): string => price.nickname ?? price.product_name ?? 'this price';
+
+/**
+ * The 409 for an overlapping window carries every figure its message spells
+ * out — with the settlement's id, ISO timestamps and a bare quantity. The
+ * `detail` block is the same facts, typed, so the dialog can say them in the
+ * workspace's own dates and units.
+ */
+function clashDetail(detail: unknown): SettlementClashDetail | null {
+  if (!detail || typeof detail !== 'object') return null;
+  const d = detail as Partial<SettlementClashDetail>;
+  if (typeof d.period_start !== 'number' || typeof d.period_end !== 'number') return null;
+  return {
+    settlement: String(d.settlement ?? ''),
+    period_start: d.period_start,
+    period_end: d.period_end,
+    requested_start: Number(d.requested_start ?? 0),
+    requested_end: Number(d.requested_end ?? 0),
+    covered_amount: Number(d.covered_amount ?? 0),
+    charged_amount: Number(d.charged_amount ?? 0),
+    drift: d.drift ?? null,
+  };
+}
+
+function clashText(f: Formatter, clash: SettlementClashDetail, unitLabel: string | null, currency: string): string {
+  const billed = `That window is on the books already — ${moneyIn(f, clash.covered_amount, currency)} covered by credit and ${moneyIn(f, clash.charged_amount, currency)} charged — so settling ${boundaryRange(f, clash.requested_start, clash.requested_end)} again would draw credit twice for usage that is billed.`;
+  const drift = clash.drift;
+  if (!drift) return `${billed} The meter still reads what was billed.`;
+  const moved = units(f, Math.abs(drift.delta), unitLabel);
+  const direction = drift.delta > 0 ? 'have arrived in' : 'have been withdrawn from';
+  const worth = drift.outstanding_amount === null || drift.outstanding_amount === 0
+    ? ''
+    : drift.outstanding_amount > 0
+      ? `, worth ${moneyIn(f, drift.outstanding_amount, currency)} more`
+      : `, worth ${moneyIn(f, -drift.outstanding_amount, currency)} back to the customer`;
+  const late = drift.open_late_arrivals.length
+    ? ` ${f.plural(drift.open_late_arrivals.length, 'late arrival')} ${drift.open_late_arrivals.length === 1 ? 'is' : 'are'} waiting on the Usage screen's Ingestion inspector — resolve ${drift.open_late_arrivals.length === 1 ? 'it' : 'them'} there to settle the difference in money.`
+    : ' The difference is already on a true-up line.';
+  return `${billed} It was billed at ${units(f, drift.settled_quantity, unitLabel)} and the meter now reads ${units(f, drift.live_quantity, unitLabel)}: ${moved} ${direction} the period since it closed${worth}.${late}`;
+}
+
 function SettleModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const f = useFormat();
   const toast = useToast();
@@ -1480,7 +1599,7 @@ function SettleModal({ open, onClose }: { open: boolean; onClose: () => void }) 
       customer, price, period_start: start, period_end: end,
     }),
     {
-      invalidates: ['/v1/credit-settlements', '/v1/credit-grants', '/v1/credits/overview', '/v1/credit-ledger', '/v1/credit-billable-items', '/v1/revenue/usage'],
+      invalidates: [...CREDIT_WRITE_INVALIDATES],
       onSuccess: (settlement) => {
         setResult(settlement);
         toast.success(`${moneyIn(f, settlement.full_amount, settlement.currency)} priced — ${moneyIn(f, settlement.covered_amount, settlement.currency)} covered by credit`);
@@ -1489,7 +1608,8 @@ function SettleModal({ open, onClose }: { open: boolean; onClose: () => void }) 
   );
 
   const params = ['customer', 'price', 'period_start', 'period_end'];
-  const general = generalError(run.error, params);
+  const clash = run.error?.code === 'usage_period_already_settled' ? clashDetail(run.error.body.detail) : null;
+  const general = clash ? null : generalError(run.error, params);
 
   return (
     <Modal
@@ -1516,6 +1636,11 @@ function SettleModal({ open, onClose }: { open: boolean; onClose: () => void }) 
     >
       <form className="rv-form" onSubmit={(e) => { e.preventDefault(); void run.run().catch(() => undefined); }}>
         {general && <Banner tone="danger" compact>{general}</Banner>}
+        {clash && (
+          <Banner tone="danger" compact title={`${boundaryRange(f, clash.period_start, clash.period_end)} is already settled on ${chosen ? priceName(chosen) : 'this price'}`}>
+            {clashText(f, clash, usage.data?.unit_label ?? chosen?.unit_label ?? null, chosen?.currency ?? f.currency)}
+          </Banner>
+        )}
         {result && (
           <Banner tone="success" compact title={`${units(f, result.quantity, usage.data?.unit_label ?? chosen?.unit_label)} priced at ${moneyIn(f, result.full_amount, result.currency)}`}>
             {`${moneyIn(f, result.covered_amount, result.currency)} was absorbed by prepaid credit and ${moneyIn(f, result.charged_amount, result.currency)} became a charge. `
@@ -1594,7 +1719,7 @@ function EditGrantModal({ grant, onClose }: { grant: CreditGrant; onClose: () =>
       expires_at: expires,
     }),
     {
-      invalidates: ['/v1/credit-grants', '/v1/credits/overview'],
+      invalidates: [...CREDIT_WRITE_INVALIDATES],
       onSuccess: () => { toast.success(`${name} updated`); onClose(); },
     },
   );
@@ -1637,7 +1762,7 @@ function VoidGrantDialog({ grant, onClose }: { grant: CreditGrant; onClose: () =
   const run = useMutation<void, CreditGrant>(
     async () => api.post<CreditGrant>(`/v1/credit-grants/${grant.id}/void`, { reason: reason || undefined }),
     {
-      invalidates: ['/v1/credit-grants', '/v1/credits/overview', '/v1/credit-ledger'],
+      invalidates: [...CREDIT_WRITE_INVALIDATES],
       onSuccess: () => { toast.success(`${grant.name} voided`); onClose(); },
     },
   );
@@ -1697,7 +1822,7 @@ function RefundGrantModal({ grant, onClose }: { grant: CreditGrant; onClose: () 
       reason: reason || undefined,
     }),
     {
-      invalidates: ['/v1/credit-grants', '/v1/credits/overview', '/v1/credit-ledger', '/v1/credit-billable-items'],
+      invalidates: [...CREDIT_WRITE_INVALIDATES],
       onSuccess: (result) => {
         const money = result.line ? moneyIn(f, Math.abs(result.line.amount), result.line.currency) : null;
         toast.success(

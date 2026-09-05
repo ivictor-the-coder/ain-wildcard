@@ -20,7 +20,7 @@ import { crmVocabulary, currencyBooks, type QualifierKind, type QualifierVocabul
 import { METRICS, stageSets, type MetricUnit, type StageSets, type GroupBy } from './metrics';
 import { propertyMap, type Condition } from './query';
 import { resolveWindowSpans, type TimeWindow } from './dates';
-import { coreName, foldAccents, normalise } from './text';
+import { COMMON_WORDS, COMPANY_NOISE, STOPWORDS, coreName, foldAccents, normalise, words } from './text';
 import { DRAFT_KINDS, TONES, type DraftKind, type Tone } from './draft';
 
 /* ------------------------------- tokens ---------------------------------- */
@@ -123,7 +123,13 @@ export type SlotValue =
   | { kind: 'tone'; value: Tone }
   | { kind: 'text'; text: string }
   | { kind: 'quantity'; value: number; formatted: string }
-  | { kind: 'verb'; value: string; label: string };
+  | { kind: 'verb'; value: string; label: string }
+  | { kind: 'movement'; bucket: MovementBucket; label: string }
+  | { kind: 'ageing-bucket'; bucket: AgeingBucketId; label: string };
+
+/** One MRR movement bucket, the net of all of them, or the whole bridge. */
+export type MovementBucket = 'new_business' | 'expansion' | 'reactivation' | 'resumed' | 'contraction' | 'churn' | 'paused' | 'net' | 'all';
+export type AgeingBucketId = 'not_yet_due' | 'd1_30' | 'd31_60' | 'd61_90' | 'd90_plus';
 
 export type SlotKind =
   | 'object' | 'activity-object' | 'state' | 'deal-state' | 'ticket-state' | 'stage' | 'pipeline'
@@ -131,7 +137,8 @@ export type SlotKind =
   | 'period' | 'currency' | 'owner' | 'plan' | 'subscription-status' | 'invoice-status'
   | 'money' | 'comparator' | 'number' | 'account' | 'contact' | 'deal' | 'record' | 'meter'
   | 'superlative' | 'most' | 'dimension' | 'industry' | 'lead-source' | 'competitor' | 'forecast-category' | 'region'
-  | 'property' | 'numeric-property' | 'property-dim' | 'draft-kind' | 'tone' | 'text' | 'quantity' | 'book-verb';
+  | 'property' | 'numeric-property' | 'property-dim' | 'draft-kind' | 'tone' | 'text' | 'quantity' | 'book-verb'
+  | 'mrr-movement' | 'movement-verb' | 'ageing-bucket';
 
 export interface Bound {
   name: string;
@@ -283,6 +290,42 @@ const BOOK_VERBS: [string, string, string[]][] = [
   ['closed_lost', 'lost', ['lose', 'lost']],
   ['invoiced', 'invoiced', ['invoice', 'invoiced', 'bill', 'billed']],
   ['revenue', 'collected', ['collect', 'collected', 'receive', 'received', 'get paid', 'got paid', 'take in', 'bring in']],
+];
+
+/**
+ * The buckets of the MRR bridge, by the nouns a revenue desk uses for them.
+ * "Churn" on its own stays the logo-churn measure it already is; the movement
+ * bucket is the MRR that churned, and every spelling here says so.
+ */
+const MRR_MOVEMENTS: [MovementBucket, string, string[]][] = [
+  ['net', 'net new MRR', ['net new mrr', 'net mrr', 'net mrr movement', 'net mrr change', 'net new monthly recurring revenue', 'net new recurring revenue', 'net change in mrr']],
+  ['new_business', 'new business MRR', ['new business mrr', 'new mrr', 'new logo mrr', 'mrr from new business', 'new business']],
+  ['expansion', 'expansion MRR', ['expansion mrr', 'mrr expansion', 'expansion', 'upsell mrr', 'expansion revenue', 'upgrades']],
+  ['contraction', 'contraction MRR', ['contraction mrr', 'mrr contraction', 'contraction', 'downgrade mrr', 'downgrades', 'contraction revenue']],
+  ['churn', 'churned MRR', ['churned mrr', 'mrr churn', 'churn mrr', 'revenue churn', 'lost mrr', 'churned revenue', 'mrr churned']],
+  ['reactivation', 'reactivation MRR', ['reactivation mrr', 'reactivated mrr', 'mrr reactivation', 'reactivation', 'reactivations', 'win back mrr']],
+  ['paused', 'paused MRR', ['paused mrr', 'mrr paused', 'mrr on pause', 'pauses']],
+  ['resumed', 'resumed MRR', ['resumed mrr', 'mrr resumed', 'resumptions']],
+  ['all', 'MRR movement', ['mrr movement', 'mrr movements', 'mrr bridge', 'mrr waterfall', 'monthly recurring revenue movement', 'recurring revenue movement', 'movement in mrr']],
+];
+
+const MOVEMENT_VERBS: [MovementBucket, string, string[]][] = [
+  ['churn', 'churned', ['churned', 'churn', 'cancelled', 'canceled', 'left']],
+  ['expansion', 'expanded', ['expanded', 'expand', 'upgraded', 'upgrade', 'upsold', 'grew']],
+  ['contraction', 'contracted', ['contracted', 'contract', 'downgraded', 'downgrade', 'shrank']],
+  ['reactivation', 'reactivated', ['reactivated', 'reactivate', 'came back', 'returned', 'won back']],
+  ['paused', 'paused', ['paused', 'pause']],
+  ['resumed', 'resumed', ['resumed', 'resume', 'unpaused']],
+  ['new_business', 'signed', ['signed', 'signed up', 'came on', 'came on board', 'started paying']],
+];
+
+/** The receivables ageing buckets, by the label the report prints and the way people say it. */
+const AGEING_BUCKETS: [AgeingBucketId, string, string[]][] = [
+  ['not_yet_due', 'Not yet due', ['not yet due', 'not due yet', 'current', 'not overdue']],
+  ['d1_30', '1–30 days past due', ['1 30', '1 30 day', '1 30 days', '1 to 30 day', '1 to 30 days', '0 30', '0 30 day', '0 30 days', '0 to 30 days', 'under 30 days', 'less than 30 days', 'up to 30 days']],
+  ['d31_60', '31–60 days past due', ['31 60', '31 60 day', '31 60 days', '31 to 60 day', '31 to 60 days', '30 60', '30 60 day', '30 60 days', '30 to 60 day', '30 to 60 days']],
+  ['d61_90', '61–90 days past due', ['61 90', '61 90 day', '61 90 days', '61 to 90 day', '61 to 90 days', '60 90', '60 90 day', '60 90 days', '60 to 90 day', '60 to 90 days']],
+  ['d90_plus', 'Over 90 days past due', ['over 90', 'over 90 day', 'over 90 days', '90 plus', '90 plus day', '90 plus days', 'more than 90 days', '90 and over', 'beyond 90 days', 'older than 90 days']],
 ];
 
 const DRAFT_ALIASES: Record<DraftKind, string[]> = {
@@ -537,7 +580,15 @@ function build(
       const value: SlotValue = { kind: 'meter', id: row.id, name: row.name, event: row.event_name, unit: row.unit_label, priceKey };
       meters.push({ id: row.id, name: row.name, event: row.event_name, unit: row.unit_label, priceKey });
       const name = normalise(row.name);
-      for (const spelling of [name, normalise(row.event_name), name.endsWith('s') ? name.replace(/s$/, '') : `${name}s`]) add('meter', spelling, value);
+      const forms = [name, normalise(row.event_name), name.endsWith('s') ? name.replace(/s$/, '') : `${name}s`];
+      for (const spelling of forms) add('meter', spelling, value);
+      // "120 GB of bulk export volume": the meter's own unit word sits between
+      // the quantity and the meter, and the meter answers to it.
+      const unit = row.unit_label ? normalise(row.unit_label) : '';
+      if (unit) {
+        const units = new Set([unit, unit.endsWith('s') ? unit : `${unit}s`]);
+        for (const u of units) for (const form of forms) { add('meter', `${u} of ${form}`, value); add('meter', `${u} ${form}`, value); }
+      }
     }
   }
 
@@ -555,6 +606,9 @@ function build(
     for (const spelling of DRAFT_ALIASES[kind]) add('draft-kind', spelling, { kind: 'draft-kind', value: kind, label: humanLabel(kind) });
   }
   for (const tone of TONES) add('tone', tone, { kind: 'tone', value: tone });
+  for (const [bucket, label, spellings] of MRR_MOVEMENTS) for (const spelling of spellings) add('mrr-movement', spelling, { kind: 'movement', bucket, label });
+  for (const [bucket, label, spellings] of MOVEMENT_VERBS) for (const spelling of spellings) add('movement-verb', spelling, { kind: 'movement', bucket, label });
+  for (const [bucket, label, spellings] of AGEING_BUCKETS) for (const spelling of spellings) add('ageing-bucket', spelling, { kind: 'ageing-bucket', bucket, label });
 
   /* records, by their exact names */
   const records: Vocabulary['records'] = [];
@@ -562,6 +616,7 @@ function build(
     ['account', ['company', 'customer']], ['contact', ['contact']], ['deal', ['deal']],
     ['record', ['company', 'contact', 'deal', 'ticket']],
   ];
+  const named: { entity: typeof entities[number]; value: SlotValue; spellings: Set<string> }[] = [];
   for (const entity of entities) {
     if (!['company', 'customer', 'contact', 'deal', 'ticket'].includes(entity.type)) continue;
     records.push({ id: entity.id, type: entity.type, label: entity.label });
@@ -573,9 +628,24 @@ function build(
       for (const alias of entity.aliases) if (!/[@.]/.test(alias)) spellings.add(normalise(alias));
     }
     if (entity.type === 'contact') for (const alias of entity.aliases) if (!/[@.]/.test(alias)) spellings.add(normalise(alias));
+    named.push({ entity, value, spellings });
+  }
+  // "Kaskade" is what people call Kaskade Pharma Group, and "Kestrel
+  // Aerospace" is Kestrel Aerospace Components: a company answers to the
+  // leading words of its name when they are distinctive — not a legal suffix,
+  // not a word of the business, not a phrase another slot already reads — and
+  // the ambiguity of two companies sharing them is settled at bind time, by
+  // refusing and naming both, never by picking one.
+  const exactNames = new Set<string>();
+  for (const one of named) if (one.entity.type === 'company' || one.entity.type === 'customer') { exactNames.add(normalise(one.entity.label)); exactNames.add(coreName(one.entity.label)); }
+  for (const one of named) {
+    if (one.entity.type !== 'company' && one.entity.type !== 'customer') continue;
+    for (const prefix of companyPrefixes(one.entity.label, phrases, exactNames)) one.spellings.add(prefix);
+  }
+  for (const one of named) {
     for (const [kind, types] of recordKinds) {
-      if (!types.includes(entity.type)) continue;
-      for (const spelling of spellings) add(kind, spelling, value);
+      if (!types.includes(one.entity.type)) continue;
+      for (const spelling of one.spellings) add(kind, spelling, one.value);
     }
   }
 
@@ -592,6 +662,163 @@ function build(
   };
   byOrg.set(orgId, { stamp, vocab });
   return vocab;
+}
+
+/* ------------------------------ prefixes --------------------------------- */
+
+const RECORD_KINDS = new Set<SlotKind>(['account', 'contact', 'deal', 'record']);
+
+/**
+ * The leading words of a company name that can stand for the company on their
+ * own: "Kaskade" for Kaskade Pharma Group, "Kestrel Aerospace" for Kestrel
+ * Aerospace Components. One word has to be four letters or more and a name
+ * rather than a word of the business; a run of words has to start and end on
+ * a word of the name — not a legal suffix, not filler — and carry at least one
+ * word that is nobody's common word. No prefix may be a phrase some other slot
+ * already binds, or the whole name of another company: an exact name always
+ * wins over somebody else's prefix.
+ */
+function companyPrefixes(label: string, phrases: Map<SlotKind, Map<string, SlotValue[]>>, exactNames: Set<string>): string[] {
+  const parts = words(label);
+  const own = normalise(label);
+  const core = coreName(label);
+  const filler = (w: string): boolean => COMPANY_NOISE.has(w) || STOPWORDS.has(w) || /^\d+$/.test(w);
+  const distinctive = (w: string): boolean => w.length >= 4 && !filler(w) && !COMMON_WORDS.has(w);
+  const taken = (prefix: string): boolean => {
+    for (const [kind, map] of phrases) if (!RECORD_KINDS.has(kind) && map.has(prefix)) return true;
+    return false;
+  };
+  const out: string[] = [];
+  for (let n = 1; n < parts.length; n++) {
+    const head = parts.slice(0, n);
+    if (filler(head[0]) || filler(head[n - 1])) continue;
+    if (n === 1 ? !distinctive(head[0]) : !head.some(distinctive)) continue;
+    const prefix = head.join(' ');
+    if (exactNames.has(prefix) && own !== prefix && core !== prefix) continue;
+    if (taken(prefix)) continue;
+    out.push(prefix);
+  }
+  return out;
+}
+
+/**
+ * Every record a span could name, one per record: what the refusal lists when
+ * `bind` finds more than one. A company and its billing customer share a name
+ * and are one candidate, the company.
+ */
+export function candidates(kind: SlotKind, tokens: Token[], start: number, len: number, vocab: Vocabulary): { id: string; type: string; label: string }[] {
+  if (!RECORD_KINDS.has(kind) || start + len > tokens.length || len < 1) return [];
+  const key = tokens.slice(start, start + len).map((t) => t.text).join(' ');
+  const found = (vocab.phrases.get(kind)?.get(key) ?? []).filter((v): v is SlotValue & { kind: 'record' } => v.kind === 'record');
+  const companies = found.filter((v) => v.type === 'company');
+  const chosen = companies.length ? companies : found;
+  const seen = new Set<string>();
+  const out: { id: string; type: string; label: string }[] = [];
+  for (const value of chosen) {
+    const label = normalise(value.label);
+    if (seen.has(label)) continue;
+    seen.add(label);
+    out.push({ id: value.id, type: value.type, label: value.label });
+  }
+  return out;
+}
+
+/* ---------------------------- slot descriptions --------------------------- */
+
+export interface SlotDescription {
+  /** What the slot binds, in one noun: "tone", "teammate", "period". */
+  noun: string;
+  /** The same noun for several: "tones", "teammates", "periods". */
+  plural: string;
+  /** Every value the slot takes, when the set is closed; null for free text, numbers, periods and record names. */
+  values: string[] | null;
+  /** How to phrase one, for a slot whose values are not a closed set. */
+  hint: string | null;
+}
+
+const SLOT_NOUNS: Record<SlotKind, [string, string]> = {
+  object: ['object type', 'object types'], 'activity-object': ['activity type', 'activity types'],
+  state: ['state', 'states'], 'deal-state': ['deal state', 'deal states'], 'ticket-state': ['ticket state', 'ticket states'],
+  stage: ['stage', 'stages'], pipeline: ['pipeline', 'pipelines'],
+  'snapshot-metric': ['measure of right now', 'measures of right now'], 'period-metric': ['measure over a period', 'measures over a period'],
+  'rank-metric': ['measure accounts rank by', 'measures accounts rank by'], 'ownable-metric': ['measure a teammate owns', 'measures a teammate owns'],
+  'ledger-snapshot-metric': ['ledger measure', 'ledger measures'], 'ledger-period-metric': ['ledger measure over a period', 'ledger measures over a period'],
+  period: ['period', 'periods'], currency: ['currency this workspace bills in', 'currencies'], owner: ['teammate', 'teammates'],
+  plan: ['product', 'products'], 'subscription-status': ['subscription status', 'subscription statuses'],
+  'invoice-status': ['invoice status', 'invoice statuses'], money: ['amount', 'amounts'], comparator: ['comparison', 'comparisons'],
+  number: ['number', 'numbers'], account: ['company', 'companies'], contact: ['contact', 'contacts'], deal: ['deal', 'deals'],
+  record: ['record', 'records'], meter: ['meter', 'meters'], superlative: ['superlative', 'superlatives'], most: ['superlative', 'superlatives'],
+  dimension: ['dimension', 'dimensions'], industry: ['industry', 'industries'], 'lead-source': ['lead source', 'lead sources'],
+  competitor: ['competitor', 'competitors'], 'forecast-category': ['forecast category', 'forecast categories'], region: ['region', 'regions'],
+  property: ['property', 'properties'], 'numeric-property': ['numeric property', 'numeric properties'], 'property-dim': ['property', 'properties'],
+  'draft-kind': ['kind of message', 'kinds of message'], tone: ['tone', 'tones'], text: ['text', 'texts'], quantity: ['quantity', 'quantities'],
+  'book-verb': ['verb', 'verbs'], 'mrr-movement': ['MRR movement', 'MRR movements'], 'movement-verb': ['movement', 'movements'],
+  'ageing-bucket': ['ageing bucket', 'ageing buckets'],
+};
+
+const SLOT_HINTS: Partial<Record<SlotKind, string>> = {
+  period: 'a period such as "in 2025", "last quarter" or "in the last 30 days"',
+  money: 'an amount such as "$500,000" or "€2m"',
+  number: 'a whole number',
+  quantity: 'a quantity such as "50 million" or "120"',
+  account: 'the name of a company',
+  contact: 'the name of a contact',
+  deal: 'the name of a deal',
+  record: 'the name of a company, contact, deal or ticket',
+  text: 'the words to write, after "saying" or a colon',
+};
+
+/** The one word or phrase a slot value is known by. */
+function canonicalOf(value: SlotValue): string | null {
+  switch (value.kind) {
+    case 'object': return value.plural;
+    case 'state': return value.label;
+    case 'stage': return value.label;
+    case 'pipeline': return value.label;
+    case 'metric': return value.label;
+    case 'currency': return value.code.toUpperCase();
+    case 'owner': return value.name;
+    case 'plan': return value.name;
+    case 'subscription-status': return value.label;
+    case 'invoice-status': return value.label;
+    case 'comparator': return value.label;
+    case 'meter': return value.name;
+    case 'superlative': return value.label;
+    case 'dimension': return value.label;
+    case 'option': return value.label;
+    case 'property': return value.label;
+    case 'draft-kind': return value.label;
+    case 'tone': return value.value;
+    case 'verb': return value.label;
+    case 'movement': return value.label;
+    case 'ageing-bucket': return value.label;
+    default: return null;
+  }
+}
+
+/**
+ * What a slot takes, for the catalogue and for a refusal: its noun, and every
+ * value it binds when those are a closed set — the seven tones, the stages of
+ * this workspace, its teammates — in the order the workspace lists them.
+ */
+export function describeSlot(kind: SlotKind, vocab: Vocabulary, objectType: string | null = null): SlotDescription {
+  const [noun, plural] = SLOT_NOUNS[kind];
+  const hint = SLOT_HINTS[kind] ?? null;
+  if (hint || RECORD_KINDS.has(kind)) return { noun, plural, values: null, hint };
+  if (kind === 'book-verb') return { noun, plural, values: BOOK_VERBS.map(([, , spellings]) => spellings[0]), hint: null };
+  if (kind === 'movement-verb') return { noun, plural, values: MOVEMENT_VERBS.map(([, label]) => label), hint: null };
+  const values: string[] = [];
+  const seen = new Set<string>();
+  for (const held of vocab.phrases.get(kind)?.values() ?? []) {
+    for (const value of held) {
+      if (objectType && 'objectType' in value && value.objectType !== objectType) continue;
+      const canonical = canonicalOf(value);
+      if (!canonical || seen.has(canonical.toLowerCase())) continue;
+      seen.add(canonical.toLowerCase());
+      values.push(canonical);
+    }
+  }
+  return { noun, plural, values, hint: null };
 }
 
 /* ------------------------------- binding --------------------------------- */

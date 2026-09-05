@@ -10,10 +10,11 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type
 import { api, invalidate, useMutation, type ApiClientError, type ListEnvelope } from '@/client/kernel/api';
 import { useSession } from '@/client/kernel/session';
 import {
-  Badge, Banner, Button, Combobox, DatePicker, Field, Input, Modal, MoneyInput, NumberInput,
+  Badge, Banner, Button, Combobox, Field, Input, Modal, MoneyInput, NumberInput,
   Select, Textarea, focusableWithin, humanize, useFormat, useToast,
   type ComboOption, type SelectOption,
 } from '@/client/design';
+import { DateField } from './date-field';
 import {
   emptyValue, num, reasonOptions, revertMove, revertMoves, revertOwners, snapshotMove,
   stageRequirements, str, useDealFormat, useOutcomeSplit,
@@ -171,10 +172,11 @@ export function PropertyInput({
     case 'date':
     case 'datetime':
       return (
-        <DatePicker
+        <DateField
           value={typeof value === 'number' ? value : null}
           onChange={(ts) => onChange(ts)}
           invalid={invalid}
+          autoFocus={autoFocus}
           aria-label={label}
         />
       );
@@ -391,7 +393,7 @@ export function NewDealDialog({
             <MoneyInput value={amount} onChange={setAmount} currency={session.currency} locale={session.locale} aria-label="Amount" />
           </Field>
           <Field label="Close date" error={errorFor(create.error, 'close_date')}>
-            <DatePicker value={closeDate} onChange={setCloseDate} aria-label="Close date" />
+            <DateField value={closeDate} onChange={setCloseDate} aria-label="Close date" />
           </Field>
         </div>
 
@@ -547,7 +549,7 @@ export function StageMoveDialog({
             disabled={missing.length > 0}
             onClick={() => { void move.run().catch(() => undefined); }}
           >
-            {to.is_won ? 'Mark won' : to.is_closed ? 'Mark closed' : `Move to ${to.label}`}
+            {to.is_won ? 'Mark won' : to.is_closed ? 'Mark lost' : `Move to ${to.label}`}
           </Button>
         </>
       }
@@ -611,7 +613,7 @@ export function StageMoveDialog({
             hint={`${to.is_won ? 'The day this deal books.' : 'The day it was lost.'} ${closeDate === null ? 'Leave it empty and the server stamps today.' : `${f.calendarDate(closeDate)} — ${f.calendarRelative(closeDate)}.`}`}
             error={errorFor(move.error, 'close_date')}
           >
-            <DatePicker
+            <DateField
               value={closeDate}
               onChange={setCloseDate}
               invalid={!!errorFor(move.error, 'close_date')}

@@ -71,8 +71,12 @@ async function pickCustomer(page: Page, scope: ReturnType<Page['getByRole']>, na
   const box = scope.getByRole('combobox').first();
   await box.click();
   await page.keyboard.type(name.slice(0, 18));
-  await expect(page.locator('[role=option]').first()).toBeVisible();
-  await page.keyboard.press('Enter');
+  // The unsearched list is on screen before the search answers, so "the first
+  // option" was a race that the newest account won. The match is waited for by
+  // name and chosen by name.
+  const match = page.locator('[role=option]', { hasText: name }).first();
+  await expect(match).toBeVisible();
+  await match.click();
 }
 
 test.beforeEach(async ({ page }) => { await signIn(page); });
@@ -664,7 +668,10 @@ test('billing registers navigation, palette commands and a home widget', async (
  */
 test('every billing boundary on an invoice agrees with the API’s own words', async ({ page }) => {
   const open = await json(page, '/v1/invoices?status=open&limit=100');
-  const invoice = open.data.find((row: { due_date: number | null }) => row.due_date) ?? open.data[0];
+  // A bill raised by hand covers no period and says so instead of printing
+  // one; the boundaries under test belong to a bill that has them.
+  const periodic = open.data.filter((row: { billing_reason: string }) => row.billing_reason !== 'manual');
+  const invoice = periodic.find((row: { due_date: number | null }) => row.due_date) ?? periodic[0];
   test.skip(!invoice, 'nothing is owed in this workspace');
 
   const utc = (ts: number) => new Intl.DateTimeFormat('en-US', {
@@ -769,10 +776,16 @@ test('the retry schedule is visible and an operator can stand it down', async ({
 });
 
 test('the workspace retry schedule can be changed where an operator meets it', async ({ page }) => {
-  const queue = await json(page, '/v1/dunning?status=all&limit=10');
-  test.skip(!queue.data.length, 'no recovery campaign exists');
+  // A campaign still running always has its bill; a finished one may belong
+  // to an account since removed, whose bill went with it.
+  const live = await json(page, '/v1/dunning?status=recovering&limit=10');
+  const queue = live.data.length ? live : await json(page, '/v1/dunning?status=all&limit=50');
+  // The API prints the bill's number on a campaign; when the bill is gone it
+  // falls back to the id, which is the tell.
+  const campaign = queue.data.find((row: { invoice: string; invoice_number: string }) => row.invoice_number !== row.invoice);
+  test.skip(!campaign, 'no recovery campaign with a bill still on the books');
 
-  await page.goto(`/billing/invoices/${queue.data[0].invoice}?tab=collection`, { waitUntil: 'networkidle' });
+  await page.goto(`/billing/invoices/${campaign.invoice}?tab=collection`, { waitUntil: 'networkidle' });
   await page.getByRole('button', { name: 'Change the retry schedule…' }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog).toContainText('workspace');
@@ -1435,9 +1448,16 @@ test('a record that does not exist offers the way back, not a doomed retry', asy
  * operator is a way to do it and an honest sentence about what it does — not a
  * dead end that says "nothing is waiting on this account" and stops.
  */
-test('a one-off amount can be charged to an account from the invoice screen', async ({ page }) => {
-  const customers = await json(page, '/v1/customers?limit=25');
-  const account = customers.data.find((row: { balance: number }) => row.balance === 0) ?? customers.data[0];
+test('a one-off amount can be carried on an account’s balance from the invoice screen', async ({ page }) => {
+  const customers = await json(page, '/v1/customers?limit=200');
+  // The account is picked by typing the start of its name, so it must be the
+  // only account that starts that way — earlier runs of this file leave
+  // "Playwright …" accounts behind that share a prefix.
+  const prefix = (name: string) => name.slice(0, 18);
+  const prefixes = new Map<string, number>();
+  for (const row of customers.data) prefixes.set(prefix(row.name), (prefixes.get(prefix(row.name)) ?? 0) + 1);
+  const unique = customers.data.filter((row: { name: string }) => prefixes.get(prefix(row.name)) === 1);
+  const account = unique.find((row: { balance: number }) => row.balance === 0) ?? unique[0];
   const before = account.balance;
 
   await page.goto('/billing/invoices', { waitUntil: 'networkidle' });
@@ -1445,8 +1465,10 @@ test('a one-off amount can be charged to an account from the invoice screen', as
   const dialog = page.getByRole('dialog');
   await pickCustomer(page, dialog, account.name);
 
-  await dialog.getByRole('button', { name: /one-off amount/ }).click();
-  const charge = page.getByRole('dialog', { name: 'Charge a one-off amount' });
+  // The path is named for what it does — a balance adjustment the next invoice
+  // draws down — not "Charge", which it never was.
+  await dialog.getByRole('button', { name: /Adjust the balance/ }).click();
+  const charge = page.getByRole('dialog', { name: 'Adjust the account balance' });
   await expect(charge).toBeVisible();
   await expect(charge).toContainText('next invoice');
 
@@ -1457,9 +1479,11 @@ test('a one-off amount can be charged to an account from the invoice screen', as
   await expect.poll(async () => (await json(page, `/v1/customers/${account.id}`)).balance)
     .toBe(before + 25_000);
 
-  // It is on the account's ledger, in the words the balance tile uses.
+  // It is on the account's ledger, in the words the balance tile uses. The
+  // newest entry is the one this run wrote; an earlier run of this file on the
+  // same workspace leaves its own behind.
   await page.goto(`/billing/customers/${account.id}?tab=ledger`, { waitUntil: 'networkidle' });
-  const row = page.locator('tbody tr', { hasText: 'Onboarding and commissioning' });
+  const row = page.locator('tbody tr', { hasText: 'Onboarding and commissioning' }).first();
   await expect(row).toBeVisible();
   await expect(row).toContainText('owed');
 
@@ -1762,4 +1786,669 @@ test('the payment dialog is operable from the keyboard alone', async ({ page }) 
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();
   expect((await json(page, `/v1/invoices/${invoice.id}`)).status).toBe('open');
+});
+
+/* ======================= what the screen says after a write ======================= */
+
+/**
+ * A customer with a card the simulated issuer will refuse, made through the
+ * API so the test is about the screen that reports the decline and not about
+ * the one that attaches the card.
+ */
+async function customerWithDecliningCard(page: Page, name: string): Promise<{ id: string; name: string }> {
+  const customer = await (await page.request.post('/api/v1/customers', {
+    data: { name, currency: 'usd', invoice_settings: { days_until_due: 0 } },
+  })).json();
+  await page.request.post('/api/v1/payment_methods', {
+    data: { customer: customer.id, type: 'card', brand: 'visa', last4: '0002', exp_month: 12, exp_year: 2030, simulated_behavior: 'card_declined', set_default: true },
+  });
+  return { id: customer.id, name: customer.name };
+}
+
+/** Leave the workspace as it was found: stop the subscriptions, remove the account. */
+async function removeAccount(page: Page, customerId: string): Promise<void> {
+  const subs = await json(page, `/v1/subscriptions?customer=${customerId}&status=all&limit=20`);
+  for (const sub of subs.data ?? []) {
+    if (sub.status !== 'canceled') await page.request.post(`/api/v1/subscriptions/${sub.id}/cancel`, { data: {} });
+  }
+  // An open bill on a deleted account is a receivable nobody can settle, and
+  // the next test to pick "an open invoice" would pick it.
+  const open = await json(page, `/v1/invoices?customer=${customerId}&status=open_like&limit=20`);
+  for (const invoice of open.data ?? []) {
+    await page.request.post(`/api/v1/invoices/${invoice.id}/void`, { data: {} });
+  }
+  await page.request.delete(`/api/v1/customers/${customerId}`);
+}
+
+test('a subscription whose first charge is declined is reported as declined, not as billed', async ({ page }) => {
+  const account = await customerWithDecliningCard(page, `Declining Card Co ${Date.now().toString().slice(-6)}`);
+  await page.goto(`/billing/customers/${account.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'New subscription' }).click();
+  const dialog = page.getByRole('dialog', { name: 'New subscription' });
+  await dialog.getByLabel('Price 1').selectOption('price_nw_starter_monthly');
+  // The basket is priced by the API before the button carries a figure; under
+  // a full suite's load that can take longer than the default expect window.
+  await expect(dialog.getByRole('button', { name: /^Create · / })).toBeEnabled({ timeout: 20_000 });
+  await dialog.getByRole('button', { name: /^Create · / }).click();
+
+  // The toast is worded from the record after the collector has answered.
+  const toast = page.locator('.ain-toast', { hasText: 'Subscription created' }).first();
+  await expect(toast).toBeVisible({ timeout: 25_000 });
+  await expect(toast).toContainText('declined');
+  await expect(toast).not.toContainText('open and billed');
+
+  // And the screen it lands on agrees with the API without a reload.
+  await expect(page).toHaveURL(/\/billing\/subscriptions\/sub_/);
+  const id = page.url().split('/').pop() as string;
+  await expect.poll(async () => (await json(page, `/v1/subscriptions/${id}`)).status).toBe('past_due');
+  await expect(page.locator('.ain-page__title')).toContainText('Past due');
+  await expect(page.locator('.ain-page__title')).not.toContainText(/\bActive\b/);
+  await removeAccount(page, account.id);
+});
+
+test('deleting a customer is confirmed with what it holds, and refused while it is subscribed', async ({ page }) => {
+  const account = await customerWithDecliningCard(page, `Delete Me Co ${Date.now().toString().slice(-6)}`);
+  await page.goto(`/billing/customers/${account.id}`, { waitUntil: 'networkidle' });
+
+  // One click on the menu item opens a dialog; it does not delete.
+  await page.getByRole('button', { name: 'More account actions' }).click();
+  await page.getByRole('menuitem', { name: /Delete this customer/ }).click();
+  const dialog = page.getByRole('dialog', { name: `Delete ${account.name}?` });
+  await expect(dialog).toBeVisible();
+  expect((await page.request.get(`/api/v1/customers/${account.id}`)).status()).toBe(200);
+  await expect(dialog).toContainText('no live subscription');
+  await expect(dialog).toContainText('no route that restores');
+
+  // Walk away: nothing happened.
+  await dialog.getByRole('button', { name: 'Keep the account' }).click();
+  await expect(dialog).toBeHidden();
+  expect((await page.request.get(`/api/v1/customers/${account.id}`)).status()).toBe(200);
+
+  // With a live subscription the door is closed, and says why, before the 409.
+  await page.request.post('/api/v1/subscriptions', {
+    data: { customer: account.id, items: [{ price: 'price_nw_starter_monthly', quantity: 1 }], collection_method: 'send_invoice' },
+  });
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'More account actions' }).click();
+  await page.getByRole('menuitem', { name: /Delete this customer/ }).click();
+  const blocked = page.getByRole('dialog', { name: `Delete ${account.name}?` });
+  await expect(blocked).toContainText('refuses to delete it');
+  await expect(blocked.getByRole('button', { name: `Delete ${account.name}` })).toBeDisabled();
+  await page.keyboard.press('Escape');
+
+  // The list's row menu goes through the same dialog, and the confirm deletes.
+  const sub = (await json(page, `/v1/subscriptions?customer=${account.id}&status=all`)).data[0];
+  await page.request.post(`/api/v1/subscriptions/${sub.id}/cancel`, { data: {} });
+  await page.goto(`/billing/customers?q=${encodeURIComponent(account.name)}`, { waitUntil: 'networkidle' });
+  const row = page.locator('tbody tr', { hasText: account.name }).first();
+  await row.hover();
+  await row.getByRole('button', { name: 'Row actions' }).click();
+  await page.getByRole('menuitem', { name: /Delete this customer/ }).click();
+  const confirm = page.getByRole('dialog', { name: `Delete ${account.name}?` });
+  await expect(confirm.getByRole('button', { name: `Delete ${account.name}` })).toBeEnabled();
+  await confirm.getByRole('button', { name: `Delete ${account.name}` }).click();
+  await expect.poll(async () => (await page.request.get(`/api/v1/customers/${account.id}`)).status()).toBe(404);
+});
+
+test('a list row’s actions menu opens from the keyboard, and Enter does not leave the page', async ({ page }) => {
+  await page.goto('/billing/customers', { waitUntil: 'networkidle' });
+  const button = page.locator('tbody tr').first().getByRole('button', { name: 'Row actions' });
+  await button.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('menu', { name: 'Row actions' })).toBeVisible();
+  await expect(page).toHaveURL(/\/billing\/customers$/);
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('menu', { name: 'Row actions' })).toBeHidden();
+
+  // Space opens it too, rather than ticking the row's checkbox.
+  await button.focus();
+  await page.keyboard.press(' ');
+  await expect(page.getByRole('menu', { name: 'Row actions' })).toBeVisible();
+  await expect(page.locator('tbody tr').first().getByRole('checkbox')).not.toBeChecked();
+  await page.keyboard.press('Escape');
+
+  // The same guard holds on the other two books.
+  for (const route of ['/billing/subscriptions', '/billing/invoices']) {
+    await page.goto(route, { waitUntil: 'networkidle' });
+    const rowMenu = page.locator('tbody tr').first().getByRole('button', { name: 'Row actions' });
+    await rowMenu.focus();
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('menu', { name: 'Row actions' }), route).toBeVisible();
+    await expect(page).toHaveURL(new RegExp(`${route}$`));
+    await page.keyboard.press('Escape');
+  }
+});
+
+test('a scheduled cancellation can be withdrawn from the screen that shows it', async ({ page }) => {
+  const subs = await json(page, '/v1/subscriptions?status=active&limit=50');
+  const sub = subs.data.find((row: { cancel_at_period_end: boolean; schedule: string | null }) => !row.cancel_at_period_end && !row.schedule);
+  test.skip(!sub, 'no active subscription to cancel');
+
+  await page.goto(`/billing/subscriptions/${sub.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'More actions' }).click();
+  await page.getByRole('menuitem', { name: 'Cancel…' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Cancel at period end' }).click();
+  await expect.poll(async () => (await json(page, `/v1/subscriptions/${sub.id}`)).cancel_at_period_end).toBe(true);
+
+  // The banner offers the way back, and the menu does too.
+  const banner = page.locator('.ain-banner', { hasText: 'Scheduled to cancel' });
+  await expect(banner).toBeVisible();
+  await page.getByRole('button', { name: 'More actions' }).click();
+  await expect(page.getByRole('menuitem', { name: /Don’t cancel/ })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await banner.getByRole('button', { name: 'Keep it running' }).click();
+  await expect(page.getByText('Cancellation withdrawn')).toBeVisible();
+  await expect.poll(async () => (await json(page, `/v1/subscriptions/${sub.id}`)).cancel_at_period_end).toBe(false);
+  await expect(banner).toBeHidden();
+});
+
+test('a canceled subscription offers nothing to change and no next invoice', async ({ page }) => {
+  const account = await customerWithDecliningCard(page, `Ended Co ${Date.now().toString().slice(-6)}`);
+  const sub = await (await page.request.post('/api/v1/subscriptions', {
+    data: { customer: account.id, items: [{ price: 'price_nw_starter_monthly', quantity: 1 }], collection_method: 'send_invoice' },
+  })).json();
+  await page.request.post(`/api/v1/subscriptions/${sub.id}/cancel`, { data: {} });
+  expect((await json(page, `/v1/subscriptions/${sub.id}`)).status).toBe('canceled');
+
+  await page.goto(`/billing/subscriptions/${sub.id}`, { waitUntil: 'networkidle' });
+  await expect(page.locator('.ain-page__title')).toContainText('Canceled');
+  await expect(page.getByRole('button', { name: 'Change plan or quantity' })).toHaveCount(0);
+  await expect(page.locator('.bl-headline__label', { hasText: /^Ended$/ })).toBeVisible();
+  await expect(page.locator('.bl-headline__label', { hasText: 'Next invoice' })).toHaveCount(0);
+  // The terms are a record, not settings.
+  await expect(page.getByLabel('Collection', { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel('Net terms', { exact: true })).toHaveCount(0);
+  await removeAccount(page, account.id);
+});
+
+test('an immediate change says which invoice it raised and what paid it', async ({ page }) => {
+  const subs = await json(page, '/v1/subscriptions?status=active&limit=50&expand=customer');
+  const sub = subs.data.find((row: { items: { metered: boolean; quantity: number }[]; cancel_at_period_end: boolean; schedule: string | null }) =>
+    !row.cancel_at_period_end && !row.schedule && row.items.some((item) => !item.metered && item.quantity > 1));
+  test.skip(!sub, 'no active subscription carries a per-seat item');
+  const seat = sub.items.find((item: { metered: boolean; quantity: number }) => !item.metered && item.quantity > 1);
+
+  // Enough credit on the account that the immediate bill is paid from it.
+  await page.request.post(`/api/v1/customers/${sub.customer}/balance_transactions`, {
+    data: { amount: -500_000, description: 'Credit for the always-invoice test', type: 'adjustment' },
+  });
+
+  await page.goto(`/billing/subscriptions/${sub.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Change plan or quantity' }).click();
+  const dialog = page.getByRole('dialog');
+  const index = sub.items.indexOf(seat) + 1;
+  const quantity = dialog.getByRole('spinbutton', { name: `Quantity for item ${index}` });
+  await quantity.fill(String(seat.quantity + 2));
+  await quantity.press('Tab');
+  await dialog.getByLabel('Proration').selectOption('always_invoice');
+
+  // The preview says the balance will be drawn before the bill exists.
+  await expect(dialog.getByTestId('bl-balance-drawn')).toBeVisible();
+  await expect(dialog).toContainText('Paid from the balance now');
+
+  await dialog.getByRole('button', { name: /^Apply/ }).click();
+  const toast = page.locator('.ain-toast', { hasText: 'Subscription changed' }).first();
+  await expect(toast).toBeVisible({ timeout: 15_000 });
+  await expect(toast).not.toContainText('waiting on the next invoice');
+
+  // The sentence names the invoice the API actually raised, and the balance that paid it.
+  const raised = (await json(page, `/v1/invoices?subscription=${sub.id}&limit=1`)).data[0];
+  expect(raised.billing_reason).toBe('subscription_update');
+  await expect(toast).toContainText(raised.number);
+  await expect(toast).toContainText('account balance');
+});
+
+test('a payment can be refunded from the invoice that collected it, and the bill is owed again', async ({ page }) => {
+  const account = await (await page.request.post('/api/v1/customers', {
+    data: { name: `Refund Me Co ${Date.now().toString().slice(-6)}`, currency: 'usd', invoice_settings: { days_until_due: 0 } },
+  })).json();
+  await page.request.post('/api/v1/payment_methods', {
+    data: { customer: account.id, type: 'card', brand: 'visa', last4: '4242', exp_month: 12, exp_year: 2030, simulated_behavior: 'succeeds', set_default: true },
+  });
+  const sub = await (await page.request.post('/api/v1/subscriptions', {
+    data: { customer: account.id, items: [{ price: 'price_nw_starter_monthly', quantity: 1 }], collection_method: 'charge_automatically' },
+  })).json();
+  const invoiceId = sub.latest_invoice.id;
+  await expect.poll(async () => (await json(page, `/v1/invoices/${invoiceId}`)).status, { timeout: 15_000 }).toBe('paid');
+
+  await page.goto(`/billing/invoices/${invoiceId}?tab=collection`, { waitUntil: 'networkidle' });
+  // The method is named, not its id.
+  await expect(page.locator('.bl-row', { hasText: 'Authorised' }).first()).toContainText('Visa ending 4242');
+  await expect(page.locator('main')).not.toContainText(/\bpm_[A-Za-z0-9]+/);
+
+  await page.locator('.bl-row', { hasText: 'Authorised' }).first().getByRole('button', { name: /^Refund the/ }).click();
+  const dialog = page.getByRole('dialog', { name: /Refund a payment on/ });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText('owed again');
+  await dialog.getByLabel('Amount to refund').fill('40');
+  await dialog.getByRole('button', { name: /^Refund \$40\.00/ }).click();
+
+  // The toast carries the gateway's own account of what the refund did.
+  const toast = page.locator('.ain-toast', { hasText: 'refunded' }).first();
+  await expect(toast).toBeVisible();
+  await expect(toast).toContainText(sub.latest_invoice.number);
+
+  const refunds = await json(page, `/v1/refunds?invoice=${invoiceId}`);
+  expect(refunds.data).toHaveLength(1);
+  expect(refunds.data[0].amount).toBe(4000);
+  await expect.poll(async () => (await json(page, `/v1/invoices/${invoiceId}`)).amount_due).toBe(4000);
+  await expect(page.locator('.ain-page__title')).toContainText('Open');
+
+  // The register on the Payments screen lists both the charge and the refund.
+  await page.goto(`/billing/payments?customer=${account.id}`, { waitUntil: 'networkidle' });
+  await expect(page.locator('tbody tr', { hasText: account.name }).first()).toContainText('$99.00');
+  await page.getByRole('tab', { name: 'Refunds' }).click();
+  await expect(page.locator('tbody tr', { hasText: account.name }).first()).toContainText('$40.00');
+  await removeAccount(page, account.id);
+});
+
+test('the Payments register lists every presentation with the issuer’s answer', async ({ page }) => {
+  const intents = await json(page, '/v1/payment_intents?status=all&limit=1');
+  await page.goto('/billing/payments', { waitUntil: 'networkidle' });
+  await expect(page.getByRole('heading', { name: 'Payments' })).toBeVisible();
+  await expect(page.locator('.ain-table__count')).toContainText(String(intents.total_count));
+
+  // The declined filter is in the address bar, like every other list filter.
+  await page.getByLabel('Status').selectOption('requires_payment_method');
+  await expect(page).toHaveURL(/status=requires_payment_method/);
+  const declined = await json(page, '/v1/payment_intents?status=requires_payment_method&limit=200');
+  if (declined.data.length) {
+    await expect(page.locator('tbody tr[data-index]')).toHaveCount(declined.data.length);
+    await expect(page.locator('tbody tr').first()).toContainText('Declined');
+    await expect(page.locator('tbody tr').first()).toContainText(declined.data[0].last_payment_error.message);
+  } else {
+    // An empty register says so — a real empty state, not a bare grid.
+    await expect(page.getByText('No payment matches this filter')).toBeVisible();
+  }
+});
+
+test('a draft invoice’s money button is closed, and says to finalise first', async ({ page }) => {
+  const drafts = await json(page, '/v1/invoices?status=draft&limit=1');
+  test.skip(!drafts.data.length, 'no draft is held in this workspace');
+  await page.goto(`/billing/invoices/${drafts.data[0].id}`, { waitUntil: 'networkidle' });
+  const pay = page.getByRole('button', { name: 'Take a payment' });
+  await expect(pay).toBeDisabled();
+  await expect(pay).toHaveAttribute('title', /Finalise it first/);
+});
+
+test('a bill raised by hand does not print a one-day service period', async ({ page }) => {
+  // A bill swept up by hand carries no service window: the engine stamps both
+  // ends on the day it was raised. The book usually holds one; when it does
+  // not, there is nothing on screen to check.
+  const book = await json(page, '/v1/invoices?status=all&limit=200');
+  const raised = book.data.find((row: { billing_reason: string; period: { start: number; end: number } }) =>
+    row.billing_reason === 'manual' && row.period.end - row.period.start <= 86_400_000);
+  test.skip(!raised, 'no hand-raised invoice in this workspace');
+
+  await page.goto(`/billing/invoices?customer=${raised.customer}`, { waitUntil: 'networkidle' });
+  const row = page.locator('tbody tr', { hasText: raised.number });
+  await expect(row).toContainText('One-off');
+  await expect(row).not.toContainText(raised.period_display);
+
+  await page.goto(`/billing/invoices/${raised.id}`, { waitUntil: 'networkidle' });
+  await expect(page.locator('.bl-headline', { hasText: 'Total' })).toContainText('One-off');
+});
+
+/* ============================ guarded writes ============================== */
+
+/**
+ * A financial write from a list menu confirms before it runs.
+ *
+ * The record pages already price and confirm every cancellation and every bill
+ * raised by hand. The list row menus and bulk bars used to skip that — one
+ * click on "Cancel at period end" set the flag, one click on "Bill what is owed
+ * now" raised an invoice — so the same action was safe on one screen and not
+ * on the next. Each test below fires the list entry point and asks the API
+ * whether anything moved before the dialog was confirmed.
+ */
+
+interface SubRow {
+  id: string; customer: string; cancel_at_period_end: boolean; schedule: string | null; status: string;
+  current_period_end: number; recurring_subtotal: number; interval: string; interval_count: number;
+  customer_detail?: { name: string };
+}
+
+const searchList = async (page: Page, label: string, text: string) => {
+  const box = page.getByLabel(label);
+  await box.fill(text);
+};
+
+test('cancelling from the subscriptions list confirms first, and changes nothing until it is confirmed', async ({ page }) => {
+  const subs = await json(page, '/v1/subscriptions?status=active&limit=100&expand=customer');
+  const perAccount = new Map<string, number>();
+  for (const row of subs.data as SubRow[]) perAccount.set(row.customer, (perAccount.get(row.customer) ?? 0) + 1);
+  // An account with exactly one active subscription, so the row is unambiguous.
+  const found = (subs.data as SubRow[]).find((row) => !row.cancel_at_period_end && !row.schedule && perAccount.get(row.customer) === 1);
+  test.skip(!found, 'no active subscription to cancel');
+  const sub = found as SubRow;
+  const name = sub.customer_detail?.name ?? sub.customer;
+
+  await page.goto('/billing/subscriptions?status=active', { waitUntil: 'networkidle' });
+  // The search goes to the server, debounced; the grid is filtered in the
+  // browser meanwhile, so the row count settles before the answer does. The
+  // menu is opened only once the server's answer has re-rendered the grid,
+  // or it is remounted under the click.
+  const answered = page.waitForResponse((res) => res.url().includes('/v1/subscriptions') && res.url().includes('query='));
+  await searchList(page, 'Search account, plan or id', name);
+  await answered;
+  await expect(page.locator('tbody tr[data-index]')).toHaveCount(1);
+  await page.waitForLoadState('networkidle');
+  const row = page.locator('tbody tr', { hasText: name }).first();
+  await expect(row).toBeVisible();
+  const openMenu = async () => {
+    await row.hover();
+    await row.getByRole('button', { name: 'Row actions' }).click();
+    await expect(page.getByRole('menu', { name: 'Row actions' })).toBeVisible();
+    await page.waitForTimeout(350);
+  };
+  await openMenu();
+  await page.getByRole('menuitem', { name: /Cancel at period end/ }).click();
+
+  // The dialog is the record page's own: it names when, asks why, and nothing
+  // has moved yet.
+  const dialog = page.getByRole('dialog', { name: /Cancel this subscription/ });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel('When')).toBeVisible();
+  expect((await json(page, `/v1/subscriptions/${sub.id}`)).cancel_at_period_end).toBe(false);
+  await dialog.getByRole('button', { name: 'Keep it running' }).click();
+  await expect(dialog).toBeHidden();
+  expect((await json(page, `/v1/subscriptions/${sub.id}`)).cancel_at_period_end).toBe(false);
+
+  // Confirmed, it does what the menu said.
+  await openMenu();
+  await page.getByRole('menuitem', { name: /Cancel at period end/ }).click();
+  await dialog.getByRole('button', { name: 'Cancel at period end' }).click();
+  await expect.poll(async () => (await json(page, `/v1/subscriptions/${sub.id}`)).cancel_at_period_end).toBe(true);
+  await page.request.patch(`/api/v1/subscriptions/${sub.id}`, { data: { cancel_at_period_end: false } });
+});
+
+test('bulk cancel from the subscriptions list names each subscription and waits to be confirmed', async ({ page }) => {
+  await page.goto('/billing/subscriptions?status=active', { waitUntil: 'networkidle' });
+  const rows = page.locator('tbody tr[data-index]');
+  await expect(rows.first()).toBeVisible();
+  // Two rows that are not already set to end, so the count the dialog quotes
+  // is the count the write would change.
+  const picked: string[] = [];
+  const count = await rows.count();
+  for (let i = 0; i < count && picked.length < 2; i++) {
+    const text = await rows.nth(i).innerText();
+    if (/\bEnds\b/.test(text)) continue;
+    await rows.nth(i).locator('input[type=checkbox]').check();
+    picked.push(await rows.nth(i).locator('.bl-link').first().innerText());
+  }
+  test.skip(picked.length < 2, 'fewer than two subscriptions to cancel');
+  const before = (await json(page, '/v1/subscriptions?status=active&limit=100')).data
+    .filter((row: SubRow) => row.cancel_at_period_end).map((row: SubRow) => row.id) as string[];
+
+  await page.getByRole('button', { name: /Cancel .*at period end/ }).click();
+  const dialog = page.getByRole('dialog', { name: /Cancel 2 subscriptions/ });
+  await expect(dialog).toBeVisible();
+  for (const name of picked) await expect(dialog).toContainText(name);
+  await expect(dialog.getByLabel('Reason')).toBeVisible();
+  const during = (await json(page, '/v1/subscriptions?status=active&limit=100')).data.filter((row: SubRow) => row.cancel_at_period_end);
+  expect(during.length).toBe(before.length);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  const afterEscape = (await json(page, '/v1/subscriptions?status=active&limit=100')).data.filter((row: SubRow) => row.cancel_at_period_end);
+  expect(afterEscape.length).toBe(before.length);
+
+  // Confirmed, both are scheduled — and nothing else is.
+  await page.getByRole('button', { name: /Cancel .*at period end/ }).click();
+  await dialog.getByRole('button', { name: /^Cancel 2 at period end$/ }).click();
+  await expect.poll(async () => (await json(page, '/v1/subscriptions?status=active&limit=100')).data
+    .filter((row: SubRow) => row.cancel_at_period_end).length).toBe(before.length + 2);
+  const scheduled = (await json(page, '/v1/subscriptions?status=active&limit=100')).data
+    .filter((row: SubRow) => row.cancel_at_period_end && !before.includes(row.id));
+  for (const row of scheduled) await page.request.patch(`/api/v1/subscriptions/${row.id}`, { data: { cancel_at_period_end: false } });
+});
+
+test('"Bill what is owed now" on a subscription shows what would be billed before raising anything', async ({ page }) => {
+  const subs = await json(page, '/v1/subscriptions?status=active&limit=50');
+  test.skip(!subs.data[0], 'no active subscription');
+  const sub = subs.data[0] as SubRow;
+  const before = (await json(page, `/v1/invoices?customer=${sub.customer}&status=all&limit=1`)).total_count;
+
+  await page.goto(`/billing/subscriptions/${sub.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'More actions' }).click();
+  await page.getByRole('menuitem', { name: /Bill what is owed now/ }).click();
+  const dialog = page.getByRole('dialog', { name: /Bill what this account owes/ });
+  await expect(dialog).toBeVisible();
+  // Priced, or told there is nothing to price — never raised on the click.
+  await expect(dialog.getByText(/Nothing is waiting on this account|before tax/)).toBeVisible();
+  expect((await json(page, `/v1/invoices?customer=${sub.customer}&status=all&limit=1`)).total_count).toBe(before);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+});
+
+test('billing an account from the customers list goes through the same priced dialog', async ({ page }) => {
+  await page.goto('/billing/customers', { waitUntil: 'networkidle' });
+  const row = page.locator('tbody tr[data-index]').first();
+  await expect(row).toBeVisible();
+  const name = await row.locator('.bl-link').first().innerText();
+  const account = (await json(page, `/v1/customers?query=${encodeURIComponent(name)}&limit=1`)).data[0];
+  const before = (await json(page, `/v1/invoices?customer=${account.id}&status=all&limit=1`)).total_count;
+
+  await row.hover();
+  await row.getByRole('button', { name: 'Row actions' }).click();
+  await page.getByRole('menuitem', { name: /Bill what is owed now/ }).click();
+  const dialog = page.getByRole('dialog', { name: /Bill what this account owes/ });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText(name, { exact: true })).toBeVisible();
+  await expect(dialog.getByText(/Nothing is waiting on this account|before tax/)).toBeVisible();
+  expect((await json(page, `/v1/invoices?customer=${account.id}&status=all&limit=1`)).total_count).toBe(before);
+  await page.keyboard.press('Escape');
+});
+
+test('"Bill N accounts" previews every account before anything is raised', async ({ page }) => {
+  await page.goto('/billing/customers', { waitUntil: 'networkidle' });
+  const rows = page.locator('tbody tr[data-index]');
+  await expect(rows.first()).toBeVisible();
+  test.skip((await rows.count()) < 2, 'fewer than two accounts');
+  const names = [await rows.nth(0).locator('.bl-link').first().innerText(), await rows.nth(1).locator('.bl-link').first().innerText()];
+  await rows.nth(0).locator('input[type=checkbox]').check();
+  await rows.nth(1).locator('input[type=checkbox]').check();
+  const before = (await json(page, '/v1/invoices?status=all&limit=1')).total_count;
+
+  await page.getByRole('button', { name: /^Bill 2 accounts/ }).click();
+  const dialog = page.getByRole('dialog', { name: /Bill 2 accounts/ });
+  await expect(dialog).toBeVisible();
+  for (const name of names) {
+    // Each account gets its own verdict: the lines it would be billed, or the
+    // fact that nothing is waiting and it will be left alone.
+    const line = dialog.locator('tr', { hasText: name });
+    await expect(line).toBeVisible();
+    await expect(line).toContainText(/Nothing waiting|line/);
+  }
+  expect((await json(page, '/v1/invoices?status=all&limit=1')).total_count).toBe(before);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+});
+
+test('the one-off path under "Bill an account" says it adjusts the balance rather than claiming to charge', async ({ page }) => {
+  const customers = await json(page, '/v1/customers?limit=12');
+  let quiet: { id: string; name: string } | null = null;
+  for (const row of customers.data) {
+    const pending = await json(page, `/v1/customers/${row.id}/pending_items`);
+    if (pending.data.length === 0) { quiet = row; break; }
+  }
+  test.skip(!quiet, 'every account has something waiting');
+
+  await page.goto('/billing/invoices', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Bill an account' }).first().click();
+  const dialog = page.getByRole('dialog', { name: /Bill what this account owes/ });
+  await pickCustomer(page, dialog, quiet!.name);
+  await expect(dialog.getByText('Nothing is waiting on this account')).toBeVisible();
+  // There is no route that puts a hand-written line on an invoice, and the
+  // dialog says so instead of offering a "charge" that is a balance debit.
+  await expect(dialog).toContainText(/balance/);
+  await expect(dialog.getByRole('button', { name: /Charge a one-off amount/ })).toHaveCount(0);
+  await dialog.getByRole('button', { name: /Adjust the balance instead/ }).click();
+  const adjust = page.getByRole('dialog', { name: /Adjust the account balance/ });
+  await expect(adjust).toBeVisible();
+  await expect(adjust).not.toContainText(/Charge a one-off/);
+});
+
+/* ============================ what the figures say ========================= */
+
+test('an invoice’s Total is what was billed, with the balance drawn shown as its own line', async ({ page }) => {
+  const name = `Balance Draw Co ${Date.now().toString().slice(-6)}`;
+  const account = await (await page.request.post('/api/v1/customers', {
+    data: { name, currency: 'usd', invoice_settings: { days_until_due: 30 } },
+  })).json();
+  await page.request.post(`/api/v1/customers/${account.id}/balance_transactions`, {
+    data: { amount: -5000, description: 'Goodwill credit before the first bill', type: 'adjustment' },
+  });
+  const sub = await (await page.request.post('/api/v1/subscriptions', {
+    data: { customer: account.id, items: [{ price: 'price_nw_starter_monthly', quantity: 1 }], collection_method: 'send_invoice' },
+  })).json();
+  const invoiceId = sub.latest_invoice?.id;
+  test.skip(!invoiceId, 'the first invoice was not raised');
+  const invoice = await json(page, `/v1/invoices/${invoiceId}`);
+  test.skip(invoice.balance_applied >= 0, 'the balance was not drawn on this bill');
+  const billed = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format((invoice.subtotal + invoice.tax) / 100);
+  expect(billed).not.toBe(invoice.total_display);
+
+  await page.goto(`/billing/invoices/${invoiceId}`, { waitUntil: 'networkidle' });
+  const totalTile = page.locator('.bl-headline__item', { has: page.locator('.bl-headline__label', { hasText: /^Total$/ }) });
+  await expect(totalTile.locator('.bl-headline__value')).toHaveText(billed);
+  const totals = page.locator('.ain-card', { hasText: 'Account balance applied' });
+  await expect(totals.locator('.bl-total', { hasText: /^Total/ }).locator('.bl-total__value')).toHaveText(billed);
+  await expect(totals.locator('.bl-total', { hasText: 'Account balance applied' })).toContainText(invoice.balance_applied_display);
+  await expect(totals.locator('.bl-total', { hasText: 'Amount due' })).toContainText(invoice.amount_due_display);
+
+  await page.goto(`/billing/invoices?customer=${account.id}`, { waitUntil: 'networkidle' });
+  await expect(page.locator('tbody tr', { hasText: invoice.number })).toContainText(billed);
+  await removeAccount(page, account.id);
+});
+
+test('the bulk void dialog pairs every invoice with its own amount', async ({ page }) => {
+  const open = await json(page, '/v1/invoices?status=open&limit=50');
+  const rows = (await notBeingChased(page, open.data)).filter((row) => row.amount_due > 0);
+  const first = rows[0];
+  const second = rows.find((row) => row.amount_due_display !== rows[0]?.amount_due_display);
+  test.skip(!first || !second, 'no two open invoices with different amounts');
+  const pair = [first, second] as InvoiceRow[];
+
+  await page.goto('/billing/invoices?status=open', { waitUntil: 'networkidle' });
+  for (const invoice of pair) {
+    await searchList(page, 'Search number, account or id', invoice.number);
+    await page.locator('tbody tr', { hasText: invoice.number }).locator('input[type=checkbox]').check();
+  }
+  await searchList(page, 'Search number, account or id', '');
+  await page.getByRole('button', { name: /^Void 2/ }).click();
+  const dialog = page.getByRole('dialog', { name: /Void 2 invoices/ });
+  await expect(dialog).toBeVisible();
+  for (const invoice of pair) {
+    const line = dialog.locator('tr', { hasText: invoice.number });
+    await expect(line).toContainText(invoice.amount_due_display);
+    await expect(line).toContainText(invoice.customer_name);
+  }
+  const before = (await json(page, `/v1/invoices/${pair[0].id}`)).status;
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  expect((await json(page, `/v1/invoices/${pair[0].id}`)).status).toBe(before);
+});
+
+test('an invoice’s menu offers only the actions its state allows', async ({ page }) => {
+  const paid = (await json(page, '/v1/invoices?status=paid&limit=1')).data[0];
+  test.skip(!paid, 'no paid invoice');
+  await page.goto(`/billing/invoices/${paid.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'More invoice actions' }).click();
+  await expect(page.getByRole('menuitem', { name: /Issue a credit note/ })).toBeVisible();
+  await expect(page.getByRole('menuitem', { name: /Finalise this draft/ })).toHaveCount(0);
+  await expect(page.getByRole('menuitem', { name: /Void this invoice/ })).toHaveCount(0);
+  await expect(page.getByRole('menuitem', { name: /Write it off/ })).toHaveCount(0);
+  await page.keyboard.press('Escape');
+
+  const voided = (await json(page, '/v1/invoices?status=void&limit=1')).data[0];
+  if (voided) {
+    await page.goto(`/billing/invoices/${voided.id}`, { waitUntil: 'networkidle' });
+    await page.getByRole('button', { name: 'More invoice actions' }).click();
+    await expect(page.getByRole('menuitem', { name: /Open the printable document/ })).toBeVisible();
+    for (const gone of [/Finalise this draft/, /Void this invoice/, /Write it off/, /Issue a credit note/, /Refund a payment/]) {
+      await expect(page.getByRole('menuitem', { name: gone })).toHaveCount(0);
+    }
+    await page.keyboard.press('Escape');
+  }
+
+  // The list row menu keeps the same discipline: an open bill is not a draft.
+  await page.goto('/billing/invoices?status=open', { waitUntil: 'networkidle' });
+  const row = page.locator('tbody tr[data-index]').first();
+  await row.hover();
+  await row.getByRole('button', { name: 'Row actions' }).click();
+  await expect(page.getByRole('menuitem', { name: /Void/ })).toBeVisible();
+  await expect(page.getByRole('menuitem', { name: /Finalise this draft/ })).toHaveCount(0);
+  await page.keyboard.press('Escape');
+});
+
+test('a yearly plan’s annual figure is the fee, not twelve rounded twelfths of it', async ({ page }) => {
+  const subs = await json(page, '/v1/subscriptions?status=active_like&limit=100');
+  const found = (subs.data as SubRow[]).find((row) => row.interval === 'year' && row.interval_count === 1 && row.recurring_subtotal % 12 !== 0 && row.status !== 'paused');
+  test.skip(!found, 'no yearly subscription whose fee does not divide by twelve');
+  const yearly = found as SubRow;
+  const summary = await json(page, `/v1/customers/${yearly.customer}/summary`);
+  test.skip(summary.subscriptions.live !== 1, 'the account has more than one live subscription');
+  const annual = new Intl.NumberFormat('en-US', { style: 'currency', currency: summary.customer.currency.toUpperCase() }).format(yearly.recurring_subtotal / 100);
+
+  await page.goto(`/billing/customers/${yearly.customer}`, { waitUntil: 'networkidle' });
+  const tile = page.locator('.bl-headline__item', { has: page.locator('.bl-headline__label', { hasText: /^MRR$/ }) });
+  await expect(tile.locator('.bl-headline__caption')).toContainText(`${annual} a year`);
+});
+
+test('lifetime value is captioned as what it is — collected — with the open bill as its own sentence', async ({ page }) => {
+  // The seeded book has such an account within its first dozen names; reading
+  // fifty summaries here is what tips a full run of this file into the rate
+  // limiter, so the search stops at twelve.
+  const customers = await json(page, '/v1/customers?limit=12');
+  let target: { id: string } | null = null;
+  for (const row of customers.data) {
+    const summary = await json(page, `/v1/customers/${row.id}/summary`);
+    if (summary.open_invoices.total > 0 && summary.lifetime_value.amount > 0) { target = row; break; }
+  }
+  test.skip(!target, 'no account with both collected money and an open bill');
+
+  await page.goto(`/billing/customers/${target!.id}`, { waitUntil: 'networkidle' });
+  const tile = page.locator('.bl-headline__item', { has: page.locator('.bl-headline__label', { hasText: /^Lifetime value$/ }) });
+  const caption = tile.locator('.bl-headline__caption');
+  await expect(caption).toContainText(/Collected/);
+  await expect(caption).toContainText(/still owed/);
+  await expect(caption).not.toContainText(/of it is still open/);
+});
+
+test('the payments register shows the whole method without truncating it', async ({ page }) => {
+  const intents = await json(page, '/v1/payment_intents?limit=50');
+  const withMethod = intents.data.find((row: { payment_method: string | null }) => row.payment_method);
+  test.skip(!withMethod, 'no payment carries a method');
+
+  await page.goto('/billing/payments', { waitUntil: 'networkidle' });
+  const header = page.locator('thead th', { hasText: /^Method/ });
+  await expect(header).toBeVisible();
+  const index = await header.evaluate((th) => Array.from(th.parentElement!.children).indexOf(th));
+  const cells = page.locator('tbody tr[data-index] td').filter({ hasText: /ending|No method|since removed/ });
+  await expect(cells.first()).toBeVisible();
+  const truncated = await page.locator('tbody tr[data-index]').evaluateAll((rows, i) => rows
+    .map((row) => row.children[i] as HTMLElement)
+    .filter((td) => td && td.scrollWidth > td.clientWidth + 1).length, index);
+  expect(truncated).toBe(0);
+});
+
+test('bulk pause from the subscriptions list asks what happens to the invoices before it holds any', async ({ page }) => {
+  await page.goto('/billing/subscriptions?status=active', { waitUntil: 'networkidle' });
+  const rows = page.locator('tbody tr[data-index]');
+  await expect(rows.first()).toBeVisible();
+  test.skip((await rows.count()) < 2, 'fewer than two subscriptions');
+  const names = [await rows.nth(0).locator('.bl-link').first().innerText(), await rows.nth(1).locator('.bl-link').first().innerText()];
+  await rows.nth(0).locator('input[type=checkbox]').check();
+  await rows.nth(1).locator('input[type=checkbox]').check();
+  const paused = (await json(page, '/v1/subscriptions?status=paused&limit=100')).total_count;
+
+  await page.getByRole('button', { name: /^Pause 2/ }).click();
+  const dialog = page.getByRole('dialog', { name: /Pause collection on 2 subscriptions/ });
+  await expect(dialog).toBeVisible();
+  for (const name of names) await expect(dialog).toContainText(name);
+  await expect(dialog.getByLabel('What happens to invoices raised while paused')).toBeVisible();
+  expect((await json(page, '/v1/subscriptions?status=paused&limit=100')).total_count).toBe(paused);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  expect((await json(page, '/v1/subscriptions?status=paused&limit=100')).total_count).toBe(paused);
 });

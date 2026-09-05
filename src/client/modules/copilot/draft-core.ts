@@ -315,3 +315,60 @@ export const LEDGER_PROMISE = {
 
 export const ledgerPromise = (): string =>
   `Read from the billing ledger just now. Before this draft can be logged — edits included — ${LEDGER_PROMISE.checks.join('; ')}. ${LEDGER_PROMISE.limit}`;
+
+/* --------------------------- the deal picker's rows ------------------------ */
+
+/**
+ * What a deal option says under its name.
+ *
+ * The picker printed the deal's id under every option — `deal_nw_58`,
+ * `deal_nw_26` — which tells a person choosing between two "pilot expansion"
+ * deals nothing. The stage and the amount are what distinguish them.
+ */
+export function dealOptionDescription(
+  row: { properties?: Record<string, unknown> | null },
+  money: (minor: number, currency?: string) => string,
+): string {
+  const properties = row.properties ?? {};
+  const stage = typeof properties.deal_stage === 'string' && properties.deal_stage
+    ? properties.deal_stage.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase())
+    : null;
+  const currency = typeof properties.currency === 'string' && properties.currency ? properties.currency : undefined;
+  const amount = typeof properties.amount === 'number' && Number.isFinite(properties.amount) ? money(properties.amount, currency) : null;
+  return [stage, amount].filter((part): part is string => !!part).join(' · ');
+}
+
+/* ------------------------------ who it is to ------------------------------ */
+
+/**
+ * The "Write it to" field, in each of the states it can be in.
+ *
+ * With nothing chosen yet it said "No contact linked · This record has no
+ * contacts linked, so the draft is addressed generically" — a verdict about a
+ * record nobody had picked, printed above a search box that was still empty.
+ * The three states are different facts and each gets its own words.
+ */
+export function recipientField(state: { hasTarget: boolean; loading: boolean; contacts: number }): {
+  placeholder: string;
+  hint: string;
+  disabled: boolean;
+} {
+  if (!state.hasTarget) {
+    return { placeholder: 'Choose a deal first', hint: 'The contacts come from the deal you pick.', disabled: true };
+  }
+  if (state.loading) {
+    return { placeholder: 'The primary contact', hint: 'Reading this record’s contacts…', disabled: true };
+  }
+  if (!state.contacts) {
+    return {
+      placeholder: 'No contact linked',
+      hint: 'This record has no contacts linked, so the draft is addressed generically.',
+      disabled: true,
+    };
+  }
+  return {
+    placeholder: 'The primary contact',
+    hint: 'Leave it on the primary contact and the engine picks whoever owns the relationship.',
+    disabled: false,
+  };
+}

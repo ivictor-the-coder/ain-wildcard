@@ -1110,6 +1110,9 @@ describe('a write to a customer record is approved by a person and never carries
     const queue = await expectOk('GET', '/v1/ai/approvals');
     const approval = queue.data.find((a: Body) => a.run_id === answer.run_id);
     assert.ok(approval, 'the gate raised an approval request a person can see');
+    // The card the completion showed carries the id the queue decides on, so a
+    // caller can approve what it was just shown without a second lookup.
+    assert.equal(pending.id, approval.id, 'pending_approvals carries the approval id');
     assert.deepEqual(approval.args.record_ids, [account.id]);
     assert.ok(approval.preview.some((line: string) => line.includes(account.name)), 'the card names the record');
     assert.ok(!approval.preview.some((line: string) => RAW_ID.test(line)), 'the card shows no raw id');

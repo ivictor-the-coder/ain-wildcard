@@ -472,3 +472,174 @@ button.crm-prop__value:focus-visible .crm-prop__pencil { opacity: 1; }
    side the moment anyone typed in it. */
 .crm-toolsearch input[type='search']::-webkit-search-cancel-button,
 .crm-toolsearch input[type='search']::-webkit-search-decoration { -webkit-appearance: none; appearance: none; display: none; }
+
+/* ---------------------------------- merge --------------------------------- */
+
+.crm-dupe__name { overflow-wrap: anywhere; min-width: 0; flex: 1; }
+.crm-dupe__facts {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3);
+  font-size: var(--text-xs); color: var(--text-secondary);
+}
+.crm-dupe__fact { display: inline-flex; align-items: center; gap: var(--space-1); min-width: 0; }
+.crm-dupe__fact svg { color: var(--text-tertiary); flex: none; }
+
+.crm-mergewarn { margin: 0 0 var(--space-3); }
+.crm-mergesec { display: flex; flex-direction: column; gap: var(--space-3); }
+.crm-mergesec__title {
+  margin: 0;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+.crm-mergesec__empty { margin: 0; font-size: var(--text-sm); color: var(--text-secondary); }
+
+.crm-mergetable__wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.crm-mergetable { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+.crm-mergetable th, .crm-mergetable td {
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border-subtle);
+  overflow-wrap: anywhere;
+}
+.crm-mergetable thead th {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--text-tertiary);
+  background: var(--bg-subtle);
+}
+.crm-mergetable tbody th { font-weight: var(--weight-medium); color: var(--text-secondary); white-space: nowrap; }
+.crm-mergetable tbody tr:last-child th, .crm-mergetable tbody tr:last-child td { border-bottom: 0; }
+/* The value that survives reads as a value; the one that goes reads as struck. */
+.crm-mergetable td.is-loses { color: var(--text-tertiary); text-decoration: line-through; text-decoration-color: var(--border-strong); }
+.crm-mergetable td.is-survives { color: var(--text-primary); }
+
+.crm-mergemoves { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.crm-mergemoves__row {
+  display: flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  min-width: 0;
+}
+.crm-mergemoves__row svg:first-child { color: var(--text-tertiary); flex: none; }
+.crm-mergemoves__row.is-conflict { border-color: var(--border-warning); background: var(--surface-warning); }
+.crm-mergemoves__name { min-width: 0; overflow-wrap: anywhere; }
+
+/* --------------------------------- import --------------------------------- */
+
+.crm-import { display: flex; flex-direction: column; gap: var(--space-5); }
+.crm-import__file { display: flex; flex-direction: column; gap: var(--space-4); }
+.crm-import__drop {
+  position: relative;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--space-2);
+  padding: var(--space-8) var(--space-5);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  text-align: center;
+  cursor: pointer;
+}
+.crm-import__drop:hover { border-color: var(--border-brand); background: var(--accent-subtle); }
+.crm-import__drop:focus-within { outline: var(--focus-ring); outline-offset: 2px; }
+.crm-import__drop svg { color: var(--text-brand); }
+.crm-import__droptitle { font-size: var(--text-sm); font-weight: var(--weight-medium); color: var(--text-primary); }
+.crm-import__drophint { font-size: var(--text-xs); color: var(--text-tertiary); max-width: 46ch; }
+/* The real control stays reachable by keyboard and by Playwright; it just
+   does not paint over the label that describes it. */
+.crm-import__drop input[type='file'] {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  opacity: 0; cursor: pointer;
+}
+.crm-import__pasterow { display: flex; justify-content: flex-end; }
+.crm-import__map, .crm-import__preview, .crm-import__result { display: flex; flex-direction: column; gap: var(--space-4); }
+.crm-import__filemeta {
+  display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3);
+  font-size: var(--text-sm); color: var(--text-secondary);
+}
+.crm-import__tablewrap {
+  overflow-x: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  max-height: 46vh;
+  overflow-y: auto;
+}
+.crm-import__table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+.crm-import__table th, .crm-import__table td {
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+  vertical-align: middle;
+  border-bottom: 1px solid var(--border-subtle);
+  white-space: nowrap;
+}
+.crm-import__table thead th {
+  position: sticky; top: 0; z-index: 1;
+  font-size: var(--text-xs); font-weight: var(--weight-medium);
+  color: var(--text-tertiary); background: var(--bg-subtle);
+}
+.crm-import__table tbody th { font-weight: var(--weight-medium); color: var(--text-secondary); }
+.crm-import__table tbody tr:last-child th, .crm-import__table tbody tr:last-child td { border-bottom: 0; }
+.crm-import__table td:last-child { white-space: normal; min-width: 220px; }
+.crm-import__sample { max-width: 260px; overflow: hidden; text-overflow: ellipsis; font-size: var(--text-xs); color: var(--text-secondary); }
+.crm-import__problems { margin: 0; padding-left: var(--space-5); display: flex; flex-direction: column; gap: var(--space-1); }
+.crm-import__done { margin: 0; font-size: var(--text-sm); color: var(--text-secondary); }
+
+/* ------------------------ property history & basis ------------------------ */
+
+.crm-prop__label { width: 100%; }
+.crm-prop__history { opacity: 0; flex: none; }
+.crm-prop:hover .crm-prop__history,
+.crm-prop:focus-within .crm-prop__history { opacity: 1; }
+.crm-prop__sla { display: inline-flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; font-size: var(--text-xs); }
+.crm-prop__basis {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  line-height: var(--leading-relaxed);
+}
+
+.crm-history__wrap { overflow-x: auto; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); }
+.crm-history { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+.crm-history th, .crm-history td {
+  padding: var(--space-2) var(--space-3);
+  text-align: left; vertical-align: top;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.crm-history thead th { font-size: var(--text-xs); font-weight: var(--weight-medium); color: var(--text-tertiary); background: var(--bg-subtle); }
+.crm-history tbody tr:last-child td { border-bottom: 0; }
+.crm-history__when { white-space: nowrap; color: var(--text-secondary); font-size: var(--text-xs); }
+.crm-history__change { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.crm-history__from { color: var(--text-tertiary); text-decoration: line-through; text-decoration-color: var(--border-strong); }
+.crm-history__to { color: var(--text-primary); }
+.crm-history__more { margin: var(--space-3) 0 0; font-size: var(--text-xs); color: var(--text-tertiary); }
+
+/* ---------------------------- timeline facts ------------------------------ */
+
+.crm-tl__facts {
+  display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2) var(--space-3);
+  margin-top: var(--space-2);
+  font-size: var(--text-xs); color: var(--text-secondary);
+}
+.crm-tl__factitem { display: inline-flex; align-items: center; }
+.crm-tl__fact { overflow-wrap: anywhere; }
+
+/* ------------------------------ status history ---------------------------- */
+
+.crm-spells { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.crm-spell { display: flex; flex-direction: column; gap: var(--space-1); padding: var(--space-3) 0; }
+.crm-spell + .crm-spell { border-top: 1px solid var(--border-subtle); }
+.crm-spell__head { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-sm); min-width: 0; }
+.crm-spell__stage { font-weight: var(--weight-medium); color: var(--text-primary); }
+.crm-spell.is-current .crm-spell__span { color: var(--text-primary); font-weight: var(--weight-medium); }
+.crm-spell__span { color: var(--text-secondary); font-size: var(--text-xs); white-space: nowrap; }
+.crm-spell__meta {
+  display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap;
+  font-size: var(--text-xs); color: var(--text-tertiary);
+}

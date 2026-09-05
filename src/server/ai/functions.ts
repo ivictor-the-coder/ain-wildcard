@@ -731,8 +731,57 @@ export function recordTimeline(ctx: Ctx, orgId: string, args: { record_id: strin
     });
   }
 
+  // The links themselves — a contact joined, a deal opened against the account
+  // — are what the record's own timeline lists first, and this one left them
+  // out. Activities are already the activity lane, so they are not linked twice.
+  if (hasTable(ctx.db, 'crm_associations')) {
+    const activity = ['note', 'call', 'meeting', 'email', 'task'];
+    for (const link of ctx.db.all<{ id: string; created: number; created_by: string | null; other_type: string; other_name: string }>(
+      `SELECT a.id, a.created, a.created_by, r.object_type AS other_type, r.display_name AS other_name
+         FROM crm_associations a
+         JOIN crm_records r ON r.id = CASE WHEN a.from_id = ? THEN a.to_id ELSE a.from_id END
+        WHERE a.org_id = ? AND (a.from_id = ? OR a.to_id = ?) AND r.archived = 0 AND r.merged_into IS NULL
+          AND r.object_type NOT IN (${activity.map(() => '?').join(', ')})
+        ORDER BY a.created DESC, a.id ASC LIMIT ?`,
+      args.record_id, orgId, args.record_id, args.record_id, ...activity, limit)) {
+      items.push({
+        id: link.id,
+        kind: 'association',
+        at: link.created,
+        title: `Linked to ${link.other_name}`,
+        body: humanise(link.other_type),
+        actor: personName(workspace, link.created_by),
+        when: formatRelative(link.created, workspace.now, workspace.locale),
+      });
+    }
+  }
+
   items.sort((a, b) => b.at - a.at);
   return { record: record?.display_name ?? args.record_id, items: items.slice(0, limit) };
+}
+
+/**
+ * How a settled bill was settled: what was paid and when. The invoice list tool
+ * carries the open-bill fields only, and "$0.00 due · due Oct 3" on a paid
+ * invoice was that shape read out for a bill that owed nothing.
+ */
+export function invoiceSettlements(ctx: Ctx, orgId: string, ids: string[]): Map<string, string> {
+  const out = new Map<string, string>();
+  const sources = billingSources(ctx.db);
+  if (!sources.invoices || !ids.length) return out;
+  const workspace = workspaceProfile(ctx, orgId);
+  const rows = ctx.db.all<{ id: string; status: string; currency: string; amount_paid: number | null; total: number; paid_at: number | null; voided_at: number | null }>(
+    `SELECT id, status, currency, amount_paid, total, paid_at, voided_at FROM ${sources.invoices.table}
+      WHERE org_id = ? AND id IN (${ids.map(() => '?').join(', ')})`, orgId, ...ids);
+  for (const row of rows) {
+    const show = (amount: number) => formatMoney({ amount: Math.round(amount), currency: row.currency }, { locale: workspace.locale });
+    if (row.status === 'paid') {
+      out.set(row.id, `${show(row.amount_paid ?? row.total)} paid${row.paid_at ? ` on ${formatDate(row.paid_at, { locale: workspace.locale, timeZone: 'UTC' })}` : ''}`);
+    } else if (row.status === 'void') {
+      out.set(row.id, `${show(row.total)} voided${row.voided_at ? ` on ${formatDate(row.voided_at, { locale: workspace.locale, timeZone: 'UTC' })}` : ''}`);
+    }
+  }
+  return out;
 }
 
 export interface RecordSearchResult {

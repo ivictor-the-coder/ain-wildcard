@@ -339,7 +339,7 @@ test('closing a deal stops at a confirmation that states the forecast change and
   await expect(dialog).toContainText(`${from.probability}%`);
   await expect(dialog).toContainText(`${won.probability}%`);
   // And it will not go through until the outcome is recorded.
-  const confirm = dialog.getByRole('button', { name: /Mark won|Mark closed/ });
+  const confirm = dialog.getByRole('button', { name: /Mark won|Mark lost/ });
   await expect(confirm).toBeDisabled();
 
   await dialog.getByLabel('Close reason').selectOption({ index: 1 });
@@ -822,11 +822,13 @@ test('the close date you pick is the close date every screen reads back', async 
   await page.getByLabel('Amount', { exact: true }).fill('80000');
   await page.getByLabel('Amount', { exact: true }).press('Tab');
 
-  await page.getByRole('button', { name: 'Close date' }).click();
+  // The close date is a typed field with the calendar beside it; a day picked
+  // from the calendar lands in the field as the workspace writes dates.
+  await page.getByRole('button', { name: 'Close date calendar' }).click();
   const day = page.getByRole('gridcell', { name: /^\w+ \d+, \d{4}$/ }).nth(20);
   const picked = (await day.getAttribute('aria-label'))!;
   await day.click();
-  await expect(page.getByRole('button', { name: 'Close date' })).toContainText(picked);
+  await expect(page.getByRole('textbox', { name: 'Close date' })).toHaveValue(picked);
 
   await page.getByRole('button', { name: 'Create deal' }).click();
   await page.waitForURL(/\/deals\/deal_/, { timeout: 20_000 });
@@ -838,7 +840,7 @@ test('the close date you pick is the close date every screen reads back', async 
 
   // And the editor, re-opened, still reads the day that was chosen.
   await page.getByRole('button', { name: 'Edit', exact: true }).first().click();
-  await expect(page.getByRole('dialog').getByRole('button', { name: 'Close date' })).toContainText(picked);
+  await expect(page.getByRole('dialog').getByRole('textbox', { name: 'Close date' })).toHaveValue(picked);
   await page.keyboard.press('Escape');
 
   // The stored value is that day at midnight UTC — a calendar date, not an instant.
@@ -877,9 +879,9 @@ test('a deal closed today books today, not yesterday', async ({ page, request })
   // mounts empty and is filled on the dialog's own effect, so it is read once
   // it holds a date — reading it a frame early got "Pick a date", which
   // `Date.parse` turns into a RangeError three lines down.
-  const stampField = dialog.getByRole('button', { name: 'Close date' });
-  await expect(stampField).toHaveText(/\w+ \d{1,2}, \d{4}/);
-  const stamp = (await stampField.innerText()).trim();
+  const stampField = dialog.getByRole('textbox', { name: 'Close date' });
+  await expect(stampField).toHaveValue(/\w+ \d{1,2}, \d{4}/);
+  const stamp = (await stampField.inputValue()).trim();
   await dialog.getByLabel('Close reason').selectOption({ index: 1 });
   await dialog.getByRole('button', { name: 'Mark won' }).click();
 
@@ -2078,7 +2080,7 @@ test('the keyboard lands somewhere after a close through the dialog', async ({ p
 
   const dialog = page.getByRole('dialog');
   await dialog.getByLabel('Close reason').selectOption({ index: 1 });
-  await dialog.getByRole('button', { name: /^Mark closed$/ }).click();
+  await dialog.getByRole('button', { name: /^Mark lost$/ }).click();
 
   await expect.poll(async () => (await deal(request, created.id)).properties.deal_status, { timeout: 15_000 })
     .toBe('lost');
@@ -3630,4 +3632,514 @@ test('a payment chase is refused outright when the ledger cannot be read', async
     .toContainText('No chase can be written for this record');
   await expect(page.getByRole('button', { name: 'Write the draft' })).toBeDisabled();
   await page.keyboard.press('Escape');
+});
+
+/* ======================== the builder's second pass ======================= */
+
+/**
+ * The editors `autoFocus` cannot reach.
+ *
+ * A native `<select>` and the date picker's button both ignore it, so Enter on
+ * "Edit Close date" opened the editor and dropped the keyboard on `<body>`:
+ * Escape reached nobody, and every further Enter opened another row until the
+ * record had two editors and two "Enter saves" hints open at once.
+ */
+test('an inline date or enum editor takes the keyboard when it opens, and only one row is ever open', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const def = defs.find((p) => p.is_default) ?? defs[0];
+  await board(page, `?pipeline=${def.name}`);
+  const open = await stageWithACard(page, def.stages.filter((s) => !s.is_closed));
+  const id = await cardsIn(page, open.name).first().getAttribute('data-deal');
+  await visit(page, `/deals/${id}`, '.pl-inline__read');
+
+  const closeDate = page.getByRole('button', { name: /^Edit Close date/ });
+  await closeDate.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.pl-inline--editing')).toHaveCount(1);
+  await expect.poll(() => page.evaluate(() => !!document.activeElement?.closest('.pl-inline__editor')), {
+    message: 'the close-date editor opened without taking the keyboard',
+  }).toBe(true);
+
+  // Escape reaches the row now, and the caret goes back to the value it left.
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.pl-inline--editing')).toHaveCount(0);
+  await expect(closeDate).toBeFocused();
+
+  // A picklist lands on its own control too…
+  await page.getByRole('button', { name: /^Edit Deal type/ }).focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.pl-inline--editing select')).toBeFocused();
+
+  // …and opening a second row closes the first rather than stacking on it.
+  await closeDate.click();
+  await expect(page.locator('.pl-inline--editing')).toHaveCount(1);
+  await expect(page.locator('.pl-inline--editing').getByLabel('Close date', { exact: true })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.pl-inline--editing')).toHaveCount(0);
+});
+
+/**
+ * A drop that cannot land says so.
+ *
+ * On the all-pipelines board a renewal dragged onto a new-business column was
+ * refused by not accepting the dragover at all: no highlight, no drop event,
+ * no toast — the card snapped back and the person was left to guess whether
+ * the move had been declined or never noticed.
+ */
+test('a card dragged onto another pipeline’s column is refused out loud, and nothing is written', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  test.skip(defs.length < 2, 'one pipeline: nothing to drag across');
+  await board(page, '?pipeline=all');
+
+  const pick = await page.evaluate(() => {
+    const card = document.querySelector<HTMLElement>('.pl-card');
+    const from = card?.closest<HTMLElement>('.pl-col')?.dataset.pipeline;
+    const column = [...document.querySelectorAll<HTMLElement>('.pl-col:not(.is-closed)')]
+      .find((col) => col.dataset.pipeline && col.dataset.pipeline !== from);
+    return card && column ? { id: card.dataset.deal!, pipeline: column.dataset.pipeline!, stage: column.dataset.stage! } : null;
+  });
+  test.skip(!pick, 'no second pipeline has an open column on the board');
+  const before = await deal(request, pick!.id);
+
+  // Hold the card over the foreign column: the column says why it will not take it.
+  await page.evaluate(({ id, pipeline, stage }) => {
+    const card = document.querySelector(`.pl-card[data-deal="${id}"]`)!;
+    const column = document.querySelector(`.pl-col[data-pipeline="${pipeline}"][data-stage="${stage}"] .pl-col__body`)!;
+    const dataTransfer = new DataTransfer();
+    const fire = (node: Element, type: string) =>
+      node.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer }));
+    fire(card, 'dragstart');
+    fire(column, 'dragover');
+  }, pick!);
+  const column = page.locator(`.pl-col[data-pipeline="${pick!.pipeline}"][data-stage="${pick!.stage}"]`);
+  await expect(column).toHaveClass(/is-blocked/);
+  await expect(column.locator('.pl-col__blocked')).toContainText('Move to another pipeline');
+
+  // Let go there. The browser fires no drop on a refused column, only dragend.
+  await page.evaluate(({ id }) => {
+    const card = document.querySelector(`.pl-card[data-deal="${id}"]`)!;
+    card.dispatchEvent(new DragEvent('dragend', { bubbles: true, cancelable: true, dataTransfer: new DataTransfer() }));
+  }, pick!);
+  await expect(page.locator('.ain-toast', { hasText: 'That deal is on another pipeline' })).toBeVisible();
+  await expect(column).not.toHaveClass(/is-blocked/);
+
+  const after = await deal(request, pick!.id);
+  expect(after.properties.deal_stage).toBe(before.properties.deal_stage);
+  expect(after.properties.pipeline).toBe(before.properties.pipeline);
+});
+
+/**
+ * Two copy slips a HubSpot user notices at once: a card whose close date is
+ * in another year read "Oct 21" as if it were next month, and a Closed-lost
+ * record captioned its close date "Booked in 4 days".
+ */
+test('a deal closed in another year says the year on its card, and a lost deal is “Lost”, not “Booked”', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const def = defs.find((p) => p.is_default) ?? defs[0];
+  const openStage = def.stages.find((s) => !s.is_closed)!;
+  const lostStage = def.stages.find((s) => s.is_closed && !s.is_won)!;
+  const health = await getJson<{ time: number }>(request, '/api/v1/health');
+  const lastYear = new Date(health.time).getUTCFullYear() - 1;
+  const closeDay = Date.UTC(lastYear, 9, 21);
+  const name = `Probe lost ${Date.now().toString(36)}`;
+  const made = await postJson<DealRecord>(request, '/api/v1/records/deal', {
+    properties: { name, amount: 123400, pipeline: def.name, deal_stage: openStage.name, close_date: closeDay },
+  });
+  try {
+    const lost = await request.patch(`/api/v1/records/deal/${made.id}`, {
+      data: { properties: { deal_stage: lostStage.name, close_reason: 'no_decision', close_date: closeDay } },
+    });
+    expect(lost.ok(), await lost.text()).toBe(true);
+    expect((await deal(request, made.id)).properties.close_date, 'the close date given with the close was not kept').toBe(closeDay);
+
+    await board(page, `?pipeline=${def.name}&closed=1&q=${encodeURIComponent(name)}`);
+    const card = page.locator(`.pl-card[data-deal="${made.id}"]`);
+    await expect(card.locator('.pl-card__meta')).toContainText(`Oct 21, ${lastYear}`);
+
+    await visit(page, `/deals/${made.id}`, '.pl-fact');
+    const fact = page.locator('.pl-fact', { hasText: 'Close date' });
+    await expect(fact).toContainText('Lost');
+    await expect(fact).not.toContainText('Booked');
+
+    // Reopened, the reason it once closed for is history, and the group says so.
+    const reopened = await request.patch(`/api/v1/records/deal/${made.id}`, {
+      data: { properties: { deal_stage: openStage.name } },
+    });
+    expect(reopened.ok(), await reopened.text()).toBe(true);
+    await visit(page, `/deals/${made.id}`, '.pl-fact');
+    await expect(page.locator('.pl-propgroup__flag')).toContainText('from an earlier close');
+  } finally {
+    await request.delete(`/api/v1/records/deal/${made.id}?permanent=true`);
+  }
+});
+
+/**
+ * The two addresses under /deals a person would guess. Both used to fall into
+ * `/deals/:id` and ask the API for a deal called "table".
+ */
+test('/deals/table opens the table and /deals/forecast the forecast, not a deal by that name', async ({ page }) => {
+  await page.goto('/deals/table?closed=1', { waitUntil: 'networkidle' });
+  await expect.poll(() => new URL(page.url()).search).toContain('display=table');
+  expect(new URL(page.url()).search).toContain('closed=1');
+  await expect(page.locator('tbody tr').first()).toBeVisible();
+  await expect(page.getByText('No such deal')).toHaveCount(0);
+
+  await page.goto('/deals/forecast', { waitUntil: 'networkidle' });
+  await expect(page.locator('.ain-page__title')).toHaveText('Forecast');
+  await expect(page.getByText('No such deal')).toHaveCount(0);
+  // And the way back is the same control the board carries.
+  await page.getByRole('radio', { name: 'Board' }).click();
+  await expect.poll(() => new URL(page.url()).pathname).toBe('/deals');
+});
+
+/**
+ * An empty pipeline still has stages, and each one takes a deal. The board
+ * used to vanish entirely behind the empty state, so a brand-new pipeline had
+ * no column to add into — while the all-pipelines strip drew them.
+ */
+test('a pipeline with no deals still draws its stages, each with somewhere to add one', async ({ page, request }) => {
+  const name = `probe_${Date.now().toString(36)}`;
+  const made = await postJson<{ id: string }>(request, '/api/v1/pipelines/deal', {
+    name,
+    label: 'Probe pipeline',
+    stages: [
+      { name: 'first', label: 'First touch', probability: 10 },
+      { name: 'second', label: 'Second call', probability: 50 },
+      { name: 'won', label: 'Won', probability: 100, is_closed: true, is_won: true },
+      { name: 'lost', label: 'Lost', probability: 0, is_closed: true },
+    ],
+  });
+  try {
+    await visit(page, `/deals?pipeline=${name}`, '.pl-col');
+    await expect(page.locator('.pl-col')).toHaveCount(2);
+    await expect(page.getByText('Probe pipeline has no deals yet')).toBeVisible();
+    const adds = page.getByRole('button', { name: 'Add a deal here' });
+    await expect(adds).toHaveCount(2);
+    // The column's own add opens the dialog on that stage.
+    await adds.nth(1).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toBeVisible();
+    await expect(dialog.locator('select').nth(1)).toHaveValue('second');
+  } finally {
+    await request.delete(`/api/v1/pipelines/deal/${made.id}`);
+  }
+});
+
+/** The rows on screen leave as a file, in the shape the CRM's own exports use. */
+test('the table exports the rows on screen as a file a spreadsheet can read back', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const def = defs.find((p) => p.is_default) ?? defs[0];
+  await table(page, `&pipeline=${def.name}`);
+  const note = await page.locator('.ain-table__footer .pl-note, .pl-note').last().innerText();
+  const shown = Number(/(\d+) deals?/.exec(note)?.[1]);
+  expect(shown).toBeGreaterThan(0);
+
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button', { name: 'Export CSV' }).click(),
+  ]);
+  expect(download.suggestedFilename()).toMatch(/^Deals .*\.csv$/);
+  const text = (await import('node:fs')).readFileSync((await download.path())!, 'utf8');
+  const lines = text.trim().split(/\r?\n/);
+  expect(lines[0]).toContain('Id,Deal,Account,Stage,Amount,Probability,Weighted,Close date,Owner');
+  expect(lines.length - 1, 'the file holds a different number of rows than the table says it shows').toBe(shown);
+
+  // A row carries the stored amount as a decimal, not the formatted string.
+  const [id, , , , amount] = lines[1].split(',');
+  const row = await deal(request, id);
+  expect(Number(amount)).toBe((row.properties.amount as number) / 100);
+  await expect(page.locator('.ain-toast')).toContainText(`${shown} deals exported`);
+});
+
+/**
+ * The forecast is the search's own answer, and each cell opens the board on
+ * the deals it summed — so the tile and the screen it opens agree.
+ */
+test('the forecast totals the quarter the way the search does, and a cell opens the board on those deals', async ({ page, request }) => {
+  interface Row { properties: Record<string, unknown> }
+  const quarter = await postJson<{ data: Row[]; has_more: boolean }>(request, '/api/v1/records/deal/search', {
+    filter: { property: 'close_date', operator: 'between', values: ['start_of_quarter', 'end_of_quarter'] },
+    properties: ['amount', 'weighted_amount', 'forecast_category', 'deal_status'],
+    limit: 200,
+  });
+  test.skip(quarter.has_more, 'more than a page closes this quarter; the check would be partial');
+  const sum = (rows: Row[]) => rows.reduce((total, row) => total + (row.properties.amount as number), 0);
+  const commit = quarter.data.filter((row) => row.properties.deal_status === 'open' && row.properties.forecast_category === 'commit');
+  const won = quarter.data.filter((row) => row.properties.deal_status === 'won');
+
+  await visit(page, '/deals/forecast', '.pl-forecast-tile');
+  await expect(page.locator('.pl-forecast-tile.is-commit .ain-stat__value')).toHaveText(money(sum(commit)));
+  await expect(page.locator('.pl-forecast-tile.is-won .ain-stat__value')).toHaveText(money(sum(won)));
+  // The grid's total row is the same arithmetic.
+  await expect(page.locator('.pl-forecast tfoot td').nth(1)).toContainText(money(sum(commit)));
+
+  test.skip(commit.length === 0, 'nothing is committed this quarter, so there is no cell to open');
+  await page.locator('.pl-forecast-tile.is-commit').click();
+  await expect.poll(() => new URL(page.url()).pathname).toBe('/deals');
+  const query = new URL(page.url()).searchParams;
+  expect(query.get('forecast')).toBe('commit');
+  expect(query.get('horizon')).toBe('quarter');
+  // The board's own filtered tile totals the same deals to the same figure.
+  await page.waitForSelector('.pl-col');
+  await expect(page.locator('.pl-summary .ain-stat__value').first()).toHaveText(money(sum(commit)));
+  await expect(page.locator('.pl-summary .ain-stat__label').first()).toContainText('filtered');
+});
+
+/** A sorted money column clicked again reverses; it never goes blank first. */
+test('clicking a sorted column again reverses it instead of clearing it', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const def = defs.find((p) => p.is_default) ?? defs[0];
+  await table(page, `&pipeline=${def.name}`);
+  const header = page.locator('th', { hasText: 'Amount' }).first();
+  await expect(header).toHaveAttribute('aria-sort', 'descending');
+  await header.locator('button').click();
+  await expect(header).toHaveAttribute('aria-sort', 'ascending');
+  await header.locator('button').click();
+  await expect(header).toHaveAttribute('aria-sort', 'descending');
+});
+
+/**
+ * A close date can be typed. The picker was calendar-only, so moving a close
+ * date you already know meant clicking through the months to it.
+ */
+test('a close date can be typed into the record, in the workspace’s own date order, and the server keeps it', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const def = defs.find((p) => p.is_default) ?? defs[0];
+  const openStage = def.stages.find((s) => !s.is_closed)!;
+  const health = await getJson<{ time: number }>(request, '/api/v1/health');
+  const year = new Date(health.time).getUTCFullYear() + 1;
+  const made = await postJson<DealRecord>(request, '/api/v1/records/deal', {
+    properties: { name: `Probe typed ${Date.now().toString(36)}`, amount: 5000, pipeline: def.name, deal_stage: openStage.name },
+  });
+  try {
+    await visit(page, `/deals/${made.id}`, '.pl-inline__read');
+    await page.getByRole('button', { name: /^Edit Close date/ }).click();
+    const field = page.locator('.pl-inline--editing').getByLabel('Close date', { exact: true });
+    await expect(field).toBeFocused();
+    // ISO reads in any locale; the row's Enter saves it.
+    await field.fill(`${year}-11-30`);
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.pl-inline--editing')).toHaveCount(0);
+    await expect.poll(async () => (await deal(request, made.id)).properties.close_date).toBe(Date.UTC(year, 10, 30));
+    await expect(page.getByRole('button', { name: /^Edit Close date/ })).toContainText(`Nov 30, ${year}`);
+
+    // Something that is not a date is refused where it was typed, and nothing is written.
+    await page.getByRole('button', { name: /^Edit Close date/ }).click();
+    const again = page.locator('.pl-inline--editing').getByLabel('Close date', { exact: true });
+    await again.fill('soon');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.pl-datefield__hint')).toContainText('is not a date');
+    await expect(page.locator('.pl-inline--editing')).toHaveCount(1);
+    expect((await deal(request, made.id)).properties.close_date).toBe(Date.UTC(year, 10, 30));
+
+    // The calendar is still there beside the field for a day you do not know
+    // yet — and Escape inside it closes the calendar, not the whole edit.
+    await page.getByRole('button', { name: 'Close date calendar' }).click();
+    await expect(page.getByRole('dialog', { name: 'Choose a date' })).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('dialog', { name: 'Choose a date' })).toHaveCount(0);
+    await expect(page.locator('.pl-inline--editing')).toHaveCount(1);
+  } finally {
+    await request.delete(`/api/v1/records/deal/${made.id}?permanent=true`);
+  }
+});
+
+/* ========================== closed deals are closed ======================== */
+
+/** The deal list as the API returns it, with the flag the board filters on. */
+interface ListedDeal extends DealRecord { archived?: boolean }
+
+const listedDeals = async (request: APIRequestContext, query = ''): Promise<ListedDeal[]> =>
+  (await getJson<{ data: ListedDeal[] }>(request, `/api/v1/records/deal?limit=200${query}`)).data
+    .filter((row) => !row.archived);
+
+/**
+ * A won or lost deal is not waiting anywhere.
+ *
+ * Its card used to read "95 days in stage" over a "$0.00" weighted chip, and its
+ * record led with "In this stage · 95 days · Deals do not wait here" beside
+ * "Booked 319 days ago", with the reason it closed for at the bottom of the
+ * page under Properties. A closed-won review reads the outcome, the day and the
+ * reason — off the card, and at the top of the record.
+ */
+test('a closed deal wears its outcome, not a stage timer', async ({ page, request }) => {
+  const def = (await pipelines(request)).find((p) => p.is_default)!;
+  const won = def.stages.find((s) => s.is_won)!;
+  const lost = def.stages.find((s) => s.is_closed && !s.is_won)!;
+  const properties = await getJson<{ data: { name: string; options: { value: string; label: string }[] }[] }>(
+    request, '/api/v1/objects/deal/properties',
+  );
+  const reasonLabel = (value: unknown) =>
+    properties.data.find((p) => p.name === 'close_reason')?.options.find((o) => o.value === value)?.label ?? String(value);
+
+  const rows = (await listedDeals(request)).filter((row) => row.properties.pipeline === def.name && row.properties.close_reason);
+  const biggest = (status: string) => rows
+    .filter((row) => row.properties.deal_status === status)
+    .sort((a, b) => (b.properties.amount as number) - (a.properties.amount as number))[0];
+  const wonDeal = biggest('won');
+  const lostDeal = biggest('lost');
+  test.skip(!wonDeal || !lostDeal, 'this workspace has no closed deal with a reason on the default pipeline');
+
+  await board(page, `?pipeline=${def.name}&closed=1`);
+
+  const wonCard = page.locator(`.pl-col[data-stage="${won.name}"] .pl-card[data-deal="${wonDeal.id}"]`);
+  await wonCard.scrollIntoViewIfNeeded();
+  await expect(wonCard.locator('.pl-card__meta')).toContainText('Won');
+  await expect(wonCard).not.toContainText('in stage');
+  // The chip beside the amount is the reason, not a second copy of the amount.
+  const wonChip = wonCard.locator('.pl-card__row .ain-badge');
+  await expect(wonChip).toContainText(reasonLabel(wonDeal.properties.close_reason));
+  await expect(wonChip).not.toContainText('$');
+
+  const lostCard = page.locator(`.pl-col[data-stage="${lost.name}"] .pl-card[data-deal="${lostDeal.id}"]`);
+  await lostCard.scrollIntoViewIfNeeded();
+  await expect(lostCard.locator('.pl-card__meta')).toContainText('Lost');
+  await expect(lostCard).not.toContainText('$0.00');
+  await expect(lostCard).not.toContainText('in stage');
+  await expect(lostCard.locator('.pl-card__row .ain-badge')).toContainText(reasonLabel(lostDeal.properties.close_reason));
+
+  // The closed columns say how they count where an open one quotes weighted.
+  await expect(page.locator(`.pl-col[data-stage="${won.name}"] .pl-col__head`)).not.toContainText('weighted');
+  await expect(page.locator(`.pl-col[data-stage="${lost.name}"] .pl-col__head`)).toContainText('Nothing forecast');
+
+  // An open card still says how long it has waited, and its chip is labelled.
+  const openStage = await stageWithACard(page, def.stages.filter((s) => !s.is_closed));
+  const openCard = cardsIn(page, openStage.name).first();
+  await expect(openCard).toContainText('in stage');
+  await expect(openCard.locator('.pl-card__row .ain-badge')).toHaveAttribute('title', /^Weighted at \d+%$/);
+
+  // The record leads with the outcome and the reason, and carries no stage timer.
+  await visit(page, `/deals/${wonDeal.id}`, '.pl-facts');
+  const facts = page.locator('.pl-facts');
+  await expect(facts).not.toContainText('In this stage');
+  const fact = facts.locator('.pl-fact').filter({ hasText: 'Outcome' });
+  await expect(fact.locator('.pl-fact__value')).toHaveText('Won');
+  await expect(fact.locator('.pl-fact__hint')).toHaveText(reasonLabel(wonDeal.properties.close_reason));
+  if (wonDeal.properties.close_notes) await expect(fact).toContainText(String(wonDeal.properties.close_notes));
+  // The close date keeps its own verb: a win was booked on a day.
+  await expect(facts.locator('.pl-fact').filter({ hasText: 'Close date' })).toContainText('Booked');
+});
+
+/**
+ * The forecast's "5 deals were lost in Q3" link lands on the board narrowed to
+ * status=lost. That board used to draw every open column first — all empty by
+ * construction — with the lost cards off-screen to the right, a subtitle of
+ * "$0.00 open · $0.00 weighted", and no control anywhere that showed or
+ * cleared the status filter.
+ */
+test('the board narrowed to the lost deals draws the lost column, and says what was lost', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const lost = (await listedDeals(request)).filter((row) => row.properties.deal_status === 'lost');
+  test.skip(lost.length === 0, 'nothing is closed lost on this workspace');
+  const lostAmount = lost.reduce((sum, row) => sum + (row.properties.amount as number), 0);
+  const money = (minor: number) => (minor / 100).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+
+  await board(page, '?pipeline=all&status=lost&closed=1');
+
+  // Every column on screen is a closed-lost stage, and every lost deal is on one.
+  const columns = page.locator('.pl-col');
+  const count = await columns.count();
+  expect(count).toBeGreaterThan(0);
+  for (let i = 0; i < count; i += 1) {
+    const stage = await columns.nth(i).getAttribute('data-stage');
+    const pipeline = await columns.nth(i).getAttribute('data-pipeline');
+    const def = defs.find((p) => p.name === pipeline);
+    const found = def?.stages.find((s) => s.name === stage);
+    expect(found && found.is_closed && !found.is_won, `${pipeline}/${stage} is not a lost stage`).toBe(true);
+  }
+  expect(await page.locator('.pl-card').count()).toBe(lost.length);
+
+  // The subtitle and the third tile quote what was lost, not $0.00 open.
+  const subtitle = page.locator('.ain-page__subtitle').first();
+  await expect(subtitle).toContainText(`${money(lostAmount)} lost`);
+  await expect(subtitle).not.toContainText('open');
+  const tile = page.locator('.pl-summary .ain-stat').nth(2);
+  await expect(tile).toContainText('Closed lost');
+  await expect(tile).toContainText(money(lostAmount));
+
+  // The filter is on screen, and clearing it gives the open columns back.
+  const chip = page.getByRole('button', { name: /Closed lost only/ });
+  await expect(chip).toBeVisible();
+  await chip.click();
+  await expect(page).not.toHaveURL(/status=/);
+  await expect(page.locator('.pl-col:not(.is-closed)').first()).toBeVisible();
+});
+
+/**
+ * Every pipeline on one board, filtered: a pipeline that holds no match drew
+ * its five empty columns of "Add a deal here" anyway, and the four deals the
+ * filter was about sat below the fold under them.
+ */
+test('a filtered all-pipelines board collapses the pipelines with nothing to show', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  test.skip(defs.length < 2, 'one pipeline is every pipeline');
+  const open = (await listedDeals(request)).filter((row) => row.properties.deal_status === 'open');
+  // Searched for by its own name, a deal can only match on its own pipeline.
+  const target = open.find((row) => open.filter((other) => other.display_name.includes(row.display_name)).length === 1);
+  test.skip(!target, 'no open deal has a name of its own');
+  const matches = (await listedDeals(request, `&q=${encodeURIComponent(target!.display_name)}`))
+    .filter((row) => row.properties.deal_status === 'open');
+  const drawn = new Set(matches.map((row) => row.properties.pipeline as string));
+  test.skip(drawn.size === defs.length, 'the search matched something on every pipeline');
+
+  await board(page, `?pipeline=all&q=${encodeURIComponent(target!.display_name)}`);
+  await expect(page.locator(`.pl-card[data-deal="${target!.id}"]`)).toBeVisible();
+  for (const def of defs) {
+    const strip = page.locator(`.pl-strip[aria-label="${def.label}"]`);
+    await expect(strip).toBeVisible();
+    if (drawn.has(def.name)) {
+      expect(await strip.locator('.pl-col').count(), `${def.label} should draw its columns`).toBeGreaterThan(0);
+    } else {
+      expect(await strip.locator('.pl-col').count(), `${def.label} should collapse`).toBe(0);
+      await expect(strip).toContainText(`Nothing on ${def.label} matches`);
+    }
+  }
+});
+
+/**
+ * Two controls over one order. Clicking the "Close date" header sorted the grid
+ * ascending by close date while the toolbar went on reading "Largest first".
+ */
+test('the table’s header sort and the toolbar sort say the same thing', async ({ page }) => {
+  await table(page);
+  const toolbar = page.getByLabel('Sort deals');
+  const header = (name: RegExp) => page.getByRole('columnheader', { name });
+  await expect(toolbar).toHaveValue('amount');
+  await expect(header(/^Amount/)).toHaveAttribute('aria-sort', 'descending');
+
+  // A header click is read back by the toolbar.
+  await header(/^Close date/).getByRole('button').click();
+  await expect(header(/^Close date/)).toHaveAttribute('aria-sort', 'ascending');
+  await expect(toolbar).toHaveValue('close');
+
+  // The toolbar writes the grid's sort, and the address.
+  await toolbar.selectOption('stage');
+  await expect(page).toHaveURL(/sort=stage/);
+  await expect(header(/^In stage/)).toHaveAttribute('aria-sort', 'descending');
+  await expect(toolbar).toHaveValue('stage');
+
+  // An order the toolbar has no word for is named, not misreported.
+  await header(/^Probability/).getByRole('button').click();
+  await expect(header(/^Probability/)).toHaveAttribute('aria-sort', 'ascending');
+  await expect(toolbar).toHaveValue('table');
+  await expect(toolbar.locator('option:checked')).toHaveText('By probability, ascending');
+});
+
+/**
+ * At 1024 wide the four stat tiles wrapped three and one, leaving Stalled alone
+ * on a second row, and a column header whose weighted figure wrapped pushed its
+ * median line and its first card a row below its neighbours'. Every header on a
+ * strip has the same rows now, closed columns included.
+ */
+test('the board holds its shape at 1024 wide, and every column header is the same height', async ({ page, request }) => {
+  const def = (await pipelines(request)).find((p) => p.is_default)!;
+  await page.setViewportSize({ width: 1024, height: 800 });
+  await board(page, `?pipeline=${def.name}&closed=1`);
+
+  const tracks = await page.locator('.pl-summary').evaluate((el) => getComputedStyle(el).gridTemplateColumns.split(' ').length);
+  expect(tracks, 'the tiles should be two by two').toBe(2);
+
+  const heights = await page.locator('.pl-col__head').evaluateAll((els) => els.map((el) => el.getBoundingClientRect().height));
+  expect(heights.length).toBe(def.stages.length);
+  expect(Math.max(...heights) - Math.min(...heights), `header heights: ${heights.join(', ')}`).toBeLessThan(1);
 });

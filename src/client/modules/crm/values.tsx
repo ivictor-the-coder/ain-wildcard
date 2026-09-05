@@ -14,7 +14,9 @@ import {
 } from '@/client/design';
 import { api, useQuery } from '@/client/kernel/api';
 import { useSession } from '@/client/kernel/session';
-import type { CrmRecord, PropertyDef, PropertyValue, WorkspaceUser } from './api';
+import type { CrmRecord, CrmSchema, PropertyDef, PropertyValue, WorkspaceUser } from './api';
+import { recordHref } from './links';
+import { slaState } from './time';
 
 /* --------------------------------- colour --------------------------------- */
 
@@ -86,6 +88,51 @@ export function exportValue(
   return String(value);
 }
 
+/* ----------------------------- service levels ----------------------------- */
+
+/** Due stamps that mean a promise, not a diary entry. */
+export const isDueProperty = (property: PropertyDef | undefined): boolean =>
+  !!property && property.type === 'datetime' && /(^|_)(sla_)?due_at$/.test(property.name);
+
+const CLOSED_WORDS = new Set(['closed', 'completed', 'done', 'resolved', 'cancelled', 'canceled', 'deferred']);
+
+/**
+ * Whether a record has reached the end of its process, read off its own
+ * pipeline when it has one — a ticket's statuses are defined per pipeline,
+ * and "closed" on one may be "resolved" on another.
+ */
+export function isClosedRecord(objectType: string, properties: Record<string, PropertyValue>, schema: CrmSchema | undefined): boolean {
+  const pipelines = (schema?.pipelines ?? []).filter((p) => p.object_type === objectType);
+  if (pipelines.length) {
+    const pipeline = pipelines.find((p) => p.name === properties.pipeline) ?? pipelines.find((p) => p.is_default) ?? pipelines[0];
+    const stage = pipeline.stages.find((s) => s.name === String(properties[pipeline.stage_property] ?? ''));
+    if (stage) return stage.is_closed;
+  }
+  return CLOSED_WORDS.has(String(properties.status ?? '').toLowerCase());
+}
+
+/**
+ * "SLA due · last week" on an open ticket is a breach reported as a date. The
+ * stamp reads as a state — overdue by how much, due in how long — with the
+ * exact instant a hover away.
+ */
+export function SlaBadge({ dueAt, closed }: { dueAt: number; closed: boolean }) {
+  const f = useFormat();
+  const session = useSession();
+  const { state, ms } = slaState(dueAt, session.now(), closed);
+  const span = f.duration(ms, 1);
+  const label = state === 'overdue' ? `Overdue by ${span}`
+    : state === 'due_soon' ? `Due in ${span}`
+      : state === 'due' ? `Due ${f.date(dueAt)}`
+        : `Was due ${f.date(dueAt)}`;
+  const tone: Tone = state === 'overdue' ? 'danger' : state === 'due_soon' ? 'warning' : 'neutral';
+  return (
+    <Tooltip content={f.dateTime(dueAt)}>
+      <Badge tone={tone} size="sm" dot={state !== 'closed'}>{label}</Badge>
+    </Tooltip>
+  );
+}
+
 /* ------------------------------- rendering -------------------------------- */
 
 export function UserChip({ user, id, size = 20 }: { user: WorkspaceUser | undefined; id: string | null; size?: number }) {
@@ -102,7 +149,7 @@ export function UserChip({ user, id, size = 20 }: { user: WorkspaceUser | undefi
 function ReferenceLabel({ objectType, id }: { objectType: string; id: string }) {
   const { data, error } = useQuery<CrmRecord>(`/v1/records/${objectType}/${id}`);
   if (error) return <span className="u-mono crm-muted">{id}</span>;
-  return <a className="crm-link" href={`/records/${objectType}/${id}`}>{data?.display_name ?? id}</a>;
+  return <a className="crm-link" href={recordHref(objectType, id)}>{data?.display_name ?? id}</a>;
 }
 
 export interface ValueViewProps {
@@ -204,6 +251,49 @@ export interface EditorProps {
 const userOptions = (users: WorkspaceUser[]): ComboOption[] =>
   users.map((u) => ({ value: u.id, label: u.name, description: u.title ?? u.email }));
 
+/**
+ * Whether a picker inside `root` currently has its list or calendar open. Both
+ * the combobox input and the date button carry `aria-expanded`, which is the
+ * one fact the boundary below needs.
+ */
+export const pickerIsOpen = (root: HTMLElement | null): boolean =>
+  !!root?.querySelector('[aria-expanded="true"]');
+
+/**
+ * Esc for the editors that are not a plain text box.
+ *
+ * The combobox and the date picker handle Escape themselves — to close their
+ * own list — and stop it there, so on a picklist the key never reached the
+ * inline editor and Seniority stayed in edit mode however many times it was
+ * pressed. This wrapper listens in the capture phase, ahead of the control:
+ * with the list open, Esc is the control's to close; with it closed, Esc
+ * cancels the edit, the way it already does on a string or a number. It also
+ * puts the caret in the control on open, since the pickers take no
+ * `autoFocus` of their own.
+ */
+function EscapeBoundary({ onCancel, autoFocus, children }: { onCancel?: () => void; autoFocus?: boolean; children: React.ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!autoFocus) return;
+    const target = ref.current?.querySelector<HTMLElement>('input, button, [tabindex="0"]');
+    target?.focus();
+  }, [autoFocus]);
+  return (
+    <div
+      ref={ref}
+      className="crm-editor"
+      onKeyDownCapture={(e) => {
+        if (e.key !== 'Escape' || !onCancel || pickerIsOpen(ref.current)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        onCancel();
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
 /** The control a property type earns. Nothing here writes; the caller commits. */
 export function PropertyEditor({ property, value, onChange, users, invalid, autoFocus, onSubmit, onCancel, id }: EditorProps) {
   const session = useSession();
@@ -220,6 +310,9 @@ export function PropertyEditor({ property, value, onChange, users, invalid, auto
   const options = useMemo<ComboOption[]>(
     () => property.options.map((o) => ({ value: o.value, label: o.label, description: o.description })),
     [property.options],
+  );
+  const bounded = (control: React.ReactNode) => (
+    <EscapeBoundary onCancel={onCancel} autoFocus={autoFocus}>{control}</EscapeBoundary>
   );
 
   switch (property.type) {
@@ -251,25 +344,25 @@ export function PropertyEditor({ property, value, onChange, users, invalid, auto
       );
     case 'date':
     case 'datetime':
-      return (
+      return bounded(
         <DatePicker
           id={id}
           value={value === null || value === undefined || value === '' ? null : Number(value)}
           onChange={(ts) => { emit(ts); }}
           invalid={invalid}
           aria-label={property.label}
-        />
+        />,
       );
     case 'bool':
-      return (
+      return bounded(
         <Switch
           checked={value === true || value === 'true' || value === 1}
           onChange={(next) => emit(next)}
           label={property.label}
-        />
+        />,
       );
     case 'enum':
-      return (
+      return bounded(
         <Combobox
           id={id}
           value={value === null || value === undefined ? '' : String(value)}
@@ -278,10 +371,10 @@ export function PropertyEditor({ property, value, onChange, users, invalid, auto
           placeholder={`Choose ${property.label.toLowerCase()}`}
           invalid={invalid}
           aria-label={property.label}
-        />
+        />,
       );
     case 'multi_enum':
-      return (
+      return bounded(
         <Combobox
           id={id}
           multiple
@@ -291,10 +384,10 @@ export function PropertyEditor({ property, value, onChange, users, invalid, auto
           placeholder={`Choose ${property.label.toLowerCase()}`}
           invalid={invalid}
           aria-label={property.label}
-        />
+        />,
       );
     case 'user':
-      return (
+      return bounded(
         <Combobox
           id={id}
           value={value ? String(value) : ''}
@@ -303,10 +396,10 @@ export function PropertyEditor({ property, value, onChange, users, invalid, auto
           placeholder="Choose a teammate"
           invalid={invalid}
           aria-label={property.label}
-        />
+        />,
       );
     case 'reference':
-      return (
+      return bounded(
         <RecordPicker
           id={id}
           objectType={property.reference_type ?? 'company'}
@@ -314,7 +407,7 @@ export function PropertyEditor({ property, value, onChange, users, invalid, auto
           onChange={(next) => emit(next || null)}
           label={property.label}
           invalid={invalid}
-        />
+        />,
       );
     case 'text':
       return (

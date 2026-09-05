@@ -448,4 +448,15 @@ CREATE INDEX idx_billing_invoice_holds_customer ON billing_invoice_holds(org_id,
 CREATE INDEX idx_billing_invoice_holds_subscription ON billing_invoice_holds(org_id, subscription_id, status);
 `,
   },
+  {
+    id: 'billing.0007_credit_note_tax_amounts',
+    sql: `
+-- A credited line's tax, jurisdiction by jurisdiction, mirroring the
+-- \`taxes\` list on the invoice line it credits. A Manhattan credit hands back
+-- a share of the state's, the city's and the transit district's tax, and each
+-- return wants its own figure. Notes written before this carry an empty list
+-- and hydrate their single rate into it, so nothing already issued changes.
+ALTER TABLE billing_credit_note_lines ADD COLUMN tax_amounts TEXT NOT NULL DEFAULT '[]';
+`,
+  },
 ];

@@ -326,7 +326,14 @@ export function renderRank(result: MetricToolResult, noun: string, direction: 'a
   };
 }
 
-/** Two periods of one metric, side by side, with the change between them. */
+/**
+ * Two periods of one metric, side by side, with the change between them.
+ *
+ * The first-named period is the subject: "how did 2025 compare with 2024" is
+ * answered about 2025, measured against 2024. Framed the other way round it
+ * read "2024 is down $1.9M on 2025" — true, and the answer to a question
+ * nobody asked.
+ */
 export function renderCompare(a: MetricToolResult, b: MetricToolResult, workspace: WorkspaceProfile, labels: [string, string]): Rendered {
   const single = (r: MetricToolResult) => r.unit !== 'money' || r.books.length <= 1;
   const describe = (r: MetricToolResult) => (single(r)
@@ -336,12 +343,12 @@ export function renderCompare(a: MetricToolResult, b: MetricToolResult, workspac
   const comparable = single(a) && single(b) && (a.currency ?? '') === (b.currency ?? '');
   let change = '';
   if (comparable && a.count + b.count > 0) {
-    const delta = b.value - a.value;
-    const pct = a.value === 0 ? null : Math.round((delta / Math.abs(a.value)) * 1000) / 10;
+    const delta = a.value - b.value;
+    const pct = b.value === 0 ? null : Math.round((delta / Math.abs(b.value)) * 1000) / 10;
     const shown = a.unit === 'money' ? money(Math.abs(delta), a.currency ?? workspace.currency, workspace) : `${Math.abs(Math.round(delta * 10) / 10)}${a.unit === 'percent' ? ' points' : ''}`;
     change = delta === 0
       ? `No change between the two.`
-      : `${labels[1]} is ${delta > 0 ? 'up' : 'down'} ${shown}${pct === null ? '' : ` (${Math.abs(pct)}%)`} on ${labels[0]}.`;
+      : `${labels[0]} is ${delta > 0 ? 'up' : 'down'} ${shown}${pct === null ? '' : ` (${Math.abs(pct)}%)`} on ${labels[1]}.`;
   } else if (!comparable) {
     change = 'The two are in more than one currency, so there is no single change to state.';
   }
@@ -458,11 +465,32 @@ export function renderSubscriptions(rows: SubscriptionRow[], total: number, scop
   };
 }
 
-export interface InvoiceRow { id: string; number: string | null; customer_name?: string | null; status: string; total_display?: string; amount_due_display?: string; due?: string | null }
+export interface InvoiceRow {
+  id: string; number: string | null; customer_name?: string | null; status: string; total_display?: string; amount_due_display?: string; due?: string | null;
+  /** "$1,200.00 paid on Jun 3, 2026" — what a settled bill shows instead of what it is owed. */
+  settled?: string | null;
+}
+
+/**
+ * One invoice line. Due language belongs to a bill that is still open: a paid
+ * one shows what was paid and when, a void one that it was withdrawn — "$0.00
+ * due · due Oct 3" on a settled bill described a debt that did not exist.
+ */
+function invoiceDetail(i: InvoiceRow): string {
+  if (i.settled) return i.settled;
+  if (i.status === 'paid') return `${i.total_display ?? ''} paid`.trim();
+  if (i.status === 'void') return `${i.total_display ?? ''} voided`.trim();
+  if (i.status === 'uncollectible') return `${i.amount_due_display ?? i.total_display ?? ''} written off`.trim();
+  if (i.status === 'draft') return `${i.total_display ?? ''} draft${i.due ? ` · due ${i.due}` : ''}`.trim();
+  return `${i.amount_due_display ? `${i.amount_due_display} due` : i.total_display ?? ''}${i.due ? ` · due ${i.due}` : ''}`.trim();
+}
 
 export function renderInvoices(rows: InvoiceRow[], total: number, scope: string): Rendered {
   if (!total) return { content: `There are no ${scope} invoices.`, citations: [], facts: { ...NO_FACTS, unit: 'count', value: 0, formatted: '0', count: 0, label: 'invoices' } };
-  const lines = rows.map((i) => `• ${i.number ?? i.id}${i.customer_name ? ` — ${i.customer_name}` : ''}${i.amount_due_display ? ` · ${i.amount_due_display} due` : i.total_display ? ` · ${i.total_display}` : ''}${i.due ? ` · due ${i.due}` : ''}`);
+  const lines = rows.map((i) => {
+    const detail = invoiceDetail(i);
+    return `• ${i.number ?? i.id}${i.customer_name ? ` — ${i.customer_name}` : ''}${detail ? ` · ${detail}` : ''}`;
+  });
   const rest = total - rows.length;
   return {
     content: [`${total} ${scope} ${plural(total, 'invoice')}:`, lines.join('\n'), rest > 0 ? `…and ${rest} more.` : ''].filter(Boolean).join('\n\n'),

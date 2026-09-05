@@ -15,7 +15,7 @@
  * "included in Telemetry Cloud Growth" would send a support agent to the wrong
  * place every time an account disagreed with its bill.
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api, useQuery, type ListEnvelope } from '../../kernel/api';
 import { useNavigate, useSearchParam } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
@@ -23,10 +23,11 @@ import {
   Badge, Banner, Button, Card, Combobox, ConfirmDialog, DataTable, DatePicker, EmptyState, Field,
   Icons, Inline, Input, Meter, Modal, NumberInput, Select, Stat, Stack, Switch, Tabs, Textarea, Tooltip,
   humanize, useFormat,
-  type DataTableColumn, type MenuSection, type TabDef,
+  type DataTableColumn, type MenuSection, type TabDef, type TableState,
   XCircleIcon,
 } from '../../design';
-import { ListFailure, Loading, SettingsShell, useAction } from './common';
+import { DialogForm, ListFailure, Loading, SettingsShell, useAction, useConsumeQuery } from './common';
+import { tileOf } from './tiles';
 import type {
   ActiveEntitlement, CustomerLite, EntitlementOverride, EntitlementSet, EntitlementsOverview, Feature,
 } from './types';
@@ -48,11 +49,23 @@ const TYPE_HINT: Record<string, string> = {
 type Tab = 'catalogue' | 'accounts';
 
 export function FeaturesPage() {
-  const [tab, setTab] = useState<Tab>('catalogue');
+  /**
+   * `?customer=cus_…` is the address this screen writes when an account is
+   * chosen, and the one the at-risk banner links to — so opening it has to land
+   * on the accounts tab with that account, not on the catalogue with the
+   * parameter ignored. Leaving the tab drops the parameter, so the address
+   * names what is on screen.
+   */
+  const [customerParam, setCustomerParam] = useSearchParam('customer');
+  const [tab, setTab] = useState<Tab>(customerParam ? 'accounts' : 'catalogue');
   const tabs: TabDef<Tab>[] = [
     { id: 'catalogue', label: 'The catalogue' },
     { id: 'accounts', label: 'What an account holds' },
   ];
+  const changeTab = (next: Tab) => {
+    if (next === 'catalogue' && customerParam) setCustomerParam(undefined);
+    setTab(next);
+  };
 
   return (
     <SettingsShell
@@ -60,7 +73,7 @@ export function FeaturesPage() {
       subtitle="What a plan lets an account do, derived from its live subscriptions and never out of step with the bill."
     >
       <Stack gap={6}>
-        <Tabs tabs={tabs} value={tab} onChange={setTab} aria-label="Features and entitlements" />
+        <Tabs tabs={tabs} value={tab} onChange={changeTab} aria-label="Features and entitlements" />
         {tab === 'catalogue' ? <Catalogue /> : <AccountEntitlements />}
       </Stack>
     </SettingsShell>
@@ -76,9 +89,20 @@ function Catalogue() {
   const action = useAction();
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<Feature | null>(null);
+  const [view, setView] = useState<TableState>({ query: '', sort: { columnId: 'name', direction: 'asc' }, filters: {} });
+  // `?feature=feat_…` — the address an event about a feature writes. The
+  // catalogue answers with that feature on top once it has the list to look in.
+  const [wanted, setWanted] = useState<string | null>(null);
+  useConsumeQuery('feature', setWanted);
 
   const admin = session.me?.role === 'owner' || session.me?.role === 'admin';
   const features = useQuery<ListEnvelope<Feature>>('/v1/features', { expand: 'products' });
+  useEffect(() => {
+    if (!wanted || !features.data) return;
+    const feature = features.data.data.find((row) => row.id === wanted || row.key === wanted);
+    setView((current) => ({ ...current, query: feature ? feature.key : wanted }));
+    setWanted(null);
+  }, [wanted, features.data]);
   const overview = useQuery<EntitlementsOverview>('/v1/entitlements/overview');
   // The overview names accounts by id. An operator cannot act on `cus_SIQeXBq…`,
   // so the same list the accounts tab reads is used to put a name on each one.
@@ -94,6 +118,26 @@ function Catalogue() {
     [overview.data],
   );
   const atRisk = (overview.data?.features ?? []).flatMap((row) => row.at_risk);
+
+  // A catalogue whose read failed is not a catalogue of zero features.
+  const tiles = {
+    defined: tileOf([features], 'GET /v1/features', () => ({
+      value: f.number(rows.length),
+      caption: `${f.number(rows.filter((row) => row.active).length)} active`,
+    })),
+    metered: tileOf([features], 'GET /v1/features', () => ({
+      value: f.number(rows.filter((row) => row.type === 'metered').length),
+      caption: 'Drawn down by real events, checked against the meter',
+    })),
+    overrides: tileOf([overview], 'GET /v1/entitlements/overview', () => ({
+      value: f.number(overview.data?.overrides_live ?? 0),
+      caption: 'Per-account grants and suspensions in force',
+    })),
+    pressure: tileOf([overview], 'GET /v1/entitlements/overview', () => ({
+      value: f.number(atRisk.length),
+      caption: atRisk.length ? 'Past their approaching threshold' : 'Nobody is near a ceiling',
+    })),
+  };
 
   const columns = useMemo<DataTableColumn<Feature>[]>(() => [
     {
@@ -196,35 +240,20 @@ function Catalogue() {
   return (
     <Stack gap={6}>
       {features.error && <ListFailure error={features.error} path="GET /v1/features" onRetry={features.refetch} />}
+      {overview.error && <ListFailure error={overview.error} path="GET /v1/entitlements/overview" onRetry={overview.refetch} />}
 
       <div className="st-tiles">
         <Card padding="tight">
-          <Stat
-            label="Features defined"
-            value={f.number(rows.length)}
-            caption={`${f.number(rows.filter((row) => row.active).length)} active`}
-          />
+          <Stat label="Features defined" value={tiles.defined.value} caption={tiles.defined.caption} />
         </Card>
         <Card padding="tight">
-          <Stat
-            label="Metered"
-            value={f.number(rows.filter((row) => row.type === 'metered').length)}
-            caption="Drawn down by real events, checked against the meter"
-          />
+          <Stat label="Metered" value={tiles.metered.value} caption={tiles.metered.caption} />
         </Card>
         <Card padding="tight">
-          <Stat
-            label="Live overrides"
-            value={f.number(overview.data?.overrides_live ?? 0)}
-            caption="Per-account grants and suspensions in force"
-          />
+          <Stat label="Live overrides" value={tiles.overrides.value} caption={tiles.overrides.caption} />
         </Card>
         <Card padding="tight">
-          <Stat
-            label="Accounts under pressure"
-            value={f.number(atRisk.length)}
-            caption={atRisk.length ? 'Past their approaching threshold' : 'Nobody is near a ceiling'}
-          />
+          <Stat label="Accounts under pressure" value={tiles.pressure.value} caption={tiles.pressure.caption} />
         </Card>
       </div>
 
@@ -272,7 +301,8 @@ function Catalogue() {
           searchPlaceholder="Search by name, key or meter"
           showFilters
           showColumnToggle
-          initialSort={{ columnId: 'name', direction: 'asc' }}
+          value={view}
+          onChange={setView}
           rowActions={rowActions}
           onRowClick={(row) => { if (admin) { action.clear(); setEditing(row); } }}
           maxHeight={520}
@@ -338,6 +368,7 @@ function FeatureDialog({ open, feature, action, onClose }: {
   const valid = keyValid && name.trim().length > 0 && (type !== 'metered' || meter.trim().length > 0);
 
   const submit = async () => {
+    if (!valid || action.busy) return;
     const shared = {
       name: name.trim(),
       usage_window: window,
@@ -397,6 +428,7 @@ function FeatureDialog({ open, feature, action, onClose }: {
         </>
       }
     >
+      <DialogForm onSubmit={() => void submit()}>
       <Stack gap={5}>
         {action.error && !action.error.body.param && (
           <Banner tone="danger" compact title="The server refused this">{action.error.body.message}</Banner>
@@ -531,6 +563,7 @@ function FeatureDialog({ open, feature, action, onClose }: {
           hint="Deactivating recomputes every account holding it immediately."
         />
       </Stack>
+      </DialogForm>
     </Modal>
   );
 }
@@ -905,7 +938,7 @@ function GrantDialog({ open, customerId, customerName, features, action, onClose
 
   const chosen = features.find((row) => row.key === feature) ?? null;
   const needsValue = effect === 'grant' && chosen?.type !== 'boolean' && !unlimited;
-  const valid = feature && reason.trim().length >= 3 && (!needsValue || (value !== null && value >= 0));
+  const valid = !!feature && reason.trim().length >= 3 && (!needsValue || (value !== null && value >= 0));
 
   const close = () => {
     setFeature(''); setEffect('grant'); setValue(null); setUnlimited(false); setReason(''); setExpiresAt(null);
@@ -913,6 +946,7 @@ function GrantDialog({ open, customerId, customerName, features, action, onClose
   };
 
   const submit = async () => {
+    if (!valid || action.busy) return;
     const saved = await action.run(
       api.post<EntitlementOverride>('/v1/entitlement-overrides', {
         customer: customerId,
@@ -954,6 +988,7 @@ function GrantDialog({ open, customerId, customerName, features, action, onClose
         </>
       }
     >
+      <DialogForm onSubmit={() => void submit()}>
       <Stack gap={5}>
         {action.error && !action.error.body.param && (
           <Banner tone="danger" compact title="The override was not written">{action.error.body.message}</Banner>
@@ -1035,6 +1070,7 @@ function GrantDialog({ open, customerId, customerName, features, action, onClose
           />
         </Field>
       </Stack>
+      </DialogForm>
     </Modal>
   );
 }

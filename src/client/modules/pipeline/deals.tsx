@@ -26,23 +26,27 @@ import { useSession } from '@/client/kernel/session';
 import {
   AlertTriangleIcon, ArrowRightIcon, Avatar, Badge, Banner, Button, Card, CheckCircleIcon,
   DataTable, EmptyState, ErrorState, GitBranchIcon, humanize, Icons, MenuButton, Page, SearchInput,
-  SegmentedControl, Select, Skeleton, SortDescIcon, Stat, Switch, useToast, XCircleIcon,
+  Select, Skeleton, SortDescIcon, Stat, Switch, toMajorUnits, useToast, XCircleIcon, XIcon,
   activeFilterCount, activeFilters, describeFilter, filterRows, searchRows,
   type CellValue, type DataTableColumn, type MenuSection, type SelectOption,
   type TableState,
 } from '@/client/design';
 import {
-  ALL_PIPELINES, HORIZON_LABEL, HORIZONS, SORTS, boardMove, boardTabStop, isBoardKey, matchesHorizon,
-  snapshotMove, stageKey, viewToState,
+  ALL_PIPELINES, CUSTOM_SORT, HORIZON_LABEL, HORIZONS, SORTS, TABLE_SORT, boardHeadline, boardMove, boardTabStop,
+  columnsFor, describeTableSort, isBoardKey, matchesHorizon, moneyLine, needsYear, outcomeWord, reverseClearedSort,
+  snapshotMove, sortKeyOf, stageKey, viewToState,
   accountOf, civilDay, dealAmount, dealCloseDate, dealEnteredStage, dealPipeline, dealStage,
   dealWeighted, num, recordHref, str, totalsOf, useDealFormat, useDealProperties, usePipelines,
   useUserIndex, useUsers, useVelocities,
   type BoardGrid, type BoardState, type CalendarFormat, type DealListEnvelope, type DealRecord, type DealView,
-  type Horizon, type Pipeline, type PipelineStage, type StageVelocity,
+  type Horizon, type OutcomeFilter, type Pipeline, type PipelineStage, type StageVelocity,
 } from './api';
 import { ViewBar } from './views';
 import { NewDealDialog, StageMoveDialog, useUndoMove } from './dialogs';
 import { BulkOwnerDialog, BulkStageDialog } from './bulk';
+import { DisplaySwitch, type DealDisplay } from './display';
+import { dealCsv, dealExportColumns } from './export-core';
+import { downloadCsv, exportFilename, toCsv } from '../crm/csv';
 
 const DAY_MS = 86_400_000;
 const PAGE_SIZE = 200;
@@ -71,7 +75,7 @@ function StatLabel({ filtered, children }: { filtered: boolean; children: React.
 /* --------------------------------- card ---------------------------------- */
 
 function DealCard({
-  deal, stages, currentStage, velocity, ownerName, busy, dragging, tabStop, onOpen, onMove, onDragStart,
+  deal, stages, currentStage, velocity, ownerName, reasonLabel, busy, dragging, tabStop, onOpen, onMove, onDragStart,
   onDragEnd, onFocus, onKeyDown,
 }: {
   deal: DealRecord;
@@ -79,6 +83,8 @@ function DealCard({
   currentStage: PipelineStage | undefined;
   velocity: StageVelocity | undefined;
   ownerName: string | null;
+  /** The close reason as the workspace labels it — what a closed card carries in place of a weighted chip. */
+  reasonLabel: string | null;
   busy: boolean;
   dragging: boolean;
   /** This is the one card on the board that Tab reaches; the rest are arrowed to. */
@@ -117,6 +123,12 @@ function DealCard({
   // A close date is a calendar day: "overdue" is measured against the day the
   // workspace is on, not against this instant in UTC.
   const overdue = close !== null && f.calendarDaysUntil(close) < 0 && !currentStage?.is_closed;
+  // A closed deal is not waiting anywhere. Its card leads with the outcome and
+  // the day it closed, and carries the reason where an open card carries the
+  // weighted figure — "95 days in stage" over a "$0.00" chip described a deal
+  // that had finished as if it were still stuck.
+  const outcome = outcomeWord(currentStage);
+  const closeDate = close !== null ? f.calendarDate(close, { withYear: needsYear(close, f.calendarToday()) }) : null;
 
   const sections: MenuSection[] = [
     {
@@ -181,19 +193,34 @@ function DealCard({
 
       <div className="pl-card__row">
         <span className="pl-card__amount">{f.money(dealAmount(deal))}</span>
-        <Badge size="sm" tone={currentStage?.is_won ? 'success' : currentStage?.is_closed ? 'neutral' : 'info'}>
-          {f.money(dealWeighted(deal))}
-        </Badge>
+        {outcome
+          ? reasonLabel && (
+            <Badge size="sm" tone={currentStage?.is_won ? 'success' : 'neutral'} title="Close reason">
+              <span className="u-visually-hidden">Close reason: </span>{reasonLabel}
+            </Badge>
+          )
+          : (
+            <Badge size="sm" tone="info" title={`Weighted at ${num(deal.properties.probability)}%`}>
+              <span className="u-visually-hidden">Weighted </span>{f.money(dealWeighted(deal))}
+            </Badge>
+          )}
       </div>
 
       <div className="pl-card__meta">
         {ownerName && <Avatar name={ownerName} seed={deal.owner_id ?? deal.id} size={18} title={ownerName} />}
-        {close !== null && (
-          <span className={overdue ? 'pl-card__stalled' : undefined}>
-            <Icons.calendar size={11} /> {f.calendarDate(close, { withYear: false })}
+        {outcome && (
+          <span className={`pl-card__outcome${currentStage?.is_won ? ' is-won' : ' is-lost'}`}>
+            {currentStage?.is_won ? <CheckCircleIcon size={11} /> : <XCircleIcon size={11} />}
+            {' '}
+            {outcome}{closeDate ? ` ${closeDate}` : ''}
           </span>
         )}
-        {daysInStage !== null && (
+        {!outcome && closeDate && (
+          <span className={overdue ? 'pl-card__stalled' : undefined}>
+            <Icons.calendar size={11} /> {closeDate}
+          </span>
+        )}
+        {!outcome && daysInStage !== null && (
           <span className={stalled ? 'pl-card__stalled' : undefined}>
             {stalled ? <AlertTriangleIcon size={11} /> : <Icons.clock size={11} />}
             {' '}
@@ -209,10 +236,12 @@ function DealCard({
 /* -------------------------------- column --------------------------------- */
 
 function StageColumn({
-  stage, pipeline, deals, stalled, velocity, ceiling, children, over, onDragOver, onDragLeave, onDrop, onAdd,
+  stage, pipeline, pipelineLabel, deals, stalled, velocity, ceiling, children, over, blocked, onDragOver,
+  onDragLeave, onDrop, onAdd,
 }: {
   stage: PipelineStage;
   pipeline: string;
+  pipelineLabel: string;
   deals: DealRecord[];
   /** How many of the cards *on screen* are past this stage's own threshold. */
   stalled: number;
@@ -220,6 +249,8 @@ function StageColumn({
   ceiling: number;
   children: React.ReactNode;
   over: boolean;
+  /** A card from another pipeline is being held over this column, and cannot land. */
+  blocked: boolean;
   onDragOver: (e: React.DragEvent) => void;
   onDragLeave: () => void;
   onDrop: (e: React.DragEvent) => void;
@@ -228,13 +259,23 @@ function StageColumn({
   const f = useDealFormat();
   const totals = totalsOf(deals);
   const share = ceiling > 0 ? Math.min(100, Math.round((totals.amount / ceiling) * 100)) : 0;
+  // Counted over the cards drawn here, not over the stage: every other figure
+  // in this header is, and a filtered column reading "0 deals · $0.00 · 2
+  // stalled" is counting deals it is not showing. A deal in a closed stage is
+  // finished, not stuck, however long it has sat there, so a closed column
+  // never reports stalled deals at all.
+  const medianLine = stage.is_closed
+    ? 'Deals do not wait here'
+    : velocity && velocity.median_days_in_stage > 0
+      ? `Median ${f.plural(velocity.median_days_in_stage, 'day')} here${stalled > 0 ? ` · ${stalled} stalled` : ''}`
+      : 'No median yet';
 
   return (
     // `tabIndex={-1}` keeps the column out of the Tab order — eight columns
     // before the first card would be punishing — while leaving it somewhere the
     // keyboard can be *put* when the card it was following has left the board.
     <section
-      className={`pl-col${over ? ' is-over' : ''}${stage.is_closed ? ' is-closed' : ''}`}
+      className={`pl-col${over && !blocked ? ' is-over' : ''}${over && blocked ? ' is-blocked' : ''}${stage.is_closed ? ' is-closed' : ''}`}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
@@ -251,27 +292,31 @@ function StageColumn({
         </div>
         <div className="pl-col__money">
           <span className="pl-col__amount">{f.money(totals.amount)}</span>
-          {!stage.is_closed && <span className="pl-col__weighted">{f.money(totals.weighted)} weighted</span>}
+          {/* Every header has the same rows, so the cards under them start on
+              the same line: a closed column says how it counts where an open one
+              quotes its weighted figure, and the median line is always drawn. */}
+          <span className="pl-col__weighted">
+            {stage.is_closed
+              ? (stage.is_won ? 'Booked in full' : 'Nothing forecast')
+              : `${f.money(totals.weighted)} weighted`}
+          </span>
         </div>
         <div className="pl-col__bar"><span className="pl-col__barfill" style={{ width: `${share}%` }} /></div>
-        {velocity && velocity.median_days_in_stage > 0 && (
-          <span className="pl-col__weighted">
-            Median {f.plural(velocity.median_days_in_stage, 'day')} here
-            {/* Counted over the cards drawn here, not over the stage: every
-                other figure in this header is, and a filtered column reading
-                "0 deals · $0.00 · 2 stalled" is counting deals it is not
-                showing. A deal in a closed stage is finished, not stuck,
-                however long it has sat there, so a closed column never reports
-                stalled deals at all. */}
-            {!stage.is_closed && stalled > 0 ? ` · ${stalled} stalled` : ''}
-          </span>
-        )}
+        {/* One line, always, so the cards below every header start together;
+            the title carries the whole sentence for the narrowest column. */}
+        <span className="pl-col__weighted pl-col__median" title={medianLine}>{medianLine}</span>
       </header>
       {/* Chromium makes an overflowing container focusable when nothing inside
           it is — which, with a roving tabindex over the cards, is every column
           but one. That put a tab stop back on each column and undid half the
           grid. The cards are reachable by arrow key and focusing one scrolls it
           into view, so the scroller needs no stop of its own. */}
+      {over && blocked && (
+        <div className="pl-col__blocked" role="status">
+          <XCircleIcon size={13} />
+          <span>Only {pipelineLabel} deals land here. Open the deal and use “Move to another pipeline”.</span>
+        </div>
+      )}
       <ol className="pl-col__body" tabIndex={-1}>
         {children}
         {deals.length === 0 && (
@@ -309,7 +354,11 @@ export function DealsPage() {
   const horizon = (location.query.horizon ?? 'all') as Horizon;
   const forecast = location.query.forecast ?? '';
   const sortKey = location.query.sort ?? 'amount';
-  const showClosed = location.query.closed === '1';
+  // Won and lost deals sit in the closed stages, so narrowing to either turns
+  // those columns on — a board filtered to "won" with the won column hidden is
+  // an empty board with a badge on it.
+  const status: OutcomeFilter = location.query.status === 'won' || location.query.status === 'lost' ? location.query.status : '';
+  const showClosed = location.query.closed === '1' || status !== '';
   const [search, setSearch] = useState(location.query.q ?? '');
   const [query, setQueryText] = useState(location.query.q ?? '');
 
@@ -382,14 +431,29 @@ export function DealsPage() {
   const [newStage, setNewStage] = useState<string | undefined>(undefined);
   const [newPipeline, setNewPipeline] = useState<string | undefined>(undefined);
   const [dragging, setDragging] = useState<string | null>(null);
+  // The same id, readable inside the very next dragover: the first one fires
+  // before React has rendered the state above, and a column that judged the
+  // card by stale state let a foreign card hover without recording it.
+  const draggingRef = useRef<string | null>(null);
   const [over, setOver] = useState<string | null>(null);
+  /**
+   * The foreign column a card was last held over, so letting go there gets an
+   * answer. The browser only fires `drop` on a column that accepted the
+   * dragover, and a column refusing a card from another pipeline used to
+   * refuse it silently: no highlight, no drop, no toast — the card snapped back
+   * and the person was left to guess whether the move had been declined or
+   * had never been noticed.
+   */
+  const refused = useRef<{ deal: DealRecord; pipeline: string } | null>(null);
   const [pending, setPending] = useState<Record<string, string>>({});
   const [move, setMove] = useState<{ deal: DealRecord; stage: PipelineStage } | null>(null);
   const [selection, setSelection] = useState<string[]>([]);
   // Held here, not inside the grid: the tiles and the subtitle total the same
   // set the table shows, so the page cannot narrow in one place and not another.
+  // The sort opens as whatever the toolbar says, so the two controls agree from
+  // the first paint.
   const [tableState, setTableState] = useState<TableState>(
-    () => ({ query: '', sort: { columnId: 'amount', direction: 'desc' }, filters: {} }),
+    () => ({ query: '', sort: TABLE_SORT[sortKey] ?? TABLE_SORT.amount, filters: {} }),
   );
   const [bulkStage, setBulkStage] = useState<PipelineStage | null>(null);
   const [bulkOwner, setBulkOwner] = useState(false);
@@ -559,14 +623,15 @@ export function DealsPage() {
     const rows = (deals.data?.data ?? []).filter((deal) => !deal.archived && onBoard.has(dealPipeline(deal)));
     return rows.filter((deal) => {
       if (forecast && str(deal.properties.forecast_category) !== forecast) return false;
+      if (status && str(deal.properties.deal_status) !== status) return false;
       return matchesHorizon(dealCloseDate(deal), horizon, today);
     });
-  }, [deals.data, onBoard, forecast, horizon, today]);
+  }, [deals.data, onBoard, forecast, status, horizon, today]);
 
   /** The columns each drawn pipeline contributes, in pipeline order. */
   const columnsOf = useCallback(
-    (pipeline: Pipeline) => pipeline.stages.filter((stage) => showClosed || !stage.is_closed),
-    [showClosed],
+    (pipeline: Pipeline) => columnsFor(pipeline.stages, showClosed, status),
+    [showClosed, status],
   );
 
   /** Every column on screen, keyed by the pipeline it belongs to as well as its name. */
@@ -644,15 +709,16 @@ export function DealsPage() {
   }, [grid, focusCard]);
 
   const boardShown = inView.length;
-  const toolbarFiltered = !!query || !!owner || !!forecast || horizon !== 'all';
+  const toolbarFiltered = !!query || !!owner || !!forecast || !!status || horizon !== 'all';
   const truncated = !!deals.data?.has_more;
 
   const toolbarSummary = useMemo(() => [
     query && `“${query}”`,
     owner && (userIndex.get(owner)?.name ?? owner),
     forecast && humanize(forecast),
+    status && `closed ${status}`,
     horizon !== 'all' && HORIZON_LABEL[horizon].toLowerCase(),
-  ].filter(Boolean), [query, owner, forecast, horizon, userIndex]);
+  ].filter(Boolean), [query, owner, forecast, status, horizon, userIndex]);
 
   const stageByKey = useMemo(() => {
     const map = new Map<string, PipelineStage>();
@@ -699,7 +765,7 @@ export function DealsPage() {
 
   const applyView = useCallback((view: DealView | null) => {
     if (!view) { setQuery({ view: undefined }); return; }
-    const { state, readable } = viewToState(view);
+    const { state, readable } = viewToState(view, today);
     setQuery({
       view: readable ? view.id : undefined,
       pipeline: state.pipeline || undefined,
@@ -715,7 +781,7 @@ export function DealsPage() {
         'It also filters on conditions this board has no control for, so it is not marked as the view you are on. What it could take is on the board.',
       );
     }
-  }, [setQuery, toast]);
+  }, [setQuery, toast, today]);
 
   const pipelineLabel = useCallback(
     (name: string) => (name === ALL_PIPELINES ? 'Every pipeline' : pipelineByName.get(name)?.label ?? name),
@@ -730,6 +796,18 @@ export function DealsPage() {
     return property?.options?.find((option) => option.value === value)?.label ?? humanize(value);
   }, [properties.data]);
 
+  /**
+   * The reason a closed deal closed for, as the workspace's own picklist labels
+   * it. The card shows it where an open card shows its weighted figure; a deal
+   * closed with no reason recorded shows nothing there rather than a guess.
+   */
+  const reasonLabel = useCallback((deal: DealRecord): string | null => {
+    const value = str(deal.properties.close_reason);
+    if (!value) return null;
+    const property = (properties.data?.data ?? []).find((p) => p.name === 'close_reason');
+    return property?.options?.find((option) => option.value === value)?.label ?? humanize(value);
+  }, [properties.data]);
+
   // Clearing has to reset the box as well as the address: the search text is
   // held here and written into the URL, so dropping only the parameter puts it
   // straight back on the next debounce.
@@ -737,7 +815,7 @@ export function DealsPage() {
     setSearch('');
     setQueryText('');
     setTableState((state) => ({ ...state, query: '', filters: {} }));
-    setQuery({ q: undefined, owner: undefined, forecast: undefined, horizon: undefined, view: undefined });
+    setQuery({ q: undefined, owner: undefined, forecast: undefined, status: undefined, horizon: undefined, view: undefined });
   }, [setQuery]);
 
   /* --------------------------------- table -------------------------------- */
@@ -850,7 +928,47 @@ export function DealsPage() {
         return entered ? f.plural(Math.floor((now - entered) / DAY_MS), 'day') : <span className="pl-muted">—</span>;
       },
     },
+    {
+      // Hidden until asked for, but sortable from the toolbar: "Recently
+      // updated" is one of the four orders the board offers, and an order the
+      // table cannot show is an order the two controls cannot agree on.
+      id: 'updated',
+      header: 'Updated',
+      width: 130,
+      sortable: true,
+      defaultHidden: true,
+      unsearchable: true,
+      accessor: (row) => row.updated,
+      cell: (row) => f.relative(row.updated),
+    },
   ], [allMode, f, now, pipelineLabel, stageLabel, userIndex]);
+
+  /**
+   * One sort, read and written by two controls.
+   *
+   * On the table the grid's own sort state is the truth — a header click is
+   * the most direct way to say "by close date" — and the toolbar reflects it:
+   * as the option that means the same thing when there is one, and as a
+   * named custom order when there is not. Choosing from the toolbar writes the
+   * grid's sort back, and the address, so the board opens in the same order
+   * when the view switches. It used to be two truths: the header sorted the
+   * grid ascending by close date while the toolbar went on reading "Largest
+   * first".
+   */
+  const tableSortKey = display === 'table' ? sortKeyOf(tableState.sort) ?? CUSTOM_SORT : sortKey;
+  const sortOptions = useMemo<SelectOption[]>(() => {
+    const options = SORTS.map<SelectOption>((option) => ({ value: option.value, label: option.label }));
+    if (tableSortKey !== CUSTOM_SORT || !tableState.sort) return options;
+    const column = tableColumns.find((c) => c.id === tableState.sort?.columnId);
+    const header = typeof column?.header === 'string' ? column.header : tableState.sort.columnId;
+    return [...options, { value: CUSTOM_SORT, label: describeTableSort(tableState.sort, header) }];
+  }, [tableSortKey, tableState.sort, tableColumns]);
+
+  const chooseSort = useCallback((next: string) => {
+    if (next === CUSTOM_SORT) return;
+    setQuery({ sort: next === 'amount' ? undefined : next });
+    setTableState((prev) => ({ ...prev, sort: TABLE_SORT[next] ?? prev.sort }));
+  }, [setQuery]);
 
   /**
    * The table's own search box and column chips, lifted out of the grid.
@@ -923,13 +1041,15 @@ export function DealsPage() {
     let open = 0;
     let weighted = 0;
     let won = 0;
+    let lost = 0;
     let stalled = 0;
     let openDeals = 0;
     let wonDeals = 0;
+    let lostDeals = 0;
     for (const deal of narrowed) {
       const stage = stageFor(deal);
       if (stage?.is_won) { won += dealAmount(deal); wonDeals += 1; continue; }
-      if (stage?.is_closed) continue;
+      if (stage?.is_closed) { lost += dealAmount(deal); lostDeals += 1; continue; }
       open += dealAmount(deal);
       weighted += dealWeighted(deal);
       openDeals += 1;
@@ -937,7 +1057,7 @@ export function DealsPage() {
       const stallsAfter = velocityByStage.get(keyOf(deal))?.stalled_after_days ?? 0;
       if (entered && stallsAfter > 0 && Math.floor((now - entered) / DAY_MS) > stallsAfter) stalled += 1;
     }
-    return { open, weighted, won, stalled, openDeals, wonDeals, deals: narrowed.length };
+    return { open, weighted, won, lost, stalled, openDeals, wonDeals, lostDeals, deals: narrowed.length };
   }, [narrowed, stageFor, keyOf, velocityByStage, now]);
 
   /**
@@ -967,6 +1087,34 @@ export function DealsPage() {
   const medianDaysToClose = !allMode && board
     ? velocity.byPipeline.get(board.name)?.median_days_to_close ?? null
     : null;
+
+  /**
+   * The rows on screen, as a file.
+   *
+   * What the table shows is what leaves: the toolbar's filters, the table's own
+   * search and column filters, and the closed-stages switch all apply, so the
+   * export of "Priya's commit this quarter" is exactly those rows. Values are
+   * the stored ones — money as a decimal, the close date as an ISO day — the
+   * same shape the CRM's contact and company exports use.
+   */
+  const exportRows = useCallback(() => {
+    const columns = dealExportColumns({
+      allMode,
+      major: (minor) => toMajorUnits(minor, session.currency),
+      now,
+      accountName: (row) => accountOf(row as DealRecord)?.display_name ?? '',
+      pipelineLabel: (row) => pipelineLabel(dealPipeline(row as DealRecord)),
+      stageLabel: (row) => stageLabel(row as DealRecord),
+      ownerName: (id) => (id ? userIndex.get(id)?.name ?? id : ''),
+    });
+    const { headers, lines } = dealCsv(gridRows, columns);
+    const label = allMode ? 'Deals' : `Deals ${board?.label ?? ''}`;
+    downloadCsv(exportFilename(label, now, session.timeZone), toCsv(headers, lines));
+    toast.success(
+      `${f.plural(gridRows.length, 'deal')} exported`,
+      'The rows on screen, with the filters applied. Money is a decimal and dates are ISO-8601, ready for a spreadsheet.',
+    );
+  }, [allMode, board?.label, f, gridRows, now, pipelineLabel, session.currency, session.timeZone, stageLabel, toast, userIndex]);
 
   const rowActions = useCallback((row: DealRecord): MenuSection[] => [
     { id: 'open', items: [{ id: 'open', label: 'Open deal', icon: <Icons.external size={14} />, onSelect: () => openDeal(row) }] },
@@ -1008,16 +1156,16 @@ export function DealsPage() {
     : loading
       ? `Reading ${board ? board.label : 'the pipeline'}…`
       : board
-        ? (() => {
-          const openRows = onScreen.filter((deal) => !stageFor(deal)?.is_closed);
-          const open = totalsOf(openRows);
-          const where = allMode ? `across ${f.plural(boards.length, 'pipeline')}` : `on ${board.label}`;
-          return [
-            `${f.plural(shown, 'deal')} ${where}${showClosed ? '' : ', open stages only'}`,
-            `${f.money(open.amount)} open`,
-            `${f.money(open.weighted)} weighted`,
-          ].join(' · ');
-        })()
+        ? boardHeadline({
+          shown,
+          where: allMode ? `across ${f.plural(boards.length, 'pipeline')}` : `on ${board.label}`,
+          showClosed,
+          status,
+          open: totalsOf(onScreen.filter((deal) => !stageFor(deal)?.is_closed)),
+          closed: totalsOf(onScreen.filter((deal) => !!stageFor(deal)?.is_closed)),
+          plural: f.plural,
+          money: f.money,
+        })
         : 'Deals, by stage';
 
   return (
@@ -1027,14 +1175,19 @@ export function DealsPage() {
       width="wide"
       actions={
         <>
-          <SegmentedControl<Display>
+          <DisplaySwitch
             value={display}
-            onChange={(next) => setQuery({ display: next === 'board' ? undefined : next })}
-            aria-label="How to show deals"
-            options={[
-              { value: 'board', label: 'Board', icon: <Icons.columns size={14} /> },
-              { value: 'table', label: 'Table', icon: <Icons.table size={14} /> },
-            ]}
+            onChange={(next: DealDisplay) => {
+              if (next !== 'forecast') { setQuery({ display: next === 'board' ? undefined : next }); return; }
+              // The forecast keeps the pipeline and, when the window is one it
+              // reads over, the close-date window; the rest of the toolbar is
+              // the board's own business.
+              const params = new URLSearchParams();
+              if (allMode) params.set('pipeline', ALL_PIPELINES);
+              else if (board) params.set('pipeline', board.name);
+              if (['quarter', 'next_quarter', 'last_quarter', 'year'].includes(horizon)) params.set('period', horizon);
+              navigate(`/deals/forecast?${params.toString()}`);
+            }}
           />
           <Button ref={newDealButton} variant="primary" iconLeft={<Icons.plus size={14} />} onClick={() => setNewOpen(true)}>
             New deal
@@ -1082,20 +1235,31 @@ export function DealsPage() {
             />
           </Card>
           <Card padding="tight">
-            <Stat
-              label={<StatLabel filtered={filtered}>Closed won</StatLabel>}
-              value={unmeasured ? '—' : f.money(filtered ? filteredTotals.won : boardTotals.won)}
-              icon={<CheckCircleIcon size={15} />}
-              caption={unmeasured
-                ? unmeasuredWhy
-                : filtered
-                  ? `${f.plural(filteredTotals.wonDeals, 'won deal')} in this filter`
-                  : allMode
-                    ? `Booked across ${f.plural(boards.length, 'pipeline')}`
-                    : medianDaysToClose !== null
-                      ? `Median ${f.plural(medianDaysToClose, 'day')} to close`
-                      : 'Booked on this pipeline'}
-            />
+            {/* Narrowed to the lost deals, the tile that would otherwise read
+                "Closed won · $0.00" is the one figure the filter is about. */}
+            {status === 'lost' ? (
+              <Stat
+                label={<StatLabel filtered={filtered}>Closed lost</StatLabel>}
+                value={unmeasured ? '—' : f.money(filteredTotals.lost)}
+                icon={<XCircleIcon size={15} />}
+                caption={unmeasured ? unmeasuredWhy : `${f.plural(filteredTotals.lostDeals, 'lost deal')} in this filter`}
+              />
+            ) : (
+              <Stat
+                label={<StatLabel filtered={filtered}>Closed won</StatLabel>}
+                value={unmeasured ? '—' : f.money(filtered ? filteredTotals.won : boardTotals.won)}
+                icon={<CheckCircleIcon size={15} />}
+                caption={unmeasured
+                  ? unmeasuredWhy
+                  : filtered
+                    ? `${f.plural(filteredTotals.wonDeals, 'won deal')} in this filter`
+                    : allMode
+                      ? `Booked across ${f.plural(boards.length, 'pipeline')}`
+                      : medianDaysToClose !== null
+                        ? `Median ${f.plural(medianDaysToClose, 'day')} to close`
+                        : 'Booked on this pipeline'}
+              />
+            )}
           </Card>
           <Card padding="tight">
             <Stat
@@ -1165,12 +1329,12 @@ export function DealsPage() {
           options={HORIZONS.map<SelectOption>((value) => ({ value, label: HORIZON_LABEL[value] }))}
         />
         <Select
-          value={sortKey}
-          onChange={(next) => setQuery({ sort: next === 'amount' ? undefined : next })}
+          value={tableSortKey}
+          onChange={chooseSort}
           size="sm"
           icon={<SortDescIcon size={13} />}
           aria-label="Sort deals"
-          options={SORTS.map<SelectOption>((option) => ({ value: option.value, label: option.label }))}
+          options={sortOptions}
         />
         <div className="pl-toolbar__spacer" />
         <div className="pl-toolbar__search">
@@ -1187,7 +1351,23 @@ export function DealsPage() {
           onChange={(next) => setQuery({ closed: next ? '1' : undefined })}
           label="Closed stages"
           size="sm"
+          // Narrowed to won or lost, the closed columns are the whole board;
+          // the switch has nothing to turn off until that narrowing is cleared.
+          disabled={status !== ''}
         />
+        {status && (
+          <Button
+            size="sm"
+            variant="secondary"
+            className="pl-toolbar__status"
+            title="Clear this filter"
+            iconLeft={status === 'won' ? <CheckCircleIcon size={13} /> : <XCircleIcon size={13} />}
+            iconRight={<XIcon size={12} />}
+            onClick={() => setQuery({ status: undefined })}
+          >
+            Closed {status} only<span className="u-visually-hidden"> — clear this filter</span>
+          </Button>
+        )}
       </div>
 
       {truncated && (
@@ -1229,10 +1409,13 @@ export function DealsPage() {
 
       {!error && !loading && board && populated === 0 && (
         <EmptyState
+          size={filtered || display !== 'board' ? 'md' : 'sm'}
+          inline={!filtered && display === 'board'}
+          illustration={!filtered && display === 'board' ? null : undefined}
           title={filtered ? 'No deal matches these filters' : `${allMode ? 'No pipeline' : board.label} has ${allMode ? 'any' : 'no'} deals yet`}
           body={filtered
             ? `Nothing on ${allMode ? 'any pipeline' : board.label} matches ${filterSummary}.`
-            : `Open the first opportunity and it lands in ${board.stages[0]?.label ?? 'the first stage'} at ${board.stages[0]?.probability ?? 0}%.`}
+            : `Open the first opportunity and it lands in ${board.stages[0]?.label ?? 'the first stage'} at ${board.stages[0]?.probability ?? 0}% — or add it straight into a stage below.`}
           action={filtered
             ? <Button variant="primary" onClick={clearFilters}>Clear filters</Button>
             : <Button variant="primary" iconLeft={<Icons.plus size={14} />} onClick={() => setNewOpen(true)}>New deal</Button>}
@@ -1240,30 +1423,50 @@ export function DealsPage() {
         />
       )}
 
-      {!error && !loading && board && populated > 0 && display === 'board' && (
-      <div id="pl-board" tabIndex={-1} className="pl-boardregion" aria-label="Deal board">
+      {/* An empty pipeline still has stages, and each one takes a deal. The
+          board used to vanish entirely behind the empty state, so a brand-new
+          pipeline showed no column to add into — while the all-pipelines strip
+          drew them with "Add a deal here". A filtered-to-nothing board keeps
+          the plain empty state: its columns would all be empty for a reason
+          the message already gives. */}
+      {!error && !loading && board && (populated > 0 || !filtered) && display === 'board' && (
+      <div
+        id="pl-board"
+        tabIndex={-1}
+        className={`pl-boardregion${populated === 0 ? ' pl-board--empty' : ''}${status ? ' pl-board--outcome' : ''}`}
+        aria-label="Deal board"
+      >
       {boards.map((pipeline) => {
         const strip = columnsOf(pipeline);
         const rows = strip.flatMap((stage) => byStage.get(stageKey(pipeline.name, stage.name)) ?? []);
         const openRows = rows.filter((deal) => !stageFor(deal)?.is_closed);
-        const totals = totalsOf(openRows);
+        const closedRows = rows.filter((deal) => !!stageFor(deal)?.is_closed);
+        // With every pipeline on and a filter narrowing them, a pipeline that
+        // holds no match is one line rather than five columns of "Add a deal
+        // here" — which is what pushed Priya's four commit deals below the fold.
+        const collapsed = allMode && toolbarFiltered && rows.length === 0;
         return (
-          <section className="pl-strip" key={pipeline.name} aria-label={pipeline.label}>
+          <section className={`pl-strip${collapsed ? ' pl-strip--collapsed' : ''}`} key={pipeline.name} aria-label={pipeline.label}>
             {allMode && (
               <header className="pl-strip__head">
                 <h2 className="pl-strip__name">{pipeline.label}</h2>
                 <span className="pl-strip__meta">
-                  {f.plural(rows.length, 'deal')} · {f.money(totals.amount)} open · {f.money(totals.weighted)} weighted
+                  {collapsed
+                    ? `Nothing on ${pipeline.label} matches`
+                    : `${f.plural(rows.length, 'deal')} · ${moneyLine({ status, open: totalsOf(openRows), closed: totalsOf(closedRows), money: f.money })}`}
                 </span>
-                <Button
-                  size="sm"
-                  variant="link"
-                  onClick={() => setQuery({ pipeline: pipeline.name })}
-                >
-                  Only {pipeline.label}
-                </Button>
+                {!collapsed && (
+                  <Button
+                    size="sm"
+                    variant="link"
+                    onClick={() => setQuery({ pipeline: pipeline.name })}
+                  >
+                    Only {pipeline.label}
+                  </Button>
+                )}
               </header>
             )}
+            {!collapsed && (
             <div className="pl-board">
               {strip.map((stage) => {
                 const key = stageKey(pipeline.name, stage.name);
@@ -1276,28 +1479,43 @@ export function DealsPage() {
                 // A card can only be dropped into its own pipeline: dragging a
                 // renewal into a new-business column would be a pipeline change,
                 // which the deal record does properly and a drop cannot say.
-                const draggedHere = !!dragging && inView.some((row) => row.id === dragging && dealPipeline(row) === pipeline.name);
+                const dragged = dragging ? inView.find((row) => row.id === dragging) : undefined;
+                const draggedHere = !!dragged && dealPipeline(dragged) === pipeline.name;
+                const blocked = !!dragged && !draggedHere;
                 return (
                   <StageColumn
                     key={key}
                     stage={stage}
                     pipeline={pipeline.name}
+                    pipelineLabel={pipeline.label}
                     deals={held}
                     stalled={stalled}
                     velocity={velocityByStage.get(key)}
                     ceiling={ceilings.get(pipeline.name) ?? 0}
                     over={over === key}
+                    blocked={blocked}
                     onDragOver={(e) => {
-                      if (dragging && !draggedHere) return;
+                      // A foreign card is still accepted as a hover, so the
+                      // column can say why it will not take it; the effect
+                      // tells the pointer the same thing.
                       e.preventDefault();
-                      e.dataTransfer.dropEffect = 'move';
+                      const heldId = draggingRef.current;
+                      const held = heldId ? inView.find((row) => row.id === heldId) : undefined;
+                      const foreign = !!held && dealPipeline(held) !== pipeline.name;
+                      e.dataTransfer.dropEffect = foreign ? 'none' : 'move';
+                      if (foreign && held) refused.current = { deal: held, pipeline: pipeline.name };
                       setOver(key);
                     }}
-                    onDragLeave={() => setOver((current) => (current === key ? null : current))}
+                    onDragLeave={() => {
+                      setOver((current) => (current === key ? null : current));
+                      if (refused.current?.pipeline === pipeline.name) refused.current = null;
+                    }}
                     onDrop={(e) => {
                       e.preventDefault();
                       setOver(null);
-                      const id = e.dataTransfer.getData('text/plain') || dragging;
+                      refused.current = null;
+                      const id = e.dataTransfer.getData('text/plain') || draggingRef.current;
+                      draggingRef.current = null;
                       setDragging(null);
                       const deal = inView.find((row) => row.id === id);
                       if (!deal) return;
@@ -1320,6 +1538,7 @@ export function DealsPage() {
                         currentStage={stageFor(deal)}
                         velocity={velocityByStage.get(keyOf(deal))}
                         ownerName={deal.owner_id ? userIndex.get(deal.owner_id)?.name ?? null : null}
+                        reasonLabel={reasonLabel(deal)}
                         busy={!!pending[deal.id]}
                         dragging={dragging === deal.id}
                         tabStop={deal.id === tabStop}
@@ -1327,14 +1546,29 @@ export function DealsPage() {
                         onKeyDown={(e) => onCardKey(deal.id, e)}
                         onOpen={() => openDeal(deal)}
                         onMove={(stageTo) => requestMove(deal, stageTo)}
-                        onDragStart={() => setDragging(deal.id)}
-                        onDragEnd={() => { setDragging(null); setOver(null); }}
+                        onDragStart={() => { draggingRef.current = deal.id; setDragging(deal.id); }}
+                        onDragEnd={() => {
+                          draggingRef.current = null;
+                          setDragging(null);
+                          setOver(null);
+                          // Let go over a column that would not take it: no
+                          // drop fired, so the answer is given here.
+                          const held = refused.current;
+                          refused.current = null;
+                          if (held) {
+                            toast.info(
+                              'That deal is on another pipeline',
+                              `${held.deal.display_name} is on ${pipelineLabel(dealPipeline(held.deal))}, so it cannot be dropped into ${pipelineLabel(held.pipeline)}. Open it and use “Move to another pipeline” — the stage and the forecast are restamped together.`,
+                            );
+                          }
+                        }}
                       />
                     ))}
                   </StageColumn>
                 );
               })}
             </div>
+            )}
           </section>
         );
       })}
@@ -1410,13 +1644,24 @@ export function DealsPage() {
               </>
             );
           }}
+          toolbar={(
+            <Button
+              size="sm"
+              variant="secondary"
+              iconLeft={<Icons.download size={13} />}
+              disabled={gridRows.length === 0}
+              onClick={exportRows}
+            >
+              Export CSV
+            </Button>
+          )}
           searchable
           searchPlaceholder="Filter the deals on screen"
           stickyFooter
           showColumnToggle
           showFilters
           value={tableState}
-          onChange={setTableState}
+          onChange={(next) => setTableState((prev) => reverseClearedSort(prev, next))}
           footer={(
             <span className="pl-note">
               {f.plural(gridRows.length, 'deal')} {allMode ? `across ${f.plural(boards.length, 'pipeline')}` : `on ${board.label}`}

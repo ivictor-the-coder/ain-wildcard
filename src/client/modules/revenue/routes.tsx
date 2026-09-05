@@ -5,6 +5,7 @@
  * pages show is read from the reporting, metering, credits and payments
  * endpoints at render time; nothing here holds a number of its own.
  */
+import { useEffect } from 'react';
 import { useQuery, type ListEnvelope } from '../../kernel/api';
 import { useNavigate } from '../../kernel/router';
 import type { CommandDef, NavItem, RouteDef, WidgetDef } from '../../kernel/registry-types';
@@ -17,7 +18,8 @@ import { RevenueBoardPage } from './board';
 import { UsagePage, MeterDetailPage } from './usage';
 import { CreditsPage } from './credits';
 import { DunningPage } from './dunning';
-import { SectionError, moneyIn, rateText, useDefaultCurrency } from './common';
+import { RecognitionPage } from './recognition';
+import { Loading, SectionError, moneyIn, rateText, useDefaultCurrency } from './common';
 import type { CreditsOverview, DunningCampaign, DunningSummary, RevenueSummary } from './types';
 
 /* ================================= widgets ================================ */
@@ -186,14 +188,32 @@ function UsageWidget() {
   );
 }
 
+/* ================================ anchors ================================= */
+
+/**
+ * Movement and receivables are sections of the board, not screens, but they
+ * are addresses people are given — a brief, a bookmark, a link in a message.
+ * Each lands on the board scrolled to its section rather than on a 404 card.
+ */
+function SectionAnchor({ section }: { section: string }) {
+  const navigate = useNavigate();
+  useEffect(() => { navigate(`/revenue#${section}`, { replace: true }); }, [navigate, section]);
+  return <Loading label="Opening the board…" />;
+}
+const MovementAnchor = () => <SectionAnchor section="movement" />;
+const CollectionsAnchor = () => <SectionAnchor section="collections" />;
+
 /* ============================== registration ============================== */
 
 export const routes: RouteDef[] = [
   { path: '/revenue', element: RevenueBoardPage, title: 'Revenue' },
+  { path: '/revenue/movement', element: MovementAnchor, title: 'MRR movement' },
+  { path: '/revenue/collections', element: CollectionsAnchor, title: 'Receivables' },
   { path: '/revenue/usage', element: UsagePage, title: 'Usage' },
   { path: '/revenue/usage/:id', element: MeterDetailPage, title: 'Meter' },
   { path: '/revenue/credits', element: CreditsPage, title: 'Credits' },
   { path: '/revenue/dunning', element: DunningPage, title: 'Recovery' },
+  { path: '/revenue/deferred', element: RecognitionPage, title: 'Revenue recognition' },
 ];
 
 export const nav: NavItem[] = [
@@ -208,6 +228,7 @@ export const nav: NavItem[] = [
     // child sharing the parent's path wins the breadcrumb lookup, and every
     // screen under it then read "Home › Overview › Usage".
     children: [
+      { id: 'revenue.recognition.nav', label: 'Recognition', to: '/revenue/deferred' },
       { id: 'revenue.usage.nav', label: 'Usage', to: '/revenue/usage' },
       { id: 'revenue.credits.nav', label: 'Credits', to: '/revenue/credits' },
       { id: 'revenue.dunning.nav', label: 'Recovery', to: '/revenue/dunning' },
@@ -228,7 +249,7 @@ export const commands: CommandDef[] = [
     group: 'Go to',
     keywords: ['expired card', 'needs human', 'authentication required', 'stuck payment', 'dunning', 'recovery'],
     icon: 'alert-triangle',
-    run: (nav) => nav('/revenue/dunning?status=all'),
+    run: (nav) => nav('/revenue/dunning?status=needs_human'),
   },
   {
     id: 'revenue.dunning.policy',

@@ -36,7 +36,7 @@ import type { Ctx } from '../../kernel/context';
 import { badRequest, conflict, internal, notFound } from '../../../shared/errors';
 import { cursorOf, newId, parseCursor } from '../../../shared/ids';
 import { formatMoney, money } from '../../../shared/money';
-import { DAY } from '../../../shared/time';
+import { DAY, formatDate } from '../../../shared/time';
 import { billingStore } from '../billing/module';
 import type { Invoice } from '../billing/types';
 import { hydrateCharge, hydrateDispute, hydrateIntent, hydrateRefund, type Page, type WriteMeta } from './records';
@@ -492,7 +492,16 @@ export class Gateway {
   cancelIntent(orgId: string, id: string, reason: PaymentCancellationReason, meta: WriteMeta = {}): PaymentIntent {
     return this.ctx.atomic(() => {
       const intent = this.requireIntent(orgId, id);
-      if (intent.status === 'canceled') return intent;
+      if (intent.status === 'canceled') {
+        // A second cancel is a double submit or a stale screen. Answering it
+        // 200 reads as though the reason it carried had been recorded, when
+        // the first one's stands; the state is named instead, as Stripe does.
+        throw badRequest(
+          'payment_intent_already_canceled',
+          `Payment intent ${id} was already cancelled on ${formatDate(intent.canceled_at ?? intent.updated, this.orgFormat(orgId))} as ${(intent.cancellation_reason ?? 'abandoned').replace(/_/g, ' ')}, so there is nothing left to cancel.`,
+          undefined, { status: intent.status, cancellation_reason: intent.cancellation_reason },
+        );
+      }
       if (intent.status === 'succeeded') {
         throw conflict('payment_intent_succeeded', `Payment intent ${id} has already been paid. Refund the charge instead.`, { charge: intent.latest_charge });
       }
@@ -508,7 +517,7 @@ export class Gateway {
         const settlesAt = charge ? charge.created + BANK_DEBIT_SETTLEMENT_DAYS * DAY : null;
         throw conflict(
           'payment_intent_processing',
-          `Payment intent ${id} is with the bank and cannot be recalled${settlesAt ? ` — it is answered by ${new Date(settlesAt).toISOString().slice(0, 10)}` : ''}. Wait for the answer: a return unpaid reopens the bill on its own, and money that does arrive can be refunded.`,
+          `Payment intent ${id} is with the bank and cannot be recalled${settlesAt ? ` — it is answered by ${formatDate(settlesAt, this.orgFormat(orgId))}` : ''}. Wait for the answer: a return unpaid reopens the bill on its own, and money that does arrive can be refunded.`,
           { status: intent.status, charge: intent.latest_charge, settles_at: settlesAt },
         );
       }
@@ -672,8 +681,13 @@ export class Gateway {
       actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
     });
     if (after.invoice) {
+      // The note is read on the invoice screen by whoever asks "how was this
+      // paid?", so it names the card the way a statement would, and the day
+      // in the workspace's own calendar — never a charge id or an ISO stamp.
+      const method = charge.payment_method ? this.payments.methods.method(orgId, charge.payment_method) : null;
+      const paidWith = method ? method.display_name.replace(/, expires \d{2}\/\d{4}$/, '') : 'the method on file';
       const invoice = this.applyCollection(orgId, after.invoice, charge.amount, {
-        note: `Collected by ${charge.id} on ${new Date(now).toISOString().slice(0, 10)}.`,
+        note: `Collected by ${paidWith} on ${formatDate(now, this.orgFormat(orgId))}.`,
         at: now, charge: charge.id, meta,
       });
       this.ctx.emit(orgId, 'invoice.payment_succeeded', {
@@ -746,7 +760,7 @@ export class Gateway {
       if (!this.drivenByDunning) {
         this.payments.dunning.stopFor(
           orgId, invoice.id,
-          `${invoice.number} was settled before ${charge.id} was answered, so the ${code} it came back with is not a bill to chase.`,
+          `${invoice.number} was settled before the issuer answered the charge, so its ${code.replace(/_/g, ' ')} decline is not a bill to chase.`,
         );
       }
       return;
@@ -874,7 +888,7 @@ export class Gateway {
     if (inFlight.amount <= 0 || inFlight.amount < invoice.amount_due) return null;
     const locale = this.locale(orgId);
     const show = (amount: number) => formatMoney(money(amount, invoice.currency), { locale });
-    const settles = inFlight.settlesAt ? new Date(inFlight.settlesAt).toISOString().slice(0, 10) : 'in a few working days';
+    const settles = inFlight.settlesAt ? formatDate(inFlight.settlesAt, this.orgFormat(orgId)) : 'in a few working days';
     return `${show(inFlight.amount)} is already with the bank against ${invoice.number} and covers the ${show(invoice.amount_due)} still owed. Presenting it again would take the money twice — the debit is answered by ${settles}, and a return unpaid reopens the bill on its own.`;
   }
 
@@ -1283,7 +1297,9 @@ export class Gateway {
       subscription: invoice.subscription,
       amount_overpaid: excess, currency: invoice.currency,
       charge: opts.charge, balance_transaction: txn.id, customer_balance: txn.ending_balance,
-      resolution: `${shown} was collected beyond what ${invoice.number} was owed and has been credited to ${customer.name}'s account balance. Refund it against ${opts.charge ?? 'the charge that collected it'} if the customer wants the money back rather than the credit.`,
+      // `charge` above is the id for anything that follows the row; the
+      // sentence is read on the timeline, where an id is not a name.
+      resolution: `${shown} was collected beyond what ${invoice.number} was owed and has been credited to ${customer.name}'s account balance. Refund it against the charge that collected it if the customer wants the money back rather than the credit.`,
     }, {
       objectId: invoice.id, objectType: 'invoice',
       actorId: opts.meta?.actorId, actorType: opts.meta?.actorType, requestId: opts.meta?.requestId,
@@ -1452,7 +1468,7 @@ export class Gateway {
       if (charge.invoice) {
         const before = this.billing.invoices.require(orgId, charge.invoice);
         const after = this.reverseCollection(orgId, charge.invoice, amount, {
-          note: `${shown} refunded to the customer on ${new Date(now).toISOString().slice(0, 10)} (${id}).`,
+          note: `${shown} refunded to the customer on ${formatDate(now, this.orgFormat(orgId))}.`,
           at: now, meta,
         });
         reopened = { before, after };
@@ -1553,7 +1569,7 @@ export class Gateway {
       });
       if (charge.invoice) {
         this.reverseCollection(orgId, charge.invoice, amount, {
-          note: `${formatMoney(money(amount, charge.currency), { locale })} withdrawn by the card network while dispute ${id} is open.`,
+          note: `${formatMoney(money(amount, charge.currency), { locale })} withdrawn by the card network while the dispute raised on ${formatDate(now, this.orgFormat(orgId))} is open.`,
           at: now, meta,
         });
       }
@@ -1598,7 +1614,16 @@ export class Gateway {
   closeDispute(orgId: string, id: string, won: boolean, note: string | null, meta: WriteMeta = {}): Dispute {
     return this.ctx.atomic(() => {
       const dispute = this.requireDispute(orgId, id);
-      if (dispute.status === 'won' || dispute.status === 'lost') return dispute;
+      if (dispute.status === 'won' || dispute.status === 'lost') {
+        // A second close is a double submit or a stale screen, and answering
+        // it 200 would let "lost" be sent over a case already won without a
+        // word. The deadline job checks the status before it gets here.
+        throw badRequest(
+          'dispute_already_closed',
+          `This dispute was closed as ${dispute.status} on ${formatDate(dispute.closed_at ?? dispute.updated, this.orgFormat(orgId))}, so there is nothing left to decide.`,
+          undefined, { status: dispute.status },
+        );
+      }
       const now = this.ctx.now();
       const locale = this.locale(orgId);
       const shown = formatMoney(money(dispute.amount, dispute.currency), { locale });
@@ -1624,7 +1649,7 @@ export class Gateway {
           // open, or before it, keeps its write-off instead of being settled by
           // money it was already holding when someone gave up on it.
           this.applyCollection(orgId, dispute.invoice, dispute.amount, {
-            note: `${shown} returned after dispute ${id} was won.`,
+            note: `${shown} returned by the card network on ${formatDate(now, this.orgFormat(orgId))} after the dispute was won.`,
             at: now, charge: charge.id, meta, restoring: true,
           });
         } else {
@@ -1643,7 +1668,10 @@ export class Gateway {
           if (invoice.status === 'open' && invoice.amount_due > 0) {
             this.billing.invoices.markUncollectible(orgId, dispute.invoice, meta, now);
           }
-          this.payments.dunning.stopFor(orgId, dispute.invoice, `Dispute ${id} was lost, so there is nothing left to recover.`);
+          this.payments.dunning.stopFor(
+            orgId, dispute.invoice,
+            `The dispute over ${shown} was lost on ${formatDate(now, this.orgFormat(orgId))}, so there is nothing left to recover.`,
+          );
         }
       }
 
@@ -1670,6 +1698,13 @@ export class Gateway {
   private locale(orgId: string): string {
     try { return this.ctx.svc.core.org(orgId).locale || 'en-US'; }
     catch { return 'en-US'; }
+  }
+
+  private orgFormat(orgId: string): { locale: string; timeZone: string } {
+    try {
+      const org = this.ctx.svc.core.org(orgId);
+      return { locale: org.locale || 'en-US', timeZone: org.timezone || 'UTC' };
+    } catch { return { locale: 'en-US', timeZone: 'UTC' }; }
   }
 
   private customerName(orgId: string, customerId: string): string {

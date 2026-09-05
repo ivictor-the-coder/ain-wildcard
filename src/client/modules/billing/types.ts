@@ -117,9 +117,16 @@ export interface Subscription {
   status_detail: string;
   next_status_options: SubscriptionStatus[];
   interval_display: string;
-  latest_invoice: Invoice | null;
+  /**
+   * The newest bill on this subscription, as `latestFor` writes it: only the
+   * fields a summary needs. Anything else about the bill — what paid it, how
+   * it is collected — is read from `GET /v1/invoices/:id`.
+   */
+  latest_invoice: LatestInvoice | null;
   customer_detail?: Customer;
 }
+
+export type LatestInvoice = Pick<Invoice, 'id' | 'number' | 'status' | 'total' | 'amount_due' | 'due_date' | 'created'>;
 
 export interface ProrationLine {
   object: 'proration_line';
@@ -454,7 +461,21 @@ export interface CustomerSummary {
   mrr: number;
   arr: number;
   balance: { amount: number; currency: string; credit: boolean; description: string; transactions: BalanceTransaction[] };
-  lifetime_value: { amount: number; currency: string; periods_billed: number; customer_since: number | null; source: string };
+  lifetime_value: {
+    /** Cash collected, net of refunds and credit notes — never an unpaid bill. */
+    amount: number;
+    currency: string;
+    /** What `amount` is, in the words the screen should use beside it. */
+    label: string;
+    /** How `amount` was arrived at, figure by figure. */
+    basis: string;
+    collected: number;
+    overpaid: number;
+    credit_held: number;
+    periods_billed: number;
+    customer_since: number | null;
+    source: string;
+  };
   next_invoice: {
     subscription: string; date: number; currency: string; lines: RecurringLine[];
     subtotal: number; uninvoiced_total: number; balance_applied: number; estimated_total: number; note: string;
@@ -660,13 +681,18 @@ export interface Charge {
   object: 'charge';
   id: string;
   payment_intent: string | null;
+  customer: string;
   payment_method: string | null;
+  invoice: string | null;
+  subscription: string | null;
   amount: number;
   amount_refunded: number;
   amount_disputed: number;
   currency: string;
   status: string;
   paid: boolean;
+  refunded: boolean;
+  disputed: boolean;
   failure_code: string | null;
   failure_message: string | null;
   authorization_code: string | null;
@@ -678,11 +704,16 @@ export interface Refund {
   object: 'refund';
   id: string;
   charge: string | null;
+  payment_intent: string | null;
+  customer: string;
+  invoice: string | null;
   amount: number;
   currency: string;
   status: string;
   reason: string | null;
   description: string | null;
+  /** What the refund did to the bill, in the gateway's own words. */
+  invoice_effect: string | null;
   created: number;
 }
 
@@ -802,6 +833,9 @@ export interface PaymentIntent {
   last_payment_error: { code: string; message: string; advice: string | null } | null;
   latest_charge: string | null;
   succeeded_at: number | null;
+  canceled_at: number | null;
+  /** Who raised it: the API, the collector, a retry, or a person. */
+  source: 'api' | 'invoice_collection' | 'dunning_retry' | 'manual_retry';
   created: number;
 }
 
@@ -820,7 +854,7 @@ export interface InvoicePayments {
   amount_disputed: number;
   cash_collected: number;
   collectable: boolean;
-  collectable_note: string;
+  collectable_note: string | null;
   payment_intents: PaymentIntent[];
   charges: Charge[];
   refunds: Refund[];

@@ -8,7 +8,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Badge, Banner, Button, ConfirmDialog, DataTable, EmptyState, Icons, Inline, MenuButton, Modal,
+  Badge, Button, ConfirmDialog, DataTable, EmptyState, ErrorState, Icons, Inline, MenuButton, Modal,
   Page, Pill, SearchInput, Skeleton, Spinner, Tabs, Tooltip,
   FilterXIcon, RotateCcwIcon, humanize, useDebouncedValue, useFormat, useToast,
   type DataTableColumn, type Density, type MenuSection, type TableState,
@@ -24,8 +24,15 @@ import {
 } from './api';
 import { FilterBuilder, FilterSummary, RECORD_FIELDS, countConditions, filterableProperties, pruneFilter } from './filter-builder';
 import { BulkLinkDialog, BulkOwnerDialog, BulkPropertyDialog, RecordFormDialog, SaveViewDialog, type SaveViewMode } from './dialogs';
-import { UserChip, ValueView, cellValue, exportValue } from './values';
+import { ImportDialog } from './import';
+import { SlaBadge, UserChip, ValueView, cellValue, exportValue, isClosedRecord, isDueProperty } from './values';
 import { downloadCsv, exportFilename, toCsv } from './csv';
+import {
+  NONE, decodeFilterParam, decodeSortParam, encodeFilterParam, encodeSortParam, listHref, recordHref,
+} from './links';
+import { isActivityDef, listBootPhase, staleViewParam, visibleViews } from './record-model';
+
+export { NONE, decodeFilterParam, decodeSortParam, encodeFilterParam, encodeSortParam, listHref, recordHref };
 
 /* --------------------------------- helpers -------------------------------- */
 
@@ -49,19 +56,6 @@ const RECORD_FIELD_INDEX = new Map(RECORD_FIELDS.map((f) => [f.name, f]));
 
 export const definitionFor = (index: Map<string, PropertyDef>, name: string): PropertyDef | undefined =>
   index.get(name) ?? RECORD_FIELD_INDEX.get(name);
-
-/**
- * Where an object type's list lives. Deals belong to the pipeline module — the
- * board and its table are the one deal screen — so a deal link from a company
- * or a contact lands there, and `/records/deal` hands over to it.
- */
-export const listHref = (objectType: string): string =>
-  objectType === 'contact' ? '/contacts'
-    : objectType === 'company' ? '/companies'
-      : objectType === 'deal' ? '/deals'
-        : `/records/${objectType}`;
-
-export const recordHref = (objectType: string, id: string): string => `${listHref(objectType)}/${id}`;
 
 /**
  * Types worth a column before anyone has said what they want to see. Long text
@@ -116,62 +110,6 @@ export function columnWidth(property: PropertyDef, numeric: () => number): numbe
 
 const sameFilter = (a: FilterNode | null, b: FilterNode | null): boolean =>
   JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-
-/* ------------------------------- url carriage ----------------------------- */
-
-/**
- * "Look at this list" has to be a link. The search box, the filter tree and
- * the sort all ride in the query string beside `view`, so a reload, the back
- * button and a message to a teammate all land on the same rows — without
- * making anyone name and share a saved view for something they wanted to look
- * at for thirty seconds.
- */
-export function encodeFilterParam(node: FilterNode | null | undefined): string {
-  if (!node) return '';
-  try {
-    const bytes = new TextEncoder().encode(JSON.stringify(node));
-    let binary = '';
-    for (const byte of bytes) binary += String.fromCharCode(byte);
-    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  } catch {
-    return '';
-  }
-}
-
-/**
- * "The view's filter, deliberately turned off" is not the same state as "no
- * opinion", and only the second one should fall back to the view on reload.
- */
-export const NONE = 'none';
-
-export function decodeFilterParam(raw: string | undefined | null): FilterNode | null {
-  if (!raw || raw === NONE) return null;
-  try {
-    const b64 = raw.replace(/-/g, '+').replace(/_/g, '/');
-    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
-    const binary = atob(padded);
-    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
-    return parsed && typeof parsed === 'object' ? (parsed as FilterNode) : null;
-  } catch {
-    // A hand-edited or truncated link should show the list, not an error page.
-    return null;
-  }
-}
-
-export const encodeSortParam = (sort: SortSpec[]): string =>
-  sort.map((s) => `${s.property}:${s.direction ?? 'desc'}`).join(',');
-
-export const decodeSortParam = (raw: string | undefined | null): SortSpec[] =>
-  (!raw || raw === NONE ? '' : raw)
-    .split(',')
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => {
-      const [property, direction] = part.split(':');
-      return { property, direction: direction === 'asc' ? 'asc' : 'desc' } satisfies SortSpec;
-    })
-    .filter((s) => !!s.property);
 
 /* --------------------------- per-operator storage ------------------------- */
 
@@ -242,15 +180,45 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
 
   const properties = useMemo(() => objects.data?.data ?? [], [objects.data]);
   const propertyIndex = useMemo(() => new Map(properties.map((p) => [p.name, p])), [properties]);
-  const viewList = useMemo(() => views.data?.data ?? [], [views.data]);
+  // A view saved without "Share with the workspace" is its author's own. The
+  // API lists it for everyone; the bar shows what the checkbox promised.
+  const viewList = useMemo(() => visibleViews(views.data?.data ?? [], session.me?.user?.id), [views.data, session.me?.user?.id]);
 
   /* -------- view + query state, seeded from the saved view in the URL ------- */
 
   const viewId = location.query.view ?? '';
+  // The view as the server just returned it from a save. The cached list is
+  // one write behind until its refetch lands, and seeding the grid from that
+  // stale copy is how "Save changes" re-sorted the grid by the *old* sort and
+  // then marked the view Modified against the new one. The fresh copy stands
+  // in until the list catches up.
+  const [freshView, setFreshView] = useState<ViewDef | null>(null);
+  useEffect(() => { setFreshView(null); }, [views.data]);
   const activeView = useMemo(
-    () => viewList.find((v) => v.id === viewId) ?? viewList.find((v) => v.is_default) ?? viewList[0] ?? null,
-    [viewList, viewId],
+    () => (freshView && freshView.id === viewId ? freshView : null)
+      ?? viewList.find((v) => v.id === viewId)
+      ?? viewList.find((v) => v.is_default)
+      ?? viewList[0]
+      ?? null,
+    [viewList, viewId, freshView],
   );
+
+  // `?view=` names a view that is not in the bar — deleted since the link was
+  // copied, or a teammate's private one. The list opens on its default, says
+  // so, and the address stops pointing at a view that is not there.
+  const staleViewTold = useRef<string | null>(null);
+  useEffect(() => {
+    if (!views.data || views.loading) return;
+    if (!staleViewParam(viewId, viewList, true)) return;
+    if (staleViewTold.current === viewId) return;
+    staleViewTold.current = viewId;
+    const fallback = viewList.find((v) => v.is_default) ?? viewList[0];
+    toast.info(
+      'That view is not available',
+      `It was deleted, or a teammate kept it to themselves${fallback ? ` — showing “${fallback.name}” instead` : ''}.`,
+    );
+    setQuery({ view: undefined }, { replace: true });
+  }, [viewId, viewList, views.data, views.loading, toast, setQuery]);
 
   // What the link that opened this page asked for. Decoded once — the view that
   // arrives a moment later must not quietly throw it away, and the query string
@@ -377,19 +345,41 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
 
   const [creating, setCreating] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
+  // The dialog edits a draft. Nothing reaches the grid, the URL or the view's
+  // Modified badge until "Show N" is pressed; Close and Esc throw the draft
+  // away — the same as every other dialog on this surface.
+  const [draft, setDraft] = useState<FilterNode | null>(null);
+  const prunedDraft = useMemo(() => pruneFilter(draft) ?? null, [draft]);
+  const previewBody = useMemo(() => ({
+    ...(prunedDraft ? { filter: prunedDraft } : {}),
+    ...(query.trim() ? { query: query.trim() } : {}),
+    ...(showArchived ? { include_archived: true } : {}),
+    limit: 1,
+  }), [prunedDraft, query, showArchived]);
+  // Counted live against the draft so the button can say "Show 8 contacts"
+  // before anything is applied.
+  const preview = useRecordSearch(filtersOpen && objectDef ? objectType : null, previewBody);
+  const openFilters = useCallback(() => { setDraft(filter); setFiltersOpen(true); }, [filter]);
+  const applyDraft = useCallback(() => { setFilter(draft); setFiltersOpen(false); }, [draft]);
   const [savingView, setSavingView] = useState<SaveViewMode | null>(null);
   const [bulk, setBulk] = useState<'owner' | 'property' | 'link' | null>(null);
   const [confirmArchive, setConfirmArchive] = useState<string[] | null>(null);
   const [confirmDeleteView, setConfirmDeleteView] = useState<ViewDef | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
 
-  // The shell's create button lands here with ?new=1.
+  // The shell's create button lands here with ?new=1; the palette's import
+  // command with ?import=1.
   useEffect(() => {
     if (location.query.new === '1') {
       setCreating(true);
       setQuery({ new: undefined });
     }
-  }, [location.query.new, setQuery]);
+    if (location.query.import === '1') {
+      setImporting(true);
+      setQuery({ import: undefined });
+    }
+  }, [location.query.new, location.query.import, setQuery]);
 
   // A custom object's route can only name itself by its slug. Once the schema
   // has answered, the tab says what the workspace calls it. The router sets the
@@ -475,14 +465,18 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
         accessor: (row) => cellValue(property, fieldValue(row, name)),
         cell: (row) => (name === 'owner_id'
           ? <UserChip id={row.owner_id} user={row.owner_id ? userIndex.get(row.owner_id) : undefined} />
-          : <ValueView property={property} value={fieldValue(row, name)} users={userIndex} compact />),
+          : isDueProperty(property) && typeof fieldValue(row, name) === 'number'
+            // A due stamp is a promise: it reads as overdue or due-in, judged
+            // against the record's own status, not as a relative date.
+            ? <SlaBadge dueAt={Number(fieldValue(row, name))} closed={isClosedRecord(objectType, row.properties, schema.data)} />
+            : <ValueView property={property} value={fieldValue(row, name)} users={userIndex} compact />),
         ...(property.type === 'currency'
           ? { total: (rows: CrmRecord[]) => <span className="crm-num">{f.money(rows.reduce((n, r) => n + Number(fieldValue(r, name) ?? 0), 0), { currency: property.currency ?? session.currency })}</span> }
           : {}),
       });
     }
     return built;
-  }, [objectDef, columns, propertyIndex, userIndex, objectType, navigate, f, session.currency, numericWidth, result.rows]);
+  }, [objectDef, columns, propertyIndex, userIndex, objectType, navigate, f, session.currency, numericWidth, result.rows, schema.data]);
 
   const tableState = useMemo<TableState>(() => ({
     query: '',
@@ -543,8 +537,20 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
   const removeView = async (view: ViewDef) => {
     try {
       await deleteView(view.id);
+      // An object with no default view opens on whichever view happens to be
+      // first. The one that ships with Ain takes the default back, so the
+      // list keeps opening somewhere deliberate.
+      const fallback = view.is_default
+        ? [...viewList].filter((v) => v.id !== view.id).sort((a, b) => Number(b.system) - Number(a.system) || a.position - b.position)[0]
+        : undefined;
+      if (fallback) await updateView(fallback.id, { is_default: true });
       crmChanged('/v1/views');
-      toast.success('View deleted', `“${view.name}” is gone. The records are untouched.`);
+      toast.success(
+        'View deleted',
+        fallback
+          ? `“${view.name}” is gone and “${fallback.name}” is the default again. The records are untouched.`
+          : `“${view.name}” is gone. The records are untouched.`,
+      );
       setQuery({ view: undefined });
       setSeeded('');
     } catch (e) {
@@ -554,29 +560,16 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
 
   /* ---------------------------------- render -------------------------------- */
 
-  if (schema.error || objects.error) {
-    const error = schema.error ?? objects.error;
-    return (
-      <Page title={humanize(objectType)} subtitle="This list could not be assembled">
-        <Banner
-          tone="danger"
-          title="The object model could not be read"
-          actions={<Button size="sm" onClick={() => { schema.refetch(); objects.refetch(); }}>Try again</Button>}
-        >
-          {error?.body.message} {error?.body.request_id ? `· ${error.body.request_id}` : null}
-        </Banner>
-      </Page>
-    );
-  }
+  // The schema decides first. A slug it does not know is not a server failure,
+  // whatever the properties call answered — a 404 there is the same fact.
+  const phase = listBootPhase({
+    schemaLoaded: !!schema.data,
+    typeKnown: !!objectDef,
+    schemaError: !!schema.error,
+    propertiesError: !!objects.error,
+  });
 
-  if (!objectDef) {
-    if (schema.loading) {
-      return (
-        <Page title={humanize(objectType)} subtitle="Reading the object model…">
-          <div className="crm-boot"><Skeleton height={38} /><Skeleton height={38} /><Skeleton height={300} /></div>
-        </Page>
-      );
-    }
+  if (phase === 'missing_type') {
     return (
       <Page title={humanize(objectType)}>
         <EmptyState
@@ -584,6 +577,28 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
           body="It may have been renamed or deleted. The data model page lists every object this workspace actually has."
           action={<Button variant="primary" onClick={() => navigate('/records')}>Open the data model</Button>}
         />
+      </Page>
+    );
+  }
+
+  if (phase !== 'ready' || !objectDef) {
+    const error = schema.error ?? objects.error;
+    if (phase === 'error' && error) {
+      return (
+        <Page title={objectDef?.plural_label ?? humanize(objectType)} subtitle="This list could not be assembled">
+          <ErrorState
+            title="The object model could not be read"
+            message={error.body.message}
+            code={`${error.status} ${schema.error ? '/v1/crm/schema' : `/v1/objects/${objectType}/properties`}`}
+            requestId={error.body.request_id ?? null}
+            action={<Button variant="primary" onClick={() => { schema.refetch(); objects.refetch(); }}>Try again</Button>}
+          />
+        </Page>
+      );
+    }
+    return (
+      <Page title={humanize(objectType)} subtitle="Reading the object model…">
+        <div className="crm-boot"><Skeleton height={38} /><Skeleton height={38} /><Skeleton height={300} /></div>
       </Page>
     );
   }
@@ -699,7 +714,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
   return (
     <Page
       title={objectDef.plural_label}
-      eyebrow="Customers"
+      eyebrow={isActivityDef(objectDef) ? 'Activity' : 'Customers'}
       width="wide"
       subtitle={
         result.loading || result.stale
@@ -742,7 +757,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
       {conditions > 0 && (
         <div className="crm-activefilter">
           <Icons.filter size={13} />
-          <FilterSummary filter={pruned} properties={propertyIndex} users={userIndex} schema={schema.data} />
+          <FilterSummary filter={pruned} properties={propertyIndex} users={userIndex} schema={schema.data} objectType={objectType} />
           <Button size="sm" variant="ghost" iconLeft={<FilterXIcon size={13} />} onClick={() => setFilter(null)}>
             Clear
           </Button>
@@ -780,7 +795,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
               size="sm"
               variant={conditions ? 'secondary' : 'ghost'}
               iconLeft={<Icons.filter size={14} />}
-              onClick={() => setFiltersOpen(true)}
+              onClick={openFilters}
             >
               Filters{conditions ? ` · ${conditions}` : ''}
             </Button>
@@ -795,15 +810,34 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
                 Archived
               </Pill>
             </Tooltip>
-            <Button
-              size="sm"
+            <MenuButton
+              sections={[{
+                id: 'io',
+                items: [
+                  {
+                    id: 'import',
+                    label: 'Import from a CSV file…',
+                    description: `New ${objectDef.plural_label.toLowerCase()}, or updates matched on a unique property`,
+                    icon: <Icons.upload size={14} />,
+                    onSelect: () => setImporting(true),
+                  },
+                  {
+                    id: 'export',
+                    label: 'Export this view as CSV',
+                    description: result.total ? `${f.number(result.total)} ${f.plural(result.total, 'row', { hideCount: true })}, every column shown` : 'Nothing to export yet',
+                    icon: <Icons.download size={14} />,
+                    disabled: exporting || !result.total,
+                    onSelect: () => { void exportCsv(); },
+                  },
+                ],
+              }]}
+              label="Import or export"
+              icon={exporting ? <Spinner size={13} /> : <Icons.upload size={14} />}
               variant="ghost"
-              iconLeft={exporting ? <Spinner size={13} /> : <Icons.download size={14} />}
-              disabled={exporting || !result.total}
-              onClick={() => { void exportCsv(); }}
+              size="sm"
             >
-              Export CSV
-            </Button>
+              Import / export
+            </MenuButton>
           </>
         }
         selectable
@@ -822,6 +856,11 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
               conditions || query
                 ? <Button variant="secondary" onClick={() => { setFilter(null); setSearch(''); }}>Clear the filter</Button>
                 : <Button variant="primary" iconLeft={<Icons.plus size={14} />} onClick={() => setCreating(true)}>New {objectDef.label.toLowerCase()}</Button>
+            }
+            secondaryAction={
+              conditions || query
+                ? undefined
+                : <Button variant="ghost" iconLeft={<Icons.upload size={14} />} onClick={() => setImporting(true)}>Import a CSV</Button>
             }
           />
         }
@@ -870,22 +909,23 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
         onClose={() => setFiltersOpen(false)}
         size="xl"
         title={`Filter ${objectDef.plural_label.toLowerCase()}`}
-        description="Nested groups, nineteen operators, moving dates, and conditions that reach across associations."
+        description="Nested groups, nineteen operators, moving dates, and conditions that reach across associations. Nothing applies until you press Show."
         footer={
           <>
-            <Button variant="ghost" onClick={() => setFilter(null)}>Clear everything</Button>
+            <Button variant="ghost" onClick={() => setDraft(null)}>Clear everything</Button>
             <span className="u-spacer" />
-            <Button variant="secondary" onClick={() => { setFiltersOpen(false); setSavingView('new'); }}>Save as a view</Button>
+            <Button variant="ghost" onClick={() => setFiltersOpen(false)}>Cancel</Button>
+            <Button variant="secondary" onClick={() => { applyDraft(); setSavingView('new'); }}>Save as a view</Button>
             {/* The count is dropped while the preview is in flight rather than
-                left showing the number the previous filter matched. */}
+                left showing the number the previous draft matched. */}
             <Button
               variant="primary"
-              iconLeft={result.loading || result.stale ? <Spinner size={13} /> : undefined}
-              onClick={() => setFiltersOpen(false)}
+              iconLeft={preview.loading || preview.stale ? <Spinner size={13} /> : undefined}
+              onClick={applyDraft}
             >
-              {result.loading || result.stale || result.error
+              {preview.loading || preview.stale || preview.error
                 ? `Show ${objectDef.plural_label.toLowerCase()}`
-                : `Show ${f.number(result.total)} ${f.plural(result.total, objectDef.label.toLowerCase(), { hideCount: true })}`}
+                : `Show ${f.number(preview.total)} ${f.plural(preview.total, objectDef.label.toLowerCase(), { hideCount: true })}`}
             </Button>
           </>
         }
@@ -896,8 +936,8 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
           properties={properties}
           schema={schema.data}
           users={users.data?.data ?? []}
-          value={filter}
-          onChange={setFilter}
+          value={draft}
+          onChange={setDraft}
         />
       </Modal>
 
@@ -908,6 +948,15 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
         properties={properties}
         users={users.data?.data ?? []}
         onCreated={(record) => navigate(recordHref(objectType, record.id))}
+      />
+
+      <ImportDialog
+        open={importing}
+        onClose={() => setImporting(false)}
+        objectType={objectDef}
+        properties={properties}
+        users={users.data?.data ?? []}
+        onImported={() => setSelected([])}
       />
 
       <SaveViewDialog
@@ -921,6 +970,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
         sort={sort}
         properties={filterableProperties(properties)}
         onSaved={(view) => {
+          setFreshView(view);
           // A rename touched nothing the grid is showing, so the grid keeps
           // showing it — including changes the operator has not saved yet.
           if (savingView === 'rename') return;
@@ -929,6 +979,15 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
           clearPref(prefKey('columns', objectType, view.id));
           clearPref(columnsKey);
           setColumnsPinned(false);
+          if (view.id === activeView?.id) {
+            // Written back onto the view on screen: the working state *is* the
+            // saved state now, so it is taken from the returned view rather
+            // than re-seeded from whichever copy the cache still holds.
+            setFilter(view.filter);
+            setSort(view.sort);
+            setColumns(view.columns);
+            return;
+          }
           setQuery({ view: view.id });
           setSeeded('');
         }}

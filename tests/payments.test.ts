@@ -1,5 +1,6 @@
 import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createApp, frozenClock, type App } from '../src/server/app';
 import type { Auth } from '../src/server/kernel/http';
 import { DAY, dayKey } from '../src/shared/time';
@@ -251,12 +252,79 @@ describe('the simulated processor', () => {
   });
 
   test('an expired card declines whatever its declared behaviour says', async () => {
+    // A card goes stale on the book, not at the door: attached while good,
+    // it expires at the end of June while the demo runs on into July.
+    const stale = await workspace(MONDAY);
+    try {
+      const customer = await stale.customer();
+      const method = await stale.card(customer.id, 'succeeds', { exp_month: 6, exp_year: 2026 });
+      assert.equal(method.simulated.effective_behavior, 'succeeds');
+      assert.equal((await stale.travel(45 * DAY)).failed, 0);
+
+      const aged: PaymentMethod = await stale.ok('GET', `/v1/payment_methods/${method.id}`);
+      assert.equal(aged.simulated.behavior, 'succeeds', 'what it was set up to do is kept');
+      assert.equal(aged.simulated.effective_behavior, 'expired_card', 'what it will do now is stated');
+      assert.match(aged.simulated.explanation, /expired 06\/2026/);
+      assert.doesNotMatch(aged.simulated.explanation, /are authorised/, 'a stale card is not described as one that authorises');
+      const listed: PaymentMethod[] = (await stale.ok('GET', `/v1/customers/${customer.id}/payment_methods`)).data;
+      assert.equal(listed[0].simulated.effective_behavior, 'expired_card', 'the list says the same as the record');
+
+      const intent: PaymentIntent = await stale.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, amount: 1_000, currency: 'usd', payment_method: method.id, confirm: true, off_session: true,
+      });
+      assert.equal(intent.last_payment_error?.code, 'expired_card');
+
+      // And a stale card cannot be moved onto another account either.
+      await stale.ok('POST', `/v1/payment_methods/${method.id}/detach`, {});
+      const other = await stale.customer('Second Account');
+      const refused = await stale.fail('POST', `/v1/payment_methods/${method.id}/attach`, { customer: other.id }, 400, 'expired_card');
+      assert.equal(refused.param, 'exp_year');
+    } finally { stale.close(); }
+  });
+
+  test('a card that has already expired is refused at the door, attaching or patching', async () => {
     const customer = await ws.customer();
-    const method = await ws.card(customer.id, 'succeeds', { exp_month: 1, exp_year: 2026 });
-    const intent: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
-      customer: customer.id, amount: 1_000, currency: 'usd', payment_method: method.id, confirm: true, off_session: true,
-    });
-    assert.equal(intent.last_payment_error?.code, 'expired_card');
+    const refused = await ws.fail('POST', '/v1/payment_methods', {
+      type: 'card', customer: customer.id, brand: 'visa', exp_month: 1, exp_year: 2026, simulated_behavior: 'succeeds',
+    }, 400, 'expired_card');
+    assert.equal(refused.param, 'exp_year');
+    assert.match(refused.message, /01\/2026/);
+    assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}/payment_methods`)).data.length, 0, 'nothing was attached');
+
+    const method = await ws.card(customer.id);
+    const patched = await ws.fail('PATCH', `/v1/payment_methods/${method.id}`, { exp_month: 5, exp_year: 2026 }, 400, 'expired_card');
+    assert.equal(patched.param, 'exp_year');
+    const kept: PaymentMethod = await ws.ok('GET', `/v1/payment_methods/${method.id}`);
+    assert.equal(kept.card?.exp_year, 2031, 'the refusal wrote nothing');
+    assert.equal(kept.simulated.effective_behavior, 'succeeds');
+
+    // The one stale card the demo carries was attached while it was good and
+    // has aged on the book; it says so rather than calling itself authorised.
+    const declared: PaymentMethod[] = (await ws.ok('GET', '/v1/payment_methods?behavior=expired_card&limit=50')).data;
+    const seeded = declared.filter((card) => card.metadata.seeded === 'true');
+    assert.ok(seeded.length >= 1, 'the seed keeps one expired card on the book');
+    for (const card of seeded) {
+      assert.ok(card.card && (card.card.exp_year < 2026 || (card.card.exp_year === 2026 && card.card.exp_month < 6)), 'and its date agrees');
+    }
+    for (const card of declared) {
+      assert.equal(card.simulated.effective_behavior, 'expired_card');
+      assert.match(card.simulated.explanation, /expired/i);
+    }
+  });
+
+  test('the payment note on a collected bill reads like a statement line, not a log line', async () => {
+    const customer = await ws.customer('Statement Lines');
+    await ws.card(customer.id);
+    const { invoice } = await ws.subscribe(customer.id);
+    assert.equal(invoice.status, 'paid');
+    assert.match(String(invoice.payment_note), /^Collected by Visa ending \d{4} on [A-Z][a-z]{2} \d{1,2}, \d{4}\.$/);
+    assert.doesNotMatch(String(invoice.payment_note), /ch_|\d{4}-\d{2}-\d{2}/, 'no charge id and no ISO stamp in operator-facing prose');
+
+    const charge = ((await ws.ok('GET', `/v1/charges?invoice=${invoice.id}`)).data as Charge[]).find((c) => c.status === 'succeeded') as Charge;
+    await ws.ok('POST', '/v1/refunds', { charge: charge.id, amount: 5_000, reason: 'requested_by_customer' });
+    const after = await ws.invoice(invoice.id);
+    assert.match(String(after.payment_note), /refunded to the customer on [A-Z][a-z]{2} \d{1,2}, \d{4}\./);
+    assert.doesNotMatch(String(after.payment_note), /re_[A-Za-z0-9]|\d{4}-\d{2}-\d{2}/);
   });
 
   test('an idempotency key makes a replayed create return the first intent, not a second charge', async () => {
@@ -517,6 +585,12 @@ describe('a bill is never collected twice in silence', () => {
       assert.ok(overpaid, 'invoice.overpaid is emitted, so a webhook sees it too');
       assert.equal(overpaid.data.amount_overpaid, half);
       assert.equal(overpaid.data.customer_balance, -half);
+      // The sentence beside the figures is read on the record timeline, so it
+      // names the charge by its role; the id travels as data for whatever
+      // follows the row.
+      assert.ok(overpaid.data.charge, 'the charge id is in the event data');
+      assert.match(String(overpaid.data.resolution), /Refund it against the charge that collected it/);
+      assert.doesNotMatch(String(overpaid.data.resolution), /\bch_[A-Za-z0-9]+/, 'no charge id in operator-facing prose');
     } finally { ws.close(); }
   });
 
@@ -1885,6 +1959,72 @@ describe('what a reversal leaves the platform able to do', () => {
     } finally { ws.close(); }
   });
 
+  test('the notes a dispute leaves on the bill name the day and the outcome, never the dispute’s id', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Kendal Drives');
+      await ws.card(customer.id, 'succeeds');
+      const { invoice } = await ws.subscribe(customer.id);
+      const charge = (await ws.ok('GET', `/v1/charges?invoice=${invoice.id}`)).data[0] as Charge;
+
+      const dispute: Dispute = await ws.ok('POST', '/v1/disputes', { charge: charge.id, reason: 'fraudulent' });
+      const withdrawn = await ws.invoice(invoice.id);
+      assert.equal(withdrawn.status, 'open');
+      assert.match(
+        String(withdrawn.payment_note),
+        /withdrawn by the card network while the dispute raised on [A-Z][a-z]{2} \d{1,2}, \d{4} is open\.$/,
+      );
+      assert.doesNotMatch(String(withdrawn.payment_note), /\bdp_[A-Za-z0-9]+|\d{4}-\d{2}-\d{2}/, 'no dispute id and no ISO stamp in operator-facing prose');
+
+      const won: Dispute = await ws.ok('POST', `/v1/disputes/${dispute.id}/close`, { status: 'won' });
+      assert.equal(won.status, 'won');
+      const returned = await ws.invoice(invoice.id);
+      assert.equal(returned.status, 'paid');
+      assert.match(
+        String(returned.payment_note),
+        /returned by the card network on [A-Z][a-z]{2} \d{1,2}, \d{4} after the dispute was won\.$/,
+      );
+      assert.doesNotMatch(String(returned.payment_note), /\bdp_[A-Za-z0-9]+|\d{4}-\d{2}-\d{2}/);
+
+      // Closing it again — the other way — is a double submit, not a second
+      // verdict, and a 200 here would have let "lost" land on a case won.
+      const again = await ws.fail('POST', `/v1/disputes/${dispute.id}/close`, { status: 'lost' }, 400, 'dispute_already_closed');
+      assert.match(again.message, /closed as won on [A-Z][a-z]{2} \d{1,2}, \d{4}/);
+      assert.equal(((await ws.ok('GET', `/v1/disputes/${dispute.id}`)) as Dispute).status, 'won', 'the verdict stands');
+      assert.equal((await ws.invoice(invoice.id)).status, 'paid', 'and so does the bill it returned the money to');
+    } finally { ws.close(); }
+  });
+
+  test('a dispute lost over a bill under recovery stands the campaign down with a sentence, not an id', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Morley Gearworks');
+      const card: PaymentMethod = await ws.card(customer.id, 'succeeds');
+      const { invoice } = await ws.subscribe(customer.id);
+      const charge = (await ws.ok('GET', `/v1/charges?invoice=${invoice.id}`)).data[0] as Charge;
+
+      // The network takes the money back, and the card has gone bad since: the
+      // retry on the reopened bill is refused, so a campaign is chasing it.
+      const dispute: Dispute = await ws.ok('POST', '/v1/disputes', { charge: charge.id, reason: 'fraudulent' });
+      await ws.ok('PATCH', `/v1/payment_methods/${card.id}`, { simulated_behavior: 'insufficient_funds' });
+      const attempt = await ws.ok('POST', `/v1/invoices/${invoice.id}/retry`, {});
+      assert.equal(attempt.collected, false);
+      const [chasing] = await ws.dunning(customer.id);
+      assert.equal(chasing?.status, 'recovering', 'the reopened bill is being chased');
+
+      const lost: Dispute = await ws.ok('POST', `/v1/disputes/${dispute.id}/close`, { status: 'lost' });
+      assert.equal(lost.status, 'lost');
+      assert.equal((await ws.invoice(invoice.id)).status, 'uncollectible');
+      const [stood] = await ws.dunning(customer.id);
+      assert.equal(stood.status, 'canceled');
+      assert.match(
+        String(stood.resolution),
+        /^The dispute over \$[\d,]+\.\d{2} was lost on [A-Z][a-z]{2} \d{1,2}, \d{4}, so there is nothing left to recover\./,
+      );
+      assert.doesNotMatch(String(stood.resolution), /\bdp_[A-Za-z0-9]+|\d{4}-\d{2}-\d{2}/, 'no dispute id and no ISO stamp on the queue');
+    } finally { ws.close(); }
+  });
+
   test('a deadline that passes on such a dispute does not leave a job failing for ever', async () => {
     const ws = await workspace();
     try {
@@ -1973,6 +2113,34 @@ describe('what a reversal leaves the platform able to do', () => {
       assert.equal(settled.status, 'paid', 'the debit settled and paid the bill');
       assert.equal(settled.amount_paid, invoice.total);
       await assertReconciled(ws, customer.id, 'after a cancel that was refused settled anyway');
+    } finally { ws.close(); }
+  });
+
+  test('cancelling an intent twice is refused, and the first reason stands', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Bramhall Actuators');
+      const card: PaymentMethod = await ws.card(customer.id, 'succeeds');
+      const intent: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, amount: 12_500, currency: 'usd', payment_method: card.id,
+      });
+      assert.notEqual(intent.status, 'canceled');
+
+      const canceled: PaymentIntent = await ws.ok('POST', `/v1/payment_intents/${intent.id}/cancel`, { cancellation_reason: 'duplicate' });
+      assert.equal(canceled.status, 'canceled');
+      assert.equal(canceled.cancellation_reason, 'duplicate');
+
+      // A second cancel with a different reason used to answer 200, which
+      // reads as though "fraudulent" had been recorded; the first reason stands
+      // and the answer now says so.
+      const again = await ws.fail(
+        'POST', `/v1/payment_intents/${intent.id}/cancel`, { cancellation_reason: 'fraudulent' },
+        400, 'payment_intent_already_canceled',
+      );
+      assert.match(again.message, /already cancelled on [A-Z][a-z]{2} \d{1,2}, \d{4} as duplicate/);
+      assert.doesNotMatch(again.message, /\d{4}-\d{2}-\d{2}/);
+      const still: PaymentIntent = await ws.ok('GET', `/v1/payment_intents/${intent.id}`);
+      assert.equal(still.cancellation_reason, 'duplicate', 'the first reason stands');
     } finally { ws.close(); }
   });
 });
@@ -2656,7 +2824,7 @@ describe('an answer that arrives after the bill has moved', () => {
 
       const [done] = await ws.dunning(customer.id);
       assert.equal(done.status, 'recovered');
-      assert.equal(done.recovered_amount, invoice.total - part, 'the schedule is credited with what its own retry brought in');
+      assert.equal(done.recovered_amount, invoice.total, 'everything that arrived while the campaign ran — the part payment and the retry that finished it');
       await assertReconciled(ws, customer.id, 'after a part payment and the retry that finished the bill');
     } finally { ws.close(); }
   });
@@ -2971,6 +3139,13 @@ describe('refunds', () => {
     assert.match(campaign.recommended_action, /credit note/);
     assert.match(campaign.recommended_action, new RegExp(`/v1/invoices/${invoice.id}/retry`));
     assert.match(campaign.recommended_action, /duplicate/, 'the queue says why the money went back');
+    // The hold's own note is read on the queue, so it carries the day and the
+    // reason — never the refund's id, and never an ISO stamp.
+    assert.match(
+      String(campaign.hold?.note),
+      /went back to the customer on [A-Z][a-z]{2} \d{1,2}, \d{4}, refunded as duplicate, so/,
+    );
+    assert.doesNotMatch(String(campaign.hold?.note), /\bre_[A-Za-z0-9]+|\d{4}-\d{2}-\d{2}/, 'no refund id and no ISO stamp in operator-facing prose');
     assert.equal(
       ws.app.ctx.db.count(
         `SELECT COUNT(*) FROM jobs WHERE type = 'payments.dunning_retry' AND status = 'pending' AND idem_key = ?`,
@@ -3194,10 +3369,37 @@ describe('payment methods', () => {
     const promoted: PaymentMethod = await ws.ok('GET', `/v1/payment_methods/${second.id}`);
     assert.equal(promoted.default_for_customer, true);
 
+    // Detaching it again is a double submit, and is told so rather than
+    // answered as though it had just happened.
+    const again = await ws.fail('POST', `/v1/payment_methods/${first.id}/detach`, {}, 400, 'payment_method_already_detached');
+    assert.match(again.message, /was already detached on [A-Z][a-z]{2} \d{1,2}, \d{4}/);
+    assert.doesNotMatch(again.message, /\d{4}-\d{2}-\d{2}/, 'the day is the workspace’s, not an ISO stamp');
+
     const { invoice } = await ws.subscribe(customer.id);
     assert.equal(invoice.status, 'paid', 'the surviving card collected the bill');
     const charge = (await ws.ok('GET', `/v1/charges?invoice=${invoice.id}`)).data[0] as Charge;
     assert.equal(charge.payment_method, second.id);
+  });
+
+  test('attaching a method already on the account is refused, and the account keeps its default', async () => {
+    const customer = await ws.customer();
+    const first: PaymentMethod = await ws.card(customer.id, 'succeeds');
+    const second: PaymentMethod = await ws.card(customer.id, 'succeeds', { brand: 'mastercard' });
+    assert.equal(first.default_for_customer, true);
+    assert.equal(second.default_for_customer, false);
+
+    // Re-attaching the default used to look for "a default already on file",
+    // find itself, and clear its own flag — a card on file and nothing to charge.
+    const refused = await ws.fail('POST', `/v1/payment_methods/${first.id}/attach`, { customer: customer.id }, 400, 'payment_method_already_attached');
+    assert.match(refused.message, /as the default method/);
+    const still: PaymentMethod = await ws.ok('GET', `/v1/payment_methods/${first.id}`);
+    assert.equal(still.default_for_customer, true, 'the account keeps its default');
+    assert.equal(still.customer, customer.id);
+
+    const other = await ws.fail('POST', `/v1/payment_methods/${second.id}/attach`, { customer: customer.id }, 400, 'payment_method_already_attached');
+    assert.match(other.message, /set_default/, 'a method that is not the default is pointed at the call that makes it one');
+    const unchanged: PaymentMethod = await ws.ok('GET', `/v1/payment_methods/${second.id}`);
+    assert.equal(unchanged.default_for_customer, false);
   });
 
   test('a subscription’s own default is charged ahead of the account default', async () => {
@@ -3859,3 +4061,84 @@ describe('a bill collected after the schedule ran out', () => {
   });
 });
 
+/* ========================================================================== *
+ * Money that arrives outside the schedule is still money the campaign recovered
+ * ========================================================================== */
+
+describe('money that arrives outside the schedule', () => {
+  test('a part payment made by hand counts toward what the campaign recovered, and revenue reads the balance as the exposure', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const customer = await ws.customer('Wexford Bearings');
+      const method = await ws.card(customer.id, 'insufficient_funds', { simulated_decline_count: 1 });
+      const { invoice } = await ws.subscribe(customer.id);
+      assert.equal(invoice.status, 'open', 'the first presentation was refused');
+      const [opened] = await ws.dunning(customer.id);
+      assert.equal(opened.status, 'recovering');
+      assert.equal(opened.recovered_amount, 0);
+      const before = await ws.ok('GET', '/v1/revenue/collections?currency=usd');
+
+      // The customer rings in and pays $200.00 of the bill on the card that
+      // has since come good. The schedule did not collect it; the campaign
+      // still did — that is money back on a bill it was chasing.
+      const part = 20_000;
+      await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: method.id,
+        amount: part, confirm: true, off_session: false,
+      });
+      const [still] = await ws.dunning(customer.id);
+      assert.equal(still.status, 'recovering', 'a part payment is not a recovery');
+      assert.equal(still.amount_at_risk, invoice.total - part, 'what is at risk is what is still owed');
+      assert.equal(still.recovered_amount, part, 'and what came in is what was recovered so far');
+
+      // Revenue's open exposure is the balance, and only the balance: the part
+      // payment comes off it once, through amount_at_risk, not a second time
+      // through recovered_amount.
+      const after = await ws.ok('GET', '/v1/revenue/collections?currency=usd');
+      assert.equal(after.recovery.at_risk, before.recovery.at_risk - part);
+      assert.equal(after.recovery.at_risk_campaigns, before.recovery.at_risk_campaigns);
+      assert.equal(after.exposure.failed_payments, after.recovery.at_risk);
+
+      // The retry that finishes the bill closes the campaign on the whole amount.
+      assert.equal((await ws.travel(30 * DAY)).failed, 0);
+      const [done] = await ws.dunning(customer.id);
+      assert.equal(done.status, 'recovered');
+      assert.equal(done.recovered_amount, invoice.total, 'the part payment and the retry together');
+      const summary = await ws.ok('GET', '/v1/dunning/summary');
+      assert.match(summary.recovery_rate_basis, /recovered \+ lost/);
+      const usd = summary.totals.find((row: any) => row.currency === 'usd');
+      assert.ok(usd.recovered_amount >= invoice.total);
+      await assertReconciled(ws, customer.id, 'after a part payment by hand and the retry that finished the bill');
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 12. Operator-facing prose carries no ids
+ * ========================================================================== */
+
+describe('operator-facing prose', () => {
+  /**
+   * Payment notes, hold notes and stand-down reasons are read on the invoice
+   * and the recovery queue by a person asking "what happened here?". A record
+   * id answers a different question, and belongs in the event data beside the
+   * sentence. An API path is the one exception: it is an instruction, and the
+   * id in it is the one the caller has to send.
+   */
+  test('no note, resolution or stand-down reason in the payments module interpolates a record id', () => {
+    const offenders: string[] = [];
+    for (const name of ['dunning.ts', 'gateway.ts', 'module.ts']) {
+      const lines = readFileSync(new URL(`../src/server/modules/payments/${name}`, import.meta.url), 'utf8').split('\n');
+      for (const [index, line] of lines.entries()) {
+        const opensProse = /^\s*(note|resolution|reason):\s*`/.test(line)
+          || /stopFor\(orgId, [^,]+, `/.test(line)
+          || /stopFor\($/.test(lines[index - 1] ?? '')
+          || /stopFor\($/.test(lines[index - 2] ?? '');
+        if (!opensProse) continue;
+        const spoken = line.replace(/\/v1\/[^\s`]*/g, '');
+        if (/\$\{[A-Za-z_.]*\b(id|Id)\}|\$\{opts\.charge\b/.test(spoken)) offenders.push(`${name}:${index + 1}: ${line.trim()}`);
+      }
+    }
+    assert.deepEqual(offenders, [], 'ids belong in event data, not in the sentence a person reads');
+  });
+});

@@ -21,7 +21,7 @@
  * The percentage is an exact decimal string on the wire and is never parsed to
  * a float on the way to the screen: `"8.875"` renders as 8.875%, not 8.874999.
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api, useQuery, type ListEnvelope } from '../../kernel/api';
 import { useNavigate } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
@@ -29,10 +29,11 @@ import {
   Badge, Banner, Button, Card, ConfirmDialog, DataTable, EmptyState, Field, Icons, Inline, Input,
   Modal, Select, Stat, Stack, Switch, Tooltip,
   humanize, useFormat,
-  type DataTableColumn, type MenuSection,
+  type DataTableColumn, type MenuSection, type TableState,
   CheckCircleIcon, XCircleIcon,
 } from '../../design';
-import { ListFailure, SettingsShell, idem, useAction } from './common';
+import { DialogForm, ListFailure, SettingsShell, idem, useAction, useConsumeQuery } from './common';
+import { tileOf } from './tiles';
 import { TaxIdStatusPill, taxIdStatusLabel } from '../billing/common';
 import type { AutomaticTaxSettings, CustomerLite, CustomerTaxId, TaxRate } from './types';
 
@@ -57,6 +58,14 @@ export function TaxPage() {
   const action = useAction();
 
   const [showRetired, setShowRetired] = useState(false);
+  const [rateView, setRateView] = useState<TableState>({ query: '', sort: { columnId: 'jurisdiction', direction: 'asc' }, filters: {} });
+  /**
+   * `?rate=txr_…` is the address an event about a tax rate writes. The register
+   * answers with that rate on top — a retired one included, since a rate on
+   * the trail is very often one that has just been retired.
+   */
+  const [wantedRate, setWantedRate] = useState<string | null>(null);
+  useConsumeQuery('rate', setWantedRate);
   const [creating, setCreating] = useState(false);
   const [retiring, setRetiring] = useState<TaxRate | null>(null);
   const [checking, setChecking] = useState<CustomerRegistration | null>(null);
@@ -69,6 +78,13 @@ export function TaxPage() {
   const customers = useQuery<ListEnvelope<CustomerLite>>('/v1/customers', { limit: 200 });
 
   const allRates = rates.data?.data ?? [];
+  useEffect(() => {
+    if (!wantedRate || !rates.data) return;
+    const rate = rates.data.data.find((row) => row.id === wantedRate);
+    if (rate && !rate.active) setShowRetired(true);
+    setRateView((current) => ({ ...current, query: rate ? rate.jurisdiction : wantedRate }));
+    setWantedRate(null);
+  }, [wantedRate, rates.data]);
   const rateRows = showRetired ? allRates : allRates.filter((rate) => rate.active);
   const retiredCount = allRates.filter((rate) => !rate.active).length;
   const countries = new Set(allRates.filter((rate) => rate.active).map((rate) => rate.country));
@@ -85,6 +101,31 @@ export function TaxPage() {
   }, [customers.data]);
 
   const unchecked = registrations.filter((row) => (row.taxId.verification?.status ?? 'pending') !== 'verified').length;
+
+  // Each tile is computed only from a read that has answered; a register whose
+  // read failed shows a dash and names the route, never a zero.
+  const tiles = {
+    active: tileOf([rates], 'GET /v1/tax_rates', () => ({
+      value: f.number(allRates.filter((rate) => rate.active).length),
+      caption: `Across ${f.plural(countries.size, 'country')}`,
+    })),
+    reverse: tileOf([rates], 'GET /v1/tax_rates', () => ({
+      value: f.number(reverseCharged),
+      caption: 'A verified business number moves the tax to the customer',
+    })),
+    registrations: tileOf([customers], 'GET /v1/customers', () => ({
+      value: f.number(registrations.length),
+      caption: unchecked
+        ? `${f.number(unchecked)} not confirmed by their register`
+        : 'Every one confirmed by its register',
+    })),
+    unplaced: tileOf([hold], 'GET /v1/billing/automatic_tax', () => ({
+      value: f.number(hold.data?.invoices_missing_a_tax_location ?? 0),
+      caption: hold.data?.enabled
+        ? `${f.number(hold.data?.invoices_held_in_draft ?? 0)} held as drafts`
+        : 'Finalising anyway — the hold is off',
+    })),
+  };
 
   const rateColumns = useMemo<DataTableColumn<TaxRate>[]>(() => [
     {
@@ -280,36 +321,16 @@ export function TaxPage() {
 
         <div className="st-tiles">
           <Card padding="tight">
-            <Stat
-              label="Active registrations"
-              value={f.number(allRates.filter((rate) => rate.active).length)}
-              caption={`Across ${f.plural(countries.size, 'country')}`}
-            />
+            <Stat label="Active registrations" value={tiles.active.value} caption={tiles.active.caption} />
           </Card>
           <Card padding="tight">
-            <Stat
-              label="Reverse charged"
-              value={f.number(reverseCharged)}
-              caption="A verified business number moves the tax to the customer"
-            />
+            <Stat label="Reverse charged" value={tiles.reverse.value} caption={tiles.reverse.caption} />
           </Card>
           <Card padding="tight">
-            <Stat
-              label="Customer registrations"
-              value={f.number(registrations.length)}
-              caption={unchecked
-                ? `${f.number(unchecked)} not confirmed by their register`
-                : 'Every one confirmed by its register'}
-            />
+            <Stat label="Customer registrations" value={tiles.registrations.value} caption={tiles.registrations.caption} />
           </Card>
           <Card padding="tight">
-            <Stat
-              label="Bills with no location"
-              value={f.number(hold.data?.invoices_missing_a_tax_location ?? 0)}
-              caption={hold.data?.enabled
-                ? `${f.number(hold.data?.invoices_held_in_draft ?? 0)} held as drafts`
-                : 'Finalising anyway — the hold is off'}
-            />
+            <Stat label="Bills with no location" value={tiles.unplaced.value} caption={tiles.unplaced.caption} />
           </Card>
         </div>
 
@@ -365,7 +386,8 @@ export function TaxPage() {
             searchPlaceholder="Search by jurisdiction, country or name"
             showFilters
             showColumnToggle
-            initialSort={{ columnId: 'jurisdiction', direction: 'asc' }}
+            value={rateView}
+            onChange={setRateView}
             rowActions={rateActions}
             rowTone={(row) => (row.active ? 'default' : 'danger')}
             maxHeight={480}
@@ -471,9 +493,10 @@ function CreateRateDialog({ open, action, onClose }: { open: boolean; action: Ac
 
   // The wire wants an exact decimal, never a float: "19", "8.875".
   const decimal = /^\d{1,3}(\.\d{1,4})?$/.test(percentage.trim());
-  const valid = displayName.trim() && jurisdiction.trim() && country.trim().length >= 2 && decimal;
+  const valid = !!displayName.trim() && !!jurisdiction.trim() && country.trim().length >= 2 && decimal;
 
   const submit = async () => {
+    if (!valid || action.busy) return;
     const saved = await action.run(
       api.post<TaxRate>('/v1/tax_rates', {
         display_name: displayName.trim(),
@@ -511,6 +534,7 @@ function CreateRateDialog({ open, action, onClose }: { open: boolean; action: Ac
         </>
       }
     >
+      <DialogForm onSubmit={() => void submit()}>
       <Stack gap={5}>
         {action.error && !action.error.body.param && (
           <Banner tone="danger" compact title="The rate was not registered">{action.error.body.message}</Banner>
@@ -615,6 +639,7 @@ function CreateRateDialog({ open, action, onClose }: { open: boolean; action: Ac
           hint="A business customer that supplies a registration number its own register confirms is charged 0% and accounts for the tax itself."
         />
       </Stack>
+      </DialogForm>
     </Modal>
   );
 }
@@ -645,6 +670,7 @@ function VerifyDialog({ registration, action, onClose }: {
   if (!registration) return null;
 
   const submit = async () => {
+    if (action.busy) return;
     const saved = await action.run(
       api.post<CustomerLite>(`/v1/customers/${registration.customer.id}/tax_ids/verify`, {
         value: registration.taxId.value,
@@ -678,6 +704,7 @@ function VerifyDialog({ registration, action, onClose }: {
         </>
       }
     >
+      <DialogForm onSubmit={() => void submit()}>
       <Stack gap={5}>
         {action.error && !action.error.body.param && (
           <Banner tone="danger" compact title="The check was not recorded">{action.error.body.message}</Banner>
@@ -700,6 +727,7 @@ function VerifyDialog({ registration, action, onClose }: {
           </Field>
         )}
       </Stack>
+      </DialogForm>
     </Modal>
   );
 }

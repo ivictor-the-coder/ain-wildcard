@@ -36,6 +36,7 @@ import { orgPrefix } from './invoices';
 import type { Billing } from './store';
 import { formatPercentage } from './tax';
 import type {
+  CreditNoteLineTaxAmount,
   CreditNote, CreditNoteLine, CreditNoteReason, Invoice, InvoiceLine,
 } from './types';
 
@@ -78,6 +79,8 @@ interface DraftCreditLine {
   quantity: number;
   amount: number;
   taxAmount: number;
+  /** `taxAmount` split across the jurisdictions the invoice line was taxed under. */
+  taxAmounts: CreditNoteLineTaxAmount[];
 }
 
 /** What `preview()` returns and `issue()` writes. */
@@ -271,6 +274,7 @@ export class CreditNotes {
 
     const lines: DraftCreditLine[] = targets.map(({ line, gross, quantity }) => {
       const { base, tax } = splitGross(gross, line);
+      const taxAmounts = splitTaxAcrossRates(base, tax, line);
       return {
         invoiceLine: line,
         description: line.description,
@@ -278,6 +282,7 @@ export class CreditNotes {
         quantity,
         amount: base,
         taxAmount: tax,
+        taxAmounts,
       };
     });
 
@@ -449,6 +454,7 @@ export class CreditNotes {
         quantity: line.quantity,
         amount: line.amount,
         tax_amount: line.taxAmount,
+        tax_amounts: line.taxAmounts,
         amount_including_tax: line.amount + line.taxAmount,
         tax_rate: line.invoiceLine.tax.rate,
         tax_percentage: line.invoiceLine.tax.percentage,
@@ -531,6 +537,7 @@ export class CreditNotes {
           quantity: line.quantity,
           amount: line.amount,
           tax_amount: line.taxAmount,
+          tax_amounts: line.taxAmounts,
           tax_rate: line.invoiceLine.tax.rate,
           tax_percentage: line.invoiceLine.tax.percentage,
           tax_display_name: line.invoiceLine.tax.display_name,
@@ -608,7 +615,13 @@ export class CreditNotes {
   void(orgId: string, id: string, meta: WriteMeta = {}): CreditNote {
     return this.ctx.atomic(() => {
       const note = this.require(orgId, id);
-      if (note.status === 'void') return note;
+      if (note.status === 'void') {
+        throw badRequest(
+          'credit_note_already_void',
+          `Credit note ${note.number} was already voided, so there is nothing left to withdraw.`,
+          undefined, { status: note.status },
+        );
+      }
       const invoice = this.billing.invoices.require(orgId, note.invoice);
       const now = this.ctx.now();
       const locale = this.billing.locale(orgId);
@@ -677,6 +690,35 @@ function splitGross(gross: number, line: InvoiceLine): { base: number; tax: numb
   if (lineTax === 0) return { base: gross, tax: 0 };
   const [base, tax] = allocate(money(gross, line.currency), [line.amount, lineTax]);
   return { base: base.amount, tax: tax.amount };
+}
+
+/**
+ * The credited tax, jurisdiction by jurisdiction.
+ *
+ * A Manhattan line is taxed by the state, the city and the transit district at
+ * once, and the invoice line lists all three. A credit against it hands back
+ * a share of each — the authorities are different, and each return wants its
+ * own figure — so the note's line carries the same list, allocated in the
+ * proportion the invoice charged and summing exactly to the line's tax.
+ */
+function splitTaxAcrossRates(base: number, tax: number, line: InvoiceLine): CreditNoteLineTaxAmount[] {
+  if (!line.taxes.length) return [];
+  const weights = line.taxes.map((entry) => Math.abs(entry.amount));
+  const parts = weights.some((weight) => weight > 0)
+    ? allocate(money(tax, line.currency), weights).map((part) => part.amount)
+    : line.taxes.map(() => 0);
+  return line.taxes.map((entry, i) => ({
+    object: 'credit_note_line_tax_amount' as const,
+    amount: parts[i],
+    taxable_amount: base,
+    rate: entry.rate,
+    display_name: entry.display_name,
+    jurisdiction: entry.jurisdiction,
+    percentage: entry.percentage,
+    tax_type: entry.tax_type,
+    behavior: entry.behavior,
+    reason: entry.reason,
+  }));
 }
 
 function explainCredit(

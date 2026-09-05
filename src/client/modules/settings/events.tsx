@@ -23,7 +23,8 @@ import {
   useFormat,
   FilterXIcon,
 } from '../../design';
-import { JsonBlock, ListFailure, Loading, SettingsShell, useActorName } from './common';
+import { JsonBlock, ListFailure, Loading, SettingsShell, TargetLink, useActorName } from './common';
+import { unattributedBecause } from './audit-core';
 import type { PlatformEvent } from './types';
 
 /** The most the route will serve in one read. */
@@ -255,15 +256,21 @@ export function EventsPage() {
                   <KeyValue
                     label="Object"
                     value={selected.object_id
-                      ? <span className="st-mono">{`${selected.object_type ?? 'object'} · ${selected.object_id}`}</span>
+                      ? <TargetLink type={selected.object_type} id={selected.object_id} />
                       : <span className="st-sub">This event is not about one object.</span>}
                   />
                   <KeyValue
                     label="Request id"
                     value={selected.request_id
                       ? <span className="st-mono">{selected.request_id}</span>
-                      : <span className="st-sub">Emitted outside an HTTP request — by a job, or by the seed.</span>}
+                      : <span className="st-sub">Not recorded — the route did not bind this event to its request.</span>}
                   />
+                  {unattributedBecause(selected.actor_id, selected.actor_type, selected.request_id) && (
+                    <KeyValue
+                      label="Actor"
+                      value={<span className="st-sub">{unattributedBecause(selected.actor_id, selected.actor_type, selected.request_id)}</span>}
+                    />
+                  )}
                   <KeyValue label="When" value={f.dateTime(selected.created)} />
                 </Stack>
 

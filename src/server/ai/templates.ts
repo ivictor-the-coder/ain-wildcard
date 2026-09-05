@@ -21,11 +21,16 @@ import type {
 } from './functions';
 import type { DraftResult } from './draft';
 import { linkedCustomerIds } from './metrics';
+import { invoiceSettlements } from './functions';
 import { capitalise, plural, humanise, listPhrase } from './text';
 import {
-  bind, bindsAnywhere, bound, slotSpan, stripPoliteness, tokenise,
-  type Bindings, type Bound, type SlotKind, type SlotValue, type Token, type Vocabulary,
+  bind, bindsAnywhere, bound, candidates, describeSlot, slotSpan, stripPoliteness, tokenise,
+  type Bindings, type Bound, type MovementBucket, type SlotKind, type SlotValue, type Token, type Vocabulary,
 } from './slots';
+import {
+  renderAgeing, renderAgeingBucket, renderDso, renderMovement, renderOverdueAge, renderRevenueSummary,
+  type CollectionsToolResult, type MovementToolResult, type SummaryToolResult,
+} from './revenue';
 import {
   NO_FACTS, citationsOf, dateOf, money, periodPhrase, renderAggregateCount, renderAggregateMeasure, renderBreakdown,
   renderCompare, renderCount, renderDelinquent, renderDraft, renderField, renderGroupedCount, renderInvoices, renderList,
@@ -157,17 +162,30 @@ function matchElements(
   return null;
 }
 
-/** A state and an object bound in one sentence must be about the same object. */
-function consistent(b: Bindings): boolean {
+/**
+ * A state and an object bound in one sentence must be about the same object.
+ * Returns why they are not — "pending" is a task's state, and a deal has no
+ * such state — or null when they agree.
+ */
+function inconsistency(b: Bindings): string | null {
   const object = Object.values(b).find((x) => x.value.kind === 'object')?.value as (SlotValue & { kind: 'object' }) | undefined;
-  if (!object) return true;
+  if (!object) return null;
   for (const one of Object.values(b)) {
-    if (one.value.kind === 'state' && one.value.objectType !== object.type) return false;
-    if (one.value.kind === 'option' && one.value.objectType !== object.type) return false;
-    if (one.value.kind === 'property' && one.value.objectType !== object.type) return false;
+    const value = one.value;
+    if (value.kind === 'state' && value.objectType !== object.type) {
+      return `"${quoted(one.raw)}" is a state of a ${value.objectType}, not of a ${object.singular}.`;
+    }
+    if (value.kind === 'option' && value.objectType !== object.type) {
+      return `"${quoted(one.raw)}" is a ${value.propertyLabel.toLowerCase()} of a ${value.objectType}, not of a ${object.singular}.`;
+    }
+    if (value.kind === 'property' && value.objectType !== object.type) {
+      return `"${quoted(one.raw)}" is a property of a ${value.objectType}, not of a ${object.singular}.`;
+    }
   }
-  return true;
+  return null;
 }
+
+const consistent = (b: Bindings): boolean => inconsistency(b) === null;
 
 export interface MatchOutcome {
   match: MatchResult | null;
@@ -193,8 +211,10 @@ export function matchTemplates(question: string, vocab: Vocabulary, catalogue: T
     for (const pattern of template.patterns) {
       let reason: string | null = null;
       const found = matchElements(parsePattern(pattern), 0, tokens, 0, raw, vocab, seed, (b) => {
-        if (!consistent(b)) return false;
-        reason = template.check?.(b, vocab) ?? null;
+        // A reading the words allow but the objects refuse — a task's state on
+        // a deal — is recorded like a failed check, so the refusal can say so
+        // when no other reading of the sentence holds.
+        reason = inconsistency(b) ?? template.check?.(b, vocab) ?? null;
         return reason === null;
       });
       if (found) {
@@ -210,6 +230,184 @@ export function matchTemplates(question: string, vocab: Vocabulary, catalogue: T
   // takes the same shape.
   matches.sort((a, b) => a.slotWords - b.slotWords);
   return { match: matches[0] ?? null, rejected, tokens };
+}
+
+/* ------------------------------ near-misses ------------------------------ */
+
+interface Gap {
+  name: string;
+  kind: SlotKind;
+  start: number;
+  len: number;
+  objectType: string | null;
+  /** The words hold a value of the slot's kind inside them, with something around it — kept only for a record slot. */
+  held: boolean;
+}
+
+const RECORD_SLOTS = new Set<SlotKind>(['account', 'contact', 'deal', 'record']);
+
+/**
+ * Whether these words hold a value for the slot anywhere inside them. A gap
+ * that does is not an unknown word — it is a known value with something in
+ * front of it ("my ARR", "ARR in total") — and naming it as unknown would deny
+ * a value the workspace has.
+ */
+function holdsValue(kind: SlotKind, tokens: Token[], start: number, len: number, raw: string, vocab: Vocabulary): boolean {
+  for (let from = start; from < start + len; from++) {
+    for (let l = start + len - from; l >= 1; l--) {
+      if (bind(kind, tokens, from, l, raw, vocab).length) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The same walk as `matchElements`, allowing exactly one slot to go unbound:
+ * it may swallow up to a few words that bind nothing, or no words at all. An
+ * alignment that then reaches the end of both the pattern and the sentence is
+ * a shape the question is, but for that one slot.
+ */
+function alignWithGap(
+  els: Element[], ei: number, tokens: Token[], ti: number, raw: string, vocab: Vocabulary,
+  gap: Gap | null, objectType: string | null, out: Gap[],
+): void {
+  if (ei === els.length) { if (ti === tokens.length && gap) out.push({ ...gap, objectType: gap.objectType ?? objectType }); return; }
+  const el = els[ei];
+  if (el.kind === 'lit') {
+    if (tokens[ti]?.text === el.word) alignWithGap(els, ei + 1, tokens, ti + 1, raw, vocab, gap, objectType, out);
+    return;
+  }
+  if (el.kind === 'alt') {
+    for (const option of el.options) {
+      if (option.every((w, k) => tokens[ti + k]?.text === w)) alignWithGap(els, ei + 1, tokens, ti + option.length, raw, vocab, gap, objectType, out);
+    }
+    return;
+  }
+  const remaining = tokens.length - ti;
+  if (el.slot === 'text') {
+    if (remaining >= 1 && ei === els.length - 1 && gap) out.push({ ...gap, objectType: gap.objectType ?? objectType });
+    return;
+  }
+  const span = slotSpan(el.slot, vocab);
+  for (let len = Math.min(span.max, remaining); len >= span.min; len--) {
+    const values = bind(el.slot, tokens, ti, len, raw, vocab);
+    if (!values.length) continue;
+    // The object the sentence is about narrows what a state or a property
+    // slot elsewhere in it can take, so it travels with the walk.
+    const object = values.find((v): v is SlotValue & { kind: 'object' } => v.kind === 'object');
+    alignWithGap(els, ei + 1, tokens, ti + len, raw, vocab, gap, object?.type ?? objectType, out);
+  }
+  if (gap) return;
+  const widest = Math.min(Math.max(span.max, 4), remaining);
+  for (let len = 0; len <= widest; len++) {
+    // Words that hold a value with something around it — "my ARR", "the
+    // Kaskade Pharma Group" — are not an unknown word. A record slot keeps the
+    // gap, marked, so the refusal can name the record inside the words rather
+    // than call the whole phrase a name nobody knows — or, worse, lose this
+    // reading and call it the name of whatever record another shape wanted.
+    const held = len > 0 && holdsValue(el.slot, tokens, ti, len, raw, vocab);
+    if (held && !RECORD_SLOTS.has(el.slot)) continue;
+    alignWithGap(els, ei + 1, tokens, ti + len, raw, vocab, { name: el.name, kind: el.slot, start: ti, len, objectType: null, held }, objectType, out);
+  }
+}
+
+const article = (noun: string): string => (/^(?:[aeiou]|MRR)/i.test(noun) ? `an ${noun}` : `a ${noun}`);
+
+/** The words as the reader wrote them, without the punctuation around them. */
+const quoted = (text: string): string => text.replace(/^[\s"'“”‘’(\[]+|[\s?!.,;:"'“”‘’)\]]+$/g, '');
+
+/** The values a slot takes, as a phrase; a long set is cut and the cut is counted. */
+function valuesPhrase(values: string[], limit = 12): string {
+  return values.length > limit
+    ? `${listPhrase(values.slice(0, limit))} — and ${values.length - limit} more the catalogue lists`
+    : listPhrase(values);
+}
+
+export interface NearMiss {
+  template: string;
+  /** The slot that did not bind, and the kind it wanted. */
+  slot: string;
+  kind: SlotKind;
+  /** The words it choked on, as written; empty when the slot was left out altogether. */
+  text: string;
+  start: number;
+  len: number;
+  /** The object type the sentence bound, when it bound one — what narrows a state or a property slot. */
+  objectType: string | null;
+  /** A record slot whose words hold a record inside them: "Kestrel Aerospace Ltd" around Kestrel Aerospace Components. */
+  held: boolean;
+}
+
+/**
+ * Every shape the question is one slot away from: the sentence walked against
+ * each pattern with exactly one slot allowed to go unbound. Closest first —
+ * fewest unexplained words, then the alignment that bound the most of the
+ * sentence before it choked, then catalogue order.
+ */
+export function nearMisses(question: string, tokens: Token[], vocab: Vocabulary, catalogue: Template[]): NearMiss[] {
+  const out: (NearMiss & { order: number })[] = [];
+  catalogue.forEach((template, order) => {
+    for (const pattern of template.patterns) {
+      const found: Gap[] = [];
+      alignWithGap(parsePattern(pattern), 0, tokens, 0, question, vocab, null, null, found);
+      for (const gap of found) {
+        out.push({
+          template: template.id, slot: gap.name, kind: gap.kind, start: gap.start, len: gap.len, objectType: gap.objectType, held: gap.held, order,
+          text: gap.len ? quoted(question.slice(tokens[gap.start].start, tokens[gap.start + gap.len - 1].end)) : '',
+        });
+      }
+    }
+  });
+  out.sort((a, b) => a.len - b.len || b.start - a.start || a.order - b.order);
+  return out.map(({ order: _order, ...miss }) => miss);
+}
+
+/**
+ * The record named inside a gap's words, when one is: the longest run of them
+ * that binds one of the record slots the shapes at this alignment wanted.
+ */
+function recordInside(misses: NearMiss[], tokens: Token[], raw: string, vocab: Vocabulary): string | null {
+  const { start, len } = misses[0];
+  const kinds = [...new Set(misses.map((m) => m.kind))];
+  for (let l = len - 1; l >= 1; l--) {
+    for (let from = start; from + l <= start + len; from++) {
+      for (const kind of kinds) {
+        const value = bind(kind, tokens, from, l, raw, vocab)[0];
+        if (value?.kind === 'record') return value.label;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Why a question that is one slot away from a shape was refused: the slot,
+ * the words it choked on, and — for a slot whose values are a closed set —
+ * what it takes instead. "Friendly" is not a tone, and the refusal says which
+ * seven are. Null when no shape comes that close.
+ */
+export function explainUnbound(question: string, tokens: Token[], vocab: Vocabulary, catalogue: Template[]): string | null {
+  const misses = nearMisses(question, tokens, vocab, catalogue);
+  const first = misses[0];
+  if (!first) return null;
+  const tied = misses.filter((m) => m.len === first.len && m.start === first.start);
+  const described = describeSlot(first.kind, vocab, first.objectType);
+  if (!first.len) {
+    const take = described.values?.length ? ` — the ${described.plural} are ${valuesPhrase(described.values)}` : described.hint ? ` — say ${described.hint}` : '';
+    return `This shape needs ${article(described.noun)} and the question names none${take}.`;
+  }
+  const kinds = [...new Set(tied.map((m) => m.kind))];
+  if (kinds.every((k) => RECORD_SLOTS.has(k))) {
+    const named = candidates(first.kind, tokens, first.start, first.len, vocab);
+    if (named.length > 1) return `"${first.text}" could be ${listPhrase(named.map((c) => c.label), 'or')} — say which.`;
+    const inside = tied.some((m) => m.held) ? recordInside(tied, tokens, question, vocab) : null;
+    return `"${first.text}" is not the name of ${listPhrase(kinds.map((k) => article(describeSlot(k, vocab).noun)), 'or')} in this workspace${inside ? ` — the nearest it holds is ${inside}` : ''}.`;
+  }
+  if (kinds.length > 1) {
+    return `"${first.text}" is not ${listPhrase(kinds.map((k) => article(describeSlot(k, vocab).noun)), 'or')} this workspace knows.`;
+  }
+  if (described.values) return `"${first.text}" is not ${article(described.noun)}; the ${described.plural} are ${valuesPhrase(described.values)}.`;
+  return `"${first.text}" is not ${article(described.noun)} this engine reads${described.hint ? ` — try ${described.hint}` : ''}.`;
 }
 
 /* ------------------------------- nearest --------------------------------- */
@@ -290,6 +488,25 @@ const dealThing = (state: Of<'state'> | null): string => (state ? `${state.noun}
 const windowArgs = (w: TimeWindow) => ({ start: w.start, end: w.end, window_label: w.label });
 
 const closeWindow = (w: TimeWindow) => ({ date_property: 'close_date', start: w.start, end: w.end });
+
+/**
+ * A window read whole, the dates after the clock included. "To date" is a
+ * period cut at the clock, so a shape that lists what closes later in the
+ * month cannot carry it: "closing in Sep 2026 to date" named deals due after
+ * today under a label that promised they were not there.
+ */
+const wholeLabel = (w: TimeWindow): string => w.label.replace(/ to date$/, '');
+
+/** How many calendar months back a window starts, counting the current one. */
+const monthsBack = (w: TimeWindow, now: number): number => {
+  const from = new Date(w.start);
+  const at = new Date(now);
+  return (at.getUTCFullYear() - from.getUTCFullYear()) * 12 + (at.getUTCMonth() - from.getUTCMonth()) + 1;
+};
+
+/** The revenue tools' own default range, stated in the answer rather than assumed by it. */
+const TRAILING_MONTHS = 12;
+const MOVEMENT_MONTHS_MAX = 60;
 
 const ORDER_BY: Record<string, string | undefined> = { deal: 'amount' };
 
@@ -419,6 +636,24 @@ const notYet = (b: Bindings, v: Vocabulary, names: string[] = ['period']): strin
     }
   }
   return null;
+};
+
+/** The bucket of the MRR bridge a question named, by noun or by verb; the whole bridge when it named neither. */
+const movementBucket = (b: Bindings): MovementBucket =>
+  maybe(b, 'move', 'movement')?.bucket ?? maybe(b, 'verb', 'movement')?.bucket ?? 'all';
+
+/**
+ * The MRR bridge is drawn by calendar month and reaches back sixty of them, so
+ * "the last 30 days" is not a period it has a bar for and 2019 is not one it
+ * can still see.
+ */
+const monthAligned = (b: Bindings, v: Vocabulary): string | null => {
+  const period = slot(b, 'period', 'period');
+  if (!['month', 'quarter', 'year'].includes(period.window.grain)) {
+    return `MRR movement is reported by calendar month, so "${quoted(b.period.raw)}" has no bar of its own — ask about a month, a quarter or a year.`;
+  }
+  const back = monthsBack(period.window, v.workspace.now);
+  return back > MOVEMENT_MONTHS_MAX ? `The MRR bridge reaches back ${MOVEMENT_MONTHS_MAX} months at most, and ${period.window.label} is further back than that.` : null;
 };
 
 /** A decided deal was won or lost; "open" and the ledger verbs name no decision. */
@@ -622,11 +857,11 @@ export const TEMPLATES: Template[] = [
     example: () => 'Which deals close in the next 90 days?',
     plan: (b, v) => {
       const period = slot(b, 'period', 'period');
-      return [{ tool: 'record_search', args: searchArgs('deal', [{ property: 'deal_stage', op: 'in', values: v.stages.open }], closeWindow(period.window)), why: `List open deals closing ${period.window.label}.` }];
+      return [{ tool: 'record_search', args: searchArgs('deal', [{ property: 'deal_stage', op: 'in', values: v.stages.open }], closeWindow(period.window)), why: `List open deals closing ${wholeLabel(period.window)}.` }];
     },
     render: (steps, b, v) => {
       const period = slot(b, 'period', 'period');
-      return renderList(resultOf<RecordSearchResult>(steps), 'open deal closing|open deals closing', periodPhrase(period.window.label), v.workspace, { period: period.window.label });
+      return renderList(resultOf<RecordSearchResult>(steps), 'open deal closing|open deals closing', periodPhrase(wholeLabel(period.window)), v.workspace, { period: wholeLabel(period.window) });
     },
   }),
   T({
@@ -640,11 +875,11 @@ export const TEMPLATES: Template[] = [
     example: () => 'How many deals close in the next 90 days?',
     plan: (b, v) => {
       const period = slot(b, 'period', 'period');
-      return [{ tool: 'record_aggregate', args: countArgs('deal', [{ property: 'deal_stage', op: 'in', values: v.stages.open }], closeWindow(period.window)), why: `Count open deals closing ${period.window.label}.` }];
+      return [{ tool: 'record_aggregate', args: countArgs('deal', [{ property: 'deal_stage', op: 'in', values: v.stages.open }], closeWindow(period.window)), why: `Count open deals closing ${wholeLabel(period.window)}.` }];
     },
     render: (steps, b, v) => {
       const period = slot(b, 'period', 'period');
-      return renderAggregateCount(resultOf<RecordAggregateResult>(steps), 'open deal closing|open deals closing', periodPhrase(period.window.label), v.workspace, { period: period.window.label });
+      return renderAggregateCount(resultOf<RecordAggregateResult>(steps), 'open deal closing|open deals closing', periodPhrase(wholeLabel(period.window)), v.workspace, { period: wholeLabel(period.window) });
     },
   }),
   T({
@@ -1320,10 +1555,13 @@ export const TEMPLATES: Template[] = [
       const status = slot(b, 'status', 'invoice-status');
       return [{ tool: 'billing_list_invoices', args: { status: status.value, ...(status.overdue ? { due_before: v.workspace.now } : {}), limit: 25 }, why: `Invoices whose status is ${status.label}.` }];
     },
-    render: (steps, b) => {
+    render: (steps, b, v) => {
       const status = slot(b, 'status', 'invoice-status');
       const result = resultOf<{ total: number; invoices: (InvoiceRow & { due?: string })[] }>(steps);
-      return renderInvoices(result.invoices, result.total, status.label);
+      // A settled bill shows how it was settled; the list tool carries only
+      // what an open one is owed.
+      const settled = ['paid', 'void'].includes(status.value) ? invoiceSettlements(v.ctx, v.orgId, result.invoices.map((i) => i.id)) : new Map<string, string>();
+      return renderInvoices(result.invoices.map((i) => ({ ...i, settled: settled.get(i.id) ?? null })), result.total, status.label);
     },
   }),
   T({
@@ -2306,6 +2544,98 @@ export const TEMPLATES: Template[] = [
     },
   }),
 
+  /* -------------------------------- revenue ------------------------------ */
+  T({
+    id: 'mrr-movement-period', kind: 'metric', intent: 'aggregate',
+    description: 'One bucket of the MRR bridge over a period — net new, new business, expansion, contraction, churned, reactivated, paused or resumed MRR — or the whole bridge, one figure per currency, with the accounts that moved it.',
+    patterns: [
+      `${WHAT_WAS} ${OUR} {move:mrr-movement} {period}`,
+      `how much (mrr|) (did we|have we) {verb:movement-verb} {period}`,
+      `how much mrr {verb:movement-verb} {period}`,
+      `(who|what|which accounts|which customers) {verb:movement-verb} {period}`,
+      `how did ${OUR} mrr (move|change) {period}`,
+    ],
+    tools: ['revenue_movement'],
+    example: () => 'What is our net new MRR this month?',
+    check: (b, v) => notYet(b, v) ?? monthAligned(b, v),
+    plan: (b, v) => {
+      const period = slot(b, 'period', 'period');
+      const bucket = movementBucket(b);
+      return [{ tool: 'revenue_movement', args: { months: monthsBack(period.window, v.workspace.now) }, why: `The MRR bridge, month by month, back to ${period.window.label}; ${bucket === 'all' ? 'every bucket' : `the ${humanise(bucket).toLowerCase()} bucket`} of the months inside it.` }];
+    },
+    render: (steps, b, v) => {
+      const period = slot(b, 'period', 'period');
+      const lead = /^(who|which)\b/.test(b.$question.text) ? 'accounts' : 'amount';
+      return renderMovement(resultOf<MovementToolResult>(steps), period.window, movementBucket(b), lead, v.workspace);
+    },
+  }),
+  T({
+    id: 'dso', kind: 'metric', intent: 'aggregate',
+    description: 'Days sales outstanding per currency, on the last twelve months of billings.',
+    patterns: [
+      `${WHAT_IS} ${OUR} (dso|days sales outstanding) (in days|right now|today|)`,
+      `how many days sales outstanding (do we have|are we at|are we carrying|)`,
+    ],
+    tools: ['revenue_collections'],
+    example: () => 'What is our DSO?',
+    plan: () => [{ tool: 'revenue_collections', args: { months: TRAILING_MONTHS }, why: `Receivables against the last ${TRAILING_MONTHS} months of billings, per currency.` }],
+    render: (steps, _b, v) => renderDso(resultOf<CollectionsToolResult>(steps), TRAILING_MONTHS, v.workspace),
+  }),
+  T({
+    id: 'overdue-ageing', kind: 'metric', intent: 'aggregate',
+    description: 'What is past due and how old it is, per currency.',
+    patterns: [
+      `(how much|what) is (overdue|past due) and how old (is it|)`,
+      `how old (is|are) ${OUR} (overdue balance|past due balance|overdue invoices|past due invoices|receivables|arrears|overdue)`,
+      `how (overdue|late) (is|are) ${OUR} (receivables|overdue invoices|past due invoices|outstanding invoices|unpaid invoices)`,
+    ],
+    tools: ['revenue_collections'],
+    example: () => 'How much is overdue and how old is it?',
+    plan: () => [{ tool: 'revenue_collections', args: { months: TRAILING_MONTHS }, why: 'The receivables ageing as it stands now, per currency.' }],
+    render: (steps, _b, v) => renderOverdueAge(resultOf<CollectionsToolResult>(steps), v.workspace),
+  }),
+  T({
+    id: 'ageing-bucket', kind: 'metric', intent: 'aggregate',
+    description: 'What sits in one receivables ageing bucket, per currency.',
+    patterns: [
+      `${WHAT_IS} in the {bucket:ageing-bucket} (bucket|ageing bucket|aging bucket|)`,
+      `how much (is|do we have|is there|is outstanding|is owed|is sitting) in the {bucket:ageing-bucket} (bucket|ageing bucket|aging bucket|)`,
+      `how (much|many invoices) (is|are) {bucket:ageing-bucket} (past due|overdue|)`,
+    ],
+    tools: ['revenue_collections'],
+    example: () => 'What is in the 61–90 day bucket?',
+    plan: (b) => [{ tool: 'revenue_collections', args: { months: TRAILING_MONTHS }, why: `The receivables ageing as it stands now; the ${slot(b, 'bucket', 'ageing-bucket').label.toLowerCase()} bucket of it.` }],
+    render: (steps, b, v) => renderAgeingBucket(resultOf<CollectionsToolResult>(steps), slot(b, 'bucket', 'ageing-bucket').bucket, v.workspace),
+  }),
+  T({
+    id: 'receivables-ageing', kind: 'breakdown', intent: 'aggregate',
+    description: 'The receivables ageing — what is outstanding and how old each part of it is, per currency.',
+    patterns: [
+      `${WHAT_IS} ${OUR} (receivables ageing|receivables aging|ar ageing|ar aging|ageing|aging|ageing report|aging report|aged receivables|aged debtors)`,
+      `how (is|does|do|are) ${OUR} (receivables|ar|receivable|outstanding balance|outstanding) (age|ageing|aging|aged)`,
+      `(break down|breakdown of|split) ${OUR} (receivables|outstanding balance|outstanding|ar) by age`,
+    ],
+    tools: ['revenue_collections'],
+    example: () => 'What is our receivables ageing?',
+    plan: () => [{ tool: 'revenue_collections', args: { months: TRAILING_MONTHS }, why: 'The receivables ageing as it stands now, per currency.' }],
+    render: (steps, _b, v) => renderAgeing(resultOf<CollectionsToolResult>(steps), v.workspace),
+  }),
+  T({
+    id: 'revenue-summary', kind: 'metric', intent: 'summarise',
+    description: 'The revenue half of the business per currency — MRR, ARR, accounts, net and gross revenue retention, receivables — over the last twelve months.',
+    patterns: [
+      `how (is|are) (the business|our business|we|our revenue|revenue|the revenue side|the revenue half of the business) doing`,
+      `(give me|show me|whats|what is|tell me) (a|the|our|) revenue summary`,
+      `(summarise|summarize) ${OUR} revenue`,
+      `where (do we stand|are we) on revenue`,
+      `${WHAT_IS} ${OUR} (revenue position|revenue picture|revenue health)`,
+    ],
+    tools: ['revenue_summary'],
+    example: () => 'How is the business doing?',
+    plan: () => [{ tool: 'revenue_summary', args: { months: TRAILING_MONTHS }, why: `MRR, ARR, retention and receivables per currency over the last ${TRAILING_MONTHS} months.` }],
+    render: (steps, _b, v) => renderRevenueSummary(resultOf<SummaryToolResult>(steps), TRAILING_MONTHS, v.workspace),
+  }),
+
   /* -------------------------------- drafts ------------------------------- */
   T({
     id: 'draft-message', kind: 'draft', intent: 'draft',
@@ -2446,7 +2776,8 @@ export interface PublishedTemplate {
   description: string;
   patterns: string[];
   example: string | null;
-  slots: { name: string; kind: SlotKind }[];
+  /** Each slot with the values it takes, when those are a closed set — the seven tones, this workspace's stages. */
+  slots: { name: string; kind: SlotKind; values: string[] | null }[];
   tools: string[];
   available: boolean;
 }
@@ -2463,7 +2794,7 @@ export function publishTemplates(v: Vocabulary): PublishedTemplate[] {
       description: t.description,
       patterns: t.patterns,
       example: t.example(v),
-      slots: [...slots.entries()].map(([name, kind]) => ({ name, kind })),
+      slots: [...slots.entries()].map(([name, kind]) => ({ name, kind, values: describeSlot(kind, v).values })),
       tools: t.tools,
       available: t.tools.every((tool) => v.tools.has(tool)),
     };

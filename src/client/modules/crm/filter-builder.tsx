@@ -12,13 +12,16 @@ import {
   Badge, Button, Combobox, DatePicker, Icons, IconButton, Input, Inline, MoneyInput, NumberInput,
   Select, Tooltip, humanize, parseMoneyInput, useFormat, type ComboOption,
 } from '@/client/design';
-import { useQuery } from '@/client/kernel/api';
+import { api, useQuery } from '@/client/kernel/api';
 import { useSession } from '@/client/kernel/session';
 import {
   isAssociationCondition, isGroup,
   type AssociationCondition, type CrmSchema, type FilterNode, type FilterOperator, type PropertyDef,
   type PropertyCondition, type RelativeUnit, type WorkspaceUser,
 } from './api';
+import {
+  OPERATOR_LABEL, describeAssociationCondition, farObjectType, identityWhere, referencedRecordIds, type AssociationWords,
+} from './filter-words';
 
 /* ------------------------------ record fields ----------------------------- */
 
@@ -45,13 +48,7 @@ export const filterableProperties = (properties: PropertyDef[]): PropertyDef[] =
 
 /* -------------------------------- operators ------------------------------- */
 
-export const OPERATOR_LABEL: Record<FilterOperator, string> = {
-  eq: 'is', neq: 'is not', gt: 'is greater than', gte: 'is at least', lt: 'is less than',
-  lte: 'is at most', contains: 'contains', not_contains: 'does not contain',
-  starts_with: 'starts with', ends_with: 'ends with', in: 'is any of', not_in: 'is none of',
-  is_set: 'is known', is_not_set: 'is unknown', between: 'is between', before: 'is before',
-  after: 'is after', within_last: 'is in the last', within_next: 'is in the next',
-};
+export { OPERATOR_LABEL, farObjectType, identityWhere, referencedRecordIds, type AssociationWords };
 
 const TEXTUAL: FilterOperator[] = ['eq', 'neq', 'contains', 'not_contains', 'starts_with', 'ends_with', 'in', 'not_in', 'is_set', 'is_not_set'];
 const NUMERIC: FilterOperator[] = ['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'between', 'in', 'not_in', 'is_set', 'is_not_set'];
@@ -758,11 +755,12 @@ export function describeFilterNode(
   users: Map<string, WorkspaceUser>,
   money: (minor: number, currency?: string) => string,
   date: (ts: number) => string,
-  associations?: Map<string, string>,
+  associations?: Map<string, AssociationWords>,
+  names?: Map<string, string>,
   depth = 0,
 ): string {
   if (isGroup(node)) {
-    const parts = node.filters.map((child) => describeFilterNode(child, properties, users, money, date, associations, depth + 1));
+    const parts = node.filters.map((child) => describeFilterNode(child, properties, users, money, date, associations, names, depth + 1));
     if (node.op === 'not') return `not (${parts.join(' and ')})`;
     if (parts.length < 2) return parts.join('');
     const joined = parts.join(node.op === 'and' ? ' and ' : ' or ');
@@ -770,11 +768,13 @@ export function describeFilterNode(
     return depth === 0 ? joined : `(${joined})`;
   }
   if (isAssociationCondition(node)) {
-    const target = associations?.get(node.association) ?? humanize(node.association);
-    const what = node.aggregate && node.aggregate !== 'count'
-      ? `${node.aggregate} of ${humanize(node.aggregate_property ?? 'value')} across ${target}`
-      : `number of ${target}`;
-    return `${what} ${OPERATOR_LABEL[node.operator]} ${String(node.value ?? '')}`;
+    const words = associations?.get(node.association)
+      ?? { plural: humanize(node.association).toLowerCase(), singular: humanize(node.association).toLowerCase() };
+    return describeAssociationCondition(
+      node, words, names,
+      (where) => describeFilterNode(where, properties, users, money, date, associations, names, depth + 1),
+      humanize,
+    );
   }
   const condition = node as PropertyCondition;
   const property = properties.get(condition.property);
@@ -793,25 +793,61 @@ export function describeFilterNode(
   return `${label} ${OPERATOR_LABEL[condition.operator]} ${render(condition.value)}`;
 }
 
-export function FilterSummary({ filter, properties, users, schema }: {
+export function FilterSummary({ filter, properties, users, schema, objectType }: {
   filter: FilterNode | null;
   properties: Map<string, PropertyDef>;
   users: Map<string, WorkspaceUser>;
   schema?: CrmSchema;
+  /** The list this filter narrows — the near side of any association in it. */
+  objectType?: string;
 }) {
   const f = useFormat();
   const associations = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const type of schema?.object_types ?? []) map.set(type.name, type.plural_label.toLowerCase());
-    for (const link of schema?.association_types ?? []) map.set(link.name, `${link.label.toLowerCase()} records`);
+    const map = new Map<string, AssociationWords>();
+    for (const type of schema?.object_types ?? []) map.set(type.name, { plural: type.plural_label.toLowerCase(), singular: type.label.toLowerCase() });
+    for (const link of schema?.association_types ?? []) map.set(link.name, { plural: `${link.label.toLowerCase()} records`, singular: `${link.label.toLowerCase()} record` });
     return map;
   }, [schema]);
+
+  // A sub-filter pinned to one record carries only its id. The chip names the
+  // record, which means asking for it once.
+  const referenced = useMemo(() => referencedRecordIds(filter), [filter]);
+  const referencedKey = referenced.map((r) => `${r.association}:${r.id}`).join(',');
+  const [names, setNames] = useState<Map<string, string>>(new Map());
+  useEffect(() => {
+    let live = true;
+    const wanted = referenced.filter((r) => !names.has(r.id));
+    if (!wanted.length || !schema || !objectType) return;
+    void Promise.all(wanted.map(async (r) => {
+      const type = farObjectType(r.association, objectType, schema);
+      if (!type) return null;
+      try {
+        const record = await api.get<{ display_name: string }>(`/v1/records/${type}/${r.id}`);
+        return [r.id, record.display_name] as const;
+      } catch {
+        // An id that no longer resolves stays an id; the chip is still true.
+        return null;
+      }
+    })).then((found) => {
+      if (!live) return;
+      setNames((prev) => {
+        const next = new Map(prev);
+        for (const entry of found) if (entry) next.set(entry[0], entry[1]);
+        return next;
+      });
+    });
+    return () => { live = false; };
+    // The ids referenced are the whole dependency; `names` is what this fills.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [referencedKey, schema, objectType]);
+
   if (!filter) return null;
   const text = describeFilterNode(
     filter, properties, users,
     (minor, currency) => f.money(minor, currency ? { currency } : undefined),
     (ts) => f.date(ts, { timeZone: 'UTC' }),
     associations,
+    names,
   );
   return <span className="crm-filter__summary u-truncate" title={text}>{text}</span>;
 }

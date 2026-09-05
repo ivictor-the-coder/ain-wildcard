@@ -15,6 +15,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, useQuery, type ListEnvelope } from '../../kernel/api';
 import { useSession, type SessionOrg } from '../../kernel/session';
+import { describeOffset } from '../../kernel/shell-core';
 import {
   Badge, Banner, Button, Card, Divider, Field, Icons, Inline, Input, KeyValue,
   Select, Stack,
@@ -22,6 +23,7 @@ import {
   type SelectOption,
 } from '../../design';
 import { Loading, SettingsShell, useAction } from './common';
+import { HEX, problemWith, type WorkspaceDraft as Draft } from './workspace-core';
 
 interface CatalogCurrency {
   object: 'catalog_currency';
@@ -91,15 +93,6 @@ const zoneLabel = (zone: string, at: number): string => {
   }
 };
 
-interface Draft {
-  name: string;
-  domain: string;
-  brand_color: string;
-  default_currency: string;
-  timezone: string;
-  locale: string;
-}
-
 const draftOf = (org: SessionOrg): Draft => ({
   name: org.name,
   domain: org.domain ?? '',
@@ -108,8 +101,6 @@ const draftOf = (org: SessionOrg): Draft => ({
   timezone: org.timezone,
   locale: org.locale,
 });
-
-const HEX = /^#[0-9a-fA-F]{6}$/;
 
 /** The label each key is known by on screen, for the toast and the diff. */
 const FIELD_LABEL: Record<keyof Draft, string> = {
@@ -120,23 +111,6 @@ const FIELD_LABEL: Record<keyof Draft, string> = {
   timezone: 'timezone',
   locale: 'locale',
 };
-
-/**
- * Why a field cannot be sent, in the words the operator needs.
- *
- * Two of these are not cosmetic. `name` is `v.string({ min: 1 })` behind
- * `v.optional`, and `optional` maps `''` to `undefined` before the minimum is
- * ever checked — so an empty name is not refused, it is *dropped*: the server
- * answers 200 with the old name, and a form that trusted its own patch would
- * report a save that never happened. The same is true of every optional string
- * on the route, which is why clearing the domain is called out too rather than
- * silently doing nothing.
- */
-function problemWith(key: keyof Draft, value: string): string | undefined {
-  if (key === 'name' && value.trim().length === 0) return 'A workspace must have a name.';
-  if (key === 'brand_color' && !HEX.test(value)) return 'Six hex digits after a #, e.g. #5B4BE1.';
-  return undefined;
-}
 
 export function WorkspacePage() {
   const session = useSession();
@@ -266,29 +240,36 @@ export function WorkspacePage() {
     if (result) session.refresh();
   };
 
+  const domainProblem = draft.domain === (org.domain ?? '') ? undefined : problemWith('domain', draft.domain);
+
   return (
     <SettingsShell
       title="Workspace"
       subtitle="What this workspace is called, and the settings every screen in the product renders through."
-      actions={
-        <Inline gap={3}>
-          {dirty && (
-            <Button variant="ghost" disabled={action.busy} onClick={() => setDraft(draftOf(org))}>
-              Discard
+      // A role that cannot PATCH /v1/org is not shown a Save button it can only
+      // ever see disabled: the banner below says what is closed and why, and
+      // the fields are read-only. A dead control is a control that lies.
+      actions={admin
+        ? (
+          <Inline gap={3}>
+            {dirty && (
+              <Button variant="ghost" disabled={action.busy} onClick={() => setDraft(draftOf(org))}>
+                Discard
+              </Button>
+            )}
+            <Button
+              variant={dirty ? 'primary' : 'ghost'}
+              loading={action.busy}
+              disabled={!dirty || blocked}
+              iconLeft={dirty ? <Icons.check size={15} /> : undefined}
+              title={blocked ? problems[0][1] : undefined}
+              onClick={() => void save()}
+            >
+              {dirty ? `Save ${f.plural(dirtyKeys.length, 'change')}` : 'Saved'}
             </Button>
-          )}
-          <Button
-            variant={dirty ? 'primary' : 'ghost'}
-            loading={action.busy}
-            disabled={!dirty || blocked || !admin}
-            iconLeft={dirty ? <Icons.check size={15} /> : undefined}
-            title={blocked ? problems[0][1] : undefined}
-            onClick={() => void save()}
-          >
-            {dirty ? `Save ${f.plural(dirtyKeys.length, 'change')}` : 'Saved'}
-          </Button>
-        </Inline>
-      }
+          </Inline>
+        )
+        : undefined}
     >
       <Stack gap={6}>
         {!admin && (
@@ -348,14 +329,14 @@ export function WorkspacePage() {
                   hint={draft.domain.trim() === '' && (org.domain ?? '') !== ''
                     ? `An empty value is dropped by the API before it is written, so saving this leaves the domain at ${org.domain}. Clearing it is not something this route can do.`
                     : 'Used to recognise a teammate signing in with a company address, and printed on customer-facing documents.'}
-                  error={action.errorFor('domain')}
+                  error={action.errorFor('domain') ?? domainProblem}
                 >
                   <Input
                     value={draft.domain}
                     disabled={!admin}
                     placeholder="northwind.io"
                     maxLength={200}
-                    invalid={!!action.errorFor('domain')}
+                    invalid={!!action.errorFor('domain') || !!domainProblem}
                     onChange={(e) => setDraft({ ...draft, domain: e.target.value })}
                     aria-label="Primary domain"
                   />
@@ -407,14 +388,21 @@ export function WorkspacePage() {
                 <KeyValue label="Slug" value={<span className="st-mono">{org.slug}</span>} />
                 <KeyValue
                   label="Clock"
-                  value={
-                    <Inline gap={3}>
-                      <Badge tone={session.me?.clock.kind === 'virtual' ? 'info' : 'neutral'} pill>
-                        {session.me?.clock.kind === 'virtual' ? 'Virtual' : 'Real time'}
-                      </Badge>
-                      {session.me?.clock.offset_ms ? <span className="st-sub">shifted</span> : null}
-                    </Inline>
-                  }
+                  // What the clock *reads*, not what kind of clock it is: a
+                  // virtual clock with no offset is in step with real time, and
+                  // the header chip on every screen says so in the same words.
+                  value={(() => {
+                    const offset = session.me?.clock.offset_ms ?? 0;
+                    const shifted = Math.abs(offset) > 60_000;
+                    return (
+                      <Inline gap={3}>
+                        <Badge tone={shifted ? 'warning' : 'neutral'} pill dot>
+                          {shifted ? 'Simulated' : 'In step with real time'}
+                        </Badge>
+                        {shifted ? <span className="st-sub">{describeOffset(offset)}</span> : null}
+                      </Inline>
+                    );
+                  })()}
                 />
                 <KeyValue label="Your role" value={session.me?.role ?? '—'} />
                 <KeyValue

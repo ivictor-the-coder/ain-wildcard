@@ -25,6 +25,7 @@ import {
   type DataTableColumn, type TabDef,
 } from '../../design';
 import { JsonBlock, ListFailure, SettingsShell } from './common';
+import { tileOf } from './tiles';
 import type { JobDrainResult, JobRow, JobStatus } from './types';
 
 /** The most the route serves in one read. Named so no count ever overstates. */
@@ -84,6 +85,28 @@ export function JobsPage() {
   const count = (result: typeof pending): string => {
     const n = result.data?.data.length ?? 0;
     return n === PAGE ? `${PAGE}+` : f.number(n);
+  };
+
+  // A tile is a number only once its read has answered. A queue whose read
+  // failed used to show "Waiting 0 · Nothing scheduled ahead", which is a
+  // claim the screen had no grounds for.
+  const tiles = {
+    waiting: tileOf([pending], 'GET /v1/jobs?status=pending', () => ({
+      value: f.number(pendingTotal),
+      caption: nextRunAt !== null ? `Next runs ${f.when(nextRunAt)}` : 'Nothing scheduled ahead',
+    })),
+    due: tileOf([pending], 'GET /v1/jobs?status=pending', () => ({
+      value: f.number(dueNow.length),
+      caption: dueNow.length ? 'Their run_at has passed — draining runs them' : 'Everything waiting is scheduled for later',
+    })),
+    failed: tileOf([failed], 'GET /v1/jobs?status=failed', () => ({
+      value: count(failed),
+      caption: (failed.data?.data.length ?? 0) > 0 ? 'Out of attempts — the error is on the row' : 'No handler has run out of attempts',
+    })),
+    done: tileOf([done], 'GET /v1/jobs?status=done', () => ({
+      value: count(done),
+      caption: 'Kept, so a replay can be checked against what actually ran',
+    })),
   };
 
   const tabs: TabDef<JobStatus>[] = STATUSES.map((status) => ({
@@ -215,36 +238,16 @@ export function JobsPage() {
 
         <div className="st-tiles">
           <Card padding="tight">
-            <Stat
-              label="Waiting"
-              value={f.number(pendingTotal)}
-              caption={nextRunAt !== null ? `Next runs ${f.when(nextRunAt)}` : 'Nothing scheduled ahead'}
-            />
+            <Stat label="Waiting" value={tiles.waiting.value} caption={tiles.waiting.caption} />
           </Card>
           <Card padding="tight">
-            <Stat
-              label="Due right now"
-              value={f.number(dueNow.length)}
-              caption={dueNow.length
-                ? 'Their run_at has passed — draining runs them'
-                : 'Everything waiting is scheduled for later'}
-            />
+            <Stat label="Due right now" value={tiles.due.value} caption={tiles.due.caption} />
           </Card>
           <Card padding="tight">
-            <Stat
-              label="Failed"
-              value={count(failed)}
-              caption={(failed.data?.data.length ?? 0) > 0
-                ? 'Out of attempts — the error is on the row'
-                : 'No handler has run out of attempts'}
-            />
+            <Stat label="Failed" value={tiles.failed.value} caption={tiles.failed.caption} />
           </Card>
           <Card padding="tight">
-            <Stat
-              label="Completed"
-              value={count(done)}
-              caption="Kept, so a replay can be checked against what actually ran"
-            />
+            <Stat label="Completed" value={tiles.done.value} caption={tiles.done.caption} />
           </Card>
         </div>
 
@@ -262,7 +265,12 @@ export function JobsPage() {
         <Card
           padding="none"
           title="The queue"
-          description="Ordered by run_at, furthest ahead first — the way the queue itself is read."
+          // The description and the sort arrow have to agree: pending work is
+          // listed soonest first, which is the order the drain claims it in;
+          // finished work is listed most recent first.
+          description={tab === 'pending'
+            ? 'Ordered by run_at, soonest first — the order the queue drains them in.'
+            : 'Ordered by run_at, most recent first.'}
         >
           <div style={{ padding: 'var(--space-5) var(--space-6) 0' }}>
             <Tabs tabs={tabs} value={tab} onChange={setTab} aria-label="Job status" />

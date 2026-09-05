@@ -21,7 +21,7 @@ import {
   Textarea, useToast, type MenuItemDef, type MenuSection,
 } from '@/client/design';
 import {
-  describeBoardState, sameBoardState, stateToView, useDealViews, viewToState,
+  describeBoardState, sameBoardState, stateToView, useDealFormat, useDealViews, viewToState,
   type BoardState, type DealView,
 } from './api';
 
@@ -60,31 +60,34 @@ export function ViewBar({
   const toast = useToast();
   const session = useSession();
   const views = useDealViews();
+  // The two quarter windows the filter engine has no token for are stored as
+  // the dates they are today, and read back against today as well.
+  const today = useDealFormat().calendarToday();
   const [draft, setDraft] = useState<Draft | null>(null);
   const [deleting, setDeleting] = useState<DealView | null>(null);
   const nameField = useRef<HTMLInputElement>(null);
 
   const rows = views.data?.data ?? [];
   const active = rows.find((row) => row.id === activeId) ?? null;
-  const decoded = useMemo(() => (active ? viewToState(active) : null), [active]);
+  const decoded = useMemo(() => (active ? viewToState(active, today) : null), [active, today]);
   // A view is "modified" only when it is legible in the first place: a filter
   // these controls cannot read is not a filter they can be said to differ from.
   const modified = !!decoded && decoded.readable && !sameBoardState(decoded.state, state);
 
   const describe = useMemo(
     () => (row: DealView) => {
-      const read = viewToState(row);
+      const read = viewToState(row, today);
       const what = read.readable
         ? describeBoardState(read.state, { pipelineLabel, ownerName, forecastLabel })
         : 'Built from conditions this board cannot show';
       return row.shared ? what : `Only you · ${what}`;
     },
-    [pipelineLabel, ownerName, forecastLabel],
+    [pipelineLabel, ownerName, forecastLabel, today],
   );
 
   const save = useMutation<Draft, DealView>(
     async (input) => {
-      const shape = input.keepFilter ? {} : stateToView(state);
+      const shape = input.keepFilter ? {} : stateToView(state, today);
       const body = {
         name: input.name.trim(),
         description: input.description.trim(),

@@ -19,15 +19,15 @@ import {
   type DescriptionItem, type MenuSection, type TimelineEntry,
 } from '@/client/design';
 import {
-  accountOf, contactsOf, dealAmount, dealCloseDate, dealEnteredStage, dealStage, dealWeighted,
-  num, recordHref, str, useDealFormat, useDealProperties, usePipelines, useUserIndex, useUsers,
-  useVelocity,
+  accountOf, civilDay, closedVerb, contactsOf, dealAmount, dealCloseDate, dealEnteredStage, dealStage,
+  dealWeighted, emptyValue, needsYear, num, outcomeWord, recordHref, str, useDealFormat, useDealProperties,
+  usePipelines, useUserIndex, useUsers, useVelocity,
   type CalendarFormat, type DealRecord, type PipelineStage, type PropertyDef, type StageHistory,
   type TimelineItem,
 } from './api';
 import { EditDealDialog, LogActivityDialog, PipelineMoveDialog, StageMoveDialog } from './dialogs';
 import { AccountCard, CommitteeCard } from './associations';
-import { InlineProperty } from './inline';
+import { InlineEditingScope, InlineProperty } from './inline';
 import { DraftDialog } from '../copilot/draft';
 
 /**
@@ -352,11 +352,14 @@ export function DealRecordPage({ id }: { id: string }) {
     icon: (() => { const Glyph = iconByName(item.icon); return <Glyph size={12} />; })(),
   }));
 
+  // A spell that started in another year says so: "Jun 2" over a deal booked
+  // in October last year read as a stage entered *after* it closed.
+  const today = f.calendarToday();
   const spells: TimelineEntry[] = (history.data?.data ?? []).map((spell) => ({
     id: `${spell.stage}-${spell.entered_at}`,
     title: spell.stage_label,
     description: `${spell.probability}% · ${spell.is_current ? `${f.plural(spell.days_in_stage, 'day')} and counting` : `${f.plural(spell.days_in_stage, 'day')}`}`,
-    time: f.date(spell.entered_at, { withYear: false }),
+    time: f.date(spell.entered_at, { withYear: needsYear(civilDay(spell.entered_at, session.timeZone), today) }),
     tone: spell.is_current ? 'brand' : spell.is_won ? 'success' : 'neutral',
     icon: <GitBranchIcon size={12} />,
   }));
@@ -408,7 +411,24 @@ export function DealRecordPage({ id }: { id: string }) {
     },
   ];
 
-  const facts: { label: string; value: string; hint?: string }[] = [
+  /**
+   * How a closed deal ended, read from the workspace's own outcome group: the
+   * picklists are the reasons, the free text beside them the notes. It takes the
+   * place of "In this stage" — a won deal is not waiting anywhere, and "95 days
+   * in stage · Deals do not wait here" beside "Booked 319 days ago" told a
+   * reviewer two things at once while the reason sat at the bottom of the page.
+   */
+  const outcome = outcomeWord(stage);
+  const outcomeProps = props.filter((p) => p.group.toLowerCase() === 'outcome' && !p.read_only && !p.calculated);
+  const reasons = outcomeProps
+    .filter((p) => p.type === 'enum' && !emptyValue(deal.properties[p.name]))
+    .map((p) => renderValue(p, deal.properties[p.name]));
+  const closeNotes = outcomeProps
+    .filter((p) => p.type !== 'enum' && !emptyValue(deal.properties[p.name]))
+    .map((p) => str(deal.properties[p.name]))
+    .join(' ');
+
+  const facts: { label: string; value: string; hint?: string; note?: string }[] = [
     { label: 'Amount', value: f.money(amount), hint: `${humanize(str(deal.properties.deal_type) || 'deal')}${deal.properties.contract_term_months ? ` · ${f.plural(num(deal.properties.contract_term_months), 'month')} term` : ''}` },
     { label: 'Probability', value: `${num(deal.properties.probability)}%`, hint: stage ? `Set by ${stage.label}` : undefined },
     { label: 'Weighted', value: f.money(dealWeighted(deal)), hint: 'At this stage’s probability' },
@@ -422,25 +442,28 @@ export function DealRecordPage({ id }: { id: string }) {
       value: close ? f.calendarDate(close) : 'Not set',
       hint: close === null
         ? undefined
-        : stage?.is_closed
-          ? `Booked ${f.calendarRelative(close)}`
+        : closedVerb(stage)
+          ? `${closedVerb(stage)} ${f.calendarRelative(close)}`
           : f.calendarDaysUntil(close) < 0
             ? `${f.plural(-f.calendarDaysUntil(close), 'day')} overdue`
             : f.calendarRelative(close),
     },
-    {
-      label: 'In this stage',
-      value: daysInStage === null ? '—' : f.plural(daysInStage, 'day'),
-      // A closed stage has no median because deals do not wait in one; saying
-      // that is more useful than an em dash where a number belongs.
-      hint: !stageVelocity
-        ? undefined
-        : stage?.is_closed
-          ? 'Deals do not wait here'
+    outcome
+      ? {
+        label: 'Outcome',
+        value: outcome,
+        hint: reasons.length ? reasons.join(' · ') : 'No reason recorded',
+        note: closeNotes || undefined,
+      }
+      : {
+        label: 'In this stage',
+        value: daysInStage === null ? '—' : f.plural(daysInStage, 'day'),
+        hint: !stageVelocity
+          ? undefined
           : stageVelocity.median_days_in_stage > 0
             ? `Median here is ${f.plural(stageVelocity.median_days_in_stage, 'day')}`
             : 'Nothing has sat here long enough to have a median',
-    },
+      },
   ];
 
   // Same rule as the board: a closed stage has no stall threshold, because a
@@ -580,13 +603,19 @@ export function DealRecordPage({ id }: { id: string }) {
           </>
         }
       >
-        <Card title="Forecast" description="Everything the stage decides, and what the clock has done to it">
+        <Card
+          title="Forecast"
+          description={outcome
+            ? 'Everything the stage decided, and how the deal ended'
+            : 'Everything the stage decides, and what the clock has done to it'}
+        >
           <div className="pl-facts">
             {facts.map((fact) => (
               <div className="pl-fact" key={fact.label}>
                 <span className="pl-fact__label">{fact.label}</span>
                 <span className="pl-fact__value">{fact.value}</span>
                 {fact.hint && <span className="pl-fact__hint">{fact.hint}</span>}
+                {fact.note && <span className="pl-fact__note">{fact.note}</span>}
               </div>
             ))}
           </div>
@@ -641,11 +670,21 @@ export function DealRecordPage({ id }: { id: string }) {
             />
           )}
           {!properties.error && properties.loading && <SkeletonText lines={10} />}
+          <InlineEditingScope>
           <div className="pl-proplist">
             {groups.map(([group, rows]) => (
               <section key={group}>
                 <div className="pl-propgroup__head">
-                  <span className="pl-propgroup__title">{group}</span>
+                  <span className="pl-propgroup__title">
+                    {group}
+                    {/* A reopened deal keeps the reason it once closed for. The
+                        values are history, not a verdict on an open deal, and
+                        the group says so rather than reading as one. */}
+                    {group.toLowerCase() === 'outcome' && str(deal.properties.deal_status) === 'open'
+                      && rows.some((property) => !property.read_only && !emptyValue(deal.properties[property.name])) && (
+                      <Badge size="sm" tone="neutral" className="pl-propgroup__flag">from an earlier close — this deal is open again</Badge>
+                    )}
+                  </span>
                   {rows.some((property) => !property.read_only && !property.calculated) && (
                     <Button size="sm" variant="ghost" onClick={() => setEditing(group)}>Edit {group.toLowerCase()}</Button>
                   )}
@@ -671,6 +710,7 @@ export function DealRecordPage({ id }: { id: string }) {
               </section>
             ))}
           </div>
+          </InlineEditingScope>
         </Card>
 
         <div style={{ height: 'var(--space-6)' }} />

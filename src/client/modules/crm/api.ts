@@ -8,6 +8,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { api, invalidate, useQuery, type ApiClientError, type ListEnvelope } from '@/client/kernel/api';
+import type { StageSpell } from './record-model';
 
 /* ------------------------------- vocabulary ------------------------------- */
 
@@ -188,6 +189,25 @@ export interface TimelineItem {
   record_id: string;
   via: { id: string; object_type: string; display_name: string } | null;
   data: Record<string, unknown>;
+}
+
+export interface HistoryEntry {
+  object: 'property_history';
+  id: string;
+  record_id: string;
+  object_type: string;
+  property: string;
+  property_label: string;
+  from_value: PropertyValue;
+  to_value: PropertyValue;
+  from_display: string | null;
+  to_display: string | null;
+  changed_at: number;
+  seq: number;
+  write_id: string;
+  actor_id: string | null;
+  actor_type: string;
+  source: string;
 }
 
 export interface SimilarMatch {
@@ -400,6 +420,30 @@ export function useSimilar(objectType: string | null, id: string | null) {
 export function useAssociationTypes() {
   return useQuery<ListEnvelope<AssociationTypeDef>>('/v1/association-types');
 }
+export interface StageHistoryEnvelope extends ListEnvelope<StageSpell> {
+  record_id: string;
+  stage_property: string;
+  current_stage: string | null;
+  days_in_current_stage: number | null;
+  total_days: number;
+}
+
+/**
+ * Every stage a pipelined record has been through, with how long it stayed.
+ * Only asked for when the schema binds a pipeline to the type — the route
+ * refuses anything else, and a contact page has nothing to ask.
+ */
+export function useStageHistory(objectType: string | null, id: string | null) {
+  return useQuery<StageHistoryEnvelope>(objectType && id ? `/v1/records/${objectType}/${id}/stage-history` : null);
+}
+
+/** Every recorded change to one property of one record, newest first. */
+export function usePropertyHistory(objectType: string | null, id: string | null, property: string | null) {
+  return useQuery<ListEnvelope<HistoryEntry>>(
+    objectType && id && property ? `/v1/records/${objectType}/${id}/history` : null,
+    { property: property ?? '', limit: 50 },
+  );
+}
 
 /* -------------------------------- indexes --------------------------------- */
 
@@ -435,6 +479,13 @@ export const restoreRecord = (objectType: string, id: string) =>
 
 export const batchUpdate = (objectType: string, records: { id: string; properties: Record<string, unknown>; owner_id?: string | null }[]) =>
   api.post<BatchResult>(`/v1/records/${objectType}/batch`, { operation: 'update', records });
+
+/** One page of an import. Each row commits on its own; the result names the ones that did not. */
+export const batchImport = (objectType: string, input: {
+  operation: 'create' | 'update' | 'upsert';
+  id_property?: string;
+  records: { id?: string; properties: Record<string, unknown>; owner_id?: string | null }[];
+}) => api.post<BatchResult>(`/v1/records/${objectType}/batch`, input);
 
 export const logActivity = (objectType: string, id: string, input: {
   type: 'note' | 'call' | 'meeting' | 'email' | 'task';

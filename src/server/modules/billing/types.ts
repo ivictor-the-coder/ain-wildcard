@@ -665,6 +665,26 @@ export type CreditNoteReason = (typeof CREDIT_NOTE_REASONS)[number];
 export const CREDIT_NOTE_STATUSES = ['issued', 'void'] as const;
 export type CreditNoteStatus = (typeof CREDIT_NOTE_STATUSES)[number];
 
+/**
+ * One jurisdiction's share of a credited line's tax — the same shape the
+ * invoice line's `taxes` carry, because the return for each authority wants
+ * the figure credited under its own rate, not the line's combined one.
+ */
+export interface CreditNoteLineTaxAmount {
+  object: 'credit_note_line_tax_amount';
+  /** Positive minor units, like the line. */
+  amount: number;
+  /** The base being credited under this rate — the line's own `amount`. */
+  taxable_amount: number;
+  rate: string | null;
+  display_name: string | null;
+  jurisdiction: string | null;
+  percentage: string | null;
+  tax_type: TaxType | null;
+  behavior: TaxBehavior | null;
+  reason: TaxReason | null;
+}
+
 export interface CreditNoteLine {
   object: 'credit_note_line_item';
   id: string;
@@ -678,8 +698,11 @@ export interface CreditNoteLine {
   /** Positive minor units — the taxable base being credited. */
   amount: number;
   tax_amount: number;
+  /** `tax_amount`, one entry per jurisdiction the invoice line was taxed under. Always sums to `tax_amount`. */
+  tax_amounts: CreditNoteLineTaxAmount[];
   /** `amount + tax_amount`: what this line takes off the bill. */
   amount_including_tax: number;
+  /** The single rate this line credits under, or null where jurisdictions stack — read `tax_amounts`. */
   tax_rate: string | null;
   tax_percentage: string | null;
   tax_display_name: string | null;

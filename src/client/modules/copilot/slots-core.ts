@@ -91,8 +91,46 @@ export interface SlotFormat {
  */
 const WRITES = /^(create|update|delete|log|send|move|assign)_/;
 
-/** The dimensions every measuring call in the plan actually narrowed on. */
-export function slotChipsFromPlan(calls: readonly ToolCallLike[], vocab: Vocabulary, f: SlotFormat): SlotChip[] {
+/**
+ * The number the engine bound from the question, if it bound one.
+ *
+ * "Top 5 customers by revenue" binds `{number} = 5`; "Which invoices are
+ * overdue?" binds no number at all and its plan still carries `limit: 25`,
+ * because every list tool takes a page size. The chip strip used to print
+ * that page size as "TOP 25" — a claim the person never made. The engine
+ * records what it bound in two places this client can read: the completion's
+ * `analysis.slots`, and the run's own note `Matched "top-n-accounts":
+ * {number} = 5, …`. Neither is the wording of the question.
+ */
+export function numberAsked(source: { analysis?: unknown; reasoning?: readonly string[] | null } | null | undefined): number | null {
+  const analysis = source?.analysis;
+  if (isRecord(analysis) && Array.isArray(analysis.slots)) {
+    for (const slot of analysis.slots) {
+      if (!isRecord(slot) || (slot.kind !== 'number' && slot.name !== 'number')) continue;
+      const value = Number(typeof slot.label === 'string' && slot.label ? slot.label : slot.text);
+      if (Number.isFinite(value) && value > 0) return value;
+    }
+  }
+  for (const line of source?.reasoning ?? []) {
+    const match = /^Matched "[^"]+":.*\{number\} = (\d+)/.exec(line.trim());
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
+
+/**
+ * The dimensions every measuring call in the plan actually narrowed on.
+ *
+ * `asked` is the number the engine bound from the question, when it bound
+ * one: a `limit` in the plan is drawn as a Top chip only when it is that
+ * number, because a page size nobody asked for is not a scope.
+ */
+export function slotChipsFromPlan(
+  calls: readonly ToolCallLike[],
+  vocab: Vocabulary,
+  f: SlotFormat,
+  asked: number | null = null,
+): SlotChip[] {
   const out: SlotChip[] = [];
   const push = (chip: SlotChip) => {
     if (!out.some((c) => c.kind === chip.kind && c.value === chip.value)) out.push(chip);
@@ -119,8 +157,25 @@ export function slotChipsFromPlan(calls: readonly ToolCallLike[], vocab: Vocabul
     if (scope.subjectId) push({ kind: 'account', label: 'Account', value: f.name(scope.subjectId) });
     if (scope.objectType) push({ kind: 'object', label: 'Records', value: humanizeName(scope.objectType) });
     if (scope.groupBy) push({ kind: 'group', label: 'By', value: humanizeName(scope.groupBy) });
-    if (scope.limit !== null && cutsRows(scope)) push({ kind: 'limit', label: 'Top', value: String(scope.limit) });
+    if (scope.limit !== null && asked !== null && scope.limit === asked && cutsRows(scope)) {
+      push({ kind: 'limit', label: 'Top', value: String(scope.limit) });
+    }
     if (scope.currency) push({ kind: 'currency', label: 'Book', value: scope.currency.toUpperCase() });
+  }
+  return out;
+}
+
+/**
+ * The chips still carrying a record id where a name belongs.
+ *
+ * A chip's names come from the citations and the teammates; a plan that
+ * measured an account which cited nothing leaves `cmp_nw_42` on the chip. The
+ * screen reads these records once and draws the chips again with the names.
+ */
+export function rawRecordIds(slots: readonly SlotChip[]): string[] {
+  const out: string[] = [];
+  for (const slot of slots) {
+    if (/^(cmp|con|deal|tkt)_[A-Za-z0-9_]+$/.test(slot.value) && !out.includes(slot.value)) out.push(slot.value);
   }
   return out;
 }
@@ -131,9 +186,11 @@ export function slotChips(input: {
   toolCalls: readonly ToolCallLike[];
   vocab: Vocabulary;
   format: SlotFormat;
+  /** The number the engine bound from the question, when it bound one. */
+  asked?: number | null;
 }): SlotChip[] {
   const bound = input.binding ? slotChipsFromBinding(input.binding) : [];
-  return bound.length ? bound : slotChipsFromPlan(input.toolCalls, input.vocab, input.format);
+  return bound.length ? bound : slotChipsFromPlan(input.toolCalls, input.vocab, input.format, input.asked ?? null);
 }
 
 export { windowText };

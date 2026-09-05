@@ -14,6 +14,7 @@
  */
 import type { Ctx } from '../../kernel/context';
 import { DAY } from '../../../shared/time';
+import { RECOVERY_RATE_BASIS } from '../payments/dunning';
 import type { MonthCell } from './grid';
 import { decimal2, ratio, type Decimal2, type Ratio } from './ratio';
 
@@ -141,14 +142,21 @@ export function ageBook(invoices: InvoiceRow[], at: number, currency: string | n
 export interface RecoveryReport {
   /** The currency these figures are in, or null when the whole book is in scope. */
   currency: string | null;
-  /** Open campaigns: what is still being chased, right now. */
+  /** Open campaigns: the balance still being chased, right now. */
   at_risk: number;
   at_risk_campaigns: number;
   /** Campaigns that started inside the range, whichever way they ended. */
   campaigns_started: number;
+  /**
+   * Money whose fate is known: recovered plus lost, over campaigns in the range
+   * that have finished. A campaign still recovering is in neither figure — it
+   * is counted in `at_risk` until it ends.
+   */
   amount_at_risk: number;
   amount_recovered: number;
+  /** `amount_recovered / amount_at_risk` — the payments module's own definition, quoted in `recovery_rate_basis`. */
   recovery_rate: Ratio;
+  recovery_rate_basis: string;
   by_status: { status: string; campaigns: number; amount_at_risk: number; amount_recovered: number }[];
   attempts: { outcome: string; attempts: number }[];
   attempt_success_rate: Ratio;
@@ -162,7 +170,12 @@ export interface RecoveryReport {
  *
  * `payments_dunning` carries the currency of the bill it is chasing, so a
  * per-currency recovery rate is a real rate rather than a ratio of two sums
- * that were never in the same unit.
+ * that were never in the same unit. The rate itself is the payments module's
+ * — `RECOVERY_RATE_BASIS` — so /v1/dunning/summary and this report can never
+ * quote two different recovery rates for one book: `amount_at_risk` on a
+ * campaign already follows its balance down as money arrives, and
+ * `recovered_amount` follows the money up, so open exposure is the balance
+ * alone and the rate is decided money only.
  */
 export function recoveryReport(
   ctx: Ctx, orgId: string, from: number, to: number, currency?: string | null,
@@ -172,7 +185,7 @@ export function recoveryReport(
     ctx.db.all<T>(sql, ...((currency ? [...params, currency] : params) as never[]));
 
   const open = ctx.db.get<{ campaigns: number; amount: number }>(
-    `SELECT COUNT(*) AS campaigns, COALESCE(SUM(amount_at_risk - recovered_amount), 0) AS amount
+    `SELECT COUNT(*) AS campaigns, COALESCE(SUM(amount_at_risk), 0) AS amount
        FROM payments_dunning WHERE org_id = ? AND status = 'recovering'${clause}`,
     ...((currency ? [orgId, currency] : [orgId]) as never[]),
   ) ?? { campaigns: 0, amount: 0 };
@@ -195,17 +208,21 @@ export function recoveryReport(
     orgId, from, to,
   );
 
+  // What each decline is still costing: the balance a campaign is chasing, or
+  // gave up on. A recovered or withdrawn campaign costs nothing any more.
   const codes = scoped<{ code: string; campaigns: number; amount: number }>(
     `SELECT last_failure_code AS code, COUNT(*) AS campaigns,
-            COALESCE(SUM(amount_at_risk - recovered_amount), 0) AS amount
+            COALESCE(SUM(CASE WHEN status IN ('recovering', 'exhausted') THEN amount_at_risk ELSE 0 END), 0) AS amount
        FROM payments_dunning
       WHERE org_id = ? AND last_failure_code IS NOT NULL AND started_at >= ? AND started_at < ?${clause}
       GROUP BY last_failure_code ORDER BY amount DESC, campaigns DESC LIMIT 8`,
     orgId, from, to,
   );
 
-  const atRisk = byStatus.reduce((sum, row) => sum + Number(row.at_risk), 0);
-  const recovered = byStatus.reduce((sum, row) => sum + Number(row.recovered), 0);
+  const decided = byStatus.filter((row) => row.status === 'recovered' || row.status === 'exhausted');
+  const recovered = decided.reduce((sum, row) => sum + Number(row.recovered), 0);
+  const lost = decided.filter((row) => row.status === 'exhausted').reduce((sum, row) => sum + Number(row.at_risk), 0);
+  const atRisk = recovered + lost;
   const succeeded = attempts.find((row) => row.outcome === 'succeeded')?.attempts ?? 0;
   const made = attempts.filter((row) => row.outcome !== 'skipped').reduce((sum, row) => sum + Number(row.attempts), 0);
 
@@ -217,6 +234,7 @@ export function recoveryReport(
     amount_at_risk: atRisk,
     amount_recovered: recovered,
     recovery_rate: ratio(recovered, atRisk),
+    recovery_rate_basis: RECOVERY_RATE_BASIS,
     by_status: byStatus.map((row) => ({
       status: row.status,
       campaigns: Number(row.campaigns),

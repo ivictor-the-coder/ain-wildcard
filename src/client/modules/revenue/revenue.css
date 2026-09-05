@@ -17,6 +17,17 @@
 .rv-tile { position: relative; }
 .rv-tile__basis { position: absolute; inset-block-start: var(--space-3); inset-inline-end: var(--space-3); }
 
+/* A labelled group of stats inside one card: "Priced when the windows closed"
+   over four tiles, "Where the charge stands" over four more. */
+.rv-group { display: grid; gap: var(--space-4); }
+.rv-kicker {
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
 /* -------------------------------- columns -------------------------------- */
 
 .rv-cols {
@@ -352,3 +363,22 @@
   overflow-y: auto;
   padding-inline-end: var(--space-3);
 }
+
+/* A pause is amber in the table as it is in the badge: money that stopped
+   without a contract ending. */
+.rv-num--warn { color: var(--text-warning); }
+
+/* A link set inside a caption sentence inherits the caption's size. */
+.rv-link--inline { font: inherit; padding: 0; background: none; border: 0; cursor: pointer; text-decoration: underline; color: var(--text-secondary); }
+.rv-link--inline:hover { color: var(--text-link); }
+
+/* ------------------------------ page header ------------------------------ */
+
+/* The board's toolbar — range chips, a date picker, a currency control — is
+   some 600px wide. The shell's header stacks it under the title only below
+   760px, so at 1024 the subtitle was being squeezed into 180px beside it and
+   wrapped to five lines. The titles claim a reading measure first; when the
+   toolbar no longer fits beside that, it wraps under the title instead. */
+.rv-page .ain-page__titlerow { flex-wrap: wrap; }
+.rv-page .ain-page__titles { flex: 1 1 440px; }
+.rv-page .ain-page__actions { flex: 0 1 auto; max-width: 100%; }

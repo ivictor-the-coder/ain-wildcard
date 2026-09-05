@@ -22,22 +22,42 @@
  * minted. That is not a detail to bury: an admin removing a departing engineer
  * is also killing the CI credential that engineer created, and the confirmation
  * says so before it happens rather than the audit log saying so afterwards.
+ *
+ * And the least comfortable honest part is the invitation itself. `POST
+ * /v1/users` creates the seat with `password_hash: null`, sends nothing, and
+ * the platform has no invitation link, no accept route and no password route —
+ * `POST /v1/auth/login` answers 401 to the new address forever. The dialog used
+ * to promise an immediate join; it now says what actually happens, so an admin
+ * is not left telling a colleague to sign in to a seat nobody can sign in to.
+ * The seat still holds a name, a role and teams, which is what the rest of the
+ * product needs it for.
  */
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, useQuery, type ListEnvelope } from '../../kernel/api';
+import { useNavigate } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
 import {
   Avatar, Badge, Banner, Button, Card, DataTable, EmptyState, Field, Icons, Inline, Input, Modal,
   RadioGroup, Stack, Tooltip,
-  useFormat,
-  type DataTableColumn, type MenuSection,
+  useFormat, useToast,
+  type DataTableColumn, type MenuSection, type TableState,
   AlertTriangleIcon,
 } from '../../design';
 import {
-  ListFailure, ROLE_GRANTS, ROLE_ORDER, ROLE_RANK, ReadOnlyForYou, RoleBadge, SettingsShell, useAction,
-  useOpenFromQuery,
+  DialogForm, ListFailure, ROLE_GRANTS, ROLE_ORDER, ROLE_RANK, ReadOnlyForYou, RoleBadge, SettingsShell, useAction,
+  useConsumeQuery, useOpenFromQuery,
 } from './common';
 import type { Member, Role } from './types';
+
+/**
+ * The one sentence that has to be true before anyone presses the button. There
+ * is no way for the person to get in yet; saying so in the dialog is what
+ * stops the admin promising them one.
+ */
+export const INVITE_TRUTH =
+  'A seat is created at the role you choose and appears on the roster straight away. Nothing is sent, and they cannot '
+  + 'sign in: the platform has no invitation link, no password route and no accept step yet, so the seat holds their '
+  + 'name, role and teams until one exists.';
 
 const ADMIN_ONLY = new Set<Role>(['owner', 'admin']);
 
@@ -67,12 +87,25 @@ const roleOptions = (grantable: (role: Role) => boolean, myRole: Role) =>
 export function TeamPage() {
   const session = useSession();
   const f = useFormat();
+  const toast = useToast();
+  const navigate = useNavigate();
   const action = useAction();
   const members = useQuery<ListEnvelope<Member>>('/v1/users');
 
   const [inviting, setInviting] = useState(false);
   const [editing, setEditing] = useState<Member | null>(null);
   const [removing, setRemoving] = useState<Member | null>(null);
+  const [view, setView] = useState<TableState>({ query: '', sort: { columnId: 'role', direction: 'asc' }, filters: {} });
+  /**
+   * `?member=usr_…` is the address the audit trail writes for a teammate it
+   * names. The roster answers with that one seat on top — the search is set to
+   * their email, which is unique — once the list it has to look them up in has
+   * arrived. A seat the roster no longer holds is answered with a sentence that
+   * says so, not with a search for an id that finds nobody.
+   */
+  const [wanted, setWanted] = useState<string | null>(null);
+  const [gone, setGone] = useState<string | null>(null);
+  useConsumeQuery('member', setWanted);
 
   const myRole = (session.me?.role ?? 'readonly') as Role;
   const myId = session.me?.user?.id ?? null;
@@ -82,10 +115,24 @@ export function TeamPage() {
   // a choice it knows will be refused.
   const grantable = (role: Role) => ROLE_GRANTS[role] !== undefined && ROLE_RANK[myRole] >= ROLE_RANK[role];
 
-  // The palette's Invite entry lands here with the dialog already open.
-  useOpenFromQuery('invite', () => { if (admin) { action.clear(); setInviting(true); } });
+  // The palette's Invite entry lands here with the dialog already open — or,
+  // for a role the server would refuse, with the reason instead of nothing.
+  useOpenFromQuery('invite', () => {
+    if (admin) { action.clear(); setInviting(true); return; }
+    toast.info(
+      'Inviting a teammate needs the admin role',
+      `Your role on this workspace is ${myRole}, and POST /v1/users is gated at admin — so the dialog is not offered rather than offered and refused.`,
+    );
+  });
 
   const rows = members.data?.data ?? [];
+  useEffect(() => {
+    if (!wanted || !members.data) return;
+    const seat = members.data.data.find((row) => row.id === wanted);
+    if (seat) setView((current) => ({ ...current, query: seat.email }));
+    else setGone(wanted);
+    setWanted(null);
+  }, [wanted, members.data]);
   const adminCount = rows.filter((row) => ADMIN_ONLY.has(row.role)).length;
   const ownerCount = rows.filter((row) => row.role === 'owner').length;
 
@@ -95,7 +142,9 @@ export function TeamPage() {
       header: 'Teammate',
       pinned: true,
       width: 300,
-      accessor: (row) => row.name,
+      // Name, email and role together, so the search the placeholder promises
+      // finds all three — the role column itself sorts on rank, not on text.
+      accessor: (row) => `${row.name} ${row.email} ${row.role}`,
       cell: (row) => (
         <Inline gap={4}>
           <Avatar name={row.name} seed={row.id} size={28} />
@@ -115,7 +164,15 @@ export function TeamPage() {
       header: 'Role',
       width: 190,
       filter: 'set',
-      accessor: (row) => row.role,
+      /**
+       * The ladder, not the alphabet. Sorted on the role's name the owner came
+       * last — admin, analyst, member, member, member, owner — which is the one
+       * order nobody reading a roster expects. The accessor is the rung's index
+       * in `ROLE_ORDER`, so ascending reads owner → admin → member → analyst →
+       * readonly, and the filter menu maps the index back to the word.
+       */
+      accessor: (row) => ROLE_ORDER.indexOf(row.role),
+      filterOptionLabel: (value) => ROLE_ORDER[Number(value)] ?? value,
       cell: (row) => (
         <Tooltip content={ROLE_GRANTS[row.role].detail}>
           <span><RoleBadge role={row.role} /></span>
@@ -178,6 +235,27 @@ export function TeamPage() {
       <Stack gap={6}>
         {members.error && <ListFailure error={members.error} path="GET /v1/users" onRetry={members.refetch} />}
 
+        {gone && (
+          <Banner
+            tone="info"
+            compact
+            title="That teammate is no longer on the roster"
+            onDismiss={() => setGone(null)}
+            actions={admin
+              ? (
+                <Button size="sm" variant="secondary" onClick={() => navigate(`/settings/audit?target=${encodeURIComponent(gone)}`)}>
+                  What the trail says
+                </Button>
+              )
+              : undefined}
+          >
+            {'GET /v1/users holds no seat with the id '}
+            <span className="st-mono">{gone}</span>
+            {'. A removed seat is gone from the roster for good — the audit trail keeps who they were, who removed '
+              + 'them and when, under that id.'}
+          </Banner>
+        )}
+
         {!admin && (
           <ReadOnlyForYou
             what="the team"
@@ -204,7 +282,8 @@ export function TeamPage() {
             searchPlaceholder="Search by name, email or role"
             showFilters
             showColumnToggle
-            initialSort={{ columnId: 'role', direction: 'asc' }}
+            value={view}
+            onChange={setView}
             rowActions={admin ? rowActions : undefined}
             onRowClick={admin ? (row) => { if (grantable(row.role)) { action.clear(); setEditing(row); } } : undefined}
             empty={
@@ -286,8 +365,10 @@ function InviteDialog({ open, grantable, myRole, action, onClose }: {
 
   const reset = () => { setEmail(''); setName(''); setTitle(''); setRole('member'); action.clear(); };
   const close = () => { reset(); onClose(); };
+  const valid = email.trim().length > 0 && name.trim().length > 0;
 
   const submit = async () => {
+    if (!valid || action.busy) return;
     const saved = await action.run(
       api.post<Member>('/v1/users', {
         email: email.trim().toLowerCase(),
@@ -296,12 +377,14 @@ function InviteDialog({ open, grantable, myRole, action, onClose }: {
         ...(title.trim() ? { title: title.trim() } : {}),
       }),
       {
-        success: `${name.trim() || email.trim()} is on the team`,
-        description: `Seated as ${role} — ${ROLE_GRANTS[role].summary.toLowerCase()}.`,
+        success: `${name.trim() || email.trim()} has a seat`,
+        description:
+          `Seated as ${role} — ${ROLE_GRANTS[role].summary.toLowerCase()}. They cannot sign in yet: no invitation or `
+          + 'password route exists, so nothing was sent.',
         failure: 'The invitation was refused',
         inlineOnly: true,
       },
-      ['/v1/users', '/v1/me'],
+      ['/v1/users', '/v1/me', '/v1/audit-log'],
     );
     if (saved) close();
   };
@@ -311,7 +394,7 @@ function InviteDialog({ open, grantable, myRole, action, onClose }: {
       open={open}
       onClose={close}
       title="Invite a teammate"
-      description="They join this workspace immediately at the role you choose."
+      description={INVITE_TRUTH}
       size="md"
       initialFocus={first}
       footer={
@@ -320,7 +403,7 @@ function InviteDialog({ open, grantable, myRole, action, onClose }: {
           <Button
             variant="primary"
             loading={action.busy}
-            disabled={!email.trim() || !name.trim()}
+            disabled={!valid}
             onClick={() => void submit()}
           >
             Add to workspace
@@ -328,43 +411,51 @@ function InviteDialog({ open, grantable, myRole, action, onClose }: {
         </>
       }
     >
-      <Stack gap={5}>
-        {action.error && !action.error.body.param && (
-          <Banner tone="danger" compact title="The invitation was refused">{action.error.body.message}</Banner>
-        )}
-        <Field label="Work email" required error={action.errorFor('email')}>
-          <Input
-            ref={first}
-            type="email"
-            value={email}
-            placeholder="name@northwind.io"
-            invalid={!!action.errorFor('email')}
-            onChange={(e) => setEmail(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && email.trim() && name.trim()) void submit(); }}
-            aria-label="Work email"
-          />
-        </Field>
-        <Field label="Full name" required error={action.errorFor('name')}>
-          <Input
-            value={name}
-            placeholder="Priya Raman"
-            invalid={!!action.errorFor('name')}
-            onChange={(e) => setName(e.target.value)}
-            aria-label="Full name"
-          />
-        </Field>
-        <Field label="Job title" optional error={action.errorFor('title')}>
-          <Input value={title} placeholder="Account Executive" onChange={(e) => setTitle(e.target.value)} aria-label="Job title" />
-        </Field>
-        <Field label="Role" required error={action.errorFor('role')}>
-          <RadioGroup
-            label="Role"
-            value={role}
-            onChange={setRole}
-            options={roleOptions(grantable, myRole)}
-          />
-        </Field>
-      </Stack>
+      <DialogForm onSubmit={() => void submit()}>
+        <Stack gap={5}>
+          {action.error && !action.error.body.param && (
+            <Banner tone="danger" compact title="The invitation was refused">{action.error.body.message}</Banner>
+          )}
+          <Banner tone="warning" compact title="No way in yet">
+            <code className="st-mono">POST /v1/users</code>
+            {' stores the seat with no password, and '}
+            <code className="st-mono">POST /v1/auth/login</code>
+            {' answers 401 to an address with none. Until the platform gains an invitation or password route, the seat '
+              + 'is a name on the roster with a role — the row will read “Never signed in”, and that is accurate.'}
+          </Banner>
+          <Field label="Work email" required error={action.errorFor('email')}>
+            <Input
+              ref={first}
+              type="email"
+              value={email}
+              placeholder="name@northwind.io"
+              invalid={!!action.errorFor('email')}
+              onChange={(e) => setEmail(e.target.value)}
+              aria-label="Work email"
+            />
+          </Field>
+          <Field label="Full name" required error={action.errorFor('name')}>
+            <Input
+              value={name}
+              placeholder="Priya Raman"
+              invalid={!!action.errorFor('name')}
+              onChange={(e) => setName(e.target.value)}
+              aria-label="Full name"
+            />
+          </Field>
+          <Field label="Job title" optional error={action.errorFor('title')}>
+            <Input value={title} placeholder="Account Executive" onChange={(e) => setTitle(e.target.value)} aria-label="Job title" />
+          </Field>
+          <Field label="Role" required error={action.errorFor('role')}>
+            <RadioGroup
+              label="Role"
+              value={role}
+              onChange={setRole}
+              options={roleOptions(grantable, myRole)}
+            />
+          </Field>
+        </Stack>
+      </DialogForm>
     </Modal>
   );
 }
@@ -413,8 +504,10 @@ function RoleDialog({ member, grantable, myRole, adminCount, ownerCount, myId, a
    */
   const destroysOwnerSeat = member.role === 'owner' && role !== 'owner' && ownerCount === 1;
   const confirmed = !destroysOwnerSeat || typed.trim().toLowerCase() === member.email.toLowerCase();
+  const submittable = (roleChanged || teamsChanged) && !lastAdmin && confirmed;
 
   const submit = async () => {
+    if (!submittable || action.busy) return;
     const saved = await action.run(
       api.patch<Member>(`/v1/users/${member.id}`, {
         ...(roleChanged ? { role } : {}),
@@ -444,7 +537,7 @@ function RoleDialog({ member, grantable, myRole, adminCount, ownerCount, myId, a
           <Button
             variant={demotingSelf || destroysOwnerSeat ? 'danger' : 'primary'}
             loading={action.busy}
-            disabled={(!roleChanged && !teamsChanged) || lastAdmin || !confirmed}
+            disabled={!submittable}
             onClick={() => void submit()}
           >
             {demotingSelf ? 'Lower my own role' : destroysOwnerSeat ? 'Give up the owner seat' : 'Save'}
@@ -452,6 +545,7 @@ function RoleDialog({ member, grantable, myRole, adminCount, ownerCount, myId, a
         </>
       }
     >
+      <DialogForm onSubmit={() => void submit()}>
       <Stack gap={5}>
         {action.error && !action.error.body.param && (
           <Banner tone="danger" compact title="The role was not changed">{action.error.body.message}</Banner>
@@ -496,7 +590,6 @@ function RoleDialog({ member, grantable, myRole, adminCount, ownerCount, myId, a
               value={typed}
               placeholder={member.email}
               onChange={(e) => setTyped(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter' && confirmed && (roleChanged || teamsChanged)) void submit(); }}
               aria-label={`Type ${member.email} to confirm`}
             />
           </Field>
@@ -521,6 +614,7 @@ function RoleDialog({ member, grantable, myRole, adminCount, ownerCount, myId, a
           <Input value={teams} placeholder="Sales, Customer Success" onChange={(e) => setTeams(e.target.value)} aria-label="Teams" />
         </Field>
       </Stack>
+      </DialogForm>
     </Modal>
   );
 }
@@ -537,6 +631,7 @@ function RemoveDialog({ member, action, onClose }: { member: Member | null; acti
   const confirmed = typed.trim().toLowerCase() === member.email.toLowerCase();
 
   const submit = async () => {
+    if (!confirmed || action.busy) return;
     // `DELETE` answers 204 with no body, which `api.del` resolves as `null` —
     // indistinguishable from the refusal `run` reports the same way. Mapping it
     // to `true` is what lets the dialog know the seat is actually gone.
@@ -570,30 +665,31 @@ function RemoveDialog({ member, action, onClose }: { member: Member | null; acti
         </>
       }
     >
-      <Stack gap={5}>
-        {action.error && (
-          <Banner tone="danger" compact title="They were not removed">{action.error.body.message}</Banner>
-        )}
-        <Banner tone="danger" compact title="This ends three things at once">
-          {'The membership goes, every session it holds is deleted, and every API key this person ever minted is '
-            + 'revoked — including keys other integrations are using right now. Re-inviting the same address later '
-            + 'creates a fresh seat; it does not bring the keys back.'}
-        </Banner>
-        <Field
-          label={`Type ${member.email} to confirm`}
-          required
-          hint="An address is harder to type by accident than a click is to make."
-        >
-          <Input
-            value={typed}
-            autoFocus
-            placeholder={member.email}
-            onChange={(e) => setTyped(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && confirmed) void submit(); }}
-            aria-label={`Type ${member.email} to confirm removal`}
-          />
-        </Field>
-      </Stack>
+      <DialogForm onSubmit={() => void submit()}>
+        <Stack gap={5}>
+          {action.error && (
+            <Banner tone="danger" compact title="They were not removed">{action.error.body.message}</Banner>
+          )}
+          <Banner tone="danger" compact title="This ends three things at once">
+            {'The membership goes, every session it holds is deleted, and every API key this person ever minted is '
+              + 'revoked — including keys other integrations are using right now. Re-inviting the same address later '
+              + 'creates a fresh seat; it does not bring the keys back.'}
+          </Banner>
+          <Field
+            label={`Type ${member.email} to confirm`}
+            required
+            hint="An address is harder to type by accident than a click is to make."
+          >
+            <Input
+              value={typed}
+              autoFocus
+              placeholder={member.email}
+              onChange={(e) => setTyped(e.target.value)}
+              aria-label={`Type ${member.email} to confirm removal`}
+            />
+          </Field>
+        </Stack>
+      </DialogForm>
     </Modal>
   );
 }

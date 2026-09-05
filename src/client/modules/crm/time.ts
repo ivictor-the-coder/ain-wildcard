@@ -105,3 +105,22 @@ export function zoneLabel(ts: number, timeZone: string): string {
   } catch { /* unknown zone */ }
   return timeZone.replace(/_/g, ' ');
 }
+
+/* ------------------------------ service levels ---------------------------- */
+
+const SOON = 24 * 60 * 60 * 1000;
+
+export type SlaState = 'overdue' | 'due_soon' | 'due' | 'closed';
+
+/**
+ * A due stamp read against the clock. "SLA due · last week" on an open ticket
+ * is a breach the screen was quietly reporting as a date; a closed ticket's
+ * target is history whichever side of now it fell.
+ */
+export function slaState(dueAt: number, now: number, closed: boolean): { state: SlaState; ms: number } {
+  const ms = Math.abs(dueAt - now);
+  if (closed) return { state: 'closed', ms };
+  if (dueAt <= now) return { state: 'overdue', ms };
+  if (dueAt - now <= SOON) return { state: 'due_soon', ms };
+  return { state: 'due', ms };
+}

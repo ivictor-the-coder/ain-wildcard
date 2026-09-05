@@ -2012,3 +2012,34 @@ describe('a currency has to be a currency', () => {
     for (const entry of page.data) assert.ok(entry.prices >= 1, `${entry.code} is listed but priced on nothing`);
   });
 });
+
+/* ------------------------- what a payload implies ------------------------- */
+
+describe('the model a payload implies', () => {
+  test('a metered price with a ladder is a usage price billed by its tiers', async () => {
+    // Metered says what the price is; the ladder is how its quantity is
+    // priced. Read the other way round, the field doc said "metered infers
+    // usage" and the row said "tiered".
+    const ladder = [{ up_to: 1000, unit_amount: 0 }, { up_to: 'inf', unit_amount: 4 }];
+    const inferred = await expectOk('POST', '/v1/prices', {
+      product: 'prod_nw_growth', currency: 'usd', recurring: { interval: 'month', usage_type: 'metered' },
+      tiers_mode: 'graduated', tiers: ladder,
+    });
+    assert.equal(inferred.model, 'usage');
+    assert.equal(inferred.billing_scheme, 'tiered');
+    assert.equal(inferred.recurring.usage_type, 'metered');
+    const priced = await expectOk('POST', `/v1/prices/${inferred.id}/preview`, { quantity: 1500 });
+    assert.equal(priced.amount, 2_000, '1,000 free, then 500 at 4 minor units each — the ladder still prices it');
+
+    // Asked for by name, tiered stays tiered; a licensed ladder is tiered.
+    const named = await expectOk('POST', '/v1/prices', {
+      product: 'prod_nw_growth', currency: 'usd', model: 'tiered', recurring: { interval: 'month', usage_type: 'metered' },
+      tiers_mode: 'graduated', tiers: ladder,
+    });
+    assert.equal(named.model, 'tiered');
+    const licensed = await expectOk('POST', '/v1/prices', {
+      product: 'prod_nw_growth', currency: 'usd', recurring: { interval: 'month' }, tiers_mode: 'graduated', tiers: ladder,
+    });
+    assert.equal(licensed.model, 'tiered');
+  });
+});

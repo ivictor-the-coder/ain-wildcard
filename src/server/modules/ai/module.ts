@@ -98,6 +98,7 @@ function assertMayAuthoriseWrites(req: Req): void {
  * other end. So: mask, and never cap.
  */
 const publicPending = (pending: PendingApproval) => ({
+  id: pending.id,
   tool: pending.tool,
   args: maskSecrets(pending.rawArgs ?? pending.args),
   reason: pending.reason,
@@ -330,6 +331,7 @@ export default defineModule({
         ctx.emit(request.orgId, 'ai.approval.requested', {
           id: approval.id, run_id: request.runId, tool: request.tool, args: request.args, reason: request.reason,
         }, { objectId: approval.id, objectType: 'ai_approval', actorId: request.actorId, actorType: 'agent' });
+        return { id: approval.id };
       },
     };
     runtime.setTraceSink(sink);

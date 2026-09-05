@@ -12,15 +12,16 @@
  * due on day one is priced and dated on day one rather than at the far end of
  * the jump. Every job it ran therefore carries its own workspace instant in
  * `updated`, and every move writes an audit entry with `before.now` and
- * `after.now`. Pairing those two is what turns "894 jobs ran" into a list you
- * can open.
+ * `after.now`. But the audit entry does not carry the count the response did,
+ * and two windows can hold the same job once the clock has been returned to
+ * real time and jumped again — so the count on each move comes from `moves.ts`,
+ * which credits a job to one move only and prefers the number the server
+ * actually answered whenever this browser was the one that asked.
  */
 import { useCallback, useMemo, useState } from 'react';
-import { invalidate, useQuery, type ListEnvelope } from '../../kernel/api';
+import { ApiClientError, invalidate, request, useQuery, type ListEnvelope } from '../../kernel/api';
 import { useSession } from '../../kernel/session';
-import { useTimeMachine, type ClockMove } from '../../kernel/platform';
-import { aftermathOf } from '../../kernel/time-machine';
-import { TIME_JUMPS, civilDayStart, clockOutcome, describeOffset, jumpDays, jumpTarget } from '../../kernel/shell-core';
+import { TIME_JUMPS, civilDayStart, clockOutcome, describeOffset, jumpDays, jumpTarget, type ClockAftermath } from '../../kernel/shell-core';
 import {
   Badge, Banner, Button, Card, ConfirmDialog, DatePicker, Divider, EmptyState, Icons, Inline,
   KeyValue, Stat, Stack, Tooltip,
@@ -29,7 +30,12 @@ import {
 } from '../../design';
 import { DAY } from '../../../shared/time';
 import { ListFailure, Loading, SettingsShell, useActorName } from './common';
-import type { AuditEntry, JobRow } from './types';
+import {
+  attributeJobs, covers, dueBy, readRecordedMoves, recordMove, recordedFor, tallyMove,
+  type MoveTally, type RecordedMove,
+} from './moves';
+import { tileOf } from './tiles';
+import type { AuditEntry, ClockResult, JobRow } from './types';
 
 const PAGE = 200;
 
@@ -40,9 +46,21 @@ interface Move {
   to: number;
   actor: string;
   requestId: string | null;
-  /** Jobs whose own workspace instant falls inside the window this move opened. */
-  ran: JobRow[];
+  tally: MoveTally;
+  /** Completed jobs this window alone holds. */
+  own: JobRow[];
+  /** Completed jobs this window holds together with another move's. */
+  shared: JobRow[];
   failed: JobRow[];
+}
+
+/** What one clock move did, from the server's answer and the read-back after it. */
+interface ClockMoveResult {
+  now: number;
+  previous: number | null;
+  jobsRun: number;
+  jobsFailed: number;
+  aftermath: ClockAftermath | null;
 }
 
 /** `{ now: 123 }` off an audit payload, or null when the row shaped differently. */
@@ -51,6 +69,63 @@ const instant = (value: unknown): number | null => {
   const now = (value as { now?: unknown }).now;
   return typeof now === 'number' && Number.isFinite(now) ? now : null;
 };
+
+/** "Nothing is due" → "nothing is due", for the middle of a sentence. */
+const quiet = (text: string): string => (text ? text[0].toLowerCase() + text.slice(1) : text);
+
+const storage = (): Storage | null => {
+  try { return typeof localStorage === 'undefined' ? null : localStorage; } catch { return null; }
+};
+
+/**
+ * A clock move, then a read-back, then the answer kept.
+ *
+ * The kernel's own hook does the first two, but hands back neither `previous`
+ * nor the request's answer in a form the history can find again — and
+ * `previous` is the one instant the audit entry stores verbatim (`before.now`),
+ * which is what lets the count the server gave be pinned to the row the trail
+ * later shows for it.
+ */
+function useClockMoves(orgId: string | null, onSettled: () => void) {
+  const [busy, setBusy] = useState(false);
+  const [records, setRecords] = useState<RecordedMove[]>(() => (orgId ? readRecordedMoves(storage(), orgId) : []));
+
+  const move = useCallback(async (path: string, body?: unknown): Promise<ClockMoveResult> => {
+    setBusy(true);
+    try {
+      const result = await request<Partial<ClockResult>>(path, { method: 'POST', body });
+      let aftermath: ClockAftermath | null = null;
+      try {
+        await request('/v1/me');
+      } catch (e) {
+        const err = e instanceof ApiClientError ? e : null;
+        aftermath = {
+          status: err?.status ?? 0,
+          message: err?.body.message ?? (e instanceof Error ? e.message : 'The workspace could not be read back.'),
+          requestId: err?.body.request_id ?? null,
+        };
+      }
+      const outcome: ClockMoveResult = {
+        now: result.now ?? Date.now(),
+        previous: typeof result.previous === 'number' ? result.previous : null,
+        jobsRun: result.jobs_run ?? 0,
+        jobsFailed: result.jobs_failed ?? 0,
+        aftermath,
+      };
+      if (orgId && outcome.previous !== null && path.endsWith('/advance')) {
+        setRecords(recordMove(storage(), orgId, {
+          from: outcome.previous, to: outcome.now, jobsRun: outcome.jobsRun, jobsFailed: outcome.jobsFailed, recordedAt: Date.now(),
+        }));
+      }
+      onSettled();
+      return outcome;
+    } finally { setBusy(false); }
+  }, [orgId, onSettled]);
+
+  const advance = useCallback((body: { to: number }) => move('/v1/time/advance', body), [move]);
+  const reset = useCallback(() => move('/v1/time/reset'), [move]);
+  return { advance, reset, busy, records };
+}
 
 export function TimeMachinePage() {
   const session = useSession();
@@ -89,7 +164,7 @@ export function TimeMachinePage() {
   const daysAhead = Math.max(1, jumpDays(target, now, f.timeZone));
 
   const settle = useCallback(() => { invalidate(); session.refresh(); }, [session]);
-  const { advance, reset, busy } = useTimeMachine(settle);
+  const { advance, reset, busy, records } = useClockMoves(session.me?.org.id ?? null, settle);
 
   // The move history is read off the audit trail, which is the one read on this
   // screen the server gates at admin. Everything else here is served to anyone.
@@ -98,45 +173,72 @@ export function TimeMachinePage() {
   const failedJobs = useQuery<ListEnvelope<JobRow>>('/v1/jobs', { status: 'failed', limit: PAGE });
   const pendingJobs = useQuery<ListEnvelope<JobRow>>('/v1/jobs', { status: 'pending', limit: PAGE });
 
+  const pending = pendingJobs.data?.data ?? [];
+  const pendingCapped = pending.length >= PAGE;
   const nextDue = useMemo(() => {
-    const upcoming = (pendingJobs.data?.data ?? []).map((job) => job.run_at).filter((at) => at > now);
+    const upcoming = pending.map((job) => job.run_at).filter((at) => at > now);
     return upcoming.length ? Math.min(...upcoming) : null;
-  }, [pendingJobs.data, now]);
+  }, [pending, now]);
 
   /**
-   * Every move anyone has made, newest first, with the work each one ran
-   * attached. A job belongs to a move when the instant its handler finished
-   * falls inside the window that move opened — which is exactly the definition
-   * `drainUntil` gives it by stepping the clock to each batch before draining.
+   * Every move anyone has made, newest first, with what it ran attached.
+   *
+   * A completed job is credited to the one move whose window holds its instant.
+   * Where two windows hold it — a jump made after a return to real time covers
+   * the same span the earlier jump did — it is credited to neither, and the
+   * count on each of those moves is the one the server answered when the move
+   * was made from this browser, or nothing at all. A number this screen cannot
+   * stand behind is not shown.
    */
   const moves = useMemo<Move[]>(() => {
     const entries = (log.data?.data ?? []).filter((row) => row.action === 'time.advanced');
-    const ran = doneJobs.data?.data ?? [];
+    const windows = entries.map((row) => ({
+      id: row.id,
+      from: instant(row.before) ?? row.created,
+      to: instant(row.after) ?? row.created,
+    }));
+    const done = doneJobs.data?.data ?? [];
     const broke = failedJobs.data?.data ?? [];
-    return entries.map((row) => {
-      const from = instant(row.before) ?? row.created;
-      const to = instant(row.after) ?? row.created;
-      const inWindow = (job: JobRow) => job.updated > from && job.updated <= Math.max(to, from);
+    const creditedDone = attributeJobs(windows, done);
+    const creditedFailed = attributeJobs(windows, broke);
+    const coverage = {
+      now,
+      capped: done.length >= PAGE,
+      floor: done.length ? Math.min(...done.map((job) => job.run_at)) : null,
+    };
+    return entries.map((row, index) => {
+      const window = windows[index];
+      const own = creditedDone.get(window.id)!;
+      const failed = creditedFailed.get(window.id)!;
+      const sharesWindow = own.shared.length > 0 || failed.shared.length > 0;
+      const recorded = recordedFor(records, window.from);
       return {
         id: row.id,
         at: row.created,
-        from,
-        to,
+        from: window.from,
+        to: window.to,
         actor: actorName(row.actor_id, row.actor_type),
         requestId: row.request_id,
-        ran: ran.filter(inWindow).sort((a, b) => a.run_at - b.run_at),
-        failed: broke.filter(inWindow),
+        tally: tallyMove({
+          recorded,
+          own: { ran: own.own.length, failed: failed.own.length },
+          sharesWindow,
+          covered: covers(window, coverage),
+        }),
+        own: own.own,
+        shared: own.shared,
+        failed: [...failed.own, ...failed.shared],
       };
     });
-  }, [log.data, doneJobs.data, failedJobs.data, actorName]);
+  }, [log.data, doneJobs.data, failedJobs.data, actorName, records, now]);
 
-  const report = (move: ClockMove, label: string) => {
+  const report = (move: ClockMoveResult, label: string) => {
     const outcome = clockOutcome({
       movedTo: f.date(move.now),
       label,
       jobsRun: move.jobsRun,
       jobsFailed: move.jobsFailed,
-      aftermath: aftermathOf(move),
+      aftermath: move.aftermath,
     });
     const raise = outcome.tone === 'success' ? toast.success : toast.error;
     raise(outcome.title, outcome.description, outcome.pinned ? { duration: 0 } : undefined);
@@ -162,6 +264,49 @@ export function TimeMachinePage() {
       toast.error('Could not return to real time', e instanceof Error ? e.message : 'The server refused the request.', { duration: 0 });
     }
   };
+
+  /** "12 jobs due", "Nothing due", "12+ jobs due" — what a jump to `to` will run. */
+  const dueLabel = (to: number): { text: string; tone: 'brand' | 'neutral' } => {
+    const due = dueBy(pending, to, pendingCapped);
+    if (due.count === 0 && !due.atLeast) return { text: 'Nothing is due — the clock moves, no job runs', tone: 'neutral' };
+    return { text: `${f.number(due.count)}${due.atLeast ? '+' : ''} ${due.count === 1 && !due.atLeast ? 'job runs' : 'jobs run'} on the way`, tone: 'brand' };
+  };
+
+  const describeTally = (tally: MoveTally): { badge: string; tone: 'success' | 'neutral' | 'warning'; why: string } => {
+    switch (tally.kind) {
+      case 'recorded':
+        return {
+          badge: f.plural(tally.ran, 'job'),
+          tone: tally.ran ? 'success' : 'neutral',
+          why: `The server answered ${f.plural(tally.ran, 'job')} ran${tally.failed ? ` and ${f.plural(tally.failed, 'failure')}` : ''} when this move was made from this browser.`,
+        };
+      case 'matched':
+        return {
+          badge: f.plural(tally.ran, 'job'),
+          tone: tally.ran ? 'success' : 'neutral',
+          why: 'Counted from completed jobs whose workspace instant falls inside this window and no other move’s.',
+        };
+      case 'shared':
+        return {
+          badge: 'Count not recorded',
+          tone: 'warning',
+          why: 'Another move’s window overlaps this one — the clock was returned to real time and jumped again over the same span — so the completed jobs in it cannot be told apart. The server’s count for this move was only reported to whoever pressed the button.',
+        };
+      case 'beyond':
+        return {
+          // A floor is honest where a count would not be: the jobs still
+          // readable certainly ran in this window, and more may have.
+          badge: tally.readable > 0 ? `At least ${f.plural(tally.readable, 'job')}` : 'Count not recorded',
+          tone: 'warning',
+          why: `The completed jobs this screen can read no longer reach the whole of this window — the queue keeps a done job for seven workspace days, a long jump prunes its own early days on the way, and the read is capped at ${PAGE}. ${tally.readable > 0 ? `${f.plural(tally.readable, 'job')} from it ${tally.readable === 1 ? 'is' : 'are'} still readable, so the true count is at least that. ` : ''}The server’s count was only reported to whoever pressed the button.`,
+        };
+    }
+  };
+
+  const nextTile = tileOf([pendingJobs], 'GET /v1/jobs?status=pending', () => ({
+    value: nextDue !== null ? f.when(nextDue) : 'Nothing ahead',
+    caption: nextDue !== null ? `Jumping past ${f.date(nextDue)} runs it` : 'No pending job carries a future run_at',
+  }));
 
   return (
     <SettingsShell
@@ -219,20 +364,16 @@ export function TimeMachinePage() {
             />
           </Card>
           <Card padding="tight">
-            <Stat
-              label="Next scheduled work"
-              value={nextDue !== null ? f.when(nextDue) : 'Nothing ahead'}
-              caption={nextDue !== null
-                ? `Jumping past ${f.date(nextDue)} runs it`
-                : 'No pending job carries a future run_at'}
-            />
+            <Stat label="Next scheduled work" value={nextTile.value} caption={nextTile.caption} />
           </Card>
           <Card padding="tight">
             <Stat
               label="Moves recorded"
               value={admin ? f.number(moves.length) : '—'}
               caption={admin
-                ? (moves.length ? 'Every one is in the audit trail' : 'The clock has not been moved yet')
+                ? (moves.length
+                  ? 'Every jump forward is in the audit trail; a return to real time leaves no entry'
+                  : 'The clock has not been jumped yet')
                 : 'Counted from the audit trail, which is closed to your role — not a count of zero'}
             />
           </Card>
@@ -246,6 +387,7 @@ export function TimeMachinePage() {
             <div className="st-jumps">
               {TIME_JUMPS.map((preset) => {
                 const to = preset.at(now);
+                const due = dueLabel(to);
                 return (
                   <button
                     key={preset.id}
@@ -257,6 +399,9 @@ export function TimeMachinePage() {
                     <span className="st-jump__title">{preset.label}</span>
                     <span className="st-jump__desc">{preset.description}</span>
                     <span className="st-jump__when">{f.date(to)}</span>
+                    <span className={`st-jump__due${due.tone === 'neutral' ? ' is-quiet' : ''}`} data-testid={`due-${preset.id}`}>
+                      {pendingJobs.loading ? 'Counting what is due…' : due.text}
+                    </span>
                   </button>
                 );
               })}
@@ -287,6 +432,11 @@ export function TimeMachinePage() {
               >
                 {`Run ${f.plural(daysAhead, 'day')} of work`}
               </Button>
+              {!pendingJobs.loading && (
+                <span className="st-sub" data-testid="due-picked">
+                  {`${f.date(target)} — ${quiet(dueLabel(target).text)}`}
+                </span>
+              )}
             </Inline>
 
             {shifted && (
@@ -302,9 +452,9 @@ export function TimeMachinePage() {
         {admin && (
           <Card
             title="What ran when it moved"
-            description="Each move as the audit trail recorded it, with the jobs whose own workspace instant falls inside the window it opened."
+            description="Each jump as the audit trail recorded it. The count is the server’s own answer when the jump was made from this browser; otherwise it is counted from completed jobs only where this window is the sole one holding them."
             actions={
-              <Button size="sm" variant="ghost" iconLeft={<Icons.refresh size={13} />} onClick={() => { log.refetch(); doneJobs.refetch(); }}>
+              <Button size="sm" variant="ghost" iconLeft={<Icons.refresh size={13} />} onClick={() => { log.refetch(); doneJobs.refetch(); failedJobs.refetch(); }}>
                 Refresh
               </Button>
             }
@@ -325,9 +475,17 @@ export function TimeMachinePage() {
                 {moves.map((move) => {
                   const days = Math.round((move.to - move.from) / DAY);
                   const isOpen = expanded === move.id;
-                  const capped = (doneJobs.data?.data.length ?? 0) === PAGE;
+                  const told = describeTally(move.tally);
+                  const counted = move.tally.kind === 'recorded' || move.tally.kind === 'matched';
+                  const ranNothing = (move.tally.kind === 'recorded' || move.tally.kind === 'matched')
+                    && move.tally.ran === 0 && move.tally.failed === 0;
+                  // What the expander can show: the jobs credited to this window
+                  // alone, plus — when the server's own count says more ran than
+                  // that — the ones it holds together with another move.
+                  const listed = move.tally.kind === 'recorded' ? [...move.failed, ...move.own, ...move.shared] : [...move.failed, ...move.own];
+                  const failedCount = move.tally.kind === 'recorded' || move.tally.kind === 'matched' ? move.tally.failed : move.failed.length;
                   return (
-                    <div className="st-row" key={move.id} style={{ display: 'block' }}>
+                    <div className="st-row" key={move.id} style={{ display: 'block' }} data-testid="clock-move" data-tally={move.tally.kind}>
                       <div className="u-row" style={{ gap: 'var(--space-6)', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                         <div className="st-row__main">
                           <div className="st-row__title">
@@ -339,31 +497,42 @@ export function TimeMachinePage() {
                           </div>
                         </div>
                         <div className="st-row__aside">
-                          {move.failed.length > 0 && <Badge tone="danger" pill>{f.plural(move.failed.length, 'failure')}</Badge>}
-                          <Tooltip content={capped
-                            ? `Matched against the ${PAGE} most recently completed jobs, so an older move may show fewer than it ran.`
-                            : 'Every completed job whose workspace instant falls in this window.'}
-                          >
-                            <span><Badge tone={move.ran.length ? 'success' : 'neutral'} pill>{f.plural(move.ran.length, 'job')}</Badge></span>
+                          {failedCount > 0 && <Badge tone="danger" pill>{f.plural(failedCount, 'failure')}</Badge>}
+                          <Tooltip content={told.why}>
+                            <span><Badge tone={told.tone} pill data-testid="move-count">{told.badge}</Badge></span>
                           </Tooltip>
                           <Button
                             size="sm"
                             variant="ghost"
-                            disabled={move.ran.length === 0 && move.failed.length === 0}
+                            disabled={ranNothing || listed.length === 0}
                             iconRight={isOpen ? <ChevronUpIcon size={13} /> : <ChevronDownIcon size={13} />}
                             onClick={() => setExpanded(isOpen ? null : move.id)}
                           >
-                            {isOpen ? 'Hide' : 'What ran'}
+                            {isOpen ? 'Hide' : counted ? 'What ran' : 'Jobs in this window'}
                           </Button>
                         </div>
                       </div>
                       {isOpen && (
                         <div style={{ marginTop: 'var(--space-5)' }}>
-                          {[...move.failed, ...move.ran].map((job) => (
+                          {move.tally.kind === 'recorded' && listed.length !== move.tally.ran + move.tally.failed && (
+                            <div className="st-hint" style={{ marginBottom: 'var(--space-3)' }}>
+                              {`The server counted ${f.plural(move.tally.ran + move.tally.failed, 'job')}; ${f.plural(listed.length, 'job')} `
+                                + `${listed.length === 1 ? 'is' : 'are'} still among the completed jobs this screen can read`
+                                + (move.shared.length ? ', and the ones marked shared sit inside another move’s window too.' : '.')}
+                            </div>
+                          )}
+                          {!counted && (
+                            <div className="st-hint" style={{ marginBottom: 'var(--space-3)' }}>
+                              {'Completed jobs whose instant falls in this window and no other move’s. '
+                                + 'This is a floor, not the server’s count.'}
+                            </div>
+                          )}
+                          {listed.map((job) => (
                             <div className="st-diffrow" key={job.id}>
                               <span className="st-diffrow__key">{f.dateTime(job.run_at)}</span>
                               <span>
                                 <span className="st-diffrow__now">{job.type}</span>
+                                {move.shared.includes(job) ? <span className="st-sub"> · shared window</span> : null}
                                 {job.status === 'failed' && job.last_error
                                   ? <span style={{ color: 'var(--text-danger)' }}> · {job.last_error}</span>
                                   : null}

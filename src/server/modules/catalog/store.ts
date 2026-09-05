@@ -332,8 +332,11 @@ function normalizeCurrencyOptions(
 function inferModel(input: PriceInput): PriceModel {
   if (input.model) return input.model;
   if (input.custom_unit_amount?.enabled) return 'custom';
-  if (input.tiers?.length) return 'tiered';
+  // Metered is what the price *is*; tiers are how its quantity is priced. A
+  // metered price with a ladder is still usage, billed in arrears from the
+  // meter, and `billing_scheme: "tiered"` carries the ladder beside it.
   if (input.recurring?.usage_type === 'metered') return 'usage';
+  if (input.tiers?.length) return 'tiered';
   if (input.transform_quantity && input.transform_quantity.divide_by > 1) return 'package';
   return 'per_unit';
 }

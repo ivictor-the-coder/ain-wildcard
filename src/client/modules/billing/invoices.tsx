@@ -10,7 +10,7 @@
  * operator commits rather than after.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, useQuery, type ApiClientError, type ListEnvelope } from '../../kernel/api';
+import { api, invalidate, useQuery, type ApiClientError, type ListEnvelope } from '../../kernel/api';
 import { useNavigate, useParams, useSearchParam } from '../../kernel/router';
 import { usePlatform } from '../../kernel/platform';
 import { useCurrentCrumb } from '../../kernel/shell';
@@ -19,12 +19,12 @@ import {
   GridItem, Icons, Inline, Input, Modal, Page, Select, Stack, Tabs, Textarea, Tooltip, humanize, useToast,
   type DataTableColumn, type MenuSection, type TableState,
 } from '../../design';
-import { AlertTriangleIcon, CheckCircleIcon, ChevronDownIcon, ChevronUpIcon, CreditCardIcon, XCircleIcon } from '../../design';
+import { AlertTriangleIcon, ArrowUpRightIcon, CheckCircleIcon, ChevronDownIcon, ChevronUpIcon, CreditCardIcon, XCircleIcon } from '../../design';
 import { ActionMenu, CreditDialog, CustomerPicker, Headline } from './subscriptions';
 import { PaymentMethodDialog } from './payments';
 import {
   BookFooter, DialogFields, EmptyList, ExportCsvButton, FieldRow, ListFailure, ListFooter, LoadFailedEmpty, Loading, MoneyField,
-  MoneyRangeFilter,
+  MoneyRangeFilter, copyFormat, keepRowMenuKeys,
   MoneyTotals, RecordLink, RecordMissing, SectionError, StatusPill, TableSearch, breakdownLabel, decodeRange,
   encodeRange,
   formatUnitRate, invoiceStatusDetail, lineWhy, matchesRange, prorationCopy, rangeActive,
@@ -33,14 +33,29 @@ import {
   csvAmount, csvDay, csvInstant, useBookTotal,
   useCursorList, useDebounced, useDialogForm, useOpenOnQuery, useRecord, useRecordTab, useTableView, visibleRows,
 } from './common';
+import { billedTotal, bulkSkipReason, coversNoPeriod, humaniseNote, invoiceActions, type BulkInvoiceKind } from './copy';
 import type { CsvColumn } from './common';
 import type {
   Charge, CreditNote, Customer, Invoice, InvoiceDunning, InvoiceLine, InvoicePayments, PaymentIntent, PaymentMethod,
-  PaymentSettings, PendingItem,
+  PaymentSettings, PendingItem, Refund,
 } from './types';
 
 /** Everything a payment moves, so one write refreshes every screen reading it. */
-const INVALIDATE_MONEY = ['/v1/invoices', '/v1/customers', '/v1/subscriptions', '/v1/revenue', '/v1/payment_intents', '/v1/charges'];
+const INVALIDATE_MONEY = ['/v1/invoices', '/v1/customers', '/v1/subscriptions', '/v1/revenue', '/v1/payment_intents', '/v1/charges', '/v1/refunds', '/v1/dunning'];
+
+/** The gateway's reasons for sending money back — the same list `POST /v1/refunds` validates. */
+const REFUND_REASONS = ['requested_by_customer', 'duplicate', 'fraudulent', 'service_not_delivered', 'goodwill'] as const;
+
+/** What a charge still has to give back — refunds and disputes both come off it. */
+const refundable = (charge: Charge): number => charge.amount - charge.amount_refunded - charge.amount_disputed;
+const canRefund = (charge: Charge): boolean => charge.status === 'succeeded' && refundable(charge) > 0;
+
+/** The words for where a bill's service period is printed, when it has one. */
+function coversText(invoice: Invoice): React.ReactNode {
+  return coversNoPeriod(invoice)
+    ? <span className="bl-muted">One-off — no service period</span>
+    : invoice.period_display;
+}
 
 /**
  * The invoice book as a month-end file.
@@ -58,7 +73,8 @@ const INVOICE_CSV: CsvColumn<Invoice>[] = [
   { header: 'Currency', value: (row) => row.currency.toUpperCase() },
   { header: 'Subtotal', value: (row) => csvAmount(row.subtotal, row.currency) },
   { header: 'Tax', value: (row) => csvAmount(row.tax, row.currency) },
-  { header: 'Total', value: (row) => csvAmount(row.total, row.currency) },
+  { header: 'Total', value: (row) => csvAmount(billedTotal(row), row.currency) },
+  { header: 'Balance applied', value: (row) => csvAmount(row.balance_applied, row.currency) },
   { header: 'Amount paid', value: (row) => csvAmount(row.amount_paid, row.currency) },
   { header: 'Amount due', value: (row) => csvAmount(row.amount_due, row.currency) },
   { header: 'Issued', value: (row) => csvDay(row.created) },
@@ -118,7 +134,9 @@ export function useInvoiceColumns(showCustomer = true): DataTableColumn<Invoice>
         header: 'Covers',
         width: 210,
         accessor: (row) => row.period.start,
-        cell: (row) => <span className="bl-nowrap">{row.period_display}</span>,
+        // A bill raised by hand covers no period; the engine stamps both ends
+        // on the day it was raised, which reads as a one-day subscription.
+        cell: (row) => <span className="bl-nowrap">{coversText(row)}</span>,
       },
       {
         id: 'currency',
@@ -138,9 +156,12 @@ export function useInvoiceColumns(showCustomer = true): DataTableColumn<Invoice>
         align: 'right',
         width: 120,
         sortable: true,
-        accessor: (row) => moneyRank(row.total, row.currency),
-        cell: (row) => row.total_display,
-        total: (rows) => <MoneyTotals totals={totalsByCurrency(rows, (r) => r.total, (r) => r.currency)} />,
+        // The bill as raised — lines plus tax. The API's `total` is what was
+        // left after the account balance was drawn, which made a $106.53
+        // invoice settled from credit read "$0.00" in this column.
+        accessor: (row) => moneyRank(billedTotal(row), row.currency),
+        cell: (row) => f.money(billedTotal(row), { currency: row.currency }),
+        total: (rows) => <MoneyTotals totals={totalsByCurrency(rows, billedTotal, (r) => r.currency)} />,
       },
       {
         id: 'amount_due',
@@ -202,7 +223,10 @@ export function InvoicesPage() {
   const [view, setView] = useTableView({ columnId: 'created', direction: 'desc' });
   const [selected, setSelected] = useState<string[]>([]);
   const [billing, setBilling] = useState(false);
-  const [voiding, setVoiding] = useState<string[] | null>(null);
+  // Every bulk write on this grid — void, mark paid, finalise — is confirmed
+  // with each invoice named beside its own figures before it runs.
+  const [bulk, setBulk] = useState<{ kind: BulkInvoiceKind; ids: string[] } | null>(null);
+  const action = useAction();
   useOpenOnQuery('new', useCallback(() => setBilling(true), []));
 
   const [rangeParam, setRangeParam] = useSearchParam('amount', '');
@@ -226,7 +250,7 @@ export function InvoicesPage() {
 
   const rows = useMemo(() => (rangeActive(range)
     ? book.rows.filter((row) => matchesRange(
-      range.field === 'amount_due' ? row.amount_due : row.total, row.currency, range,
+      range.field === 'amount_due' ? row.amount_due : billedTotal(row), row.currency, range,
     ))
     : book.rows), [book.rows, range]);
   // The grid's own search and column filters, replayed so the footer can quote
@@ -239,25 +263,60 @@ export function InvoicesPage() {
   const visible = useMemo(() => visibleRows(rows, columns, view), [rows, columns, view]);
   const shown = visible.length;
 
-  // Acts on the rows the bulk bar actually hands over, which is the selection
-  // minus anything the current filter hides unless the operator opted those in.
-  const bulk = async (ids: string[], label: string, action: string, body?: unknown) => {
-    let ok = 0;
-    for (const id of ids) {
-      try { await api.post(`/v1/invoices/${id}/${action}`, body ?? {}); ok++; } catch { /* reported below */ }
-    }
-    book.retry();
-    setSelected([]);
-    if (ok === ids.length) toast.success(`${label} ${ok} ${ok === 1 ? 'invoice' : 'invoices'}`);
-    else toast.warning(`${label} ${ok} of ${ids.length}`, 'The rest were refused — a paid bill cannot be voided, and a draft cannot be paid.', { duration: 0 });
-  };
-
-  // What a bulk void would destroy, stated per currency because there is no
-  // exchange-rate table here and one number across three books is not a number.
-  const voidTargets = useMemo(
-    () => rows.filter((row) => voiding?.includes(row.id)),
-    [rows, voiding],
+  // The rows a bulk dialog is about — resolved from the book so it can print
+  // each invoice's own figures rather than the ids it was handed.
+  const bulkTargets = useMemo(
+    () => rows.filter((row) => bulk?.ids.includes(row.id)),
+    [rows, bulk],
   );
+
+  /**
+   * The same row menu the Customers and Subscriptions grids carry, built from
+   * what the invoice's state allows rather than listing every action greyed.
+   * Finalise runs here because it is safe and reversible by nothing worse than
+   * a void; the money and the destruction go through the record's own dialogs.
+   */
+  const rowMenu = (row: Invoice): MenuSection[] => {
+    const allowed = invoiceActions(row);
+    return [{
+      id: 'invoice',
+      items: [
+        { id: 'open', label: 'Open', icon: <ArrowUpRightIcon size={14} />, onSelect: () => navigate(invoiceHref(row.id)) },
+        { id: 'customer', label: 'Open the account', icon: <Icons.wallet size={14} />, onSelect: () => navigate(customerHref(row.customer)) },
+        ...(allowed.includes('finalize') ? [{
+          id: 'finalize',
+          label: 'Finalise this draft',
+          icon: <Icons.check size={14} />,
+          onSelect: () => {
+            void action.run(
+              api.post<Invoice>(`/v1/invoices/${row.id}/finalize`, {}),
+              { success: `${row.number} finalised`, description: 'It is now owed and carries a due date.', failure: 'It could not be finalised' },
+              ['/v1/invoices', '/v1/customers'],
+            ).then(() => book.retry());
+          },
+        }] : []),
+        ...(allowed.includes('pay') ? [{
+          id: 'pay',
+          label: 'Take a payment…',
+          icon: <CheckCircleIcon size={14} />,
+          onSelect: () => navigate(`${invoiceHref(row.id)}?pay=1`),
+        }] : []),
+        ...(allowed.includes('refund') ? [{
+          id: 'refund',
+          label: 'Refund a payment…',
+          icon: <Icons.refresh size={14} />,
+          onSelect: () => navigate(`${invoiceHref(row.id)}?tab=collection&refund=1`),
+        }] : []),
+        ...(allowed.includes('void') ? [{
+          id: 'void',
+          label: 'Void…',
+          icon: <XCircleIcon size={14} />,
+          danger: true,
+          onSelect: () => setBulk({ kind: 'void', ids: [row.id] }),
+        }] : []),
+      ],
+    }];
+  };
 
   return (
     <Page
@@ -271,7 +330,7 @@ export function InvoicesPage() {
       }
     >
       {book.error && <ListFailure error={book.error} path="GET /v1/invoices" onRetry={book.retry} />}
-      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'}>
+      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'} onKeyDownCapture={keepRowMenuKeys}>
       <DataTable
         rows={rows}
         columns={columns}
@@ -288,6 +347,7 @@ export function InvoicesPage() {
         selected={selected}
         onSelectionChange={setSelected}
         onRowClick={(row) => navigate(invoiceHref(row.id))}
+        rowActions={rowMenu}
         maxHeight={640}
         stickyFooter
         toolbar={
@@ -370,11 +430,11 @@ export function InvoicesPage() {
         }
         bulkActions={(ids) => (
           <Inline gap={3}>
-            <Button size="sm" variant="secondary" onClick={() => { void bulk(ids, 'Finalised', 'finalize'); }}>Finalise {ids.length}</Button>
-            <Button size="sm" variant="secondary" onClick={() => { void bulk(ids, 'Recorded payment on', 'pay', { note: 'Recorded in bulk from the invoice list.' }); }}>
+            <Button size="sm" variant="secondary" onClick={() => setBulk({ kind: 'finalize', ids })}>Finalise {ids.length}</Button>
+            <Button size="sm" variant="secondary" onClick={() => setBulk({ kind: 'pay', ids })}>
               Mark {ids.length} paid
             </Button>
-            <Button size="sm" variant="danger-ghost" onClick={() => setVoiding(ids)}>Void {ids.length}</Button>
+            <Button size="sm" variant="danger-ghost" onClick={() => setBulk({ kind: 'void', ids })}>Void {ids.length}</Button>
           </Inline>
         )}
         empty={book.error
@@ -394,23 +454,187 @@ export function InvoicesPage() {
         platform, so nothing here is converted and no figure is added across two books.
       </p>
       <BillNowDialog open={billing} onClose={() => setBilling(false)} />
-      <ConfirmDialog
-        open={voiding !== null}
-        onCancel={() => setVoiding(null)}
-        title={`Void ${voidTargets.length} ${voidTargets.length === 1 ? 'invoice' : 'invoices'}?`}
-        body={`${voidTargets.map((row) => row.number).join(', ')} — `
-          + `${f.list(totalsByCurrency(voidTargets, (r) => r.total, (r) => r.currency)
-            .map((total) => f.money(total.amount, { currency: total.currency })))}`
-          + ' — are withdrawn and stop being owed. Anything they swept up goes back to be billed later.'
-          + ' There is no route that un-voids an invoice.'}
-        confirmLabel={`Void ${voidTargets.length}`}
-        onConfirm={() => {
-          const ids = voiding ?? [];
-          setVoiding(null);
-          void bulk(ids, 'Voided', 'void');
-        }}
-      />
+      {bulk && (
+        <BulkInvoiceDialog
+          kind={bulk.kind}
+          invoices={bulkTargets}
+          open
+          onClose={() => setBulk(null)}
+          onDone={() => { setBulk(null); setSelected([]); book.retry(); }}
+        />
+      )}
     </Page>
+  );
+}
+
+/* ============================ bulk invoice writes ========================== */
+
+const BULK_COPY: Record<BulkInvoiceKind, {
+  title: (count: number, single: Invoice | null) => string;
+  intro: string;
+  confirm: (count: number) => string;
+  done: string;
+  tone: 'danger' | 'primary';
+}> = {
+  void: {
+    title: (count, single) => (single ? `Void ${single.number}?` : `Void ${count} invoices?`),
+    intro: 'Each is withdrawn and stops being owed. Anything it swept up goes back to be billed on a later invoice, and any recovery schedule chasing it stands down. There is no route that un-voids an invoice.',
+    confirm: (count) => `Void ${count}`,
+    done: 'Voided',
+    tone: 'danger',
+  },
+  pay: {
+    title: (count, single) => (single ? `Mark ${single.number} paid?` : `Mark ${count} invoices paid?`),
+    intro: 'Records that the money arrived outside this platform — a transfer, a cheque, an offset — and settles each bill in full. Nothing is presented to a card.',
+    confirm: (count) => `Mark ${count} paid`,
+    done: 'Recorded payment on',
+    tone: 'primary',
+  },
+  finalize: {
+    title: (count, single) => (single ? `Finalise ${single.number}?` : `Finalise ${count} invoices?`),
+    intro: 'Each draft becomes an open bill with a due date and starts being owed. A draft held by a paused subscription is released the same way.',
+    confirm: (count) => `Finalise ${count}`,
+    done: 'Finalised',
+    tone: 'primary',
+  },
+};
+
+/**
+ * A bulk write on invoices, confirmed with every invoice's own figures.
+ *
+ * The old confirmation joined the numbers with one comma and the amounts with
+ * another — "NR-000341, NR-000340 — £1,560.00 and $500.00" — which paired the
+ * first number with the second amount, and quoted the full total of a bill
+ * that was already part paid. This lists each invoice on its own row with what
+ * is owed and what has been collected against it, says which of the selection
+ * the action would refuse and why, and warns when voiding would orphan money
+ * already taken.
+ */
+function BulkInvoiceDialog({ kind, invoices, open, onClose, onDone }: {
+  kind: BulkInvoiceKind; invoices: Invoice[]; open: boolean; onClose: () => void; onDone: () => void;
+}) {
+  const f = useBillingFormat();
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState('');
+  const copy = BULK_COPY[kind];
+  const verdicts = useMemo(
+    () => invoices.map((invoice) => ({ invoice, skip: bulkSkipReason(kind, invoice) })),
+    [invoices, kind],
+  );
+  const targets = verdicts.filter((row) => row.skip === null).map((row) => row.invoice);
+  const collectedOnTargets = kind === 'void' ? targets.filter((row) => row.amount_paid > 0) : [];
+  const owed = totalsByCurrency(targets, (row) => row.amount_due, (row) => row.currency);
+  const single = invoices.length === 1 ? invoices[0] : null;
+
+  const submit = async () => {
+    setBusy(true);
+    let ok = 0;
+    const refused: string[] = [];
+    for (const invoice of targets) {
+      try {
+        await api.post(`/v1/invoices/${invoice.id}/${kind}`,
+          kind === 'pay' ? { note: note.trim() || 'Recorded in bulk from the invoice list.' } : {});
+        ok++;
+      } catch {
+        refused.push(invoice.number);
+      }
+    }
+    setBusy(false);
+    invalidate('/v1/invoices', '/v1/customers', '/v1/subscriptions', '/v1/revenue', '/v1/dunning');
+    if (refused.length === 0) toast.success(`${copy.done} ${f.plural(ok, 'invoice')}`);
+    else toast.warning(`${copy.done} ${ok} of ${targets.length}`, `Refused: ${f.list(refused)} — open each to see why.`, { duration: 0 });
+    onDone();
+  };
+
+  const form = useDialogForm(open, targets.length > 0 && !busy, () => { void submit(); });
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="lg"
+      title={copy.title(invoices.length, single)}
+      description={copy.intro}
+      icon={copy.tone === 'danger' ? <AlertTriangleIcon size={18} /> : undefined}
+      iconTone={copy.tone === 'danger' ? 'danger' : undefined}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
+          <Button variant={copy.tone} loading={busy} disabled={targets.length === 0} onClick={() => { void submit(); }}>
+            {copy.confirm(targets.length)}
+          </Button>
+        </>
+      }
+    >
+      <DialogFields form={form}>
+      <Stack gap={5}>
+        <div className="bl-tablewrap">
+          <table className="bl-lines">
+            <thead>
+              <tr>
+                <th>Invoice</th>
+                <th>Account</th>
+                <th className="bl-num">Owed</th>
+                <th className="bl-num">Collected</th>
+              </tr>
+            </thead>
+            <tbody>
+              {verdicts.map(({ invoice, skip }) => (
+                <tr key={invoice.id} className={skip ? 'bl-lines__row--skipped' : undefined}>
+                  <td>
+                    <div className="bl-cellstack">
+                      <span className="bl-cellstack__top">{invoice.number}</span>
+                      <span className="bl-cellstack__sub">{skip ?? statusLabel(invoice.status)}</span>
+                    </div>
+                  </td>
+                  <td>{invoice.customer_name ?? invoice.customer}</td>
+                  <td className="bl-num">{invoice.amount_due_display}</td>
+                  <td className="bl-num">
+                    {invoice.amount_paid > 0
+                      ? f.money(invoice.amount_paid, { currency: invoice.currency })
+                      : <span className="bl-muted">—</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {targets.length > 0 && kind !== 'finalize' && (
+          <div className="bl-totals">
+            <div className="bl-total bl-total--grand">
+              <span className="bl-total__label">{kind === 'void' ? 'Stops being owed' : 'Recorded as collected'}</span>
+              <span className="bl-total__value"><MoneyTotals totals={owed} /></span>
+            </div>
+          </div>
+        )}
+        {collectedOnTargets.length > 0 && (
+          <Banner tone="warning" compact title={`${f.plural(collectedOnTargets.length, 'invoice')} already ${collectedOnTargets.length === 1 ? 'has' : 'have'} money collected`}>
+            {`${f.list(collectedOnTargets.map((row) => `${row.number} (${f.money(row.amount_paid, { currency: row.currency })})`))} — voiding withdraws the bill but not the money, which stays on the account with no bill to belong to. If the intent is to give it back, refund or credit the invoice instead.`}
+          </Banner>
+        )}
+        {targets.length === 0 && (
+          <Banner tone="info" compact>
+            {kind === 'void'
+              ? 'Nothing selected can be voided — a settled bill is credited instead, and a voided one is already withdrawn.'
+              : kind === 'pay'
+                ? 'Nothing selected is owed, so there is nothing to record a payment against.'
+                : 'Nothing selected is a draft, so there is nothing to finalise.'}
+          </Banner>
+        )}
+        {kind === 'pay' && targets.length > 0 && (
+          <Field label="How it was collected" optional hint="Recorded on every invoice in the list.">
+            <Input
+              value={note}
+              maxLength={300}
+              placeholder="Bank transfer received 5 September"
+              onChange={(e) => setNote(e.target.value)}
+            />
+          </Field>
+        )}
+      </Stack>
+      </DialogFields>
+    </Modal>
   );
 }
 
@@ -445,7 +669,18 @@ function PendingWhy({ item }: { item: PendingItem }) {
   );
 }
 
-export function BillNowDialog({ open, onClose, customer }: { open: boolean; onClose: () => void; customer?: string }) {
+export function BillNowDialog({ open, onClose, customer, subscription }: {
+  open: boolean;
+  onClose: () => void;
+  customer?: string;
+  /**
+   * Opened from a subscription: the bill is raised against it, so it carries
+   * the subscription's period and collection method — presented to the card
+   * on a charge_automatically agreement — exactly as the menu item did before
+   * it was routed through this dialog.
+   */
+  subscription?: string;
+}) {
   const f = useBillingFormat();
   const navigate = useNavigate();
   const action = useAction();
@@ -472,7 +707,10 @@ export function BillNowDialog({ open, onClose, customer }: { open: boolean; onCl
 
   const submit = async () => {
     const invoice = await action.run(
-      api.post<Invoice>('/v1/invoices', { customer: customerId }, { idempotencyKey: idem() }),
+      api.post<Invoice>('/v1/invoices', {
+        customer: customerId,
+        ...(subscription && customerId === customer ? { subscription } : {}),
+      }, { idempotencyKey: idem() }),
       {
         success: 'Invoice raised',
         description: 'Every proration waiting, the usage already settled and the account balance are on it.',
@@ -544,7 +782,8 @@ export function BillNowDialog({ open, onClose, customer }: { open: boolean; onCl
           <Banner tone="info" title="Nothing is waiting on this account">
             <div>
               No proration and no settled usage is unbilled here, so raising an invoice now would be refused.
-              The recurring fee is billed when the next period opens.
+              The recurring fee is billed when the next period opens. An invoice here only ever carries what a
+              subscription has priced — there is no route that puts a hand-written line on one.
             </div>
             {/* Where a hand-written charge went. Without this the dialog says
                 "nothing is waiting" straight after one was carried, and the
@@ -559,10 +798,12 @@ export function BillNowDialog({ open, onClose, customer }: { open: boolean; onCl
             {/* A refusal that names no next move is a dead end. This platform
                 bills a hand-written amount by carrying it on the account
                 balance, which the next invoice draws down — so that is offered
-                here, in the same dialog, rather than left to be found. */}
+                here, in the same dialog, rather than left to be found. It is
+                named for what it does: the button used to say "Charge", and a
+                balance debit raises no document and collects nothing today. */}
             <Inline gap={3} style={{ marginTop: 'var(--space-4)' }}>
               <Button size="sm" variant="secondary" iconLeft={<Icons.percent size={13} />} onClick={() => setOneOff(true)}>
-                Charge a one-off amount instead…
+                Adjust the balance instead…
               </Button>
             </Inline>
           </Banner>
@@ -605,7 +846,7 @@ export function BillNowDialog({ open, onClose, customer }: { open: boolean; onCl
             </div>
             <Inline gap={3}>
               <Button size="sm" variant="ghost" iconLeft={<Icons.percent size={13} />} onClick={() => setOneOff(true)}>
-                Add a one-off amount first…
+                Adjust the balance first…
               </Button>
             </Inline>
           </Stack>
@@ -619,12 +860,162 @@ export function BillNowDialog({ open, onClose, customer }: { open: boolean; onCl
           open={oneOff}
           onClose={() => { setOneOff(false); pending.refetch(); account.refetch(); }}
           initialDirection="debit"
-          title="Charge a one-off amount"
-          description={'This platform bills a hand-written amount by carrying it on the account balance: the next invoice '
-            + 'raised for this account draws it down, and the reason you type shows on the balance ledger. It does not '
-            + 'raise a document of its own.'}
+          description={'A debit here is carried on the account balance, not charged: the next invoice raised for this '
+            + 'account draws it down as a line of its own, and the reason you type shows on the balance ledger. Nothing '
+            + 'is presented to a card and no document is raised today.'}
         />
       )}
+    </Modal>
+  );
+}
+
+/* ============================== bulk billing ============================== */
+
+/** What one account would be billed if the bulk action ran, or why it would not. */
+interface AccountPreview {
+  customer: Customer;
+  items: PendingItem[] | null;
+  error: ApiClientError | null;
+}
+
+/**
+ * Billing several accounts at once, priced per account before anything runs.
+ *
+ * "Bill 3 accounts" used to post three invoices on the click and report
+ * "Raised 0 of 3" afterwards — the refusal arriving after the attempt, for a
+ * write whose outcome was knowable beforehand. This reads what each account
+ * has waiting, names the lines and the subtotal it would be billed, says which
+ * accounts have nothing and will be left alone, and only then offers to raise
+ * the invoices that would actually be raised.
+ */
+export function BulkBillDialog({ customers, open, onClose, onDone }: {
+  customers: Customer[]; open: boolean; onClose: () => void; onDone: (raised: Invoice[]) => void;
+}) {
+  const f = useBillingFormat();
+  const toast = useToast();
+  const navigate = useNavigate();
+  const [busy, setBusy] = useState(false);
+  const [previews, setPreviews] = useState<Record<string, AccountPreview>>({});
+  const ids = useMemo(() => customers.map((row) => row.id), [customers]);
+  const idsKey = ids.join(',');
+
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    setPreviews(Object.fromEntries(customers.map((row) => [row.id, { customer: row, items: null, error: null }])));
+    for (const customer of customers) {
+      api.get<ListEnvelope<PendingItem>>(`/v1/customers/${customer.id}/pending_items`)
+        .then((page) => { if (live) setPreviews((rows) => ({ ...rows, [customer.id]: { customer, items: page.data, error: null } })); })
+        .catch((e: ApiClientError) => { if (live) setPreviews((rows) => ({ ...rows, [customer.id]: { customer, items: null, error: e } })); });
+    }
+    return () => { live = false; };
+  }, [open, idsKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const rows = ids.map((id) => previews[id]).filter((row): row is AccountPreview => !!row);
+  const reading = rows.some((row) => row.items === null && row.error === null);
+  const billable = rows.filter((row) => (row.items?.length ?? 0) > 0);
+  const totals = totalsByCurrency(
+    billable.flatMap((row) => row.items ?? []),
+    (item) => item.amount,
+    (item) => item.currency,
+  );
+
+  const submit = async () => {
+    setBusy(true);
+    const raised: Invoice[] = [];
+    const refused: string[] = [];
+    for (const row of billable) {
+      try {
+        raised.push(await api.post<Invoice>('/v1/invoices', { customer: row.customer.id }, { idempotencyKey: idem() }));
+      } catch {
+        refused.push(row.customer.name);
+      }
+    }
+    setBusy(false);
+    invalidate('/v1/invoices', '/v1/customers', '/v1/subscriptions');
+    if (refused.length === 0) {
+      toast.success(
+        `Raised ${f.plural(raised.length, 'invoice')}`,
+        raised.length === 1 ? `${raised[0].number} is open and carries its due date.` : 'Each is open and carries its due date.',
+      );
+    } else {
+      toast.warning(`Raised ${raised.length} of ${billable.length}`, `Refused for ${f.list(refused)} — open the account to see why.`, { duration: 0 });
+    }
+    onDone(raised);
+    if (raised.length === 1) navigate(invoiceHref(raised[0].id));
+  };
+
+  const form = useDialogForm(open, billable.length > 0 && !reading && !busy, () => { void submit(); });
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="lg"
+      title={`Bill ${f.plural(customers.length, 'account')}`}
+      description="The recurring fee is not billed again — that happened when each period opened. This sweeps up what is waiting on each account, and skips the ones with nothing."
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
+          <Button variant="primary" loading={busy} disabled={reading || billable.length === 0} onClick={() => { void submit(); }}>
+            {reading
+              ? 'Reading what is waiting…'
+              : billable.length === 0
+                ? 'Nothing to raise'
+                : `Raise ${f.plural(billable.length, 'invoice')} · ${f.list(totals.map((total) => f.money(total.amount, { currency: total.currency })))}`}
+          </Button>
+        </>
+      }
+    >
+      <DialogFields form={form}>
+      <Stack gap={5}>
+        <div className="bl-tablewrap">
+          <table className="bl-lines">
+            <thead>
+              <tr><th>Account</th><th>What would be billed</th><th className="bl-num">Before tax</th></tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => {
+                const items = row.items ?? [];
+                const subtotal = items.reduce((sum, item) => sum + item.amount, 0);
+                return (
+                  <tr key={row.customer.id} className={row.items !== null && items.length === 0 ? 'bl-lines__row--skipped' : undefined}>
+                    <td>{row.customer.name}</td>
+                    {row.error && (
+                      <td colSpan={2} className="bl-sub">{`Could not be read — ${row.error.body.message}`}</td>
+                    )}
+                    {!row.error && row.items === null && <td colSpan={2} className="bl-sub">Reading what is waiting…</td>}
+                    {!row.error && row.items !== null && items.length === 0 && (
+                      <td colSpan={2} className="bl-sub">Nothing waiting — no invoice will be raised for this account</td>
+                    )}
+                    {!row.error && items.length > 0 && (
+                      <>
+                        <td>
+                          <div>{f.plural(items.length, 'line')}</div>
+                          <div className="bl-lines__why">{f.list(items.slice(0, 3).map((item) => item.description))}{items.length > 3 ? ` and ${items.length - 3} more` : ''}</div>
+                        </td>
+                        <td className="bl-num">{f.money(subtotal, { currency: row.customer.currency })}</td>
+                      </>
+                    )}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {!reading && billable.length === 0 && (
+          <Banner tone="info" compact>
+            None of these accounts has a proration or settled usage waiting, so no invoice can be raised for them now.
+            Their recurring fees are billed when their next periods open.
+          </Banner>
+        )}
+        {billable.length > 0 && (
+          <div className="bl-sub">
+            Tax and each account balance are applied when the bills are raised, so the totals on the invoices may differ from these subtotals.
+          </div>
+        )}
+      </Stack>
+      </DialogFields>
     </Modal>
   );
 }
@@ -641,9 +1032,14 @@ export function InvoiceDetailPage() {
   const platform = usePlatform(true);
   const [rawTab, setTab] = useRecordTab(INVOICE_TABS, 'lines');
   const toast = useToast();
-  const [dialog, setDialog] = useState<null | 'pay' | 'credit'>(null);
+  const [dialog, setDialog] = useState<null | 'pay' | 'credit' | 'refund'>(null);
+  const [refundCharge, setRefundCharge] = useState<Charge | null>(null);
   const [destroy, setDestroy] = useState<null | 'void' | 'uncollectible'>(null);
   const [docOpen, setDocOpen] = useState(false);
+  // Reached from a list row: `?pay=1` opens the payment dialog, `?refund=1`
+  // the refund dialog, once the record is on screen.
+  useOpenOnQuery('pay', useCallback(() => setDialog('pay'), []));
+  useOpenOnQuery('refund', useCallback(() => { setRefundCharge(null); setDialog('refund'); }, []));
 
   const { data: invoice, error, loading, refetch } = useRecord<Invoice>(`/v1/invoices/${id}`);
   const notes = useQuery<ListEnvelope<CreditNote>>('/v1/credit_notes', { invoice: id, status: 'all', limit: 50 });
@@ -675,7 +1071,9 @@ export function InvoiceDetailPage() {
   // is a closed door rather than a dead control.
   const payBlocked = invoice.status === 'void'
     ? `${invoice.number} was withdrawn, so there is nothing left to collect on it.`
-    : invoice.amount_due <= 0
+    : invoice.status === 'draft'
+      ? `Finalise it first — a draft is not owed yet, so nothing can be collected against it.`
+      : invoice.amount_due <= 0
       ? invoice.paid_at
         ? `Nothing left to collect — ${invoice.number} was settled ${f.day(invoice.paid_at, { withYear: true })}.`
         : `Nothing is owed on ${invoice.number}, so there is nothing to record against it.`
@@ -692,24 +1090,55 @@ export function InvoiceDetailPage() {
    * safe actions lead; voiding and writing off name the invoice, the amount and
    * the account before they run, the way the credit-note void already does.
    */
+  // Only what this bill's state allows. The menu used to list every action on
+  // every invoice and grey the rest — "Finalise this draft" on a paid bill,
+  // "Void" on a voided one — with nothing to say why; Stripe hides them.
+  const allowed = invoiceActions(invoice);
+  const moneyItems: MenuSection['items'] = [
+    ...(allowed.includes('credit') ? [{ id: 'credit', label: 'Issue a credit note…', icon: <Icons.receipt size={14} />, onSelect: () => setDialog('credit') }] : []),
+    // Money that has been collected can be sent back. The route exists,
+    // the Collection tab renders refunds — the menu never offered one.
+    ...(hasPayments && allowed.includes('refund') ? [{
+      id: 'refund',
+      label: 'Refund a payment…',
+      icon: <Icons.refresh size={14} />,
+      onSelect: () => { setRefundCharge(null); setDialog('refund'); },
+    }] : []),
+    ...(canCollect ? [{
+      id: 'collect',
+      label: 'Present it for collection now',
+      icon: <CreditCardIcon size={14} />,
+      onSelect: () => act(`/v1/invoices/${invoice.id}/retry`, {
+        success: 'Presented for collection',
+        description: 'The attempt is recorded against the recovery campaign like any other.',
+        failure: 'The collection attempt failed',
+      }),
+    }] : []),
+  ];
+  const statusItems: MenuSection['items'] = [
+    ...(allowed.includes('finalize') ? [{
+      id: 'finalize',
+      label: 'Finalise this draft',
+      icon: <Icons.check size={14} />,
+      onSelect: () => act(`/v1/invoices/${invoice.id}/finalize`, { success: 'Invoice finalised', description: 'It is now owed and carries a due date.', failure: 'It could not be finalised' }),
+    }] : []),
+    ...(allowed.includes('void') ? [{
+      id: 'void',
+      label: 'Void this invoice…',
+      icon: <XCircleIcon size={14} />,
+      danger: true,
+      onSelect: () => setDestroy('void'),
+    }] : []),
+    ...(allowed.includes('uncollectible') ? [{
+      id: 'uncollectible',
+      label: 'Write it off…',
+      icon: <AlertTriangleIcon size={14} />,
+      danger: true,
+      onSelect: () => setDestroy('uncollectible'),
+    }] : []),
+  ];
   const sections: MenuSection[] = [
-    {
-      id: 'money',
-      label: 'Money',
-      items: [
-        { id: 'credit', label: 'Issue a credit note…', icon: <Icons.receipt size={14} />, disabled: invoice.status === 'draft' || invoice.status === 'void', onSelect: () => setDialog('credit') },
-        ...(canCollect ? [{
-          id: 'collect',
-          label: 'Present it for collection now',
-          icon: <CreditCardIcon size={14} />,
-          onSelect: () => act(`/v1/invoices/${invoice.id}/retry`, {
-            success: 'Presented for collection',
-            description: 'The attempt is recorded against the recovery campaign like any other.',
-            failure: 'The collection attempt failed',
-          }),
-        }] : []),
-      ],
-    },
+    ...(moneyItems.length ? [{ id: 'money', label: 'Money', items: moneyItems }] : []),
     {
       id: 'doc',
       label: 'Document',
@@ -728,35 +1157,7 @@ export function InvoiceDetailPage() {
         { id: 'tab', label: 'Open it in a new tab', icon: <Icons.external size={14} />, onSelect: () => window.open(`/api${invoice.document_url}`, '_blank', 'noopener') },
       ],
     },
-    {
-      id: 'status',
-      label: 'Change the status',
-      items: [
-        {
-          id: 'finalize',
-          label: 'Finalise this draft',
-          icon: <Icons.check size={14} />,
-          disabled: invoice.status !== 'draft',
-          onSelect: () => act(`/v1/invoices/${invoice.id}/finalize`, { success: 'Invoice finalised', description: 'It is now owed and carries a due date.', failure: 'It could not be finalised' }),
-        },
-        {
-          id: 'void',
-          label: 'Void this invoice…',
-          icon: <XCircleIcon size={14} />,
-          danger: true,
-          disabled: invoice.status === 'paid' || invoice.status === 'void',
-          onSelect: () => setDestroy('void'),
-        },
-        {
-          id: 'uncollectible',
-          label: 'Write it off…',
-          icon: <AlertTriangleIcon size={14} />,
-          danger: true,
-          disabled: invoice.status !== 'open',
-          onSelect: () => setDestroy('uncollectible'),
-        },
-      ],
-    },
+    ...(statusItems.length ? [{ id: 'status', label: 'Change the status', items: statusItems }] : []),
   ];
 
   return (
@@ -819,7 +1220,10 @@ export function InvoiceDetailPage() {
       <Stack gap={6}>
         <Card>
           <div className="bl-headline">
-            <Headline label="Total" value={invoice.total_display} caption={invoice.period_display} />
+            {/* What was billed — lines plus tax — not the API's `total`, which
+                has the account balance already taken off it and read "$0.00"
+                over a bill the balance settled. */}
+            <Headline label="Total" value={f.money(billedTotal(invoice), { currency: invoice.currency })} caption={coversText(invoice)} />
             <Headline
               label="Amount due"
               value={invoice.amount_due_display}
@@ -857,7 +1261,7 @@ export function InvoiceDetailPage() {
             version stands down rather than repeating itself above it. */}
         {invoice.payment_note && tab !== 'collection' && (
           <Banner tone="info" compact title="How it was collected">
-            {invoice.payment_note}
+            {humaniseNote(invoice.payment_note, copyFormat(f))}
             {/* The gateway writes its own note and names the charge in it. The
                 place that explains a charge is the Collection tab, so the note
                 points at it rather than leaving an id to be searched for. */}
@@ -873,11 +1277,18 @@ export function InvoiceDetailPage() {
         )}
 
         {tab === 'lines' && <LinesTab invoice={invoice} />}
-        {tab === 'collection' && hasPayments && <CollectionTab invoice={invoice} onRetry={() => act(`/v1/invoices/${invoice.id}/retry`, {
-          success: 'Presented for collection',
-          description: 'The attempt is recorded against the recovery campaign like any other.',
-          failure: 'The collection attempt failed',
-        })} busy={action.busy} />}
+        {tab === 'collection' && hasPayments && (
+          <CollectionTab
+            invoice={invoice}
+            onRetry={() => act(`/v1/invoices/${invoice.id}/retry`, {
+              success: 'Presented for collection',
+              description: 'The attempt is recorded against the recovery campaign like any other.',
+              failure: 'The collection attempt failed',
+            })}
+            onRefund={(charge) => { setRefundCharge(charge); setDialog('refund'); }}
+            busy={action.busy}
+          />
+        )}
         {tab === 'credits' && (
           <CreditNotesTab
             invoice={invoice}
@@ -893,6 +1304,14 @@ export function InvoiceDetailPage() {
 
       <RecordPaymentDialog invoice={invoice} open={dialog === 'pay'} onClose={() => setDialog(null)} />
       <CreditNoteDialog invoice={invoice} open={dialog === 'credit'} onClose={() => setDialog(null)} />
+      {hasPayments && (
+        <RefundDialog
+          invoice={invoice}
+          charge={refundCharge}
+          open={dialog === 'refund'}
+          onClose={() => { setDialog(null); setRefundCharge(null); }}
+        />
+      )}
       <ConfirmDialog
         open={destroy !== null}
         onCancel={() => setDestroy(null)}
@@ -902,7 +1321,7 @@ export function InvoiceDetailPage() {
           ? `${invoice.amount_due_display} owed by ${invoice.customer_name ?? invoice.customer} stops being chased and is `
             + 'recognised as a loss. The bill stays on the books and stays owed — it is simply not going to be collected. '
             + 'There is no route that un-writes it off.'
-          : `${invoice.total_display} billed to ${invoice.customer_name ?? invoice.customer} is withdrawn. `
+          : `${f.money(billedTotal(invoice), { currency: invoice.currency })} billed to ${invoice.customer_name ?? invoice.customer} is withdrawn. `
             + `${invoice.amount_due > 0 ? `${invoice.amount_due_display} stops being owed, ` : ''}`
             + 'anything it swept up goes back to be billed on a later invoice, and any recovery schedule chasing it stands down. '
             + 'There is no route that un-voids an invoice.'}
@@ -945,10 +1364,20 @@ export function InvoiceDetailPage() {
  * what has since been refunded or disputed and when the recovery campaign will
  * try again. Chasing a failing account from anywhere else means guessing.
  */
-function CollectionTab({ invoice, onRetry, busy }: { invoice: Invoice; onRetry: () => void; busy: boolean }) {
+function CollectionTab({ invoice, onRetry, onRefund, busy }: {
+  invoice: Invoice; onRetry: () => void; onRefund: (charge: Charge) => void; busy: boolean;
+}) {
   const f = useBillingFormat();
   const navigate = useNavigate();
   const { data, error, loading, refetch } = useQuery<InvoicePayments>(`/v1/invoices/${invoice.id}/payments`);
+  // A charge names its method by id. The account's methods are read once so
+  // every row can say "Visa ending 4242" instead of `pm_card_meridianfo`.
+  const methods = useQuery<ListEnvelope<PaymentMethod>>(`/v1/customers/${invoice.customer}/payment_methods`);
+  const methodName = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const method of methods.data?.data ?? []) map.set(method.id, method.display_name);
+    return (id: string | null): string | null => (id ? map.get(id) ?? (methods.data ? 'a method since removed from the account' : null) : null);
+  }, [methods.data]);
   const money = (amount: number) => f.money(amount, { currency: invoice.currency });
 
   if (error) return <Card><SectionError error={error} path={`GET /v1/invoices/${invoice.id}/payments`} onRetry={refetch} /></Card>;
@@ -995,7 +1424,9 @@ function CollectionTab({ invoice, onRetry, busy }: { invoice: Invoice; onRetry: 
                 : undefined}
             />
           )}
-          {data.charges.map((charge) => <ChargeRow key={charge.id} charge={charge} />)}
+          {data.charges.map((charge) => (
+            <ChargeRow key={charge.id} charge={charge} method={methodName(charge.payment_method)} onRefund={canRefund(charge) ? () => onRefund(charge) : undefined} />
+          ))}
         </Card>
 
         {data.payment_intents.length > 0 && (
@@ -1030,11 +1461,15 @@ function CollectionTab({ invoice, onRetry, busy }: { invoice: Invoice; onRetry: 
         )}
 
         {data.refunds.length > 0 && (
-          <Card title="Refunds" description="Money sent back against this bill.">
+          <Card title="Refunds" description="Money sent back against this bill. A refund moves cash; it does not rewrite what was billed — that is a credit note.">
             {data.refunds.map((refund) => (
               <div key={refund.id} className="bl-row">
                 <div className="bl-row__main">
-                  <div className="bl-row__title">{refund.description ?? humanize(refund.reason ?? 'refund')}</div>
+                  <div className="bl-row__title">
+                    {humanize(refund.reason ?? 'refund')}
+                    {refund.description ? ` · ${refund.description}` : ''}
+                  </div>
+                  {refund.invoice_effect && <div className="bl-row__sub">{refund.invoice_effect}</div>}
                   <div className="bl-row__sub">{f.dateTime(refund.created)}</div>
                 </div>
                 <div className="bl-row__aside">
@@ -1465,9 +1900,10 @@ function RetryScheduleDialog({ open, onClose }: { open: boolean; onClose: () => 
   );
 }
 
-function ChargeRow({ charge }: { charge: Charge }) {
+function ChargeRow({ charge, method, onRefund }: { charge: Charge; method: string | null; onRefund?: () => void }) {
   const f = useBillingFormat();
   const ok = charge.status === 'succeeded';
+  const money = (amount: number) => f.money(amount, { currency: charge.currency });
   return (
     <div className="bl-row">
       <span className="bl-row__icon">{ok ? <CheckCircleIcon size={16} /> : <XCircleIcon size={16} />}</span>
@@ -1480,14 +1916,187 @@ function ChargeRow({ charge }: { charge: Charge }) {
         <div className="bl-row__sub">
           {f.dateTime(charge.created)}
           {charge.outcome?.risk_level ? ` · risk ${charge.outcome.risk_level}${charge.outcome.risk_score !== null ? ` (${charge.outcome.risk_score})` : ''}` : ''}
-          {charge.payment_method ? ` · ${charge.payment_method}` : ''}
+          {method ? ` · ${method}` : ''}
         </div>
+        {(charge.amount_refunded > 0 || charge.amount_disputed > 0) && (
+          <div className="bl-row__sub">
+            {charge.amount_refunded > 0 ? `${money(charge.amount_refunded)} refunded` : ''}
+            {charge.amount_refunded > 0 && charge.amount_disputed > 0 ? ' · ' : ''}
+            {charge.amount_disputed > 0 ? `${money(charge.amount_disputed)} held by a dispute` : ''}
+          </div>
+        )}
       </div>
       <div className="bl-row__aside">
-        <div>{f.money(charge.amount, { currency: charge.currency })}</div>
+        <div>{money(charge.amount)}</div>
         <div className="bl-sub"><StatusPill status={ok ? 'paid' : 'unpaid'} /></div>
       </div>
+      {onRefund && (
+        <div className="bl-row__act">
+          <Button size="sm" variant="ghost" iconLeft={<Icons.refresh size={14} />} aria-label={`Refund the ${money(charge.amount)} charge`} onClick={onRefund}>
+            Refund…
+          </Button>
+        </div>
+      )}
     </div>
+  );
+}
+
+/* ================================= refunds ================================ */
+
+/**
+ * Send collected money back.
+ *
+ * The gateway does two things with a refund and the dialog says both before
+ * they happen: the cash goes back to the customer, and the bill it settled is
+ * owed again for that amount — nothing charges the reopened balance on its own,
+ * so the invoice goes into the recovery queue held for a person. What it does
+ * *not* do is reduce the bill; that is a credit note, and the dialog points
+ * there for anyone who reached for the wrong tool.
+ */
+function RefundDialog({ invoice, charge, open, onClose }: {
+  invoice: Invoice; charge: Charge | null; open: boolean; onClose: () => void;
+}) {
+  const f = useBillingFormat();
+  const action = useAction();
+  const toast = useToast();
+  const payments = useQuery<InvoicePayments>(`/v1/invoices/${invoice.id}/payments`, undefined, { enabled: open });
+  const methods = useQuery<ListEnvelope<PaymentMethod>>(`/v1/customers/${invoice.customer}/payment_methods`, undefined, { enabled: open });
+  const candidates = useMemo(() => (payments.data?.charges ?? []).filter(canRefund), [payments.data]);
+  const [chargeId, setChargeId] = useState<string>(charge?.id ?? '');
+  const [amount, setAmount] = useState<number | null>(null);
+  const [reason, setReason] = useState<string>('requested_by_customer');
+  const [description, setDescription] = useState('');
+
+  useEffect(() => {
+    if (!open) return;
+    setChargeId(charge?.id ?? '');
+    setAmount(null);
+    setReason('requested_by_customer');
+    setDescription('');
+    action.clear();
+  }, [open, charge?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The first refundable charge is chosen once the list arrives, and the
+  // amount defaults to everything it still has to give back.
+  const chosen = candidates.find((row) => row.id === chargeId) ?? candidates[0] ?? null;
+  useEffect(() => {
+    if (!open || !chosen) return;
+    if (chosen.id !== chargeId) setChargeId(chosen.id);
+    if (amount === null) setAmount(refundable(chosen));
+  }, [open, chosen, chargeId, amount]);
+
+  const money = (value: number) => f.money(value, { currency: invoice.currency });
+  const remaining = chosen ? refundable(chosen) : 0;
+  const value = amount ?? 0;
+  const invalid = !chosen
+    ? null
+    : value <= 0
+      ? 'Enter the amount to send back.'
+      : value > remaining
+        ? `${money(value)} is more than the ${money(remaining)} this charge still has to give back.`
+        : null;
+  const methodName = (id: string | null) => (methods.data?.data ?? []).find((row) => row.id === id)?.display_name ?? 'the method it was taken from';
+
+  const submit = async () => {
+    if (!chosen || invalid) return;
+    const refund = await action.run(
+      api.post<Refund>('/v1/refunds', {
+        charge: chosen.id,
+        amount: value,
+        reason,
+        ...(description.trim() ? { description: description.trim() } : {}),
+      }, { idempotencyKey: idem() }),
+      { success: `${money(value)} refunded`, silent: true, failure: 'The refund was refused' },
+      INVALIDATE_MONEY,
+    );
+    if (!refund) return;
+    // The gateway writes what the refund did to the bill; that sentence, not
+    // a canned one, is the toast.
+    toast.success(`${money(refund.amount)} refunded to ${invoice.customer_name ?? invoice.customer}`, refund.invoice_effect ?? undefined, { duration: 0 });
+    onClose();
+  };
+
+  const form = useDialogForm(open, !!chosen && !invalid && !action.busy, () => { void submit(); });
+  const owedAfter = invoice.amount_due + value;
+  const collectedAfter = Math.max(0, invoice.amount_paid - value);
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="md"
+      title={`Refund a payment on ${invoice.number}`}
+      description={`${money(invoice.amount_paid)} has been collected against this bill. A refund sends cash back; it does not change what was billed.`}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>Cancel</Button>
+          <Button variant="primary" loading={action.busy} disabled={!chosen || !!invalid} onClick={() => { void submit(); }}>
+            {chosen && !invalid ? `Refund ${money(value)}` : 'Refund'}
+          </Button>
+        </>
+      }
+    >
+      <DialogFields form={form}>
+        <Stack gap={5}>
+          {payments.error && <SectionError error={payments.error} path={`GET /v1/invoices/${invoice.id}/payments`} onRetry={payments.refetch} />}
+          {!payments.error && payments.loading && <Loading label="Reading what was collected…" />}
+          {payments.data && candidates.length === 0 && (
+            <EmptyState
+              size="sm"
+              inline
+              illustration={null}
+              title="Nothing here can be refunded"
+              body={invoice.amount_paid > 0
+                ? `${money(invoice.amount_paid)} was settled without a charge to reverse — by hand, or from the account balance. Give it back as a credit note or a balance adjustment instead.`
+                : `Nothing has been collected against ${invoice.number}, so there is nothing to send back.`}
+            />
+          )}
+          {chosen && (
+            <>
+              {candidates.length > 1 && (
+                <Field label="Which charge" required>
+                  <Select
+                    value={chosen.id}
+                    onChange={(next) => { setChargeId(next); setAmount(null); }}
+                    options={candidates.map((row) => ({
+                      value: row.id,
+                      label: `${money(row.amount)} on ${f.date(row.created, { withYear: true })} · ${methodName(row.payment_method)}${refundable(row) < row.amount ? ` · ${money(refundable(row))} left` : ''}`,
+                    }))}
+                  />
+                </Field>
+              )}
+              {candidates.length === 1 && (
+                <FieldRow label="Charge">
+                  {`${money(chosen.amount)} taken ${f.dateTime(chosen.created)} from ${methodName(chosen.payment_method)}`}
+                  {refundable(chosen) < chosen.amount ? ` — ${money(refundable(chosen))} left to give back` : ''}
+                </FieldRow>
+              )}
+              <Field
+                label="Amount to refund"
+                required
+                error={action.errorFor('amount') ?? invalid ?? undefined}
+                hint={`Up to ${money(remaining)}. A part refund leaves the rest collected.`}
+              >
+                <MoneyField value={amount} onChange={setAmount} currency={invoice.currency} min={0} max={remaining} label="Amount to refund" />
+              </Field>
+              <Field label="Reason" error={action.errorFor('reason')}>
+                <Select value={reason} onChange={setReason} options={REFUND_REASONS.map((row) => ({ value: row, label: humanize(row) }))} />
+              </Field>
+              <Field label="Note" optional counter={{ value: description.length, max: 500 }} error={action.errorFor('description')}>
+                <Input value={description} maxLength={500} placeholder="What the customer was told." onChange={(e) => setDescription(e.target.value)} />
+              </Field>
+              {!invalid && value > 0 && (
+                <Banner tone="warning" compact title="What this leaves">
+                  {`${money(value)} goes back to ${methodName(chosen.payment_method)}. ${invoice.number} then shows ${money(collectedAfter)} collected and `}
+                  {`${money(owedAfter)} owed again${invoice.status === 'paid' ? ' — it reopens' : ''}. Nothing charges that on its own: the bill goes to the `}
+                  {'recovery queue held for a person, who credits it or presents it by hand. To make the bill itself smaller, issue a credit note instead.'}
+                </Banner>
+              )}
+            </>
+          )}
+        </Stack>
+      </DialogFields>
+    </Modal>
   );
 }
 
@@ -1554,13 +2163,15 @@ function LinesTab({ invoice }: { invoice: Invoice }) {
           <div className="bl-totals">
             <div className="bl-total"><span className="bl-total__label">Subtotal</span><span className="bl-total__value">{invoice.subtotal_display}</span></div>
             <div className="bl-total"><span className="bl-total__label">Tax</span><span className="bl-total__value">{invoice.tax_display}</span></div>
+            {/* Total is the bill; the balance drawn against it is its own line
+                under it, the way the document and Stripe both lay it out. */}
+            <div className="bl-total bl-total--grand"><span className="bl-total__label">Total</span><span className="bl-total__value">{f.money(billedTotal(invoice), { currency: invoice.currency })}</span></div>
             {invoice.balance_applied !== 0 && (
               <div className="bl-total">
                 <span className="bl-total__label">Account balance applied</span>
                 <span className="bl-total__value">{invoice.balance_applied_display}</span>
               </div>
             )}
-            <div className="bl-total bl-total--grand"><span className="bl-total__label">Total</span><span className="bl-total__value">{invoice.total_display}</span></div>
             <div className="bl-total"><span className="bl-total__label">Paid</span><span className="bl-total__value">{f.money(invoice.amount_paid, { currency: invoice.currency })}</span></div>
             {invoice.pre_payment_credit_notes_amount > 0 && (
               <div className="bl-total">
@@ -1581,7 +2192,7 @@ function LinesTab({ invoice }: { invoice: Invoice }) {
         <Card title="Details">
           <FieldRow label="Billing reason">{humanize(invoice.billing_reason)}</FieldRow>
           <FieldRow label="Collection">{humanize(invoice.collection_method)}</FieldRow>
-          <FieldRow label="Service period">{invoice.period_display}</FieldRow>
+          <FieldRow label="Service period">{coversText(invoice)}</FieldRow>
           {invoice.arrears_period && (
             <FieldRow label="Usage settled" hint="The window whose metered usage this bill settles, in arrears.">
               {f.dayRange(invoice.arrears_period.start, invoice.arrears_period.end)}

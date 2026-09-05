@@ -14,7 +14,7 @@ import type { AiCallContext, AinAiRuntime, AiTraceSpan } from './runtime';
 import type { SchemaNode } from '../../shared/validate';
 import { vocabulary, type Bindings, type Vocabulary } from './slots';
 import {
-  catalogueFor, matchTemplates, nearestTemplates, type Nearest, type PlanStep, type StepOutcome, type Template, type TemplateIntent,
+  catalogueFor, explainUnbound, matchTemplates, nearestTemplates, type Nearest, type PlanStep, type StepOutcome, type Template, type TemplateIntent,
 } from './templates';
 import { NO_FACTS, renderRefusal, type Citation, type Facts } from './answer';
 import { fillSchema, normaliseResponseSchema } from './extract';
@@ -78,6 +78,8 @@ function labelOf(b: Bindings[string]): string {
     case 'text': return value.text;
     case 'quantity': return value.formatted;
     case 'verb': return value.label;
+    case 'movement': return value.label;
+    case 'ageing-bucket': return value.label;
     default: return b.text;
   }
 }
@@ -162,7 +164,13 @@ export function builtinEngine(): AiProvider {
             : 'No tool this engine plans against is registered in this workspace.');
       } else if (!outcome.match) {
         const rejected = outcome.rejected[0];
+        // A shape whose words all fitted and whose one slot did not bind is
+        // refused by naming that slot — the word it choked on and, for a slot
+        // with a closed set of values, the values — so the reader can fix the
+        // question rather than guess at what the engine could not read.
+        const unbound = rejected ? null : explainUnbound(question, outcome.tokens, vocab, catalogue);
         if (rejected) refuse('slot_unbound', rejected.reason);
+        else if (unbound) refuse('slot_unbound', unbound);
         else refuse('no_template', 'Nothing in the question shapes this workspace answers matches it.');
       } else {
         template = outcome.match.template;

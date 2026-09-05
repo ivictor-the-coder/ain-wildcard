@@ -9,7 +9,7 @@
  * and the two vocabularies this surface has to speak honestly about — what a
  * role actually grants, and what an API key's scopes actually reach.
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
 import { invalidate, type ApiClientError } from '../../kernel/api';
 import { Link, useLocation, useSearchParam } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
@@ -19,6 +19,8 @@ import {
   type Tone,
 } from '../../design';
 import type { Role } from './types';
+import { targetLabel, targetRoute } from './targets';
+import { actorLabel } from './audit-core';
 import './settings.css';
 
 /* ============================== the sub-nav =============================== */
@@ -141,16 +143,73 @@ export interface SettingsShellProps {
   children: ReactNode;
 }
 
+/**
+ * Enter on a row's "Row actions" button must open its menu — and nothing else.
+ *
+ * `DataTable` listens for keys on its `<tbody>` and, on Enter with a focused
+ * row, calls `preventDefault()` and fires `onRowClick`. It does not look at
+ * where the key landed, so Enter on the "…" button inside that row had its
+ * native click suppressed (no menu) while the row's own action ran: on the
+ * team screen the change-role dialog for the first teammate opened with no
+ * menu ever shown, and on Tax nothing happened at all. Only Space opened it.
+ * The fix belongs in `DataTable`'s handler — ignore keys whose target is a
+ * control inside the row — and is recorded for the design system. Until it
+ * lands, the frame stops that one keystroke from reaching the grid's handler,
+ * in the capture phase, before the button's own click is dispatched.
+ */
+export function shieldsRowMenuEnter(event: KeyboardEvent<HTMLElement>): boolean {
+  if (event.key !== 'Enter') return false;
+  const target = event.target as HTMLElement | null;
+  return !!target?.closest?.('.ain-table__actioncell');
+}
+
 /** The frame: one page header, the rail on the left, the screen on the right. */
 export function SettingsShell({ title, subtitle, actions, children }: SettingsShellProps) {
   return (
     <Page title={title} eyebrow="Settings" subtitle={subtitle} actions={actions} width="wide">
       <div className="st-frame">
         <SettingsRail />
-        <div className="st-body">{children}</div>
+        <div
+          className="st-body"
+          onKeyDownCapture={(event) => { if (shieldsRowMenuEnter(event)) event.stopPropagation(); }}
+        >
+          {children}
+        </div>
       </div>
     </Page>
   );
+}
+
+/**
+ * A dialog body that Enter submits.
+ *
+ * The contract says Enter submits; the dialogs here put their primary button in
+ * the Modal's footer, outside anything a browser would treat as a form, so
+ * Enter in the second field of the invitation did nothing and the operator had
+ * to Tab to the button. This wraps the fields in a real `<form>` and submits it
+ * from any single-line input — not from a textarea (Enter is a newline there),
+ * not from a tag input (Enter adds the tag), not from a native select or a
+ * button (each has its own Enter). The caller decides whether the form is
+ * valid; an invalid form does nothing on Enter, the way the disabled button
+ * does nothing on click.
+ */
+export function DialogForm({ onSubmit, children, className }: {
+  onSubmit: () => void;
+  children: ReactNode;
+  className?: string;
+}) {
+  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); onSubmit(); };
+  const onKeyDown = (event: KeyboardEvent<HTMLFormElement>) => {
+    if (event.key !== 'Enter' || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.nativeEvent.isComposing) return;
+    const target = event.target as HTMLElement | null;
+    if (!target || target.tagName !== 'INPUT') return;
+    const input = target as HTMLInputElement;
+    if (input.type === 'button' || input.type === 'submit' || input.type === 'reset') return;
+    if (input.closest('.ain-taginput') || input.getAttribute('role') === 'combobox') return;
+    event.preventDefault();
+    onSubmit();
+  };
+  return <form className={className} noValidate onSubmit={submit} onKeyDown={onKeyDown}>{children}</form>;
 }
 
 /* ================================= roles ================================== */
@@ -343,6 +402,24 @@ export function useOpenFromQuery(key: string, open: () => void): void {
   }, [flag, setFlag]);
 }
 
+/**
+ * The same one-shot instruction, carrying a value: `?member=usr_…` on the team
+ * screen, `?key=ak_…` on API keys, `?rate=txr_…` on tax. The audit trail and the
+ * event stream write these addresses for every id they show, so the screen
+ * that owns the object has to answer with *that* object on top — and then drop
+ * the parameter, so the address bar goes back to naming the screen.
+ */
+export function useConsumeQuery(key: string, consume: (value: string) => void): void {
+  const [value, setValue] = useSearchParam(key);
+  const latest = useRef(consume);
+  latest.current = consume;
+  useEffect(() => {
+    if (!value) return;
+    setValue(undefined);
+    latest.current(value);
+  }, [value, setValue]);
+}
+
 export const idem = (): string => (
   typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `idem_${Date.now()}_${Math.random()}`
 );
@@ -460,7 +537,9 @@ export function JsonBlock({ value, label, maxHeight = 340 }: { value: unknown; l
 /**
  * Actor ids are opaque (`usr_seed01`, `null` for the system). Every screen that
  * shows one resolves it against the teammates the session already carries, so
- * the audit trail and the event stream name people rather than row ids.
+ * the audit trail and the event stream name people rather than row ids — and
+ * an entry with no actor says so rather than crediting "the platform" with a
+ * change the record cannot attribute (see `actorLabel`).
  */
 export function useActorName(): (id: string | null, kind?: string) => string {
   const { me } = useSession();
@@ -469,10 +548,79 @@ export function useActorName(): (id: string | null, kind?: string) => string {
     for (const mate of me?.teammates ?? []) map.set(mate.id, mate.name);
     return map;
   }, [me?.teammates]);
-  return useCallback((id: string | null, kind?: string) => {
-    if (!id) return kind === 'system' ? 'The platform' : 'Unattributed';
-    return byId.get(id) ?? id;
-  }, [byId]);
+  return useCallback((id: string | null, kind?: string) => actorLabel(id, kind, (key) => byId.get(key)), [byId]);
+}
+
+/**
+ * The screen an object id opens, and what to call it there.
+ *
+ * Teammates and the workspace are named off the session. Anything else is
+ * named by the caller when it holds a list that knows (the audit screen reads
+ * the API keys it is allowed to), and shown by id otherwise — the id still
+ * opens the record, which is what matters.
+ */
+export function useTargetLink(names?: ReadonlyMap<string, string>): (type: string | null, id: string | null) => {
+  to: string | null;
+  label: string;
+  name: string | null;
+} {
+  const { me } = useSession();
+  const teammates = useMemo(() => new Map((me?.teammates ?? []).map((mate) => [mate.id, mate.name])), [me?.teammates]);
+  const orgId = me?.org.id ?? null;
+  const orgName = me?.org.name ?? null;
+  return useCallback((type, id) => ({
+    to: targetRoute(type, id),
+    label: targetLabel(type),
+    name: id === null
+      ? null
+      : (type === 'user' ? teammates.get(id) : null)
+        ?? ((type === 'org' || type === 'organization') && id === orgId ? orgName : null)
+        ?? names?.get(id)
+        ?? null,
+  }), [teammates, orgId, orgName, names]);
+}
+
+/**
+ * An object on the trail or the stream: its type, its name when one is known,
+ * and its id — as a link to the record whenever the platform has a screen for
+ * it. `compact` puts the id under the label for a table cell; the default
+ * reads inline for a drawer. `notes` says what else the caller knows about an
+ * id — "removed", for a teammate no roster will find — beside the label.
+ */
+export function TargetLink({ type, id, names, notes, compact }: {
+  type: string | null;
+  id: string | null;
+  names?: ReadonlyMap<string, string>;
+  notes?: ReadonlyMap<string, string>;
+  compact?: boolean;
+}) {
+  const resolve = useTargetLink(names);
+  if (!id) return <span className="st-sub">The workspace itself</span>;
+  const target = resolve(type, id);
+  const note = notes?.get(id) ?? null;
+  const label = note ? `${target.label} · ${note}` : target.label;
+  const headline = target.name ?? id;
+  const inner = target.to
+    ? <Link to={target.to} className={`st-link${target.name ? '' : ' st-mono'}`} title={`Open ${target.label.toLowerCase()} ${id}`}>{headline}</Link>
+    : <span className={target.name ? undefined : 'st-mono'}>{headline}</span>;
+  if (compact) {
+    return (
+      <span className="st-target">
+        <span className="u-truncate">{inner}</span>
+        <span className="st-sub u-truncate" title={target.name ? id : undefined}>
+          {label}{target.name ? <> · <span className="st-target__id">{id}</span></> : null}
+        </span>
+      </span>
+    );
+  }
+  return (
+    <span>
+      {label}
+      {' · '}
+      {inner}
+      {target.name ? <> <span className="st-target__id">{id}</span></> : null}
+    </span>
+  );
 }
 
 /* ================================= exports ================================ */

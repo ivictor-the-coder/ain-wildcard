@@ -10,8 +10,13 @@
  * which three sit under a refusal, and which engine an answer came from.
  */
 
-/** One slot a template binds from the workspace before it runs. */
-export interface TemplateSlot { name: string; type: string }
+/**
+ * One slot a template binds from the workspace before it runs.
+ *
+ * The endpoint spells the slot's kind `kind` (`{ name: 'deal', kind: 'deal',
+ * values: null }`); `type` is kept for rows written the older way.
+ */
+export interface TemplateSlot { name: string; type?: string; kind?: string; values?: string[] | null }
 
 /** One row of `GET /v1/ai/templates`. */
 export interface AiTemplate {
@@ -28,6 +33,10 @@ export interface AiTemplate {
    * group is read off the id's first segment, then off the wording.
    */
   group?: string | null;
+  /** `count`, `list`, `write`, … — what the shape does when it runs. */
+  kind?: string | null;
+  /** The wordings the engine matches, in its own grammar: `who owns {deal}`. */
+  patterns?: string[] | null;
 }
 
 export type TemplateGroupId = 'revenue' | 'pipeline' | 'customers' | 'usage' | 'people' | 'other';
@@ -130,13 +139,33 @@ const STOP = new Set([
 const tokensOf = (text: string): string[] =>
   text.toLowerCase().replace(/[{}]/g, ' ').split(/[^a-z0-9$€£]+/).filter((w) => w.length > 1 && !STOP.has(w));
 
-/** The rows whose example, shape or description mentions every word typed. */
+/**
+ * A typed word reduced to the part every form of it shares.
+ *
+ * The panel's own placeholder suggested "owed", and "owed" found nothing: the
+ * shapes say "owe" and "owes". A filter that rejects the word it proposed is a
+ * filter nobody trusts twice, so an inflected word is matched on its stem —
+ * "owed" and "owes" on "owe", "invoices" on "invoice", "closing" on "clos".
+ */
+export function stemOf(word: string): string {
+  const lower = word.toLowerCase();
+  if (lower.length <= 3) return lower;
+  for (const suffix of ['ing', 'ies', 's', 'ed', 'd']) {
+    if (lower.endsWith(suffix) && lower.length - suffix.length >= 3) {
+      const stem = lower.slice(0, -suffix.length);
+      return suffix === 'ies' ? `${stem}y` : stem;
+    }
+  }
+  return lower;
+}
+
+/** The rows whose example, shape, patterns or description mention every word typed, in any form. */
 export function filterTemplates(rows: readonly AiTemplate[], query: string): AiTemplate[] {
   const words = query.toLowerCase().split(/\s+/).filter(Boolean);
   if (!words.length) return [...rows];
   return rows.filter((row) => {
-    const hay = `${row.example} ${row.shape} ${row.description}`.toLowerCase();
-    return words.every((word) => hay.includes(word));
+    const hay = `${row.example} ${row.shape} ${row.description} ${(row.patterns ?? []).join(' ')}`.toLowerCase();
+    return words.every((word) => hay.includes(word) || hay.includes(stemOf(word)));
   });
 }
 
@@ -148,25 +177,127 @@ export interface NearestChip {
   question: string;
 }
 
-/** `nearest` as the completion sends it. */
-export interface NearestOnWire { template_id: string; example?: string | null }
+/**
+ * `nearest` as the engine sends it.
+ *
+ * Two spellings reach this client. The completion's `analysis.nearest` is the
+ * engine's own — `{ id, example, overlap }` — and a run's working notes hand
+ * the examples back with no id at all; `template_id` is the documented shape.
+ * All three are read, because the chips were reading only the last and the
+ * engine was sending the first.
+ */
+export interface NearestOnWire { template_id?: string | null; id?: string | null; example?: string | null }
 
 /**
  * The server's own list of nearest shapes, resolved against the whitelist.
  *
- * The example is what a person presses, so a row that names a template this
- * client cannot find and carries no example of its own has nothing to offer
- * and is dropped rather than drawn as an empty chip.
+ * The example is what a person presses. A row that names no template this
+ * client can find still offers its example — the engine wrote it, so the
+ * engine answers it — and only a row with neither is dropped rather than
+ * drawn as an empty chip.
  */
 export function nearestFromWire(rows: readonly NearestOnWire[], templates: readonly AiTemplate[]): NearestChip[] {
   const byId = new Map(templates.map((t) => [t.id, t]));
+  const byExample = new Map(templates.map((t) => [t.example.trim(), t]));
   const out: NearestChip[] = [];
   for (const row of rows) {
-    const question = (row.example ?? '').trim() || byId.get(row.template_id)?.example?.trim() || '';
+    const stated = (row.template_id ?? row.id ?? '').trim();
+    const question = (row.example ?? '').trim() || byId.get(stated)?.example?.trim() || '';
     if (!question || out.some((chip) => chip.question === question)) continue;
-    out.push({ templateId: row.template_id, question });
+    out.push({ templateId: stated || byExample.get(question)?.id || '', question });
   }
   return out;
+}
+
+/* ------------------------- a question about one record ------------------- */
+
+/**
+ * One of the engine's own wordings, filled in.
+ *
+ * The grammar is the engine's: `{slot}` or `{slot:kind}` takes the value,
+ * `(a|b|)` is a choice and the first option is taken, everything else is a
+ * word. "who owns {deal}" with the deal named becomes "Who owns Aconcagua
+ * Alimentos — pilot expansion to 3 lines?" — a sentence the engine matches by
+ * construction, because it is the engine's own pattern read back to it.
+ */
+export function renderPattern(pattern: string, values: Record<string, string>): string {
+  const words: string[] = [];
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === ' ') { i += 1; continue; }
+    if (ch === '{') {
+      const end = pattern.indexOf('}', i);
+      if (end < 0) break;
+      const name = pattern.slice(i + 1, end).split(':')[0];
+      const value = values[name];
+      if (value) words.push(value);
+      i = end + 1;
+      continue;
+    }
+    if (ch === '(') {
+      const end = pattern.indexOf(')', i);
+      if (end < 0) break;
+      const first = pattern.slice(i + 1, end).split('|')[0].trim();
+      if (first) words.push(first);
+      i = end + 1;
+      continue;
+    }
+    let j = i;
+    while (j < pattern.length && pattern[j] !== ' ') j += 1;
+    words.push(pattern.slice(i, j));
+    i = j;
+  }
+  const sentence = words.join(' ').trim();
+  if (!sentence) return '';
+  const capitalised = sentence.charAt(0).toUpperCase() + sentence.slice(1);
+  return /^(what|which|who|whose|when|where|why|how|is|are|does|do|did|has|have|can|will)\b/i.test(capitalised)
+    ? `${capitalised}?`
+    : capitalised;
+}
+
+/** A question shape filled in for one record, ready to press. */
+export interface RecordQuestion { template: AiTemplate; question: string }
+
+/**
+ * The read shapes that take one record, each worded for the record in hand.
+ *
+ * This is what a record's own copilot entry offers: not "Where does the deal
+ * stand?" — which no shape answers — but the four things the engine does
+ * answer about a deal, with that deal's name in them. Writes are left out;
+ * the entry is a place to ask, not a place to move a deal from.
+ */
+export function templatesAbout(
+  rows: readonly AiTemplate[],
+  slotKind: string,
+  name: string,
+): RecordQuestion[] {
+  const out: RecordQuestion[] = [];
+  for (const template of rows) {
+    if (template.kind === 'write' || /^write[-_.]/.test(template.id)) continue;
+    const slot = (template.slots ?? []).find((one) => (one.kind ?? one.type) === slotKind);
+    if (!slot || (template.slots ?? []).length !== 1) continue;
+    const pattern = (template.patterns ?? [])[0];
+    if (!pattern) continue;
+    const question = renderPattern(pattern, { [slot.name]: name });
+    if (question) out.push({ template, question });
+  }
+  return out;
+}
+
+/**
+ * The record a screen sent this page to ask about, read off the question it
+ * composed.
+ *
+ * The deal screen's "Ask the copilot about this deal" arrives as `?ask=Where
+ * does <deal> stand right now?`, and no shape answers that for a deal: it was
+ * refused every single time, which made the one record-aware entry in the
+ * product a guaranteed dead end. The sentence still says which record was
+ * meant, so it is read as a request to open the deal's own questions.
+ */
+export function recordAsk(ask: string | null | undefined): { name: string } | null {
+  const match = /^\s*where does (.+?) stand(?: right now| now| today)?\??\s*$/i.exec(ask ?? '');
+  return match ? { name: match[1].trim() } : null;
 }
 
 /**

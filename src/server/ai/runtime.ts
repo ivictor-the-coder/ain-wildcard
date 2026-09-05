@@ -92,6 +92,13 @@ export interface AiRunFinish {
 }
 
 export interface PendingApproval {
+  /**
+   * The approval row a person decides on — what `POST /v1/ai/approvals/:id`
+   * takes. Null only until the sink has written the row; a completion that
+   * showed a card without its id left the caller unable to approve what it
+   * had just been shown.
+   */
+  id: string | null;
   tool: string;
   /**
    * What the card *shows*: secrets masked and long strings capped, because
@@ -120,7 +127,8 @@ export interface AiTraceSink {
   runStarted(run: AiRunStart): void;
   span(span: AiTraceSpan): void;
   runFinished(finish: AiRunFinish): void;
-  approvalRequested(request: PendingApproval & { runId: string; orgId: string; actorId: string | null }): void;
+  /** Persist the request; the id it comes back with is the one the card carries. */
+  approvalRequested(request: PendingApproval & { runId: string; orgId: string; actorId: string | null }): { id: string } | void;
 }
 
 export interface AiCallContext {
@@ -443,6 +451,7 @@ export function createAiRuntime(config: Config): AinAiRuntime {
       // customer's record is the thing being gated, not the flag.
       if ((!tool.readOnly || tool.requiresApproval) && !(call.approvals ?? []).includes(name)) {
         const pending: PendingApproval = {
+          id: null,
           tool: name,
           args: redactArgs(parsed as Record<string, unknown>),
           rawArgs: parsed as Record<string, unknown>,
@@ -452,8 +461,10 @@ export function createAiRuntime(config: Config): AinAiRuntime {
           readOnly: tool.readOnly,
         };
         (call.pendingApprovals ||= []).push(pending);
-        try { sink?.approvalRequested({ ...pending, runId: call.runId ?? 'run_unbound', orgId: call.orgId, actorId: call.actorId ?? null }); }
-        catch (e) { call.ctx.log.warn('ai.approval_sink_failed', { error: (e as Error).message }); }
+        try {
+          const written = sink?.approvalRequested({ ...pending, runId: call.runId ?? 'run_unbound', orgId: call.orgId, actorId: call.actorId ?? null });
+          if (written?.id) pending.id = written.id;
+        } catch (e) { call.ctx.log.warn('ai.approval_sink_failed', { error: (e as Error).message }); }
         return fail({
           code: 'approval_required',
           message: `"${name}" is waiting for approval before it can run.`,

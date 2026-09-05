@@ -10,31 +10,42 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, useQuery, type ApiClientError, type ListEnvelope } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import {
-  AlertTriangleIcon, Badge, Banner, Button, Card, DataTable, EmptyState, ErrorState, Icons,
-  MessageSquareIcon, Page, SegmentedControl, Select, SkeletonText, Stat, humanize, useFormat,
+  AlertTriangleIcon, Badge, Banner, BarChart, Button, Card, DataTable, EmptyState, ErrorState, Icons,
+  MessageSquareIcon, Page, SearchInput, SegmentedControl, Select, SkeletonText, Stat, humanize, useFormat,
   useToast,
   type DataTableColumn, type SelectOption,
 } from '@/client/design';
 import {
-  OUTCOME_LABEL, OUTCOME_TONE, answerCard, runOutcome, useAiStatus, useAllApprovals, useApprovals,
-  useFeatureCatalogue, useRun, useTemplates, useVocabulary, windowText,
-  type AiRun, type RunDetail, type RunOutcome,
+  OUTCOME_LABEL, OUTCOME_TONE, answerCard, humanTool, runOutcome, useAiStatus, useAiUsage, useAllApprovals,
+  useApprovals, useFeatureCatalogue, useRun, useTemplates, useTools, useVocabulary, windowText,
+  type AiRun, type AiUsageBucket, type RunDetail, type RunOutcome,
 } from './api';
 import { ApprovalQueue, CitationChips, ReasoningList, RunFacts, TraceSteps } from './trace';
 import { EngineIndicator, RefusalHelp, SlotChips } from './card';
+import { filterTools, tagLabel, toolSummary } from './tools-core';
+import { dayStart, everyDay, integerTickCount } from './usage-core';
 
 /** How many runs one read of the log brings back, and how far each “show more” goes. */
 const PAGE = 100;
 
+export type RunsTab = 'runs' | 'approvals' | 'usage' | 'tools';
+
+const TABS: readonly RunsTab[] = ['runs', 'approvals', 'usage', 'tools'];
+
+/** Where each tab lives: the queue has its own address, the rest are views of the log. */
+const tabHref = (tab: RunsTab): string =>
+  tab === 'approvals' ? '/copilot/approvals' : tab === 'runs' ? '/copilot/runs' : `/copilot/runs?tab=${tab}`;
+
 /* ------------------------------- run list --------------------------------- */
 
-export function RunsPage() {
+export function RunsPage({ tab: fixedTab }: { tab?: RunsTab } = {}) {
   const f = useFormat();
   const toast = useToast();
   const { location, navigate, setQuery } = useRouter();
   const status = location.query.status ?? '';
   const feature = location.query.feature ?? '';
-  const tab = location.query.tab === 'approvals' ? 'approvals' : 'runs';
+  const asked = location.query.tab;
+  const tab: RunsTab = fixedTab ?? (TABS.includes(asked as RunsTab) ? (asked as RunsTab) : 'runs');
 
   // The outcome filter is applied here rather than by the server, because the
   // server's `needs_approval` never resolves once a person decides: a run whose
@@ -133,7 +144,7 @@ export function RunsPage() {
     {
       id: 'started',
       header: 'When',
-      width: 130,
+      width: 120,
       sortable: true,
       accessor: (row) => row.started,
       cell: (row) => <span title={f.dateTime(row.started)}>{f.relative(row.started)}</span>,
@@ -146,9 +157,15 @@ export function RunsPage() {
       accessor: (row) => row.question,
       cell: (row) => <span className="u-truncate" title={row.question}>{row.question}</span>,
     },
+    // Widths are set on every column that is not the question, so the header
+    // never has to fit "Feature" into what is left: at 1512 wide the table
+    // read "Feat…", "Aggre…" and "Dura…". They sum to 1,200px, which is what
+    // the card has at that width; anything narrower scrolls inside the table
+    // with the question pinned.
     {
       id: 'feature',
       header: 'Feature',
+      width: 110,
       filter: 'set',
       accessor: (row) => row.feature,
       cell: (row) => <Badge size="sm" tone="neutral">{humanize(row.feature)}</Badge>,
@@ -156,7 +173,7 @@ export function RunsPage() {
     {
       id: 'status',
       header: 'Outcome',
-      width: 180,
+      width: 172,
       filter: 'set',
       accessor: (row) => OUTCOME_LABEL[outcomeOf(row)],
       cell: (row) => {
@@ -167,10 +184,13 @@ export function RunsPage() {
     {
       id: 'intent',
       header: 'Intent',
+      width: 126,
       filter: 'set',
       accessor: (row) => (row.intent ? humanize(row.intent) : '—'),
     },
     {
+      // Every template run reads its intent at 100%, so the column says the
+      // same thing on every row; it is there for the model's runs, on demand.
       id: 'confidence',
       header: 'Confidence',
       width: 118,
@@ -178,10 +198,12 @@ export function RunsPage() {
       sortable: true,
       accessor: (row) => row.confidence ?? 0,
       cell: (row) => (row.confidence === null ? <span className="cp-note">—</span> : `${Math.round(row.confidence * 100)}%`),
+      defaultHidden: true,
     },
     {
       id: 'steps',
       header: 'Steps',
+      width: 72,
       align: 'right',
       sortable: true,
       accessor: (row) => row.span_count,
@@ -189,6 +211,7 @@ export function RunsPage() {
     {
       id: 'duration',
       header: 'Duration',
+      width: 104,
       align: 'right',
       sortable: true,
       accessor: (row) => row.duration_ms,
@@ -197,6 +220,7 @@ export function RunsPage() {
     {
       id: 'tokens',
       header: 'Tokens',
+      width: 92,
       align: 'right',
       sortable: true,
       accessor: (row) => row.usage.input_tokens + row.usage.output_tokens,
@@ -206,6 +230,7 @@ export function RunsPage() {
     {
       id: 'credits',
       header: 'Credits',
+      width: 84,
       align: 'right',
       sortable: true,
       accessor: (row) => row.usage.credits,
@@ -231,22 +256,30 @@ export function RunsPage() {
 
   return (
     <Page
-      title="Runs and traces"
+      title={tab === 'approvals' ? 'Approvals' : tab === 'usage' ? 'AI usage' : tab === 'tools' ? 'Tools' : 'Runs and traces'}
       width="wide"
       subtitle={
-        runs.data
-          ? `${f.plural(totals.count, 'run')} · ${f.number(totals.tokens)} tokens · ${f.plural(totals.credits, 'credit')}${totals.refused ? ` · ${totals.refused} refused` : ''}${totals.failed ? ` · ${totals.failed} failed` : ''}`
-          : 'Every question the engine has been asked, and what it did about it'
+        tab === 'approvals'
+          ? 'Writes an agent prepared and stopped on, until a person decides'
+          : tab === 'usage'
+            ? 'Credits, tokens and provider spend across the whole log — by day, feature, teammate and model'
+            : tab === 'tools'
+              ? 'Every tool the copilot and the agents read and write the workspace through'
+              : runs.data
+                ? `${f.plural(totals.count, 'run')} · ${f.number(totals.tokens)} tokens · ${f.plural(totals.credits, 'credit')}${totals.refused ? ` · ${totals.refused} refused` : ''}${totals.failed ? ` · ${totals.failed} failed` : ''}`
+                : 'Every question the engine has been asked, and what it did about it'
       }
       actions={
         <>
           <SegmentedControl
             value={tab}
-            onChange={(next) => setQuery({ tab: next === 'runs' ? undefined : next })}
-            aria-label="Runs or approvals"
+            onChange={(next) => navigate(tabHref(next as RunsTab))}
+            aria-label="Runs, approvals, usage or tools"
             options={[
               { value: 'runs', label: 'Runs', icon: <Icons.activity size={14} /> },
               { value: 'approvals', label: 'Approvals', icon: <Icons.shield size={14} /> },
+              { value: 'usage', label: 'Usage', icon: <Icons.gauge size={14} /> },
+              { value: 'tools', label: 'Tools', icon: <Icons.terminal size={14} /> },
             ]}
           />
           <Button variant="primary" iconLeft={<Icons.sparkles size={14} />} onClick={() => navigate('/copilot')}>
@@ -255,7 +288,9 @@ export function RunsPage() {
         </>
       }
     >
-      {tab === 'approvals' ? (
+      {tab === 'usage' && <UsagePanel />}
+      {tab === 'tools' && <ToolsPanel />}
+      {tab === 'approvals' && (
         <Card
           title="Writes waiting on a person"
           description="Each card shows the tool, the exact arguments and what it would change. Nothing runs until you approve it."
@@ -284,10 +319,18 @@ export function RunsPage() {
           )}
           {!approvals.error && approvals.loading && <SkeletonText lines={6} />}
           {!approvals.error && approvals.data && (
-            <ApprovalQueue approvals={approvals.data.data} onDecided={approvals.refetch} />
+            <ApprovalQueue
+              approvals={approvals.data.data}
+              onDecided={approvals.refetch}
+              onAsk={() => navigate('/copilot?new=1&writes=1')}
+              onShowDecided={(location.query.approvals ?? 'pending') === 'pending'
+                ? () => setQuery({ approvals: 'approved' })
+                : undefined}
+            />
           )}
         </Card>
-      ) : (
+      )}
+      {tab === 'runs' && (
         <>
           <div className="pl-summary">
             <Card padding="tight">
@@ -344,6 +387,7 @@ export function RunsPage() {
                 { value: 'succeeded', label: 'Succeeded' },
                 { value: 'needs_approval', label: 'Needs approval' },
                 { value: 'written', label: 'Approved and written' },
+                { value: 'scheduled', label: 'Approved and scheduled' },
                 { value: 'declined', label: 'Declined' },
                 { value: 'refused', label: 'Refused' },
                 { value: 'failed', label: 'Failed' },
@@ -420,6 +464,275 @@ export function RunsPage() {
   );
 }
 
+/* --------------------------------- usage ---------------------------------- */
+
+const USAGE_WINDOWS: SelectOption[] = [
+  { value: '7', label: 'Last 7 days' },
+  { value: '30', label: 'Last 30 days' },
+  { value: '90', label: 'Last 90 days' },
+  { value: '365', label: 'Last year' },
+];
+
+
+/**
+ * What the engine has cost, over the whole log.
+ *
+ * `/v1/ai/usage` has answered credits by day, feature, teammate and model all
+ * along and nothing drew it: the run log's tiles totalled the rows on screen
+ * — at most a hundred — and the subtitle's "51 tools" was the only thing said
+ * about the tools. Every figure here is a field of that one response.
+ */
+function UsagePanel() {
+  const f = useFormat();
+  const { location, setQuery } = useRouter();
+  const window = Number.parseInt(location.query.days ?? '', 10) || 30;
+  const usage = useAiUsage(window);
+  const report = usage.data;
+
+  const bucketColumns = useMemo((): DataTableColumn<AiUsageBucket>[] => [
+    { id: 'runs', header: 'Runs', align: 'right', sortable: true, accessor: (row) => row.runs, cell: (row) => f.number(row.runs), total: (_rows, sum) => f.number(sum) },
+    { id: 'credits', header: 'Credits', align: 'right', sortable: true, accessor: (row) => row.credits, cell: (row) => f.number(row.credits), total: (_rows, sum) => f.number(sum) },
+    {
+      id: 'tokens',
+      header: 'Tokens',
+      align: 'right',
+      sortable: true,
+      accessor: (row) => row.input_tokens + row.output_tokens,
+      cell: (row) => <span title={`${f.number(row.input_tokens)} in · ${f.number(row.output_tokens)} out`}>{f.number(row.input_tokens + row.output_tokens)}</span>,
+      total: (_rows, sum) => f.number(sum),
+    },
+    { id: 'tool_calls', header: 'Tool calls', align: 'right', sortable: true, accessor: (row) => row.tool_calls, cell: (row) => f.number(row.tool_calls), total: (_rows, sum) => f.number(sum) },
+    {
+      id: 'spend',
+      header: 'Provider spend',
+      align: 'right',
+      sortable: true,
+      accessor: (row) => row.cost_micros,
+      cell: (row) => (row.cost_micros > 0 ? f.money(row.cost_cents) : <span className="cp-note">none</span>),
+    },
+  ], [f]);
+
+  const table = (
+    title: string,
+    description: string,
+    rows: AiUsageBucket[],
+    first: DataTableColumn<AiUsageBucket>,
+  ) => (
+    <Card title={title} description={description} padding="tight">
+      <DataTable<AiUsageBucket>
+        rows={rows}
+        columns={[{ ...first, width: 260, pinned: true }, ...bucketColumns]}
+        getRowId={(row) => row.key}
+        caption={title}
+        stickyFooter
+        searchable={false}
+        showColumnToggle={false}
+        showFilters={false}
+        showDensityToggle={false}
+        initialSort={{ columnId: 'credits', direction: 'desc' }}
+        empty={<EmptyState size="sm" inline illustration={null} title="Nothing ran in this window" body="Pick a longer window, or ask the copilot something." />}
+      />
+    </Card>
+  );
+
+  const days = report ? everyDay(report.period, report.by_day) : [];
+  const busiest = report ? [...report.by_day].sort((a, b) => b.credits - a.credits)[0] : undefined;
+
+  return (
+    <div className="cp-usage" data-usage-days={window}>
+      <div className="pl-toolbar">
+        <Select
+          value={String(window)}
+          onChange={(next) => setQuery({ days: next === '30' ? undefined : next })}
+          size="sm"
+          aria-label="Usage window"
+          icon={<Icons.calendar size={13} />}
+          options={USAGE_WINDOWS}
+        />
+        {report && (
+          <span className="cp-note">
+            {f.dateRange(dayStart(report.period.since), dayStart(report.period.until), { timeZone: 'UTC' })} · every run the engine logged, whoever asked
+          </span>
+        )}
+      </div>
+
+      {usage.error && (
+        <Card>
+          <ErrorState
+            title="The usage report did not answer"
+            message={usage.error.body.message}
+            code={`${usage.error.status} /v1/ai/usage`}
+            requestId={usage.error.body.request_id ?? null}
+            action={<Button variant="primary" iconLeft={<Icons.refresh size={14} />} onClick={usage.refetch}>Try again</Button>}
+          />
+        </Card>
+      )}
+
+      {!usage.error && !report && <SkeletonText lines={8} />}
+
+      {report && (
+        <>
+          <div className="pl-summary" data-usage-totals>
+            <Card padding="tight">
+              <Stat label="Runs" value={f.number(report.totals.runs)} icon={<Icons.activity size={15} />} caption={`${f.plural(report.totals.tool_calls, 'tool call')} between them`} />
+            </Card>
+            <Card padding="tight">
+              <Stat label="Credits charged" value={f.number(report.totals.credits)} icon={<Icons.coins size={15} />} caption={report.totals.runs ? `${f.number(Math.round(report.totals.credits / report.totals.runs))} per run` : 'No runs in this window'} />
+            </Card>
+            <Card padding="tight">
+              <Stat label="Tokens" value={f.compact(report.totals.input_tokens + report.totals.output_tokens)} icon={<Icons.cpu size={15} />} caption={`${f.compact(report.totals.input_tokens)} in · ${f.compact(report.totals.output_tokens)} out`} />
+            </Card>
+            <Card padding="tight">
+              <Stat
+                label="Provider spend"
+                value={report.totals.cost_micros > 0 ? f.money(report.totals.cost_cents) : f.money(0)}
+                icon={<Icons.wallet size={15} />}
+                caption={report.totals.cost_micros > 0 ? 'What the hosted model cost us' : 'Answered in-house — no provider spend'}
+              />
+            </Card>
+          </div>
+
+          <Card
+            title="Credits by day"
+            description={busiest
+              ? `One bar per day of the window; the engine ran on ${f.plural(report.by_day.length, 'day')} of ${days.length}, busiest on ${f.date(dayStart(busiest.key), { timeZone: 'UTC' })}`
+              : 'One bar per day of the window, in the engine’s own day boundaries'}
+            padding="tight"
+          >
+            {report.by_day.length ? (
+              <BarChart
+                title="Credits charged by day"
+                description={`${f.plural(report.totals.credits, 'credit')} over ${f.plural(report.by_day.length, 'day')} with runs${busiest ? `, the most on ${f.date(dayStart(busiest.key), { timeZone: 'UTC' })}` : ''}`}
+                categories={days.map((row) => f.date(dayStart(row.key), { timeZone: 'UTC' }))}
+                series={[{ id: 'credits', label: 'Credits', values: days.map((row) => row.credits) }]}
+                valueFormat={(value) => f.number(value)}
+                yTickCount={integerTickCount(Math.max(0, ...days.map((row) => row.credits)))}
+                legend={false}
+                height={200}
+              />
+            ) : (
+              <EmptyState size="sm" inline illustration={null} title="Nothing ran in this window" body="Pick a longer window, or ask the copilot something." />
+            )}
+          </Card>
+
+          <div className="cp-usage__tables">
+            {table('By feature', 'The copilot, the agents, drafting — whatever opened the run', report.by_feature, {
+              id: 'key', header: 'Feature', accessor: (row) => humanize(row.key), cell: (row) => <Badge size="sm" tone="neutral">{humanize(row.key)}</Badge>,
+            })}
+            {table('By teammate', 'Who asked; agent runs count under System', report.by_user, {
+              id: 'key', header: 'Teammate', accessor: (row) => row.name ?? row.key, cell: (row) => row.name ?? row.key,
+            })}
+            {table('By model', 'The engine that answered', report.by_model, {
+              id: 'key', header: 'Model', accessor: (row) => row.key, cell: (row) => <span className="cp-mono">{row.key}</span>,
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* --------------------------------- tools ---------------------------------- */
+
+/**
+ * The catalogue the subtitle counts.
+ *
+ * "51 tools" was a number and nothing else. Each tool here says what it reads
+ * or writes, in the words the engine itself is given, and whether a person
+ * stands between it and the workspace.
+ */
+function ToolsPanel() {
+  const f = useFormat();
+  const tools = useTools();
+  const [query, setQuery] = useState('');
+  const rows = useMemo(() => filterTools(tools.data?.data ?? [], query), [tools.data, query]);
+  const reads = rows.filter((tool) => tool.read_only).length;
+  const writes = rows.length - reads;
+
+  return (
+    <Card
+      title={tools.data ? `${f.plural(tools.data.data.length, 'tool')}` : 'Tools'}
+      description={tools.data ? `${f.plural(reads, 'read')} the workspace; ${f.plural(writes, 'write')} to it, each stopping for a person's approval` : 'Reading the catalogue…'}
+      actions={
+        <SearchInput
+          value={query}
+          onChange={setQuery}
+          size="sm"
+          placeholder="Filter the tools"
+          aria-label="Filter the tools"
+        />
+      }
+    >
+      {tools.error && (
+        <ErrorState
+          title="The tool catalogue did not answer"
+          message={tools.error.body.message}
+          code={`${tools.error.status} /v1/ai/tools`}
+          requestId={tools.error.body.request_id ?? null}
+          action={<Button variant="primary" iconLeft={<Icons.refresh size={14} />} onClick={tools.refetch}>Try again</Button>}
+        />
+      )}
+      {!tools.error && tools.loading && <SkeletonText lines={8} />}
+      {tools.data && rows.length === 0 && (
+        <EmptyState
+          size="sm"
+          inline
+          illustration={null}
+          title="No tool matches"
+          body={`None of the ${tools.data.data.length} tools mention “${query}”.`}
+          action={<Button size="sm" onClick={() => setQuery('')}>Clear the filter</Button>}
+        />
+      )}
+      {tools.data && rows.length > 0 && (
+        <div className="cp-tools" data-tools={rows.length}>
+          {rows.map((tool) => (
+            <div className="cp-tool" key={tool.name} data-tool={tool.name}>
+              <span>
+                <span className="cp-tool__name">{humanTool(tool.name)}</span>
+                <span className="cp-tool__wire">{tool.name}</span>
+              </span>
+              <span style={{ display: 'inline-flex', gap: 'var(--space-2)' }}>
+                {tool.read_only
+                  ? <Badge size="sm" tone="info" icon={<Icons.search size={11} />}>Reads</Badge>
+                  : <Badge size="sm" tone="warning" icon={<Icons.shield size={11} />}>Writes · needs approval</Badge>}
+              </span>
+              <ToolWords tool={tool} />
+              {tool.tags.length > 0 && (
+                <span className="cp-tool__tags">
+                  {tool.tags.map((tag) => <Badge key={tag} size="sm" tone="neutral">{tagLabel(tag)}</Badge>)}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/**
+ * What a tool does, for a person, with what the engine is told kept underneath.
+ *
+ * The catalogue printed the prompt text — "Pass a company id, or a contact id
+ * to get the company behind it" — to whoever opened the tab. The first
+ * sentence is the summary; the rest is how the model is told to call it, and
+ * it is one disclosure away for anyone debugging a plan.
+ */
+function ToolWords({ tool }: { tool: { name: string; description: string; read_only: boolean; tags: string[] } }) {
+  const { summary, guidance } = toolSummary(tool);
+  return (
+    <>
+      <p className="cp-tool__desc">{summary}</p>
+      {guidance && (
+        <details className="cp-details cp-tool__guidance">
+          <summary>How the engine is told to use it</summary>
+          <p className="cp-tool__prompt">{guidance}</p>
+        </details>
+      )}
+    </>
+  );
+}
+
 /* ------------------------------- run detail ------------------------------- */
 
 export function RunDetailPage({ id }: { id: string }) {
@@ -471,6 +784,7 @@ export function RunDetailPage({ id }: { id: string }) {
    */
   const card = answerCard({
     question: detail.question,
+    content: detail.answer ?? undefined,
     toolCalls: detail.trace.filter((span) => span.kind === 'tool').map((span) => ({ name: span.name, arguments: span.args })),
     run: detail,
     remembered: null,
@@ -525,9 +839,7 @@ export function RunDetailPage({ id }: { id: string }) {
     >
       {card.refusal && (
         <Banner tone="warning" title="This run refused to answer" bar>
-          {card.refusal.message && (
-            <p>{card.refusal.message} <span className="cp-mono">({card.refusal.code})</span></p>
-          )}
+          {card.refusal.message && <p>{card.refusal.message}</p>}
           <RefusalHelp refusal={card.refusal} onAsk={askAgain} />
         </Banner>
       )}

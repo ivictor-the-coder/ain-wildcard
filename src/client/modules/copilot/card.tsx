@@ -8,25 +8,28 @@
 import { Icons } from '@/client/design';
 import type { Refusal } from './card-core';
 import type { SlotChip } from './slots-core';
-import { MODEL_KEY_NOTE, type EngineLine } from './templates-core';
+import type { EngineLine } from './templates-core';
 
 /**
- * "answered from a template" / "answered by the model", with the honest
- * footnote. With no hosted model the footnote says what one takes; it is not a
- * link, because nothing in the product can set it.
+ * "answered from a template" / "answered by the model".
+ *
+ * The footnote about what free text takes — a hosted model, an environment
+ * variable — is said once, in the empty state and the "What can I ask?"
+ * panel, where a person deciding what to ask will read it. It used to be
+ * repeated on every card: thirty answers, thirty env vars in front of a sales
+ * manager. The card keeps it as the tooltip, where the curious can find it.
  */
 export function EngineIndicator({ line }: { line: EngineLine }) {
   const Glyph = line.engine === 'anthropic' ? Icons.sparkles : Icons.bolt;
   return (
-    <span className={`cp-engine cp-engine--${line.engine}`} title={line.detail} data-engine={line.engine}>
+    <span
+      className={`cp-engine cp-engine--${line.engine}`}
+      title={line.detail}
+      data-engine={line.engine}
+      data-needs-key={line.needsKey ? 'true' : undefined}
+    >
       <Glyph size={11} />
       <span>{line.label}</span>
-      {line.needsKey && (
-        <>
-          <span aria-hidden>·</span>
-          <span className="cp-engine__note" title={line.detail}>{MODEL_KEY_NOTE}</span>
-        </>
-      )}
     </span>
   );
 }

@@ -22,7 +22,7 @@ export function TemplatePanel({ groups, onAsk, query, total }: {
     return (
       <p className="cp-templates__empty" role="status">
         {query
-          ? `None of the ${total ?? 0} shapes mention “${query}”. Try a shorter word — “deals”, “owed”, “Growth”.`
+          ? `None of the ${total ?? 0} shapes mention “${query}”. Try a shorter word — “deals”, “owe”, “Growth”.`
           : 'This workspace publishes no question shapes yet, so there is nothing to pick from.'}
       </p>
     );

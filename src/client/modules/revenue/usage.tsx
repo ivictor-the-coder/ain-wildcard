@@ -7,13 +7,13 @@
  * was billed, and one so old the meter refused it — and gives an operator the
  * controls to see and settle each of them.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, useMutation, useQuery, type ApiClientError, type ListEnvelope } from '../../kernel/api';
 import { useNavigate, useParams, useSearchParam } from '../../kernel/router';
 import { useCurrentCrumb } from '../../kernel/shell';
 import {
-  AreaChart, Badge, Banner, Button, Card, ConfirmDialog, DataTable, DatePicker, DescriptionList,
-  EmptyState, Field, Grid, Icons, Inline, Input, Modal, Page, RadioGroup, Section,
+  AreaChart, Badge, Banner, Button, Card, Collapsible, ConfirmDialog, DataTable, DatePicker, DescriptionList,
+  Drawer, EmptyState, Field, Grid, Icons, Inline, Input, Modal, Page, RadioGroup, Section,
   SegmentedControl, Select, Skeleton, Stack, Stat, Textarea, formatNumber, humanize, pluralize,
   useFormat, useToast,
   type DataTableColumn, type MenuSection,
@@ -21,14 +21,15 @@ import {
 } from '../../design';
 import {
   BasisNote, ChartSkeleton, CustomerName, EmptyBody, ExportCsvButton, LiveNumberInput, Loading,
-  SectionError, StatusChip, boundaryDate, boundaryRange, csvInstant, moneyIn, rateText,
+  SectionError, StatusChip, boundaryDate, boundaryRange, csvInstant, moneyIn, rateText, signedMoneyIn,
   unitRateText, units, useCustomerNames, useDefaultCurrency, useTabParam, useUrlTableState,
   visibleRows,
   type CsvColumn,
 } from './common';
+import { NEVER_COPY, OVERVIEW_WINDOW_DAYS, QUIET_COPY, daysAgoCopy, lastSeen, lastSeenAt, type LastSeen } from './meter-copy';
 import type {
-  Meter, MeterDetail, MeterEvent, MeterEventAdjustment, MeterEventResult, MeterLateArrival,
-  MeterPeriodClosure, MeterUsage, MeteringOverview, PriceLite, RevenueUsage, SummaryBucket,
+  CreditSettlement, Meter, MeterDetail, MeterEvent, MeterEventAdjustment, MeterEventResult, MeterLateArrival,
+  MeterPeriodClosure, MeterPeriodClosureDetail, MeterUsage, MeteringOverview, PriceLite, RevenueUsage, SummaryBucket,
 } from './types';
 
 const DAY_MS = 86_400_000;
@@ -91,7 +92,57 @@ const generalError = (error: ApiClientError | null, params: string[]): string | 
 
 /* ================================ overview ================================ */
 
+interface MeterRow {
+  meter: Meter;
+  live: MeteringOverview['meters'][number] | null;
+  seen: LastSeen;
+}
+
+/**
+ * The true last event of every meter the overview's 30-day window has gone
+ * quiet on.
+ *
+ * The overview is one bounded read and it is right about the window; it just
+ * cannot say when a meter last streamed if that was longer ago. For those
+ * meters — and only those — the meter's own record is read, once, and held
+ * beside the row. A meter that starts streaming again is answered by the
+ * overview and its record is not consulted.
+ */
+function useMeterLastSeen(meters: Meter[], live: MeteringOverview | undefined): Map<string, number | null> {
+  const [known, setKnown] = useState<Map<string, number | null>>(() => new Map());
+  const asked = useRef(new Set<string>());
+  useEffect(() => {
+    if (!live) return;
+    const recent = new Map(live.meters.map((m) => [m.id, m.last_hour_with_events]));
+    const quiet = meters.filter((m) => !recent.get(m.id) && !asked.current.has(m.id));
+    if (quiet.length === 0) return;
+    let cancelled = false;
+    for (const meter of quiet) asked.current.add(meter.id);
+    void Promise.all(quiet.map(async (meter) => {
+      try {
+        const detail = await api.get<MeterDetail>(`/v1/meters/${meter.id}`);
+        return [meter.id, detail.ingestion.last_event_at] as const;
+      } catch {
+        // Left unanswered rather than answered wrong: the cell keeps saying
+        // the record has not been read, and the next render asks again.
+        asked.current.delete(meter.id);
+        return null;
+      }
+    })).then((answers) => {
+      if (cancelled) return;
+      setKnown((prev) => {
+        const next = new Map(prev);
+        for (const answer of answers) if (answer) next.set(answer[0], answer[1]);
+        return next;
+      });
+    });
+    return () => { cancelled = true; };
+  }, [meters, live]);
+  return known;
+}
+
 export function UsagePage() {
+  const f = useFormat();
   const navigate = useNavigate();
   const toast = useToast();
   const names = useCustomerNames();
@@ -125,12 +176,19 @@ export function UsagePage() {
   const retired = archived.data?.data ?? [];
   const all = useMemo(() => [...live, ...retired], [live, retired]);
   const rows = showArchived ? all : live;
-  const volume = useMemo(() => {
+  const lastEvents = useMeterLastSeen(rows, stats);
+  // To the minute, so the rows are not rebuilt on every render for a clock
+  // reading nobody can see move.
+  const now = Math.floor(f.now() / 60_000) * 60_000;
+  const volume = useMemo<MeterRow[]>(() => {
     const index = new Map((stats?.meters ?? []).map((m) => [m.id, m]));
-    return rows.map((meter) => ({ meter, live: index.get(meter.id) ?? null }));
-  }, [rows, stats]);
+    return rows.map((meter) => {
+      const overview = index.get(meter.id) ?? null;
+      return { meter, live: overview, seen: lastSeen(overview?.last_hour_with_events, lastEvents.get(meter.id), now) };
+    });
+  }, [rows, stats, lastEvents, now]);
 
-  const columns: DataTableColumn<{ meter: Meter; live: MeteringOverview['meters'][number] | null }>[] = useMemo(() => [
+  const columns: DataTableColumn<MeterRow>[] = useMemo(() => [
     {
       id: 'name',
       header: 'Meter',
@@ -169,8 +227,8 @@ export function UsagePage() {
       cell: (row) => <span className="rv-num">{formatNumber(row.live?.customers_30d ?? 0)}</span>,
     },
     {
-      id: 'last_event', header: 'Last event', accessor: (row) => row.live?.last_hour_with_events ?? 0,
-      cell: (row) => <LastSeen at={row.live?.last_hour_with_events ?? null} />,
+      id: 'last_event', header: 'Last event', accessor: (row) => lastSeenAt(row.seen) ?? 0,
+      cell: (row) => <LastSeenCell seen={row.seen} />, width: 230,
     },
   ], []);
 
@@ -243,8 +301,8 @@ export function UsagePage() {
             )}
             <div className="rv-tiles rv-tiles--tight">
               <Card padding="tight"><Stat label="Meters" value={formatNumber(stats.meters.length)} caption={`${stats.meters.filter((m) => m.status === 'active').length} active`} /></Card>
-              <Card padding="tight"><Stat label="Events · 30 days" value={formatNumber(stats.meters.reduce((sum, m) => sum + m.events_30d, 0))} caption="across every meter" /></Card>
-              <Card padding="tight"><Stat label="Customers streaming" value={formatNumber(Math.max(0, ...stats.meters.map((m) => m.customers_30d)))} caption="most on any one meter" /></Card>
+              <Card padding="tight"><Stat label="Events · 30 days" value={formatNumber(stats.meters.reduce((sum, m) => sum + m.events_30d, 0))} caption={`across every meter, last ${OVERVIEW_WINDOW_DAYS} days`} /></Card>
+              <Card padding="tight"><Stat label="Customers streaming" value={formatNumber(Math.max(0, ...stats.meters.map((m) => m.customers_30d)))} caption={`most on any one meter, last ${OVERVIEW_WINDOW_DAYS} days`} /></Card>
               <Card padding="tight"><Stat label="Billed periods" value={formatNumber(stats.closed_periods)} caption={`${formatNumber(stats.periods_awaiting_settlement)} awaiting settlement`} /></Card>
               <Card padding="tight"><Stat label="Late arrivals open" value={formatNumber(stats.open_late_arrivals)} caption={`${formatNumber(stats.true_ups_settled.n)} already trued up`} /></Card>
               <Card padding="tight"><Stat label="Events withdrawn" value={formatNumber(stats.withdrawn_events)} caption="cancelled after ingestion" /></Card>
@@ -288,8 +346,9 @@ export function UsagePage() {
                       { header: 'Status', value: (row) => row.meter.status },
                       { header: 'Events 30d', value: (row) => row.live?.events_30d ?? 0 },
                       { header: 'Customers 30d', value: (row) => row.live?.customers_30d ?? 0 },
-                      { header: 'Last event', value: (row) => csvInstant(row.live?.last_hour_with_events ?? null) },
-                    ] satisfies CsvColumn<{ meter: Meter; live: MeteringOverview['meters'][number] | null }>[]}
+                      { header: 'Last event', value: (row) => csvInstant(lastSeenAt(row.seen)) },
+                      { header: 'Streamed in the last 30 days', value: (row) => (row.seen.state === 'recent' ? 'yes' : 'no') },
+                    ] satisfies CsvColumn<MeterRow>[]}
                   />
                 </Inline>
               )}
@@ -335,14 +394,27 @@ export function UsagePage() {
   );
 }
 
-function LastSeen({ at }: { at: number | null }) {
+/**
+ * When the meter last saw an event. The 30-day window is the overview's, not
+ * the meter's: a meter the window has gone quiet on says so, and names the
+ * last event it did see, rather than claiming nothing has ever arrived.
+ */
+function LastSeenCell({ seen }: { seen: LastSeen }) {
   const f = useFormat();
-  if (!at) return <span className="rv-muted">Never</span>;
-  const silent = f.now() - at;
+  if (seen.state === 'pending') return <span className="rv-muted" aria-busy>…</span>;
+  if (seen.state === 'never') return <span className="rv-muted">{NEVER_COPY}</span>;
+  if (seen.state === 'quiet') {
+    return (
+      <div className="rv-cell">
+        <span className="rv-cell__top rv-muted">{QUIET_COPY}</span>
+        <span className="rv-cell__sub" title={f.dateTime(seen.at)}>{`Last event ${daysAgoCopy(seen.at, f.now()) ?? f.relative(seen.at)} · ${f.date(seen.at, { withYear: true })}`}</span>
+      </div>
+    );
+  }
   return (
     <div className="rv-cell">
-      <span className="rv-cell__top">{f.relative(at)}</span>
-      <span className="rv-cell__sub">{silent > 2 * DAY_MS ? 'Stalled — nothing for two days' : f.dateTime(at)}</span>
+      <span className="rv-cell__top">{f.relative(seen.at)}</span>
+      <span className="rv-cell__sub">{seen.stalled ? 'Stalled — nothing for two days' : f.dateTime(seen.at)}</span>
     </div>
   );
 }
@@ -1093,6 +1165,8 @@ function ClosuresTable({ meter, limit, names }: { meter: string; limit: number; 
   const f = useFormat();
   const rowsQuery = useQuery<ListEnvelope<MeterPeriodClosure>>('/v1/meter-period-closures', { meter: meter || undefined, limit });
   const rows = rowsQuery.data?.data ?? [];
+  const [open, setOpen] = useState<MeterPeriodClosure | null>(null);
+  const navigate = useNavigate();
   const columns: DataTableColumn<MeterPeriodClosure>[] = useMemo(() => [
     { id: 'customer', header: 'Customer', pinned: true, accessor: (row) => names.name(row.customer), cell: (row) => <CustomerName id={row.customer} names={names} />, width: 210 },
     { id: 'period', header: 'Period', accessor: (row) => row.period_start, cell: (row) => <span className="rv-nowrap">{boundaryRange(f, row.period_start, row.period_end)}</span>, width: 200 },
@@ -1106,24 +1180,175 @@ function ClosuresTable({ meter, limit, names }: { meter: string; limit: number; 
   ], [f, names]);
 
   return (
-    <DataTable
-      rows={rows}
-      columns={columns}
-      getRowId={(row) => row.id}
-      caption="Billed periods"
-      loading={rowsQuery.loading}
-      error={rowsQuery.error ? { message: rowsQuery.error.body?.message, code: rowsQuery.error.body?.code, requestId: rowsQuery.error.body?.request_id } : null}
-      onRetry={rowsQuery.refetch}
-      plain
-      maxHeight={520}
-      searchPlaceholder="Search billed periods…"
-      empty={(
-        <EmptyState
-          title="No period has been frozen yet"
-          body={<EmptyBody>A period closes when it is billed; anything landing inside it afterwards is a late arrival.</EmptyBody>}
-        />
+    <>
+      <DataTable
+        rows={rows}
+        columns={columns}
+        getRowId={(row) => row.id}
+        caption="Billed periods"
+        loading={rowsQuery.loading}
+        error={rowsQuery.error ? { message: rowsQuery.error.body?.message, code: rowsQuery.error.body?.code, requestId: rowsQuery.error.body?.request_id } : null}
+        onRetry={rowsQuery.refetch}
+        onRowClick={setOpen}
+        rowActions={(row) => [{
+          id: 'closure',
+          items: [
+            { id: 'open', label: 'Open the billed period', icon: <ArrowRightIcon size={14} />, onSelect: () => setOpen(row) },
+            { id: 'meter', label: 'Open the meter', icon: <Icons.gauge size={14} />, onSelect: () => navigate(`/revenue/usage/${row.meter}`) },
+          ],
+        }]}
+        plain
+        maxHeight={520}
+        searchPlaceholder="Search billed periods…"
+        empty={(
+          <EmptyState
+            title="No period has been frozen yet"
+            body={<EmptyBody>A period closes when it is billed; anything landing inside it afterwards is a late arrival.</EmptyBody>}
+          />
+        )}
+      />
+      {open && <ClosureDrawer closure={open} names={names} onClose={() => setOpen(null)} />}
+    </>
+  );
+}
+
+/**
+ * One billed period: what was frozen for the bill, what the meter reads for
+ * the same window today, and where the difference went.
+ *
+ * `GET /v1/meter-period-closures/:id` re-aggregates the window now, so the
+ * drawer can say "billed at 33,138,678, reads 32,705,472 today, and the
+ * 433,206 withdrawn are already on a true-up" rather than leave the operator
+ * to subtract. The settlement that billed it links on to the invoice.
+ */
+function ClosureDrawer({
+  closure, names, onClose,
+}: { closure: MeterPeriodClosure; names: ReturnType<typeof useCustomerNames>; onClose: () => void }) {
+  const f = useFormat();
+  const navigate = useNavigate();
+  const detail = useQuery<MeterPeriodClosureDetail>(`/v1/meter-period-closures/${closure.id}`);
+  const meter = useQuery<MeterDetail>(`/v1/meters/${closure.meter}`);
+  const settlement = useQuery<CreditSettlement>(
+    closure.ref_type === 'credit_settlement' && closure.ref_id ? `/v1/credit-settlements/${closure.ref_id}` : null,
+  );
+  const row = detail.data ?? closure;
+  const unit = meter.data?.unit_label ?? null;
+  const live = detail.data;
+  // `adjustment` is every late arrival since the freeze; `settled_adjustment`
+  // is the part a true-up has already billed. What is left is outstanding.
+  const outstandingQuantity = live ? live.outstanding_quantity : row.adjustment - row.settled_adjustment;
+  const invoiceIds = [...new Set((settlement.data ? [...settlement.data.lines, ...settlement.data.true_ups] : [])
+    .map((line) => line.invoice)
+    .filter((id): id is string => !!id))];
+
+  return (
+    <Drawer
+      open
+      onClose={onClose}
+      size="lg"
+      title={`${names.name(closure.customer)} — ${boundaryRange(f, closure.period_start, closure.period_end)}`}
+      description={`${meter.data?.name ?? 'The meter'} as it was frozen for billing ${f.when(closure.closed_at)}, against what it reads for the same window today.`}
+      actions={(
+        <Inline gap={3}>
+          <Button size="sm" variant="secondary" onClick={() => navigate(`/revenue/usage/${closure.meter}`)}>Open the meter</Button>
+          {invoiceIds.length > 0 && (
+            <Button size="sm" variant="primary" iconRight={<ArrowRightIcon size={13} />} onClick={() => navigate(`/billing/invoices/${invoiceIds[0]}`)}>
+              Open the invoice
+            </Button>
+          )}
+        </Inline>
       )}
-    />
+    >
+      <Stack gap={6}>
+        {detail.error && <SectionError error={detail.error} path={`GET /v1/meter-period-closures/${closure.id}`} onRetry={detail.refetch} />}
+        <Grid minColumnWidth={150} gap={5}>
+          <Stat size="sm" label="Frozen total" value={units(f, row.total, unit)} caption={`summed from ${f.plural(row.event_count, 'reading')} when it was billed`} />
+          <Stat
+            size="sm"
+            label="Reads today"
+            value={live ? units(f, live.live_total, unit) : '…'}
+            caption={live ? (live.live_total === row.total ? 'the same as when it was frozen' : 're-aggregated over the window now') : 're-aggregating the window…'}
+          />
+          <Stat
+            size="sm"
+            label="Late arrivals"
+            value={row.adjustment === 0 ? '—' : `${row.adjustment > 0 ? '+' : '−'}${units(f, Math.abs(row.adjustment), unit)}`}
+            caption={row.late_event_count === 0
+              ? 'nothing has landed in the window since'
+              : `${f.plural(row.late_event_count, 'reading')} since the freeze · ${row.settled_adjustment === 0 ? 'none resolved yet' : `${units(f, Math.abs(row.settled_adjustment), unit)} resolved into a true-up`}`}
+          />
+          <Stat
+            size="sm"
+            label="Still outstanding"
+            value={outstandingQuantity === 0 ? '—' : `${outstandingQuantity > 0 ? '+' : '−'}${units(f, Math.abs(outstandingQuantity), unit)}`}
+            caption={live?.outstanding_amount
+              ? (live.outstanding_amount > 0
+                ? `${signedMoneyIn(f, live.outstanding_amount, closure.currency)} the customer still owes`
+                : `${moneyIn(f, -live.outstanding_amount, closure.currency)} owed back to the customer`)
+              : outstandingQuantity === 0 ? 'the invoice and the meter agree' : 'not priced — the period was billed without a price'}
+          />
+        </Grid>
+
+        {live && live.open_entries.length > 0 && (
+          <Card title="Late arrivals waiting to be resolved" description="Usage that landed inside this window after it was billed. Each is resolved from the Late arrivals tab of the inspector.">
+            <div className="rv-rows">
+              {live.open_entries.map((late) => (
+                <div className="rv-row" key={late.id}>
+                  <div className="rv-row__main">
+                    <div className="rv-row__title">{`${late.value >= 0 ? '+' : '−'}${units(f, Math.abs(late.value), unit)}`}</div>
+                    <div className="rv-row__sub">{`dated ${f.dateTime(late.timestamp)} · filed ${f.when(late.created)}`}</div>
+                  </div>
+                  <div className="rv-row__aside">
+                    <Badge tone="warning" size="sm">Open</Badge>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+
+        <Card title="How it was billed">
+          {closure.ref_type !== 'credit_settlement' && (
+            <div className="rv-hint">This period was frozen without a settlement, so nothing in the credit ledger prices it.</div>
+          )}
+          {closure.ref_type === 'credit_settlement' && settlement.error && (
+            <SectionError error={settlement.error} path={`GET /v1/credit-settlements/${closure.ref_id}`} onRetry={settlement.refetch} />
+          )}
+          {closure.ref_type === 'credit_settlement' && !settlement.error && !settlement.data && <Loading label="Reading the settlement…" />}
+          {settlement.data && (
+            <DescriptionList
+              divided
+              items={[
+                { term: 'Priced at', value: moneyIn(f, settlement.data.full_amount, settlement.data.currency) },
+                { term: 'Covered by credit', value: moneyIn(f, settlement.data.covered_amount, settlement.data.currency) },
+                { term: 'Charged', value: moneyIn(f, settlement.data.charged_amount, settlement.data.currency) },
+                ...(settlement.data.true_ups.length
+                  ? [{ term: 'True-ups', value: f.list(settlement.data.true_ups.map((line) => `${moneyIn(f, line.billed_amount, line.currency)} · ${humanize(line.status)}`)) }]
+                  : []),
+                {
+                  term: 'On the bill',
+                  value: invoiceIds.length
+                    ? (
+                      <Inline gap={3} wrap>
+                        {invoiceIds.map((id) => (
+                          <Button key={id} size="sm" variant="ghost" iconRight={<ArrowRightIcon size={13} />} onClick={() => navigate(`/billing/invoices/${id}`)}>
+                            Open the invoice
+                          </Button>
+                        ))}
+                      </Inline>
+                    )
+                    : 'Not yet — the lines are waiting for the account’s next invoice',
+                },
+                {
+                  term: 'Settlement',
+                  value: <Button size="sm" variant="ghost" iconRight={<ArrowRightIcon size={13} />} onClick={() => navigate('/revenue/credits?record=settlements')}>Open the settlements</Button>,
+                },
+              ]}
+            />
+          )}
+        </Card>
+      </Stack>
+    </Drawer>
   );
 }
 
@@ -1158,9 +1383,32 @@ export function MeterDetailPage() {
   const meterEconomics = economics.data?.meters.find((row) => row.meter === id) ?? null;
 
   if (meter.error) {
+    const missing = meter.error.status === 404;
+    const back = <Button variant="ghost" iconLeft={<ArrowLeftIcon size={15} />} onClick={() => navigate('/revenue/usage')}>All meters</Button>;
     return (
-      <Page title="Meter" eyebrow="Usage">
-        <Card><SectionError error={meter.error} path={`GET /v1/meters/${id}`} onRetry={meter.refetch} /></Card>
+      <Page title={missing ? 'Meter not found' : 'Meter'} eyebrow="Usage" actions={back}>
+        <Card>
+          {missing
+            ? (
+              <Stack gap={5}>
+                <EmptyState
+                  title="This meter does not exist or was deleted"
+                  body={<EmptyBody>Nothing at this address answers to a meter. It may have been archived and removed, or the link may be out of date — every meter this workspace still has is on the Usage screen.</EmptyBody>}
+                  action={<Button variant="primary" iconLeft={<ArrowLeftIcon size={15} />} onClick={() => navigate('/revenue/usage')}>All meters</Button>}
+                />
+                <Collapsible title="Request details">
+                  <DescriptionList
+                    items={[
+                      { term: 'Request', value: <code className="rv-mono">{`GET /v1/meters/${id}`}</code> },
+                      { term: 'Request id', value: <code className="rv-mono">{meter.error.body.request_id ?? '—'}</code> },
+                      { term: 'The server said', value: meter.error.body.message },
+                    ]}
+                  />
+                </Collapsible>
+              </Stack>
+            )
+            : <SectionError error={meter.error} path={`GET /v1/meters/${id}`} onRetry={meter.refetch} />}
+        </Card>
       </Page>
     );
   }
@@ -1185,8 +1433,11 @@ export function MeterDetailPage() {
     >
       <Stack gap={7}>
         <div className="rv-tiles">
-          <Card padding="tight"><Stat label="Events recorded" value={formatNumber(m.ingestion.event_count)} caption={m.ingestion.first_event_at ? `since ${f.date(m.ingestion.first_event_at)}` : 'nothing has arrived'} /></Card>
-          <Card padding="tight"><Stat label="Customers" value={formatNumber(m.ingestion.customer_count)} caption="streaming into this meter" /></Card>
+          {/* These three read the meter's whole record, whatever the window
+              control below is set to — the caption says so, because a tile that
+              sits beside a 7d/30d/90d control and never moves reads as broken. */}
+          <Card padding="tight"><Stat label="Events recorded" value={formatNumber(m.ingestion.event_count)} caption={m.ingestion.first_event_at ? `all time, since ${f.date(m.ingestion.first_event_at)}` : 'nothing has arrived'} /></Card>
+          <Card padding="tight"><Stat label="Customers" value={formatNumber(m.ingestion.customer_count)} caption="have ever streamed into this meter" /></Card>
           <Card padding="tight"><Stat label="Last event" value={m.ingestion.last_event_at ? f.relative(m.ingestion.last_event_at) : '—'} caption={m.ingestion.last_event_at ? f.dateTime(m.ingestion.last_event_at) : 'nothing has arrived'} /></Card>
           {meterEconomics && (
             <>

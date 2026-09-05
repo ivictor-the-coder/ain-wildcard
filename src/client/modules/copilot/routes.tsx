@@ -15,6 +15,16 @@ const RunRoute = () => {
   return <RunDetailPage key={params.id} id={params.id} />;
 };
 
+/**
+ * The queue at its own address.
+ *
+ * The brief, the nav and the palette all named `/copilot/approvals`, and the
+ * shell drew its breadcrumb — Home › Copilot › Approvals — over a 404, because
+ * the only screen was a tab of the run log. It is the same screen; it now
+ * answers at the address everything points to.
+ */
+const ApprovalsRoute = () => <RunsPage tab="approvals" />;
+
 /* --------------------------------- widget --------------------------------- */
 
 /** The writes an agent has prepared and stopped on, decidable from the dashboard. */
@@ -31,7 +41,7 @@ function ApprovalsWidget() {
         ? `${f.plural(rows.length, 'write')} an agent prepared and stopped on`
         : 'Writes an agent prepares stop here until a person decides'}
       actions={
-        <Button size="sm" variant="ghost" onClick={() => navigate('/copilot/runs?tab=approvals')}>
+        <Button size="sm" variant="ghost" onClick={() => navigate('/copilot/approvals')}>
           Open the queue
         </Button>
       }
@@ -47,7 +57,11 @@ function ApprovalsWidget() {
       )}
       {!approvals.error && approvals.loading && <SkeletonText lines={4} />}
       {!approvals.error && approvals.data && (
-        <ApprovalQueue approvals={rows.slice(0, 2)} onDecided={approvals.refetch} />
+        <ApprovalQueue
+          approvals={rows.slice(0, 2)}
+          onDecided={approvals.refetch}
+          onAsk={() => navigate('/copilot?new=1&writes=1')}
+        />
       )}
       {rows.length > 2 && (
         <p className="cp-note" style={{ marginTop: 'var(--space-4)' }}>
@@ -64,6 +78,7 @@ export const routes: RouteDef[] = [
   { path: '/copilot', element: CopilotPage, title: 'Copilot' },
   { path: '/copilot/runs', element: RunsPage, title: 'Runs and traces' },
   { path: '/copilot/runs/:id', element: RunRoute, title: 'Run' },
+  { path: '/copilot/approvals', element: ApprovalsRoute, title: 'Approvals' },
 ];
 
 export const nav: NavItem[] = [
@@ -77,14 +92,15 @@ export const nav: NavItem[] = [
     children: [
       { id: 'copilot.threads', label: 'Conversations', to: '/copilot' },
       { id: 'copilot.runs', label: 'Runs & traces', to: '/copilot/runs' },
+      { id: 'copilot.approvals', label: 'Approvals', to: '/copilot/approvals' },
     ],
   },
 ];
 
 /**
- * The nav already puts "Copilot" and "Runs & traces" in the palette, so these
- * are the actions the sidebar cannot express: a fresh thread, a draft, the
- * approval queue.
+ * The nav already puts "Copilot", "Runs & traces" and "Approvals" in the
+ * palette — one entry per destination — so these are the actions the sidebar
+ * cannot express: a fresh thread and a draft.
  */
 export const commands: CommandDef[] = [
   {
@@ -104,15 +120,6 @@ export const commands: CommandDef[] = [
     keywords: ['ai', 'draft', 'email', 'write', 'follow up', 'compose'],
     icon: 'edit',
     run: (go) => go('/copilot?draft=1'),
-  },
-  {
-    id: 'copilot.approvals',
-    title: 'Writes waiting for approval',
-    subtitle: 'Approve or decline what an agent prepared',
-    group: 'Go to',
-    keywords: ['ai', 'approve', 'approval', 'safety', 'guardrail'],
-    icon: 'shield',
-    run: (go) => go('/copilot/runs?tab=approvals'),
   },
 ];
 

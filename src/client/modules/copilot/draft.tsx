@@ -24,7 +24,9 @@ import {
   humanize, useFormat, useToast, type ComboOption, type SelectOption,
 } from '@/client/design';
 import {
-  EMPTY_LEDGER, canLog, chaseVerdict, draftsFromAccount, ledgerFrom, ledgerPromise, ledgerTotal, type LedgerRead,
+  dealOptionDescription,
+  EMPTY_LEDGER, canLog, chaseVerdict, draftsFromAccount, ledgerFrom, ledgerPromise, ledgerTotal, recipientField,
+  type LedgerRead,
 } from './draft-core';
 
 /** What each kind actually produces, so the control that steers is legible. */
@@ -75,7 +77,7 @@ export interface DraftSubject {
   name: string;
 }
 
-interface RecordRow { id: string; display_name: string }
+interface RecordRow { id: string; display_name: string; properties?: Record<string, unknown> }
 
 interface AssociationRow {
   id: string;
@@ -265,11 +267,20 @@ export function DraftDialog({
   const searchDeals = useMemo(() => async (query: string): Promise<ComboOption[]> => {
     const page = await api.get<ListEnvelope<RecordRow>>('/v1/records/deal', { q: query, limit: 8 });
     for (const row of page.data) names.current.set(row.id, row.display_name);
-    return page.data.map((row) => ({ value: row.id, label: row.display_name, description: row.id }));
-  }, []);
+    // The stage and the amount tell two "pilot expansion" deals apart; the id
+    // that used to sit here told a person nothing.
+    return page.data.map((row) => ({
+      value: row.id,
+      label: row.display_name,
+      description: dealOptionDescription(row, (minor, currency) => f.money(minor, currency ? { currency } : undefined)),
+    }));
+  }, [f]);
 
   const kindHint = KINDS.find((row) => row.value === kind)?.hint ?? '';
   const toneHint = TONES.find((row) => row.value === tone)?.hint ?? '';
+  // Three different facts — no deal chosen, still reading, none linked — used
+  // to share one sentence, and the sentence was the third one.
+  const recipient = recipientField({ hasTarget: !!targetId, loading: record.loading, contacts: contacts.length });
 
   // A chase is composed from the account, because that is the record the
   // ledger hangs off; everything else is composed from the deal.
@@ -456,16 +467,14 @@ export function DraftDialog({
             <Field
               label="Write it to"
               optional
-              hint={contacts.length
-                ? 'Leave it on the primary contact and the engine picks whoever owns the relationship.'
-                : record.loading ? 'Reading this record’s contacts…' : 'This record has no contacts linked, so the draft is addressed generically.'}
+              hint={recipient.hint}
             >
               <Select
                 value={contactId}
                 onChange={setContactId}
-                disabled={contacts.length === 0}
+                disabled={recipient.disabled}
                 options={[
-                  { value: '', label: contacts.length ? 'The primary contact' : 'No contact linked' },
+                  { value: '', label: recipient.placeholder },
                   ...contacts.map<SelectOption>((row) => ({
                     value: row.record_id,
                     label: `${row.display_name}${row.is_primary ? ' · primary' : ''}`,

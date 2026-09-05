@@ -15,21 +15,22 @@ import { usePlatform } from '../../kernel/platform';
 import { useCurrentCrumb } from '../../kernel/shell';
 import {
   Badge, Banner, Button, Card, DataTable, EmptyState, Field, Grid, GridItem, Icons, Inline, Input,
-  Modal, Page, Section, Select, Stack, Tabs, Textarea, Tooltip, humanize, useToast,
+  Modal, Page, Section, Select, Stack, Tabs, Textarea, Tooltip, humanize,
   type DataTableColumn, type MenuSection,
 } from '../../design';
-import { ArrowUpRightIcon } from '../../design';
+import { AlertTriangleIcon, ArrowUpRightIcon } from '../../design';
 import {
   BookFooter, DialogFields, EmptyList, FieldRow, InlineEdit, ListFailure, LoadFailedEmpty, Loading,
-  balanceWords, csvAmount, csvDay, ExportCsvButton, invoiceClockNote, useBookTotal,
+  balanceWords, copyFormat, csvAmount, csvDay, ExportCsvButton, invoiceClockNote, keepRowMenuKeys, useBookTotal,
   MoneyRangeFilter, MoneyTotals, RecordLink, RecordMissing, SectionError, StatusPill, TableSearch, customerHref,
   decodeRange, encodeRange, idem, invoiceHref, matchesRange, moneyRank, prorationCopy, rangeActive, subscriptionHref,
   totalsByCurrency, useAction, useBillingFormat, useBookList, useCurrencyChoices, useDebounced, useDialogForm,
   useOpenOnQuery, useRecord, useRecordTab, useTableView, visibleRows,
 } from './common';
 import { ActionMenu, CreditDialog, Headline, SubscriptionCreateDialog } from './subscriptions';
-import { BillNowDialog, CustomerInvoices } from './invoices';
+import { BillNowDialog, BulkBillDialog, CustomerInvoices } from './invoices';
 import { PaymentsTab, TaxRegistrationsCard } from './payments';
+import { annualRecurring, describeDelete, pluraliseBrackets } from './copy';
 import type { BillingFormatter, CsvColumn } from './common';
 import type { BalanceTransaction, Customer, CustomerSummary, Invoice, RevenueAccount } from './types';
 
@@ -40,8 +41,6 @@ const currencyOfRow = (row: { currency: string }): string => row.currency;
 export function CustomersPage() {
   const f = useBillingFormat();
   const navigate = useNavigate();
-  const toast = useToast();
-  const action = useAction();
   const platform = usePlatform(true);
   const [currency, setCurrency] = useSearchParam('currency', '');
   const [standing, setStanding] = useSearchParam('standing', '');
@@ -49,6 +48,11 @@ export function CustomersPage() {
   const [selected, setSelected] = useState<string[]>([]);
   const [creating, setCreating] = useState(false);
   const [crediting, setCrediting] = useState<Customer | null>(null);
+  const [deleting, setDeleting] = useState<Customer | null>(null);
+  // Billing from a row or the bulk bar goes through the priced dialog the
+  // account page uses, never straight to POST /v1/invoices.
+  const [billing, setBilling] = useState<Customer | null>(null);
+  const [bulkBilling, setBulkBilling] = useState<Customer[] | null>(null);
   useOpenOnQuery('new', useCallback(() => setCreating(true), []));
 
   // The grid's own search filters the rows it holds; sending the same string to
@@ -85,7 +89,7 @@ export function CustomersPage() {
         cell: (row) => (
           <div className="bl-cellstack">
             <RecordLink to={customerHref(row.id)}>{row.name}</RecordLink>
-            <span className="bl-cellstack__sub">{row.email ?? row.id}</span>
+            <span className="bl-cellstack__sub">{row.email ?? 'No billing email'}</span>
           </div>
         ),
       },
@@ -213,47 +217,26 @@ export function CustomersPage() {
   const visible = useMemo(() => visibleRows(rows, columns, view), [rows, columns, view]);
   const shown = visible.length;
 
-  const billSelected = async () => {
-    const ids = [...selected];
-    let ok = 0;
-    for (const id of ids) {
-      try { await api.post('/v1/invoices', { customer: id }); ok++; } catch { /* reported below */ }
-    }
-    setSelected([]);
-    book.retry();
-    if (ok === ids.length) toast.success(`Raised ${ok} ${ok === 1 ? 'invoice' : 'invoices'}`);
-    else toast.warning(`Raised ${ok} of ${ids.length}`, 'The rest had nothing waiting to bill.', { duration: 0 });
-  };
-
   const rowMenu = (row: Customer): MenuSection[] => [{
     id: 'customer',
     items: [
       { id: 'open', label: 'Open', icon: <ArrowUpRightIcon size={14} />, onSelect: () => navigate(customerHref(row.id)) },
       { id: 'credit', label: 'Adjust the balance…', icon: <Icons.percent size={14} />, onSelect: () => setCrediting(row) },
       {
+        // The account page shows the lines this would sweep up, and the
+        // refusal when there are none, before the bill exists. The row used to
+        // raise it on the click.
         id: 'bill',
-        label: 'Bill what is owed now',
+        label: 'Bill what is owed now…',
         icon: <Icons.invoice size={14} />,
-        onSelect: () => {
-          void action.run(
-            api.post<Invoice>('/v1/invoices', { customer: row.id }, { idempotencyKey: idem() }),
-            { success: 'Invoice raised', failure: 'Nothing could be billed' },
-            ['/v1/invoices', '/v1/customers'],
-          ).then((invoice) => { if (invoice) navigate(invoiceHref(invoice.id)); });
-        },
+        onSelect: () => setBilling(row),
       },
       {
         id: 'delete',
-        label: 'Delete this customer',
+        label: 'Delete this customer…',
         icon: <Icons.trash size={14} />,
         danger: true,
-        onSelect: () => {
-          void action.run(
-            api.del(`/v1/customers/${row.id}`),
-            { success: `${row.name} deleted`, failure: 'The customer could not be deleted' },
-            ['/v1/customers'],
-          ).then(() => book.retry());
-        },
+        onSelect: () => setDeleting(row),
       },
     ],
   }];
@@ -281,7 +264,7 @@ export function CustomersPage() {
           </Banner>
         )}
         {book.error && <ListFailure error={book.error} path="GET /v1/customers" onRetry={book.retry} />}
-        <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'}>
+        <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'} onKeyDownCapture={keepRowMenuKeys}>
         <DataTable
           /* The grid decides which columns start hidden once, on its first
              render. The revenue columns only exist after `/v1/system/map`
@@ -358,8 +341,13 @@ export function CustomersPage() {
           }
           bulkActions={(ids) => (
             <Inline gap={3}>
-              <Button size="sm" variant="secondary" iconLeft={<Icons.invoice size={13} />} onClick={() => { void billSelected(); }}>
-                Bill {ids.length} {ids.length === 1 ? 'account' : 'accounts'}
+              <Button
+                size="sm"
+                variant="secondary"
+                iconLeft={<Icons.invoice size={13} />}
+                onClick={() => setBulkBilling(rows.filter((row) => ids.includes(row.id)))}
+              >
+                Bill {ids.length} {ids.length === 1 ? 'account' : 'accounts'}…
               </Button>
             </Inline>
           )}
@@ -391,7 +379,108 @@ export function CustomersPage() {
           onClose={() => setCrediting(null)}
         />
       )}
+      {deleting && (
+        <DeleteCustomerDialog
+          customer={deleting}
+          open
+          onClose={() => setDeleting(null)}
+          onDeleted={() => { setDeleting(null); book.retry(); }}
+        />
+      )}
+      {billing && <BillNowDialog open customer={billing.id} onClose={() => setBilling(null)} />}
+      {bulkBilling && (
+        <BulkBillDialog
+          customers={bulkBilling}
+          open
+          onClose={() => setBulkBilling(null)}
+          onDone={() => { setBulkBilling(null); setSelected([]); book.retry(); }}
+        />
+      )}
     </Page>
+  );
+}
+
+/* ============================== delete dialog ============================= */
+
+/**
+ * Deleting an account is confirmed, and confirmed with the facts.
+ *
+ * The menu item used to run `DELETE` on the click — no dialog, no undo, and no
+ * route that restores a customer. Void and write-off on an invoice already
+ * name the amount and the account before they run; this does the same, from
+ * the account's summary rather than from the row: how many live subscriptions
+ * (the server refuses while there are any, so the door is closed here with the
+ * reason on it), what balance is lost with the record, and what still names it.
+ */
+export function DeleteCustomerDialog({ customer, open, onClose, onDeleted }: {
+  customer: Customer; open: boolean; onClose: () => void; onDeleted: () => void;
+}) {
+  const f = useBillingFormat();
+  const action = useAction();
+  const summary = useQuery<CustomerSummary>(`/v1/customers/${customer.id}/summary`, undefined, { enabled: open });
+  const facts = summary.data
+    ? {
+      live: summary.data.subscriptions.live,
+      balance: summary.data.balance.amount,
+      currency: summary.data.balance.currency,
+      // `open_invoices.total` is the money owed, not a count; the rows are.
+      openInvoices: summary.data.open_invoices.data.length,
+    }
+    : null;
+  const words = facts ? describeDelete(customer.name, facts, copyFormat(f)) : null;
+
+  const remove = async () => {
+    const result = await action.run(
+      api.del(`/v1/customers/${customer.id}`),
+      {
+        success: `${customer.name} deleted`,
+        description: 'The record is gone from this workspace. Its invoices stay on the books as documents.',
+        failure: 'The customer could not be deleted',
+      },
+      ['/v1/customers', '/v1/revenue'],
+    );
+    if (result) onDeleted();
+  };
+
+  const canDelete = !!words && !words.blocked && !action.busy;
+  const form = useDialogForm(open, canDelete, () => { void remove(); });
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="sm"
+      title={`Delete ${customer.name}?`}
+      icon={<AlertTriangleIcon size={18} />}
+      iconTone="danger"
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose} disabled={action.busy}>Keep the account</Button>
+          <Button
+            variant="danger"
+            loading={action.busy}
+            disabled={!canDelete}
+            title={words?.blocked ?? (summary.loading ? 'Reading what this account holds…' : undefined)}
+            onClick={() => { void remove(); }}
+          >
+            {`Delete ${customer.name}`}
+          </Button>
+        </>
+      }
+    >
+      <DialogFields form={form}>
+        {summary.error && (
+          <SectionError error={summary.error} path={`GET /v1/customers/${customer.id}/summary`} onRetry={summary.refetch} />
+        )}
+        {!summary.error && !words && <Loading label="Reading what this account holds…" />}
+        {words && (
+          <Stack gap={4}>
+            {words.blocked && <Banner tone="warning" compact title="This will be refused">{words.blocked}</Banner>}
+            <div className="bl-sub" style={{ fontSize: 'var(--text-sm)', color: 'var(--text-primary)' }}>{words.body}</div>
+          </Stack>
+        )}
+      </DialogFields>
+    </Modal>
   );
 }
 
@@ -555,7 +644,7 @@ export function CustomerDetailPage() {
   const navigate = useNavigate();
   const action = useAction();
   const [tab, setTab] = useRecordTab(CUSTOMER_TABS, 'overview');
-  const [dialog, setDialog] = useState<null | 'credit' | 'subscription' | 'bill'>(null);
+  const [dialog, setDialog] = useState<null | 'credit' | 'subscription' | 'bill' | 'delete'>(null);
 
   const { data, error, loading, refetch } = useRecord<CustomerSummary>(`/v1/customers/${id}/summary`);
   useCurrentCrumb(data?.customer.name);
@@ -592,16 +681,10 @@ export function CustomerDetailPage() {
       { id: 'subscription', label: 'Start a subscription…', icon: <Icons.repeat size={14} />, onSelect: () => setDialog('subscription') },
       {
         id: 'delete',
-        label: 'Delete this customer',
+        label: 'Delete this customer…',
         icon: <Icons.trash size={14} />,
         danger: true,
-        onSelect: () => {
-          void action.run(
-            api.del(`/v1/customers/${customer.id}`),
-            { success: `${customer.name} deleted`, failure: 'The customer could not be deleted' },
-            ['/v1/customers'],
-          ).then((result) => { if (result) navigate('/billing/customers'); });
-        },
+        onSelect: () => setDialog('delete'),
       },
     ],
   }];
@@ -640,19 +723,24 @@ export function CustomerDetailPage() {
             <Headline
               label="Lifetime value"
               value={f.money(data.lifetime_value.amount, { currency: data.lifetime_value.currency })}
-              caption={data.lifetime_value.customer_since
+              // The figure is cash collected, net of refunds and credit notes,
+              // and an open bill is not in it. The caption says so in the
+              // server's own words, and what is still owed is its own sentence
+              // — "$127,840.00 of it is still open" read as if the open bill
+              // were part of the figure.
+              caption={`${data.lifetime_value.label ?? 'Collected, net of refunds and credit notes'}${data.lifetime_value.customer_since
                 // Not "customer since": this is the first invoice, which on a
                 // migrated book is years after the record was created. The list
                 // column keeps `created` and this one says what it measures.
-                ? `First billed ${f.day(data.lifetime_value.customer_since, { withYear: true })} · ${f.plural(data.lifetime_value.periods_billed, 'period')} billed`
-                : `${f.plural(data.lifetime_value.periods_billed, 'period')} billed`}
+                ? ` · First billed ${f.day(data.lifetime_value.customer_since, { withYear: true })} · ${f.plural(data.lifetime_value.periods_billed, 'period')} billed`
+                : ` · ${f.plural(data.lifetime_value.periods_billed, 'period')} billed`}${stillOwed(data, f)}`}
             />
             <Headline
               label="MRR"
               value={f.money(data.mrr, { currency: customer.currency })}
               // The count beside the money is counted the same way the money is,
               // so a $0.00 MRR is never captioned "1 live".
-              caption={`${f.money(data.arr, { currency: customer.currency })} a year · ${subscriptionCountShort(data, f)}`}
+              caption={`${f.money(annualRecurring(data.subscriptions.data) ?? data.arr, { currency: customer.currency })} a year · ${subscriptionCountShort(data, f)}`}
             />
             <Headline
               label="Balance"
@@ -687,6 +775,12 @@ export function CustomerDetailPage() {
       <CreditDialog customer={customer.id} currency={customer.currency} open={dialog === 'credit'} onClose={() => setDialog(null)} />
       <SubscriptionCreateDialog open={dialog === 'subscription'} onClose={() => setDialog(null)} customer={customer.id} />
       <BillNowDialog open={dialog === 'bill'} onClose={() => setDialog(null)} customer={customer.id} />
+      <DeleteCustomerDialog
+        customer={customer}
+        open={dialog === 'delete'}
+        onClose={() => setDialog(null)}
+        onDeleted={() => { setDialog(null); navigate('/billing/customers'); }}
+      />
     </Page>
   );
 }
@@ -713,6 +807,19 @@ function accountHeadline(summary: CustomerSummary, f: BillingFormatter): string 
 }
 
 /**
+ * What the account still owes, as its own sentence after the collected figure
+ * — nothing when every bill raised has been settled. It is not part of the
+ * figure beside it, and the wording never suggests it is.
+ */
+function stillOwed(summary: CustomerSummary, f: BillingFormatter): string {
+  const open = summary.open_invoices.data.filter((row) => row.status === 'open');
+  if (open.length === 0) return '';
+  const owed = open.reduce((sum, row) => sum + row.amount_due, 0);
+  if (owed <= 0) return '';
+  return ` · ${f.money(owed, { currency: summary.lifetime_value.currency })} more is still owed`;
+}
+
+/**
  * The summary's attention lines, with the ids and enums taken out.
  *
  * The server writes them for any client — "Collection on sub_sGghNQZy96toyJYU
@@ -721,21 +828,28 @@ function accountHeadline(summary: CustomerSummary, f: BillingFormatter): string 
  * becomes the sentence the pause dialog itself uses.
  */
 function AttentionLine({ line, summary }: { line: string; summary: CustomerSummary }) {
-  const named = line
+  const named = pluraliseBrackets(line)
     .replace(/\(keep_as_draft\)/g, '— the invoices it raises are held as drafts')
     .replace(/\(void\)/g, '— the invoices it raises are voided')
     .replace(/\(mark_uncollectible\)/g, '— the invoices it raises are written off');
-  const parts = named.split(/(sub_[A-Za-z0-9]+)/g);
+  // Every record the sentence names is a link to it: the subscription by the
+  // plan it sells, the invoice by its number, so the banner is a next step
+  // rather than a diagnosis.
+  const parts = named.split(/(sub_[A-Za-z0-9]+|\b[A-Z]{2,4}-\d{4,}\b)/g);
   return (
     <>
       {parts.map((part, index) => {
-        if (!/^sub_[A-Za-z0-9]+$/.test(part)) return <span key={index}>{part}</span>;
-        const sub = summary.subscriptions.data.find((row) => row.id === part);
-        return (
-          <RecordLink key={index} to={subscriptionHref(part)}>
-            {sub?.items[0]?.description ?? sub?.description ?? part}
-          </RecordLink>
-        );
+        if (/^sub_[A-Za-z0-9]+$/.test(part)) {
+          const sub = summary.subscriptions.data.find((row) => row.id === part);
+          return (
+            <RecordLink key={index} to={subscriptionHref(part)}>
+              {sub?.items[0]?.description ?? sub?.description ?? part}
+            </RecordLink>
+          );
+        }
+        const invoice = /^[A-Z]{2,4}-\d{4,}$/.test(part) ? summary.open_invoices.data.find((row) => row.number === part) : null;
+        if (invoice) return <RecordLink key={index} to={invoiceHref(invoice.id)}>{part}</RecordLink>;
+        return <span key={index}>{part}</span>;
       })}
     </>
   );
@@ -902,6 +1016,15 @@ function OverviewTab({ summary, onNewSubscription }: { summary: CustomerSummary;
 function LedgerTab({ summary, onGrant }: { summary: CustomerSummary; onGrant: () => void }) {
   const f = useBillingFormat();
   const rows = summary.balance.transactions;
+  // The ledger carries invoice ids. Every other screen prints numbers, so the
+  // account's invoices are read once and the id is only the fallback for a
+  // bill that has since been removed.
+  const invoices = useQuery<ListEnvelope<Invoice>>('/v1/invoices', { customer: summary.customer.id, status: 'all', limit: 200 });
+  const numbers = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const invoice of invoices.data?.data ?? []) map.set(invoice.id, invoice.number);
+    return map;
+  }, [invoices.data]);
   return (
     <Card
       title="Balance ledger"
@@ -940,7 +1063,13 @@ function LedgerTab({ summary, onGrant }: { summary: CustomerSummary; onGrant: ()
                   <td className="bl-nowrap">{f.date(row.created, { withYear: true })}</td>
                   <td>
                     <div>{row.description}</div>
-                    {row.invoice && <div className="bl-lines__why"><RecordLink to={invoiceHref(row.invoice)} mono>{row.invoice}</RecordLink></div>}
+                    {row.invoice && (
+                      <div className="bl-lines__why">
+                        <RecordLink to={invoiceHref(row.invoice)} mono={!numbers.has(row.invoice)}>
+                          {numbers.get(row.invoice) ?? row.invoice}
+                        </RecordLink>
+                      </div>
+                    )}
                   </td>
                   <td><Badge tone="neutral">{humanize(row.type)}</Badge></td>
                   <td className="bl-num">

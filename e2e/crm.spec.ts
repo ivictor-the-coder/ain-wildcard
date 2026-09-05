@@ -25,6 +25,12 @@ const openList = async (page: Page, path: string) => {
 /** The grid's own row count, which is what "the list is showing this" means. */
 const rowCount = (page: Page) => page.locator('table tbody tr[data-index]').count();
 
+/** Export lives beside Import in one toolbar menu; this is the one gesture that reaches it. */
+const exportCsv = async (page: Page) => {
+  await page.getByRole('button', { name: 'Import / export' }).click();
+  return page.getByRole('menuitem', { name: /Export this view as CSV/ }).click();
+};
+
 const recordOf = async (request: APIRequestContext, type: string, id: string) =>
   (await (await request.get(`/api/v1/records/${type}/${id}`)).json()) as {
     id: string; display_name: string; owner_id: string | null;
@@ -42,21 +48,25 @@ test('the contact list renders the workspace’s own records, and every number o
   await expect(page.locator('.ain-page__subtitle')).toContainText(String(total));
   expect(await rowCount(page)).toBeGreaterThan(0);
 
-  // Money is never raw minor units. A deal's amount column must carry a
+  // Money is never raw minor units. A company's open-deal total must carry a
   // currency symbol and grouped thousands, not the integer the API stores —
-  // and in a grid the cents come off a whole-unit amount, so "$96,520" is
-  // right and "$9652000" would be the defect.
-  await openList(page, '/records/deal');
+  // "$1,164,240.00" is right and "116424000" would be the defect. (Deals
+  // themselves live on the pipeline's board now; the CRM's own money column
+  // is the rollup on the account.)
+  const views = (await (await page.request.get('/api/v1/views?object_type=company')).json()).data as { id: string; name: string }[];
+  await openList(page, `/companies?view=${views.find((v) => v.name.startsWith('Open pipeline'))!.id}`);
   const row = page.locator('table tbody tr[data-index]').first();
   const amount = row.locator('td').filter({ hasText: /[$€£]/ }).first();
   await expect(amount).toContainText(/[$€£]\d{1,3}(,\d{3})*(\.\d{2})?$/);
 
-  const first = (await (await page.request.post('/api/v1/records/deal/search', {
-    data: { limit: 1, sort: [{ property: 'amount', direction: 'desc' }] },
+  const first = (await (await page.request.post('/api/v1/records/company/search', {
+    data: { limit: 1, sort: [{ property: 'total_open_deal_value', direction: 'desc' }] },
   })).json()).data[0];
-  const minor = String(first.properties.amount);
-  const shown = (await amount.innerText()).replace(/[^\d]/g, '');
-  expect(shown).not.toBe(minor);
+  const minor = Number(first.properties.total_open_deal_value);
+  const me = await (await page.request.get('/api/v1/me')).json();
+  const expected = new Intl.NumberFormat(me.org.locale, { style: 'currency', currency: me.org.default_currency.toUpperCase() }).format(minor / 100);
+  await expect(amount).toHaveText(expected);
+  expect(expected).not.toBe(String(minor));
 });
 
 test('a saved view swaps the filter and the columns, and the server count follows it', async ({ page }) => {
@@ -183,7 +193,8 @@ test('logging a note writes an activity and it appears on the timeline', async (
 });
 
 test('an association added from the record page shows on both records, and can be removed', async ({ page }) => {
-  const deal = (await (await page.request.get('/api/v1/records/deal?limit=1')).json()).data[0];
+  // A ticket rather than a deal: the deal record is the pipeline's screen now.
+  const deal = (await (await page.request.get('/api/v1/records/ticket?limit=1')).json()).data[0];
   const contacts = (await (await page.request.get('/api/v1/records/contact?limit=40')).json()).data;
   const linked = new Set(
     ((await (await page.request.get(`/api/v1/associations?record_id=${deal.id}`)).json()).data as { record_id: string }[])
@@ -191,7 +202,7 @@ test('an association added from the record page shows on both records, and can b
   );
   const target = contacts.find((c: { id: string }) => !linked.has(c.id));
 
-  await page.goto(`/records/deal/${deal.id}`, { waitUntil: 'networkidle' });
+  await page.goto(`/tickets/${deal.id}`, { waitUntil: 'networkidle' });
   await page.getByRole('button', { name: 'Link another record' }).click();
   const dialog = page.getByRole('dialog');
   await dialog.getByLabel('What kind of record').selectOption('contact');
@@ -254,7 +265,7 @@ test('Export CSV hands over a real file whose money is a number and whose dates 
   await openList(page, '/companies');
   const [download] = await Promise.all([
     page.waitForEvent('download'),
-    page.getByRole('button', { name: 'Export CSV' }).click(),
+    exportCsv(page),
   ]);
   expect(download.suggestedFilename()).toMatch(/^Companies \d{4}-\d{2}-\d{2}\.csv$/);
 
@@ -591,7 +602,7 @@ test('the CSV carries the labels the grid shows, not the enum codes underneath',
   await openList(page, '/companies');
   const [download] = await Promise.all([
     page.waitForEvent('download'),
-    page.getByRole('button', { name: 'Export CSV' }).click(),
+    exportCsv(page),
   ]);
   const stream = await download.createReadStream();
   const chunks: Buffer[] = [];
@@ -1051,7 +1062,491 @@ test('the CSV is stamped with the workspace’s day, and still carries exact mon
 
   const [download] = await Promise.all([
     page.waitForEvent('download'),
-    page.getByRole('button', { name: 'Export CSV' }).click(),
+    exportCsv(page),
   ]);
   expect(download.suggestedFilename()).toBe(`Companies ${day}.csv`);
+});
+
+
+/* ======================= the critic's second pass ========================= */
+
+/**
+ * Each of these is a defect a fresh critic found on screen: a save that undid
+ * itself, a merge nobody could see into, a file the export promised could come
+ * back and could not, an admin surface offered to a member. The tests fail on
+ * the code as it stood.
+ */
+
+test('saving a sort onto the view keeps the grid on that sort, with nothing left over to mark Modified', async ({ page }) => {
+  const views = (await (await page.request.get('/api/v1/views?object_type=contact')).json()).data as { id: string; name: string }[];
+  const all = views.find((v) => v.name === 'All contacts')!;
+  // The seed's own sort, put back whatever an earlier run left behind.
+  const restore = () => page.request.patch(`/api/v1/views/${all.id}`, { data: { sort: [{ property: 'last_activity_at', direction: 'desc' }] } });
+  await restore();
+
+  await openList(page, '/contacts');
+  await page.getByRole('columnheader', { name: 'Job title' }).getByRole('button').click();
+  await page.waitForFunction(() => !document.querySelector('.ain-skeleton'));
+  await expect(page).toHaveURL(/s=job_title/);
+  const top = await page.locator('table tbody tr[data-index] .crm-cell__name').first().innerText();
+
+  await page.getByRole('button', { name: 'View', exact: true }).click();
+  await page.getByRole('menuitem', { name: /Save changes to this view/ }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Save changes' }).click();
+  await expect(page.getByRole('status', { name: 'View updated' })).toBeVisible();
+
+  try {
+    const saved = (await (await page.request.get(`/api/v1/views/${all.id}`)).json()) as { sort: { property: string }[] };
+    expect(saved.sort[0].property).toBe('job_title');
+    // The grid stays on what was just saved: same first row, the header still
+    // sorted on Job title, no override in the address bar, nothing "Modified".
+    await page.waitForTimeout(800);
+    await expect(page.locator('table tbody tr[data-index] .crm-cell__name').first()).toHaveText(top);
+    await expect(page.locator('table thead th[aria-sort]')).toContainText('Job title');
+    await expect(page).not.toHaveURL(/[?&]s=/);
+    await expect(page.locator('main').getByText('Modified', { exact: true })).toHaveCount(0);
+
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.waitForSelector('table tbody tr[data-index]');
+    await expect(page.locator('table tbody tr[data-index] .crm-cell__name').first()).toHaveText(top);
+    await expect(page.locator('main').getByText('Modified', { exact: true })).toHaveCount(0);
+  } finally {
+    await restore();
+  }
+});
+
+test('the filter dialog holds a draft: Esc discards it, Show applies it', async ({ page }) => {
+  await openList(page, '/contacts');
+  const total = (await (await page.request.get('/api/v1/records/contact?limit=1')).json()).total_count as number;
+
+  await page.getByRole('button', { name: /^Filters/ }).click();
+  let dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'Condition' }).click();
+  await dialog.locator('.crm-filter__field input').first().click();
+  await page.keyboard.type('Job title');
+  await page.keyboard.press('Enter');
+  await dialog.getByLabel('Operator').selectOption('contains');
+  await dialog.locator('.crm-filter__value input').first().click();
+  await page.keyboard.type('Chief');
+  await page.waitForTimeout(700);
+
+  // The button counts the draft; the grid behind the dialog is untouched.
+  const narrowed = (await (await page.request.post('/api/v1/records/contact/search', {
+    data: { filter: { property: 'job_title', operator: 'contains', value: 'Chief' }, limit: 1 },
+  })).json()).total_count as number;
+  await expect(dialog.locator('.ain-modal__footer button.ain-btn--primary')).toContainText(String(narrowed));
+  await expect(page.locator('.crm-tablefoot')).toContainText(`${total} contacts`);
+  await expect(page).not.toHaveURL(/[?&]f=/);
+
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page).not.toHaveURL(/[?&]f=/);
+  await expect(page.locator('.crm-activefilter')).toHaveCount(0);
+  await expect(page.locator('.crm-tablefoot')).toContainText(`${total} contacts`);
+
+  // Reopened, the discarded draft is gone; built again and applied, it lands.
+  await page.getByRole('button', { name: /^Filters/ }).click();
+  dialog = page.getByRole('dialog');
+  await expect(dialog.locator('.crm-filter__row')).toHaveCount(0);
+  await dialog.getByRole('button', { name: 'Condition' }).click();
+  await dialog.locator('.crm-filter__field input').first().click();
+  await page.keyboard.type('Job title');
+  await page.keyboard.press('Enter');
+  await dialog.getByLabel('Operator').selectOption('contains');
+  await dialog.locator('.crm-filter__value input').first().click();
+  await page.keyboard.type('Chief');
+  await page.waitForTimeout(700);
+  await dialog.locator('.ain-modal__footer button.ain-btn--primary').click();
+  await expect(page).toHaveURL(/[?&]f=/);
+  await expect(page.locator('.crm-activefilter')).toContainText('Job title contains Chief');
+  await expect(page.locator('.crm-tablefoot')).toContainText(`${narrowed} contacts`);
+});
+
+test('the merge dialog shows what survives and what moves, refuses a cross-account merge until acknowledged, and reports the real diff', async ({ page }) => {
+  const stamp = Date.now();
+  const companies = (await (await page.request.get('/api/v1/records/company?limit=2')).json()).data as { id: string; display_name: string }[];
+  const make = async (companyId: string, extra: Record<string, unknown>) => (await (await page.request.post('/api/v1/records/ticket', {
+    data: { properties: { subject: `Gateway drops offline overnight ${stamp}`, ...extra }, associate_to: [companyId] },
+  })).json()) as { id: string; properties: Record<string, unknown> };
+  const winner = await make(companies[0].id, { priority: 'medium' });
+  const loser = await make(companies[1].id, { priority: 'high', affected_line: 'Press shop A', status: 'closed' });
+
+  await page.goto(`/tickets/${winner.id}`, { waitUntil: 'networkidle' });
+  // Earlier runs leave same-named tickets behind; the candidate is the one
+  // with this run's stamp and the other account.
+  const card = page.locator('.crm-dupe').filter({ hasText: `overnight ${stamp}` }).filter({ hasText: companies[1].display_name });
+  // The candidate carries the facts that tell two same-named tickets apart.
+  await expect(card).toContainText('Same subject');
+  await card.getByRole('button', { name: 'Merge into this record' }).click();
+
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toContainText('belong to different accounts');
+  await expect(dialog.locator('.crm-mergetable')).toContainText('Affected line');
+  await expect(dialog.locator('.crm-mergetable tr', { hasText: 'Affected line' })).toContainText('Fills the blank');
+  await expect(dialog.locator('.crm-mergetable tr', { hasText: 'Priority' })).toContainText('Survivor keeps its own');
+  await expect(dialog.getByRole('row', { name: /^Status / })).toContainText('Survivor keeps its own');
+  await expect(dialog.locator('.crm-mergemoves__row', { hasText: companies[1].display_name })).toContainText('Moves across');
+  const merge = dialog.getByRole('button', { name: /^Merge into/ });
+  await expect(merge).toBeDisabled();
+  await dialog.getByRole('checkbox', { name: /merge anyway/ }).check();
+  await expect(merge).toBeEnabled();
+
+  const before = await recordOf(page.request, 'ticket', winner.id);
+  await merge.click();
+  const toast = page.getByRole('status', { name: 'Duplicate merged' });
+  await expect(toast).toBeVisible();
+
+  // The sentence is computed from the survivor as it now stands, not from the
+  // server's count of blanks it meant to fill.
+  const after = await recordOf(page.request, 'ticket', winner.id);
+  const changed = [...new Set([...Object.keys(before.properties), ...Object.keys(after.properties)])]
+    .filter((k) => JSON.stringify(before.properties[k] ?? null) !== JSON.stringify(after.properties[k] ?? null)).length;
+  const said = Number(/(\d+) propert/.exec(await toast.innerText())?.[1]);
+  expect(said).toBe(changed);
+  expect(after.properties.affected_line).toBe('Press shop A');
+  expect(after.properties.priority).toBe('medium');
+  expect((await (await page.request.get(`/api/v1/records/ticket/${loser.id}`)).json()).id).toBe(winner.id);
+});
+
+test('a CSV imports through mapping and preview, and every refused row names the property and the reason', async ({ page }) => {
+  const stamp = Date.now();
+  await openList(page, '/contacts');
+  await page.getByRole('button', { name: 'Import / export' }).click();
+  await page.getByRole('menuitem', { name: /Import from a CSV/ }).click();
+  const dialog = page.getByRole('dialog');
+
+  const csv = [
+    'First name,Last name,E-mail,Job title,Owner,Lifecycle stage',
+    `Ingrid,Halvorsen ${stamp},ingrid.${stamp}@nordhavn.example,Plant Manager,Marcus Ilori,Lead`,
+    `Piet,de Vries ${stamp},not-an-email,Buyer,Dana Whitfield,Customer`,
+    `Aiko,Sato ${stamp},aiko.${stamp}@example.com,,Nobody Here,Lead`,
+  ].join('\r\n');
+  await dialog.locator('input[type=file]').setInputFiles({ name: 'contacts.csv', mimeType: 'text/csv', buffer: Buffer.from(csv) });
+
+  // Headers mapped themselves — the export's labels, punctuation and all.
+  await expect(dialog.getByLabel('Import "E-mail" as')).toHaveValue('email');
+  await expect(dialog.getByLabel('Import "Owner" as')).toHaveValue('owner_id');
+  await expect(dialog.getByLabel('How to treat existing records')).toHaveValue('upsert');
+  await dialog.getByRole('button', { name: /^Check 3 rows/ }).click();
+
+  // The preview holds back the row it cannot write, and says which cell.
+  await expect(dialog).toContainText('2 ready');
+  await expect(dialog).toContainText('Row 3, Owner: No teammate called "Nobody Here"');
+  await dialog.getByRole('button', { name: /^Import 2 contacts/ }).click();
+
+  await expect(dialog).toContainText('1 created');
+  await expect(dialog).toContainText('2 refused');
+  const refused = dialog.locator('table[aria-label="Refused rows"] tbody tr');
+  await expect(refused).toHaveCount(2);
+  await expect(refused.nth(0)).toContainText('Email');
+  await expect(refused.nth(0)).toContainText('not a valid email');
+  await expect(refused.nth(1)).toContainText('Owner');
+
+  const found = (await (await page.request.post('/api/v1/records/contact/search', { data: { query: String(stamp), limit: 5 } })).json()) as
+    { total_count: number; data: { properties: Record<string, unknown>; owner_id: string; source: string }[] };
+  expect(found.total_count).toBe(1);
+  expect(found.data[0].properties.email).toBe(`ingrid.${stamp}@nordhavn.example`);
+  expect(found.data[0].properties.lifecycle_stage).toBe('lead');
+  expect(found.data[0].source).toBe('import');
+  const users = (await (await page.request.get('/api/v1/users')).json()).data as { id: string; name: string }[];
+  expect(found.data[0].owner_id).toBe(users.find((u) => u.name === 'Marcus Ilori')!.id);
+});
+
+test('a member sees the data model read-only, with the reason, instead of forms that fail at the end', async ({ page }) => {
+  const login = await page.request.post('/api/v1/auth/login', { data: { email: 'priya@northwind.io', password: 'demo1234' } });
+  expect(login.ok()).toBe(true);
+  expect(((await (await page.request.get('/api/v1/me')).json()) as { role: string }).role).toBe('member');
+
+  await page.goto('/records', { waitUntil: 'networkidle' });
+  await expect(page.locator('.ain-banner')).toContainText('Read-only for your role');
+  await expect(page.getByRole('button', { name: 'Add a property' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'New custom object' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'New association type' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /^Manage / })).toHaveCount(0);
+  // The model itself is still there to read.
+  await expect(page.locator('.crm-objcard')).not.toHaveCount(0);
+  await expect(page.getByText('first_name')).toBeVisible();
+});
+
+test('every property row opens its own history, from → to with who', async ({ page }) => {
+  const stamp = Date.now();
+  const created = (await (await page.request.post('/api/v1/records/contact', {
+    data: { properties: { first_name: 'Hilde', last_name: `Historian ${stamp}`, email: `hilde.${stamp}@example.com`, job_title: 'Plant Manager' } },
+  })).json()) as { id: string };
+  await page.goto(`/contacts/${created.id}`, { waitUntil: 'networkidle' });
+
+  await page.getByRole('button', { name: 'Edit Job title' }).click();
+  const editor = page.locator('#edit-job_title');
+  await editor.press('Control+a');
+  await page.keyboard.type('Head of Reliability');
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('status', { name: 'Job title updated' })).toBeVisible();
+
+  const row = page.locator('.crm-prop', { hasText: 'Job title' }).first();
+  await row.hover();
+  await row.getByRole('button', { name: 'History of Job title' }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toContainText('Job title — history');
+  const change = dialog.locator('.crm-history tbody tr').first();
+  await expect(change.locator('.crm-history__from')).toContainText('Plant Manager');
+  await expect(change.locator('.crm-history__to')).toContainText('Head of Reliability');
+  await expect(change).toContainText('Dana Whitfield');
+
+  const history = (await (await page.request.get(`/api/v1/records/contact/${created.id}/history?property=job_title`)).json()).data as
+    { from_value: unknown; to_value: unknown }[];
+  expect(history[0].to_value).toBe('Head of Reliability');
+  expect(history[0].from_value).toBe('Plant Manager');
+});
+
+test('tickets have their own address, and an SLA reads as a state rather than a date', async ({ page }) => {
+  await page.goto('/records/ticket', { waitUntil: 'networkidle' });
+  await expect(page).toHaveURL(/\/tickets$/);
+  await page.waitForSelector('table tbody tr[data-index]');
+  await expect(page.locator('.ain-crumbs')).not.toContainText('Data model');
+
+  await page.getByRole('button', { name: 'SLA at risk' }).click();
+  await page.waitForFunction(() => !document.querySelector('.ain-skeleton'));
+  const cells = page.locator('table tbody tr[data-index] .ain-badge', { hasText: /Overdue by|Due in|Due / });
+  await expect(cells.first()).toBeVisible();
+  // Every row in this view is past or inside its target: none of them is a bare date.
+  const rows = await rowCount(page);
+  expect(await cells.count()).toBe(rows);
+
+  const ticket = (await (await page.request.get('/api/v1/records/ticket?limit=1')).json()).data[0] as { id: string };
+  await page.goto(`/records/ticket/${ticket.id}`, { waitUntil: 'networkidle' });
+  await expect(page).toHaveURL(new RegExp(`/tickets/${ticket.id}$`));
+});
+
+test('a task logged on the timeline shows its status and can be completed from there', async ({ page }) => {
+  const stamp = Date.now();
+  const contact = (await (await page.request.get('/api/v1/records/contact?limit=1')).json()).data[0] as { id: string };
+  await page.goto(`/contacts/${contact.id}`, { waitUntil: 'networkidle' });
+
+  await page.getByRole('button', { name: 'Task', exact: true }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('What needs doing').fill(`Send the pilot SOW ${stamp}`);
+  await dialog.getByRole('button', { name: 'Create a task' }).click();
+
+  const item = page.locator('.crm-tl', { hasText: `Send the pilot SOW ${stamp}` });
+  await expect(item.locator('.ain-badge', { hasText: 'Task' })).toBeVisible();
+  await expect(item).toContainText('Not started');
+  await item.getByRole('button', { name: 'Mark complete' }).click();
+  await expect(page.getByRole('status', { name: 'Task completed' })).toBeVisible();
+  await expect(item).toContainText('Completed');
+
+  const tasks = (await (await page.request.post('/api/v1/records/task/search', { data: { query: String(stamp), limit: 2 } })).json()) as
+    { data: { properties: Record<string, unknown> }[] };
+  expect(tasks.data[0].properties.status).toBe('completed');
+});
+
+test('a rollup names its basis in words, filter included, and counts the records it stands on', async ({ page }) => {
+  const company = await recordOf(page.request, 'company', 'cmp_nw_07');
+  await page.goto('/companies/cmp_nw_07', { waitUntil: 'networkidle' });
+  await page.locator('.ain-accordion__trigger', { hasText: 'Pipeline' }).click();
+
+  const row = page.locator('.crm-prop', { hasText: 'Total open deal value' });
+  await expect(row.locator('.crm-prop__basis')).toContainText(/Sum of Amount over deals where .*Open/);
+  await expect(row.locator('.crm-prop__basis')).toContainText(`${company.properties.open_deal_count} deals`);
+  await expect(row.locator('.crm-prop__basis a')).toHaveAttribute('href', /\/deals\?q=/);
+});
+
+test('the record page’s property groups each control their own panel', async ({ page }) => {
+  await page.goto('/companies/cmp_nw_07', { waitUntil: 'networkidle' });
+  await page.waitForSelector('.ain-accordion__trigger');
+  const targets = await page.locator('.ain-accordion__trigger').evaluateAll((els) => els.map((el) => el.getAttribute('aria-controls')));
+  expect(new Set(targets).size).toBe(targets.length);
+  expect(await page.locator('#acc-only').count()).toBe(0);
+});
+
+/* ============================ activity records ============================ */
+
+test('a note’s own page shows what it was logged on, and offers nothing only a record can do', async ({ page }) => {
+  const stamp = Date.now();
+  const note = (await (await page.request.post('/api/v1/records/contact/con_nw_143/activities', {
+    data: { type: 'note', subject: `Site walk recap ${stamp}`, body: 'Two lines down, one integrator on site.' },
+  })).json()) as { id: string };
+
+  await page.goto(`/notes/${note.id}`, { waitUntil: 'networkidle' });
+  // The rail is the records it was logged on, under a heading that says so —
+  // not "Not linked to anything yet" beside a timeline saying the opposite.
+  const rail = page.locator('.ain-card', { hasText: 'Logged on' }).first();
+  await expect(rail.locator('.crm-assoc__row')).toContainText('Carmen Escamilla');
+  await expect(page.getByText('Not linked to anything yet')).toHaveCount(0);
+  await expect(page.locator('.ain-page__subtitle')).toContainText('Logged on Carmen Escamilla');
+  // Nothing is logged *on* a note, and two notes are never a duplicate.
+  const header = page.locator('.ain-page__actions');
+  for (const kind of ['Note', 'Call', 'Meeting', 'Email', 'Task']) {
+    await expect(header.getByRole('button', { name: kind, exact: true })).toHaveCount(0);
+  }
+  await expect(page.locator('.ain-card', { hasText: 'Possible duplicates' })).toHaveCount(0);
+  await header.getByRole('button', { name: 'More actions on this record' }).click();
+  await expect(page.getByRole('menuitem', { name: /Merge a duplicate/ })).toHaveCount(0);
+  await page.keyboard.press('Escape');
+  // It crumbs under Notes, and the generic address hands over to its own.
+  const crumbs = page.locator('nav[aria-label="Breadcrumb"]');
+  await expect(crumbs).toContainText('Notes');
+  await expect(crumbs).not.toContainText('Data model');
+  await expect(crumbs.locator('[aria-current="page"]')).toHaveText(`Site walk recap ${stamp}`);
+  await page.goto(`/records/note/${note.id}`, { waitUntil: 'networkidle' });
+  await expect(page).toHaveURL(new RegExp(`/notes/${note.id}$`));
+});
+
+test('the task queue has an address of its own, out from under the data model', async ({ page }) => {
+  await page.goto('/records/task', { waitUntil: 'networkidle' });
+  await expect(page).toHaveURL(/\/tasks$/);
+  await page.waitForSelector('table tbody tr[data-index]');
+  const crumbs = page.locator('nav[aria-label="Breadcrumb"]');
+  await expect(crumbs).not.toContainText('Data model');
+  await expect(crumbs.locator('[aria-current="page"]')).toHaveText('Tasks');
+  await expect(page).toHaveTitle(/Tasks/);
+});
+
+test('an unknown object slug gets the door to the data model, not a server-error banner', async ({ page }) => {
+  await page.goto('/records/gadget', { waitUntil: 'networkidle' });
+  await expect(page.locator('.ain-empty__title')).toContainText('No object type called “gadget”');
+  await expect(page.getByRole('button', { name: 'Try again' })).toHaveCount(0);
+  await expect(page.locator('.ain-page')).not.toContainText(/req_[A-Za-z0-9]+/);
+  await page.getByRole('button', { name: 'Open the data model' }).click();
+  await expect(page).toHaveURL(/\/records$/);
+});
+
+test('Esc cancels a picklist edit the way it cancels a text edit', async ({ page }) => {
+  const before = await recordOf(page.request, 'contact', 'con_nw_143');
+  await page.goto('/contacts/con_nw_143', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Edit Seniority' }).click();
+  const picker = page.locator('.crm-prop--editing [role="combobox"]');
+  // Focus lands in the picker and its list opens; the first Esc is the list's.
+  await expect(picker).toBeFocused();
+  await expect(picker).toHaveAttribute('aria-expanded', 'true');
+  await page.keyboard.press('Escape');
+  await expect(picker).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.locator('.crm-prop--editing')).toHaveCount(1);
+  // With the list closed, Esc leaves edit mode — and writes nothing.
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.crm-prop--editing')).toHaveCount(0);
+  const after = await recordOf(page.request, 'contact', 'con_nw_143');
+  expect(after.properties.seniority).toEqual(before.properties.seniority);
+});
+
+test('a view kept to yourself stays out of a teammate’s view bar, and their link to it falls back with a word', async ({ browser, page }) => {
+  const stamp = Date.now();
+  const mine = (await (await page.request.post('/api/v1/views', {
+    data: { object_type: 'contact', name: `Dana only ${stamp}`, shared: false, columns: ['first_name', 'email'] },
+  })).json()) as { id: string };
+  await openList(page, `/contacts?view=${mine.id}`);
+  await expect(page.getByRole('button', { name: `Dana only ${stamp}` })).toBeVisible();
+
+  const context = await browser.newContext();
+  const sofia = await context.newPage();
+  await sofia.goto('/', { waitUntil: 'domcontentloaded' });
+  await sofia.request.post('/api/v1/auth/login', { data: { email: 'sofia@northwind.io', password: 'demo1234' } });
+  await openList(sofia, '/contacts');
+  await expect(sofia.getByRole('button', { name: `Dana only ${stamp}` })).toHaveCount(0);
+  await sofia.goto(`/contacts?view=${mine.id}`, { waitUntil: 'networkidle' });
+  await expect(sofia.getByRole('status', { name: 'That view is not available' })).toBeVisible();
+  await expect(sofia).not.toHaveURL(new RegExp(`view=${mine.id}`));
+  await expect(sofia.locator('.ain-page__subtitle')).toContainText('All contacts');
+  await context.close();
+});
+
+test('a link to a deleted view says so and opens the default instead of keeping the dead id', async ({ page }) => {
+  await page.goto('/contacts?view=view_gone_for_good', { waitUntil: 'networkidle' });
+  await expect(page.getByRole('status', { name: 'That view is not available' })).toBeVisible();
+  await expect(page).not.toHaveURL(/view=view_gone_for_good/);
+  await page.waitForSelector('table tbody tr[data-index]');
+  await expect(page.locator('.ain-page__subtitle')).toContainText('All contacts');
+});
+
+test('the roll-up does not attribute a contact’s own notes to their company', async ({ page }) => {
+  const record = (await (await page.request.get('/api/v1/records/contact/con_nw_143')).json()) as
+    { associations: { association_type: string; record_id: string }[] };
+  const own = new Set(record.associations.filter((a) => a.association_type === 'activity_to_record').map((a) => a.record_id));
+  const timeline = (await (await page.request.get('/api/v1/records/contact/con_nw_143/timeline?roll_up=true&limit=30')).json()) as
+    { data: { record_id: string; via: unknown }[] };
+  const direct = timeline.data.filter((i) => i.via && own.has(i.record_id)).length;
+  const foreign = timeline.data.filter((i) => i.via && !own.has(i.record_id)).length;
+  expect(direct, 'the API still marks some of Carmen’s own notes as via her company').toBeGreaterThan(0);
+
+  await page.goto('/contacts/con_nw_143', { waitUntil: 'networkidle' });
+  await page.waitForSelector('ol.crm-timeline');
+  await expect(page.locator('.crm-tl__foot a', { hasText: /^via / })).toHaveCount(foreign);
+});
+
+test('a ticket says how long it has been in its status, matching its stage history', async ({ page }) => {
+  const history = (await (await page.request.get('/api/v1/records/ticket/tkt_nw_07/stage-history')).json()) as
+    { data: { is_current: boolean; stage_label: string; days_in_stage: number }[] };
+  const current = history.data.find((s) => s.is_current)!;
+  const span = current.days_in_stage === 0 ? 'Less than a day' : `${current.days_in_stage} ${current.days_in_stage === 1 ? 'day' : 'days'}`;
+
+  await page.goto('/tickets/tkt_nw_07', { waitUntil: 'networkidle' });
+  await expect(page.locator('.ain-page__subtitle')).toContainText(`${span} in ${current.stage_label}`);
+  const card = page.locator('.ain-card', { hasText: 'Status history' });
+  await expect(card.locator('.crm-spell.is-current')).toContainText(current.stage_label);
+  await expect(card.locator('.crm-spell')).toHaveCount(history.data.length);
+});
+
+test('the merge preview compares stamps as dates, and a merged-in visit names no id in prose', async ({ page }) => {
+  const stamp = Date.now();
+  const make = async (extra: Record<string, unknown>) => (await (await page.request.post('/api/v1/records/ticket', {
+    data: { properties: { subject: `Conveyor PLC fault ${stamp}`, ...extra } },
+  })).json()) as { id: string };
+  const now = (await (await page.request.get('/api/v1/me')).json()).clock.now as number;
+  const day = 24 * 60 * 60 * 1000;
+  const winner = await make({ priority: 'medium', first_response_at: now - 3 * day });
+  const loser = await make({ priority: 'urgent', first_response_at: now - 200 * day });
+
+  await page.goto(`/tickets/${winner.id}`, { waitUntil: 'networkidle' });
+  const card = page.locator('.crm-dupe').filter({ hasText: `fault ${stamp}` }).first();
+  await card.getByRole('button', { name: 'Merge into this record' }).click();
+  const dialog = page.getByRole('dialog');
+  const due = dialog.locator('.crm-mergetable tr', { hasText: 'First response' });
+  await expect(due).toHaveCount(1);
+  // Two stamps side by side read as dates — "Sep 2, 2026, 9:00 AM" — never as
+  // "3 days ago" against "7 months ago".
+  for (const cell of [due.locator('td').nth(0), due.locator('td').nth(1)]) {
+    const text = await cell.innerText();
+    expect(text).toMatch(/\d{4}/);
+    expect(text).not.toMatch(/\bago\b|last week|yesterday|in \d+ (days|hours)/);
+  }
+  await dialog.getByRole('button', { name: /^Merge into/ }).click();
+  await expect(page.getByRole('status', { name: 'Duplicate merged' })).toBeVisible();
+
+  await page.goto(`/tickets/${loser.id}`, { waitUntil: 'networkidle' });
+  const subtitle = page.locator('.ain-page__subtitle');
+  await expect(subtitle).toContainText('reached through a duplicate merged into this record');
+  await expect(subtitle).not.toContainText(loser.id);
+});
+
+test('the filter chip names the record an association condition is pinned to', async ({ page }) => {
+  const filter = { op: 'and', filters: [{ association: 'company', where: { property: 'id', operator: 'eq', value: 'cmp_nw_07' }, operator: 'gt', value: 0 }] };
+  const encoded = Buffer.from(JSON.stringify(filter)).toString('base64url');
+  const company = await recordOf(page.request, 'company', 'cmp_nw_07');
+  await openList(page, `/contacts?f=${encoded}`);
+  await expect(page.locator('.crm-activefilter')).toContainText(`linked to company ${company.display_name}`);
+  await expect(page.locator('.crm-activefilter')).not.toContainText('number of companies');
+  const expected = await (await page.request.post('/api/v1/records/contact/search', { data: { filter, limit: 1 } })).json();
+  await expect(page.locator('.ain-page__subtitle')).toContainText(`${expected.total_count} contacts`);
+});
+
+test('the company rail does not badge every deal “Deals”, and the data model cards pluralise', async ({ page }) => {
+  await page.goto('/companies/cmp_nw_07', { waitUntil: 'networkidle' });
+  const deals = page.locator('.crm-assoc', { has: page.locator('.crm-assoc__head', { hasText: 'Deals' }) });
+  await expect(deals.locator('.crm-assoc__row').first()).toBeVisible();
+  await expect(deals.locator('.crm-assoc__row .ain-badge', { hasText: /^Deals$/ })).toHaveCount(0);
+  const contacts = page.locator('.crm-assoc', { has: page.locator('.crm-assoc__head', { hasText: 'Contacts' }) });
+  await expect(contacts.locator('.crm-assoc__row .ain-badge', { hasText: 'Employs' }).first()).toBeVisible();
+
+  const stamp = Date.now();
+  const created = (await (await page.request.post('/api/v1/objects', {
+    data: { name: `gizmo_${stamp}`, label: `Gizmo ${stamp}`, plural_label: `Gizmos ${stamp}` },
+  })).json()) as { name: string };
+  const objects = (await (await page.request.get('/api/v1/objects')).json()).data as
+    { name: string; plural_label: string; record_count: number; property_count: number }[];
+  const mine = objects.find((o) => o.name === created.name)!;
+  await page.goto('/records', { waitUntil: 'networkidle' });
+  const stats = page.locator('.crm-objcard', { hasText: mine.plural_label }).locator('.crm-objcard__stats');
+  await expect(stats).toContainText(`${mine.record_count} ${mine.record_count === 1 ? 'record' : 'records'}`);
+  await expect(stats).toContainText(`${mine.property_count} ${mine.property_count === 1 ? 'property' : 'properties'}`);
+  await expect(page.locator('.crm-objcard__stats', { hasText: /\b1 (records|properties)\b/ })).toHaveCount(0);
+  await page.request.delete(`/api/v1/objects/${created.name}`);
 });

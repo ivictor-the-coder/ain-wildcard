@@ -19,10 +19,17 @@
 @media (max-height: 760px) {
   .cp-shell { min-height: 0; }
 }
+/* Below the breakpoint the rail stacks above the stream — and the shell keeps
+   its measured height, so the composer stays pinned to the bottom of the
+   window instead of being pushed under it. The rail opens on demand: at 1024
+   wide the conversation list was taking 280px of a 768px window and the box
+   you type in was entirely off-screen. */
+.cp-rail__toggle { display: none; }
 @media (max-width: 1080px) {
-  .cp-shell { grid-template-columns: 1fr; height: auto; min-height: 0; }
-  .cp-rail { max-height: 280px; }
-  .cp-stream { max-height: 60vh; }
+  .cp-shell { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); min-height: 0; }
+  .cp-rail { max-height: 40vh; }
+  .cp-rail__toggle { display: inline-flex; }
+  .cp-rail.is-collapsed > .ain-card__body { display: none; }
 }
 
 /**
@@ -672,6 +679,7 @@ a.cp-chip { text-decoration: none; }
   background: var(--bg-sunken);
 }
 .cp-resolution.is-written { border-left-color: var(--border-success); }
+.cp-resolution.is-scheduled { border-left-color: var(--border-info); }
 .cp-resolution__head { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
 .cp-resolution__line {
   margin: 0;
@@ -693,4 +701,49 @@ a.cp-chip { text-decoration: none; }
   text-transform: uppercase;
   letter-spacing: var(--tracking-wide);
   color: var(--text-tertiary);
+}
+
+/* ------------------------------ record entry ------------------------------ */
+
+/* An empty thread opened from a record: the record's name over the four
+   questions the engine answers about it, each already worded for it. */
+.cp-about {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+.cp-about__name { font-weight: var(--weight-semibold); color: var(--text-primary); }
+
+/* --------------------------------- usage ---------------------------------- */
+
+.cp-usage { display: grid; gap: var(--space-6); }
+.cp-usage__tables { display: grid; gap: var(--space-6); grid-template-columns: 1fr; }
+
+/* --------------------------------- tools ---------------------------------- */
+
+.cp-tools { display: grid; gap: var(--space-3); }
+.cp-tool {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-2) var(--space-5);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+.cp-tool__name { font-size: var(--text-sm); font-weight: var(--weight-semibold); color: var(--text-primary); }
+.cp-tool__wire { font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--text-tertiary); margin-left: var(--space-3); }
+.cp-tool__desc { grid-column: 1 / -1; margin: 0; font-size: var(--text-sm); color: var(--text-secondary); line-height: var(--leading-normal); }
+.cp-tool__tags { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.cp-tool__guidance { grid-column: 1 / -1; }
+.cp-tool__guidance > summary { font-size: var(--text-xs); }
+.cp-tool__prompt {
+  margin: var(--space-2) 0 0;
+  padding-left: var(--space-5);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  line-height: var(--leading-normal);
 }

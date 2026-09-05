@@ -42,13 +42,16 @@ export interface OpenInvoice {
 
 /**
  * The extension point. It is deliberately tiny: this screen only ever asks
- * "what is still open for this customer, and how much have they been billed in
- * total?". A reader that cannot answer the second question falls back to the
- * period ledger, which is why `lifetimeBilled` is optional.
+ * "what is still open for this customer, and what has actually been collected
+ * from them?". A reader that cannot answer the second question falls back to
+ * the period ledger, which is why the collection figures are optional.
  */
 export interface InvoiceReader {
   openInvoices(orgId: string, customerId: string): OpenInvoice[];
-  lifetimeBilled?(orgId: string, customerId: string): number;
+  /** Cash that settled the account's bills, net of refunds and chargebacks. */
+  lifetimeCollected?(orgId: string, customerId: string): number;
+  /** Cash collected past what a bill was owed and held as credit, net of what was since refunded. */
+  overpaymentCredit?(orgId: string, customerId: string): number;
 }
 
 export interface SubscriptionSummaryRow {
@@ -135,8 +138,19 @@ export interface CustomerSummary {
     transactions: BalanceTransaction[];
   };
   lifetime_value: {
+    /** Cash collected, net of refunds and credit notes — never an unpaid bill. */
     amount: number;
     currency: string;
+    /** What `amount` is, in the words the screen should use beside it. */
+    label: string;
+    /** How `amount` was arrived at, figure by figure. */
+    basis: string;
+    /** Cash that settled the account's bills. Refunds and chargebacks are already out of it. */
+    collected: number;
+    /** Collected past what a bill was owed and held as credit. */
+    overpaid: number;
+    /** Credit the account still holds — a credit note handed back after payment, a goodwill grant — which its next bill will spend. */
+    credit_held: number;
     periods_billed: number;
     customer_since: number | null;
     source: 'invoicing' | 'subscription_ledger';
@@ -228,12 +242,28 @@ export function buildCustomerSummary(
 
   /* ------------------------------ lifetime value --------------------------- */
 
+  // Lifetime value is money that arrived, not money that was asked for: an
+  // open bill is not value until it is paid, and a bill that was paid and then
+  // refunded or credited was value only briefly. `amount_paid` already has
+  // refunds, chargebacks and pre-payment credit notes taken out of it; what it
+  // cannot see is cash that landed on the account rather than on a bill (an
+  // overpayment) and credit the account still holds and will spend on its next
+  // bill (a credit note issued after payment, a goodwill grant). Once that
+  // credit is spent the next bill is smaller and collects less, so subtracting
+  // it while it is held — and only while it is held — counts it exactly once.
   const periods = billing.periods(orgId, { customer: customerId, to: now, limit: 2000 })
     .filter((p) => p.status === 'billed');
   const ledgerValue = periods.reduce((total, p) => total + p.amount, 0)
     + billing.pendingItems(orgId, { customer: customerId, status: 'invoiced', limit: 500 })
       .reduce((total, item) => total + item.amount, 0);
-  const invoiced = reader.lifetimeBilled ? reader.lifetimeBilled(orgId, customerId) : null;
+  const collected = reader.lifetimeCollected ? reader.lifetimeCollected(orgId, customerId) : null;
+  const overpaid = reader.overpaymentCredit ? reader.overpaymentCredit(orgId, customerId) : 0;
+  const creditHeld = Math.max(0, -customer.balance);
+  // Credit can only hand back what came in: an account that has paid nothing
+  // and holds a goodwill grant is worth nothing so far, not less than nothing.
+  const cashIn = (collected ?? 0) + overpaid;
+  const creditDeducted = Math.min(creditHeld, cashIn);
+  const lifetimeValue = collected === null ? ledgerValue : cashIn - creditDeducted;
   const customerSince = subs.length ? Math.min(...subs.map((s) => s.start_date)) : null;
 
   /* ------------------------------- next invoice ---------------------------- */
@@ -414,11 +444,22 @@ export function buildCustomerSummary(
       transactions: billing.balanceTransactions(orgId, customerId, 10),
     },
     lifetime_value: {
-      amount: invoiced ?? ledgerValue,
+      amount: lifetimeValue,
       currency: customer.currency,
+      label: collected === null ? 'Billed, by the period ledger' : 'Collected, net of refunds and credit notes',
+      basis: collected === null
+        ? `${formatMoney(money(ledgerValue, customer.currency), { locale })} of periods billed on the subscription ledger. Nothing here has read the invoices, so refunds and credit notes are not taken off it.`
+        : `${formatMoney(money(collected, customer.currency), { locale })} settled ${customer.name}'s bills — refunds and chargebacks already taken back out, and a credit note taken off a bill before payment never collected at all`
+          + (overpaid > 0 ? `, plus ${formatMoney(money(overpaid, customer.currency), { locale })} collected past what a bill was owed and held as credit` : '')
+          + (creditDeducted > 0 ? `, less ${formatMoney(money(creditDeducted, customer.currency), { locale })} of credit the account still holds and will spend on its next bill` : '')
+          + (creditHeld > creditDeducted ? `. The account holds ${formatMoney(money(creditHeld, customer.currency), { locale })} of credit against bills it has not paid yet, which is a promise rather than money handed back` : '')
+          + '. An unpaid bill is not lifetime value until it is paid.',
+      collected: collected ?? ledgerValue,
+      overpaid,
+      credit_held: creditHeld,
       periods_billed: periods.length,
       customer_since: customerSince,
-      source: invoiced === null ? 'subscription_ledger' : 'invoicing',
+      source: collected === null ? 'subscription_ledger' : 'invoicing',
     },
     next_invoice: nextInvoice,
     open_invoices: {

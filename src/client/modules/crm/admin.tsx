@@ -14,6 +14,7 @@ import {
   humanize, iconByName, useFormat, useToast, type DataTableColumn, type MenuSection,
 } from '@/client/design';
 import { useRouter } from '@/client/kernel/router';
+import { useSession } from '@/client/kernel/session';
 import type { ApiClientError } from '@/client/kernel/api';
 import {
   createAssociationType, createObjectType, createProperty, crmChanged, deleteObjectType, deleteProperty,
@@ -24,6 +25,7 @@ import {
 import { FilterBuilder, pruneFilter } from './filter-builder';
 import { blamedProperty, errorMessage } from './dialogs';
 import { listHref } from './list';
+import { associationTypeName, slug } from './naming';
 import { optionTone } from './values';
 
 const PROPERTY_TYPES: { value: PropertyType; label: string; hint: string }[] = [
@@ -50,17 +52,19 @@ const ROLLUP_TYPES: PropertyType[] = ['number', 'currency', 'date', 'datetime'];
 
 const OPTION_COLORS = ['blue', 'violet', 'teal', 'green', 'amber', 'orange', 'red', 'pink', 'indigo', 'gray'];
 
-const slug = (input: string): string =>
-  input.toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40);
-
 /* ------------------------------- the surface ------------------------------ */
 
 export function DataModelPage() {
   const { location, setQuery, navigate } = useRouter();
+  const session = useSession();
   const objects = useObjectTypes();
   const schema = useSchema();
   const associations = useAssociationTypes();
   const f = useFormat();
+  // Every write on this page declares `roles: ['admin']` on the server. A
+  // member used to fill in a whole property form and learn that at the end;
+  // now the page says so first and the forms are simply not there.
+  const canEdit = ['owner', 'admin'].includes(session.me?.role ?? '');
 
   const list = useMemo(() => objects.data?.data ?? [], [objects.data]);
   const selectedName = location.query.type || list.find((t) => t.category === 'record')?.name || '';
@@ -89,8 +93,10 @@ export function DataModelPage() {
       title="Data model"
       eyebrow="Customers"
       width="wide"
-      subtitle="Every object, property and association in this workspace — editable, and live the moment it is saved."
-      actions={
+      subtitle={canEdit
+        ? 'Every object, property and association in this workspace — editable, and live the moment it is saved.'
+        : 'Every object, property and association in this workspace, as it stands.'}
+      actions={canEdit ? (
         <Inline gap={3}>
           <Button variant="ghost" iconLeft={<Icons.link size={14} />} onClick={() => setCreatingAssociation(true)}>
             New association type
@@ -99,8 +105,14 @@ export function DataModelPage() {
             New custom object
           </Button>
         </Inline>
-      }
+      ) : undefined}
     >
+      {!canEdit && session.me && (
+        <Banner tone="info" title="Read-only for your role">
+          Changing the data model — a new object, property or association type — needs an admin or the workspace owner.
+          You are signed in as {session.me.role === 'readonly' ? 'a read-only user' : `a${session.me.role === 'analyst' ? 'n' : ''} ${session.me.role}`}, so everything here is shown as it is.
+        </Banner>
+      )}
       {objects.error && (
         <Banner
           tone="danger"
@@ -134,9 +146,9 @@ export function DataModelPage() {
                   {!type.system && <Badge tone="purple" size="sm">Custom</Badge>}
                 </button>
                 <div className="crm-objcard__stats">
-                  <span>{f.number(type.record_count ?? 0)} records</span>
+                  <span>{f.plural(type.record_count ?? 0, 'record')}</span>
                   <span aria-hidden>·</span>
-                  <span>{f.number(type.property_count ?? 0)} properties</span>
+                  <span>{f.plural(type.property_count ?? 0, 'property')}</span>
                 </div>
                 <div className="crm-objcard__foot">
                   <Badge tone={type.category === 'activity' ? 'neutral' : 'info'} size="sm">{humanize(type.category)}</Badge>
@@ -144,7 +156,7 @@ export function DataModelPage() {
                   {/* An activity type has a list too — the calls, tasks and
                       notes queues are the same screen as contacts. */}
                   <Button size="sm" variant="ghost" onClick={() => navigate(listHref(type.name))}>Open list</Button>
-                  <MenuButton
+                  {canEdit && <MenuButton
                     size="sm"
                     label={`Manage ${type.plural_label}`}
                     icon={<Icons.more size={14} />}
@@ -163,7 +175,7 @@ export function DataModelPage() {
                         },
                       ],
                     }] satisfies MenuSection[]}
-                  />
+                  />}
                 </div>
               </Card>
             );
@@ -171,14 +183,14 @@ export function DataModelPage() {
         </Grid>
       )}
 
-      {selected && <PropertyAdmin objectType={selected} schema={schema.data} />}
+      {selected && <PropertyAdmin objectType={selected} schema={schema.data} canEdit={canEdit} />}
 
       <AssociationAdmin
         types={associations.data?.data ?? []}
         loading={associations.loading}
         error={associations.error}
         onRetry={associations.refetch}
-        onCreate={() => setCreatingAssociation(true)}
+        onCreate={canEdit ? () => setCreatingAssociation(true) : undefined}
       />
 
       <ObjectDialog
@@ -191,6 +203,7 @@ export function DataModelPage() {
         open={creatingAssociation}
         onClose={() => setCreatingAssociation(false)}
         objectTypes={list}
+        existing={associations.data?.data ?? []}
       />
 
       <ConfirmDialog
@@ -218,7 +231,7 @@ function sourceOf(property: PropertyDef): 'stored' | 'calculated' | 'rollup' {
   return 'stored';
 }
 
-function PropertyAdmin({ objectType, schema }: { objectType: ObjectTypeDef; schema: ReturnType<typeof useSchema>['data'] }) {
+function PropertyAdmin({ objectType, schema, canEdit }: { objectType: ObjectTypeDef; schema: ReturnType<typeof useSchema>['data']; canEdit: boolean }) {
   const toast = useToast();
   const props = useProperties(objectType.name);
   const [editing, setEditing] = useState<PropertyDef | null>(null);
@@ -299,13 +312,13 @@ function PropertyAdmin({ objectType, schema }: { objectType: ObjectTypeDef; sche
       <Card
         title={`${objectType.label} properties`}
         description={`${rows.length} properties. Formulas and rollups are recomputed across every existing record the moment they are saved.`}
-        actions={
+        actions={canEdit ? (
           <Inline gap={3}>
             <Button size="sm" variant="ghost" iconLeft={<Icons.table size={13} />} onClick={() => setCreating(true)}>
               Add a property
             </Button>
           </Inline>
-        }
+        ) : undefined}
         padding="none"
       >
         <DataTable<PropertyDef>
@@ -322,10 +335,10 @@ function PropertyAdmin({ objectType, schema }: { objectType: ObjectTypeDef; sche
             <EmptyState
               title="No properties yet"
               body={`${objectType.label} has no fields. Add the first one and it appears in every list, filter and form for this object.`}
-              action={<Button variant="primary" onClick={() => setCreating(true)}>Add a property</Button>}
+              action={canEdit ? <Button variant="primary" onClick={() => setCreating(true)}>Add a property</Button> : undefined}
             />
           }
-          rowActions={(row) => ([{
+          rowActions={canEdit ? (row) => ([{
             id: 'prop',
             items: [
               { id: 'edit', label: 'Edit this property', icon: <Icons.edit size={14} />, onSelect: () => setEditing(row) },
@@ -338,7 +351,7 @@ function PropertyAdmin({ objectType, schema }: { objectType: ObjectTypeDef; sche
                 onSelect: () => setConfirmDelete(row),
               },
             ],
-          }] satisfies MenuSection[])}
+          }] satisfies MenuSection[]) : undefined}
         />
       </Card>
 
@@ -737,7 +750,8 @@ function AssociationAdmin({ types, loading, error, onRetry, onCreate }: {
   loading: boolean;
   error: ApiClientError | null;
   onRetry: () => void;
-  onCreate: () => void;
+  /** Absent for roles that may not define one. */
+  onCreate?: () => void;
 }) {
   const columns: DataTableColumn<AssociationTypeDef>[] = [
     { id: 'name', header: 'Name', pinned: true, width: 220, accessor: (row) => row.name, cell: (row) => <span className="u-mono">{row.name}</span> },
@@ -751,8 +765,8 @@ function AssociationAdmin({ types, loading, error, onRetry, onCreate }: {
   return (
     <Card
       title="Association types"
-      description="How objects link to each other, and what the link reads as from both ends."
-      actions={<Button size="sm" variant="ghost" iconLeft={<Icons.plus size={13} />} onClick={onCreate}>New association type</Button>}
+      description="How objects link to each other, and what the link reads as from both ends. A type is permanent once defined — the API has no rename or delete for one yet — so check both labels before saving."
+      actions={onCreate ? <Button size="sm" variant="ghost" iconLeft={<Icons.plus size={13} />} onClick={onCreate}>New association type</Button> : undefined}
       padding="none"
     >
       <DataTable<AssociationTypeDef>
@@ -765,14 +779,14 @@ function AssociationAdmin({ types, loading, error, onRetry, onCreate }: {
         maxHeight={360}
         plain
         searchPlaceholder="Search association types…"
-        empty={<EmptyState title="No association types" body="Objects cannot be linked until one exists." action={<Button variant="primary" onClick={onCreate}>Define one</Button>} />}
+        empty={<EmptyState title="No association types" body="Objects cannot be linked until one exists." action={onCreate ? <Button variant="primary" onClick={onCreate}>Define one</Button> : undefined} />}
       />
     </Card>
   );
 }
 
-function AssociationDialog({ open, onClose, objectTypes }: {
-  open: boolean; onClose: () => void; objectTypes: ObjectTypeDef[];
+function AssociationDialog({ open, onClose, objectTypes, existing }: {
+  open: boolean; onClose: () => void; objectTypes: ObjectTypeDef[]; existing: AssociationTypeDef[];
 }) {
   const toast = useToast();
   const [label, setLabel] = useState('');
@@ -781,6 +795,9 @@ function AssociationDialog({ open, onClose, objectTypes }: {
   const [toObject, setToObject] = useState('');
   const [cardinality, setCardinality] = useState('many_to_many');
   const [name, setName] = useState('');
+  // Once the person has typed an internal name it is theirs; until then it
+  // follows the label and the two object types.
+  const [nameTouched, setNameTouched] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<ApiClientError | null>(null);
 
@@ -788,19 +805,21 @@ function AssociationDialog({ open, onClose, objectTypes }: {
     if (!open) return;
     const first = objectTypes.find((t) => t.category === 'record')?.name ?? '';
     setLabel(''); setInverseLabel(''); setFromObject(first); setToObject(first);
-    setCardinality('many_to_many'); setName(''); setError(null);
+    setCardinality('many_to_many'); setName(''); setNameTouched(false); setError(null);
   }, [open, objectTypes]);
 
+  const taken = useMemo(() => existing.map((t) => t.name), [existing]);
+  const derived = fromObject && toObject ? associationTypeName(fromObject, toObject, label, taken) : '';
   useEffect(() => {
-    if (!name && fromObject && toObject) setName(`${fromObject}_to_${toObject}`);
-  }, [fromObject, toObject, name]);
+    if (!nameTouched) setName(derived);
+  }, [derived, nameTouched]);
 
   const submit = async () => {
     setBusy(true);
     setError(null);
     try {
       await createAssociationType({
-        name: name || `${fromObject}_to_${toObject}`,
+        name: name || derived,
         from_object: fromObject,
         to_object: toObject,
         label,
@@ -840,8 +859,8 @@ function AssociationDialog({ open, onClose, objectTypes }: {
       {error && <Banner tone="danger" compact>{errorMessage(error)}</Banner>}
       <div className="crm-form">
         <div className="crm-form__grid">
-          <Field label="From" required><Select value={fromObject} onChange={(next) => { setFromObject(next); setName(''); }} options={options} /></Field>
-          <Field label="To" required><Select value={toObject} onChange={(next) => { setToObject(next); setName(''); }} options={options} /></Field>
+          <Field label="From" required><Select value={fromObject} onChange={setFromObject} options={options} /></Field>
+          <Field label="To" required><Select value={toObject} onChange={setToObject} options={options} /></Field>
         </div>
         <div className="crm-form__grid">
           <Field label="Reads as, from the left" required hint="“Works at”" error={error?.body.param === 'label' ? error.body.message : undefined}>
@@ -864,8 +883,12 @@ function AssociationDialog({ open, onClose, objectTypes }: {
               ]}
             />
           </Field>
-          <Field label="Internal name" error={error?.body.param === 'name' ? error.body.message : undefined}>
-            <Input value={name} onChange={(e) => setName(slug(e.target.value))} mono />
+          <Field
+            label="Internal name"
+            hint={nameTouched ? 'What the API and filters call it.' : `Derived from the label — ${taken.includes(name.replace(/_\d+$/, '')) && name !== name.replace(/_\d+$/, '') ? 'the plain name is taken, so this one steps aside' : 'edit it if you prefer'}.`}
+            error={error?.body.param === 'name' ? error.body.message : undefined}
+          >
+            <Input value={name} onChange={(e) => { setNameTouched(true); setName(slug(e.target.value)); }} mono />
           </Field>
         </div>
       </div>

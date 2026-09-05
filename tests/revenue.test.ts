@@ -784,6 +784,87 @@ describe('collections', () => {
     const byStatus = report.recovery.by_status.reduce((sum: number, row: any) => sum + row.campaigns, 0);
     assert.equal(byStatus, report.recovery.campaigns_started);
   });
+
+  test('the recovery rate is the payments module\'s own, so the two reports cannot disagree', async () => {
+    // One definition, read by both: recovered over recovered plus lost, across
+    // campaigns that have finished. This module used to divide by everything
+    // at risk — campaigns still recovering included — and published a second,
+    // lower rate for the same book.
+    // A campaign still recovering, so the old denominator and the new one
+    // cannot coincide: a card that refuses the first presentation opens one.
+    const customer = await ws.customer('Halting Hydraulics');
+    await ws.ok('POST', '/v1/payment_methods', {
+      type: 'card', customer: customer.id, brand: 'visa', exp_month: 4, exp_year: 2031, simulated_behavior: 'insufficient_funds',
+    });
+    await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price: 'growth_monthly' }] });
+    assert.equal((await ws.app.tick()).failed, 0);
+    // A day on, so the campaign's start is inside the range the report reads.
+    await ws.travelTo(ws.now() + DAY);
+
+    const summary = await ws.ok('GET', '/v1/dunning/summary');
+    const usd = summary.totals.find((row: any) => row.currency === 'usd');
+    assert.ok(usd, 'the seed has dollar campaigns');
+    assert.ok(usd.amount_at_risk >= GROWTH_MONTHLY, 'and at least one still recovering, or this proves nothing');
+    const report = await ws.ok('GET', '/v1/revenue/collections?currency=usd&months=60');
+    assert.equal(report.recovery.recovery_rate_basis, summary.recovery_rate_basis, 'the same sentence defines both');
+    assert.equal(report.recovery.recovery_rate.bps, usd.recovery_rate_bps);
+    assert.equal(report.recovery.amount_recovered, usd.recovered_amount);
+    assert.equal(
+      report.recovery.amount_at_risk, usd.recovered_amount + usd.lost_amount,
+      'decided money only: a campaign still recovering is in neither figure',
+    );
+    assert.equal(report.recovery.at_risk, usd.amount_at_risk, 'what is still being chased is the same balance on both');
+  });
+});
+
+/* ========================================================================== *
+ * 6b. Inputs a report refuses
+ * ========================================================================== */
+
+describe('inputs a report refuses', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 6, 15)); });
+  after(() => ws.close());
+
+  test('a currency that is not one is refused, not answered with zeros', async () => {
+    for (const path of ['/v1/revenue/mrr?currency=zzz', '/v1/revenue/summary?currency=ZZZ', '/v1/revenue/accounts?currency=xyz']) {
+      const res = await ws.call('GET', path);
+      assert.equal(res.status, 400, `${path} → ${res.status} ${JSON.stringify(res.body)}`);
+      assert.equal(res.body.error.code, 'parameter_invalid');
+      assert.equal(res.body.error.param, 'currency');
+      assert.match(res.body.error.message, /Invalid currency/);
+    }
+    const real = await ws.call('GET', '/v1/revenue/mrr?currency=jpy');
+    assert.equal(real.status, 200, 'a real currency the book does not bill in is a real, empty answer');
+    assert.equal(real.body.totals.mrr, 0);
+  });
+
+  test('a range that runs backwards is refused, not shrunk to a month', async () => {
+    const res = await ws.call('GET', '/v1/revenue/collections?from=2026-06-01&to=2026-01-01');
+    assert.equal(res.status, 400, JSON.stringify(res.body));
+    assert.equal(res.body.error.code, 'parameter_invalid');
+    assert.equal(res.body.error.param, 'from');
+    const forwards = await ws.call('GET', '/v1/revenue/collections?from=2026-01-01&to=2026-06-01');
+    assert.equal(forwards.status, 200);
+    assert.equal(forwards.body.series.length, 6);
+  });
+
+  test('the summary totals say which kind of figure each is', async () => {
+    const summary = await ws.ok('GET', '/v1/revenue/summary?currency=usd');
+    const deferred = await ws.ok('GET', '/v1/revenue/deferred?currency=usd');
+    const collections = await ws.ok('GET', '/v1/revenue/collections?currency=usd');
+    assert.equal(summary.totals.all_time.invoiced, deferred.totals.invoiced, 'recognition runs over every invoice ever raised');
+    assert.equal(summary.totals.all_time.recognised, deferred.totals.recognised);
+    assert.equal(summary.totals.in_range.billed, collections.totals.billed, 'cash is the range\'s');
+    assert.equal(summary.totals.in_range.collected, collections.totals.collected);
+    assert.equal(summary.totals.now.receivables, collections.totals.outstanding);
+    // The flat keys are kept and still mean what they meant.
+    assert.equal(summary.totals.invoiced, summary.totals.all_time.invoiced);
+    assert.equal(summary.totals.billed, summary.totals.in_range.billed);
+    assert.equal(summary.totals.mrr, summary.totals.now.mrr);
+    assert.match(summary.totals.note, /all_time/);
+    assert.match(summary.totals.note, /in_range/);
+  });
 });
 
 /* ========================================================================== *

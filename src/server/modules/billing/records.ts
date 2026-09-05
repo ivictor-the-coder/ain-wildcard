@@ -16,7 +16,7 @@ import {
 import type {
   AutomaticTax, AutomaticTaxStatus, BalanceTransaction, BalanceTransactionType, BilledPeriod,
   CancellationReason, CollectionMethod,
-  CreditNote, CreditNoteLine, CreditNoteReason, CreditNoteStatus,
+  CreditNote, CreditNoteLine, CreditNoteLineTaxAmount, CreditNoteReason, CreditNoteStatus,
   Customer, Invoice, InvoiceBillingReason, InvoiceLine, InvoiceLineKind, InvoiceLineSource,
   InvoiceLineTax, InvoiceStatus, LineTaxAmount, PaymentBehavior, PendingInvoiceItem, PendingItemStatus,
   PeriodStatus, Subscription, SubscriptionItem, SubscriptionStatus, TaxId, TaxIdVerification, TrialEndBehavior,
@@ -506,6 +506,42 @@ export function hydrateInvoiceLine(row: any): InvoiceLine {
   };
 }
 
+/**
+ * A credited line's per-jurisdiction tax. Notes written before the list
+ * existed carry one rate in their own columns; that rate is the list.
+ */
+function hydrateCreditNoteLineTaxes(row: any, amount: number, taxAmount: number): CreditNoteLineTaxAmount[] {
+  const stored = parseJson<Partial<CreditNoteLineTaxAmount>[]>(row.tax_amounts, []);
+  if (stored.length) {
+    return stored.map((entry) => ({
+      object: 'credit_note_line_tax_amount',
+      amount: Number(entry.amount ?? 0),
+      taxable_amount: Number(entry.taxable_amount ?? amount),
+      rate: entry.rate ?? null,
+      display_name: entry.display_name ?? null,
+      jurisdiction: entry.jurisdiction ?? null,
+      percentage: entry.percentage ?? null,
+      tax_type: (entry.tax_type as TaxType | null) ?? null,
+      behavior: (entry.behavior as TaxBehavior | null) ?? null,
+      reason: (entry.reason as TaxReason | null) ?? null,
+    }));
+  }
+  const legacy = row.tax_reason ?? row.tax_rate ?? row.tax_percentage;
+  if (legacy === null || legacy === undefined) return [];
+  return [{
+    object: 'credit_note_line_tax_amount',
+    amount: taxAmount,
+    taxable_amount: amount,
+    rate: row.tax_rate ?? null,
+    display_name: row.tax_display_name ?? null,
+    jurisdiction: null,
+    percentage: row.tax_percentage ?? null,
+    tax_type: null,
+    behavior: (row.tax_behavior as TaxBehavior | null) ?? null,
+    reason: (row.tax_reason as TaxReason | null) ?? null,
+  }];
+}
+
 export function hydrateCreditNoteLine(row: any): CreditNoteLine {
   const amount = Number(row.amount);
   const taxAmount = Number(row.tax_amount ?? 0);
@@ -519,6 +555,7 @@ export function hydrateCreditNoteLine(row: any): CreditNoteLine {
     quantity: Number(row.quantity),
     amount,
     tax_amount: taxAmount,
+    tax_amounts: hydrateCreditNoteLineTaxes(row, amount, taxAmount),
     amount_including_tax: amount + taxAmount,
     tax_rate: row.tax_rate ?? null,
     tax_percentage: row.tax_percentage ?? null,

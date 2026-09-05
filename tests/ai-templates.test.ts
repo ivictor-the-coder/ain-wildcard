@@ -481,6 +481,13 @@ function timelineOf(record: Rec, now: number): Expectation {
     `SELECT id, property, to_value, changed_at FROM crm_property_history WHERE org_id = ? AND record_id = ?`, ORG, record.id)) {
     items.push({ id: change.id, at: change.changed_at, title: `${change.property} changed to ${change.to_value ?? ''}` });
   }
+  // The links themselves are timeline items, as they are on the record's own timeline; activities are their own lane.
+  for (const link of app.db.all<{ id: string; created: number; nm: string }>(
+    `SELECT a.id, a.created, r.display_name AS nm FROM crm_associations a
+     JOIN crm_records r ON r.id = CASE WHEN a.from_id = ? THEN a.to_id ELSE a.from_id END
+     WHERE a.org_id = ? AND (a.from_id = ? OR a.to_id = ?) AND r.object_type NOT IN ('note', 'call', 'meeting', 'email', 'task')`, record.id, ORG, record.id, record.id)) {
+    items.push({ id: link.id, at: link.created, title: `Linked to ${link.nm}` });
+  }
   return {
     figures: [record.name],
     numbers: allow(record.name, ...items.flatMap((i) => [formatRelative(i.at, now), i.title])),
@@ -689,6 +696,136 @@ async function quoteOf(lookupKey: string, quantity: number): Promise<Expectation
   return { figures: [res.body.amount_display, n(quantity)], numbers: allow(res.body.amount_display, quantity) };
 }
 
+/* -------------------------------- revenue --------------------------------- */
+
+/** One of the revenue module's own reports, read the way a dashboard reads it. */
+async function revenueReport(path: string, months: number): Promise<Record<string, any>> {
+  const res = await app.handle({ method: 'GET', path, query: { months: String(months) }, auth: DANA });
+  assert.equal(res.status, 200, `${path} → ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+  return res.body;
+}
+/** The revenue tools' own default range: the twelve months the answer names. */
+const TRAILING = 12;
+const monthsBack = (w: Window, now: number): number => utcMonth(now) - utcMonth(w.start) + 1;
+const monthKeyOf = (ts: number): string => new Date(ts).toISOString().slice(0, 7);
+const addAll = (numbers: Set<number>, ...values: unknown[]): void => { for (const v of allow(...values)) numbers.add(v); };
+
+type Bucket = 'net' | 'all' | 'new_business' | 'expansion' | 'reactivation' | 'resumed' | 'contraction' | 'churn' | 'paused';
+const BUCKETS: Exclude<Bucket, 'net' | 'all'>[] = ['new_business', 'expansion', 'reactivation', 'resumed', 'contraction', 'churn', 'paused'];
+const MOVER_KIND: Record<string, Bucket> = { new: 'new_business', expansion: 'expansion', reactivation: 'reactivation', resumed: 'resumed', contraction: 'contraction', churn: 'churn', paused: 'paused' };
+interface MoverRow { name: string; kind: string; amount: number; currency: string }
+
+/**
+ * One bucket of the MRR bridge over a window, from GET /v1/revenue/movement:
+ * the months inside the window, summed per currency and never across, with
+ * the accounts the report names as movers. The whole bridge states every
+ * book's opening and closing; the net states the net.
+ */
+async function movementOf(w: Window, now: number, bucket: Bucket): Promise<Expectation> {
+  const body = await revenueReport('/v1/revenue/movement', monthsBack(w, now));
+  const rows = (body.series as { month: string; by_currency: Record<string, number | string>[]; top_movers: MoverRow[] }[])
+    .filter((r) => r.month >= monthKeyOf(w.start) && r.month < monthKeyOf(w.end));
+  assert.ok(rows.length, `fixture: the bridge has months inside ${w.label}`);
+  const books = new Map<string, Record<string, number>>();
+  for (const row of rows) {
+    for (const slice of row.by_currency) {
+      const currency = String(slice.currency);
+      const held = books.get(currency) ?? { opening: num(slice.opening), closing: 0, net: 0, new_business: 0, expansion: 0, reactivation: 0, resumed: 0, contraction: 0, churn: 0, paused: 0 };
+      for (const key of ['net', ...BUCKETS]) held[key] += num(slice[key]);
+      held.closing = num(slice.closing);
+      books.set(currency, held);
+    }
+  }
+  const movers = rows.flatMap((r) => r.top_movers);
+  const numbers = allow(w.label, ...rows.map((r) => r.month.slice(0, 4)), ...movers.flatMap((m) => [m.name, money2(Math.abs(m.amount), m.currency)]));
+  for (const [currency, book] of books) addAll(numbers, ...Object.values(book).map((v) => money2(v, currency)));
+  const figures: (string | RegExp)[] = [];
+  if (bucket === 'all') for (const [currency, book] of books) figures.push(money2(book.opening, currency), money2(book.closing, currency));
+  else if (bucket === 'net') for (const [currency, book] of books) figures.push(money2(Math.abs(book.net), currency));
+  else {
+    const moved = [...books].filter(([, book]) => book[bucket] !== 0);
+    figures.push(...(moved.length ? moved.map(([currency, book]) => money2(book[bucket], currency)) : [/^No MRR /]));
+  }
+  const named = bucket === 'all' || bucket === 'net' ? movers : movers.filter((m) => MOVER_KIND[m.kind] === bucket);
+  return { figures, numbers, also: (body) => { for (const m of named) assert.ok(body.content.includes(m.name), `${m.name} moved ${w.label} and is named:\n${body.content}`); } };
+}
+
+const currencyOf = (row: { currency: string }): string => row.currency.toUpperCase();
+
+/** Days sales outstanding per currency, from GET /v1/revenue/collections. */
+async function dsoOf(): Promise<Expectation> {
+  const books = (await revenueReport('/v1/revenue/collections', TRAILING)).by_currency as { currency: string; totals: { dso: { display: string; undefined_value: boolean } } }[];
+  return {
+    figures: books.map((b) => (b.totals.dso.undefined_value ? new RegExp(`none in ${currencyOf(b)}`) : `${b.totals.dso.display} days in ${currencyOf(b)}`)),
+    numbers: allow(TRAILING, ...books.map((b) => b.totals.dso.display)),
+  };
+}
+
+interface AgeingBook { currency: string; totals: { outstanding: number; past_due: number }; ageing: { total: number; invoices: number; buckets: { label: string; invoices: number; amount: number }[] } }
+
+/** What is past due and how old, per currency. */
+async function overdueOf(): Promise<Expectation> {
+  const books = (await revenueReport('/v1/revenue/collections', TRAILING)).by_currency as AgeingBook[];
+  const numbers = allow();
+  const figures: (string | RegExp)[] = [];
+  for (const b of books) {
+    figures.push(b.totals.past_due > 0 ? money2(b.totals.past_due, b.currency) : new RegExp(`${currencyOf(b)}: nothing past due`));
+    addAll(numbers, money2(b.totals.past_due, b.currency), money2(b.totals.outstanding, b.currency), ...b.ageing.buckets.flatMap((x) => [money2(x.amount, b.currency), x.invoices, x.label]));
+  }
+  return { figures, numbers };
+}
+
+/** One ageing bucket, per currency. */
+async function bucketOf(label: string): Promise<Expectation> {
+  const books = (await revenueReport('/v1/revenue/collections', TRAILING)).by_currency as AgeingBook[];
+  const held = books.map((b) => ({ b, cell: b.ageing.buckets.find((x) => x.label === label)! })).filter((x) => x.cell && x.cell.amount !== 0);
+  return {
+    figures: held.length ? held.map((x) => money2(x.cell.amount, x.b.currency)) : [/^Nothing is in/],
+    numbers: allow(label, ...held.flatMap((x) => [money2(x.cell.amount, x.b.currency), x.cell.invoices])),
+  };
+}
+
+/** The whole ageing, per currency. */
+async function ageingOf(): Promise<Expectation> {
+  const books = (await revenueReport('/v1/revenue/collections', TRAILING)).by_currency as AgeingBook[];
+  const numbers = allow();
+  const figures: (string | RegExp)[] = [];
+  for (const b of books) {
+    if (b.ageing.total > 0) figures.push(money2(b.ageing.total, b.currency));
+    addAll(numbers, money2(b.ageing.total, b.currency), b.ageing.invoices, ...b.ageing.buckets.flatMap((x) => [money2(x.amount, b.currency), x.invoices, x.label]));
+  }
+  return { figures, numbers };
+}
+
+/** MRR, ARR, accounts, retention and receivables per currency, from GET /v1/revenue/summary. */
+async function summaryOf(): Promise<Expectation> {
+  const books = (await revenueReport('/v1/revenue/summary', TRAILING)).by_currency as { currency: string; mrr: number; arr: number; accounts: number; receivables: number; net_revenue_retention: { percent: string }; gross_revenue_retention: { percent: string } }[];
+  const numbers = allow(TRAILING, books.length);
+  const figures: (string | RegExp)[] = [];
+  for (const b of books) {
+    figures.push(money2(b.mrr, b.currency), b.net_revenue_retention.percent);
+    addAll(numbers, money2(b.mrr, b.currency), money2(b.arr, b.currency), b.accounts, money2(b.receivables, b.currency), b.net_revenue_retention.percent, b.gross_revenue_retention.percent);
+  }
+  return { figures, numbers };
+}
+
+/** Paid invoices show what was paid and when; nothing on them is "due". */
+function paidInvoices(): Expectation {
+  const rows = app.db.all<{ id: string; number: string; amount_paid: number; currency: string; paid_at: number | null; nm: string | null }>(
+    `SELECT i.id, i.number, i.amount_paid, i.currency, i.paid_at, (SELECT name FROM billing_customers c WHERE c.id = i.customer_id) AS nm
+     FROM billing_invoices i WHERE i.org_id = ? AND i.status = 'paid'`, ORG);
+  const shown = Math.min(rows.length, 25);
+  return {
+    figures: [rows.length ? countRe(rows.length) : NONE, ...(rows.some((r) => r.paid_at) ? [/ paid on /] : [])],
+    numbers: allow(rows.length, rows.length - shown, ...rows.flatMap((r) => [r.number, r.nm, money2(r.amount_paid, r.currency), r.paid_at ? day(r.paid_at) : ''])),
+    ids: new Set(rows.map((r) => r.id)),
+    also: (body) => {
+      assert.equal(body.citations.length, shown);
+      assert.doesNotMatch(body.content, /\bdue\b/, `a paid invoice carries no due language:\n${body.content}`);
+    },
+  };
+}
+
 /** Sync-or-async expectation, so the ledger routes can be read where the rows need them. */
 type Expect = (now: number) => Expectation | Promise<Expectation>;
 interface CorpusRow { template: string; q: string | (() => string); writes?: boolean; expect: Expect }
@@ -813,7 +950,8 @@ const CORPUS: CorpusRow[] = [
   { template: 'customers-past-due', q: 'Which customers are past due?', expect: (now) => delinquents(now) },
   { template: 'customers-past-due', q: 'Who owes us money?', expect: (now) => delinquents(now) },
   { template: 'invoices-status', q: 'Which invoices are overdue?', expect: (now) => invoicesWith(`i.status IN ('draft', 'open') AND i.due_date IS NOT NULL AND i.due_date <= ?`, [now]) },
-  { template: 'invoices-status', q: 'List the paid invoices', expect: () => invoicesWith(`i.status = 'paid'`, []) },
+  // A settled bill shows how it was settled — what was paid and when — and no due language.
+  { template: 'invoices-status', q: 'List the paid invoices', expect: () => paidInvoices() },
   { template: 'count-invoices-status', q: 'How many invoices are open?', expect: () => countOf(app.db.count(`SELECT COUNT(*) FROM billing_invoices WHERE org_id = ? AND status = 'open'`, ORG)) },
   { template: 'count-invoices-status', q: 'How many overdue invoices are there?', expect: (now) => countOf(app.db.count(`SELECT COUNT(*) FROM billing_invoices WHERE org_id = ? AND status IN ('draft', 'open') AND due_date IS NOT NULL AND due_date <= ?`, ORG, now)) },
   { template: 'count-invoices-period', q: 'How many invoices did we issue in 2025?', expect: () => countOf(invoicedBooks(YEAR(2025)).reduce((s, b) => s + b.count, 0), [2025]) },
@@ -835,12 +973,18 @@ const CORPUS: CorpusRow[] = [
   { template: 'quote-price', q: 'How much would 50 million telemetry events cost?', expect: () => quoteOf('telemetry_events_monthly', 50_000_000) },
   { template: 'quote-price', q: 'How much does 500 bulk export volume cost?', expect: () => quoteOf('data_export_monthly', 500) },
   { template: 'quote-price', q: 'Quote me 2 million telemetry events', expect: () => quoteOf('telemetry_events_monthly', 2_000_000) },
+  // The meter's own unit word may sit between the quantity and the meter.
+  { template: 'quote-price', q: 'How much would 120 GB of bulk export volume cost?', expect: () => quoteOf('data_export_monthly', 120) },
+  { template: 'quote-price', q: 'What is the price of 10 million events of telemetry events?', expect: () => quoteOf('telemetry_events_monthly', 10_000_000) },
 
   /* --------------------------------- accounts -------------------------------- */
   { template: 'account-profile', q: `Where does ${ACONCAGUA} stand?`, expect: (now) => profileOf(byName('company', ACONCAGUA), now) },
   { template: 'account-profile', q: `Tell me about ${KESTREL}`, expect: (now) => profileOf(byName('company', KESTREL), now) },
   { template: 'account-owner', q: `Who owns ${ACONCAGUA}?`, expect: () => ({ figures: [ownerName(byName('company', ACONCAGUA).owner)], numbers: allow(ACONCAGUA) }) },
   { template: 'account-owner', q: `Who looks after ${MERIDIAN}?`, expect: () => ({ figures: [ownerName(byName('company', MERIDIAN).owner)], numbers: allow(MERIDIAN) }) },
+  // A company answers to a distinctive run of its leading words, and the answer names it in full.
+  { template: 'account-owner', q: 'Who owns Kestrel Aerospace?', expect: () => ({ figures: [ownerName(byName('company', KESTREL).owner), KESTREL], numbers: allow(KESTREL) }) },
+  { template: 'account-owner', q: 'Who looks after Meridian Forge?', expect: () => ({ figures: [ownerName(byName('company', MERIDIAN).owner), MERIDIAN], numbers: allow(MERIDIAN) }) },
   { template: 'account-spend-period', q: `How much did ${ACONCAGUA} spend in 2025?`, expect: () => { const books = revenueBooks(YEAR(2025), cust(ACONCAGUA)); return books.length ? moneyOf(books, [2025]) : { figures: [/nothing/], numbers: allow(0, 2025) }; } },
   { template: 'account-spend-period', q: `How much did ${KESTREL} pay us in 2025?`, expect: () => { const books = revenueBooks(YEAR(2025), cust(KESTREL)); return books.length ? moneyOf(books, [2025]) : { figures: [/nothing/], numbers: allow(0, 2025) }; } },
   { template: 'account-invoiced-period', q: `How much did we invoice ${ACONCAGUA} in 2025?`, expect: () => moneyOf(invoicedBooks(YEAR(2025), cust(ACONCAGUA)), [2025]) },
@@ -889,20 +1033,29 @@ const CORPUS: CorpusRow[] = [
   { template: 'top-n-deals', q: 'List our 4 smallest lost deals', expect: () => { const rows = [...recs('deal').filter(isLost)].sort((a, b) => amount(a) - amount(b)); const cut = amount(rows[3]); const low = rows.filter((d) => amount(d) <= cut); return { figures: low.slice(0, 4).map((d) => money(amount(d))), numbers: allow(4, ...low.flatMap((d) => [d.name, money(amount(d))])), ids: new Set(low.map((d) => d.id)), also: (body) => assert.equal(body.citations.length, 4) }; } },
 
   /* -------------------------------- comparisons ------------------------------ */
+  // The first-named period is the subject, measured against the second: "2025 is up … on 2024", never "2024 is down … on 2025".
   { template: 'compare-metric', q: 'How did our closed-won bookings in 2025 compare with 2024?', expect: () => {
     const a = recs('deal').filter((d) => isWon(d) && closeIn(d, YEAR(2025)));
     const b = recs('deal').filter((d) => isWon(d) && closeIn(d, YEAR(2024)));
-    const delta = total(b) - total(a);
-    const change = total(a) === 0 ? null : Math.round((delta / Math.abs(total(a))) * 1000) / 10;
-    return { figures: [money(total(a)), money(total(b))], numbers: allow(money(total(a)), a.length, money(total(b)), b.length, money(Math.abs(delta)), change === null ? '' : Math.abs(change), 2025, 2024) };
+    const delta = total(a) - total(b);
+    const change = total(b) === 0 ? null : Math.round((delta / Math.abs(total(b))) * 1000) / 10;
+    return {
+      figures: [money(total(a)), money(total(b)), ...(delta === 0 ? [/No change/] : [`2025 is ${delta > 0 ? 'up' : 'down'} ${money(Math.abs(delta))}`])],
+      numbers: allow(money(total(a)), a.length, money(total(b)), b.length, money(Math.abs(delta)), change === null ? '' : Math.abs(change), 2025, 2024),
+      also: (body) => assert.doesNotMatch(body.content, /2024 is (up|down)/, `the period asked about is the subject:\n${body.content}`),
+    };
   } },
   { template: 'compare-metric', q: 'Compare our win rate in Q1 2026 with Q2 2026', expect: () => {
     const rate = (w: Window) => { const rows = decidedIn(w); const won = rows.filter(isWon).length; return { won, decided: rows.length, value: rows.length ? (won / rows.length) * 100 : 0 }; };
     const a = rate(QUARTER(1, 2026));
     const b = rate(QUARTER(2, 2026));
-    const delta = b.value - a.value;
-    const change = a.value === 0 ? null : Math.round((delta / Math.abs(a.value)) * 1000) / 10;
-    return { figures: [pct(a.value), pct(b.value)], numbers: allow(pct(a.value), a.won, a.decided, pct(b.value), b.won, b.decided, Math.abs(Math.round(delta * 10) / 10), change === null ? '' : Math.abs(change), 'Q1 2026', 'Q2 2026') };
+    const delta = a.value - b.value;
+    const change = b.value === 0 ? null : Math.round((delta / Math.abs(b.value)) * 1000) / 10;
+    return {
+      figures: [pct(a.value), pct(b.value), ...(Math.round(delta * 10) === 0 ? [/No change/] : [`Q1 2026 is ${delta > 0 ? 'up' : 'down'}`])],
+      numbers: allow(pct(a.value), a.won, a.decided, pct(b.value), b.won, b.decided, Math.abs(Math.round(delta * 10) / 10), change === null ? '' : Math.abs(change), 'Q1 2026', 'Q2 2026'),
+      also: (body) => assert.doesNotMatch(body.content, /Q2 2026 is (up|down)/, `the period asked about is the subject:\n${body.content}`),
+    };
   } },
 
   /* -------------------------------- dimensions ------------------------------- */
@@ -946,9 +1099,30 @@ const CORPUS: CorpusRow[] = [
   { template: 'count-new-customers-period', q: 'How many new customers did we add in 2025?', expect: () => countRows(recs('company').filter((c) => str(c.p.type) === 'customer' && inWindow(c.p.became_customer_at, YEAR(2025))), [2025]) },
   { template: 'count-new-customers-period', q: 'How many new logos came on in Q2 2026?', expect: () => countRows(recs('company').filter((c) => str(c.p.type) === 'customer' && inWindow(c.p.became_customer_at, QUARTER(2, 2026))), ['Q2 2026']) },
 
+  /* ---------------------------------- revenue -------------------------------- */
+  // Every figure is one currency's, from the revenue module's own report for the same months; nothing is summed across books.
+  { template: 'mrr-movement-period', q: 'What is our net new MRR this month?', expect: (now) => movementOf({ ...monthWindow(utcMonth(now)), label: `${monthWindow(utcMonth(now)).label} to date` }, now, 'net') },
+  { template: 'mrr-movement-period', q: 'What churned in August 2026?', expect: (now) => movementOf(MONTH(7, 2026), now, 'churn') },
+  { template: 'mrr-movement-period', q: 'Who expanded last quarter?', expect: (now) => movementOf(LAST_QUARTER(now), now, 'expansion') },
+  { template: 'mrr-movement-period', q: 'How did our MRR move in Q2 2026?', expect: (now) => movementOf(QUARTER(2, 2026), now, 'all') },
+  { template: 'mrr-movement-period', q: 'What was our expansion MRR in 2025?', expect: (now) => movementOf(YEAR(2025), now, 'expansion') },
+  { template: 'mrr-movement-period', q: 'How much MRR did we churn in 2025?', expect: (now) => movementOf(YEAR(2025), now, 'churn') },
+  { template: 'dso', q: 'What is our DSO?', expect: () => dsoOf() },
+  { template: 'dso', q: 'How many days sales outstanding are we at?', expect: () => dsoOf() },
+  { template: 'overdue-ageing', q: 'How much is overdue and how old is it?', expect: () => overdueOf() },
+  { template: 'overdue-ageing', q: 'How old are our past due invoices?', expect: () => overdueOf() },
+  { template: 'ageing-bucket', q: 'What is in the 61–90 day bucket?', expect: () => bucketOf('61–90 days past due') },
+  { template: 'ageing-bucket', q: 'How much is in the 31-60 day bucket?', expect: () => bucketOf('31–60 days past due') },
+  { template: 'ageing-bucket', q: 'How much is over 90 days past due?', expect: () => bucketOf('Over 90 days past due') },
+  { template: 'receivables-ageing', q: 'What is our receivables ageing?', expect: () => ageingOf() },
+  { template: 'receivables-ageing', q: 'How do our receivables age?', expect: () => ageingOf() },
+  { template: 'revenue-summary', q: 'How is the business doing?', expect: () => summaryOf() },
+  { template: 'revenue-summary', q: 'Give me a revenue summary', expect: () => summaryOf() },
+
   /* ---------------------------------- drafts --------------------------------- */
   { template: 'draft-message', q: `Draft a check-in email to ${ACONCAGUA}`, expect: (now) => ({ figures: [/^Subject: /, ACONCAGUA], numbers: allow(...accountUniverse(byName('company', ACONCAGUA), now)) }) },
   { template: 'draft-message', q: `Write a formal renewal email to ${KESTREL}`, expect: (now) => ({ figures: [/^Subject: /, KESTREL, /^Dear /m], numbers: allow(...accountUniverse(byName('company', KESTREL), now)) }) },
+  { template: 'draft-message', q: 'Draft a warm renewal email to Kestrel Aerospace', expect: (now) => ({ figures: [/^Subject: /, KESTREL], numbers: allow(...accountUniverse(byName('company', KESTREL), now)) }) },
 
   /* ---------------------------------- writes --------------------------------- */
   { template: 'write-note', writes: true, q: `Add a note to ${ACONCAGUA} saying "The pilot slipped to October"`, expect: () => pendingWrite('add_note', (body) => {
@@ -1055,6 +1229,7 @@ const SLOT_SAMPLES: Record<string, string> = {
   most: 'most', dimension: 'account', industry: 'automotive', 'lead-source': 'webinar', competitor: 'tulip', 'forecast-category': 'commit',
   region: 'apac', property: 'next step', 'numeric-property': 'amount', 'property-dim': 'stage', 'draft-kind': 'check in email', tone: 'warm',
   text: 'the pilot slipped to october', quantity: '2 million', 'book-verb': 'book',
+  'mrr-movement': 'net new mrr', 'movement-verb': 'churned', 'ageing-bucket': '61 90 days',
 };
 /** Where a template's own check needs a different word for a slot. */
 const SLOT_OVERRIDES: Record<string, Record<string, string>> = {
@@ -1476,6 +1651,194 @@ describe('a breakdown by account states every book in its own currency and count
     assert.equal(body.analysis.template?.id, 'breakdown-snapshot', body.analysis.refusal?.why ?? body.content);
     assert.ok(String(body.content).includes(`…and ${n(rows.length - 25)} more.`), `the tail counts the ${rows.length - 25} accounts below the cut:\n${body.content}`);
     for (const g of rows.slice(25)) assert.ok(!String(body.content).includes(g.label), `${g.label} is below the cut and not printed`);
+  });
+});
+
+/* ------------------------- the revenue tools are reached ------------------- */
+
+describe('every copilot tool the revenue module registers is dispatched to by a shape', () => {
+  test('revenue_summary, revenue_movement and revenue_collections each have a template, and the templates are available', async () => {
+    const published = await app.handle({ method: 'GET', path: '/v1/ai/templates', auth: DANA });
+    const tools = (await app.handle({ method: 'GET', path: '/v1/ai/tools', query: { tag: 'revenue' }, auth: DANA })).body.data.map((t: { name: string }) => t.name);
+    for (const tool of ['revenue_summary', 'revenue_movement', 'revenue_collections']) {
+      assert.ok(tools.includes(tool), `fixture: ${tool} is registered`);
+      const shapes = (published.body.data as { id: string; tools: string[]; available: boolean }[]).filter((t) => t.tools.includes(tool));
+      assert.ok(shapes.length >= 1, `${tool} is listed by GET /v1/ai/tools and no shape dispatches to it`);
+      assert.ok(shapes.every((t) => t.available), `${tool}'s shapes are reachable`);
+    }
+  });
+
+  test('a period the bridge has no bar for, and one further back than it reaches, are refused by name', async () => {
+    for (const [q, why] of [['How much did we churn in the last 30 days?', /calendar month/], ['What was our net new MRR in 2019?', /60 months/]] as [string, RegExp][]) {
+      tick();
+      const body = await ask(q);
+      assert.equal(body.analysis.refusal?.code, 'slot_unbound', `"${q}": ${body.content}`);
+      assert.match(body.analysis.refusal.why, why);
+      assert.deepEqual(body.tool_calls, [], 'a refusal runs no tool');
+    }
+  });
+});
+
+/* ------------------------- a refusal names the slot ------------------------ */
+
+const TONES = ['direct', 'warm', 'formal', 'concise', 'consultative', 'urgent', 'apologetic'];
+
+describe('a refusal names the slot that did not bind, and the catalogue publishes what a closed slot takes', () => {
+  test('a tone outside the seven is named, with the seven', async () => {
+    tick();
+    const body = await ask(`Write me a friendly renewal email for ${KESTREL}`);
+    assert.equal(body.analysis.refusal?.code, 'slot_unbound', body.content);
+    const why = String(body.analysis.refusal.why);
+    assert.match(why, /"friendly"/);
+    assert.match(why, /\btone\b/);
+    for (const tone of TONES) assert.ok(why.includes(tone), `the refusal lists ${tone}:\n${why}`);
+    assert.ok(body.content.includes(why), 'the reason is in the answer, not only in the analysis');
+    assert.equal(body.analysis.template, null);
+  });
+
+  test('a company nobody has heard of, a period left out and a comparison left out are each named', async () => {
+    const cases: [string, RegExp[]][] = [
+      ['Who owns Acme Corp?', [/"Acme Corp"/, /company/]],
+      ['What was our revenue?', [/needs a period/, /in 2025/]],
+      ['How many deals are worth $500,000?', [/needs a comparison/, /more than/, /at least/, /less than/, /at most/]],
+      ['How many deals did Bob Smith win in 2025?', [/"Bob Smith"/, /teammate/, /Dana Whitfield/]],
+      ['What is our MRR in CHF?', [/"CHF"/, /currency/, /EUR/, /GBP/, /USD/]],
+      ['How many opportunities are pending?', [/"pending"/, /state of a task/]],
+      // Words that hold a company's name with a suffix nobody recorded: the refusal names the kind the shape wanted and the record inside the words.
+      ['Who owns Kestrel Aerospace Ltd?', [/"Kestrel Aerospace Ltd"/, /company/, /Kestrel Aerospace Components/]],
+      ['Who owns the Kaskade Pharma Group?', [/"the Kaskade Pharma Group"/, /company/, /Kaskade Pharma Group/]],
+    ];
+    for (const [q, patterns] of cases) {
+      tick();
+      const body = await ask(q);
+      assert.equal(body.analysis.refusal?.code, 'slot_unbound', `"${q}": ${body.analysis.refusal?.code} — ${body.content}`);
+      for (const re of patterns) assert.match(String(body.analysis.refusal.why), re, `"${q}"`);
+    }
+  });
+
+  test('GET /v1/ai/templates publishes the values of every closed slot and none for an open one', async () => {
+    const published = await app.handle({ method: 'GET', path: '/v1/ai/templates', auth: DANA });
+    const rows = published.body.data as { id: string; slots: { name: string; kind: string; values: string[] | null }[] }[];
+    const slotOf = (id: string, kind: string) => {
+      const found = rows.find((t) => t.id === id)?.slots.find((s) => s.kind === kind);
+      assert.ok(found, `${id} publishes a ${kind} slot`);
+      return found!;
+    };
+    assert.deepEqual(slotOf('draft-message', 'tone').values, TONES);
+    assert.ok(slotOf('count-deals-at-stage', 'stage').values!.includes('Negotiation'));
+    assert.deepEqual(slotOf('pipeline-worth', 'pipeline').values, [...new Set(app.db.all<{ label: string }>(`SELECT label FROM crm_pipelines WHERE org_id = ? AND object_type = 'deal' ORDER BY position`, ORG).map((r) => r.label))]);
+    assert.equal(slotOf('metric-period', 'period').values, null);
+    assert.equal(slotOf('account-owner', 'account').values, null);
+    assert.equal(slotOf('deals-with-term', 'number').values, null);
+  });
+});
+
+/* ------------------------- a company by its first word ---------------------- */
+
+describe('a company answers to the distinctive leading words of its name', () => {
+  test('a unique first word or run of leading words binds the company; a word with another meaning, or too short to be a name, does not', async () => {
+    const leading: [string, string][] = [
+      ['Kaskade', 'Kaskade Pharma Group'], ['Meridian', MERIDIAN], ['Kestrel', KESTREL], ['Brightline', BRIGHTLINE],
+      // Two leading words, including a pair whose first word alone is a currency or too short.
+      ['Kestrel Aerospace', KESTREL], ['Meridian Forge', MERIDIAN], ['Sterling Heat', 'Sterling Heat Treating'], ['Van Doorn', 'Van Doorn Verpakking'],
+    ];
+    for (const [short, full] of leading) {
+      tick();
+      const body = await ask(`Who owns ${short}?`);
+      assert.equal(body.analysis.template?.id, 'account-owner', `"${short}": ${body.analysis.refusal?.why ?? body.content}`);
+      assert.ok(body.content.includes(full), `${short} is ${full}:\n${body.content}`);
+      assert.ok(body.content.includes(ownerName(byName('company', full).owner)));
+      assertOnlyTheseNumbers(body.content, allow(full), short);
+    }
+    // "Sterling" is a currency word and "Van" is three letters: neither is a name on its own.
+    for (const q of ['Who owns Sterling?', 'Who owns Van?']) {
+      tick();
+      const body = await ask(q);
+      assert.ok(body.analysis.refusal, `"${q}" was answered as ${body.analysis.template?.id}:\n${body.content}`);
+    }
+  });
+
+  test('two companies sharing a first word are refused with both named, and the full name still binds', async () => {
+    const twin = await app.handle({ method: 'POST', path: '/v1/records/company', body: { properties: { name: 'Kaskade Logistics', domain: 'kaskade-logistics.de' } }, auth: DANA });
+    assert.ok(twin.status < 300, JSON.stringify(twin.body).slice(0, 200));
+    try {
+      tick();
+      const body = await ask('Who owns Kaskade?');
+      assert.equal(body.analysis.refusal?.code, 'slot_unbound', body.content);
+      assert.match(String(body.analysis.refusal.why), /Kaskade Pharma Group/);
+      assert.match(String(body.analysis.refusal.why), /Kaskade Logistics/);
+      assert.deepEqual(body.tool_calls, []);
+      tick();
+      const exact = await ask('Who owns Kaskade Pharma Group?');
+      assert.equal(exact.analysis.template?.id, 'account-owner', exact.analysis.refusal?.why ?? exact.content);
+    } finally {
+      const gone = await app.handle({ method: 'DELETE', path: `/v1/records/company/${twin.body.id}`, auth: DANA });
+      assert.ok(gone.status < 300, `cleanup: ${gone.status}`);
+    }
+    tick();
+    const again = await ask('Who owns Kaskade?');
+    assert.equal(again.analysis.template?.id, 'account-owner', again.analysis.refusal?.why ?? again.content);
+  });
+});
+
+/* ------------------------- to date, only to the clock ---------------------- */
+
+describe('"to date" is a period cut at the clock, never a month with weeks still to run', () => {
+  test('deals closing this month are labelled with the month, and the window runs to its end', async () => {
+    tick();
+    const now = app.ctx.now();
+    const w = monthWindow(utcMonth(now));
+    const body = await ask('Which deals close this month?');
+    assert.equal(body.analysis.template?.id, 'deals-closing-period', body.analysis.refusal?.why ?? body.content);
+    assert.deepEqual({ start: body.analysis.plan[0].args.start, end: body.analysis.plan[0].args.end }, { start: w.start, end: w.end });
+    assert.ok(body.content.includes(`closing in ${w.label}`), `labelled ${w.label}:\n${body.content}`);
+    assert.doesNotMatch(body.content, /to date/, `a window read to its end is not "to date":\n${body.content}`);
+    const expected = listOf(recs('deal').filter((d) => isOpen(d) && closeIn(d, w)), 'deal', 10, [w.label]);
+    for (const figure of expected.figures) assert.ok(figure instanceof RegExp && figure.test(body.content), body.content);
+    assertOnlyTheseNumbers(body.content, expected.numbers, 'this month');
+    expected.also?.(body);
+  });
+
+  test('the count twin says the same, and a measure of what already closed keeps "to date"', async () => {
+    tick();
+    const now = app.ctx.now();
+    const { q, y } = quarterOf(now);
+    const closing = await ask('How many deals close this quarter?');
+    assert.equal(closing.analysis.template?.id, 'count-deals-closing-period', closing.analysis.refusal?.why ?? closing.content);
+    assert.ok(closing.content.includes(`closing in Q${q} ${y}.`), closing.content);
+    assert.doesNotMatch(closing.content, /to date/);
+    tick();
+    const closed = await ask('How many deals closed this quarter?');
+    assert.equal(closed.analysis.template?.id, 'count-deals-decided-period', closed.analysis.refusal?.why ?? closed.content);
+    assert.ok(closed.content.includes(`Q${q} ${y} to date`), `what has already closed is a figure to date:\n${closed.content}`);
+  });
+});
+
+/* ------------------------- the timeline lists the links --------------------- */
+
+describe('a record timeline lists the links the record\'s own timeline lists', () => {
+  test('a contact linked to a new account is on the account\'s timeline, newest first', async () => {
+    const company = await app.handle({ method: 'POST', path: '/v1/records/company', body: { properties: { name: 'Tarn Hydraulics', domain: 'tarnhydraulics.co.uk' } }, auth: DANA });
+    assert.ok(company.status < 300, JSON.stringify(company.body).slice(0, 200));
+    tick();
+    const contact = await app.handle({ method: 'POST', path: '/v1/records/contact', body: { properties: { first_name: 'Iona', last_name: 'Maclean', email: 'iona@tarnhydraulics.co.uk' }, associate_to: [company.body.id] }, auth: DANA });
+    assert.ok(contact.status < 300, JSON.stringify(contact.body).slice(0, 200));
+    try {
+      const link = app.db.get<{ id: string }>(`SELECT id FROM crm_associations WHERE org_id = ? AND from_id = ? AND to_id = ?`, ORG, contact.body.id, company.body.id);
+      assert.ok(link, 'fixture: the contact is linked to the company');
+      const rest = await app.handle({ method: 'GET', path: `/v1/records/company/${company.body.id}/timeline`, auth: DANA });
+      assert.ok((rest.body.data as { id: string }[]).some((item) => item.id === link!.id), 'fixture: the REST timeline lists the link');
+      tick();
+      const body = await ask('What happened recently at Tarn Hydraulics?');
+      assert.equal(body.analysis.template?.id, 'record-timeline', body.analysis.refusal?.why ?? body.content);
+      assert.ok(body.content.includes(`Linked to ${contact.body.display_name}`), `the link is on the timeline:\n${body.content}`);
+      assert.ok((body.citations as { id: string }[]).some((c) => c.id === link!.id), 'the link is cited by its own row');
+    } finally {
+      for (const [type, id] of [['contact', contact.body.id], ['company', company.body.id]]) {
+        const gone = await app.handle({ method: 'DELETE', path: `/v1/records/${type}/${id}`, auth: DANA });
+        assert.ok(gone.status < 300, `cleanup ${type}: ${gone.status}`);
+      }
+    }
   });
 });
 

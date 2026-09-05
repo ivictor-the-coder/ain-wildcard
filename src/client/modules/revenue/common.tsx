@@ -22,6 +22,8 @@ import {
   type CellValue, type DateRange, type Formatter, type InputProps, type SortState, type TableState,
 } from '../../design';
 import { exponentOf, type Currency } from '../../../shared/money';
+import { toCsv, type CsvColumn } from './csv';
+import { isUnitAbbreviation } from './meter-copy';
 import type { Basis, CurrencyScope, Rate, Ratio, CustomerLite } from './types';
 import './revenue.css';
 
@@ -93,11 +95,13 @@ export function monthLabel(month: string, f: Formatter, withYear = false): strin
  * pluralise — "4,200 event" is the tell that one did not.
  */
 export const units = (f: Formatter, count: number, label: string | null | undefined): string =>
-  `${f.number(count, { maxDecimals: 2 })} ${pluralize(label || 'unit', count)}`;
+  `${f.number(count, { maxDecimals: 2 })} ${unitNoun(count, label)}`;
 
-/** The unit noun alone, agreeing with a count rendered elsewhere. */
-export const unitNoun = (count: number, label: string | null | undefined): string =>
-  pluralize(label || 'unit', count);
+/** The unit noun alone, agreeing with a count rendered elsewhere — unless it is a symbol, which never inflects. */
+export const unitNoun = (count: number, label: string | null | undefined): string => {
+  const word = label || 'unit';
+  return isUnitAbbreviation(word) ? word : pluralize(word, count);
+};
 
 /* --------------------------------- states --------------------------------- */
 
@@ -320,6 +324,12 @@ export function useRevenueRange(defaultCurrency: string): RevenueRange {
   };
 }
 
+/**
+ * The named windows, and — only while two dates are in force — a "Custom" chip
+ * that shows which control is deciding the range. The chip used to sit there
+ * disabled whenever a preset was chosen, a control that did nothing beside a
+ * picker that did everything; a chip is either the current answer or absent.
+ */
 export function RangeControl({ range }: { range: RevenueRange }) {
   const f = useFormat();
   return (
@@ -331,7 +341,10 @@ export function RangeControl({ range }: { range: RevenueRange }) {
         onChange={(value) => { if (value !== 'custom') range.setMonths(Number(value)); }}
         options={[
           ...MONTH_CHOICES.map((n) => ({ value: String(n), label: `${n}m` })),
-          { value: 'custom', label: 'Custom', disabled: range.preset, title: 'Pick two dates to the right' },
+          // No title: the control reads an option's title as its accessible
+          // name, and this chip's name is "Custom" — the picker beside it
+          // already states the dates.
+          ...(range.preset ? [] : [{ value: 'custom', label: 'Custom' }]),
         ]}
       />
       <DateRangePicker
@@ -433,6 +446,28 @@ export function CustomerName({ id, names }: { id: string | null | undefined; nam
 
 /* --------------------------------- chrome --------------------------------- */
 
+/**
+ * Land on the section a `#fragment` names once it exists. The board's sections
+ * render around queries that have not answered yet, so the element is looked
+ * for briefly rather than assumed; `/revenue/movement` is an address people
+ * were given, and it should arrive at the movement rather than at the top.
+ */
+export function useScrollToHash(): void {
+  useEffect(() => {
+    const id = window.location.hash.replace(/^#/, '');
+    if (!id) return undefined;
+    let tries = 0;
+    let timer = 0;
+    const look = () => {
+      const target = document.getElementById(id);
+      if (target) { target.scrollIntoView({ block: 'start' }); return; }
+      if (tries++ < 40) timer = window.setTimeout(look, 75);
+    };
+    look();
+    return () => window.clearTimeout(timer);
+  }, []);
+}
+
 /** The workspace's own currency — the sane default for the currency control. */
 export function useDefaultCurrency(): string {
   const { currency } = useSession();
@@ -487,10 +522,19 @@ export interface LiveNumberInputProps extends Omit<InputProps, 'value' | 'onChan
   step?: number;
   precision?: number;
   showSteppers?: boolean;
+  /**
+   * Whether typed text outside `min`–`max` is clamped and rewritten (the
+   * default, for a quantity where the limit is the whole rule) or lifted as
+   * typed so the form can say why it is refused. A policy field that turned 0
+   * into 1 under the operator's hands, silently, saved a schedule nobody
+   * asked for; a form that owns a rule states it. The steppers still stop at
+   * the limits either way.
+   */
+  rewriteOutOfRange?: boolean;
 }
 
 export function LiveNumberInput({
-  value, onChange, min, max, step = 1, precision = 0, suffix, showSteppers = true, ...rest
+  value, onChange, min, max, step = 1, precision = 0, suffix, showSteppers = true, rewriteOutOfRange = true, ...rest
 }: LiveNumberInputProps) {
   const [text, setText] = useState(value === null ? '' : String(value));
   const lifted = useRef(value);
@@ -512,6 +556,7 @@ export function LiveNumberInput({
     if (raw.trim() === '') { lift(null); return; }
     const parsed = Number(raw.replace(/[^0-9.\-]/g, ''));
     if (!Number.isFinite(parsed)) return;
+    if (!rewriteOutOfRange) { lift(Number(parsed.toFixed(precision))); return; }
     const clamped = clamp(parsed);
     // Only the out-of-range case rewrites what was typed; "6." and "06" are
     // left alone so a decimal or a leading zero can still be entered.
@@ -651,6 +696,12 @@ export function useTabParam<T extends string>(
 export function moneyAxis(f: Formatter, currency: string, values: number[]): (value: number) => string {
   const code = (currency || f.currency).toLowerCase();
   const finite = values.filter((value) => Number.isFinite(value));
+  // An all-zero series gives the chart a 0–1 domain in minor units, and five
+  // gridlines reading "$0.01 $0.01 $0.01 $0 $0". Nothing on that axis is a
+  // figure, so every tick reads as the zero it is.
+  if (finite.every((value) => value === 0)) {
+    return () => formatMoney(0, { locale: f.locale, currency: code, compact: true, trimZeroFraction: true });
+  }
   const ticks = niceTicks(Math.min(0, ...finite), Math.max(0, ...finite), 5);
   const distinct = new Set(ticks).size;
   const candidates: ((value: number) => string)[] = [
@@ -690,45 +741,11 @@ export function unitRateText(
 /* ---------------------------------- export -------------------------------- */
 
 /**
- * What a revenue operator's week ends in.
- *
- * Everything exported is what the grid is showing at that moment — the same
- * filter, the same order — because a file holding rows the screen did not is
- * how a reconciliation goes wrong twice. Amounts are plain decimals in the
- * major unit with the currency in its own column: a spreadsheet cannot add
- * "€1.309,00", and it adds `130900` to the wrong answer.
+ * The CSV columns and cells are pure and live in `csv.ts`, so the columns a
+ * screen exports can be checked in a unit test; the button that writes the file
+ * is the only part that needs a browser.
  */
-export interface CsvColumn<T> {
-  header: string;
-  value: (row: T) => string | number | null | undefined;
-}
-
-export const csvAmount = (minor: number | null | undefined, currency: string): string => {
-  if (minor === null || minor === undefined) return '';
-  const exp = exponentOf((currency || 'usd').toLowerCase() as Currency);
-  return (minor / 10 ** exp).toFixed(exp);
-};
-
-export const csvDay = (ts: number | null | undefined): string =>
-  (ts === null || ts === undefined ? '' : new Date(ts).toISOString().slice(0, 10));
-
-export const csvInstant = (ts: number | null | undefined): string =>
-  (ts === null || ts === undefined ? '' : new Date(ts).toISOString());
-
-/** RFC 4180: quote anything with a comma, a quote or a newline; double the quotes. */
-const csvCell = (raw: string | number | null | undefined): string => {
-  if (raw === null || raw === undefined) return '';
-  const text = String(raw);
-  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-};
-
-export function toCsv<T>(rows: T[], columns: CsvColumn<T>[]): string {
-  const lines = [columns.map((column) => csvCell(column.header)).join(',')];
-  for (const row of rows) lines.push(columns.map((column) => csvCell(column.value(row))).join(','));
-  // Excel on Windows wants the CRLF, and the BOM is what lets it read the €
-  // and £ signs a multi-currency book is full of.
-  return `﻿${lines.join('\r\n')}\r\n`;
-}
+export { csvAmount, csvDay, csvInstant, toCsv, type CsvColumn } from './csv';
 
 const fileStamp = (now: number, timeZone: string): string => new Intl.DateTimeFormat('en-CA', {
   timeZone, year: 'numeric', month: '2-digit', day: '2-digit',

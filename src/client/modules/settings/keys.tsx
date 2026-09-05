@@ -15,18 +15,48 @@
  * though it confined a key to CRM would be the most dangerous sentence on this
  * surface, so the reach is spelled out under every key.
  */
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, useQuery, type ListEnvelope } from '../../kernel/api';
 import { useSession } from '../../kernel/session';
 import {
   Badge, Banner, Button, Card, Checkbox, CopyField, DataTable, EmptyState, Field, Icons, Inline, Input,
   Modal, RadioGroup, Stack, Switch, TagInput, Tooltip,
-  useFormat,
-  type DataTableColumn, type MenuSection,
+  useFormat, useToast,
+  type DataTableColumn, type MenuSection, type TableState,
   AlertTriangleIcon, XCircleIcon,
 } from '../../design';
-import { ListFailure, NeedsAdmin, SettingsShell, scopeReach, useAction, useOpenFromQuery } from './common';
-import type { ApiKey, MintedApiKey } from './types';
+import {
+  DialogForm, ListFailure, NeedsAdmin, SettingsShell, scopeReach, useAction, useActorName, useConsumeQuery, useOpenFromQuery,
+} from './common';
+import type { ApiKey, AuditEntry, MintedApiKey } from './types';
+
+/**
+ * Who minted each key, read off the audit trail.
+ *
+ * `GET /v1/api-keys` does not carry `created_by`, but every mint writes an
+ * `api_key.created` entry whose target is the key and whose actor is the
+ * teammate — and the trail is served to exactly the role this screen is served
+ * to. A key older than the readable page of the trail, or seeded, has no entry
+ * and says so rather than guessing.
+ */
+function useMinters(enabled: boolean): { minter: (keyId: string) => string | null; loading: boolean } {
+  const trail = useQuery<ListEnvelope<AuditEntry>>('/v1/audit-log', { limit: 500 }, { enabled });
+  const actorName = useActorName();
+  const byKey = useMemo(() => {
+    const map = new Map<string, string | null>();
+    for (const entry of trail.data?.data ?? []) {
+      if (entry.action === 'api_key.created' && entry.target_id) map.set(entry.target_id, entry.actor_id);
+    }
+    return map;
+  }, [trail.data]);
+  return {
+    minter: (keyId) => {
+      const actor = byKey.get(keyId);
+      return actor === undefined ? null : actorName(actor, 'user');
+    },
+    loading: trail.loading,
+  };
+}
 
 /**
  * The three reaches the platform actually distinguishes, named as such. A
@@ -42,21 +72,54 @@ const PRESETS = [
 
 type PresetId = (typeof PRESETS)[number]['id'];
 
+/**
+ * How a key reads in a list: its prefix and its last four, which is everything
+ * a hash can vouch for. The server's `masked` form spells out twenty bullets
+ * and, at the width the column actually has, lost the last four off the right
+ * edge — the one part that tells two keys apart.
+ */
+export const shortMask = (key: { prefix: string; last4: string }): string => `${key.prefix}_${'•'.repeat(6)}${key.last4}`;
+
 export function ApiKeysPage() {
   const session = useSession();
   const f = useFormat();
+  const toast = useToast();
   const action = useAction();
-  const keys = useQuery<ListEnvelope<ApiKey>>('/v1/api-keys');
+  const admin = session.me?.role === 'owner' || session.me?.role === 'admin';
+  // The read is gated at admin, so it is not even asked for below that.
+  const keys = useQuery<ListEnvelope<ApiKey>>('/v1/api-keys', undefined, { enabled: admin });
+  const minters = useMinters(admin);
 
   const [creating, setCreating] = useState(false);
   const [minted, setMinted] = useState<MintedApiKey | null>(null);
   const [revoking, setRevoking] = useState<ApiKey | null>(null);
   const [showRevoked, setShowRevoked] = useState(false);
+  const [view, setView] = useState<TableState>({ query: '', sort: { columnId: 'created', direction: 'desc' }, filters: {} });
+  /**
+   * `?key=ak_…` is the address the audit trail writes for a key it names. The
+   * list answers with that key on top — revoked ones included, since a key on
+   * the trail is very often one that has just been revoked.
+   */
+  const [wanted, setWanted] = useState<string | null>(null);
+  useConsumeQuery('key', setWanted);
 
-  const admin = session.me?.role === 'owner' || session.me?.role === 'admin';
-  // The palette's Create entry lands here with the dialog already open.
-  useOpenFromQuery('new', () => { if (admin) { action.clear(); setCreating(true); } });
+  // The palette's Create entry lands here with the dialog already open — or,
+  // for a role the server would refuse, with the reason instead of nothing.
+  useOpenFromQuery('new', () => {
+    if (admin) { action.clear(); setCreating(true); return; }
+    toast.info(
+      'Creating an API key needs the admin role',
+      `Your role on this workspace is ${session.me?.role ?? 'unknown'}, and POST /v1/api-keys is gated at admin — so the dialog is not offered rather than offered and refused.`,
+    );
+  });
   const all = keys.data?.data ?? [];
+  useEffect(() => {
+    if (!wanted || !keys.data) return;
+    const key = keys.data.data.find((row) => row.id === wanted);
+    if (key?.revoked_at) setShowRevoked(true);
+    setView((current) => ({ ...current, query: key ? key.name : wanted }));
+    setWanted(null);
+  }, [wanted, keys.data]);
   const rows = showRevoked ? all : all.filter((key) => key.revoked_at === null);
   const revokedCount = all.filter((key) => key.revoked_at !== null).length;
   const liveCount = all.filter((key) => key.revoked_at === null && key.livemode).length;
@@ -66,19 +129,20 @@ export function ApiKeysPage() {
       id: 'name',
       header: 'Key',
       pinned: true,
-      width: 260,
+      // The one flexible column: with Created on screen, fixed widths summed
+      // past the card at 1512 and Status scrolled off the right edge.
       accessor: (row) => row.name,
       cell: (row) => (
         <span style={{ minWidth: 0, display: 'block' }}>
           <span style={{ display: 'block', fontWeight: 'var(--weight-medium)' }} className="u-truncate">{row.name}</span>
-          <span className="st-mono" style={{ display: 'block' }}>{row.masked}</span>
+          <span className="st-mono" style={{ display: 'block' }} title={row.masked}>{shortMask(row)}</span>
         </span>
       ),
     },
     {
       id: 'mode',
       header: 'Mode',
-      width: 110,
+      width: 100,
       filter: 'set',
       accessor: (row) => (row.livemode ? 'live' : 'test'),
       cell: (row) => <Badge tone={row.livemode ? 'warning' : 'neutral'} pill>{row.livemode ? 'Live' : 'Test'}</Badge>,
@@ -86,7 +150,7 @@ export function ApiKeysPage() {
     {
       id: 'reach',
       header: 'Reach',
-      width: 300,
+      width: 220,
       accessor: (row) => scopeReach(row.scopes).role,
       cell: (row) => {
         const reach = scopeReach(row.scopes);
@@ -104,7 +168,7 @@ export function ApiKeysPage() {
       id: 'last_used',
       header: 'Last used',
       align: 'right',
-      width: 150,
+      width: 130,
       accessor: (row) => row.last_used ?? 0,
       cell: (row) => (row.last_used
         ? <Tooltip content={f.dateTime(row.last_used)}><span>{f.relative(row.last_used)}</span></Tooltip>
@@ -114,22 +178,35 @@ export function ApiKeysPage() {
       id: 'created',
       header: 'Created',
       align: 'right',
-      width: 140,
+      width: 170,
       accessor: (row) => row.created,
-      cell: (row) => f.date(row.created),
-      defaultHidden: true,
+      // When, and by whom — the two facts Stripe puts on every key, and the two
+      // an operator deciding whether a key is safe to revoke reads first.
+      cell: (row) => {
+        const minter = minters.minter(row.id);
+        return (
+          <Tooltip content={f.dateTime(row.created)}>
+            <span style={{ display: 'block', minWidth: 0 }}>
+              <span style={{ display: 'block' }}>{f.relative(row.created)}</span>
+              <span className="st-sub u-truncate" style={{ display: 'block' }} data-testid="key-minter">
+                {minter ? `by ${minter}` : minters.loading ? 'Reading who minted it…' : 'Minter not on the readable trail'}
+              </span>
+            </span>
+          </Tooltip>
+        );
+      },
     },
     {
       id: 'status',
       header: 'Status',
-      width: 150,
+      width: 120,
       filter: 'set',
       accessor: (row) => (row.revoked_at ? 'revoked' : 'active'),
       cell: (row) => (row.revoked_at
         ? <Tooltip content={`Revoked ${f.dateTime(row.revoked_at)}`}><span><Badge tone="danger" pill dot>Revoked</Badge></span></Tooltip>
         : <Badge tone="success" pill dot>Active</Badge>),
     },
-  ], [f]);
+  ], [f, minters]);
 
   const rowActions = (row: ApiKey): MenuSection[] => [{
     id: 'key',
@@ -198,7 +275,8 @@ export function ApiKeysPage() {
             searchPlaceholder="Search by name, prefix or scope"
             showFilters
             showColumnToggle
-            initialSort={{ columnId: 'created', direction: 'desc' }}
+            value={view}
+            onChange={setView}
             rowActions={rowActions}
             rowTone={(row) => (row.revoked_at ? 'danger' : 'default')}
             empty={
@@ -263,7 +341,12 @@ export function ApiKeysPage() {
 
       <SecretDialog minted={minted} onClose={() => setMinted(null)} />
 
-      <RevokeDialog apiKey={revoking} action={action} onClose={() => setRevoking(null)} />
+      <RevokeDialog
+        apiKey={revoking}
+        minter={revoking ? minters.minter(revoking.id) : null}
+        action={action}
+        onClose={() => setRevoking(null)}
+      />
     </SettingsShell>
   );
 }
@@ -291,6 +374,7 @@ function CreateKeyDialog({ open, action, onClose, onMinted }: {
   const close = () => { setName(''); setPreset('write'); setCustom([]); setLivemode(false); action.clear(); onClose(); };
 
   const submit = async () => {
+    if (!valid || action.busy) return;
     const key = await action.run(
       api.post<MintedApiKey>('/v1/api-keys', { name: name.trim(), livemode, scopes }),
       {
@@ -324,6 +408,7 @@ function CreateKeyDialog({ open, action, onClose, onMinted }: {
         </>
       }
     >
+      <DialogForm onSubmit={() => void submit()}>
       <Stack gap={5}>
         {action.error && !action.error.body.param && (
           <Banner tone="danger" compact title="The key was not created">{action.error.body.message}</Banner>
@@ -342,7 +427,6 @@ function CreateKeyDialog({ open, action, onClose, onMinted }: {
             maxLength={80}
             invalid={!!action.errorFor('name')}
             onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && valid) void submit(); }}
             aria-label="What is this key for"
           />
         </Field>
@@ -394,6 +478,7 @@ function CreateKeyDialog({ open, action, onClose, onMinted }: {
           />
         </Field>
       </Stack>
+      </DialogForm>
     </Modal>
   );
 }
@@ -455,7 +540,7 @@ function SecretDialog({ minted, onClose }: { minted: MintedApiKey | null; onClos
           <div className="st-row">
             <div className="st-row__main">
               <div className="st-row__title">In the list it will read</div>
-              <div className="st-row__sub"><span className="st-mono">{minted.masked}</span></div>
+              <div className="st-row__sub"><span className="st-mono" title={minted.masked}>{shortMask(minted)}</span></div>
             </div>
           </div>
         </div>
@@ -472,8 +557,9 @@ function SecretDialog({ minted, onClose }: { minted: MintedApiKey | null; onClos
 
 /* ================================= revoke ================================= */
 
-function RevokeDialog({ apiKey, action, onClose }: {
+function RevokeDialog({ apiKey, minter, action, onClose }: {
   apiKey: ApiKey | null;
+  minter: string | null;
   action: Action;
   onClose: () => void;
 }) {
@@ -522,7 +608,7 @@ function RevokeDialog({ apiKey, action, onClose }: {
           <div className="st-row">
             <div className="st-row__main">
               <div className="st-row__title">Key</div>
-              <div className="st-row__sub"><span className="st-mono">{apiKey.masked}</span></div>
+              <div className="st-row__sub"><span className="st-mono" title={apiKey.masked}>{shortMask(apiKey)}</span></div>
             </div>
           </div>
           <div className="st-row">
@@ -534,7 +620,10 @@ function RevokeDialog({ apiKey, action, onClose }: {
           <div className="st-row">
             <div className="st-row__main">
               <div className="st-row__title">Created</div>
-              <div className="st-row__sub">{f.dateTime(apiKey.created)}</div>
+              <div className="st-row__sub">
+                {f.dateTime(apiKey.created)}
+                {minter ? ` · by ${minter}` : ' · the minter is not on the readable audit trail'}
+              </div>
             </div>
           </div>
         </div>

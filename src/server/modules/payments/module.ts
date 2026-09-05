@@ -597,13 +597,14 @@ export default defineModule({
     router.post('/v1/payment_methods/:id/attach', (req: Req, c: Ctx) =>
       paymentsStore(c).methods.attach(req.auth.orgId, req.params.id, (req.body as { customer: string }).customer, writeMeta(req)), {
       summary: 'Attach a method to a customer', tags: ['payments'], roles: ['member'],
+      description: 'A detached method comes back onto an account; a method already on another account is refused with payment_method_in_use, one already on this account with payment_method_already_attached, and a card whose expiry has passed with expired_card. Attaching never changes which method is the default unless the account had none.',
       body: v.object({ customer: v.id('cus') }),
     });
 
     router.post('/v1/payment_methods/:id/detach', (req: Req, c: Ctx) =>
       paymentsStore(c).methods.detach(req.auth.orgId, req.params.id, writeMeta(req)), {
       summary: 'Detach a payment method', tags: ['payments'], roles: ['member'],
-      description: 'The row stays: charges point at it, and a detached card still has to explain last March’s invoice. If it was the default, the next method on the account takes over.',
+      description: 'The row stays: charges point at it, and a detached card still has to explain last March’s invoice. If it was the default, the next method on the account takes over. Detaching a method that is already detached is refused with payment_method_already_detached rather than answered as though it had just happened.',
     });
 
     router.post('/v1/payment_methods/:id/set_default', (req: Req, c: Ctx) =>
@@ -678,6 +679,7 @@ export default defineModule({
       return paymentsStore(c).gateway.cancelIntent(req.auth.orgId, req.params.id, body.cancellation_reason ?? 'abandoned', writeMeta(req));
     }, {
       summary: 'Cancel a payment intent', tags: ['payments'], roles: ['member'],
+      description: 'Withdraws an intent that has not been paid. One already paid is refused with payment_intent_succeeded (refund the charge instead), one with the bank with payment_intent_processing (wait for the answer), and one already cancelled with payment_intent_already_canceled — a second cancel is a double submit, and a 200 would read as though the reason it carried had been recorded when the first one’s stands.',
       body: v.object({ cancellation_reason: v.optional(v.enum(['duplicate', 'fraudulent', 'requested_by_customer', 'abandoned', 'superseded'])) }),
     });
 
@@ -779,7 +781,7 @@ export default defineModule({
       return paymentsStore(c).gateway.closeDispute(req.auth.orgId, req.params.id, body.status === 'won', body.note ?? null, writeMeta(req));
     }, {
       summary: 'Close a dispute', tags: ['payments'], roles: ['member'],
-      description: 'Winning returns the money to the invoice. Losing writes the invoice off as uncollectible, which billing turns into an unpaid subscription through its own status machine.',
+      description: 'Winning returns the money to the invoice. Losing writes the invoice off as uncollectible, which billing turns into an unpaid subscription through its own status machine. A dispute already won or lost is refused with dispute_already_closed — a second close is a double submit, not a second verdict.',
       body: v.object({ status: v.enum(['won', 'lost']), note: v.optional(v.string({ max: 1000 })) }),
     });
 

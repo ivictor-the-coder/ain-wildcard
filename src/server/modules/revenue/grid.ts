@@ -11,7 +11,8 @@
  * the current bar never counts a renewal that has not happened or drops a
  * subscription that is only scheduled to cancel.
  */
-import { DAY, addInterval, interval, monthKey, startOfMonth } from '../../../shared/time';
+import { badRequest } from '../../../shared/errors';
+import { DAY, addInterval, interval, monthKey, startOfMonth, toIso } from '../../../shared/time';
 
 export interface MonthCell {
   /** `2026-03` */
@@ -142,10 +143,23 @@ export interface Range {
   to: number;
 }
 
-/** Default reporting window: the last twelve months, ending now. */
+/**
+ * Default reporting window: the last twelve months, ending now.
+ *
+ * A range that runs backwards is refused rather than quietly turned into an
+ * empty one: `?from=June&to=January` used to answer with a clean one-month
+ * report, which reads as a real answer to a question nobody asked.
+ */
 export function resolveRange(query: { from?: number; to?: number }, now: number, months = 12): Range {
   const to = query.to ?? now;
   const from = query.from ?? addInterval(startOfMonth(to), interval('month', -(months - 1)), 1);
-  if (from > to) return { from: to, to };
+  if (from > to) {
+    throw badRequest(
+      'parameter_invalid',
+      `from (${toIso(from)}) is after to (${toIso(to)}); a range runs forwards. Swap them, or leave from out for the last ${months} months.`,
+      'from',
+      { from, to },
+    );
+  }
   return { from, to };
 }

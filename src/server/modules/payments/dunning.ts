@@ -106,8 +106,29 @@ export interface RecoveryTotals {
   recovery_rate_bps: number;
 }
 
+/**
+ * The one definition of a recovery rate, and revenue/collections reads this
+ * one rather than keeping its own: money recovered over money whose fate is
+ * known — recovered plus lost — across campaigns that have finished. A
+ * campaign still recovering has no outcome yet and sits in neither figure,
+ * and a part payment counts as recovered whichever way its campaign ends.
+ */
+export const RECOVERY_RATE_BASIS =
+  'Recovered ÷ (recovered + lost), over campaigns that have finished. recovered_amount is every payment that arrived ' +
+  'while a campaign ran — a part payment included, whichever way the campaign ended — and lost_amount is what an ' +
+  'exhausted campaign was still chasing when its schedule ran out. A campaign still recovering has no outcome yet and ' +
+  'is in neither figure; what it is still chasing is amount_at_risk.';
+
+/** Basis points, exact: a ratio of two integers scaled and rounded once. */
+export function recoveryRateBps(recovered: number, lost: number): number {
+  const decided = recovered + lost;
+  return decided > 0 ? Number(ratRound(ratMul(rat(recovered, decided), rat(10_000)))) : 0;
+}
+
 export interface RecoverySummary {
   object: 'dunning_summary';
+  /** How `recovery_rate_bps` is defined — the same sentence /v1/revenue/collections carries. */
+  recovery_rate_basis: string;
   open_campaigns: number;
   needs_human: number;
   /** Open campaigns presenting nothing until a person acts. Part of `open_campaigns`, and of what is at risk. */
@@ -387,10 +408,13 @@ export class DunningEngine {
       `SELECT status, COUNT(*) AS n FROM payments_dunning WHERE org_id = ? GROUP BY status`, orgId,
     );
     const byStatus = Object.fromEntries(counts.map((row) => [row.status, Number(row.n)]));
+    // Only campaigns with an outcome are in the rate: what a recovered one
+    // brought in, and what an exhausted one brought in before it gave up —
+    // a part payment is money that arrived whichever way the campaign ended.
     const perCurrency = this.ctx.db.all<{ currency: string; at_risk: number; recovered: number; lost: number }>(
       `SELECT currency,
               COALESCE(SUM(CASE WHEN status = 'recovering' THEN amount_at_risk ELSE 0 END), 0) AS at_risk,
-              COALESCE(SUM(CASE WHEN status = 'recovered'  THEN recovered_amount ELSE 0 END), 0) AS recovered,
+              COALESCE(SUM(CASE WHEN status IN ('recovered', 'exhausted') THEN recovered_amount ELSE 0 END), 0) AS recovered,
               COALESCE(SUM(CASE WHEN status = 'exhausted'  THEN amount_at_risk ELSE 0 END), 0) AS lost
          FROM payments_dunning WHERE org_id = ? GROUP BY currency ORDER BY at_risk DESC, currency ASC`,
       orgId,
@@ -415,6 +439,7 @@ export class DunningEngine {
 
     return {
       object: 'dunning_summary',
+      recovery_rate_basis: RECOVERY_RATE_BASIS,
       open_campaigns: byStatus.recovering ?? 0,
       needs_human: needsHuman,
       held_campaigns: held,
@@ -423,15 +448,12 @@ export class DunningEngine {
       totals: perCurrency.map((row) => {
         const recovered = Number(row.recovered);
         const lost = Number(row.lost);
-        const decided = recovered + lost;
         return {
           currency: row.currency,
           amount_at_risk: Number(row.at_risk),
           recovered_amount: recovered,
           lost_amount: lost,
-          // Exact: a ratio of two integers scaled and rounded once, rather
-          // than a float that has been through a division and a product.
-          recovery_rate_bps: decided > 0 ? Number(ratRound(ratMul(rat(recovered, decided), rat(10_000)))) : 0,
+          recovery_rate_bps: recoveryRateBps(recovered, lost),
         };
       }),
       attempts: {
@@ -457,9 +479,9 @@ export class DunningEngine {
       if (existing.status !== 'recovering') {
         // A campaign that had finished is chasing the bill again, so what it
         // reads as recovered goes back to nothing: the money a recovered
-        // campaign counted has been given back or taken back, and revenue
-        // reads open exposure as `amount_at_risk - recovered_amount`. The
-        // attempts stay — the history of a bill is one story.
+        // campaign counted has been given back or taken back, and the summary
+        // would otherwise go on counting it. The attempts stay — the history
+        // of a bill is one story.
         this.ctx.db.patch('payments_dunning', 'id', existing.id, {
           status: 'recovering', resolved_at: null, resolution: null, end_behavior_applied: null,
           amount_at_risk: invoice.amount_due, recovered_amount: 0, ...holdColumns(null), updated: now,
@@ -610,14 +632,15 @@ export class DunningEngine {
         : this.nextAttemptAt(policy, {
           invoiceId: campaign.invoice, failedAttempt: Math.max(1, campaign.attempt_count), from: now, severity, now,
         });
-    // Only what is at risk moves, and it moves to the live balance — the same
-    // figure `open` keeps there. `recovered_amount` stays where it is on purpose:
-    // revenue reads open exposure as `amount_at_risk - recovered_amount`, so
-    // crediting the part payment here as well would subtract it twice and
-    // under-state what the workspace is still chasing by exactly the amount that
-    // came in.
+    // Two figures move, and they are two different facts. What is at risk is
+    // the live balance — the same figure `open` keeps there, and what revenue
+    // reads as open exposure. What was recovered grows by what came in: money
+    // that arrived while the campaign ran is recovered money whichever way the
+    // campaign ends, and a campaign that gives up later has still brought this
+    // much back.
     this.ctx.db.patch('payments_dunning', 'id', campaign.id, {
       amount_at_risk: invoice.amount_due,
+      recovered_amount: campaign.recovered_amount + charge.amount,
       next_attempt_at: scheduled,
       updated: now,
     });
@@ -861,7 +884,10 @@ export class DunningEngine {
     const hold: DunningHold = {
       reason: 'reopened_by_refund',
       until: null,
-      note: `${show(refund.amount)} of ${after.number} went back to the customer on ${formatDate(now, org)} (${refund.id}, ${refund.reason.replace(/_/g, ' ')}), so ${show(after.amount_due)} is owed again on a bill that had been settled.`,
+      // Read on the recovery queue by whoever asks why a settled bill is back:
+      // the refund's reason is the answer, its id is not, and the id travels
+      // in the event data below for anything that needs to follow the row.
+      note: `${show(refund.amount)} of ${after.number} went back to the customer on ${formatDate(now, org)}, refunded as ${refund.reason.replace(/_/g, ' ')}, so ${show(after.amount_due)} is owed again on a bill that had been settled.`,
     };
     this.ctx.db.patch('payments_dunning', 'id', campaign.id, {
       next_attempt_at: null, ...holdColumns(hold), updated: now,
@@ -885,7 +911,8 @@ export class DunningEngine {
       ?? `${shown} recovered on attempt ${input.attemptNumber} of ${campaign.max_attempts}, ${Math.max(1, Math.round((now - campaign.started_at) / DAY))} day(s) after the first failure.`;
     this.ctx.db.patch('payments_dunning', 'id', campaign.id, {
       status: 'recovered', attempt_count: input.attemptNumber, last_attempt_at: now,
-      next_attempt_at: null, ...holdColumns(null), recovered_amount: input.amount, resolved_at: now, resolution, updated: now,
+      next_attempt_at: null, ...holdColumns(null), recovered_amount: campaign.recovered_amount + input.amount,
+      resolved_at: now, resolution, updated: now,
     });
     this.writeAttempt(orgId, campaign, {
       attemptNumber: input.attemptNumber, scheduledFor: input.scheduledFor, outcome: 'succeeded',
@@ -1131,9 +1158,9 @@ export class DunningEngine {
    * The mirror of `recordPartialCollection` for money the schedule collected
    * itself: the window was spent, so the attempt is written and the count moves
    * on, but the campaign stays open because what decides that is the balance,
-   * not the authorisation. `amount_at_risk` follows the balance down;
-   * `recovered_amount` stays where it is, because the summary counts it only
-   * for a campaign that finished as recovered.
+   * not the authorisation. `amount_at_risk` follows the balance down and
+   * `recovered_amount` follows the money up, exactly as a part payment made by
+   * hand moves them.
    */
   private recordPartialAttempt(
     orgId: string, campaign: Dunning, invoice: Invoice,
@@ -1155,7 +1182,7 @@ export class DunningEngine {
       : `${shown(input.amount)} was authorised on attempt ${input.attemptNumber}, but ${shown(invoice.amount_due)} of ${invoice.number} is still owed and that was the last scheduled window.`;
     this.ctx.db.patch('payments_dunning', 'id', campaign.id, {
       attempt_count: input.attemptNumber, last_attempt_at: now, next_attempt_at: nextAt, ...holdColumns(null),
-      amount_at_risk: invoice.amount_due, updated: now,
+      amount_at_risk: invoice.amount_due, recovered_amount: campaign.recovered_amount + input.amount, updated: now,
     });
     const attempt = this.writeAttempt(orgId, campaign, {
       attemptNumber: input.attemptNumber, scheduledFor: input.scheduledFor, outcome: 'succeeded',

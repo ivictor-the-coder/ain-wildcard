@@ -143,7 +143,7 @@ const PRICE_FIELDS = {
   type: v.optional(v.enum(PRICE_TYPES)),
   model: v.optional(described(
     v.enum(PRICE_MODELS),
-    'How a quantity turns into money. Omit it and the payload decides, the way Stripe reads one: tiers → tiered, recurring.usage_type "metered" → usage, transform_quantity → package, custom_unit_amount → custom, and otherwise per_unit — unit_amount multiplied by the quantity. "flat", one charge whatever the quantity, is never inferred: ask for it by name.',
+    'How a quantity turns into money. Omit it and the payload decides, the way Stripe reads one: recurring.usage_type "metered" → usage (with or without tiers — the ladder is billing_scheme "tiered" beside it), tiers → tiered, transform_quantity → package, custom_unit_amount → custom, and otherwise per_unit — unit_amount multiplied by the quantity. "flat", one charge whatever the quantity, is never inferred: ask for it by name.',
   )),
   unit_amount: v.optional(described(
     v.int({ min: 0 }),

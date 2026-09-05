@@ -65,7 +65,10 @@ export function hydrateMethod(row: any): PaymentMethod {
       : null,
     billing_details: { name: text(row.billing_name), email: text(row.billing_email) },
     fingerprint: String(row.fingerprint),
-    simulated: { behavior, decline_count: declineCount, explanation: describeBehavior(behavior, declineCount) },
+    simulated: {
+      behavior, decline_count: declineCount, effective_behavior: behavior,
+      explanation: describeBehavior(behavior, declineCount),
+    },
     metadata: parseJson<Record<string, string>>(row.metadata, {}),
     created: num(row.created),
     updated: num(row.updated),

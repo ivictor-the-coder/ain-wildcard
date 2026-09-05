@@ -21,8 +21,10 @@ import type { Ctx } from '../../kernel/context';
 import { rat, ratRound } from '../../../shared/money';
 import { startOfMonth } from '../../../shared/time';
 import { Pricebook } from '../billing/cycle';
+import { badRequest } from '../../../shared/errors';
 import { billingStore } from '../billing/module';
 import type { Subscription } from '../billing/types';
+import { isCurrency } from '../catalog/currencies';
 import {
   clipBetween, instantsOf, monthGrid, resolveRange, type MonthCell, type Range, type WindowClip,
 } from './grid';
@@ -119,6 +121,26 @@ export interface Book {
   now: number;
 }
 
+/**
+ * A currency a report can be narrowed to, or a refusal that names the field.
+ *
+ * Three letters are not a currency: `?currency=zzz` used to come back as a
+ * clean report of zeros in a currency that does not exist, which reads as
+ * "nothing was billed in ZZZ" rather than "that is not a currency".
+ */
+function requestedCurrency(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const code = raw.toLowerCase();
+  if (!isCurrency(code)) {
+    throw badRequest(
+      'parameter_invalid',
+      `Invalid currency: ${raw}. Use an ISO-4217 code such as usd, eur or gbp — the currency a book is billed in.`,
+      'currency',
+    );
+  }
+  return code;
+}
+
 export class Revenue {
   constructor(private readonly ctx: Ctx) {}
 
@@ -137,7 +159,7 @@ export class Revenue {
    */
   book(orgId: string, query: RevenueQuery, opts: { fullHistory?: boolean } = {}): Book {
     const now = this.ctx.now();
-    const requested = query.currency?.toLowerCase();
+    const requested = requestedCurrency(query.currency);
     const requestedRange = resolveRange(query, now, query.months ?? 12);
 
     const ids = this.ctx.db.all<{ id: string }>(
@@ -1187,7 +1209,7 @@ export class Revenue {
           'A bill ages from its due date, or from the day it was finalised when it carries none (due on receipt).',
           'The collection rate is cohorted on billings: of what was raised in a month, how much has been collected since. Cash collected in a month is reported beside it but never divided by that month\'s billings — that ratio reads over 100% whenever long-dated terms land and says nothing about whether anyone paid.',
           'DSO is closing receivables divided by everything billed inside the range, times the days the range covers. Both figures use the same "what it asked for" definition, and both are in one currency — a DSO computed across currencies is a ratio of two numbers that were never in the same unit.',
-          'Failed-payment exposure is the unrecovered balance of campaigns still in recovery. Recovery rate is money recovered over money at risk across campaigns that started inside the range, which is why it can differ from the attempt success rate beside it.',
+          'Failed-payment exposure is the balance campaigns still in recovery are chasing. The recovery rate is the payments module\'s own — recovered over recovered plus lost, across campaigns that started inside the range and have finished — so it is the figure /v1/dunning/summary quotes, and it can differ from the attempt success rate beside it.',
           'Voided invoices are excluded everywhere: a withdrawn bill is not a receivable and never was.',
         ],
         {
@@ -1468,6 +1490,10 @@ export class Revenue {
       window_clipped: window.clipped,
       balanced,
       series,
+      // Three kinds of figure share this block, and the flat keys never said
+      // which: recognition runs over every invoice ever raised, cash is the
+      // range's, and MRR is a reading at the clock. The named sub-blocks say
+      // so; the flat keys stay, each meaning exactly what it always meant.
       totals: {
         currency: scope.single,
         mrr: mrr.totals.mrr,
@@ -1489,6 +1515,45 @@ export class Revenue {
         usage_unbilled: usage.totals.unbilled_balance,
         credit_purchased: usage.credit.purchased,
         credit_burned: usage.credit.burned_against_usage,
+        /** Every invoice line ever raised, read at `as_of` — the recognition schedule is not a window. */
+        all_time: {
+          as_of: mrr.as_of,
+          invoiced: deferred.totals.invoiced,
+          invoiced_gross: deferred.totals.invoiced_gross,
+          credited: deferred.totals.credited,
+          recognised: deferred.totals.recognised,
+          deferred_balance: deferred.totals.deferred_balance,
+        },
+        /** Only what happened between `range.from` and `range.to`. */
+        in_range: {
+          from: mrr.range.from,
+          to: mrr.range.to,
+          billed: collections.totals.billed,
+          collected: collections.totals.collected,
+          collected_on_billings: collections.totals.collected_on_billings,
+          credited: collections.totals.credited,
+          written_off: collections.totals.written_off,
+          metered_value: usage.totals.metered_value,
+          usage_charged: usage.totals.charged,
+          opening_mrr: movement.totals.opening,
+          net_movement: movement.totals.net,
+        },
+        /** Balances read at the clock: neither a window nor a history. */
+        now: {
+          at: mrr.as_of,
+          mrr: mrr.totals.mrr,
+          arr: mrr.totals.arr,
+          accounts: mrr.totals.accounts,
+          subscriptions: mrr.totals.subscriptions,
+          closing_mrr: movement.totals.closing,
+          receivables: collections.totals.outstanding,
+          past_due: collections.totals.past_due,
+          usage_unbilled: usage.totals.unbilled_balance,
+        },
+        note:
+          'invoiced, recognised and deferred_balance are all-time figures (all_time); billed, collected, metered_value ' +
+          'and usage_charged are the range\'s (in_range); mrr, arr, receivables and past_due are balances at the clock (now). ' +
+          'The flat keys are kept and mean what they always meant — read the sub-blocks to know which kind each is.',
       },
       headline: {
         mrr: mrr.totals.mrr,

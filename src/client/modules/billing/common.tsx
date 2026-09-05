@@ -57,6 +57,12 @@ export function useBillingFormat(): BillingFormatter {
   }), [f]);
 }
 
+/** The two formatters the pure copy functions take, bound to this workspace. */
+export const copyFormat = (f: BillingFormatter): { money: (amount: number, currency: string) => string; day: (ts: number) => string } => ({
+  money: (amount, currency) => f.money(amount, { currency }),
+  day: (ts) => f.day(ts, { withYear: true }),
+});
+
 /* ------------------------------- data access ----------------------------- */
 
 export type Query = Record<string, string | number | boolean | undefined | null>;
@@ -123,8 +129,8 @@ export function useCursorList<T>(path: string, query: Query, limit = 100): Curso
  * re-read is in flight. The kept copy is dropped the instant the address
  * changes, so moving between two records never shows the previous one.
  */
-export function useRecord<T>(path: string | null, query?: Query): QueryResult<T> {
-  const result = useQuery<T>(path, query);
+export function useRecord<T>(path: string | null, query?: Query, opts: { refreshMs?: number } = {}): QueryResult<T> {
+  const result = useQuery<T>(path, query, opts);
   const kept = useRef<{ key: string | null; data: T | undefined }>({ key: path, data: undefined });
   if (kept.current.key !== path) kept.current = { key: path, data: undefined };
   if (result.data !== undefined) kept.current.data = result.data;
@@ -176,6 +182,13 @@ export interface ActionCopy {
    * is the same warning covering the control that would fix it.
    */
   inlineOnly?: boolean;
+  /**
+   * Skip the success toast. For a write whose outcome is not known when the
+   * response arrives — a subscription whose first invoice the collector has
+   * not yet presented — the caller re-reads the record and says what actually
+   * happened, rather than this hook announcing what was asked for.
+   */
+  silent?: boolean;
 }
 
 export interface ActionState {
@@ -205,7 +218,7 @@ export function useAction(): ActionState {
     try {
       const result = await work;
       if (invalidates.length) invalidate(...invalidates);
-      toast.success(copy.success, copy.description);
+      if (!copy.silent) toast.success(copy.success, copy.description);
       return result;
     } catch (e) {
       const err = e as ApiClientError;
@@ -228,6 +241,54 @@ export function useAction(): ActionState {
 export const idem = (): string => (
   typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `idem_${Date.now()}_${Math.random()}`
 );
+
+/**
+ * Read a record until it has finished changing.
+ *
+ * A write that hands off to a job — `POST /v1/subscriptions` finalises the
+ * first invoice and the collector presents it a tick later — returns before
+ * the money has moved. Rendering that response is how a screen says "billed"
+ * over a declined card. This reads again, a few hundred milliseconds apart,
+ * until `settled` says the record can be spoken about or the patience runs
+ * out; whatever was read last is what the caller words its sentence from.
+ */
+export async function readUntilSettled<T>(
+  read: () => Promise<T>,
+  settled: (record: T) => boolean,
+  opts: { tries?: number; gapMs?: number } = {},
+): Promise<T> {
+  const tries = opts.tries ?? 6;
+  const gap = opts.gapMs ?? 500;
+  let last = await read();
+  for (let i = 1; i < tries && !settled(last); i++) {
+    await new Promise((resolve) => setTimeout(resolve, gap));
+    // One refused read — a rate limit, a dropped connection — is not a reason
+    // to fall back to the answer from before the money moved. Keep the last
+    // good reading and ask again.
+    try { last = await read(); } catch { /* the next pass reads again */ }
+  }
+  return last;
+}
+
+/**
+ * Let the row-actions button answer the keyboard.
+ *
+ * The grid's body handles Enter as "open the focused row" and Space as
+ * "select it", and it handles them for every keydown that bubbles up to it —
+ * including the ones aimed at the "…" button inside the row, which is how
+ * Enter on "Row actions" navigated away and Space ticked the checkbox instead
+ * of opening the menu the button exists for. This runs in the capture phase on
+ * the grid's wrapper, before the body's handler, and stops those two keys
+ * there when they are aimed at a menu button; the button's own default action —
+ * the click that opens its menu — is untouched.
+ */
+export function keepRowMenuKeys(e: React.KeyboardEvent<HTMLElement>): void {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const target = e.target as HTMLElement | null;
+  if (!target || typeof target.closest !== 'function') return;
+  if (!target.closest('tbody')) return;
+  if (target.closest('button[aria-haspopup="menu"]')) e.stopPropagation();
+}
 
 /* --------------------------------- links --------------------------------- */
 

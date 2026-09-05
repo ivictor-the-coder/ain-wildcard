@@ -15,7 +15,7 @@
 import type { Ctx } from '../../kernel/context';
 import { badRequest, conflict, notFound } from '../../../shared/errors';
 import { cursorOf, newId, parseCursor } from '../../../shared/ids';
-import { daysInMonth } from '../../../shared/time';
+import { daysInMonth, formatDate } from '../../../shared/time';
 import { hash32, last4For } from './simulator';
 import { hydrateMethod, type Page, type WriteMeta } from './records';
 import {
@@ -101,7 +101,51 @@ export class Methods {
 
   method(orgId: string, id: string): PaymentMethod | null {
     const row = this.ctx.db.get<any>(`SELECT * FROM payments_methods WHERE org_id = ? AND id = ?`, orgId, id);
-    return row ? hydrateMethod(row) : null;
+    return row ? this.atClock(hydrateMethod(row)) : null;
+  }
+
+  /**
+   * The method as it behaves now, not as it was declared.
+   *
+   * A card attached three years ago with a "succeeds" behaviour and an expiry
+   * that has since passed will decline every charge as `expired_card`, and a
+   * payload that still says "charges are authorised" describes a card that no
+   * longer exists. The declared behaviour is kept — it is what comes back when
+   * a new expiry is recorded — and the effective one is stated beside it.
+   */
+  private atClock(method: PaymentMethod): PaymentMethod {
+    const now = this.ctx.now();
+    const effective = this.effectiveBehavior(method, now);
+    if (effective.behavior === method.simulated.behavior || !method.card) {
+      return { ...method, simulated: { ...method.simulated, effective_behavior: method.simulated.behavior } };
+    }
+    const expiry = `${String(method.card.exp_month).padStart(2, '0')}/${method.card.exp_year}`;
+    return {
+      ...method,
+      simulated: {
+        ...method.simulated,
+        effective_behavior: effective.behavior,
+        explanation: `This card expired ${expiry}, so every charge against it is declined as expired_card whatever it was set up to do — until a new expiry is recorded on it.`,
+      },
+    };
+  }
+
+  private orgFormat(orgId: string): { locale: string; timeZone: string } {
+    try {
+      const org = this.ctx.svc.core.org(orgId);
+      return { locale: org.locale || 'en-US', timeZone: org.timezone || 'UTC' };
+    } catch { return { locale: 'en-US', timeZone: 'UTC' }; }
+  }
+
+  /** Refuse an expiry that has already passed: no issuer would authorise a charge on it. */
+  private assertNotExpired(expMonth: number, expYear: number, now: number): void {
+    if (monthEnd(expYear, expMonth) >= now) return;
+    throw badRequest(
+      'expired_card',
+      `A card expiring ${String(expMonth).padStart(2, '0')}/${expYear} has already expired, so no charge against it could ever be authorised. Ask the customer for the card they hold now, and record its expiry.`,
+      'exp_year',
+      { exp_month: expMonth, exp_year: expYear },
+    );
   }
 
   require(orgId: string, id: string): PaymentMethod {
@@ -135,7 +179,7 @@ export class Methods {
       ...(paged as any[]), limit + 1,
     );
     const hasMore = rows.length > limit;
-    const data = rows.slice(0, limit).map(hydrateMethod);
+    const data = rows.slice(0, limit).map((row) => this.atClock(hydrateMethod(row)));
     const last = data[data.length - 1];
     return { data, hasMore, nextCursor: hasMore && last ? cursorOf(last.created, last.id) : null, totalCount };
   }
@@ -150,7 +194,7 @@ export class Methods {
         ORDER BY is_default DESC, created ASC LIMIT 1`,
       orgId, customerId,
     );
-    return row ? hydrateMethod(row) : null;
+    return row ? this.atClock(hydrateMethod(row)) : null;
   }
 
   /**
@@ -220,6 +264,7 @@ export class Methods {
       if (isCard && (expMonth < 1 || expMonth > 12)) {
         throw badRequest('exp_month_invalid', 'exp_month is a calendar month, 1 through 12.', 'exp_month');
       }
+      if (isCard) this.assertNotExpired(expMonth, expYear, now);
       const bankName = input.bank_name ?? 'Midland Union Bank';
       const accountType: BankAccountType = input.account_type ?? 'checking';
       const displayName = isCard
@@ -269,7 +314,7 @@ export class Methods {
     return this.ctx.atomic(() => {
       const before = this.require(orgId, id);
       if (before.status === 'detached') {
-        throw conflict('payment_method_detached', `Payment method ${id} was detached on ${new Date(before.detached_at ?? 0).toISOString().slice(0, 10)} and cannot be edited. Attach a new one.`);
+        throw conflict('payment_method_detached', `${before.display_name} was detached on ${formatDate(before.detached_at ?? 0, this.orgFormat(orgId))} and cannot be edited. Attach a new one.`);
       }
       const now = this.ctx.now();
       const changes: Record<string, unknown> = { updated: now };
@@ -277,6 +322,7 @@ export class Methods {
         if (!before.card) throw badRequest('not_a_card', 'Only a card has an expiry date.', 'exp_month');
         const expMonth = input.exp_month ?? before.card.exp_month;
         const expYear = input.exp_year ?? before.card.exp_year;
+        this.assertNotExpired(expMonth, expYear, now);
         changes.exp_month = expMonth;
         changes.exp_year = expYear;
         changes.display_name = `${BRAND_LABELS[before.card.brand]} ending ${before.card.last4}, expires ${String(expMonth).padStart(2, '0')}/${expYear}`;
@@ -312,11 +358,25 @@ export class Methods {
     return this.ctx.atomic(() => {
       const method = this.require(orgId, id);
       const customer = this.ctx.svc.billing.requireCustomer(orgId, customerId);
+      // A card that has gone stale on the book is as dead as one typed in stale.
+      if (method.card) this.assertNotExpired(method.card.exp_month, method.card.exp_year, this.ctx.now());
       if (method.customer && method.customer !== customerId && method.status === 'attached') {
         throw conflict(
           'payment_method_in_use',
           `${method.display_name} is already attached to another customer. A payment method belongs to one account.`,
           { customer: method.customer },
+        );
+      }
+      // Attaching a method that is already on this account is not a no-op to
+      // wave through: `defaultFor` below would find the method itself and the
+      // write would clear its own default flag, leaving the account with a
+      // card on file and nothing to charge.
+      if (method.customer === customerId && method.status === 'attached') {
+        throw badRequest(
+          'payment_method_already_attached',
+          `${method.display_name} is already attached to ${customer.name}${method.default_for_customer ? ' as the default method' : ''}, so there is nothing to attach.`
+            + (method.default_for_customer ? '' : ` To charge it first, POST /v1/payment_methods/${id}/set_default.`),
+          undefined, { customer: customerId, default_for_customer: method.default_for_customer },
         );
       }
       const now = this.ctx.now();
@@ -341,7 +401,16 @@ export class Methods {
   detach(orgId: string, id: string, meta: WriteMeta = {}): PaymentMethod {
     return this.ctx.atomic(() => {
       const method = this.require(orgId, id);
-      if (method.status === 'detached') return method;
+      if (method.status === 'detached') {
+        // Answering 200 to a transition that changed nothing hides a double
+        // submit or a stale screen; the state is named so the caller can tell
+        // "done" from "done already", as the invoice transitions do.
+        throw badRequest(
+          'payment_method_already_detached',
+          `${method.display_name} was already detached on ${formatDate(method.detached_at ?? method.updated, this.orgFormat(orgId))}, so there is nothing left to detach.`,
+          undefined, { status: method.status },
+        );
+      }
       const now = this.ctx.now();
       const customerId = method.customer;
       this.ctx.db.patch('payments_methods', 'id', id, {

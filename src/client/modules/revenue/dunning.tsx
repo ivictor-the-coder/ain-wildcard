@@ -23,9 +23,26 @@ import {
   csvInstant, moneyIn, useUrlTableState, visibleRows,
   type CsvColumn,
 } from './common';
+import { attemptsError, collectionHourError, policySavedLine, recoveryRateText } from './dunning-policy';
 import type {
-  CollectionAttempt, DunningCampaign, DunningPolicy, DunningSummary, PaymentSettings,
+  CollectionAttempt, DunningCampaign, DunningPolicy, DunningSummary, OpenInvoice, PaymentSettings,
 } from './types';
+
+/** The little of a subscription the campaign drawer names: its plan and state. */
+interface SubscriptionLite {
+  id: string;
+  status: string;
+  description: string | null;
+  items: { description: string | null; metered: boolean }[];
+}
+
+/** The plan a subscription is on, as the bill would name it — never its id. */
+export function planName(subscription: SubscriptionLite): string {
+  return subscription.items.find((item) => !item.metered)?.description
+    ?? subscription.items[0]?.description
+    ?? subscription.description
+    ?? 'Subscription';
+}
 
 /**
  * A campaign is only at risk while it is being chased.
@@ -47,8 +64,17 @@ const outcomeNote = (f: ReturnType<typeof useFormat>, row: DunningCampaign): str
 const errorFor = (error: ApiClientError | null, param: string): string | undefined =>
   (error && error.param === param ? error.body.message : undefined);
 
-const STATUSES = ['recovering', 'open', 'recovered', 'exhausted', 'canceled', 'all'] as const;
+/**
+ * The queue's filters. Every one but `needs_human` is a status the API lists
+ * by; `needs_human` is a property that cuts across statuses — an exhausted
+ * campaign on an expired card and a live one with no method on file both need
+ * a person — so it is read from the whole queue and narrowed here.
+ */
+const STATUSES = ['recovering', 'open', 'recovered', 'exhausted', 'canceled', 'all', 'needs_human'] as const;
 type StatusFilter = (typeof STATUSES)[number];
+
+/** Which rows the person-needed count and chip are made of. */
+export const needsPerson = (row: Pick<DunningCampaign, 'needs_human'>): boolean => row.needs_human;
 
 /**
  * What the policy select offers, and what the API calls each one.
@@ -95,7 +121,11 @@ export function DunningPage() {
   const status = (STATUSES as readonly string[]).includes(statusParam) ? (statusParam as StatusFilter) : 'recovering';
 
   const summary = useQuery<DunningSummary>('/v1/dunning/summary');
-  const queue = useQuery<ListEnvelope<DunningCampaign>>('/v1/dunning', { status, limit: 200 });
+  // The whole queue is read alongside the filtered one: it is what the
+  // "need a person" count and chip are made of, and a badge on a row the tile
+  // above does not count is a screen contradicting itself.
+  const everything = useQuery<ListEnvelope<DunningCampaign>>('/v1/dunning', { status: 'all', limit: 200 });
+  const queue = useQuery<ListEnvelope<DunningCampaign>>('/v1/dunning', { status: status === 'needs_human' ? 'all' : status, limit: 200 });
   const settings = useQuery<PaymentSettings>('/v1/payments/settings');
 
   const [open, setOpen] = useState<DunningCampaign | null>(null);
@@ -113,8 +143,12 @@ export function DunningPage() {
   const [retrying, setRetrying] = useState<DunningCampaign | null>(null);
   const table = useUrlTableState('d', { columnId: 'next_attempt_at', direction: 'asc' });
 
-  const rows = queue.data?.data ?? [];
+  const rows = useMemo(() => {
+    const listed = queue.data?.data ?? [];
+    return status === 'needs_human' ? listed.filter(needsPerson) : listed;
+  }, [queue.data, status]);
   const stats = summary.data;
+  const needingPerson = (everything.data?.data ?? []).filter(needsPerson);
 
   const openPolicy = () => { if (settings.data) setPolicyDraft(settings.data); };
 
@@ -252,6 +286,7 @@ export function DunningPage() {
             onChange={setStatusParam}
             options={[
               { value: 'recovering', label: 'In recovery' },
+              { value: 'needs_human', label: 'Needs a person' },
               { value: 'recovered', label: 'Recovered' },
               { value: 'exhausted', label: 'Given up' },
               { value: 'all', label: 'All' },
@@ -266,19 +301,31 @@ export function DunningPage() {
         {!summary.error && !stats && <div className="rv-tiles">{[0, 1, 2, 3, 4].map((i) => <Card key={i} padding="tight"><Skeleton height={70} /></Card>)}</div>}
         {stats && (
           <>
-            {stats.needs_human > 0 && (
-              <Banner tone="danger" title={`${f.plural(stats.needs_human, 'campaign')} cannot be fixed by another retry`}>
-                A card that has expired, an account that is closed or a charge the issuer wants authenticated will refuse every automatic attempt. These need a new payment method or a call.
+            {needingPerson.length > 0 && status !== 'needs_human' && (
+              <Banner
+                tone="danger"
+                title={`${f.plural(needingPerson.length, 'campaign')} cannot be fixed by another retry`}
+                actions={<Button size="sm" variant="secondary" onClick={() => setStatusParam('needs_human')}>Show them</Button>}
+              >
+                A card that has expired, an account that is closed, a schedule that has run out or a charge the issuer wants authenticated will refuse every automatic attempt. These need a new payment method, a call or a write-off.
               </Banner>
             )}
             <div className="rv-tiles">
-              <Card padding="tight"><Stat label="In recovery" value={formatNumber(stats.open_campaigns)} caption={`${formatNumber(stats.needs_human)} need a person`} /></Card>
+              <Card padding="tight">
+                <Stat
+                  label="In recovery"
+                  value={formatNumber(stats.open_campaigns)}
+                  /* Counted from the queue itself, whatever status the rows are
+                     in — the same rows that wear the badge below. */
+                  caption={`${formatNumber(needingPerson.length)} need a person`}
+                />
+              </Card>
               {stats.totals.map((total) => (
                 <Card padding="tight" key={total.currency}>
                   <Stat
                     label={`At risk · ${total.currency.toUpperCase()}`}
                     value={moneyIn(f, total.amount_at_risk, total.currency)}
-                    caption={`${moneyIn(f, total.recovered_amount, total.currency)} recovered · ${(total.recovery_rate_bps / 100).toFixed(2)}% rate`}
+                    caption={`${moneyIn(f, total.recovered_amount, total.currency)} recovered · ${recoveryRateText(total)}`}
                   />
                 </Card>
               ))}
@@ -380,12 +427,16 @@ export function DunningPage() {
               maxHeight={620}
               empty={(
                 <EmptyState
-                  title={status === 'recovering' ? 'Nothing is in recovery' : 'No campaigns match this filter'}
+                  title={status === 'recovering'
+                    ? 'Nothing is in recovery'
+                    : status === 'needs_human' ? 'Nobody needs a person right now' : 'No campaigns match this filter'}
                   body={(
                     <EmptyBody>
                       {status === 'recovering'
                         ? 'Every automatic charge is clearing. A campaign starts the moment a payment is refused.'
-                        : 'Switch the filter above to see campaigns in another state.'}
+                        : status === 'needs_human'
+                          ? 'Every campaign still being chased is on a schedule that can clear it, and nothing has run out of attempts.'
+                          : 'Switch the filter above to see campaigns in another state.'}
                     </EmptyBody>
                   )}
                   action={status === 'recovering'
@@ -422,8 +473,8 @@ export function DunningPage() {
         <PolicyModal
           settings={policyDraft}
           onClose={() => setPolicyDraft(null)}
-          onSaved={(schedule) => {
-            toast.success('Retry policy saved', schedule);
+          onSaved={(policy) => {
+            toast.success('Retry policy saved', policySavedLine(policy, f.list));
             setPolicyDraft(null);
           }}
         />
@@ -563,8 +614,29 @@ function CampaignDrawer({
 }) {
   const f = useFormat();
   const navigate = useNavigate();
+  const toast = useToast();
   const live = useQuery<DunningCampaign>(`/v1/dunning/${campaign.id}`);
   const row = live.data ?? campaign;
+  const subscription = useQuery<SubscriptionLite>(row.subscription ? `/v1/subscriptions/${row.subscription}` : null);
+  // The advice on an exhausted campaign ends "collect it by hand or write it
+  // off". Writing it off is an invoice action two hops away on another
+  // screen's overflow menu; it is offered here, on the bill it names, once the
+  // bill is confirmed still open — a paid or already written-off bill has
+  // nothing left to write off.
+  const invoice = useQuery<OpenInvoice>(row.status === 'exhausted' ? `/v1/invoices/${row.invoice}` : null);
+  const writable = row.status === 'exhausted' && invoice.data?.status === 'open' && invoice.data.amount_due > 0;
+  const [writingOff, setWritingOff] = useState(false);
+  const writeOff = useMutation<void, OpenInvoice>(
+    async () => api.post<OpenInvoice>(`/v1/invoices/${row.invoice}/mark_uncollectible`),
+    {
+      invalidates: ['/v1/dunning', '/v1/invoices', '/v1/revenue'],
+      onSuccess: (bill) => {
+        toast.success(`${bill.number} written off`, `${moneyIn(f, row.amount_at_risk, row.currency)} stays billed and is no longer owed.`);
+        setWritingOff(false);
+        onClose();
+      },
+    },
+  );
 
   const entries: TimelineEntry[] = row.attempts.map((attempt) => ({
     id: attempt.id,
@@ -605,7 +677,9 @@ function CampaignDrawer({
       footer={
         row.status === 'recovering' || row.status === 'open'
           ? <Button variant="danger-ghost" iconLeft={<Icons.x size={15} />} onClick={onCancel}>Stop chasing this bill</Button>
-          : null
+          : writable
+            ? <Button variant="danger-ghost" iconLeft={<Icons.trash size={15} />} onClick={() => setWritingOff(true)}>{`Write off ${moneyIn(f, invoice.data?.amount_due ?? row.amount_at_risk, row.currency)}`}</Button>
+            : null
       }
     >
       <Stack gap={6}>
@@ -628,7 +702,24 @@ function CampaignDrawer({
             { term: 'Payment method', value: row.payment_method?.display_name ?? 'None on file' },
             { term: 'Last decline', value: row.last_failure_code ? `${humanize(row.last_failure_code)} — ${row.last_failure_message ?? ''}` : 'None' },
             { term: 'Retry schedule', value: `${f.list(row.retry_days.map((d) => `${d} days`))} between attempts` },
-            { term: 'Subscription', value: row.subscription ? `${row.subscription} · ${humanize(row.subscription_status ?? '')}` : 'None' },
+            {
+              term: 'Subscription',
+              value: row.subscription
+                ? (
+                  <Inline gap={3} wrap>
+                    <span>
+                      {subscription.data
+                        ? planName(subscription.data)
+                        : subscription.error ? 'Could not be read' : '…'}
+                    </span>
+                    {(row.subscription_status || subscription.data?.status) && (
+                      <StatusChip status={row.subscription_status ?? subscription.data?.status ?? ''} />
+                    )}
+                    <Button size="sm" variant="ghost" iconRight={<ArrowRightIcon size={13} />} onClick={() => navigate(`/billing/subscriptions/${row.subscription}`)}>Open</Button>
+                  </Inline>
+                )
+                : 'None',
+            },
           ]}
         />
 
@@ -636,6 +727,24 @@ function CampaignDrawer({
           {live.loading && !live.data ? <Loading label="Reading the campaign…" /> : <Timeline entries={entries} />}
         </Card>
       </Stack>
+      {writingOff && invoice.data && (
+        <ConfirmDialog
+          open
+          tone="danger"
+          onCancel={() => setWritingOff(false)}
+          onConfirm={() => { void writeOff.run().catch(() => undefined); }}
+          loading={writeOff.loading}
+          title={`Write ${invoice.data.number} off?`}
+          confirmLabel={`Write off ${moneyIn(f, invoice.data.amount_due, invoice.data.currency)}`}
+          body={(
+            <>
+              {`${row.customer_name} still owes ${moneyIn(f, invoice.data.amount_due, invoice.data.currency)} on a bill the schedule gave up on. `}
+              {'The bill stays billed and counts in what was invoiced; it is simply not going to be collected, so it comes off receivables and the subscription follows the policy\u2019s end behaviour.'}
+              {writeOff.error ? ` — ${writeOff.error.body.message}` : ''}
+            </>
+          )}
+        />
+      )}
     </Drawer>
   );
 }
@@ -773,7 +882,7 @@ function PolicyModal({ settings, onClose, onSaved }: {
   settings: PaymentSettings;
   onClose: () => void;
   /** Raised on the page, which outlives the dialog the save closes. */
-  onSaved: (schedule: string) => void;
+  onSaved: (policy: DunningPolicy) => void;
 }) {
   const [retryDays, setRetryDays] = useState<string[]>(settings.dunning.retry_days.map(String));
   const [maxAttempts, setMaxAttempts] = useState<number | null>(settings.dunning.max_attempts);
@@ -795,11 +904,17 @@ function PolicyModal({ settings, onClose, onSaved }: {
     }),
     {
       invalidates: ['/v1/payments/settings', '/v1/dunning'],
-      onSuccess: (result) => { onSaved(result.schedule_explained); },
+      onSuccess: (result) => { onSaved(result.dunning); },
     },
   );
 
   const endBehaviorError = errorFor(save.error, 'dunning.end_behavior');
+  // The server's limits, stated before the request: a field that clamped
+  // 0 → 1 on the way in saved a one-attempt schedule nobody asked for.
+  const attemptsProblem = attemptsError(maxAttempts);
+  const hourProblem = collectionHourError(collectionHour);
+  const invalid = attemptsProblem !== null || hourProblem !== null;
+  const submit = () => { if (!invalid) void save.run().catch(() => undefined); };
 
   return (
     <Modal
@@ -811,11 +926,19 @@ function PolicyModal({ settings, onClose, onSaved }: {
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
-          <Button variant="primary" loading={save.loading} onClick={() => { void save.run().catch(() => undefined); }}>Save policy</Button>
+          <Button
+            variant="primary"
+            loading={save.loading}
+            disabled={invalid}
+            title={attemptsProblem ?? hourProblem ?? undefined}
+            onClick={submit}
+          >
+            Save policy
+          </Button>
         </>
       }
     >
-      <form className="rv-form" onSubmit={(e) => { e.preventDefault(); void save.run().catch(() => undefined); }}>
+      <form className="rv-form" onSubmit={(e) => { e.preventDefault(); submit(); }}>
         {save.error && !save.error.param && <Banner tone="danger" compact>{save.error.body.message}</Banner>}
         <Field
           label="Gaps between attempts"
@@ -825,11 +948,20 @@ function PolicyModal({ settings, onClose, onSaved }: {
           <TagInput value={retryDays} onChange={setRetryDays} placeholder="3" />
         </Field>
         <div className="rv-form__pair">
-          <Field label="Maximum attempts" required error={errorFor(save.error, 'dunning.max_attempts')}>
-            <LiveNumberInput value={maxAttempts} onChange={setMaxAttempts} min={1} max={12} />
+          <Field
+            label="Maximum attempts"
+            required
+            hint="The first presentation is attempt one; 1 to 12."
+            error={errorFor(save.error, 'dunning.max_attempts') ?? errorFor(save.error, 'max_attempts') ?? attemptsProblem ?? undefined}
+          >
+            <LiveNumberInput value={maxAttempts} onChange={setMaxAttempts} min={1} max={12} rewriteOutOfRange={false} />
           </Field>
-          <Field label="Collection hour" hint="Local hour the day's attempts are presented at." error={errorFor(save.error, 'dunning.collection_hour')}>
-            <LiveNumberInput value={collectionHour} onChange={setCollectionHour} min={0} max={23} />
+          <Field
+            label="Collection hour"
+            hint="Local hour the day's attempts are presented at, 0 to 23."
+            error={errorFor(save.error, 'dunning.collection_hour') ?? errorFor(save.error, 'collection_hour') ?? hourProblem ?? undefined}
+          >
+            <LiveNumberInput value={collectionHour} onChange={setCollectionHour} min={0} max={23} rewriteOutOfRange={false} />
           </Field>
         </div>
         <Field

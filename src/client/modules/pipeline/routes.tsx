@@ -2,6 +2,7 @@
  * The deal surface: a kanban board that moves real deals, a table view of the
  * same set, and the deal record.
  */
+import { useEffect } from 'react';
 import type { CommandDef, NavItem, RouteDef, WidgetDef } from '@/client/kernel/registry-types';
 import { useRouter } from '@/client/kernel/router';
 import {
@@ -9,15 +10,32 @@ import {
 } from '@/client/design';
 import { DealsPage } from './deals';
 import { DealRecordPage } from './record';
+import { ForecastPage } from './forecast';
 import {
-  ALL_PIPELINES, SIX_WEEK_DAYS, accountOf, dealAmount, dealCloseDate, recordHref, useDealFormat,
-  useDealSearch, type DealSearchBody,
+  ALL_PIPELINES, SIX_WEEK_DAYS, accountOf, dealAmount, dealCloseDate, needsYear, recordHref,
+  useDealFormat, useDealSearch, type DealSearchBody,
 } from './api';
 import './pipeline.css';
 
 const DealRecordRoute = () => {
   const { params } = useRouter();
   return <DealRecordPage key={params.id} id={params.id} />;
+};
+
+/**
+ * `/deals/table` is the table. It used to fall into `/deals/:id` and ask the
+ * API for a deal called "table", which answered 404 — so the one address a
+ * person would guess for the table view was a dead end. The table lives at
+ * `/deals?display=table`; whatever else was in the address travels with it.
+ */
+const TableRedirect = () => {
+  const { location, navigate } = useRouter();
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    params.set('display', 'table');
+    navigate(`/deals?${params.toString()}`, { replace: true });
+  }, [location.search, navigate]);
+  return null;
 };
 
 /* --------------------------------- widget --------------------------------- */
@@ -121,7 +139,7 @@ function ClosingSoon() {
             <span className="pl-widgetrow__text">
               <span className="pl-widgetrow__title u-truncate">{deal.display_name}</span>
               <span className="pl-widgetrow__sub u-truncate">
-                {accountOf(deal)?.display_name ?? 'No account'} · {close !== null ? f.calendarDate(close, { withYear: false }) : 'no close date'}
+                {accountOf(deal)?.display_name ?? 'No account'} · {close !== null ? f.calendarDate(close, { withYear: needsYear(close, f.calendarToday()) }) : 'no close date'}
               </span>
             </span>
             <span className="pl-widgetrow__amount">{f.money(dealAmount(deal))}</span>
@@ -160,6 +178,8 @@ function ClosingSoon() {
 
 export const routes: RouteDef[] = [
   { path: '/deals', element: DealsPage, title: 'Deals' },
+  { path: '/deals/table', element: TableRedirect, title: 'Deals' },
+  { path: '/deals/forecast', element: ForecastPage, title: 'Forecast' },
   { path: '/deals/:id', element: DealRecordRoute, title: 'Deal' },
 ];
 
@@ -195,9 +215,18 @@ export const commands: CommandDef[] = [
     title: 'Deals closing this quarter',
     subtitle: 'Filtered to the current quarter’s close dates',
     group: 'Go to',
-    keywords: ['forecast', 'quarter', 'close'],
+    keywords: ['quarter', 'close'],
     icon: 'calendar-check',
     run: (go) => go(boardHref('quarter')),
+  },
+  {
+    id: 'pipeline.forecast',
+    title: 'Forecast',
+    subtitle: 'Closed won, commit, best case and pipeline by owner, for the quarter',
+    group: 'Go to',
+    keywords: ['forecast', 'commit', 'best case', 'rollup', 'quota', 'deals'],
+    icon: 'target',
+    run: (go) => go('/deals/forecast'),
   },
 ];
 

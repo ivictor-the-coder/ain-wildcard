@@ -1,12 +1,23 @@
 import { strict as assert } from 'node:assert';
+import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 
 import {
-  ALL_PIPELINES, BOARD_KEYS, DAY_MS, HORIZON_LABEL, HORIZONS, SIX_WEEK_DAYS, boardMove, boardTabStop,
-  describeBoardState, isBoardKey, matchesHorizon,
-  horizonWindow, quarterEnd, quarterStart, sameBoardState, stageKey, stateToView, viewToState,
+  ALL_PIPELINES, BOARD_KEYS, CUSTOM_SORT, DAY_MS, FORECAST_PERIODS, HORIZON_LABEL, HORIZONS, PERIOD_LABEL,
+  SIX_WEEK_DAYS, SORTS, TABLE_SORT,
+  boardHeadline, boardMove, boardTabStop, closedVerb, columnsFor, dateExample, dateOrderOf, describeBoardState,
+  describeTableSort, isBoardKey, matchesHorizon, moneyLine, needsYear, horizonWindow, outcomeWord, parseTypedDate,
+  quarterEnd, quarterName, quarterStart, reverseClearedSort, sameBoardState, sortKeyOf, stageKey, stateToView,
+  viewToState,
   type BoardState, type FilterCondition,
 } from '../src/client/modules/pipeline/board-core';
+import {
+  FORECAST_BUCKETS, UNASSIGNED, bucketOf, byOwner, byPipeline, composition, rollupForecast,
+  type ForecastDeal,
+} from '../src/client/modules/pipeline/forecast-core';
+import { dealCsv, dealExportColumns, isoDay } from '../src/client/modules/pipeline/export-core';
+import { matchRoute } from '../src/client/kernel/router';
+import type { TableState } from '../src/client/design/table-core';
 import { splitToolEcho, parseBlocks, confidenceBand, refusalOf } from '../src/client/modules/copilot/answer-core';
 import {
   MONEY_TOTAL, QUALIFIER_KINDS, UNMEASURED, boardHref, boundScopeOf, countedObject, currencyOfFigure,
@@ -36,7 +47,7 @@ const board = (over: Partial<BoardState> = {}): BoardState =>
 describe('the six-week commit window', () => {
   it('is a real horizon the board can be filtered to', () => {
     assert.equal(HORIZON_LABEL['42'], 'Closing within six weeks');
-    assert.deepEqual(HORIZONS, ['all', 'overdue', '30', '42', 'quarter']);
+    assert.deepEqual(HORIZONS, ['all', 'overdue', '30', '42', 'quarter', 'next_quarter', 'last_quarter', 'year']);
     // Every horizon is offered, and the control does not open on the third one
     // because two keys happen to look like integers to the runtime.
     assert.deepEqual([...HORIZONS].sort(), Object.keys(HORIZON_LABEL).sort());
@@ -100,9 +111,12 @@ describe('the six-week window as a saved view', () => {
   });
 
   it('round-trips every horizon the board offers', () => {
+    // Read and written against the same civil day: the two quarter windows the
+    // filter engine has no token for are stored as dates, and dates are only
+    // a horizon relative to a clock.
     for (const horizon of HORIZONS) {
-      const stored = stateToView(board({ horizon }));
-      const { state, readable } = viewToState({ filter: stored.filter, sort: stored.sort });
+      const stored = stateToView(board({ horizon }), TODAY);
+      const { state, readable } = viewToState({ filter: stored.filter, sort: stored.sort }, TODAY);
       assert.equal(readable, true, `${horizon} did not read back`);
       assert.equal(state.horizon, horizon, `${horizon} read back as ${state.horizon}`);
       assert.equal(sameBoardState(state, board({ horizon })), true);
@@ -737,7 +751,9 @@ describe('where a cited record opens', () => {
   it('leaves the screens that were already right alone', () => {
     assert.equal(citationHref({ id: 'deal_1', label: 'A deal', type: 'deal' }), '/deals/deal_1');
     assert.equal(citationHref({ id: 'cmp_1', label: 'A company', type: 'company' }), '/companies/cmp_1');
-    assert.equal(citationHref({ id: 'in_1', label: 'An invoice', type: 'invoice' }), '/invoices/in_1');
+    // The invoice screen moved under /billing in the coherence pass; the
+    // citation follows it there rather than to the address that no longer exists.
+    assert.equal(citationHref({ id: 'in_1', label: 'An invoice', type: 'invoice' }), '/billing/invoices/in_1');
     assert.equal(citationHref({ id: 'prc_1', label: 'A price', type: 'price' }), null);
   });
 });
@@ -2067,5 +2083,467 @@ describe('a pipeline this workspace has and the engine does not measure', () => 
       deniedPipeline('No deal pipeline in this workspace is called "Support".', VOCAB),
       null,
     );
+  });
+});
+
+
+/* ------------------------- the year on a calendar day --------------------- */
+
+describe('the year on a close date', () => {
+  it('is said when the day is in another year, and only then', () => {
+    // A card reading "Oct 21" over a deal booked on 21 October 2025 reads as
+    // next month from September 2026.
+    assert.equal(needsYear(Date.UTC(2025, 9, 21), TODAY), true);
+    assert.equal(needsYear(Date.UTC(2027, 0, 1), TODAY), true);
+    assert.equal(needsYear(Date.UTC(2026, 0, 1), TODAY), false);
+    assert.equal(needsYear(Date.UTC(2026, 11, 31), TODAY), false);
+    assert.equal(needsYear(TODAY, TODAY), false);
+  });
+});
+
+/* --------------------- the verb on a closed deal's date ------------------- */
+
+describe('the verb on a closed deal’s close date', () => {
+  it('books a won deal and loses a lost one', () => {
+    assert.equal(closedVerb({ is_closed: true, is_won: true }), 'Booked');
+    // A Closed-lost record used to caption its close date "Booked in 4 days".
+    assert.equal(closedVerb({ is_closed: true, is_won: false }), 'Lost');
+  });
+
+  it('says nothing about an open deal, or a deal whose stage is unknown', () => {
+    assert.equal(closedVerb({ is_closed: false, is_won: false }), null);
+    assert.equal(closedVerb(undefined), null);
+  });
+});
+
+/* ------------------------ the forecast's periods ------------------------- */
+
+describe('the quarters either side of this one', () => {
+  it('are whole calendar quarters, across a year boundary too', () => {
+    assert.deepEqual(horizonWindow('next_quarter', TODAY), { from: Date.UTC(2026, 9, 1), to: Date.UTC(2026, 11, 31) });
+    assert.deepEqual(horizonWindow('last_quarter', TODAY), { from: Date.UTC(2026, 3, 1), to: Date.UTC(2026, 5, 30) });
+    assert.deepEqual(horizonWindow('year', TODAY), { from: Date.UTC(2026, 0, 1), to: Date.UTC(2026, 11, 31) });
+    const december = Date.UTC(2026, 11, 15);
+    assert.deepEqual(horizonWindow('next_quarter', december), { from: Date.UTC(2027, 0, 1), to: Date.UTC(2027, 2, 31) });
+    const january = Date.UTC(2027, 0, 4);
+    assert.deepEqual(horizonWindow('last_quarter', january), { from: Date.UTC(2026, 9, 1), to: Date.UTC(2026, 11, 31) });
+    assert.equal(quarterEnd(TODAY, 1), Date.UTC(2026, 11, 31));
+  });
+
+  it('are named the way a forecast call names them', () => {
+    assert.equal(quarterName(TODAY), 'Q3 2026');
+    assert.equal(quarterName(quarterStart(TODAY, 1)), 'Q4 2026');
+    assert.equal(quarterName(quarterStart(Date.UTC(2026, 11, 15), 1)), 'Q1 2027');
+  });
+
+  it('are every one of them a horizon the board can be filtered to', () => {
+    for (const period of FORECAST_PERIODS) {
+      assert.ok(HORIZONS.includes(period), `${period} is not a board horizon`);
+      assert.ok(PERIOD_LABEL[period]);
+    }
+    assert.ok(matchesHorizon(Date.UTC(2026, 10, 2), 'next_quarter', TODAY));
+    assert.equal(matchesHorizon(Date.UTC(2026, 10, 2), 'quarter', TODAY), false);
+    assert.ok(matchesHorizon(Date.UTC(2026, 4, 2), 'last_quarter', TODAY));
+    assert.ok(matchesHorizon(Date.UTC(2026, 4, 2), 'year', TODAY));
+    assert.equal(matchesHorizon(Date.UTC(2025, 4, 2), 'year', TODAY), false);
+  });
+
+  it('save as the filter engine’s own tokens where it has them', () => {
+    const year = stateToView(board({ horizon: 'year' }));
+    assert.deepEqual(year.filter, {
+      op: 'and',
+      filters: [{ property: 'close_date', operator: 'between', values: ['start_of_year', 'end_of_year'] }],
+    });
+    const back = viewToState({ filter: year.filter, sort: year.sort });
+    assert.equal(back.readable, true);
+    assert.equal(back.state.horizon, 'year');
+  });
+
+  it('save next quarter as the days it is today, and read those days back as whatever quarter they are now', () => {
+    const saved = stateToView(board({ horizon: 'next_quarter' }), TODAY);
+    const condition = (saved.filter as { filters: FilterCondition[] }).filters[0];
+    assert.deepEqual(condition, { property: 'close_date', operator: 'between', values: [Date.UTC(2026, 9, 1), Date.UTC(2026, 11, 31)] });
+
+    // Read in September, it is next quarter.
+    assert.deepEqual(viewToState({ filter: saved.filter, sort: saved.sort }, TODAY), {
+      state: board({ horizon: 'next_quarter' }), readable: true,
+    });
+    // Read in November, the same days are this quarter — the same deals.
+    assert.equal(viewToState({ filter: saved.filter, sort: saved.sort }, Date.UTC(2026, 10, 9)).state.horizon, 'quarter');
+    // Read the following February, they were last quarter.
+    assert.equal(viewToState({ filter: saved.filter, sort: saved.sort }, Date.UTC(2027, 1, 9)).state.horizon, 'last_quarter');
+    // Read a year on, the window is nothing the board's controls can say.
+    assert.equal(viewToState({ filter: saved.filter, sort: saved.sort }, Date.UTC(2027, 8, 9)).readable, false);
+    // And without a clock to read them against, dated windows are not guessed at.
+    assert.equal(viewToState({ filter: saved.filter, sort: saved.sort }).readable, false);
+  });
+});
+
+/* -------------------------- the table's sort toggle ----------------------- */
+
+describe('a sorted column clicked again', () => {
+  const sorted: TableState = { query: '', sort: { columnId: 'amount', direction: 'desc' }, filters: {} };
+
+  it('reverses rather than going blank first', () => {
+    // The grid's own cycle is asc → desc → none: the second click on Amount
+    // used to put the deals in whatever order the server sent them.
+    const cleared: TableState = { ...sorted, sort: null };
+    assert.deepEqual(reverseClearedSort(sorted, cleared).sort, { columnId: 'amount', direction: 'asc' });
+    const ascending: TableState = { ...sorted, sort: { columnId: 'amount', direction: 'asc' } };
+    assert.deepEqual(reverseClearedSort(ascending, cleared).sort, { columnId: 'amount', direction: 'desc' });
+  });
+
+  it('leaves every other change alone', () => {
+    const other: TableState = { ...sorted, sort: { columnId: 'close_date', direction: 'asc' } };
+    assert.equal(reverseClearedSort(sorted, other), other);
+    const searched: TableState = { ...sorted, sort: null, query: 'wexler' };
+    assert.equal(reverseClearedSort(sorted, searched), searched);
+    const unsorted: TableState = { ...sorted, sort: null };
+    assert.equal(reverseClearedSort(unsorted, { ...unsorted, filters: {} }).sort, null);
+  });
+});
+
+/* ------------------------------ the forecast ------------------------------ */
+
+describe('the forecast rollup', () => {
+  const deal = (over: Partial<ForecastDeal>): ForecastDeal => ({
+    id: 'd', owner_id: 'u1', pipeline: 'new_business', amount: 0, weighted: 0, status: 'open', category: 'pipeline', ...over,
+  });
+  const deals: ForecastDeal[] = [
+    deal({ id: 'a', amount: 100_00, weighted: 80_00, category: 'commit' }),
+    deal({ id: 'b', amount: 200_00, weighted: 50_00, category: 'best_case' }),
+    deal({ id: 'c', owner_id: 'u2', amount: 400_00, weighted: 400_00, status: 'won', category: 'closed' }),
+    deal({ id: 'd', owner_id: 'u2', amount: 50_00, weighted: 0, status: 'lost', category: 'closed' }),
+    deal({ id: 'e', owner_id: null, pipeline: 'renewal', amount: 70_00, weighted: 7_00, category: 'pipeline' }),
+    deal({ id: 'f', amount: 10_00, weighted: 5_00, category: 'omitted' }),
+  ];
+
+  it('puts each deal in the column its status and category say', () => {
+    assert.equal(bucketOf({ status: 'open', category: 'commit' }), 'commit');
+    assert.equal(bucketOf({ status: 'open', category: 'best_case' }), 'best_case');
+    assert.equal(bucketOf({ status: 'open', category: 'pipeline' }), 'pipeline');
+    // Both closed stages carry the `closed` category; the status tells them apart.
+    assert.equal(bucketOf({ status: 'won', category: 'closed' }), 'won');
+    assert.equal(bucketOf({ status: 'lost', category: 'closed' }), 'lost');
+    // An open deal with no forecast column is left out, and counted as such.
+    assert.equal(bucketOf({ status: 'open', category: 'omitted' }), 'omitted');
+    assert.equal(bucketOf({ status: 'open', category: '' }), 'omitted');
+    assert.equal(bucketOf({ status: 'open', category: 'closed' }), 'omitted');
+  });
+
+  it('totals every column, largest forecast first, with the unowned as their own row', () => {
+    const rollup = rollupForecast(deals, byOwner);
+    assert.deepEqual(rollup.lines.map((line) => line.key), ['u2', 'u1', UNASSIGNED]);
+    const [u2, u1, nobody] = rollup.lines;
+    assert.deepEqual(u2.cells.won, { amount: 400_00, count: 1 });
+    assert.deepEqual(u2.cells.lost, { amount: 50_00, count: 1 });
+    assert.deepEqual(u2.forecast, { amount: 400_00, count: 1 });
+    assert.equal(u2.weighted, 0);
+    assert.deepEqual(u1.cells.commit, { amount: 100_00, count: 1 });
+    assert.deepEqual(u1.cells.best_case, { amount: 200_00, count: 1 });
+    assert.deepEqual(u1.cells.omitted, { amount: 10_00, count: 1 });
+    assert.deepEqual(u1.forecast, { amount: 300_00, count: 2 });
+    // Weighted covers the forecast columns only: the omitted deal's $5 is not in it.
+    assert.equal(u1.weighted, 130_00);
+    assert.deepEqual(nobody.cells.pipeline, { amount: 70_00, count: 1 });
+    assert.equal(rollup.deals, 6);
+  });
+
+  it('computes the total over the deals, and it agrees with the lines', () => {
+    const rollup = rollupForecast(deals, byOwner);
+    assert.deepEqual(rollup.total.forecast, { amount: 770_00, count: 4 });
+    assert.equal(rollup.total.weighted, 137_00);
+    assert.deepEqual(rollup.total.cells.omitted, { amount: 10_00, count: 1 });
+    assert.deepEqual(rollup.total.cells.lost, { amount: 50_00, count: 1 });
+    for (const bucket of FORECAST_BUCKETS) {
+      const summed = rollup.lines.reduce((sum, line) => sum + line.cells[bucket].amount, 0);
+      assert.equal(rollup.total.cells[bucket].amount, summed, bucket);
+    }
+  });
+
+  it('groups by pipeline when asked, with the same total', () => {
+    const rollup = rollupForecast(deals, byPipeline);
+    assert.deepEqual(rollup.lines.map((line) => line.key), ['new_business', 'renewal']);
+    assert.deepEqual(rollup.total.forecast, rollupForecast(deals, byOwner).total.forecast);
+  });
+
+  it('draws a row’s mix as shares of its own forecast that add up to one', () => {
+    const rollup = rollupForecast(deals, byOwner);
+    const parts = composition(rollup.lines[1]);
+    assert.deepEqual(parts.map((part) => part.bucket), ['commit', 'best_case']);
+    assert.equal(parts.reduce((sum, part) => sum + part.share, 0), 1);
+    assert.deepEqual(composition(rollupForecast([], byOwner).total), []);
+  });
+});
+
+/* ------------------------- the deals table as a file ---------------------- */
+
+describe('the deals table as a file', () => {
+  const columns = dealExportColumns({
+    allMode: false,
+    major: (minor) => minor / 100,
+    now: TODAY,
+    accountName: () => 'Rheinwerk Antriebstechnik',
+    pipelineLabel: () => 'New business',
+    stageLabel: () => 'Proposal sent',
+    ownerName: (id) => (id === 'usr_seed03' ? 'Priya Raman' : ''),
+  });
+  const row = {
+    id: 'deal_1',
+    display_name: 'Rheinwerk — OEE programme phase 2',
+    owner_id: 'usr_seed03',
+    properties: {
+      amount: 80_000_00, probability: 60, weighted_amount: 48_000_00, close_date: Date.UTC(2026, 9, 21),
+      forecast_category: 'commit', deal_status: 'open', stage_entered_at: TODAY - 12 * DAY_MS,
+    },
+  };
+
+  it('writes stored values a spreadsheet can read back, in the table’s column order', () => {
+    const { headers, lines } = dealCsv([row], columns);
+    assert.deepEqual(headers, [
+      'Id', 'Deal', 'Account', 'Stage', 'Amount', 'Probability', 'Weighted', 'Close date', 'Owner',
+      'Forecast category', 'Status', 'Days in stage', 'Stage entered',
+    ]);
+    assert.deepEqual(lines, [[
+      'deal_1', 'Rheinwerk — OEE programme phase 2', 'Rheinwerk Antriebstechnik', 'Proposal sent',
+      '80000', '60', '48000', '2026-10-21', 'Priya Raman', 'commit', 'open', '12',
+      new Date(TODAY - 12 * DAY_MS).toISOString(),
+    ]]);
+  });
+
+  it('leaves a blank where the deal has nothing, rather than a zero or an epoch', () => {
+    const bare = { id: 'deal_2', display_name: 'Bare', owner_id: null, properties: {} };
+    const [line] = dealCsv([bare], columns).lines;
+    assert.deepEqual(line.slice(4), ['', '', '', '', '', '', '', '', '']);
+    assert.equal(isoDay(null), '');
+  });
+
+  it('adds the pipeline column only when the table spans every pipeline', () => {
+    const across = dealExportColumns({
+      allMode: true, major: (m) => m, now: TODAY,
+      accountName: () => '', pipelineLabel: () => 'Renewal', stageLabel: () => '', ownerName: () => '',
+    });
+    assert.deepEqual(across.map((column) => column.header).slice(2, 5), ['Account', 'Pipeline', 'Stage']);
+    assert.equal(dealCsv([row], across).lines[0][3], 'Renewal');
+  });
+});
+
+/* ------------------------- the addresses under /deals --------------------- */
+
+describe('the addresses under /deals', () => {
+  // The route table is read off the module as written, so this fails the
+  // moment a static address is dropped and falls back into `/deals/:id`.
+  const source = readFileSync(new URL('../src/client/modules/pipeline/routes.tsx', import.meta.url), 'utf8');
+  const paths = [...source.matchAll(/\{ path: '([^']+)', element/g)].map((m) => m[1]);
+  const defs = paths.map((path) => ({ path, element: () => null }));
+
+  it('give the table and the forecast their own screens instead of a deal called "table"', () => {
+    assert.ok(paths.includes('/deals/table'), `routes are ${paths.join(', ')}`);
+    assert.ok(paths.includes('/deals/forecast'), `routes are ${paths.join(', ')}`);
+    assert.equal(matchRoute(defs, '/deals/table')?.route.path, '/deals/table');
+    assert.equal(matchRoute(defs, '/deals/forecast')?.route.path, '/deals/forecast');
+  });
+
+  it('still open a deal by its id', () => {
+    const match = matchRoute(defs, '/deals/deal_nw_54');
+    assert.equal(match?.route.path, '/deals/:id');
+    assert.deepEqual(match?.params, { id: 'deal_nw_54' });
+  });
+});
+
+
+/* ------------------------------- typed dates ------------------------------ */
+
+describe('a date as a person types it', () => {
+  const oct21 = Date.UTC(2026, 9, 21);
+
+  it('reads the locale’s own order off the locale', () => {
+    assert.equal(dateOrderOf('en-US'), 'mdy');
+    assert.equal(dateOrderOf('en-GB'), 'dmy');
+    assert.equal(dateOrderOf('de-DE'), 'dmy');
+    assert.equal(dateOrderOf('sv-SE'), 'ymd');
+    assert.equal(dateOrderOf('not-a-locale-at-all'), 'mdy');
+  });
+
+  it('takes ISO whatever the locale', () => {
+    assert.equal(parseTypedDate('2026-10-21', 'mdy', TODAY), oct21);
+    assert.equal(parseTypedDate('2026-10-21', 'dmy', TODAY), oct21);
+    assert.equal(parseTypedDate(' 2026-10-21 ', 'ymd', TODAY), oct21);
+  });
+
+  it('reads numeric dates in the order the workspace writes them', () => {
+    assert.equal(parseTypedDate('10/21/2026', 'mdy', TODAY), oct21);
+    assert.equal(parseTypedDate('21/10/2026', 'dmy', TODAY), oct21);
+    assert.equal(parseTypedDate('21.10.2026', 'dmy', TODAY), oct21);
+    assert.equal(parseTypedDate('2026/10/21', 'ymd', TODAY), oct21);
+    // A four-digit year up front is a year in any order.
+    assert.equal(parseTypedDate('2026/10/21', 'mdy', TODAY), oct21);
+    // Two digits of year mean this century.
+    assert.equal(parseTypedDate('10/21/26', 'mdy', TODAY), oct21);
+    // No year means this year.
+    assert.equal(parseTypedDate('10/21', 'mdy', TODAY), oct21);
+    assert.equal(parseTypedDate('21/10', 'dmy', TODAY), oct21);
+    // The same digits are a different day in a different locale — that is the point.
+    assert.equal(parseTypedDate('3/10/2026', 'mdy', TODAY), Date.UTC(2026, 2, 10));
+    assert.equal(parseTypedDate('3/10/2026', 'dmy', TODAY), Date.UTC(2026, 9, 3));
+  });
+
+  it('reads a month by name in either position', () => {
+    assert.equal(parseTypedDate('Oct 21', 'mdy', TODAY), oct21);
+    assert.equal(parseTypedDate('21 Oct', 'dmy', TODAY), oct21);
+    assert.equal(parseTypedDate('October 21, 2026', 'mdy', TODAY), oct21);
+    assert.equal(parseTypedDate('21 October 2026', 'dmy', TODAY), oct21);
+    assert.equal(parseTypedDate('2026 Oct 21', 'ymd', TODAY), oct21);
+    assert.equal(parseTypedDate('Oct 21 26', 'mdy', TODAY), oct21);
+    assert.equal(parseTypedDate('Sept 1', 'mdy', TODAY), Date.UTC(2026, 8, 1));
+  });
+
+  it('knows today, tomorrow and yesterday relative to the workspace’s day', () => {
+    assert.equal(parseTypedDate('today', 'mdy', TODAY), TODAY);
+    assert.equal(parseTypedDate('Tomorrow', 'mdy', TODAY), TODAY + DAY_MS);
+    assert.equal(parseTypedDate('yesterday', 'mdy', TODAY), TODAY - DAY_MS);
+  });
+
+  it('refuses what is not a date rather than guessing', () => {
+    assert.equal(parseTypedDate('', 'mdy', TODAY), null);
+    assert.equal(parseTypedDate('soon', 'mdy', TODAY), null);
+    assert.equal(parseTypedDate('13/45/2026', 'mdy', TODAY), null);
+    assert.equal(parseTypedDate('2026-02-30', 'mdy', TODAY), null);
+    assert.equal(parseTypedDate('Feb 30', 'mdy', TODAY), null);
+    assert.equal(parseTypedDate('Octember 4', 'mdy', TODAY), null);
+    assert.equal(parseTypedDate('1/2/3/4', 'mdy', TODAY), null);
+    assert.equal(parseTypedDate('Oct 21 2026 extra', 'mdy', TODAY), null);
+  });
+
+  it('shows an example in the order it will read', () => {
+    assert.equal(dateExample('mdy', TODAY), '09/02/2026');
+    assert.equal(dateExample('dmy', TODAY), '02/09/2026');
+    assert.equal(dateExample('ymd', TODAY), '2026-09-02');
+  });
+});
+
+/* ------------------------- closed deals are closed ------------------------ */
+
+describe('a closed deal on the board', () => {
+  const won = { is_closed: true, is_won: true };
+  const lost = { is_closed: true, is_won: false };
+  const open = { is_closed: false, is_won: false };
+
+  it('leads with its outcome, and an open deal with nothing', () => {
+    assert.equal(outcomeWord(won), 'Won');
+    assert.equal(outcomeWord(lost), 'Lost');
+    assert.equal(outcomeWord(open), null);
+    assert.equal(outcomeWord(undefined), null);
+  });
+
+  it('keeps the outcome and the close-date verb apart: a win is Won, and it was Booked', () => {
+    assert.equal(closedVerb(won), 'Booked');
+    assert.equal(outcomeWord(won), 'Won');
+    assert.equal(closedVerb(lost), outcomeWord(lost));
+  });
+});
+
+describe('the columns a pipeline puts on the board', () => {
+  const stages = [
+    { name: 'qualification', is_closed: false, is_won: false },
+    { name: 'negotiation', is_closed: false, is_won: false },
+    { name: 'closed_won', is_closed: true, is_won: true },
+    { name: 'closed_lost', is_closed: true, is_won: false },
+  ];
+  const names = (rows: typeof stages) => rows.map((stage) => stage.name);
+
+  it('are the open ones, or all of them, as the switch says', () => {
+    assert.deepEqual(names(columnsFor(stages, false, '')), ['qualification', 'negotiation']);
+    assert.deepEqual(names(columnsFor(stages, true, '')), ['qualification', 'negotiation', 'closed_won', 'closed_lost']);
+  });
+
+  it('narrowed to an outcome, are that outcome’s closed stage and nothing else', () => {
+    // The forecast's "5 deals were lost" link used to land on five empty open
+    // columns with the lost cards off-screen to the right of them.
+    assert.deepEqual(names(columnsFor(stages, true, 'lost')), ['closed_lost']);
+    assert.deepEqual(names(columnsFor(stages, true, 'won')), ['closed_won']);
+    // The switch cannot hide the only column the filter can land in.
+    assert.deepEqual(names(columnsFor(stages, false, 'lost')), ['closed_lost']);
+  });
+});
+
+describe('the board’s subtitle', () => {
+  const money = (minor: number) => `$${(minor / 100).toFixed(2)}`;
+  const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? '' : 's'}`;
+  const base = {
+    where: 'across 4 pipelines', showClosed: true, open: { amount: 0, weighted: 0 }, closed: { amount: 13_624_000 }, plural, money,
+  };
+
+  it('quotes what was lost over a set narrowed to the lost deals, never "$0.00 open"', () => {
+    const line = boardHeadline({ ...base, shown: 5, status: 'lost' });
+    assert.equal(line, '5 lost deals across 4 pipelines · $136240.00 lost');
+    assert.equal(boardHeadline({ ...base, shown: 1, status: 'won', closed: { amount: 500 } }), '1 won deal across 4 pipelines · $5.00 won');
+  });
+
+  it('quotes open and weighted otherwise, and says when the closed stages are off', () => {
+    assert.equal(
+      boardHeadline({ ...base, shown: 22, status: '', showClosed: false, where: 'on New business', open: { amount: 438_546_000, weighted: 180_932_700 } }),
+      '22 deals on New business, open stages only · $4385460.00 open · $1809327.00 weighted',
+    );
+    assert.equal(
+      boardHeadline({ ...base, shown: 61, status: '', where: 'on New business', open: { amount: 100, weighted: 10 } }),
+      '61 deals on New business · $1.00 open · $0.10 weighted',
+    );
+    assert.equal(moneyLine({ status: '', open: { amount: 100, weighted: 10 }, closed: { amount: 500 }, money }), '$1.00 open · $0.10 weighted');
+  });
+});
+
+/* ------------------------- one sort behind two controls ------------------- */
+
+describe('one sort behind two controls', () => {
+  it('names every toolbar sort as a table column and direction, and reads each back', () => {
+    for (const option of SORTS) {
+      assert.ok(TABLE_SORT[option.value], `${option.value} has no table sort`);
+      assert.equal(sortKeyOf(TABLE_SORT[option.value]), option.value);
+    }
+  });
+
+  it('reads a header sort back as the toolbar option that means it', () => {
+    // The critic's case: the grid sorted ascending by close date while the
+    // toolbar still read "Largest first".
+    assert.equal(sortKeyOf({ columnId: 'close_date', direction: 'asc' }), 'close');
+    assert.equal(sortKeyOf({ columnId: 'amount', direction: 'desc' }), 'amount');
+    // "Longest in stage" is the most days first.
+    assert.equal(sortKeyOf({ columnId: 'stage_age', direction: 'desc' }), 'stage');
+    assert.equal(sortKeyOf({ columnId: 'updated', direction: 'desc' }), 'updated');
+  });
+
+  it('admits an order the toolbar has no word for, and names it rather than misreporting it', () => {
+    assert.equal(sortKeyOf({ columnId: 'amount', direction: 'asc' }), null);
+    assert.equal(sortKeyOf({ columnId: 'probability', direction: 'desc' }), null);
+    assert.equal(sortKeyOf(null), null);
+    assert.equal(describeTableSort({ columnId: 'probability', direction: 'desc' }, 'Probability'), 'By probability, descending');
+    assert.equal(describeTableSort({ columnId: 'amount', direction: 'asc' }, 'Amount'), 'By amount, ascending');
+    assert.ok(!SORTS.some((option) => option.value === CUSTOM_SORT), 'the custom marker must not collide with a real sort');
+  });
+});
+
+/* ---------------------------- the closing dialog -------------------------- */
+
+describe('the closing dialog’s confirm button', () => {
+  it('says "Mark lost" under a title that says Closed lost, as "Mark won" does for a win', () => {
+    const source = readFileSync(new URL('../src/client/modules/pipeline/dialogs.tsx', import.meta.url), 'utf8');
+    assert.ok(source.includes("'Mark won'"), 'the win label is missing');
+    assert.ok(source.includes("'Mark lost'"), 'the loss label is missing');
+    assert.ok(!source.includes('Mark closed'), 'the button still reads "Mark closed"');
+  });
+});
+
+/* ------------------------------ the 1024 layout --------------------------- */
+
+describe('the stat tiles below the toolbar’s breakpoint', () => {
+  it('are laid out two by two, by a rule that comes after the one it overrides', () => {
+    const css = readFileSync(new URL('../src/client/modules/pipeline/pipeline.css', import.meta.url), 'utf8');
+    const base = css.indexOf('.pl-summary {');
+    const narrow = css.search(/@media \(max-width: 1180px\) \{\s*\.pl-summary \{ grid-template-columns: repeat\(2, minmax\(0, 1fr\)\); \}/);
+    assert.ok(base >= 0, 'the tile grid has no base rule');
+    assert.ok(narrow >= 0, 'no rule lays the tiles out two by two below 1180px');
+    // Equal specificity: whichever is later wins, so the override must be later.
+    assert.ok(narrow > base, 'the two-by-two rule is written before the rule it overrides, so it never applies');
   });
 });

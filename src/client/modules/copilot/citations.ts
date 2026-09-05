@@ -44,14 +44,60 @@ export function citationHref(citation: Citation): string | null {
     case 'customer_company': return `/companies/${encodeURIComponent(citation.id)}`;
     case 'contact': return `/contacts/${encodeURIComponent(citation.id)}`;
     case 'ticket': return `/records/ticket/${encodeURIComponent(citation.id)}`;
-    case 'customer': return `/customers/${encodeURIComponent(citation.id)}`;
-    case 'invoice': return `/invoices/${encodeURIComponent(citation.id)}`;
-    case 'subscription': return `/subscriptions/${encodeURIComponent(citation.id)}`;
+    // Billing registers its screens under `/billing/…`. The bare `/customers`,
+    // `/invoices` and `/subscriptions` this used to build are nothing in this
+    // product, so every chip under a revenue answer opened the shell's 404 —
+    // the one answer a Stripe user checks first was the one with dead sources.
+    case 'customer': return `/billing/customers/${encodeURIComponent(citation.id)}`;
+    case 'invoice': return `/billing/invoices/${encodeURIComponent(citation.id)}`;
+    case 'subscription': return `/billing/subscriptions/${encodeURIComponent(citation.id)}`;
     case 'meter': return `/revenue/usage/${encodeURIComponent(citation.id)}`;
     default:
       if (RECORD_TYPES.has(citation.type)) return `/records/${citation.type}/${encodeURIComponent(citation.id)}`;
       return citation.id.startsWith('cmp_') ? `/companies/${encodeURIComponent(citation.id)}` : null;
   }
+}
+
+/**
+ * Whether a chip's record has to be asked about before it is drawn as a link.
+ *
+ * The metering module cites the customer id its events carry, and its seed
+ * meters accounts billing never created: `cus_nw_pemberton` streams 21 million
+ * events and answers 404 at `/v1/customers/cus_nw_pemberton`. A billing chip
+ * is the one kind of citation whose id can come from a module other than the
+ * one that owns the screen, so those are checked; a CRM record is cited by the
+ * module that holds it.
+ */
+export const needsProbe = (citation: Citation): boolean => citation.type === 'customer';
+
+/** What one probe of a cited record came back with, as much of it as the chip needs. */
+export interface CitationProbe { status: number }
+
+export interface CitationResolution {
+  href: string | null;
+  /** Why nothing opens, in the chip's accessible name. Null while it can be opened. */
+  note: string | null;
+}
+
+/**
+ * Where a chip goes, once the record behind it has been asked about.
+ *
+ * A record that answered 404 is drawn as the flat chip the surface already
+ * uses for records nothing shows, with the reason in words: the chip is still
+ * a true citation — the engine did read that row — it just leads nowhere.
+ * Any other failure, and no probe at all, leaves the link alone: an
+ * unreachable API is not evidence the account is missing.
+ */
+export function citationResolution(citation: Citation, probe: CitationProbe | null): CitationResolution {
+  const href = citationHref(citation);
+  if (!href) return { href: null, note: `${citation.label} — ${citation.type.replace(/_/g, ' ')} ${citation.id}. No screen in this workspace opens it.` };
+  if (probe && probe.status === 404 && needsProbe(citation)) {
+    return {
+      href: null,
+      note: `${citation.label} — the meter knows this account, but billing has no customer ${citation.id}. Nothing opens it.`,
+    };
+  }
+  return { href, note: null };
 }
 
 export const CITATION_ICON: Record<string, string> = {

@@ -417,7 +417,15 @@ export default defineModule({
         due_date: invoice.due_date,
         created: invoice.created,
       })),
-      lifetimeBilled: (orgId, customerId) => billing.invoices.lifetimeBilled(orgId, customerId),
+      lifetimeCollected: (orgId, customerId) => billing.invoices.lifetimeCollected(orgId, customerId),
+      // Overpayment rows are signed: the credit is negative when it lands and
+      // a refund of it writes the positive reversal, so the sum is what is
+      // still held past the bills — never a refund counted as collected.
+      overpaymentCredit: (orgId, customerId) => -ctx.db.count(
+        `SELECT COALESCE(SUM(amount), 0) FROM billing_balance_transactions
+          WHERE org_id = ? AND customer_id = ? AND type = 'invoice_overpayment'`,
+        orgId, customerId,
+      ),
     };
 
     const service: BillingService = {
@@ -788,22 +796,21 @@ export default defineModule({
         delinquent_customers: c.db.count(`SELECT COUNT(*) FROM billing_customers WHERE org_id = ? AND delinquent = 1`, orgId),
         renewing_next_30_days: live.filter((sub) => sub.current_period_end <= now + 30 * 86_400_000).length,
         scheduled_to_cancel: live.filter((sub) => sub.cancel_at_period_end || sub.cancel_at).length,
-        // The last money figure on this payload, and it was the last one still
-        // added up across every currency and published bare. A proration
-        // waiting on a euro subscription is not worth what its minor units say
-        // in dollars, so the flat figure is kept for the shape it has always
-        // had and the buckets beside it are the ones that are amounts of
-        // something — exactly what mrr and invoices above do.
-        uninvoiced_prorations: prorations.reduce((total, row) => total + row.amount, 0),
+        // The same rule the MRR above follows: a proration waiting on a euro
+        // subscription is not worth what its minor units say in dollars, so the
+        // flat figure is the workspace's own currency's book and the buckets
+        // beside it carry the rest.
+        uninvoiced_prorations: prorations.length === 1
+          ? prorations[0].amount
+          : prorations.find((row) => row.currency === currency)?.amount ?? 0,
         uninvoiced_prorations_by_currency: prorations,
         uninvoiced_prorations_note: prorations.length > 1
-          ? `Prorations are waiting in ${prorations.map((row) => row.currency).join(', ')}, so uninvoiced_prorations is every currency's minor units added together — a figure in no currency at all. uninvoiced_prorations_by_currency is the one to read, and to show.`
+          ? `Prorations are waiting in ${prorations.map((row) => row.currency).join(', ')}. uninvoiced_prorations is the ${currency.toUpperCase()} book alone — the workspace's own currency — not a sum across them; uninvoiced_prorations_by_currency carries every book, and is the one to show.`
           : null,
         invoices,
-        // The same rule the MRR above follows: a mixed book publishes no single
-        // money figure with a currency on it, and says where the real ones are.
+        // And once more for the bills: one book's figures, named, never a sum.
         invoices_note: invoices.mixed_currency
-          ? `Bills were raised in ${invoices.currencies.join(', ')}, so invoices.billed, collected, outstanding and written_off are every currency's minor units added together — a figure in no currency at all. invoices.by_currency is the one to read, and to show.`
+          ? `Bills were raised in ${invoices.currencies.join(', ')}. invoices.billed, collected, outstanding and written_off are the ${invoices.headline_currency.toUpperCase()} book alone — the workspace's own currency — not a sum across them; invoices.by_currency carries every book, and is the one to show.`
           : null,
         // Bills that charged no tax, and how many of those are a figure nobody
         // decided on. `missing_tax_location` is the backlog: an account whose
@@ -827,7 +834,7 @@ export default defineModule({
     }, {
       summary: 'The subscription book at a glance', tags: ['billing'],
       description:
-        'Live count, MRR and ARR normalised across every interval, what renews in the next 30 days and what is set to cancel — over the whole book, not a page of it. Money is bucketed by the currency it is billed in; a mixed book publishes no single figure with a currency symbol on it.',
+        'Live count, MRR and ARR normalised across every interval, what renews in the next 30 days and what is set to cancel — over the whole book, not a page of it. Money is bucketed by the currency it is billed in; on a mixed book the invoice and proration headlines are the workspace\'s own currency\'s book, named in `currency`, never a sum across books, and mrr_note says what the MRR figures are.',
     });
 
     router.get('/v1/subscriptions', (req: Req, c: Ctx) => {
@@ -1157,6 +1164,16 @@ export default defineModule({
     router.get('/v1/tax_rates/:id', (req: Req, c: Ctx) =>
       taxRatePayload(new TaxRates(c, req.auth.orgId).require(req.params.id)),
       { summary: 'Retrieve a tax rate', tags: ['billing'] });
+
+    router.patch('/v1/tax_rates/:id', (req: Req, c: Ctx) => {
+      const body = req.body as { active: boolean };
+      return taxRatePayload(c.atomic(() => new TaxRates(c, req.auth.orgId).setActive(req.params.id, body.active, c.now())));
+    }, {
+      summary: 'Retire or reinstate a tax rate', tags: ['billing'], roles: ['admin'],
+      description:
+        'active=false stops the rate matching new invoices, exactly as POST /v1/tax_rates/:id/deactivate does; active=true brings a retired rate back, and is refused with tax_rate_exists while another active rate covers the same jurisdiction over the same addresses — the overlap rule belongs to the transition, whoever asks for it. Every invoice already raised keeps its own snapshot either way.',
+      body: v.object({ active: v.boolean() }, { strict: true }),
+    });
 
     router.post('/v1/tax_rates/:id/deactivate', (req: Req, c: Ctx) =>
       taxRatePayload(c.atomic(() => new TaxRates(c, req.auth.orgId).setActive(req.params.id, false, c.now()))),

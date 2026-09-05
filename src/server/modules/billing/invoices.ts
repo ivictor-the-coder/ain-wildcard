@@ -38,7 +38,7 @@ import type { Ctx } from '../../kernel/context';
 import { badRequest, conflict, internal, notFound } from '../../../shared/errors';
 import { cursorOf, newId, parseCursor } from '../../../shared/ids';
 import { formatMoney, money } from '../../../shared/money';
-import { DAY, type Period } from '../../../shared/time';
+import { DAY, startOfDay, type Period } from '../../../shared/time';
 import type { TaxBehavior } from '../catalog/types';
 import type { BillableItem } from '../credits/types';
 import { longDate } from './cycle';
@@ -101,11 +101,14 @@ export interface InvoiceCurrencyTotals {
 }
 
 /**
- * The invoice book at a glance. The money fields are every currency's minor
- * units added together — read `by_currency` for figures that are amounts of
- * something. The counts are counts, so they hold across the whole book.
+ * The invoice book at a glance. The money fields are one book's figures — the
+ * workspace's own currency, named in `headline_currency` — never minor units
+ * added across currencies; `by_currency` carries every book. The counts are
+ * counts, so they hold across the whole book.
  */
 export interface InvoiceTotals extends Omit<InvoiceCurrencyTotals, 'currency'> {
+  /** The currency `billed`, `collected`, `outstanding` and `written_off` are stated in. */
+  headline_currency: string;
   untaxed: number;
   missing_tax_location: number;
   held_for_tax_location: number;
@@ -298,15 +301,18 @@ export class Invoices {
   }
 
   /**
-   * What this account has actually been billed over its life. Drafts are not
-   * bills yet and voided invoices were withdrawn, so neither counts; an
-   * uncollectible one does, because it was charged even though it was written
-   * off, and hiding it would flatter the number.
+   * Cash that actually settled this account's bills, over its life.
+   *
+   * `amount_paid` is the honest column: a refund or a chargeback reverses it,
+   * a credit note taken off a bill before payment was never collected into
+   * it, and a withdrawn bill keeps whatever was collected on it so a refund
+   * can still reach that money — which, until one does, is real. An open
+   * bill's total is not in here, because a bill nobody has paid is not value
+   * this customer has brought in yet.
    */
-  lifetimeBilled(orgId: string, customerId: string): number {
+  lifetimeCollected(orgId: string, customerId: string): number {
     return this.ctx.db.count(
-      `SELECT COALESCE(SUM(total), 0) FROM billing_invoices
-        WHERE org_id = ? AND customer_id = ? AND status IN ('open','paid','uncollectible')`,
+      `SELECT COALESCE(SUM(amount_paid), 0) FROM billing_invoices WHERE org_id = ? AND customer_id = ?`,
       orgId, customerId,
     );
   }
@@ -319,9 +325,10 @@ export class Invoices {
    * Northwind bills in dollars, euros and pounds, and adding those three
    * columns together produces `billed: 96,853,946` — a number that is not
    * 968,539.46 of anything, and that moves by 98,000 when a ¥98,000 bill is
-   * raised. The flat figures are kept because they are what the shape has
-   * always published and because the counts beside them are currency-free, but
-   * `by_currency` is the one to read and the one to show.
+   * raised. So the flat figures are never that sum: on a mixed book they are
+   * the workspace's own currency's book alone, named in `headline_currency`,
+   * and `by_currency` carries every book. The counts are currency-free and
+   * hold across the whole book.
    */
   totals(orgId: string): InvoiceTotals {
     const rows = this.ctx.db.all<Record<string, number | string>>(
@@ -351,17 +358,21 @@ export class Invoices {
       written_off: Number(row.written_off ?? 0),
       count: Number(row.count ?? 0),
     }));
-    // Summed here rather than by a second query, so the buckets and the total
-    // can never be two different readings of the same book.
-    const of = (key: keyof Omit<InvoiceCurrencyTotals, 'currency'>) =>
-      byCurrency.reduce((total, row) => total + row[key], 0);
+    // Taken from the buckets rather than by a second query, so the headline and
+    // its bucket can never be two different readings of the same book. A
+    // workspace whose own currency has no bill yet has a zero headline, which
+    // is a true figure in that currency — unlike the other books added up.
+    const home = this.billing.defaultCurrency(orgId);
+    const headline: InvoiceCurrencyTotals = (byCurrency.length === 1 ? byCurrency[0] : byCurrency.find((row) => row.currency === home))
+      ?? { currency: home, billed: 0, collected: 0, outstanding: 0, written_off: 0, count: 0 };
     const counted = (key: string) => rows.reduce((total, row) => total + Number(row[key] ?? 0), 0);
     return {
-      billed: of('billed'),
-      collected: of('collected'),
-      outstanding: of('outstanding'),
-      written_off: of('written_off'),
-      count: of('count'),
+      billed: headline.billed,
+      collected: headline.collected,
+      outstanding: headline.outstanding,
+      written_off: headline.written_off,
+      headline_currency: headline.currency,
+      count: byCurrency.reduce((total, row) => total + row.count, 0),
       untaxed: counted('untaxed'),
       missing_tax_location: counted('missing_tax_location'),
       held_for_tax_location: counted('held_for_tax_location'),
@@ -576,12 +587,22 @@ export class Invoices {
       );
     }
 
+    // A bill raised outside a cycle — `POST /v1/invoices` for an account with
+    // no subscription, a credit pack bought on its own — arrives with the
+    // instant it was raised as both ends of its period, and an undated line
+    // would inherit that zero-length window. Nothing is supplied for no time
+    // at all: such a line covers the day it was billed on, and the bill covers
+    // whatever its lines cover.
+    const fallbackWindow: Period = input.period.end > input.period.start
+      ? input.period
+      : { start: startOfDay(createdAt), end: startOfDay(createdAt) + DAY };
     const drafts: DraftLine[] = [
       ...this.recurringDrafts(orgId, input.subscription?.id ?? null, input.recurring),
       ...this.prorationDrafts(claimed),
-      ...this.usageDrafts(orgId, outbox, input.subscription?.id ?? null, input.arrearsPeriod ?? input.period),
+      ...this.usageDrafts(orgId, outbox, input.subscription?.id ?? null, input.arrearsPeriod ?? fallbackWindow),
     ];
     if (!drafts.length) return null;
+    const period: Period = input.subscription ? input.period : spanOf(drafts, fallbackWindow);
 
     const lines = this.taxDrafts(orgId, customer, drafts);
     const taxStatus = this.taxStatusFor(orgId, customer);
@@ -610,8 +631,8 @@ export class Invoices {
       billing_reason: input.reason,
       currency: input.currency,
       collection_method: input.collectionMethod,
-      period_start: input.period.start,
-      period_end: input.period.end,
+      period_start: period.start,
+      period_end: period.end,
       arrears_period_start: input.arrearsPeriod?.start ?? null,
       arrears_period_end: input.arrearsPeriod?.end ?? null,
       subtotal,
@@ -755,7 +776,16 @@ export class Invoices {
   finalize(orgId: string, id: string, meta: WriteMeta | undefined, at?: number): Invoice {
     const invoice = this.require(orgId, id);
     if (invoice.status !== 'draft') {
-      if (invoice.status === 'open') return invoice;
+      // Answering 200 to a transition that changed nothing hides a double
+      // submit, a stale screen or a replayed webhook; Stripe refuses it and
+      // names the state, so the caller can tell "done" from "done already".
+      if (invoice.status === 'open') {
+        throw badRequest(
+          'invoice_already_finalized',
+          `Invoice ${invoice.number} is already finalised and open, so there is nothing left to finalise. Record its payment with POST /v1/invoices/${id}/pay or withdraw it with POST /v1/invoices/${id}/void.`,
+          undefined, { status: invoice.status },
+        );
+      }
       throw conflict('invoice_not_draft', `Invoice ${invoice.number} is ${invoice.status}, so there is nothing left to finalise.`, { status: invoice.status });
     }
     const now = at ?? this.ctx.now();
@@ -889,7 +919,13 @@ export class Invoices {
    */
   pay(orgId: string, id: string, opts: { note?: string | null; at?: number } = {}, meta?: WriteMeta): Invoice {
     const invoice = this.require(orgId, id);
-    if (invoice.status === 'paid') return invoice;
+    if (invoice.status === 'paid') {
+      throw badRequest(
+        'invoice_already_paid',
+        `Invoice ${invoice.number} is already paid in full, so recording another payment would count the same money twice. To hand money back, refund the charge (POST /v1/refunds) or credit the bill (POST /v1/credit_notes).`,
+        undefined, { status: invoice.status },
+      );
+    }
     if (invoice.status === 'void') {
       throw conflict('invoice_void', `Invoice ${invoice.number} was voided, so it cannot be paid. Raise a new one.`, { status: invoice.status });
     }
@@ -938,7 +974,13 @@ export class Invoices {
    */
   voidInvoice(orgId: string, id: string, meta?: WriteMeta, at?: number): Invoice {
     const invoice = this.require(orgId, id);
-    if (invoice.status === 'void') return invoice;
+    if (invoice.status === 'void') {
+      throw badRequest(
+        'invoice_already_void',
+        `Invoice ${invoice.number} was already voided, so there is nothing left to withdraw.`,
+        undefined, { status: invoice.status },
+      );
+    }
     if (invoice.status === 'paid') {
       throw conflict(
         'invoice_paid',
@@ -1000,7 +1042,13 @@ export class Invoices {
    */
   markUncollectible(orgId: string, id: string, meta?: WriteMeta, at?: number): Invoice {
     const invoice = this.require(orgId, id);
-    if (invoice.status === 'uncollectible') return invoice;
+    if (invoice.status === 'uncollectible') {
+      throw badRequest(
+        'invoice_already_uncollectible',
+        `Invoice ${invoice.number} was already written off, so there is nothing left to write off.`,
+        undefined, { status: invoice.status },
+      );
+    }
     if (invoice.status === 'paid' || invoice.status === 'void') {
       throw conflict(
         'invoice_not_collectible',
@@ -1218,3 +1266,12 @@ function describeJurisdiction(customer: Customer, resolved: ResolvedRate): strin
   return state ? `${state}, ${resolved.country}` : resolved.country;
 }
 
+/** The window a set of lines covers: from the earliest start to the latest end of the lines that have one. */
+function spanOf(lines: DraftLine[], fallback: Period): Period {
+  const dated = lines.filter((line) => line.period.end > line.period.start);
+  if (!dated.length) return fallback;
+  return {
+    start: Math.min(...dated.map((line) => line.period.start)),
+    end: Math.max(...dated.map((line) => line.period.end)),
+  };
+}

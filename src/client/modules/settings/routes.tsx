@@ -20,6 +20,7 @@ import { useSession } from '../../kernel/session';
 import { Badge, Button, Card, EmptyState, Icons, Inline, Stack, Stat, useFormat } from '../../design';
 import { describeOffset } from '../../kernel/shell-core';
 import { SETTINGS_NAV } from './common';
+import { tileOf } from './tiles';
 import { WorkspacePage } from './workspace';
 import { TeamPage } from './team';
 import { ApiKeysPage } from './keys';
@@ -54,6 +55,12 @@ function PlatformWidget() {
   const broken = failed.data?.data.length ?? 0;
   const upcoming = (pending.data?.data ?? []).map((job) => job.run_at).filter((at) => at > now);
   const next = upcoming.length ? Math.min(...upcoming) : null;
+  // The failed read can fail on its own while the pending one answered; a
+  // dash with the reason, never a zero the screen cannot stand behind.
+  const failedTile = tileOf([failed], 'GET /v1/jobs?status=failed', () => ({
+    value: f.number(broken),
+    caption: broken ? 'Out of attempts' : 'None',
+  }));
 
   return (
     <Card
@@ -85,12 +92,7 @@ function PlatformWidget() {
               value={f.number(waiting)}
               caption={next !== null ? `Next ${f.when(next)}` : 'Nothing ahead'}
             />
-            <Stat
-              size="sm"
-              label="Failed"
-              value={f.number(broken)}
-              caption={broken ? 'Out of attempts' : 'None'}
-            />
+            <Stat size="sm" label="Failed" value={failedTile.value} caption={failedTile.caption} />
           </Inline>
           {shifted && (
             <Inline gap={3}>

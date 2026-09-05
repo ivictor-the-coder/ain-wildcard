@@ -132,7 +132,13 @@ export interface PaymentMethod {
      * so setting it on a card with a year of history means the *next* n.
      */
     decline_count: number | null;
-    /** What this method will do next time it is charged, in words. */
+    /**
+     * What the method will actually do at the workspace clock. Usually
+     * `behavior`; `expired_card` once a card's expiry has passed, whatever it
+     * was set up to do.
+     */
+    effective_behavior: SimulatedBehavior;
+    /** What this method will do next time it is charged, in words — at the clock, not as declared. */
     explanation: string;
   };
   metadata: Record<string, string>;

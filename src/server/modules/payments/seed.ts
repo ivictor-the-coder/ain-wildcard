@@ -83,17 +83,29 @@ export function seedPayments(ctx: Ctx, orgId: string): void {
       customer: customer.id,
       brand: BRANDS[index % BRANDS.length],
       funding: FUNDING[index % FUNDING.length],
-      // Talbot's card really has expired — the declared behaviour and the date
-      // on the card agree, because a demo that contradicts itself is a bug.
-      exp_month: expired ? new Date(now - 45 * DAY).getUTCMonth() + 1 : ((index * 5) % 12) + 1,
-      exp_year: expired ? new Date(now - 45 * DAY).getUTCFullYear() : new Date(now).getUTCFullYear() + 3,
+      exp_month: ((index * 5) % 12) + 1,
+      exp_year: new Date(now).getUTCFullYear() + 3,
       country: customer.address?.country ?? 'US',
       billing_name: customer.name,
       billing_email: customer.email ?? undefined,
       metadata: { seeded: 'true' },
       ...behaviour,
     }, { actorType: 'system' });
-    methodByCustomer.set(customer.id, method);
+    if (expired) {
+      // Talbot's card really has expired — the declared behaviour and the date
+      // on the card agree, because a demo that contradicts itself is a bug.
+      // It was attached while it was still good, which is the only way a
+      // stale card gets onto a book: the API refuses one that has already
+      // expired, so the date is aged on the row rather than sent through it.
+      const stale = new Date(now - 45 * DAY);
+      const expMonth = stale.getUTCMonth() + 1;
+      const expYear = stale.getUTCFullYear();
+      ctx.db.patch('payments_methods', 'id', method.id, {
+        exp_month: expMonth, exp_year: expYear,
+        display_name: method.display_name.replace(/expires \d{2}\/\d{4}$/, `expires ${String(expMonth).padStart(2, '0')}/${expYear}`),
+      });
+    }
+    methodByCustomer.set(customer.id, store.methods.require(orgId, method.id));
     index++;
   }
 

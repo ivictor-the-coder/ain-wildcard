@@ -153,6 +153,92 @@ export function propertyAsked(question: string): { property: string; label: stri
   return found ? { property: found.property, label: found.label, group: found.group } : null;
 }
 
+/**
+ * The nearest shapes, read back off the run's own working notes.
+ *
+ * The completion carries them in structure, once, and only to the session
+ * that asked. A thread reopened later has the run, and the run has the line
+ * the engine wrote as it refused — `Nearest shapes: "…"; "…"; "…".` — which
+ * is the same three questions. Reading them here is what lets a redrawn
+ * refusal offer what the engine offered rather than a guess ranked by wording.
+ */
+export function nearestFromReasoning(reasoning: readonly string[] | null | undefined): { example: string }[] {
+  for (const line of reasoning ?? []) {
+    const match = /^Nearest shapes:\s*(.+?)\.?\s*$/.exec(line.trim());
+    if (!match) continue;
+    const examples = [...match[1].matchAll(/"([^"]+)"/g)].map((hit) => hit[1].trim()).filter(Boolean);
+    if (examples.length) return examples.map((example) => ({ example }));
+  }
+  return [];
+}
+
+/**
+ * The refusal's own offer, split off the refusal.
+ *
+ * The engine ends a refusal with "Try one of these:" and three bullets, and
+ * the card draws those three as chips. Left in the prose too, the same three
+ * questions appeared twice on one card — once as text nobody can press and
+ * once as buttons — and when the chips came from a different list, the card
+ * disagreed with itself. The bullets are read out here so the card can show
+ * them once, as the thing a person presses.
+ */
+export function splitRefusalOffer(content: string): { prose: string; offered: string[] } {
+  const match = /\n{2,}Try one of these:\s*\n+((?:\s*[•\-*]\s+.+\n?)+)\s*$/.exec(content);
+  if (!match) return { prose: content, offered: [] };
+  const offered = match[1].split('\n').map((line) => line.trim().replace(/^[•\-*]\s+/, '')).filter(Boolean);
+  return { prose: content.slice(0, match.index).trimEnd(), offered };
+}
+
+/**
+ * A write asked for with the switch off.
+ *
+ * The engine stops before its write extractor and says so in its notes — `No
+ * write prepared: the request looks like update_record, but this run is
+ * read-only…`. The person who asked has a switch on the screen, not a request
+ * body, so the card turns this into the action that fixes it.
+ */
+export function writeNeedsSwitch(run: { reasoning?: string[]; analysis?: unknown } | undefined | null): { tool: string } | null {
+  // The template engine records the blocked write in structure —
+  // `analysis.write_blocked: { wanted, reason }` — on the completion.
+  const analysis = run?.analysis;
+  if (analysis && typeof analysis === 'object' && !Array.isArray(analysis)) {
+    const blocked = (analysis as Record<string, unknown>).write_blocked;
+    if (blocked && typeof blocked === 'object') {
+      const wanted = (blocked as Record<string, unknown>).wanted;
+      const reason = (blocked as Record<string, unknown>).reason;
+      if (typeof wanted === 'string' && wanted && (typeof reason !== 'string' || /read-only/i.test(reason))) return { tool: wanted };
+    }
+  }
+  for (const line of run?.reasoning ?? []) {
+    const text = line.trim();
+    // The template engine's note: `Ran update_record in 1ms →
+    // write_not_permitted: "update_record" changes data and this run is read-only.`
+    const ran = /^Ran ([a-z_]+) in \d+ms → write_not_permitted:/.exec(text);
+    if (ran) return { tool: ran[1] };
+    // The older engine's: `No write prepared: the request looks like
+    // update_record, but this run is read-only. …`
+    const match = NO_WRITE.exec(text);
+    if (match && RUN_IS_READ_ONLY.test(match[2].trim())) return { tool: match[1].replace(/\s+/g, '_') };
+  }
+  return null;
+}
+
+/**
+ * The same answer without the request-body instruction.
+ *
+ * "I changed nothing. This run is read-only — send `allow_writes: true` and I
+ * will prepare the stage change for your approval." is written for a caller
+ * with a JSON body. On this screen the reader has a switch, and the card puts
+ * the switch under the sentence; the sentence keeps the fact and drops the
+ * instruction it cannot follow.
+ */
+export function withoutApiInstruction(content: string): string {
+  return content.replace(
+    /\s*—\s*send `allow_writes: true` and I will prepare (?:the |an? )?(.+?) for your approval\./i,
+    '. The $1 was not prepared.',
+  );
+}
+
 export function refusalOf(run: { reasoning?: string[] } | undefined | null): { code: string; message: string } | null {
   for (const line of run?.reasoning ?? []) {
     // "Refused (period_unresolved): …" and "Refused after the run

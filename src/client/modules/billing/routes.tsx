@@ -21,6 +21,7 @@ import {
 import { CustomersPage, CustomerDetailPage } from './customers';
 import { SubscriptionsPage, SubscriptionDetailPage } from './subscriptions';
 import { InvoicesPage, InvoiceDetailPage } from './invoices';
+import { PaymentsPage } from './payments-book';
 import type { BillingOverview, Invoice, RevenueAccount, Subscription } from './types';
 
 /**
@@ -454,6 +455,7 @@ export const routes: RouteDef[] = [
   { path: '/billing/subscriptions/:id', element: SubscriptionDetailPage, title: 'Subscription' },
   { path: '/billing/invoices', element: InvoicesPage, title: 'Invoices' },
   { path: '/billing/invoices/:id', element: InvoiceDetailPage, title: 'Invoice' },
+  { path: '/billing/payments', element: PaymentsPage, title: 'Payments' },
   { path: '/billing/taxes', element: TaxRedirect, title: 'Tax' },
 ];
 
@@ -462,6 +464,7 @@ export const nav: NavItem[] = [
   { id: 'billing.customers.nav', label: 'Customers', to: '/billing/customers', group: 'revenue', order: 12, icon: 'wallet' },
   { id: 'billing.subscriptions.nav', label: 'Subscriptions', to: '/billing/subscriptions', group: 'revenue', order: 14, icon: 'repeat' },
   { id: 'billing.invoices.nav', label: 'Invoices', to: '/billing/invoices', group: 'revenue', order: 16, icon: 'invoice' },
+  { id: 'billing.payments.nav', label: 'Payments', to: '/billing/payments', group: 'revenue', order: 18, icon: 'coins' },
 ];
 
 /**
@@ -497,6 +500,15 @@ export const commands: CommandDef[] = [
     keywords: ['tax missing', 'no country', 'untaxed', 'held'],
     icon: 'alert-triangle',
     run: (nav) => nav('/billing/invoices?tax=missing'),
+  },
+  {
+    id: 'billing.payments.declined',
+    title: 'Declined payments',
+    subtitle: 'Every presentation the issuer refused',
+    group: 'Go to',
+    keywords: ['declined', 'failed payment', 'card declined', 'refused', 'refunds'],
+    icon: 'coins',
+    run: (nav) => nav('/billing/payments?status=requires_payment_method'),
   },
   {
     id: 'billing.open.past_due',
