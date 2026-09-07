@@ -117,20 +117,60 @@ export const settings: SettingsPage[] = [...]; // settings sub-pages
   arrow keys move within grids and menus. Every icon-only control has a label.
 - Both themes must look deliberate. Check light *and* dark before you finish.
 
+### Do not re-implement what the kit already owns
+
+Three modules once each owned a status vocabulary, an error panel and a loading
+panel, and they drifted apart — the same word rendered as a different colour on
+two screens. The kit owns them now. Import, never re-declare:
+
+| The kit's | Use it for |
+| --- | --- |
+| `StatusPill`, `statusLabel`, `statusTone` | any status, state or lifecycle word |
+| `SectionError` | a panel whose read failed, with the request and a retry |
+| `useFormat` | money, dates, relative times, counts, plurals, lists |
+
+A status word the kit does not know, or a panel shape it cannot make, is a
+change **to the kit**, proposed with the exact edit — not a fourth local copy.
+The same goes for a kit component that misbehaves: fix it there, and say which
+module workarounds become removable.
+
 ## 5. Verification you must run before declaring done
 
 ```bash
-npm run typecheck        # must be clean
-npm test                 # must pass
-npm run build            # must succeed
-npx tsx scripts/verify.ts <module>   # boots the app and exercises your routes
+npx tsc --noEmit                     # must be clean
+npm test                             # must pass
+npx tsx scripts/verify.ts            # boots in-process, smokes every GET, runs the time machine
 ```
 
-For UI work, also take screenshots and look at them:
+**Do not run `npm run build`.** `dist/` is shared, so a build races every other
+builder in the checkout. To see your work running, take a port and a database of
+your own:
+
 ```bash
-npm run build && (npm run api &) && sleep 3
-npx playwright screenshot --viewport-size=1512,950 http://127.0.0.1:8787/your/route out.png
+node scripts/preview.mjs --fresh --port 8901 --name your-name   # isolated build + server + db
+node scripts/shoot.mjs --url http://127.0.0.1:8901 --routes /billing,/deals --themes light,dark --out .artifacts/your-name
 ```
+
+Then **read the PNGs and look at them**. Playwright is installed (Chromium at
+`/opt/pw-browsers`); put any driving script under `.artifacts/<your-name>/`,
+never under `scripts/` or `src/`.
+
+### Every fix ships a test that fails without it
+
+A test that passes before and after your change proves nothing, and that has
+happened here more than once. Revert your change, run the test, watch it fail,
+restore it, watch it pass — and report both runs. Expected values are computed
+from the database or from first principles inside the test, never pasted from
+the output of the code under test. Pinning a formatted literal (`'$38,873.66'`)
+pins the seed too, and the next legitimate seed change fails your test for a
+reason that is not a defect.
+
+### After a fix, hunt its mirror image
+
+Twice here a fix has created its own reverse. When you have fixed something,
+look for the same mistake in the reverse operation, the sibling call and the
+undo path — refund against charge, credit against debit, attach against detach,
+create against void.
 
 ## 5a. Never write a credential-shaped literal
 
@@ -162,7 +202,25 @@ Run `npx tsx scripts/verify.ts` before you finish; it fails on this.
 Everything seeds into **Northwind Robotics** (`org_demo`), an industrial
 automation company selling a usage-priced robotics telemetry platform. Six
 teammates (Dana, Marcus, Priya, Sofia, Tom, Nina), ~40 customer companies,
-multi-year history. Your seed data must be consistent with that story — the same
-company that appears as a CRM record must be the one on the invoice and in the
-agent trace. Sign in with `dana@northwind.io` / `demo1234`, or one click on
-"Use the demo workspace".
+multi-year history. Sign in with `dana@northwind.io` / `demo1234`, or one click
+on "Use the demo workspace".
+
+**One company, one identity.** The company on the CRM record, the customer on
+the invoice, the account streaming into a meter and the record in an agent trace
+are the same company. This rule has been broken twice and both times it surfaced
+as a falsehood on screen: a meter attributed events to two accounts billing had
+never created, so the copilot cited customers whose pages answered "No such
+account", and a goodwill credit was granted to one of them. If a seed cannot
+resolve an entry to a real customer, it must refuse to write the row rather than
+invent an id.
+
+**The demo keeps running.** A seed that writes history and schedules nothing
+leaves a usage-priced company showing no usage the moment anyone advances the
+clock. Deferred work is a row in `jobs`, so seeded activity that should continue
+is a durable, re-enqueuing job — not a backfill that ends at the seed instant.
+Check yours by advancing 45 days and looking at the screens that read it.
+
+**A seat has a state.** A teammate is `invited` until they accept: `POST
+/v1/users` creates the seat and returns a one-time invitation token, `POST
+/v1/auth/accept` sets a password and activates it, and the token is refused the
+second time. Anything that lists people shows that state.

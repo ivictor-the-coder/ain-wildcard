@@ -20,7 +20,7 @@ npm run check      # typecheck + test
 
 npx tsx scripts/verify.ts                        # boot in-process, smoke every GET, run the time machine
 npx tsx scripts/verify.ts GET /v1/invoices       # call one route with a demo session
-node scripts/preview.mjs --port 8801 --name x    # isolated build + server on its own port and DB
+node scripts/preview.mjs --fresh --port 8801 --name x   # isolated build + server on its own port and DB
 node scripts/shoot.mjs --url http://127.0.0.1:8801 --routes /,/billing --out .artifacts/shots
 node scripts/progress.mjs                        # regenerate docs/progress.html
 ```
