@@ -1364,24 +1364,6 @@ const DEFS: MetricDefinition[] = [
   },
 ];
 
-/**
- * Measures that are *undefined* over no rows rather than zero.
- *
- * A sum over nothing is zero: nothing was booked, and saying so is true. An
- * average over nothing is not zero — "Northwind has no average deal size in the
- * Expansion pipeline, so the honest answer is zero" says every deal in that
- * book is worth nothing, about a book carrying $3,162,060. A ratio with an
- * empty denominator is the same shape of falsehood, and the win rate already
- * refused it; every average has to refuse it too.
- */
-const UNDEFINED_AT_ZERO = new Set([
-  'win_rate', 'avg_deal_size', 'sales_cycle', 'resolution_time', 'csat',
-  'churn', 'net_revenue_retention', 'gross_revenue_retention',
-]);
-
-export const metricUndefinedWhenEmpty = (id: string | null | undefined): boolean =>
-  !!id && UNDEFINED_AT_ZERO.has(id);
-
 export const METRICS: MetricDefinition[] = DEFS;
 export const metricById = (id: string): MetricDefinition | undefined => DEFS.find((d) => d.id === id);
 export const metricIds = (): string[] => DEFS.map((d) => d.id);

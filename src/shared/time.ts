@@ -57,21 +57,7 @@ export interface Period {
   end: Millis;
 }
 
-export const periodLength = (p: Period): Millis => p.end - p.start;
-
 export const contains = (p: Period, ts: Millis): boolean => ts >= p.start && ts < p.end;
-
-/** Fraction of a period remaining at `ts`, as an exact {n, d} pair of millis. */
-export function remainingFraction(p: Period, ts: Millis): { n: number; d: number } {
-  const d = Math.max(1, p.end - p.start);
-  const n = Math.min(Math.max(p.end - ts, 0), d);
-  return { n, d };
-}
-
-export function elapsedFraction(p: Period, ts: Millis): { n: number; d: number } {
-  const { n, d } = remainingFraction(p, ts);
-  return { n: d - n, d };
-}
 
 /** The billing period containing `ts` for a cycle anchored at `anchor`. */
 export function periodFor(anchor: Millis, iv: Interval, ts: Millis, anchorDay?: number): Period {
@@ -87,20 +73,7 @@ export function periodFor(anchor: Millis, iv: Interval, ts: Millis, anchorDay?: 
   return { start, end };
 }
 
-/** Number of whole intervals between two timestamps (used for schedule phases). */
-export function intervalsBetween(from: Millis, to: Millis, iv: Interval, anchorDay?: number): number {
-  let count = 0;
-  let cursor = from;
-  const day = anchorDay ?? new Date(from).getUTCDate();
-  while (cursor < to && count < 10_000) { cursor = addInterval(cursor, iv, day); count++; }
-  return count;
-}
-
-/* ------------------------------- formatting ------------------------------ */
-
 export const toIso = (ts: Millis): string => new Date(ts).toISOString();
-export const fromIso = (iso: string): Millis => Date.parse(iso);
-
 const dtCache = new Map<string, Intl.DateTimeFormat>();
 function dtf(locale: string, opts: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
   const key = locale + JSON.stringify(opts);
@@ -157,8 +130,6 @@ export function formatDuration(ms: number, maxParts = 2): string {
 }
 
 export const startOfDay = (ts: Millis): Millis => { const d = new Date(ts); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
-export const endOfDay = (ts: Millis): Millis => startOfDay(ts) + DAY - 1;
-
 /**
  * The calendar day a workspace is on, as a stored-shaped number.
  *
@@ -186,18 +157,8 @@ export function civilDay(ts: Millis, timeZone: string | undefined): Millis {
   return startOfDay(ts);
 }
 export const startOfMonth = (ts: Millis): Millis => { const d = new Date(ts); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1); };
-export const endOfMonth = (ts: Millis): Millis => { const d = new Date(ts); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) - 1; };
 export const monthKey = (ts: Millis): string => new Date(ts).toISOString().slice(0, 7);
 export const dayKey = (ts: Millis): string => new Date(ts).toISOString().slice(0, 10);
-
-/** Enumerate month keys inclusive of both ends — for MRR/cohort series. */
-export function monthRange(from: Millis, to: Millis): string[] {
-  const out: string[] = [];
-  let cursor = startOfMonth(from);
-  const last = startOfMonth(to);
-  while (cursor <= last && out.length < 600) { out.push(monthKey(cursor)); cursor = addInterval(cursor, interval('month', 1), 1); }
-  return out;
-}
 
 export function dayRange(from: Millis, to: Millis): string[] {
   const out: string[] = [];

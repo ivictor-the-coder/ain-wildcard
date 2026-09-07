@@ -9,10 +9,6 @@ import './controls.css';
 export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'danger-ghost' | 'link';
 export type ControlSize = 'sm' | 'md' | 'lg';
 
-const ICON_SIZE: Record<ControlSize, number> = { sm: 14, md: 16, lg: 18 };
-
-/* ================================ Button ================================== */
-
 export interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'type'> {
   variant?: ButtonVariant;
   size?: ControlSize;
@@ -434,11 +430,3 @@ export function Kbd({ combo, children }: { combo?: string; children?: ReactNode 
     </span>
   );
 }
-
-/** Copies the caller from writing the same `useState` for every toggle strip. */
-export function useSegmented<T extends string>(initial: T): [T, (v: T) => void] {
-  const [value, setValue] = useState<T>(initial);
-  return [value, useCallback((v: T) => setValue(v), [])];
-}
-
-export { ICON_SIZE };

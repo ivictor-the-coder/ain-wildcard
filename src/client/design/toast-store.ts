@@ -121,8 +121,6 @@ export function setToastsPaused(next: boolean): void {
   }
 }
 
-export const toastsPaused = (): boolean => paused;
-
 export function pushToast(opts: ToastOptions): string {
   const id = opts.id ?? `toast_${++seq}`;
   const record: ToastRecord = { ...opts, id, tone: opts.tone ?? 'default', createdAt: Date.now() };

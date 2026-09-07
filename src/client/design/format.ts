@@ -264,17 +264,6 @@ export function formatDateRange(start: number, end: number, o: DateOptions = {})
 
 export const formatDuration = (ms: number, maxParts = 2): string => formatDurationBase(ms, maxParts);
 
-/** "4 min 12 s" — spelled out, for SLA copy rather than table cells. */
-export function formatDurationLong(ms: number): string {
-  const abs = Math.abs(ms);
-  if (abs < MINUTE) return plural(Math.round(abs / SECOND), 'second');
-  if (abs < HOUR) return plural(Math.round(abs / MINUTE), 'minute');
-  if (abs < DAY) return plural(Math.round((abs / HOUR) * 10) / 10, 'hour');
-  return plural(Math.round(abs / DAY), 'day');
-}
-
-/* ------------------------------ quantities ------------------------------- */
-
 const SIZE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
 
 export function formatFileSize(bytes: number, locale = DEFAULT_LOCALE.locale): string {

@@ -159,10 +159,6 @@ export function useAuthLoss(): AuthLoss | null {
 export function useRateLimit(): RateLimited | null {
   return useSyncExternalStore(subscribe, currentRateLimit, () => null);
 }
-export function useNetworkFailure(): NetworkFailure | null {
-  return useSyncExternalStore(subscribe, currentNetworkFailure, () => null);
-}
-
 /** Client backoff for a server that refuses without saying how long to wait. */
 const RATE_LIMIT_BACKOFF_MS = [5_000, 10_000, 20_000, 40_000, 60_000];
 

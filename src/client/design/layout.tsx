@@ -10,7 +10,6 @@ export { cx } from './cx';
 export type Space = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14;
 const space = (n: Space | undefined): string | undefined => (n === undefined ? undefined : `var(--space-${n})`);
 
-
 /* -------------------------------- Page ----------------------------------- */
 
 export interface PageProps {
@@ -238,11 +237,6 @@ export function Inline({ gap = 4, align = 'center', justify, wrap, as, children,
   );
 }
 
-/** Pushes whatever follows it to the far edge of a flex row. */
-export const Spacer = () => <div className="u-spacer" aria-hidden />;
-
-/* --------------------------------- Grid ---------------------------------- */
-
 export interface GridProps extends HTMLAttributes<HTMLDivElement> {
   columns?: number;
   /** Auto-fit tracks at least this wide — responsive without media queries. */
@@ -348,12 +342,6 @@ export function Toolbar({ sticky, plain, children, className, ...rest }: Toolbar
     </div>
   );
 }
-
-export const ToolbarGroup = ({ children, className }: { children: ReactNode; className?: string }) => (
-  <div className={cx('ain-toolbar__group', className)}>{children}</div>
-);
-
-/* ------------------------------- Surface --------------------------------- */
 
 export interface SurfaceProps extends HTMLAttributes<HTMLDivElement> {
   variant?: 'default' | 'sunken' | 'accent';

@@ -728,25 +728,6 @@ export function MoneyField({ value, onChange, currency, min, max, label, placeho
   );
 }
 
-/** The blur-committed field, for forms that submit rather than price. */
-export function MoneyInputField({ value, onChange, currency, min, label }: {
-  value: number | null; onChange: (v: number | null) => void; currency: string; min?: number; label?: string;
-}) {
-  const f = useFormat();
-  return (
-    <MoneyInput
-      value={value}
-      onChange={onChange}
-      currency={currency as Currency}
-      locale={f.locale}
-      min={min ?? 0}
-      aria-label={label}
-    />
-  );
-}
-
-/* ------------------------------- currencies ------------------------------ */
-
 /**
  * A sort key that ranks money inside its own currency.
  *
@@ -1427,8 +1408,6 @@ export interface DialogForm {
     onKeyDown: (e: React.KeyboardEvent) => void;
   };
 }
-
-
 
 const SUBMIT_ON_ENTER = new Set(['INPUT']);
 

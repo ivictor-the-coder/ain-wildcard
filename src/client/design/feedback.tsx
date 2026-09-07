@@ -221,5 +221,3 @@ export function DismissibleBanner(props: BannerProps) {
   if (!open) return null;
   return <Banner {...props} onDismiss={() => { setOpen(false); props.onDismiss?.(); }} />;
 }
-
-export const InlineAlert = Banner;

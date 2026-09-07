@@ -37,13 +37,6 @@ export function moneyIn(f: Formatter, amount: number | null | undefined, currenc
   return formatMoney(amount, { locale: f.locale, currency: (currency || f.currency).toLowerCase() });
 }
 
-export function compactMoneyIn(f: Formatter, amount: number | null | undefined, currency: string | null | undefined): string {
-  if (amount === null || amount === undefined) return '—';
-  return formatMoney(amount, {
-    locale: f.locale, currency: (currency || f.currency).toLowerCase(), compact: true, trimZeroFraction: true,
-  });
-}
-
 /** A signed money figure, so a contraction never renders as if it were growth. */
 export function signedMoneyIn(f: Formatter, amount: number | null | undefined, currency: string | null | undefined): string {
   if (amount === null || amount === undefined) return '—';
@@ -197,7 +190,6 @@ export function NotePopover({ label, title, children }: { label: string; title: 
     </>
   );
 }
-
 
 /**
  * The provenance of a figure, one click away from the figure itself.
@@ -471,11 +463,6 @@ export function useScrollToHash(): void {
 export function useDefaultCurrency(): string {
   const { currency } = useSession();
   return currency;
-}
-
-/** A labelled figure with its own provenance button, used across the tiles. */
-export function TileRow({ children }: { children: ReactNode }) {
-  return <div className="rv-tiles">{children}</div>;
 }
 
 export function FieldRow({ label, children }: { label: ReactNode; children: ReactNode }) {

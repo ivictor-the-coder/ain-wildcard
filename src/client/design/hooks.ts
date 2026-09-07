@@ -43,32 +43,6 @@ export function useDisclosure(initial = false): Disclosure {
 
 /* ------------------------------ controllable ----------------------------- */
 
-/** Lets a component be used controlled or uncontrolled with one code path. */
-export function useControllableState<T>(
-  controlled: T | undefined,
-  defaultValue: T,
-  onChange?: (value: T) => void,
-): [T, (value: T | ((prev: T) => T)) => void] {
-  const [internal, setInternal] = useState(defaultValue);
-  const isControlled = controlled !== undefined;
-  const value = isControlled ? (controlled as T) : internal;
-  const onChangeRef = useRef(onChange);
-  onChangeRef.current = onChange;
-
-  const set = useCallback((next: T | ((prev: T) => T)) => {
-    setInternal((prev) => {
-      const base = isControlled ? (controlled as T) : prev;
-      const resolved = typeof next === 'function' ? (next as (p: T) => T)(base) : next;
-      if (!Object.is(resolved, base)) onChangeRef.current?.(resolved);
-      return isControlled ? prev : resolved;
-    });
-  }, [isControlled, controlled]);
-
-  return [value, set];
-}
-
-/* ------------------------------ media queries ---------------------------- */
-
 export function useMediaQuery(query: string): boolean {
   const subscribe = useCallback((cb: () => void) => {
     if (typeof window === 'undefined' || !window.matchMedia) return () => {};
@@ -600,12 +574,6 @@ export function useToast(): ToastApi {
 
 /* ------------------------------ small utilities -------------------------- */
 
-export function usePrevious<T>(value: T): T | undefined {
-  const ref = useRef<T | undefined>(undefined);
-  useEffect(() => { ref.current = value; }, [value]);
-  return ref.current;
-}
-
 export function useDebouncedValue<T>(value: T, delay = 220): T {
   const [debounced, setDebounced] = useState(value);
   useEffect(() => {
@@ -613,17 +581,6 @@ export function useDebouncedValue<T>(value: T, delay = 220): T {
     return () => clearTimeout(t);
   }, [value, delay]);
   return debounced;
-}
-
-export function useDebouncedCallback<A extends unknown[]>(fn: (...args: A) => void, delay = 220, deps: DependencyList = []) {
-  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const fnRef = useRef(fn);
-  fnRef.current = fn;
-  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
-  return useCallback((...args: A) => {
-    if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => fnRef.current(...args), delay);
-  }, [delay, ...deps]);
 }
 
 /** Copies text and reports success for ~1.6s so buttons can show a tick. */

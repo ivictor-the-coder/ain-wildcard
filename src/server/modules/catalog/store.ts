@@ -1244,8 +1244,3 @@ function featureMatrix(plans: CatalogPlanView[]): CatalogView['feature_matrix'] 
   }
   return { plans: plans.map((p) => ({ id: p.product.id, name: p.product.name })), rows: [...rows.values()] };
 }
-
-export const priceCurrencies = (price: Price): string[] =>
-  [price.currency, ...Object.keys(price.currency_options)].filter((c, i, all) => all.indexOf(c) === i);
-
-export { resolveForCurrency };

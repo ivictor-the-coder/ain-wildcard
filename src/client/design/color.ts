@@ -41,9 +41,6 @@ export function toneStyle(seed: string): ToneStyle {
 export const VIZ_COUNT = 8;
 export const vizColor = (index: number): string => `var(--viz-${(index % VIZ_COUNT) + 1})`;
 
-/** A stable series colour when order is not meaningful (e.g. per-plan MRR). */
-export const vizColorFor = (seed: string): string => `var(--viz-${toneOf(seed, VIZ_COUNT)})`;
-
 export type Tone =
   | 'neutral' | 'brand' | 'success' | 'warning' | 'danger' | 'info' | 'purple' | 'teal' | 'pink';
 

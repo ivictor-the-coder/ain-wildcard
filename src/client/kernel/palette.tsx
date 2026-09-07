@@ -240,7 +240,3 @@ export function CommandPalette({ open, onClose, entries, sources, onOpenSearch }
     </Modal>
   );
 }
-
-export function paletteHint(): ReactNode {
-  return <Kbd combo="mod+k" />;
-}

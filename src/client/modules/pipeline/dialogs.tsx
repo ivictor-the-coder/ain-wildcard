@@ -1054,7 +1054,3 @@ export function useFirstControl(): {
   }), []);
   return { body, initialFocus };
 }
-
-export function DialogHint({ children }: { children: ReactNode }) {
-  return <p className="pl-note">{children}</p>;
-}

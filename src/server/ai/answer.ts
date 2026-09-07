@@ -560,6 +560,3 @@ export function renderRefusal(nearest: { example: string }[], reason: string | n
   }
   return lines.join('\n\n');
 }
-
-export const daysAgo = (ts: number, now: number): number => Math.floor((now - ts) / DAY);
-export { truncate };

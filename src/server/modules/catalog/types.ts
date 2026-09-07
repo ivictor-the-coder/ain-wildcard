@@ -35,7 +35,6 @@ export type TransformRounding = 'up' | 'down';
 export const PRICE_MODELS = ['flat', 'per_unit', 'tiered', 'package', 'usage', 'custom'] as const;
 export const PRICE_TYPES = ['recurring', 'one_time'] as const;
 export const TIERS_MODES = ['graduated', 'volume'] as const;
-export const BILLING_SCHEMES = ['per_unit', 'tiered'] as const;
 export const USAGE_TYPES = ['licensed', 'metered'] as const;
 export const USAGE_AGGREGATIONS = ['sum', 'max', 'last_during_period', 'last_ever', 'unique'] as const;
 export const PRORATION_BEHAVIORS = ['create_prorations', 'none', 'always_invoice'] as const;

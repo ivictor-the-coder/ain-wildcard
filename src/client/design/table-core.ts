@@ -364,11 +364,6 @@ export function decodeTableState(params: { q?: string; sort?: string; filter?: s
   };
 }
 
-export const tableStateIsEmpty = (state: TableState): boolean =>
-  !state.query.trim() && state.sort === null && activeFilterCount(state.filters) === 0;
-
-/* ================================ selection =============================== */
-
 export type SelectionState = 'none' | 'some' | 'all';
 
 export function selectionState(selected: ReadonlySet<string> | string[], visibleIds: string[]): SelectionState {

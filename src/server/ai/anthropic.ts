@@ -327,7 +327,3 @@ export function anthropicProvider(config: Config): AiProvider {
     },
   };
 }
-
-export const anthropicConfigured = (): boolean => !!process.env.ANTHROPIC_API_KEY;
-export type { AiCallContext };
-export const providerConfig = (config: Config) => ({ provider: config.aiProvider, model: ANTHROPIC_MODEL });

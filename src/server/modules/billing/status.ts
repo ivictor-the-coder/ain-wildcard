@@ -11,9 +11,6 @@ import type { SubscriptionStatus } from './types';
 /** Statuses a subscription can never leave. */
 export const TERMINAL_STATUSES: readonly SubscriptionStatus[] = ['canceled', 'incomplete_expired'];
 
-/** Statuses that keep cycling: the renewal job advances the period. */
-export const CYCLING_STATUSES: readonly SubscriptionStatus[] = ['trialing', 'active', 'past_due', 'unpaid', 'paused'];
-
 /** Statuses that count towards recurring revenue. */
 export const REVENUE_STATUSES: readonly SubscriptionStatus[] = ['active', 'past_due', 'unpaid'];
 
@@ -50,7 +47,6 @@ export function assertTransition(id: string, from: SubscriptionStatus, to: Subsc
 }
 
 export const isTerminal = (status: SubscriptionStatus): boolean => TERMINAL_STATUSES.includes(status);
-export const isCycling = (status: SubscriptionStatus): boolean => CYCLING_STATUSES.includes(status);
 export const countsAsRevenue = (status: SubscriptionStatus): boolean => REVENUE_STATUSES.includes(status);
 
 /** The event emitted alongside `subscription.updated` for a given move. */

@@ -14,16 +14,6 @@ export interface Clock {
   readonly offset: number;
 }
 
-export function realClock(): Clock {
-  return {
-    kind: 'real',
-    offset: 0,
-    now: () => Date.now(),
-    advance() { throw new Error('Cannot advance a real clock. Use a virtual clock.'); },
-    set() { throw new Error('Cannot set a real clock. Use a virtual clock.'); },
-  };
-}
-
 /** A clock that tracks wall time but carries a persisted offset. */
 export function offsetClock(getOffset: () => number, setOffset: (ms: number) => void): Clock {
   return {

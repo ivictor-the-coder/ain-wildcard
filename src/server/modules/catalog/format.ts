@@ -634,6 +634,3 @@ export function anchorUnitDecimal(price: Price, currency: string): string | null
   }
   return resolved.unitAmountDecimal;
 }
-
-export const decimalIsZero = (decimal: string | null): boolean =>
-  decimal === null ? false : decimalToRat(decimal).n === 0n;

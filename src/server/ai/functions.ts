@@ -1029,36 +1029,6 @@ export function subscriptionsOnProduct(ctx: Ctx, orgId: string, args: { product_
 
 /* --------------------------- shared presentation -------------------------- */
 
-export interface RecordLine { id: string; label: string; detail: string }
-
-/** The one-line rendering of a record used in answers and citations. */
-export function describeRecord(workspace: WorkspaceProfile, record: RecordSummary): RecordLine {
-  const props = record.properties;
-  const detail: string[] = [];
-  if (record.object_type === 'deal') {
-    detail.push(formatAmount(Number(props.amount ?? 0), workspace.currency, workspace));
-    if (props.deal_stage) detail.push(humanise(String(props.deal_stage)));
-    // `close_date` is a calendar day stored as midnight UTC, not an instant:
-    // read back in a zone west of Greenwich it reports the evening before, so
-    // the citation under an answer disagrees with the deal board it links to.
-    if (props.close_date) detail.push(`closes ${formatDate(Number(props.close_date), { locale: workspace.locale, timeZone: 'UTC' })}`);
-  } else if (record.object_type === 'ticket') {
-    if (props.priority) detail.push(`${humanise(String(props.priority))} priority`);
-    if (props.status) detail.push(humanise(String(props.status)));
-    detail.push(`opened ${formatDate(record.created, { locale: workspace.locale, timeZone: workspace.timezone })}`);
-  } else if (record.object_type === 'contact') {
-    if (props.job_title) detail.push(String(props.job_title));
-    if (props.email) detail.push(String(props.email));
-  } else if (record.object_type === 'company') {
-    if (props.industry) detail.push(humanise(String(props.industry)));
-    if (props.employee_count) detail.push(`${Number(props.employee_count).toLocaleString('en-US')} employees`);
-    if (props.type) detail.push(humanise(String(props.type)));
-  } else if (props.occurred_at) {
-    detail.push(formatDate(Number(props.occurred_at), { locale: workspace.locale, timeZone: workspace.timezone }));
-  }
-  return { id: record.id, label: record.display_name, detail: detail.join(' · ') };
-}
-
 export const daysBetween = (from: number, to: number): number => Math.round((to - from) / DAY);
 
 export type { GroupBy, MetricSubject, ResolvedEntity, RecordSummary };

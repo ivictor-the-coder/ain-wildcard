@@ -149,11 +149,3 @@ export function Link({ to, replace, state, onClick, ...rest }: LinkProps) {
     />
   );
 }
-
-/** True when `to` matches the current path (exact, or as a section prefix). */
-export function useIsActive(to: string, exact = false): boolean {
-  const { location } = useRouter();
-  const base = to.split('?')[0].replace(/\/+$/, '') || '/';
-  if (exact || base === '/') return location.path === base;
-  return location.path === base || location.path.startsWith(base + '/');
-}

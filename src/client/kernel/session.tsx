@@ -66,12 +66,6 @@ export function useSession(): SessionValue {
   return value;
 }
 
-/** Workspace-aware formatting helpers, wired to org locale/currency/timezone. */
-export function useWorkspaceFormat() {
-  const { currency, locale, timeZone } = useSession();
-  return useMemo(() => ({ currency, locale, timeZone }), [currency, locale, timeZone]);
-}
-
 const readStored = <T,>(key: string, fallback: T): T => {
   try { const raw = localStorage.getItem(key); return raw ? (JSON.parse(raw) as T) : fallback; } catch { return fallback; }
 };

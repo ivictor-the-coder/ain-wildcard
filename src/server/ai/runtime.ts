@@ -647,11 +647,3 @@ export function createAiRuntime(config: Config): AinAiRuntime {
 }
 
 export const ANTHROPIC_DEFAULT_MODEL = 'claude-sonnet-4-5';
-
-export const newToolCallId = (): string => randomId('call', 12);
-
-export const toolCall = (name: string, args: Record<string, unknown>): AiToolCall => ({
-  id: newToolCallId(),
-  name,
-  arguments: args,
-});

@@ -24,8 +24,6 @@ export const PREFIX = {
   approval: 'appr', trace: 'trc', key: 'key', idem: 'idem', sla: 'sla',
 } as const;
 
-export type IdPrefix = (typeof PREFIX)[keyof typeof PREFIX];
-
 export function randomId(prefix: string, size = 16): string {
   const bytes = randomBytes(size);
   let out = '';
@@ -34,24 +32,6 @@ export function randomId(prefix: string, size = 16): string {
 }
 
 export const newId = (kind: keyof typeof PREFIX): string => randomId(PREFIX[kind]);
-export const uuid = (): string => randomUUID();
-
-/** Deterministic id generator for seeds and tests — stable across runs. */
-export function seededIds(seed: number) {
-  let state = seed >>> 0 || 1;
-  const next = () => {
-    state ^= state << 13; state >>>= 0;
-    state ^= state >> 17;
-    state ^= state << 5; state >>>= 0;
-    return state;
-  };
-  return (kind: keyof typeof PREFIX, size = 16): string => {
-    let out = '';
-    for (let i = 0; i < size; i++) out += ALPHABET[next() % ALPHABET.length];
-    return `${PREFIX[kind]}_${out}`;
-  };
-}
-
 /** Monotonic, sortable token for cursor pagination. */
 export function cursorOf(createdAt: number, id: string): string {
   return Buffer.from(`${createdAt}:${id}`).toString('base64url');
