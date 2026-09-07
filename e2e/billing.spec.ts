@@ -34,6 +34,24 @@ const json = async (page: Page, path: string): Promise<any> => { // eslint-disab
   }
 };
 
+/**
+ * A fixture written through the API, past the same limiter.
+ *
+ * A refused *read* costs a flake; a refused *write* costs the fixture, and the
+ * test then drives the UI at `/billing/customers/undefined` and fails a minute
+ * later on a locator that was never going to appear. Writes that build a
+ * fixture are retried the way reads are, and a write that is still refused
+ * says so here rather than a screen away.
+ */
+const post = async (page: Page, path: string, data: unknown): Promise<any> => { // eslint-disable-line @typescript-eslint/no-explicit-any
+  for (let attempt = 0; ; attempt++) {
+    const res = await page.request.post(`/api${path}`, { data });
+    if (res.ok()) return res.json();
+    if (attempt === 3) throw new Error(`POST ${path} → ${res.status()} ${await res.text()}`);
+    await new Promise((resolve) => setTimeout(resolve, 1200 * (attempt + 1)));
+  }
+};
+
 /** The "nothing was presented" option in the payment dialog, worded once. */
 const BY_HAND_LABEL = 'Recorded by hand — nothing is presented';
 
@@ -1855,13 +1873,10 @@ test('the payment dialog is operable from the keyboard alone', async ({ page }) 
  * the one that attaches the card.
  */
 async function customerWithDecliningCard(page: Page, name: string): Promise<{ id: string; name: string }> {
-  const res0 = await page.request.post('/api/v1/customers', {
-    data: { name, currency: 'usd', invoice_settings: { days_until_due: 0 } },
-  });
-  const customer = await res0.json();
-  if (!customer.id) throw new Error(`DIAG customer create ${res0.status()} ${JSON.stringify(customer)}`);
-  await page.request.post('/api/v1/payment_methods', {
-    data: { customer: customer.id, type: 'card', brand: 'visa', last4: '0002', exp_month: 12, exp_year: 2030, simulated_behavior: 'card_declined', set_default: true },
+  const customer = await post(page, '/v1/customers', { name, currency: 'usd', invoice_settings: { days_until_due: 0 } });
+  await post(page, '/v1/payment_methods', {
+    customer: customer.id, type: 'card', brand: 'visa', last4: '0002',
+    exp_month: 12, exp_year: 2030, simulated_behavior: 'card_declined', set_default: true,
   });
   return { id: customer.id, name: customer.name };
 }
@@ -1904,6 +1919,128 @@ test('a subscription whose first charge is declined is reported as declined, not
   await expect.poll(async () => (await json(page, `/v1/subscriptions/${id}`)).status).toBe('past_due');
   await expect(page.locator('.ain-page__title')).toContainText('Past due');
   await expect(page.locator('.ain-page__title')).not.toContainText(/\bActive\b/);
+  await removeAccount(page, account.id);
+});
+
+/**
+ * The same screen, with the one answer a busy minute really gives.
+ *
+ * `POST /v1/subscriptions` returns before the collector has run, so the dialog
+ * reads the record back until the issuer has answered and words the toast — and
+ * primes the detail page — from that reading. The read-back goes through the
+ * same rate limiter as everything else, and 429 is a legitimate answer to it.
+ * One refusal used to end the wait outright: the sentence was written from the
+ * POST's own response, which knows nothing about the money and carries no
+ * expanded customer, so the toast said nothing was collected over a declined
+ * card and the page opened on a raw cus_… id under the word "Active".
+ *
+ * The refusal is injected rather than waited for, because a limiter that only
+ * refuses under load is a defect you can only reproduce by accident.
+ */
+test('one refused read-back does not turn a declined charge into "nothing collected yet"', async ({ page }) => {
+  const account = await customerWithDecliningCard(page, `Refused Read Co ${Date.now().toString().slice(-6)}`);
+
+  let refusals = 0;
+  await page.route('**/api/v1/subscriptions/sub_*', async (route) => {
+    if (route.request().method() === 'GET' && refusals === 0) {
+      refusals += 1;
+      await route.fulfill({
+        status: 429,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: { type: 'rate_limit_error', code: 'rate_limit', message: 'Too many requests. Retry with exponential backoff.' } }),
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto(`/billing/customers/${account.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'New subscription' }).click();
+  const dialog = page.getByRole('dialog', { name: 'New subscription' });
+  await dialog.getByLabel('Price 1').selectOption('price_nw_starter_monthly');
+  await expect(dialog.getByRole('button', { name: /^Create · / })).toBeEnabled({ timeout: 20_000 });
+  await dialog.getByRole('button', { name: /^Create · / }).click();
+
+  const toast = page.locator('.ain-toast', { hasText: 'Subscription created' }).first();
+  await expect(toast).toBeVisible({ timeout: 25_000 });
+  expect(refusals).toBe(1);                       // the refusal really happened
+  await expect(toast).toContainText('declined');
+  await expect(toast).not.toContainText('nothing collected yet');
+
+  // And the screen it lands on names the account rather than its key, and says
+  // what happened — from the first frame, not once a refresh tick has been
+  // round to correct it. Sampled rather than awaited: `expect` retries, so an
+  // assertion that only has to become true a second and a half later is one
+  // the stale record passes too.
+  await expect(page).toHaveURL(/\/billing\/subscriptions\/sub_/);
+  const title = page.locator('.ain-page__title');
+  const samples: string[] = [];
+  for (let i = 0; i < 30; i++) {
+    samples.push(await title.innerText().catch(() => ''));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  expect(samples.join(' | ')).not.toMatch(/cus_[A-Za-z0-9]/);
+  expect(samples.join(' | ')).not.toMatch(/\bActive\b/);
+  await expect(title).toContainText(account.name);
+  await expect(title).toContainText('Past due');
+
+  await page.unroute('**/api/v1/subscriptions/sub_*');
+  await removeAccount(page, account.id);
+});
+
+/**
+ * And when every read-back is refused, so there is no reading at all.
+ *
+ * The dialog primes the detail page's cache so the next screen opens on the
+ * record the money has already moved on. What it must never prime it with is
+ * the POST's own answer: that came back from a different address, one that was
+ * asked for no `expand=customer`, so the account on the headline rendered as
+ * its raw cus_… key — under a status read before the collector ran. Nothing
+ * read means nothing primed, and the screen asks for itself.
+ */
+test('a read-back that never answers leaves the next screen to read for itself', async ({ page }) => {
+  const account = await customerWithDecliningCard(page, `Silent Read Co ${Date.now().toString().slice(-6)}`);
+
+  // Long enough to outlast the dialog's patience, then out of the way so the
+  // page that opens can read the record it needs.
+  let refusals = 0;
+  await page.route('**/api/v1/subscriptions/sub_*', async (route) => {
+    if (route.request().method() === 'GET' && refusals < 12) {
+      refusals += 1;
+      await route.fulfill({
+        status: 429,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: { type: 'rate_limit_error', code: 'rate_limit', message: 'Too many requests. Retry with exponential backoff.' } }),
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto(`/billing/customers/${account.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'New subscription' }).click();
+  const dialog = page.getByRole('dialog', { name: 'New subscription' });
+  await dialog.getByLabel('Price 1').selectOption('price_nw_starter_monthly');
+  await expect(dialog.getByRole('button', { name: /^Create · / })).toBeEnabled({ timeout: 20_000 });
+  await dialog.getByRole('button', { name: /^Create · / }).click();
+
+  const toast = page.locator('.ain-toast', { hasText: 'Subscription created' }).first();
+  await expect(toast).toBeVisible({ timeout: 40_000 });
+  expect(refusals).toBe(12);                      // every attempt was refused
+  // Nothing was read, so nothing is claimed about the money either way.
+  await expect(toast).not.toContainText('was raised and');
+
+  await expect(page).toHaveURL(/\/billing\/subscriptions\/sub_/);
+  const title = page.locator('.ain-page__title');
+  const samples: string[] = [];
+  for (let i = 0; i < 30; i++) {
+    samples.push(await title.innerText().catch(() => ''));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  expect(samples.join(' | ')).not.toMatch(/cus_[A-Za-z0-9]/);
+  await expect(title).toContainText(account.name);
+
+  await page.unroute('**/api/v1/subscriptions/sub_*');
   await removeAccount(page, account.id);
 });
 

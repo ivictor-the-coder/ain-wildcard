@@ -527,13 +527,25 @@ test('the primary link on an association can actually be set', async ({ page }) 
   await expect(row.locator('.crm-assoc__primary')).toHaveAttribute('aria-pressed', 'true');
 
   // The star is one POST, and the route promises `is_primary` is "the field you
-  // read back". Sending it against a link that already exists used to answer
-  // with the row as it was *before* the flag moved, so the screen only looked
-  // right because it threw the answer away and asked again.
-  const promoted = await (await page.request.post('/api/v1/associations', {
-    data: { from_id: created.id, to_id: 'cmp_nw_45', association_type: edge.association_type, primary: true },
+  // read back". Sent against a link that is already there — which is what the
+  // star always is — it used to answer with the row as it stood *before* the
+  // flag moved, so the screen only looked right because it threw the answer
+  // away and asked again. Proven on a second contact, whose link starts plain.
+  const other = await (await page.request.post('/api/v1/records/contact', {
+    data: { properties: { first_name: 'Yara', last_name: stamp, email: `yara.${stamp}@example.com` } },
+  })).json() as { id: string };
+  const plain = await (await page.request.post('/api/v1/associations', {
+    data: { from_id: other.id, to_id: 'cmp_nw_45', association_type: edge.association_type },
   })).json() as { is_primary: boolean };
-  expect(promoted.is_primary).toBe(true);
+  expect(plain.is_primary).toBe(false);
+
+  const promoted = await (await page.request.post('/api/v1/associations', {
+    data: { from_id: other.id, to_id: 'cmp_nw_45', association_type: edge.association_type, primary: true },
+  })).json() as { is_primary: boolean };
+  const stored = ((await (await page.request.get(`/api/v1/records/contact/${other.id}/associations?object_type=company`)).json()).data as
+    { record_id: string; is_primary: boolean }[]).find((e) => e.record_id === 'cmp_nw_45');
+  expect(stored?.is_primary).toBe(true);
+  expect(promoted.is_primary).toBe(stored?.is_primary);
 });
 
 test('moving the primary link to another record stands the first one down', async ({ page }) => {

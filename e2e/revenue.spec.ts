@@ -404,15 +404,35 @@ test('credit can be issued to an account and shows up in that grant’s ledger',
   await expect(drawer.locator('tbody tr', { hasText: 'Goodwill after the e2e outage' })).toBeVisible();
 });
 
+/**
+ * What the grant's own book says it is worth, and whether that book adds up.
+ * `balance` on the grant is a summary; the ledger is the thing it summarises,
+ * and a void that leaves the two disagreeing is credit that exists in one place
+ * and not the other. `reconciled` is the module's own lie detector: it re-adds
+ * every delta on read and checks it against the running total each entry
+ * carries.
+ */
+const ledgerOf = async (page: Page, grantId: string): Promise<{ balance: number; reconciled: boolean; entries: { type: string; delta: number }[] }> => {
+  const read = await json(page, `/v1/credit-grants/${grantId}/ledger`);
+  const entries = read.entries as { type: string; delta: number }[];
+  return { balance: entries.reduce((total, entry) => total + entry.delta, 0), reconciled: read.reconciled, entries };
+};
+
 test('a grant can be edited and its unused balance voided', async ({ page }) => {
   const customers = await json(page, '/v1/customers?limit=50&currency=usd');
+  const AMOUNT = 5000;
   const created = await page.request.post('/api/v1/credit-grants', {
     data: {
       customer: customers.data[0].id, name: `Playwright voidable ${Date.now()}`, category: 'promotional',
-      kind: 'monetary', currency: 'usd', amount: 5000, applicability: { scope: 'all' },
+      kind: 'monetary', currency: 'usd', amount: AMOUNT, applicability: { scope: 'all' },
     },
   });
   const grant = await created.json();
+
+  const before = await ledgerOf(page, grant.id);
+  expect(before.reconciled).toBe(true);
+  expect(before.balance).toBe(AMOUNT);
+  expect(grant.balance).toBe(before.balance);
 
   await page.goto('/revenue/credits', { waitUntil: 'networkidle' });
   await page.getByPlaceholder('Search grants and accounts…').fill(grant.name);
@@ -433,6 +453,20 @@ test('a grant can be edited and its unused balance voided', async ({ page }) => 
 
   await expect.poll(async () => (await json(page, `/v1/credit-grants/${grant.id}`)).status).toBe('voided');
   await expect.poll(async () => (await json(page, `/v1/credit-grants/${grant.id}`)).balance).toBe(0);
+
+  // The money has to be gone from the book, not only from the summary: one
+  // `void` entry for exactly what was unspent, the deltas still adding to the
+  // running totals, and nothing left to draw.
+  const after = await ledgerOf(page, grant.id);
+  expect(after.reconciled).toBe(true);
+  expect(after.balance).toBe(0);
+  const voided = after.entries.filter((entry) => entry.type === 'void');
+  expect(voided.map((entry) => entry.delta)).toEqual([-before.balance]);
+  expect((await json(page, `/v1/credit-grants/${grant.id}`)).balance).toBe(after.balance);
+
+  // And nothing that adds credit up for this account still counts it.
+  const balances = await json(page, `/v1/customers/${grant.customer}/credit-balance`);
+  expect(JSON.stringify(balances)).not.toContain(grant.id);
 });
 
 test('a usage period can be settled from the credits screen, drawing the grants that apply', async ({ page }) => {
