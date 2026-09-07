@@ -872,6 +872,17 @@ export default defineModule({
          */
         amount_overpaid: overpaid,
         amount_refunded: refunded,
+        /**
+         * Of what the bill records collecting, how much has since gone back off
+         * it. `amount_paid` does not move for a refund and the bill keeps its
+         * status — a settled bill that refunded cash is still settled — so this
+         * is the figure that says what it is really holding. Money refunded off
+         * the account credit an overpayment made is not here; it is in
+         * `amount_refunded`, which is every unit that went back.
+         */
+        amount_refunded_on_the_bill: invoice.amount_refunded,
+        /** `amount_paid - amount_refunded_on_the_bill`: what this bill is holding of the customer's. */
+        net_paid_on_the_bill: invoice.amount_paid - invoice.amount_refunded,
         /** Withdrawn by the network and not yet returned — an open case, or one lost. */
         amount_disputed: held,
         cash_collected: taken,
@@ -882,11 +893,15 @@ export default defineModule({
         refunds,
         disputes,
         dunning: campaign ? store.dunning.view(orgId, campaign) : null,
-        summary: returned > 0 ? `${headline} ${show(returned)} of it has since gone back to the customer.` : headline,
+        summary: returned > 0
+          ? `${headline} ${show(returned)} of it has since gone back to the customer${
+            refunded > 0 && invoice.status === 'paid' ? ', and the bill stands as paid: what was billed and what was collected have not changed' : ''
+          }.`
+          : headline,
       };
     }, {
       summary: 'What happened to the money on one invoice', tags: ['payments'],
-      description: 'Every presentation, refund and dispute against one bill, with the recovery campaign chasing it and the two numbers that have to agree: what the customer’s account was actually charged, and what the platform did with it. amount_overpaid is anything collected past what the bill was owed — it is credit on the customer’s balance, never a difference that was dropped.',
+      description: 'Every presentation, refund and dispute against one bill, with the recovery campaign chasing it and the two numbers that have to agree: what the customer’s account was actually charged, and what the platform did with it. amount_overpaid is anything collected past what the bill was owed — it is credit on the customer’s balance, never a difference that was dropped. A refund does not reopen the bill: what went back is recorded in amount_refunded, the part of it that came off what the bill collected in amount_refunded_on_the_bill, and cash_collected − amount_refunded − amount_disputed always equals net_paid_on_the_bill + amount_overpaid.',
     });
 
     router.post('/v1/invoices/:id/retry', (req: Req, c: Ctx) => {

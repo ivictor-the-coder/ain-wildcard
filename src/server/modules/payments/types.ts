@@ -430,13 +430,12 @@ export interface DunningAttempt {
  * off": the first is a fact about the card, the second is a decision the
  * workspace's policy makes after a set number of days, not a millisecond.
  *
- * `reopened_by_refund`: a person gave the money back and the bill is owed
- * again. Nothing presents it automatically — charging a card straight after
- * refunding it is exactly the pair of lines on a statement that produces a
- * chargeback — and nothing ends it but a person: a credit note if the bill
- * should be smaller, or a hand retry once the customer expects the charge.
+ * There was a second reason here, `reopened_by_refund`, for a bill a refund
+ * had put back on the books. A refund no longer puts one back: the cash going
+ * out is recorded on the invoice and the bill stays paid, so nothing is owed
+ * again and there is nothing to hold.
  */
-export const DUNNING_HOLD_REASONS = ['card_needs_person', 'reopened_by_refund'] as const;
+export const DUNNING_HOLD_REASONS = ['card_needs_person'] as const;
 export type DunningHoldReason = (typeof DUNNING_HOLD_REASONS)[number];
 
 export interface DunningHold {

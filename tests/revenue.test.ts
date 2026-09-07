@@ -194,8 +194,20 @@ describe('MRR and ARR', () => {
       assert.equal(row.mrr, bookOf(billing.by_currency, row.currency).mrr,
         `the ${row.currency} book is the same figure in both modules`);
     }
+    // The headline is one book — the workspace's own currency — and never the
+    // sum of the three, which is a figure in no currency at all. Both halves
+    // are asserted: that it equals that book, and that it is not the sum.
+    const me = await ws.ok('GET', '/v1/me');
+    assert.equal(billing.currency, me.org.default_currency, 'the headline names the workspace\'s own currency');
     assert.equal(billing.mrr, bookOf(billing.by_currency, billing.currency).mrr,
       'the headline is the workspace-currency book itself');
+    const across = billing.by_currency.reduce((sum: number, row: any) => sum + row.mrr, 0);
+    assert.equal(billing.cross_currency_sum_minor_units.mrr, across, 'the sum is published as minor units, and named as such');
+    assert.notEqual(billing.mrr, across, 'and the headline is not it');
+    assert.equal(
+      revenue.by_currency.reduce((sum: number, row: any) => sum + row.mrr, 0), across,
+      'revenue holds the same books, to the minor unit — it just refuses to publish their sum as money',
+    );
     for (const row of revenue.not_yet_revenue.by_currency) {
       assert.equal(row.trialing_mrr, bookOf(billing.by_currency, row.currency).trial_mrr,
         `trialing ${row.currency} agrees book for book`);
@@ -833,6 +845,32 @@ describe('collections', () => {
     );
     assert.equal(report.recovery.at_risk, usd.amount_at_risk, 'what is still being chased is the same balance on both');
   });
+
+  test('a book with no finished campaign reports no recovery rate, not a rate of zero', async () => {
+    // Northwind chases one euro bill and has decided nothing about it. The
+    // rate is recovered ÷ (recovered + lost); with that denominator at zero
+    // there is no rate, and 0.00% would read as "none of it comes back".
+    const report = await ws.ok('GET', '/v1/revenue/collections?currency=eur&months=60');
+    assert.equal(report.recovery.amount_recovered, 0);
+    assert.equal(report.recovery.amount_at_risk, 0, 'nothing recovered and nothing lost');
+    assert.ok(report.recovery.at_risk > 0, 'while real money is still being chased');
+    assert.equal(report.recovery.recovery_rate_bps, null, 'so there is no rate at all');
+    assert.equal(report.recovery.recovery_rate.undefined_rate, true, 'and the ratio beside it says the same');
+    assert.match(report.recovery.recovery_rate_basis, /no campaign has finished/i);
+
+    // The same book through the payments module: one definition, one answer,
+    // including the answer "there is not one".
+    const eur = (await ws.ok('GET', '/v1/dunning/summary')).totals.find((row: any) => row.currency === 'eur');
+    assert.ok(eur, 'the euro campaign is on the summary too');
+    assert.equal(eur.recovery_rate_bps, report.recovery.recovery_rate_bps);
+    assert.equal(eur.recovery_rate_basis, report.recovery.recovery_rate_basis, 'the same sentence explains both');
+
+    // And across a mixed book there is no rate either, for the older reason:
+    // recovered euros over decided dollars was never a rate.
+    const mixed = await ws.ok('GET', '/v1/revenue/collections?months=60');
+    assert.equal(mixed.currency, null);
+    assert.equal(mixed.recovery.recovery_rate_bps, null);
+  });
 });
 
 /* ========================================================================== *
@@ -920,6 +958,85 @@ describe('usage economics', () => {
     assert.equal(split.ok, true, 'the settlement columns are checked against each other, not assumed');
     const bridge = report.reconciliation.checks.find((check: any) => check.name === 'invoice_lines_carry_the_settled_amount');
     assert.equal(bridge.ok, true, `${bridge.description}: expected ${bridge.expected}, got ${bridge.actual}`);
+  });
+
+  test('settled, invoiced and unbilled are three words with one meaning each', async () => {
+    // The report used to answer "what was charged?" twice: totals.charged from
+    // the invoice lines and totals.settled.charged from the settlement ledger,
+    // two different numbers under one word. Nothing is charged on the seeded
+    // book until its metered windows are billed, so the clock is moved far
+    // enough for the two figures to be different and both non-zero.
+    const local = await workspace(UTC(2026, 6, 15));
+    try {
+      await local.app.travel(45 * DAY);
+      const report = await local.ok('GET', '/v1/revenue/usage?months=36&currency=usd');
+      const totals = report.totals;
+      assert.ok(totals.settled.charged > 0, 'the settlement ledger priced real usage');
+      assert.ok(totals.invoiced_charges > 0, 'and a finalised invoice carried real money for it');
+
+      // Settled is what the window priced at; invoiced is what a finalised
+      // invoice carried; unbilled is the difference, at every level.
+      assert.equal(totals.settled.unbilled, totals.settled.net_charged - totals.settled.invoiced);
+      assert.equal(totals.unbilled, totals.settled.unbilled, 'unbilled is settled minus invoiced, and is read that way');
+      const identity = report.reconciliation.checks
+        .find((check: any) => check.name === 'unbilled_is_settled_minus_invoiced');
+      assert.ok(identity, 'and the report checks it rather than asserting it');
+      assert.equal(identity.ok, true, `${identity.description}: expected ${identity.expected}, got ${identity.actual}`);
+
+      // Both figures against the two tables they come from, over the window
+      // the report says it read.
+      const db = local.app.ctx.db;
+      const invoicedFromLines = db.count(
+        `SELECT COALESCE(SUM(l.amount), 0) FROM billing_invoice_lines l
+           JOIN billing_invoices i ON i.id = l.invoice_id AND i.org_id = l.org_id
+          WHERE l.org_id = ? AND l.released = 0 AND i.status IN ('open', 'paid', 'uncollectible')
+            AND i.finalized_at >= ? AND i.finalized_at < ? AND i.currency = 'usd'
+            AND l.kind IN ('usage', 'true_up')`,
+        ORG, report.range.from, report.range.to,
+      );
+      const settledFromLedger = db.count(
+        `SELECT COALESCE(SUM(b.billed_amount), 0) FROM credit_billable_items b
+          WHERE b.org_id = ? AND b.kind IN ('charged', 'true_up') AND b.status <> 'void'
+            AND b.currency = 'usd' AND b.period_end > ? AND b.period_end <= ?`,
+        ORG, report.range.from, report.range.to,
+      );
+      assert.equal(totals.invoiced_charges, invoicedFromLines, 'invoiced_charges is the invoice lines, and only them');
+      assert.equal(totals.settled.net_charged, settledFromLedger, 'settled is the settlement ledger, and only it');
+
+      // Every level of the response uses the same three words.
+      for (const meter of report.meters) {
+        assert.equal(typeof meter.invoiced_charges, 'number', `${meter.name} names its invoiced figure`);
+        assert.equal(typeof meter.invoiced_credit_covered, 'number');
+        assert.equal(meter.settled.unbilled, meter.settled.net_charged - meter.settled.invoiced);
+        assert.equal(meter.unbilled, meter.settled.unbilled, `${meter.name}: unbilled is settled minus invoiced`);
+      }
+      for (const row of report.series) {
+        assert.equal(typeof row.invoiced_charges, 'number', `${row.month} names its invoiced figure`);
+        assert.equal(typeof row.invoiced_credit_covered, 'number');
+      }
+      assert.equal(
+        report.series.reduce((sum: number, row: any) => sum + row.invoiced_charges, 0),
+        totals.invoiced_charges,
+        'the months add up to the range',
+      );
+
+      // The old names are kept for one release, pointing at the invoiced
+      // figure they always carried, and the response says which is which.
+      const at = (path: string) => path.split(/[.[\]]+/).filter(Boolean)
+        .reduce((node: any, key: string) => (key === '' ? node : node[key]), report);
+      assert.ok(report.deprecated.length > 0, 'the response lists what is going away');
+      for (const row of report.deprecated) {
+        const old = at(row.field.replace('[]', '.0'));
+        const now = at(row.use.replace('[]', '.0'));
+        assert.equal(typeof old, 'number', `${row.field} is still served`);
+        assert.equal(old, now, `${row.field} carries exactly ${row.use}`);
+      }
+      assert.equal(totals.charged, totals.invoiced_charges);
+      assert.notEqual(totals.charged, totals.settled.charged, 'which is why the old name had to go');
+      const rules = report.basis.rules.join(' ');
+      for (const word of ['SETTLED', 'INVOICED', 'UNBILLED']) assert.match(rules, new RegExp(word));
+      assert.match(rules, /kept for one release/);
+    } finally { local.close(); }
   });
 
   test('the invoiced mix is a partition of everything billed', async () => {

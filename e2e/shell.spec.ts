@@ -24,13 +24,30 @@ const signIn = async (page: Page) => {
 /** The symbol a formatted amount carries — "$1,250.00" → "$". */
 const symbolOf = (money: string): string => money.replace(/[\d.,\s ]/g, '');
 
+/**
+ * A read, retried past a refusal.
+ *
+ * This file runs last in a whole-suite run, by which point the platform's
+ * per-principal limiter has seen a few hundred requests a minute and answers
+ * 429 to the tail of them. A 429 is the right answer; reading `me.org` off one
+ * and failing with "Cannot read properties of undefined" is a flake, not a
+ * finding.
+ */
+const json = async (page: Page, path: string): Promise<any> => { // eslint-disable-line @typescript-eslint/no-explicit-any
+  for (let attempt = 0; ; attempt += 1) {
+    const res = await page.request.get(`/api${path}`);
+    if (res.ok() || attempt === 3) return res.json();
+    await new Promise((resolve) => setTimeout(resolve, 1200 * (attempt + 1)));
+  }
+};
+
 test.beforeEach(async ({ page }) => { await signIn(page); });
 
 /* ============================== the dashboard ============================= */
 
 test('prepaid credit is reported in the workspace currency, not the first pot the API listed', async ({ page }) => {
-  const me = await (await page.request.get('/api/v1/me')).json();
-  const overview = await (await page.request.get('/api/v1/credits/overview')).json();
+  const me = await json(page, '/v1/me');
+  const overview = await json(page, '/v1/credits/overview');
   const currency: string = me.org.default_currency;
   const pot = overview.outstanding.find((row: { currency: string }) => row.currency === currency);
   test.skip(!pot || pot.monetary_outstanding === 0, 'this workspace holds no prepaid credit in its own currency');

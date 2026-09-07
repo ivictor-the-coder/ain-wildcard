@@ -1153,7 +1153,15 @@ export class Entitlements {
   /* --------------------------------- reports ------------------------------- */
 
   /** Everyone at or over a feature's ceiling right now — the expansion list. */
-  atLimit(orgId: string, featureKey: string, limit = 50): LimitPressure[] {
+  /**
+   * Every account at or past a feature's warning threshold, worst first.
+   *
+   * Uncapped, because a caller that only wants the top few still has to be
+   * able to say how many there are: a list of five silently cut from fifty is
+   * how an expansion list turns into a wrong number. `atLimit` takes the top
+   * of it; the overview takes both the top and the count.
+   */
+  pressureOn(orgId: string, featureKey: string): LimitPressure[] {
     const feature = this.requireFeature(orgId, featureKey);
     const now = this.ctx.now();
     const rows = this.ctx.db.all<ActiveRow>(
@@ -1166,11 +1174,21 @@ export class Entitlements {
       if (usage.percent_used === null || usage.percent_used < feature.approaching_threshold_percent) continue;
       out.push({
         object: 'entitlement_pressure',
-        customer: row.customer_id, feature: featureKey, value: row.value,
+        customer: row.customer_id,
+        // The one thing a person reading an expansion list needs and an id is
+        // not. A deleted customer keeps its id here rather than going blank.
+        customer_name: this.ctx.svc.billing.customer(orgId, row.customer_id)?.name ?? row.customer_id,
+        feature: featureKey,
+        feature_name: feature.name,
+        value: row.value,
         used: usage.used, remaining: usage.remaining, percent_used: usage.percent_used,
       });
     }
-    return out.sort((a, b) => (b.percent_used ?? 0) - (a.percent_used ?? 0)).slice(0, limit);
+    return out.sort((a, b) => (b.percent_used ?? 0) - (a.percent_used ?? 0));
+  }
+
+  atLimit(orgId: string, featureKey: string, limit = 50): LimitPressure[] {
+    return this.pressureOn(orgId, featureKey).slice(0, limit);
   }
 }
 

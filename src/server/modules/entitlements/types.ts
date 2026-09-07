@@ -366,7 +366,11 @@ export interface VersionSnapshotRow {
 export interface LimitPressure {
   object: 'entitlement_pressure';
   customer: string;
+  /** Who it is. This list is read by a person deciding who to call, and `cus_…` is not a name. */
+  customer_name: string;
   feature: string;
+  /** The feature's own name, for the same reason. */
+  feature_name: string;
   value: number | null;
   used: number;
   remaining: number | null;

@@ -79,10 +79,28 @@ const NOT_FOUND = 'Nothing is registered at this address';
 test.describe('grounding: a Sources chip opens the record it names', () => {
   test('invoice, subscription and customer chips land on billing’s screens, not the 404', async ({ page, request }) => {
     await signIn(page, request);
+    // The questions are chosen from the ledger rather than written down: this
+    // file used to ask "Which invoices are overdue?" and "Which customers are
+    // past due?", and billing's own suite — which runs first in a whole-suite
+    // run — settles the overdue book, so the engine answered "none" and cited
+    // nothing. A status the workspace actually holds is a question with an
+    // answer whatever ran before it.
+    interface Row { status: string }
+    const statusIn = async <T extends Row>(path: string, wanted: string[]): Promise<string> => {
+      const rows = await getJson<{ data: T[] }>(request, path);
+      const held = wanted.find((status) => rows.data.some((row) => row.status === status));
+      expect(held, `this workspace holds no ${path} in any of ${wanted.join(', ')}`).toBeTruthy();
+      return held!;
+    };
+    const invoiceStatus = await statusIn('/api/v1/invoices?status=all&limit=200', ['overdue', 'open', 'paid', 'draft']);
+    const subscriptionStatus = await statusIn(
+      '/api/v1/subscriptions?status=all&limit=200', ['active', 'past_due', 'trialing', 'paused', 'canceled'],
+    );
+
     const { thread, answers } = await threadWith(request, [
-      'Which invoices are overdue?',
-      'What is our MRR in EUR?',
-      'Which customers are past due?',
+      `Which invoices are ${invoiceStatus}?`,
+      `Which subscriptions are ${subscriptionStatus.replace('_', ' ')}?`,
+      'Top 3 customers by revenue',
     ]);
     const cited = new Map(answers.flatMap((a) => a.citations).map((c) => [c.type, c]));
     for (const type of ['invoice', 'subscription', 'customer']) {
@@ -202,6 +220,11 @@ test.describe('the screens the surface advertises', () => {
     await visit(page, '/copilot?new=1', '.cp-composer');
     await page.locator('.ain-page__subtitle button', { hasText: /tools$/ }).click();
     await page.waitForURL(/tab=tools/);
+    // The catalogue is read on arrival and `useQuery` keeps a refused read
+    // rather than retrying it, so a screen that landed while the API was
+    // saying 429 draws nothing for good. Ask the screen again rather than wait
+    // out a minute on a list that has already given up.
+    if (await page.locator('.cp-tool').count() === 0) await visit(page, '/copilot/runs?tab=tools', '.cp-tool');
     await expect(page.locator('.cp-tool')).toHaveCount(tools.total_count);
   });
 });
@@ -317,7 +340,13 @@ test.describe('a write that is booked, not written', () => {
     await expect(resolution).not.toContainText('Approved and written');
     await expect(resolution).toContainText('is booked for');
     await expect(resolution).toContainText('assigned to you');
-    await expect(resolution).toContainText('Nothing is on Aconcagua Alimentos’s timeline yet');
+    // The card used to say "Nothing is on Aconcagua Alimentos’s timeline yet",
+    // which is true and tells the reader nothing about what will be. It now
+    // separates the two: the task exists now, the note lands when it comes due.
+    await expect(resolution).toContainText('The task is on Aconcagua Alimentos now');
+    await expect(resolution).toContainText('written onto its timeline when it comes due');
+    // Whatever the wording, it never reports the note as already written.
+    await expect(resolution).not.toContainText('was written onto');
     await expect(resolution.locator('.cp-chips__label')).toHaveText('Scheduled on');
     await expect(resolution.locator('a.cp-chip').first()).toContainText('Aconcagua Alimentos');
     await expect(page.locator('.cp-answer').last().locator('.cp-answer__head')).toContainText('decided — scheduled');

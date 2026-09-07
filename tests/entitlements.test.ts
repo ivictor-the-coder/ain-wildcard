@@ -970,3 +970,103 @@ describe('replaying the billing year leaves nothing out of step', () => {
     }
   });
 });
+
+/* ========================================================================== *
+ * The overview — the expansion list a person actually reads
+ * ========================================================================== */
+
+describe('the entitlements overview', () => {
+  test('names the accounts at a limit, counts all of them, and counts every live override', async () => {
+    const before = await expectOk('GET', '/v1/entitlements/overview');
+    const robots = before.features.find((row: any) => row.feature === 'robots');
+    assert.ok(robots, 'Northwind meters connected robots against a plan limit');
+    assert.ok(robots.at_risk.length > 0, 'and at least one account is already pressing against it');
+
+    // An expansion list is read by a person deciding who to call. `cus_…` is
+    // not a name, and the account's own name is one lookup away.
+    for (const row of robots.at_risk) {
+      const customer = await expectOk('GET', `/v1/customers/${row.customer}`);
+      assert.equal(row.customer_name, customer.name, 'the row names the account, not just its id');
+      assert.equal(row.feature_name, robots.name);
+      assert.doesNotMatch(row.customer_name, /^cus_/, 'and the name is a name');
+    }
+
+    // Push more accounts up against the ceiling than the list shows. The
+    // meter aggregates connected robots as a max, so reporting exactly the
+    // account's own allowance puts it at 100% of it.
+    const holders = app.ctx.db.all<{ customer_id: string; value: number }>(
+      `SELECT customer_id, value FROM entitlement_active
+        WHERE org_id = ? AND feature_key = 'robots' AND unlimited = 0 AND value IS NOT NULL
+        ORDER BY customer_id LIMIT 8`, ORG,
+    );
+    assert.ok(holders.length >= 6, 'enough accounts hold the feature to overflow a five-row list');
+    for (const holder of holders) {
+      await expectOk('POST', '/v1/meter-events', {
+        meter: 'connected_robots', customer: holder.customer_id, value: holder.value,
+        identifier: `overview-pressure-${holder.customer_id}`,
+      });
+    }
+
+    // Every account that was over the threshold before, plus every account
+    // just put at exactly 100% of its own allowance. Counted here rather than
+    // read back off the report.
+    assert.equal(
+      robots.at_risk_accounts, robots.at_risk.length,
+      'nothing was hidden before, so the accounts listed then are all there were',
+    );
+    const expected = new Set([
+      ...robots.at_risk.map((row: any) => row.customer as string),
+      ...holders.map((holder) => holder.customer_id),
+    ]);
+
+    const after = await expectOk('GET', '/v1/entitlements/overview');
+    const pressed = after.features.find((row: any) => row.feature === 'robots');
+    assert.ok(expected.size > 5, 'more accounts are over the threshold than the list has room for');
+    assert.equal(pressed.at_risk.length, 5, 'the list shows the worst five');
+    assert.equal(pressed.at_risk_shown, 5);
+    assert.equal(
+      pressed.at_risk_accounts, expected.size,
+      'and says how many there are in total, not how many it printed',
+    );
+    for (const row of pressed.at_risk) {
+      assert.ok(expected.has(row.customer), `${row.customer_name} is one of the accounts over the threshold`);
+      assert.ok((row.percent_used ?? 0) >= 80, 'and is really over it');
+    }
+    for (let i = 1; i < pressed.at_risk.length; i++) {
+      assert.ok(
+        (pressed.at_risk[i - 1].percent_used ?? 0) >= (pressed.at_risk[i].percent_used ?? 0),
+        'worst first, so the five it shows are the five worth calling',
+      );
+    }
+
+    // The override count was the length of a page of overrides, and that page
+    // is capped at 500 rows: a workspace past the cap was told it had exactly
+    // 500 live overrides for ever after.
+    const customer = holders[0].customer_id;
+    const live = () => app.ctx.db.count(
+      `SELECT COUNT(*) FROM entitlement_overrides WHERE org_id = ? AND status = 'active'`, ORG,
+    );
+    const granted = await expectOk('POST', '/v1/entitlement-overrides', {
+      customer, feature: 'sso', effect: 'grant',
+      reason: 'Enterprise trial of single sign-on while the contract is drafted.',
+    });
+    assert.equal(granted.status, 'active');
+    // And then past the page. Written straight to the table because that is
+    // exactly what is under test — the overview counts rows, and five hundred
+    // more round trips through the API would only prove the API can be called
+    // five hundred times.
+    const now = app.ctx.now();
+    for (let i = live(); i <= 505; i++) {
+      app.ctx.db.insert('entitlement_overrides', {
+        id: `ent_ovr_bulk_${i}`, org_id: ORG, customer_id: customer, feature_key: 'sso',
+        effect: 'grant', value: null, unlimited: 0,
+        reason: `Enterprise trial of single sign-on, week ${i}.`,
+        expires_at: null, status: 'active', revoked_at: null, revoked_reason: null,
+        created_by: null, metadata: {}, created: now, updated: now,
+      });
+    }
+    const counted = await expectOk('GET', '/v1/entitlements/overview');
+    assert.ok(live() > 500, 'the workspace now holds more overrides than one page of them');
+    assert.equal(counted.overrides_live, live(), 'and the overview counts the rows, not the page');
+  });
+});

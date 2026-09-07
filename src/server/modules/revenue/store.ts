@@ -1268,6 +1268,9 @@ export class Revenue {
         amount_at_risk: only(scope, whole.recovery.amount_at_risk),
         amount_recovered: only(scope, whole.recovery.amount_recovered),
         recovery_rate: onlyIn(scope, whole.recovery.recovery_rate),
+        // A rate over two sums that were never in the same currency is not a
+        // rate, so it goes the same way every money scalar here goes.
+        recovery_rate_bps: onlyIn(scope, whole.recovery.recovery_rate_bps),
         by_status: whole.recovery.by_status.map((row) => ({
           status: row.status,
           campaigns: row.campaigns,
@@ -1304,14 +1307,15 @@ export class Revenue {
         book,
         'Usage economics: revenue per meter, credit bought against credit burned, and how much of the book is overage.',
         [
-          'metered_value comes from the settlement ledger in credits, which prices a window once when it closes and records what the usage was worth, what prepaid credit absorbed and what was charged; a settlement is counted in the month its window ends. The settled split of the range\'s windows is published as `settled`.',
-          'charged is money that reached a finalised invoice: usage and true-up lines on invoices finalised in the range, counted in the month the invoice was finalised. credit_covered is the value the credit-covered lines on those invoices carried. Neither is read from the settlement — a settlement is a price, an invoice is a bill, and the two differ by exactly what is still unbilled.',
-          'unbilled is settled and not yet billed: charges for windows that closed in the range with no finalised invoice at the end of it. unbilled_balance is the same reading over every window that has ever closed, and is the arrears balance /v1/revenue/deferred reports. The bridge between the two ledgers is checked in reconciliation.checks: every settled charge on a finalised invoice is carried there at the amount the settlement said, or the report says so.',
+          'Three words, and they mean the same thing at every level of this response. SETTLED is what a window priced at when it closed, read from the settlement ledger in credits: metered_value is that value and `settled` is its split into what credit absorbed and what was charged. INVOICED is what reached a finalised invoice, read from the invoice lines: invoiced_charges (usage and true-up lines), invoiced_credit_covered (the value the credit-covered lines carried) and invoiced_all_lines (every line, metered or not). UNBILLED is settled minus invoiced.',
+          'A settlement is counted in the month its window ends; an invoice line in the month the bill was finalised. That is why the two sides are named apart — a settlement is a price and an invoice is a bill, and they differ by exactly what is still unbilled.',
+          'unbilled is the range\'s own windows: charges settled for a window that closed in the range with no finalised invoice at the end of it, and it equals settled.net_charged - settled.invoiced. unbilled_balance is the same reading over every window that has ever closed, and is the arrears balance /v1/revenue/deferred reports. The bridge between the two ledgers is checked in reconciliation.checks: every settled charge on a finalised invoice is carried there at the amount the settlement said, or the report says so.',
+          'totals.charged, totals.credit_covered and totals.invoiced — and the same two names on each meter and each month — are the previous names for invoiced_charges, invoiced_credit_covered and invoiced_all_lines. They carry exactly those figures and are kept for one release; `deprecated` below lists the replacement for each. totals.charged was never the settlement figure, which is what made the old names worth changing: totals.settled.charged is a different number by exactly the arrears.',
           'Credit-covered usage is revenue that was recognised when the credit was sold, not when it was burned. It is reported beside charged usage, never added to it.',
           'Quantities are micro-units: 1 unit is 1,000,000 micro, which is how metering stores them so a sum is integer arithmetic.',
           'Monetary credit is reported in minor units; unit-denominated credit stays in micro-units and says so with a micro flag, because a telemetry event is not a cent.',
           'A credit flow is a ledger and is reported like one: every field is the signed sum of one ledger type, so a burn is negative and a refund carries whichever sign the refund had. Rollovers in and out are named separately from grants — a rollover is credit moving between grants, not credit sold — and any type this report does not name lands in `other` rather than disappearing.',
-          'Overage share is charged usage over everything invoiced in the range, on finalised invoices only, both keyed on the invoice\'s finalisation. Its numerator is totals.charged.',
+          'Overage share is invoiced_charges over invoiced_all_lines, on finalised invoices only, both keyed on the invoice\'s finalisation.',
           'reconciliation.checks are the checks that can fail: the three settlement columns re-summed against each other, every settled charge on a finalised invoice against the amount the invoice line carries, every metered invoice line against the settlement behind it, the named flow components against the movement of the ledger they came from, and every ledger row against the grant it belongs to.',
         ],
         {
@@ -1331,25 +1335,41 @@ export class Revenue {
         complete: row.complete,
         settlements: row.settlements,
         metered_value: only(scope, row.metered_value),
-        credit_covered: only(scope, row.credit_covered),
-        charged: only(scope, row.charged),
+        invoiced_credit_covered: only(scope, row.invoiced_credit_covered),
+        invoiced_charges: only(scope, row.invoiced_charges),
         unbilled_balance: only(scope, row.unbilled_balance),
+        credit_covered: only(scope, row.invoiced_credit_covered),
+        charged: only(scope, row.invoiced_charges),
         by_currency: report.by_currency.map((part) => ({ currency: part.currency, ...part.months[i] })),
       })),
       totals: {
         metered_value: only(scope, report.totals.metered_value),
-        credit_covered: only(scope, report.totals.credit_covered),
-        charged: only(scope, report.totals.charged),
+        settled: scope.single ? report.totals.settled : null,
+        invoiced_charges: only(scope, report.totals.invoiced_charges),
+        invoiced_credit_covered: only(scope, report.totals.invoiced_credit_covered),
+        invoiced_all_lines: only(scope, report.totals.invoiced_all_lines),
         unbilled: only(scope, report.totals.unbilled),
         unbilled_balance: only(scope, report.totals.unbilled_balance),
-        settled: scope.single ? report.totals.settled : null,
         settlements: report.totals.settlements,
         skipped_settlements: report.totals.skipped_settlements,
         currency: scope.single,
         metered_share_of_invoiced: onlyIn(scope, report.totals.metered_share_of_invoiced),
         overage_share_of_invoiced: onlyIn(scope, report.totals.overage_share_of_invoiced),
-        invoiced: only(scope, report.totals.invoiced),
+        credit_covered: only(scope, report.totals.invoiced_credit_covered),
+        charged: only(scope, report.totals.invoiced_charges),
+        invoiced: only(scope, report.totals.invoiced_all_lines),
       },
+      // Removed one release from now. Every field here carries the figure its
+      // replacement carries, to the minor unit — the names changed, nothing else.
+      deprecated: [
+        { field: 'totals.charged', use: 'totals.invoiced_charges' },
+        { field: 'totals.credit_covered', use: 'totals.invoiced_credit_covered' },
+        { field: 'totals.invoiced', use: 'totals.invoiced_all_lines' },
+        { field: 'series[].charged', use: 'series[].invoiced_charges' },
+        { field: 'series[].credit_covered', use: 'series[].invoiced_credit_covered' },
+        { field: 'meters[].charged', use: 'meters[].invoiced_charges' },
+        { field: 'meters[].credit_covered', use: 'meters[].invoiced_credit_covered' },
+      ],
       by_currency: report.by_currency,
       meters: report.meters,
       credit: {
@@ -1414,7 +1434,7 @@ export class Revenue {
       collected: collections.series[i]?.collected ?? null,
       receivables: collections.series[i]?.outstanding ?? null,
       metered_value: usage.series[i]?.metered_value ?? null,
-      usage_charged: usage.series[i]?.charged ?? null,
+      usage_charged: usage.series[i]?.invoiced_charges ?? null,
       by_currency: scope.currencies.map((currency) => {
         const move = currencyAt(row.by_currency, currency);
         const rec = currencyAt(deferred.series[i]?.by_currency ?? [], currency);
@@ -1432,7 +1452,7 @@ export class Revenue {
           collected: cash?.collected ?? 0,
           receivables: cash?.outstanding ?? 0,
           metered_value: meter?.metered_value ?? 0,
-          usage_charged: meter?.charged ?? 0,
+          usage_charged: meter?.invoiced_charges ?? 0,
         };
       }),
     }));
@@ -1511,7 +1531,7 @@ export class Revenue {
         receivables: collections.totals.outstanding,
         past_due: collections.totals.past_due,
         metered_value: usage.totals.metered_value,
-        usage_charged: usage.totals.charged,
+        usage_charged: usage.totals.invoiced_charges,
         usage_unbilled: usage.totals.unbilled_balance,
         credit_purchased: usage.credit.purchased,
         credit_burned: usage.credit.burned_against_usage,
@@ -1534,7 +1554,7 @@ export class Revenue {
           credited: collections.totals.credited,
           written_off: collections.totals.written_off,
           metered_value: usage.totals.metered_value,
-          usage_charged: usage.totals.charged,
+          usage_charged: usage.totals.invoiced_charges,
           opening_mrr: movement.totals.opening,
           net_movement: movement.totals.net,
         },
@@ -1553,7 +1573,9 @@ export class Revenue {
         note:
           'invoiced, recognised and deferred_balance are all-time figures (all_time); billed, collected, metered_value ' +
           'and usage_charged are the range\'s (in_range); mrr, arr, receivables and past_due are balances at the clock (now). ' +
-          'The flat keys are kept and mean what they always meant — read the sub-blocks to know which kind each is.',
+          'The flat keys are kept and mean what they always meant — read the sub-blocks to know which kind each is. ' +
+          'usage_charged is the invoiced figure — /v1/revenue/usage totals.invoiced_charges, usage and true-up lines on ' +
+          'invoices finalised in the range — and never the settled one, which is larger by whatever is still unbilled.',
       },
       headline: {
         mrr: mrr.totals.mrr,

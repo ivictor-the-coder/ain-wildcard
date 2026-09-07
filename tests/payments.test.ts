@@ -8,6 +8,7 @@ import type { CreditNote, Invoice, Subscription } from '../src/server/modules/bi
 import type {
   Charge, Dispute, DunningAttempt, DunningView, PaymentIntent, PaymentMethod, Refund, SimulatedBehavior,
 } from '../src/server/modules/payments/types';
+import { NO_RECOVERY_RATE_BASIS, recoveryRateBps } from '../src/server/modules/payments/dunning';
 
 const ORG = 'org_demo';
 const DANA: Auth = { kind: 'session', orgId: ORG, userId: 'usr_seed01', role: 'owner', scopes: ['*'], livemode: true };
@@ -687,14 +688,20 @@ describe('a bill is never collected twice in silence', () => {
  * The identity underneath every test here, and the one the property test at
  * the end holds over random sequences:
  *
- *     net cash in === invoice amount_paid + overpayment credit on the account
+ *     net cash in === (amount_paid - amount_refunded) + overpayment credit
  *
  * where net cash in is every succeeded charge, less what has been refunded,
- * less what the network is holding over an open or lost dispute.
+ * less what the network is holding over an open or lost dispute. A refund does
+ * not move `amount_paid` — a bill the customer settled stays settled, and what
+ * went back is recorded beside it — so the bill's own half of the identity is
+ * what it collected less what it has given back.
  * ========================================================================== */
 
 /** Every unit the customer's account is out of pocket for this bill, right now. */
 const netCashIn = (view: any): number => view.cash_collected - view.amount_refunded - view.amount_disputed;
+
+/** What the bill itself is holding: collected, less what has gone back off it. */
+const heldByBill = (view: any): number => view.net_paid_on_the_bill;
 
 /**
  * The identity, asserted from two independent places: the payments view, and
@@ -729,8 +736,16 @@ async function assertReconciled(ws: Workspace, customerId: string, where: string
     );
     assert.ok(creditForBill >= 0, `${where}: ${invoice.number} holds negative overpayment credit (${creditForBill})`);
     assert.equal(
-      netCashIn(view), view.amount_paid + view.amount_overpaid,
-      `${where}: ${invoice.number} took ${netCashIn(view)} net and accounts for ${view.amount_paid} on the bill + ${view.amount_overpaid} on the account`,
+      view.net_paid_on_the_bill, view.amount_paid - view.amount_refunded_on_the_bill,
+      `${where}: ${invoice.number} says it is holding ${view.net_paid_on_the_bill} of ${view.amount_paid} collected less ${view.amount_refunded_on_the_bill} refunded off it`,
+    );
+    assert.ok(
+      view.amount_refunded_on_the_bill >= 0 && view.amount_refunded_on_the_bill <= view.amount_paid,
+      `${where}: ${invoice.number} records ${view.amount_refunded_on_the_bill} refunded off ${view.amount_paid} collected, so money has gone back that it never collected`,
+    );
+    assert.equal(
+      netCashIn(view), heldByBill(view) + view.amount_overpaid,
+      `${where}: ${invoice.number} took ${netCashIn(view)} net and accounts for ${heldByBill(view)} on the bill (${view.amount_paid} collected less ${view.amount_refunded_on_the_bill} refunded off it) + ${view.amount_overpaid} on the account`,
     );
     // A struck-out bill is the one document allowed to record cash it is not
     // owed: voiding leaves whatever was collected in `amount_paid` so a refund
@@ -758,12 +773,12 @@ async function assertReconciled(ws: Workspace, customerId: string, where: string
       );
     }
     cash += netCashIn(view);
-    accounted += view.amount_paid;
+    accounted += heldByBill(view);
   }
   const credit = overpaymentRows.reduce((total, row) => total - row.amount, 0);
   assert.equal(
     cash, accounted + credit,
-    `${where}: ${cash} net cash in across the account, but ${accounted} recorded on bills + ${credit} of overpayment credit`,
+    `${where}: ${cash} net cash in across the account, but ${accounted} still held on bills + ${credit} of overpayment credit`,
   );
   return credit;
 }
@@ -847,12 +862,15 @@ describe('money going back out is the mirror of money coming in', () => {
       await ws.ok('POST', '/v1/refunds', { charge: charge.id, amount: 40_000, reason: 'requested_by_customer' });
 
       const after = await ws.invoice(invoice.id);
-      assert.equal(after.amount_paid, 9_900, '$300.00 came off the account and only the last $100.00 off the bill');
-      assert.equal(after.amount_due, 10_000, 'and the bill is owed exactly what was taken back out of it');
-      assert.equal(after.status, 'open');
+      assert.equal(after.amount_paid, 19_900, 'what the bill collected has not changed: a refund is not an unpayment');
+      assert.equal(after.amount_refunded, 10_000, '$300.00 came off the account and only the last $100.00 off the bill');
+      assert.equal(after.amount_due, 0, 'and a bill somebody chose to refund is not owed again by that choice');
+      assert.equal(after.status, 'paid');
       const view = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
       assert.equal(view.amount_overpaid, 0);
+      assert.equal(view.amount_refunded_on_the_bill, 10_000, 'the account emptied first, and only then did the bill give any back');
       assert.equal(netCashIn(view), 9_900);
+      assert.equal(heldByBill(view), 9_900, 'which is exactly what the bill is still holding');
       assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0);
       await assertReconciled(ws, customer.id, 'after a refund that outran the credit');
     } finally { ws.close(); }
@@ -1351,11 +1369,14 @@ describe('a bill that shrinks under money already on it', () => {
       assert.equal(view.amount_refunded, 40_000, 'every unit that was taken can still be given back');
       assert.equal(netCashIn(view), 0);
       assert.equal(view.amount_overpaid, 0);
+      assert.equal(view.amount_refunded_on_the_bill, 29_900, 'the credit the note displaced went back first, then the bill\'s own cash');
+      assert.equal(heldByBill(view), 0, 'so the bill is holding nothing');
       assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0);
       const after = await ws.invoice(invoice.id);
-      assert.equal(after.amount_paid, 0);
-      assert.equal(after.amount_due, 29_900, 'and what the bill still charges is owed again');
-      assert.equal(after.status, 'open');
+      assert.equal(after.amount_paid, 29_900, 'what it collected is a fact and does not move');
+      assert.equal(after.amount_refunded, 29_900, 'what went back is recorded beside it');
+      assert.equal(after.amount_due, 0, 'and a bill the customer settled is not owed again by a refund');
+      assert.equal(after.status, 'paid');
       await assertReconciled(ws, customer.id, 'after refunding everything off a credited part-paid bill');
     } finally { ws.close(); }
   });
@@ -1686,9 +1707,11 @@ describe('the reconciliation identity holds over random sequences', () => {
   // again afterwards. The five assertions at the end of the walk enforce that,
   // so a seed that stops covering a case fails loudly instead of passing
   // quietly — which is exactly what two of them did when the stop on this
-  // account was added below, and why they were re-picked rather than the
-  // assertions relaxed.
-  for (const seed of [0x5eed_007f, 0x5eed_00b1, 0x5eed_00f7, 0x5eed_0115, 0x5eed_011a, 0x5eed_0132]) {
+  // account was added below, and 0x5eed_0115 did again when a refund stopped
+  // reopening the bill: its note then displaced cash that had already gone
+  // back rather than cash on the account, so withdrawing the note put nothing
+  // back. Re-picked as 0x5eed_0204 rather than the assertion relaxed.
+  for (const seed of [0x5eed_007f, 0x5eed_00b1, 0x5eed_00f7, 0x5eed_0204, 0x5eed_011a, 0x5eed_0132]) {
     test(`seed ${seed.toString(16)}: collect / overpay / refund / dispute in any order still reconciles`, async () => {
       const ws = await workspace();
       const log: string[] = [];
@@ -2075,8 +2098,11 @@ describe('what a reversal leaves the platform able to do', () => {
       assert.equal(refund.amount, 24_950);
       const after = await ws.invoice(invoice.id);
       assert.equal(after.status, 'void', 'a withdrawn bill stays withdrawn');
-      assert.equal(after.amount_paid, 0, 'and no longer records money it does not hold');
+      assert.equal(after.amount_paid, 24_950, 'what it collected before it was struck out is still what it collected');
+      assert.equal(after.amount_refunded, 24_950, 'and all of it is recorded as gone back');
       assert.equal(after.amount_due, 0, 'a struck-out bill is never owed again');
+      const emptied = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+      assert.equal(heldByBill(emptied), 0, 'so it is holding nothing of the customer\'s');
       await assertReconciled(ws, customer.id, 'after refunding what a withdrawn bill held');
     } finally { ws.close(); }
   });
@@ -2668,6 +2694,53 @@ describe('smart dunning', () => {
     } finally { ws.close(); }
   });
 
+  test('a book with nothing decided has no recovery rate, and says which it is', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const summary = await ws.ok('GET', '/v1/dunning/summary');
+      // A rate is recovered ÷ (recovered + lost). Where that denominator is
+      // zero there is no rate, and 0 bps — "we recover none of it" — is the
+      // one answer that is guaranteed to be read as the worst possible news.
+      for (const row of summary.totals) {
+        const decided = row.recovered_amount + row.lost_amount;
+        assert.equal(
+          row.recovery_rate_bps === null, decided === 0,
+          `${row.currency}: ${row.recovered_amount} recovered + ${row.lost_amount} lost, rate ${row.recovery_rate_bps}`,
+        );
+        assert.equal(row.recovery_rate_bps, recoveryRateBps(row.recovered_amount, row.lost_amount));
+        assert.equal(
+          row.recovery_rate_basis,
+          decided === 0 ? NO_RECOVERY_RATE_BASIS : summary.recovery_rate_basis,
+          'every row says how its own figure was arrived at',
+        );
+      }
+
+      const undecided = summary.totals.find((row: any) => row.recovered_amount + row.lost_amount === 0);
+      assert.ok(undecided, 'Northwind is chasing money in a currency no campaign has finished in');
+      assert.ok(undecided.amount_at_risk > 0, 'and it is real money, still being chased');
+      assert.equal(undecided.recovery_rate_bps, null, 'so there is no rate, rather than a rate of zero');
+      assert.match(undecided.recovery_rate_basis, /no campaign has finished/i);
+
+      const decided = summary.totals.find((row: any) => row.recovered_amount + row.lost_amount > 0);
+      assert.ok(decided, 'and one where campaigns have finished');
+      assert.equal(
+        decided.recovery_rate_bps,
+        Math.round((decided.recovered_amount * 10_000) / (decided.recovered_amount + decided.lost_amount)),
+        'which is recovered over what was decided, in basis points',
+      );
+
+      // The first campaign to finish in that currency is what turns it into a
+      // rate — nothing else about the book changed.
+      const chased = (await ws.ok('GET', `/v1/dunning?status=open&limit=100`)).data
+        .find((row: DunningView) => row.currency === undecided.currency);
+      assert.ok(chased, 'the open campaign behind the null rate');
+      await ws.ok('POST', `/v1/dunning/${chased.id}/cancel`, { reason: 'Collected by bank transfer.' });
+      const stillNone = (await ws.ok('GET', '/v1/dunning/summary')).totals
+        .find((row: any) => row.currency === undecided.currency);
+      assert.equal(stillNone.recovery_rate_bps, null, 'a campaign stood down was neither recovered nor lost');
+    } finally { ws.close(); }
+  });
+
   test('stopping a campaign by hand stands the schedule down and leaves the bill alone', async () => {
     const ws = await workspace(MONDAY);
     try {
@@ -3065,7 +3138,7 @@ describe('refunds', () => {
   before(async () => { ws = await workspace(); });
   after(() => ws.close());
 
-  test('a refund on a paid invoice moves amount_paid and leaves the bill owed again', async () => {
+  test('a refund on a paid invoice records what went back and leaves the bill paid', async () => {
     const customer = await ws.customer('Larkfield Systems');
     await ws.card(customer.id, 'succeeds');
     const { invoice } = await ws.subscribe(customer.id);
@@ -3078,23 +3151,32 @@ describe('refunds', () => {
     assert.equal(first.amount, part);
     assert.equal(first.status, 'succeeded');
 
+    // A bill the customer settled is settled. Giving money back is a fact
+    // about the payment, not about what was billed: it is recorded beside what
+    // was collected, and `total`, `amount_paid`, `amount_due` and `status` all
+    // stand. If the customer owes this money again they owe it on a new bill.
     const afterPartial = await ws.invoice(invoice.id);
-    assert.equal(afterPartial.amount_paid, invoice.total - part);
-    assert.equal(afterPartial.amount_due, part);
-    assert.equal(afterPartial.status, 'open');
+    assert.equal(afterPartial.amount_paid, invoice.total, 'what was collected does not un-collect itself');
+    assert.equal(afterPartial.amount_refunded, part);
+    assert.equal(afterPartial.amount_due, 0);
+    assert.equal(afterPartial.status, 'paid');
     assert.equal(
       afterPartial.amount_paid + afterPartial.pre_payment_credit_notes_amount + afterPartial.amount_due,
       afterPartial.total,
       'the bill still accounts for itself',
     );
+    assert.match(first.invoice_effect ?? '', /stays paid/);
+    assert.match(first.invoice_effect ?? '', /raise a new invoice/i);
 
     const rest: Refund = await ws.ok('POST', '/v1/refunds', { invoice: invoice.id, reason: 'requested_by_customer' });
     assert.equal(rest.amount, invoice.total - part, 'the default refund is whatever is left on the charge');
 
     const afterFull = await ws.invoice(invoice.id);
-    assert.equal(afterFull.amount_paid, 0);
-    assert.equal(afterFull.amount_due, afterFull.total);
-    assert.equal(afterFull.paid_at, null);
+    assert.equal(afterFull.amount_paid, invoice.total);
+    assert.equal(afterFull.amount_refunded, invoice.total, 'everything it collected has gone back');
+    assert.equal(afterFull.amount_due, 0, 'and it is still not owed: nothing was billed twice');
+    assert.equal(afterFull.status, 'paid');
+    assert.ok(afterFull.paid_at, 'the day it was settled is still the day it was settled');
 
     const charge = (await ws.ok('GET', `/v1/charges?invoice=${invoice.id}`)).data[0] as Charge;
     assert.equal(charge.amount_refunded, invoice.total);
@@ -3105,77 +3187,63 @@ describe('refunds', () => {
     assert.equal(money.cash_collected, invoice.total);
     assert.equal(money.amount_refunded, invoice.total);
     assert.equal(money.amount_overpaid, 0);
-    assert.equal(money.amount_paid, 0);
+    assert.equal(money.amount_paid, invoice.total);
+    assert.equal(money.amount_refunded_on_the_bill, invoice.total);
+    assert.equal(heldByBill(money), 0, 'the bill is holding none of the customer\'s money');
+    assert.equal(netCashIn(money), 0);
     assert.equal(money.refunds.length, 2);
     assert.match(money.summary, /gone back to the customer/);
+    assert.match(money.summary, /stands as paid/);
 
     await ws.fail('POST', '/v1/refunds', { invoice: invoice.id, amount: 100 }, 400, 'refund_exceeds_charge');
   });
 
-  test('a refund never re-opens the retry schedule, but the reopened bill is owed by somebody', async () => {
+  test('a refund never re-opens the retry schedule, and never re-opens the bill either', async () => {
     const customer = await ws.customer('Ashgrove Instruments');
     await ws.card(customer.id, 'succeeds');
     const { sub, invoice } = await ws.subscribe(customer.id);
     const presented = (await ws.ok('GET', `/v1/payment_intents?invoice=${invoice.id}&status=all`)).data.length;
     const refund: Refund = await ws.ok('POST', '/v1/refunds', { invoice: invoice.id, reason: 'duplicate' });
-    assert.match(refund.invoice_effect ?? '', /recovery queue/);
 
-    const reopened = await ws.invoice(invoice.id);
-    assert.equal(reopened.status, 'open');
-    assert.equal(reopened.amount_due, invoice.total);
+    // Giving money back is not a failed collection, and it is not an unpaid
+    // bill either. The bill the customer settled stays settled: what went back
+    // is recorded against it, nothing is owed, and nothing is queued to chase.
+    // A customer who is charged again for a bill somebody here chose to refund
+    // is a customer filing a chargeback.
+    const after = await ws.invoice(invoice.id);
+    assert.equal(after.status, 'paid');
+    assert.equal(after.amount_due, 0);
+    assert.equal(after.amount_paid, invoice.total);
+    assert.equal(after.amount_refunded, invoice.total);
+    assert.match(refund.invoice_effect ?? '', /stays paid/);
+    assert.doesNotMatch(refund.invoice_effect ?? '', /recovery queue/);
+    assert.doesNotMatch(String(refund.invoice_effect), /\bre_[A-Za-z0-9]+|\d{4}-\d{2}-\d{2}/, 'no ids and no ISO stamps in operator-facing prose');
 
-    // Giving money back is not a failed collection: no schedule, no
-    // presentation, no arrears. But the bill is open and owed, and a bill
-    // nothing owns is a bill nobody collects.
-    const [campaign] = await ws.dunning(customer.id);
-    assert.ok(campaign, 'the reopened bill is in the recovery queue');
-    assert.equal(campaign.status, 'recovering');
-    assert.equal(campaign.attempt_count, 0, 'nothing was refused');
-    assert.equal(campaign.next_attempt_at, null, 'and nothing is scheduled');
-    assert.equal(campaign.hold?.reason, 'reopened_by_refund');
-    assert.equal(campaign.hold?.until, null, 'nothing ends this but a person');
-    assert.equal(campaign.amount_at_risk, invoice.total);
-    assert.equal(campaign.needs_human, true);
-    assert.match(campaign.recommended_action, /credit note/);
-    assert.match(campaign.recommended_action, new RegExp(`/v1/invoices/${invoice.id}/retry`));
-    assert.match(campaign.recommended_action, /duplicate/, 'the queue says why the money went back');
-    // The hold's own note is read on the queue, so it carries the day and the
-    // reason — never the refund's id, and never an ISO stamp.
-    assert.match(
-      String(campaign.hold?.note),
-      /went back to the customer on [A-Z][a-z]{2} \d{1,2}, \d{4}, refunded as duplicate, so/,
-    );
-    assert.doesNotMatch(String(campaign.hold?.note), /\bre_[A-Za-z0-9]+|\d{4}-\d{2}-\d{2}/, 'no refund id and no ISO stamp in operator-facing prose');
+    assert.deepEqual(await ws.dunning(customer.id), [], 'no campaign was opened, because nothing is owed');
     assert.equal(
       ws.app.ctx.db.count(
-        `SELECT COUNT(*) FROM jobs WHERE type = 'payments.dunning_retry' AND status = 'pending' AND idem_key = ?`,
-        `payments.dunning_retry:${campaign.id}`,
+        `SELECT COUNT(*) FROM jobs WHERE status = 'pending' AND (payload LIKE ? OR idem_key LIKE ?)`,
+        `%${invoice.id}%`, `%${invoice.id}%`,
       ),
-      0, 'no retry job',
+      0, 'and nothing at all is scheduled against this bill',
     );
     assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'active', 'a refund is not a decline');
-    const summary = await ws.ok('GET', '/v1/dunning/summary');
-    assert.ok(summary.held_campaigns >= 1);
 
     // Six weeks pass and nothing charges the card on the heels of a refund.
     assert.equal((await ws.travel(45 * DAY)).failed, 0);
     assert.equal((await ws.ok('GET', `/v1/payment_intents?invoice=${invoice.id}&status=all`)).data.length, presented, 'never presented');
-    assert.equal((await ws.dunning(customer.id))[0].hold?.reason, 'reopened_by_refund');
+    assert.deepEqual(await ws.dunning(customer.id), [], 'and still nothing is chasing it');
+    assert.equal((await ws.invoice(invoice.id)).status, 'paid');
     assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'active');
 
-    // A person presents it once the customer expects the charge, and the
-    // campaign that held it records the recovery.
-    const collected = await ws.ok('POST', `/v1/invoices/${invoice.id}/retry`, {});
-    assert.equal(collected.collected, true);
-    assert.equal((await ws.invoice(invoice.id)).status, 'paid');
-    const [done] = await ws.dunning(customer.id);
-    assert.equal(done.status, 'recovered');
-    assert.equal(done.hold, null);
-    assert.equal(done.attempt_count, 1);
-    assert.equal(done.recovered_amount, invoice.total);
+    // Not even by hand: there is nothing to present. Charging this again is a
+    // new invoice, which is what the refund's own answer says to raise.
+    const refused = await ws.fail('POST', `/v1/invoices/${invoice.id}/retry`, {}, 409, 'invoice_not_collectable');
+    assert.match(refused.message, /already paid/);
+    await assertReconciled(ws, customer.id, 'after refunding a settled bill in full');
   });
 
-  test('a refund of a bill a schedule recovered reopens that campaign, and a credit note ends it', async () => {
+  test('a refund of a bill a schedule recovered leaves the campaign recovered, and the rate with it', async () => {
     const customer = await ws.customer('Fallowfield Drives');
     const card = await ws.card(customer.id, 'insufficient_funds', { simulated_decline_count: 1 });
     const { invoice } = await ws.subscribe(customer.id);
@@ -3187,32 +3255,43 @@ describe('refunds', () => {
 
     const part = 5000;
     await ws.ok('POST', '/v1/refunds', { invoice: invoice.id, amount: part, reason: 'goodwill' });
-    const [reopened] = await ws.dunning(customer.id);
-    assert.equal(reopened.id, recovered.id, 'one campaign per bill: the history is one story');
-    assert.equal(reopened.status, 'recovering');
-    assert.equal(reopened.hold?.reason, 'reopened_by_refund');
-    assert.equal(reopened.amount_at_risk, part);
-    assert.equal(reopened.recovered_amount, 0, 'what it had recovered is no longer counted as recovered');
-    assert.equal(reopened.attempt_count, recovered.attempt_count, 'the attempts it made are still its attempts');
-    const usdAfter = (await ws.ok('GET', '/v1/dunning/summary')).totals.find((t: any) => t.currency === 'usd');
-    assert.equal(usdAfter.recovered_amount, usdBefore.recovered_amount - invoice.total);
-    assert.equal(usdAfter.amount_at_risk, usdBefore.amount_at_risk + part);
 
-    // The goodwill was the point: the bill should have been smaller.
+    // The schedule recovered this bill and that is a fact about what the card
+    // did, not about what finance decided afterwards. A refund does not take a
+    // recovery back: the bill stays paid, the campaign stays closed, and the
+    // recovery rate — which is what these campaigns are measured on — does not
+    // move because somebody made a goodwill gesture a week later.
+    const [after] = await ws.dunning(customer.id);
+    assert.equal(after.id, recovered.id, 'one campaign per bill: the history is one story');
+    assert.equal(after.status, 'recovered');
+    assert.equal(after.hold, null, 'nothing is on hold, because nothing is owed');
+    assert.equal(after.recovered_amount, invoice.total, 'what it recovered, it recovered');
+    assert.equal(after.attempt_count, recovered.attempt_count);
+    assert.equal((await ws.invoice(invoice.id)).status, 'paid');
+    assert.equal((await ws.invoice(invoice.id)).amount_refunded, part);
+    const usdAfter = (await ws.ok('GET', '/v1/dunning/summary')).totals.find((t: any) => t.currency === 'usd');
+    assert.equal(usdAfter.recovered_amount, usdBefore.recovered_amount, 'the money it recovered still counts as recovered');
+    assert.equal(usdAfter.amount_at_risk, usdBefore.amount_at_risk, 'and nothing went back at risk');
+    assert.equal(usdAfter.recovery_rate_bps, usdBefore.recovery_rate_bps);
+
+    // The goodwill was the point: the bill should have been smaller. On a
+    // settled bill a credit note is money, not a smaller balance — it lands on
+    // the account and comes off the next invoice.
+    const balanceBefore = (await ws.ok('GET', `/v1/customers/${customer.id}`)).balance;
     const note: CreditNote = await ws.ok('POST', '/v1/credit_notes', {
       invoice: invoice.id, amount: part, reason: 'order_change', memo: 'Two days of ingestion downtime.',
     });
     assert.ok(note.id);
+    assert.equal(note.credit_amount, part, 'a paid bill has no balance left to reduce, so the credit goes to the account');
+    assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, balanceBefore - part);
     assert.equal((await ws.invoice(invoice.id)).status, 'paid');
     const [ended] = await ws.dunning(customer.id);
-    assert.equal(ended.status, 'canceled');
-    assert.equal(ended.hold, null);
-    assert.match(ended.resolution ?? '', /settled/);
+    assert.equal(ended.status, 'recovered', 'and the campaign is where it was');
     assert.equal(card.customer, customer.id);
     await assertReconciled(ws, customer.id, 'after a refund and the credit note that answered it');
   });
 
-  test('a refund of a part payment on a bill a schedule is chasing only tells the schedule the new balance', async () => {
+  test('a refund of a part payment leaves the schedule chasing the same balance, in the same window', async () => {
     const customer = await ws.customer('Ingleby Robotics');
     const card = await ws.card(customer.id, 'insufficient_funds');
     const { invoice } = await ws.subscribe(customer.id);
@@ -3229,13 +3308,23 @@ describe('refunds', () => {
     assert.equal(partPaid.hold, null);
 
     await ws.ok('POST', '/v1/refunds', { invoice: invoice.id, amount: part, reason: 'requested_by_customer' });
+
+    // The part payment is still recorded as collected — a refund does not
+    // un-collect it — so the balance the schedule presents is the balance the
+    // bill still says it is owed, and the window it was going to present in is
+    // untouched. Nothing about a refund is a decline, so nothing reschedules.
+    const refunded = await ws.invoice(invoice.id);
+    assert.equal(refunded.amount_paid, part);
+    assert.equal(refunded.amount_refunded, part);
+    assert.equal(refunded.amount_due, invoice.total - part);
     const [after] = await ws.dunning(customer.id);
     assert.equal(after.status, 'recovering');
-    assert.equal(after.amount_at_risk, invoice.total, 'the schedule is told the balance it will present');
+    assert.equal(after.amount_at_risk, refunded.amount_due, 'the schedule chases what the bill says it is owed');
     assert.equal(after.hold, null, 'a live schedule owns this bill, so nothing is put on hold');
     assert.ok(after.next_attempt_at, 'and it keeps its window');
     assert.equal(dayKey(after.next_attempt_at as number), dayKey(partPaid.next_attempt_at as number));
     assert.equal(window > 0, true);
+    await assertReconciled(ws, customer.id, 'after refunding a part payment on a bill in recovery');
   });
 });
 

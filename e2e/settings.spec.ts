@@ -51,6 +51,38 @@ const dialog = (page: Page) => page.getByRole('dialog');
 /** Unique per run, so a re-run against a warm database never collides. */
 const stamp = () => Date.now().toString(36).slice(-6);
 
+/**
+ * Seat a teammate through the dialog, and clear the one-time link it hands back.
+ *
+ * The invite used to end on "Add to workspace" and close. Ain sends no email,
+ * so it now mints a one-time invitation link and shows it in a second dialog
+ * that will not dismiss until the operator says they have copied it — the
+ * token is stored only as a hash and no route reads it back, so this is the
+ * one moment it exists. Every test that seats somebody walks through both,
+ * which is why the walk lives here rather than in four copies.
+ */
+const inviteTeammate = async (
+  page: Page,
+  email: string,
+  opts: { name?: string; title?: string; role?: string } = {},
+) => {
+  await page.getByRole('button', { name: 'Invite a teammate' }).click();
+  await dialog(page).getByLabel('Work email').fill(email);
+  await dialog(page).getByLabel('Full name').fill(opts.name ?? 'E2E Fixture');
+  if (opts.title) await dialog(page).getByLabel('Job title').fill(opts.title);
+  if (opts.role) await dialog(page).getByRole('radio', { name: new RegExp(`^${opts.role}\\b`) }).check();
+  await dialog(page).getByRole('button', { name: 'Invite and show me the link' }).click();
+
+  const link = dialog(page);
+  await expect(link).toContainText('invitation is ready', { timeout: 15_000 });
+  // The link cannot be dismissed until it has been acknowledged — that is the
+  // point of it, so the acknowledgement is part of seating someone.
+  await expect(link.getByRole('button', { name: 'Copy it first' })).toBeDisabled();
+  await link.getByRole('checkbox', { name: /I have copied the link/ }).check();
+  await link.getByRole('button', { name: 'Done' }).click();
+  await expect(dialog(page)).toBeHidden({ timeout: 15_000 });
+};
+
 /* ============================== the sub-nav =============================== */
 
 test('the settings surface exists and every page in its sub-navigation opens', async ({ page }) => {
@@ -130,13 +162,7 @@ test('a teammate can be invited, have their role changed and be removed', async 
 
   const email = `e2e.${stamp()}@northwind.io`;
 
-  await page.getByRole('button', { name: 'Invite a teammate' }).click();
-  await dialog(page).getByLabel('Work email').fill(email);
-  await dialog(page).getByLabel('Full name').fill('E2E Fixture');
-  await dialog(page).getByLabel('Job title').fill('Commissioning Engineer');
-  await dialog(page).getByRole('radio', { name: /^analyst\b/ }).check();
-  await dialog(page).getByRole('button', { name: 'Add to workspace' }).click();
-  await expect(dialog(page)).toBeHidden({ timeout: 15_000 });
+  await inviteTeammate(page, email, { title: 'Commissioning Engineer', role: 'analyst' });
 
   const seated = (await json(page, '/v1/users')).data.find((row: any) => row.email === email); // eslint-disable-line @typescript-eslint/no-explicit-any
   expect(seated, 'the invited teammate is on the workspace').toBeTruthy();
@@ -154,19 +180,29 @@ test('a teammate can be invited, have their role changed and be removed', async 
   const promoted = (await json(page, '/v1/users')).data.find((row: any) => row.email === email); // eslint-disable-line @typescript-eslint/no-explicit-any
   expect(promoted.role).toBe('member');
 
-  // Removal is destructive, so it confirms — and it will not proceed until the
-  // address is typed back.
+  // This seat never opened its link, so taking it away is a cancellation, not
+  // a removal: there are no sessions to end and no keys to revoke, and the
+  // menu, the dialog and the trail all say the smaller thing. (Typing the
+  // address back is what the *destructive* half asks for, and the owner test
+  // below holds that.)
+  expect(promoted.status, 'the seat is still waiting on its invitation').toBe('invited');
   await rowMenu(page, email);
-  await page.getByRole('menuitem', { name: 'Remove from workspace…' }).click();
-  const remove = dialog(page).getByRole('button', { name: 'Remove and revoke' });
-  await expect(remove).toBeDisabled();
-  await dialog(page).getByRole('textbox').fill(email);
-  await expect(remove).toBeEnabled();
-  await remove.click();
+  await expect(page.getByRole('menuitem', { name: 'Remove from workspace…' })).toHaveCount(0);
+  await page.getByRole('menuitem', { name: 'Cancel the invitation…' }).click();
+  const cancel = dialog(page);
+  await expect(cancel).toContainText('has not accepted yet');
+  await expect(cancel).toContainText('no sessions to end and no API keys to revoke');
+  await expect(cancel.getByRole('textbox')).toHaveCount(0);
+  await cancel.getByRole('button', { name: 'Cancel the invitation' }).click();
   await expect(dialog(page)).toBeHidden({ timeout: 15_000 });
 
   const users = (await json(page, '/v1/users')).data;
   expect(users.some((row: any) => row.email === email)).toBe(false); // eslint-disable-line @typescript-eslint/no-explicit-any
+
+  // And the trail records it as what it was.
+  const trail = await json(page, '/v1/audit-log?limit=200');
+  const entry = trail.data.find((row: any) => row.target_id === seated.id); // eslint-disable-line @typescript-eslint/no-explicit-any
+  expect(entry?.action, 'the trail calls a cancelled invitation what it is').toBe('user.invitation_cancelled');
 });
 
 /* =============================== API keys ================================ */
@@ -298,7 +334,10 @@ test('the tax screen is operable from the keyboard alone', async ({ page }) => {
   await openSettings(page, '/settings/tax', 'Tax');
 
   // Tab to the primary action rather than clicking it, and open it with Enter.
-  const register = page.getByRole('button', { name: 'Register a rate' });
+  // `.first()` is the header's button: an empty register draws a second one in
+  // its empty state, and whether the register is empty depends on what the
+  // tests before this one left behind.
+  const register = page.getByRole('button', { name: 'Register a rate' }).first();
   await register.focus();
   await expect(register).toBeFocused();
   await page.keyboard.press('Enter');
@@ -483,7 +522,11 @@ test('the time machine moves the clock, runs the queue and logs what it ran', as
     const row = page.locator('.st-row').filter({ hasText: entry.request_id }).first();
     await expect(row).toBeVisible({ timeout: 20_000 });
     await expect(row).toContainText('moved by Dana Whitfield');
-    await expect(row.getByTestId('move-count')).toHaveText(`${move.jobs_run} ${move.jobs_run === 1 ? 'job' : 'jobs'}`);
+    // Grouped, the way every other number on the surface is: a month of a busy
+    // workspace runs 1,030 jobs and the badge said so while this line asked for
+    // "1030 jobs".
+    const grouped = new Intl.NumberFormat(before.org.locale).format(move.jobs_run);
+    await expect(row.getByTestId('move-count')).toHaveText(`${grouped} ${move.jobs_run === 1 ? 'job' : 'jobs'}`);
 
     if (move.jobs_run > 0) {
       // Work actually ran, and it ran *inside the window the jump opened* — not
@@ -536,10 +579,18 @@ test('the job queue screen reports exactly what the queue holds', async ({ page 
   // Every status the route serves is a tab, and each one reads its own page.
   const done = await json(page, '/v1/jobs?status=done&limit=200');
   await page.getByRole('tab', { name: /Done/ }).click();
-  await expect(page.locator('tbody tr')).toHaveCount(Math.min(done.data.length, 200), { timeout: 15_000 });
+  // Counting `tbody tr` said 32 against a true 200: the table virtualises above
+  // 80 rows, so the DOM holds one screenful and two `aria-hidden` spacers. What
+  // the screen believes it is showing is `aria-rowcount` on the table itself,
+  // and the drawn rows are a window onto it.
+  const grid = page.locator('table[aria-rowcount]').first();
+  await expect(grid).toHaveAttribute('aria-rowcount', String(Math.min(done.data.length, 200)), { timeout: 15_000 });
+  const drawn = await page.locator('tbody tr[data-index]').count();
+  expect(drawn, 'the table drew no rows at all').toBeGreaterThan(0);
+  expect(drawn, 'the table drew more rows than it says it has').toBeLessThanOrEqual(Math.min(done.data.length, 200));
 
   // A completed job carries its payload — the argument the handler was given.
-  await page.locator('tbody tr').first().click();
+  await page.locator('tbody tr[data-index]').first().click();
   const drawer = page.getByRole('dialog');
   await expect(drawer).toContainText('payload — what the handler is given');
   await expect(drawer.locator('.st-json__code')).toBeVisible();
@@ -900,7 +951,11 @@ test('each move in the time machine history reads the count the server answered 
   // The count badge is the one whose text ends in "job" or "jobs" — the same
   // element before and after this fix, so the comparison is against the number.
   const badge = (answer: { previous: number }) => rowFor(answer).locator('.ain-badge').filter({ hasText: /\bjobs?$/ });
-  const said = (answer: { jobs_run: number }) => `${answer.jobs_run} ${answer.jobs_run === 1 ? 'job' : 'jobs'}`;
+  // Grouped through the workspace's locale, like every other number here: a
+  // four-figure move reads "1,030 jobs" on the badge.
+  const locale = (await json(page, '/v1/me')).org.locale as string;
+  const said = (answer: { jobs_run: number }) =>
+    `${new Intl.NumberFormat(locale).format(answer.jobs_run)} ${answer.jobs_run === 1 ? 'job' : 'jobs'}`;
   await expect(badge(second)).toHaveText(said(second));
   await expect(badge(first)).toHaveText(said(first));
   await expect(rowFor(second)).toHaveAttribute('data-tally', 'recorded');
@@ -1048,17 +1103,20 @@ test('Enter on a row’s “Row actions” opens its menu, and only its menu', a
   await page.keyboard.press('Escape');
 });
 
-test('the invitation says the seat cannot sign in, and Enter in any field submits it', async ({ page }) => {
+test('the invitation says what the seat can and cannot do, and Enter in any field submits it', async ({ page }) => {
   await signIn(page);
   await openSettings(page, '/settings/team', 'Team');
 
   const email = `e2e.enter.${stamp()}@northwind.io`;
   await page.getByRole('button', { name: 'Invite a teammate' }).click();
 
-  // No promise the platform cannot keep: there is no invitation link, no
-  // password route and no accept step, and the dialog says so before the button.
-  await expect(dialog(page)).toContainText('they cannot sign in');
-  await expect(dialog(page)).toContainText('no invitation link, no password route');
+  // There *is* an invitation link now — `POST /v1/users` mints a one-time
+  // token — so the dialog no longer says "no invitation link, no password
+  // route". What it still may not do is promise an email nobody sends, or a
+  // seat that works before the link is opened.
+  await expect(dialog(page)).toContainText('a one-time invitation link is minted');
+  await expect(dialog(page)).toContainText('Ain does not send email');
+  await expect(dialog(page)).toContainText('until they open it and set a password');
   await expect(dialog(page)).not.toContainText('immediately');
 
   // Enter in the second field — not only the first — submits the form.
@@ -1066,12 +1124,18 @@ test('the invitation says the seat cannot sign in, and Enter in any field submit
   await page.keyboard.press('Tab');
   await page.keyboard.type('E2E Enter Fixture');
   await page.keyboard.press('Enter');
+
+  // Submitting hands over the link, once, behind an acknowledgement.
+  const link = dialog(page);
+  await expect(link).toContainText('invitation is ready', { timeout: 15_000 });
+  await expect(link).toContainText('This is the only time this link exists outside your clipboard.');
+  await link.getByRole('checkbox', { name: /I have copied the link/ }).check();
+  await link.getByRole('button', { name: 'Done' }).click();
   await expect(dialog(page)).toBeHidden({ timeout: 15_000 });
 
   const seated = (await json(page, '/v1/users')).data.find((row: any) => row.email === email); // eslint-disable-line @typescript-eslint/no-explicit-any
   expect(seated, 'Enter submitted the invitation').toBeTruthy();
-  // …and the toast tells the same truth the dialog did.
-  await expect(page.locator('.ain-toast').filter({ hasText: 'cannot sign in yet' })).toBeVisible();
+  expect(seated.status, 'the seat waits for the link to be opened').toBe('invited');
 
   await page.request.delete(`/api/v1/users/${seated.id}`);
 });
@@ -1124,8 +1188,15 @@ test('the roster lists the owner first and the readers last', async ({ page }) =
 
   // Sorted on the role's name the owner came last — admin, analyst, member,
   // member, member, owner. The default order is the ladder.
+  //
+  // Read by the column's header rather than by its position: the roster grew a
+  // "Seat" column between the teammate and the job title, and the third cell —
+  // which used to be the role — became "VP of Revenue Operations".
+  const headers = (await page.locator('thead th').allInnerTexts()).map((text) => text.trim());
+  const roleColumn = headers.indexOf('Role') + 1;
+  expect(roleColumn, `the roster has no Role column: ${JSON.stringify(headers)}`).toBeGreaterThan(0);
   const rank: Record<string, number> = { owner: 0, admin: 1, member: 2, analyst: 3, readonly: 4 };
-  const roles = await page.locator('tbody tr td:nth-child(3)').allInnerTexts();
+  const roles = await page.locator(`tbody tr td:nth-child(${roleColumn})`).allInnerTexts();
   expect(roles[0].trim()).toBe('owner');
   for (let i = 1; i < roles.length; i++) {
     expect(rank[roles[i].trim()], `${roles[i]} follows ${roles[i - 1]}`).toBeGreaterThanOrEqual(rank[roles[i - 1].trim()]);
@@ -1151,13 +1222,24 @@ test('a domain that is not a hostname is refused under the field, and nothing is
   await expect(page.getByRole('button', { name: 'Saved' })).toBeVisible();
 });
 
-test('the trail names a removed teammate, and their link lands on a roster that says they are gone', async ({ page }) => {
+test('the trail names a removed teammate, and their link lands on a roster that says they are gone', async ({ page, request }) => {
   await signIn(page);
 
-  // Seat and remove a teammate through the API, so the trail holds the pair.
+  // Seat, accept and remove a teammate through the API, so the trail holds the
+  // trio. The acceptance is what makes this a *removal*: deleting a seat that
+  // never opened its invitation is a cancellation, logged as
+  // `user.invitation_cancelled` with "Cancelled the invitation to …", and this
+  // test is about the other one. The link is redeemed on the `request` context
+  // rather than the page's, because `POST /v1/auth/accept` answers with a
+  // session cookie and that would sign the browser in as the new teammate.
   const email = `e2e.gone.${stamp()}@northwind.io`;
-  const created = await (await page.request.post('/api/v1/users', { data: { email, name: 'E2E Departed', role: 'analyst' } })).json();
-  expect(created.id, 'the seat was created').toBeTruthy();
+  const seating = await page.request.post('/api/v1/users', { data: { email, name: 'E2E Departed', role: 'analyst' } });
+  const created = await seating.json();
+  expect(created.id, `the seat was created — ${seating.status()} ${JSON.stringify(created)}`).toBeTruthy();
+  expect(created.invitation?.token, 'the seat came with a one-time invitation token').toBeTruthy();
+  expect((await request.post('/api/v1/auth/accept', {
+    data: { token: created.invitation.token, password: 'demo1234' },
+  })).status()).toBe(200);
   expect((await page.request.delete(`/api/v1/users/${created.id}`)).status()).toBe(204);
 
   // The width the critic read "Workspace setti…" at.
@@ -1205,9 +1287,11 @@ test('the workspace facts read the clock as it stands, and the stream does not c
   if (Math.abs(me.clock.offset_ms) <= 60_000) await expect(clock).toContainText('In step with real time');
   else await expect(clock).toContainText(/Simulated.*(ahead of|behind) real time/);
 
-  // user.invited is emitted with actor_type system, no actor and no request id
-  // for a change only a signed-in admin can make. The stream must not say the
-  // platform did it — it does not know who did.
+  // `user.invited` used to be emitted with `actor_type: system`, no actor and
+  // no request id, for a change only a signed-in admin can make; the stream
+  // drew that as "Unattributed" because "The platform did it" was a lie it
+  // could not support. The teammate routes carry the actor now, so the honest
+  // reading is the person's name — and never the platform's.
   const email = `e2e.actor.${stamp()}@northwind.io`;
   const seat = await (await page.request.post('/api/v1/users', { data: { email, name: 'E2E Actor Fixture', role: 'analyst' } })).json();
   expect(seat.id, 'the seat was created').toBeTruthy();
@@ -1218,9 +1302,9 @@ test('the workspace facts read the clock as it stands, and the stream does not c
   const item = page.locator('.st-event').filter({ hasText: 'user.invited' }).first();
   await expect(item).toBeVisible({ timeout: 15_000 });
   await expect(item).not.toContainText('The platform');
-  await expect(item).toContainText('Unattributed');
+  await expect(item).toContainText(me.user.name);
   await item.click();
   const detail = page.locator('.ain-card').filter({ hasText: 'Event id' });
-  await expect(detail).toContainText('Unattributed');
-  await expect(detail).toContainText('cannot be read as either');
+  await expect(detail).toContainText(me.user.name);
+  await expect(detail).not.toContainText('The platform');
 });

@@ -38,7 +38,14 @@ import { decimal2, ratio, type Decimal2, type Ratio } from './ratio';
 import type { CurrencyScope } from './currency';
 import type { ArrearsItem } from './recognition';
 
-/** What the settlement ledger says a set of windows was worth, and to whom. */
+/**
+ * What the settlement ledger says a set of windows was worth, and to whom.
+ *
+ * Everything here is **settled** — priced when the window closed — except
+ * `invoiced` and `unbilled`, which split that settled figure by whether a
+ * finalised invoice has carried it yet. Those three words mean the same thing
+ * at every level of this report: settled, invoiced, unbilled.
+ */
 export interface SettledSplit {
   /** Absorbed by prepaid credit when the windows were priced. */
   credit_covered: number;
@@ -50,6 +57,8 @@ export interface SettledSplit {
   net_charged: number;
   /** The part of `net_charged` that is on a finalised invoice, at the amount the invoice carries. */
   invoiced: number;
+  /** `net_charged - invoiced`: settled and not yet billed. */
+  unbilled: number;
 }
 
 export interface MeterEconomics {
@@ -60,16 +69,20 @@ export interface MeterEconomics {
   settlements: number;
   /** Metered quantity in micro-units: 1 unit = 1,000,000. */
   quantity_micro: number;
-  /** What the usage priced at, before credit, over the windows that closed in the range. */
+  /** Settled: what the usage priced at, before credit, over the windows that closed in the range. */
   metered_value: number;
-  /** Credit-covered usage that reached a finalised invoice in the range, at the value the credit absorbed. */
-  credit_covered: number;
-  /** Reached a finalised invoice in the range as new money: usage and true-up lines. */
-  charged: number;
+  /** Invoiced: credit-covered usage on invoices finalised in the range, at the value the credit absorbed. */
+  invoiced_credit_covered: number;
+  /** Invoiced: usage and true-up lines on invoices finalised in the range — new money. */
+  invoiced_charges: number;
   /** Settled for a window in the range and not on a finalised invoice by the end of it. */
   unbilled: number;
   /** The same windows, as the settlement ledger recorded them. */
   settled: SettledSplit;
+  /** @deprecated The old name for `invoiced_credit_covered`, and exactly that figure. */
+  credit_covered: number;
+  /** @deprecated The old name for `invoiced_charges`, and exactly that figure. */
+  charged: number;
   /** `settled.net_charged / metered_value` — how much of this meter is really overage. */
   charged_share: Ratio;
   /** Minor units of metered value per whole unit, to two decimal places. */
@@ -80,15 +93,19 @@ export interface UsageMonth {
   month: string;
   period: { start: number; end: number };
   complete: boolean;
-  /** Windows that closed this month, at the value they priced at. */
+  /** Settled: windows that closed this month, at the value they priced at. */
   metered_value: number;
-  /** Credit-covered value on invoices finalised this month. */
-  credit_covered: number;
-  /** Usage and true-up lines on invoices finalised this month. */
-  charged: number;
+  /** Invoiced: credit-covered value on invoices finalised this month. */
+  invoiced_credit_covered: number;
+  /** Invoiced: usage and true-up lines on invoices finalised this month. */
+  invoiced_charges: number;
   /** Settled usage with no finalised invoice at the close of this month. */
   unbilled_balance: number;
   settlements: number;
+  /** @deprecated The old name for `invoiced_credit_covered`, and exactly that figure. */
+  credit_covered: number;
+  /** @deprecated The old name for `invoiced_charges`, and exactly that figure. */
+  charged: number;
 }
 
 /**
@@ -152,26 +169,43 @@ export interface UsageCheck {
   ok: boolean;
 }
 
+/**
+ * The range's usage in one vocabulary, and only one.
+ *
+ * **settled** is what the windows priced at when they closed, read from the
+ * settlement ledger. **invoiced** is what reached a finalised invoice, read
+ * from the invoice lines. **unbilled** is settled minus invoiced. Every field
+ * below says which of the three it is in its own name, because a report with
+ * two fields called "charged" — one from each ledger, differing by exactly the
+ * arrears — is a report nobody can quote.
+ */
 export interface UsageTotals {
-  /** Windows closed in the range, at the value they priced at. */
+  /** Settled: windows closed in the range, at the value they priced at. */
   metered_value: number;
-  /** Credit-covered value on invoices finalised in the range. */
-  credit_covered: number;
-  /** Usage and true-up lines on invoices finalised in the range. */
-  charged: number;
-  /** Settled for a window in the range and still not on a finalised invoice at the end of it. */
-  unbilled: number;
-  /** Every settled window, whenever it closed, not on a finalised invoice at the end of the range. */
-  unbilled_balance: number;
-  /** The range's windows as the settlement ledger recorded them. */
+  /** Settled: the range's windows as the settlement ledger recorded them. */
   settled: SettledSplit;
+  /** Invoiced: usage and true-up lines on invoices finalised in the range. */
+  invoiced_charges: number;
+  /** Invoiced: the value the credit-covered lines on those invoices carried. */
+  invoiced_credit_covered: number;
+  /** Invoiced: every line on invoices finalised in the range, metered or not. */
+  invoiced_all_lines: number;
+  /** Unbilled: settled for a window in the range and not invoiced by the end of it. */
+  unbilled: number;
+  /** Unbilled: every settled window, whenever it closed, not invoiced by the end of the range. */
+  unbilled_balance: number;
   settlements: number;
   skipped_settlements: number;
   currency: string | null;
-  /** Metered lines as a share of everything invoiced in the range. */
+  /** Metered invoice lines as a share of everything invoiced in the range. */
   metered_share_of_invoiced: Ratio;
-  /** Charged usage as a share of everything invoiced — the true overage line. */
+  /** `invoiced_charges / invoiced_all_lines` — the true overage line. */
   overage_share_of_invoiced: Ratio;
+  /** @deprecated The old name for `invoiced_credit_covered`, and exactly that figure. */
+  credit_covered: number;
+  /** @deprecated The old name for `invoiced_charges`, and exactly that figure. */
+  charged: number;
+  /** @deprecated The old name for `invoiced_all_lines`, and exactly that figure. */
   invoiced: number;
 }
 
@@ -494,7 +528,10 @@ export function usageReport(
     const invoiced = rows
       .filter((row) => CHARGE_KINDS.has(row.kind) && invoicedBy(row, to))
       .reduce((sum, row) => sum + (row.line_amount ?? 0), 0);
-    return { credit_covered: covered, charged, true_ups: trueUps, net_charged: charged + trueUps, invoiced };
+    return {
+      credit_covered: covered, charged, true_ups: trueUps, net_charged: charged + trueUps,
+      invoiced, unbilled: charged + trueUps - invoiced,
+    };
   };
   const unbilledOf = (rows: ItemRow[], at: number): number => rows
     .filter((row) => CHARGE_KINDS.has(row.kind) && row.period_end <= at && !invoicedBy(row, at))
@@ -530,6 +567,10 @@ export function usageReport(
       const mine = itemsByMeter.get(key) ?? [];
       const billed = linesByMeter.get(key) ?? [];
       const settled = settledSplit(mine);
+      const invoicedCovered = billed
+        .filter((line) => line.kind === 'credit_covered').reduce((sum, line) => sum + lineValue(line), 0);
+      const invoicedCharges = billed
+        .filter((line) => line.kind !== 'credit_covered').reduce((sum, line) => sum + line.amount, 0);
       return {
         meter: row.meter_id,
         name: row.name ?? (row.meter_id ? row.meter_id : `Priced usage on ${row.price_id}`),
@@ -538,10 +579,12 @@ export function usageReport(
         settlements: num(row.settlements),
         quantity_micro: num(row.quantity_micro),
         metered_value: num(row.full_amount),
-        credit_covered: billed.filter((line) => line.kind === 'credit_covered').reduce((sum, line) => sum + lineValue(line), 0),
-        charged: billed.filter((line) => line.kind !== 'credit_covered').reduce((sum, line) => sum + line.amount, 0),
+        invoiced_credit_covered: invoicedCovered,
+        invoiced_charges: invoicedCharges,
         unbilled: unbilledOf(mine, to),
         settled,
+        credit_covered: invoicedCovered,
+        charged: invoicedCharges,
         charged_share: ratio(settled.net_charged, num(row.full_amount)),
         revenue_per_unit: decimal2(num(row.full_amount) * MICRO, num(row.quantity_micro)),
       };
@@ -573,19 +616,23 @@ export function usageReport(
         period: { start: cell.start, end: cell.end },
         complete: cell.complete,
         metered_value: num(row?.full),
-        credit_covered: num(billed?.covered),
-        charged: num(billed?.charged),
+        invoiced_credit_covered: num(billed?.covered),
+        invoiced_charges: num(billed?.charged),
         unbilled_balance: unbilledOf(scopedItems, Math.min(cell.at, to)),
         settlements: num(row?.settlements),
+        credit_covered: num(billed?.covered),
+        charged: num(billed?.charged),
       };
     });
 
-    const invoiced = mixRows.reduce((sum, row) => sum + num(row.amount), 0);
+    const invoicedAllLines = mixRows.reduce((sum, row) => sum + num(row.amount), 0);
     const meteredLines = mixRows
       .filter((row) => row.kind === 'usage' || row.kind === 'true_up' || row.kind === 'credit_covered')
       .reduce((sum, row) => sum + num(row.amount), 0);
-    const charged = scopedLines.filter((line) => line.kind !== 'credit_covered').reduce((sum, line) => sum + line.amount, 0);
-    const covered = scopedLines.filter((line) => line.kind === 'credit_covered').reduce((sum, line) => sum + lineValue(line), 0);
+    const invoicedCharges = scopedLines
+      .filter((line) => line.kind !== 'credit_covered').reduce((sum, line) => sum + line.amount, 0);
+    const invoicedCovered = scopedLines
+      .filter((line) => line.kind === 'credit_covered').reduce((sum, line) => sum + lineValue(line), 0);
 
     const flows: CreditFlow[] = (['monetary', 'unit'] as const).map(
       (kind) => creditFlow(kind, currency, keep(ledger).filter((row) => row.kind === kind)),
@@ -600,17 +647,20 @@ export function usageReport(
 
     const totals: UsageTotals = {
       metered_value: scopedMeters.reduce((sum, row) => sum + row.metered_value, 0),
-      credit_covered: covered,
-      charged,
+      settled: settledSplit(windowItems),
+      invoiced_charges: invoicedCharges,
+      invoiced_credit_covered: invoicedCovered,
+      invoiced_all_lines: invoicedAllLines,
       unbilled: unbilledOf(windowItems, to),
       unbilled_balance: unbilledOf(scopedItems, to),
-      settled: settledSplit(windowItems),
       settlements: scopedMeters.reduce((sum, row) => sum + row.settlements, 0),
       skipped_settlements: keep(skipped).reduce((sum, row) => sum + num(row.count), 0),
       currency,
-      metered_share_of_invoiced: ratio(meteredLines, invoiced),
-      overage_share_of_invoiced: ratio(charged, invoiced),
-      invoiced,
+      metered_share_of_invoiced: ratio(meteredLines, invoicedAllLines),
+      overage_share_of_invoiced: ratio(invoicedCharges, invoicedAllLines),
+      credit_covered: invoicedCovered,
+      charged: invoicedCharges,
+      invoiced: invoicedAllLines,
     };
 
     const credit: UsageCredit = {
@@ -629,7 +679,7 @@ export function usageReport(
       currency: row.currency,
       lines: num(row.lines),
       amount: num(row.amount),
-      share: ratio(num(row.amount), invoiced),
+      share: ratio(num(row.amount), invoicedAllLines),
     }));
 
     return { totals, months, meters: scopedMeters, credit, invoiced_mix: invoicedMix };
@@ -686,6 +736,20 @@ export function usageReport(
       difference: carriedOnInvoices - settledOnInvoices,
       unit: 'minor',
       ok: settledOnInvoices === carriedOnInvoices,
+    },
+    {
+      name: 'unbilled_is_settled_minus_invoiced',
+      description:
+        'The one arithmetic the three words have to satisfy: unbilled is settled minus invoiced. Expected is ' +
+        'settled.net_charged minus settled.invoiced, accumulated over the settlement ledger and the invoice lines ' +
+        'that claimed it; actual is totals.unbilled, accumulated separately over the charges no finalised invoice ' +
+        'has reached. They part only where an invoice line carries an amount its settlement did not, which the ' +
+        'check above names.',
+      expected: whole.totals.settled.net_charged - whole.totals.settled.invoiced,
+      actual: whole.totals.unbilled,
+      difference: whole.totals.unbilled - (whole.totals.settled.net_charged - whole.totals.settled.invoiced),
+      unit: 'minor',
+      ok: whole.totals.unbilled === whole.totals.settled.net_charged - whole.totals.settled.invoiced,
     },
     {
       name: 'every_metered_line_has_a_settlement',

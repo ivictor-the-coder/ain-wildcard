@@ -480,6 +480,9 @@ export default defineModule({
             `SELECT COUNT(*) FROM entitlement_active WHERE org_id = ? AND feature_key = ? AND unlimited = 1`,
             orgId, feature.key,
           );
+          // Counted before it is cut: `at_risk` shows the worst few, and a
+          // reader who cannot tell five from fifty cannot use the list.
+          const pressure = feature.type === 'boolean' ? [] : store.pressureOn(orgId, feature.key);
           return {
             feature: feature.key,
             name: feature.name,
@@ -488,15 +491,23 @@ export default defineModule({
             granted_by: store.productFeatures(orgId, { feature: feature.key }).length,
             accounts: holders,
             unlimited_accounts: unlimited,
-            at_risk: feature.type === 'boolean' ? [] : store.atLimit(orgId, feature.key, 5),
+            at_risk: pressure.slice(0, AT_RISK_SHOWN),
+            /** Every account over the threshold, not only the ones listed. */
+            at_risk_accounts: pressure.length,
+            at_risk_shown: Math.min(pressure.length, AT_RISK_SHOWN),
           };
         }),
-        overrides_live: store.overrides(orgId, { status: 'active', limit: 500 }).length,
+        // COUNT(*), not the length of a page of them: the override list is
+        // capped at 500 rows, and a workspace with more than that was told it
+        // had exactly 500.
+        overrides_live: ctx.db.count(
+          `SELECT COUNT(*) FROM entitlement_overrides WHERE org_id = ? AND status = 'active'`, orgId,
+        ),
         as_of: ctx.now(),
       };
     }, {
       summary: 'Feature adoption and the accounts pressing against their limits',
-      description: 'Which features each plan grants, how many accounts hold them, and — for anything with a ceiling — who is at or past the warning threshold right now. This is the expansion list.',
+      description: 'Which features each plan grants, how many accounts hold them, and — for anything with a ceiling — who is at or past the warning threshold right now. This is the expansion list, so each row carries the account\'s name as well as its id, and at_risk_accounts counts everyone over the threshold while at_risk lists the worst few.',
       tags: ['entitlements'],
     });
   },
@@ -537,6 +548,9 @@ export default defineModule({
     ];
   },
 });
+
+/** How many of the accounts pressing against a limit the overview lists. */
+const AT_RISK_SHOWN = 5;
 
 /** Why the set is being re-derived, in words the version history can carry. */
 function reasonForTrigger(type: string): string {

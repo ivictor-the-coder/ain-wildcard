@@ -11,28 +11,30 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { bool, int, parseArgs, text } from './lib/args.mjs';
 
-const args = Object.fromEntries(
-  process.argv.slice(2).flatMap((a, i, all) => (a.startsWith('--') ? [[a.slice(2), all[i + 1]?.startsWith('--') ? 'true' : all[i + 1]]] : [])),
-);
-const name = args.name || 'preview';
-const port = Number(args.port || 8800);
+const { options } = parseArgs(process.argv.slice(2), { booleans: ['fresh', 'skipBuild', 'verbose'] });
+const name = text(options, 'name', 'preview');
+const port = int(options, 'port', 8800);
 const outDir = join(process.cwd(), '.artifacts', name, 'client');
-const dbPath = args.db === 'memory' ? 'memory' : join(process.cwd(), '.artifacts', name, 'ain.db');
+const dbPath = text(options, 'db', '') === 'memory' ? 'memory' : join(process.cwd(), '.artifacts', name, 'ain.db');
 
-if (args.fresh !== undefined) rmSync(join(process.cwd(), '.artifacts', name), { recursive: true, force: true });
+// `--fresh` is a boolean and takes nothing with it, so it means the same thing
+// written first on the line as written last. It used to mean nothing at all
+// written last, and the preview quietly came up on yesterday's database.
+if (bool(options, 'fresh')) rmSync(join(process.cwd(), '.artifacts', name), { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
 const gen = spawnSync('node', ['scripts/gen-registry.mjs'], { stdio: 'inherit' });
 if (gen.status !== 0) process.exit(gen.status ?? 1);
 
-if (args.skipBuild === undefined) {
+if (!bool(options, 'skipBuild')) {
   const build = spawnSync('npx', ['vite', 'build', '--outDir', outDir, '--emptyOutDir', '--logLevel', 'warn'], { stdio: 'inherit' });
   if (build.status !== 0) { console.error('client build failed'); process.exit(build.status ?? 1); }
 }
 
 const server = spawn('npx', ['tsx', 'src/server/main.ts'], {
-  env: { ...process.env, PORT: String(port), AIN_CLIENT_DIR: outDir, AIN_DB: dbPath, AIN_LOG_LEVEL: args.verbose !== undefined ? 'info' : 'warn' },
+  env: { ...process.env, PORT: String(port), AIN_CLIENT_DIR: outDir, AIN_DB: dbPath, AIN_LOG_LEVEL: bool(options, 'verbose') ? 'info' : 'warn' },
   stdio: ['ignore', 'inherit', 'inherit'],
 });
 process.on('SIGINT', () => { server.kill(); process.exit(0); });

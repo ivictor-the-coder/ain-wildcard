@@ -20,7 +20,19 @@ const openSection = async (page: Page, id: string) => {
   await page.locator(`#${id}`).scrollIntoViewIfNeeded();
 };
 
+/**
+ * The style guide lives inside the shell, so it is behind the shell's session.
+ *
+ * This file used to open `/design` cold. That worked while the route rendered
+ * without a workspace; now an unauthenticated visit lands on the marketing
+ * splash and its sign-in card ("You will land on /design"), `#overlays` is
+ * never mounted, and all fourteen tests here died in this hook on the 60s
+ * timeout. Minting the demo session on the page's own cookie jar first — the
+ * same thing `crm`, `copilot` and `pipeline` do — is what makes `/design` the
+ * page the rest of this file is written against.
+ */
 test.beforeEach(async ({ page }) => {
+  await page.request.post('/api/v1/auth/demo');
   await page.goto(DESIGN, { waitUntil: 'networkidle' });
   await page.waitForSelector('#overlays');
 });

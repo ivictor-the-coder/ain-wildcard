@@ -408,6 +408,64 @@ describe('multi-currency', () => {
     const error = await expectError('POST', '/v1/prices/price_nw_growth_monthly/preview', { quantity: 1, currency: 'jpy' }, 400, 'currency_not_supported');
     assert.equal(error.param, 'currency');
     assert.match(error.message, /EUR|GBP|USD/);
+
+    // The refusal is read by whoever is trying to sell in yen. It names the
+    // price the way the price book does and the currencies the way a person
+    // says them; the id travels in the detail block, for the caller that has
+    // to follow the row rather than read the sentence.
+    const price = await expectOk('GET', '/v1/prices/price_nw_growth_monthly');
+    assert.match(error.message, new RegExp(price.nickname));
+    assert.doesNotMatch(error.message, /price_nw_growth_monthly/, 'no raw id in the sentence');
+    assert.match(error.message, /Japanese yen \(JPY\)/, 'the currency is named, not just coded');
+    assert.equal(error.detail.price, 'price_nw_growth_monthly');
+    assert.equal(error.detail.currency, 'jpy');
+    assert.deepEqual(error.detail.offered_in.slice().sort(), price.currencies.slice().sort());
+  });
+
+  test('a price with nothing to charge in a currency says so in the price book’s own words', () => {
+    // Both halves of `price_incomplete`, which is only reachable from a
+    // currency option that is offered but carries no amount for the model the
+    // price actually uses.
+    const flat = priceOf({
+      id: 'price_fixture_growth', nickname: 'Growth monthly', model: 'per_unit',
+      currency: 'usd', unit_amount: null,
+    });
+    assert.throws(
+      () => computeLineAmount(flat, 3),
+      (error: any) => {
+        assert.equal(error.code, 'price_incomplete');
+        assert.equal(error.param, 'price');
+        assert.match(error.message, /^"Growth monthly" has no amount in US dollar \(USD\)/);
+        assert.doesNotMatch(error.message, /price_fixture_growth/, 'the id is not the name');
+        assert.match(error.message, /currency options/, 'and the sentence says what to do about it');
+        assert.deepEqual(error.detail, { price: 'price_fixture_growth', currency: 'usd' });
+        return true;
+      },
+    );
+
+    const tiered = priceOf({
+      id: 'price_fixture_scale', nickname: 'Scale seats', currency: 'usd',
+      tiers: [{ up_to: 10, unit_amount: 1_000, unit_amount_decimal: null, flat_amount: null, flat_amount_decimal: null },
+        { up_to: 'inf', unit_amount: 800, unit_amount_decimal: null, flat_amount: null, flat_amount_decimal: null }],
+      currency_options: { eur: { unit_amount: 900 } as CurrencyOption },
+    });
+    assert.equal(computeLineAmount(tiered, 4).amount, 4_000, 'the home currency has its ladder');
+    assert.throws(
+      () => computeLineAmount(tiered, 4, 'eur'),
+      (error: any) => {
+        assert.equal(error.code, 'price_incomplete');
+        assert.equal(error.param, 'tiers');
+        assert.match(error.message, /^"Scale seats" is a tiered price with no tiers in Euro \(EUR\)/);
+        assert.doesNotMatch(error.message, /price_fixture_scale/);
+        assert.deepEqual(error.detail, { price: 'price_fixture_scale', currency: 'eur' });
+        return true;
+      },
+    );
+
+    // With neither a nickname nor a lookup key there is nothing else to call
+    // it, and the id is the honest last resort rather than a blank.
+    const unnamed = priceOf({ id: 'price_fixture_bare', currency: 'usd', unit_amount: null });
+    assert.throws(() => computeLineAmount(unnamed, 1), /"price_fixture_bare" has no amount/);
   });
 
   test('zero-decimal currencies format without a fraction', () => {

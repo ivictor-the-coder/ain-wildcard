@@ -14,7 +14,7 @@
  */
 import type { Ctx } from '../../kernel/context';
 import { DAY } from '../../../shared/time';
-import { RECOVERY_RATE_BASIS } from '../payments/dunning';
+import { NO_RECOVERY_RATE_BASIS, RECOVERY_RATE_BASIS, recoveryRateBps } from '../payments/dunning';
 import type { MonthCell } from './grid';
 import { decimal2, ratio, type Decimal2, type Ratio } from './ratio';
 
@@ -156,6 +156,13 @@ export interface RecoveryReport {
   amount_recovered: number;
   /** `amount_recovered / amount_at_risk` — the payments module's own definition, quoted in `recovery_rate_basis`. */
   recovery_rate: Ratio;
+  /**
+   * The same rate in basis points, and `null` where there is not one: over a
+   * book whose campaigns are all still running, recovered + lost is zero, and
+   * 0 bps would read as "none of it comes back" rather than "nothing has been
+   * decided". This is the figure /v1/dunning/summary carries per currency.
+   */
+  recovery_rate_bps: number | null;
   recovery_rate_basis: string;
   by_status: { status: string; campaigns: number; amount_at_risk: number; amount_recovered: number }[];
   attempts: { outcome: string; attempts: number }[];
@@ -223,6 +230,9 @@ export function recoveryReport(
   const recovered = decided.reduce((sum, row) => sum + Number(row.recovered), 0);
   const lost = decided.filter((row) => row.status === 'exhausted').reduce((sum, row) => sum + Number(row.at_risk), 0);
   const atRisk = recovered + lost;
+  // The payments module's own arithmetic, so the two endpoints cannot quote
+  // two rates for one book — including where there is no rate to quote.
+  const rateBps = recoveryRateBps(recovered, lost);
   const succeeded = attempts.find((row) => row.outcome === 'succeeded')?.attempts ?? 0;
   const made = attempts.filter((row) => row.outcome !== 'skipped').reduce((sum, row) => sum + Number(row.attempts), 0);
 
@@ -234,7 +244,8 @@ export function recoveryReport(
     amount_at_risk: atRisk,
     amount_recovered: recovered,
     recovery_rate: ratio(recovered, atRisk),
-    recovery_rate_basis: RECOVERY_RATE_BASIS,
+    recovery_rate_bps: rateBps,
+    recovery_rate_basis: rateBps === null ? NO_RECOVERY_RATE_BASIS : RECOVERY_RATE_BASIS,
     by_status: byStatus.map((row) => ({
       status: row.status,
       campaigns: Number(row.campaigns),

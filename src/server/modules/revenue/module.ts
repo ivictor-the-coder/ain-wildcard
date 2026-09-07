@@ -215,9 +215,9 @@ export default defineModule({
       tags: ['revenue'],
       query: rangeQuery,
       description:
-        'Revenue per meter split into metered value as the settlement priced it, the credit-covered and charged money ' +
-        'that reached finalised invoices, and the settled usage still waiting for a bill; credit purchased against credit ' +
-        'burned; and the share of everything invoiced that is metered rather than recurring.',
+        'Revenue per meter in one vocabulary: settled is what a window priced at when it closed, invoiced is what ' +
+        'reached a finalised invoice, and unbilled is settled minus invoiced. Credit purchased against credit burned, ' +
+        'and the share of everything invoiced that is metered rather than recurring, on the same three words.',
     });
 
     router.get('/v1/revenue/summary', (req: Req, c: Ctx) => revenueStore(c).summary(req.auth.orgId, query(req)), {

@@ -16,6 +16,7 @@ import {
   rat, ratAdd, ratMul, ratSub, ratCmp, ratRound, type Rational, type RoundingMode,
 } from '../../../shared/money';
 import { badRequest } from '../../../shared/errors';
+import { currencyName } from './currencies';
 import type {
   CurrencyOption, CurvePoint, CustomUnitAmount, LineAmount, LineBreakdownRow, Price,
   PriceCurve, PriceTier, TaxBehavior, TransformQuantity, UsageAggregation, UsageRecord,
@@ -75,6 +76,36 @@ export interface ResolvedPrice {
 export const currenciesOf = (price: Price): string[] =>
   [price.currency, ...Object.keys(price.currency_options || {})].filter((c, i, all) => all.indexOf(c) === i);
 
+/**
+ * What to call a price in a sentence a person reads.
+ *
+ * `price_nw_growth_monthly` is how the row is addressed, not what it is
+ * called: a refusal that names it that way tells whoever is reading nothing
+ * they did not already type. The nickname is what the price book shows, the
+ * lookup key is what an integration uses, and the id is the last resort — and
+ * it travels in the error's detail block either way, where a caller that needs
+ * to follow the row can find it.
+ */
+const priceName = (price: Price): string =>
+  (price.nickname?.trim() || price.lookup_key?.trim() || price.id);
+
+/** "US dollar (USD)" — the currency named, not just coded. */
+const currencyPhrase = (code: string): string => `${currencyName(code)} (${code.toUpperCase()})`;
+
+/**
+ * A price the book cannot charge in this currency. Said in the price book's
+ * own words, with the remedy, and with the ids in the detail block.
+ */
+const incompletePrice = (price: Price, currency: string, param: 'price' | 'tiers') =>
+  badRequest(
+    'price_incomplete',
+    param === 'tiers'
+      ? `"${priceName(price)}" is a tiered price with no tiers in ${currencyPhrase(currency)}, so there is no ladder to charge against. Add the tiers for that currency to the price before billing in it.`
+      : `"${priceName(price)}" has no amount in ${currencyPhrase(currency)}, so there is nothing to charge. Add that currency to the price's currency options before billing in it.`,
+    param,
+    { price: price.id, currency },
+  );
+
 const optionIsOffered = (o: CurrencyOption): boolean =>
   o.unit_amount !== null && o.unit_amount !== undefined
   || !!o.unit_amount_decimal
@@ -98,8 +129,10 @@ export function resolveForCurrency(price: Price, currency?: string): ResolvedPri
   if (!option || !optionIsOffered(option)) {
     throw badRequest(
       'currency_not_supported',
-      `Price ${price.id} is not offered in ${want.toUpperCase()}. It sells in ${currenciesOf(price).map((c) => c.toUpperCase()).join(', ')}.`,
+      `"${priceName(price)}" is not offered in ${currencyPhrase(want)}. It sells in ${
+        currenciesOf(price).map(currencyPhrase).join(', ')}.`,
       'currency',
+      { price: price.id, currency: want, offered_in: currenciesOf(price) },
     );
   }
   return {
@@ -256,7 +289,7 @@ function rawRowsFor(price: Price, resolved: ResolvedPrice, quantity: number, opt
 
   if (price.model === 'flat') {
     const unit = resolved.unitAmount;
-    if (!unit) throw badRequest('price_incomplete', `Price ${price.id} has no amount in ${resolved.currency.toUpperCase()}.`, 'price');
+    if (!unit) throw incompletePrice(price, resolved.currency, 'price');
     const name = price.nickname || 'Flat fee';
     return {
       billable: 1,
@@ -278,8 +311,9 @@ function rawRowsFor(price: Price, resolved: ResolvedPrice, quantity: number, opt
     if (supplied === null || supplied === undefined) {
       throw badRequest(
         'price_requires_custom_amount',
-        `Price ${price.id} is a negotiated price. Supply custom_unit_amount (in minor units) to compute a line.`,
+        `"${priceName(price)}" is a negotiated price. Supply custom_unit_amount (in minor units) to compute a line.`,
         'custom_unit_amount',
+        { price: price.id },
       );
     }
     if (!Number.isInteger(supplied)) throw badRequest('parameter_invalid', 'custom_unit_amount must be a whole number of minor units.', 'custom_unit_amount');
@@ -305,7 +339,7 @@ function rawRowsFor(price: Price, resolved: ResolvedPrice, quantity: number, opt
 
   if (price.billing_scheme === 'tiered') {
     if (!tiers || !tiers.length) {
-      throw badRequest('price_incomplete', `Tiered price ${price.id} has no tiers in ${resolved.currency.toUpperCase()}.`, 'tiers');
+      throw incompletePrice(price, resolved.currency, 'tiers');
     }
     const rows = price.tiers_mode === 'volume'
       ? volumeRows(tiers, billable, unitNoun)
@@ -314,7 +348,7 @@ function rawRowsFor(price: Price, resolved: ResolvedPrice, quantity: number, opt
   }
 
   const unit = resolved.unitAmount;
-  if (!unit) throw badRequest('price_incomplete', `Price ${price.id} has no amount in ${resolved.currency.toUpperCase()}.`, 'price');
+  if (!unit) throw incompletePrice(price, resolved.currency, 'price');
 
   if (price.transform_quantity && price.transform_quantity.divide_by > 1) {
     const t = price.transform_quantity;

@@ -484,8 +484,20 @@ test('money is ranked inside its own currency, and totalled one currency at a ti
 });
 
 test('the invoice grid narrows to one account without a lucky text search', async ({ page }) => {
-  const invoices = await json(page, '/v1/invoices?status=all&limit=20');
-  const target = invoices.data[0];
+  // The account with the most invoices in the seeded book, not whoever happens
+  // to own the newest one. `data[0]` is the last invoice raised, which in a
+  // whole-suite run belongs to a throwaway account another test in this file
+  // created and then deleted underneath this one — so the grid held rows the
+  // filtered count no longer had, and the poll read "two rows too many" out of
+  // a grid that was filtering correctly.
+  const invoices = await json(page, '/v1/invoices?status=all&limit=200');
+  const byCustomer = new Map<string, { customer: string; customer_name: string; n: number }>();
+  for (const row of invoices.data as { customer: string; customer_name: string }[]) {
+    const seen = byCustomer.get(row.customer);
+    byCustomer.set(row.customer, { customer: row.customer, customer_name: row.customer_name, n: (seen?.n ?? 0) + 1 });
+  }
+  const target = [...byCustomer.values()].sort((a, b) => b.n - a.n)[0];
+  expect(target?.n, 'no account in this book has more than one invoice to narrow to').toBeGreaterThan(1);
   await page.goto('/billing/invoices', { waitUntil: 'networkidle' });
 
   await page.locator('.bl-acctfilter input.ain-combo__input').click();
@@ -493,7 +505,10 @@ test('the invoice grid narrows to one account without a lucky text search', asyn
   await page.locator('.ain-combo__option', { hasText: target.customer_name }).first().click();
 
   await expect(page).toHaveURL(new RegExp(`customer=${target.customer}`));
-  const rows = page.locator('tbody tr');
+  // `[data-index]`, not every `tr`: a virtualised table pads the window with an
+  // `aria-hidden` spacer row above and below the rows it drew, and a bare `tr`
+  // counts those as records.
+  const rows = page.locator('tbody tr[data-index]');
   await expect(rows.first()).toBeVisible();
   // The book is re-read on every poll: other tests in this file raise invoices
   // while this one runs, and a count taken once before the sweep settles is a
@@ -1467,7 +1482,10 @@ test('a one-off amount can be carried on an account’s balance from the invoice
 
   // The path is named for what it does — a balance adjustment the next invoice
   // draws down — not "Charge", which it never was.
-  await dialog.getByRole('button', { name: /Adjust the balance/ }).click();
+  // "Adjust the balance…" became "Adjust the account balance instead…" when
+  // the dialog grew a second act beside it: "Add a one-off line…" really does
+  // write a line on a document now. The two are named for what each does.
+  await dialog.getByRole('button', { name: /Adjust the account balance instead/ }).click();
   const charge = page.getByRole('dialog', { name: 'Adjust the account balance' });
   await expect(charge).toBeVisible();
   await expect(charge).toContainText('next invoice');
@@ -2278,11 +2296,16 @@ test('the one-off path under "Bill an account" says it adjusts the balance rathe
   const dialog = page.getByRole('dialog', { name: /Bill what this account owes/ });
   await pickCustomer(page, dialog, quiet!.name);
   await expect(dialog.getByText('Nothing is waiting on this account')).toBeVisible();
-  // There is no route that puts a hand-written line on an invoice, and the
-  // dialog says so instead of offering a "charge" that is a balance debit.
+  // A hand-written line has a route of its own now (`POST /v1/invoice_items`),
+  // so the dialog offers both — what it may never do is call a balance debit a
+  // charge.
   await expect(dialog).toContainText(/balance/);
   await expect(dialog.getByRole('button', { name: /Charge a one-off amount/ })).toHaveCount(0);
-  await dialog.getByRole('button', { name: /Adjust the balance instead/ }).click();
+  // Both acts are on the dialog, each named for what it does: a line goes on a
+  // document today, a balance adjustment raises none and is drawn down by the
+  // next bill. Neither is called a charge.
+  await expect(dialog.getByRole('button', { name: /Add a one-off line/ })).toBeVisible();
+  await dialog.getByRole('button', { name: /Adjust the account balance instead/ }).click();
   const adjust = page.getByRole('dialog', { name: /Adjust the account balance/ });
   await expect(adjust).toBeVisible();
   await expect(adjust).not.toContainText(/Charge a one-off/);

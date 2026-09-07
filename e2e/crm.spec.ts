@@ -534,6 +534,10 @@ test('a duplicate’s confidence is a percentage a person could believe', async 
 
   await page.goto(`/contacts/${first.id}`, { waitUntil: 'networkidle' });
   const badge = page.locator('.crm-dupe__head .ain-badge').first();
+  // The duplicate card is drawn from `/similar`, and `useQuery` keeps a refused
+  // read rather than retrying it — so a page that arrived while the limiter was
+  // answering 429 shows no card at all, for good. Ask the screen again.
+  if (await badge.count() === 0) await page.reload({ waitUntil: 'networkidle' });
   await expect(badge).toBeVisible();
   const percent = Number((await badge.innerText()).replace(/\D+/g, ''));
   const scored = (await (await page.request.get(`/api/v1/records/contact/${first.id}/similar?limit=1`)).json()).data as { score: number }[];
@@ -1465,7 +1469,14 @@ test('the roll-up does not attribute a contact’s own notes to their company', 
     { data: { record_id: string; via: unknown }[] };
   const direct = timeline.data.filter((i) => i.via && own.has(i.record_id)).length;
   const foreign = timeline.data.filter((i) => i.via && !own.has(i.record_id)).length;
-  expect(direct, 'the API still marks some of Carmen’s own notes as via her company').toBeGreaterThan(0);
+  // This used to require `direct > 0` — the screen was being held to hiding a
+  // `via` the API was still stamping on the contact's own notes. The API stops
+  // stamping it now, so the assertion is the fixed thing rather than the
+  // broken one: her own activities are hers, and the rolled-up ones are the
+  // only ones that carry a source.
+  expect(direct, 'the API marks some of Carmen’s own notes as via her company').toBe(0);
+  expect(foreign, 'nothing is rolled up onto this contact, so the screen has nothing to label')
+    .toBeGreaterThan(0);
 
   await page.goto('/contacts/con_nw_143', { waitUntil: 'networkidle' });
   await page.waitForSelector('ol.crm-timeline');

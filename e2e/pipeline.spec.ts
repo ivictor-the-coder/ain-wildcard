@@ -111,6 +111,43 @@ const findDeal = async (request: APIRequestContext, name: string): Promise<DealR
   return list.data.find((row) => row.display_name === name);
 };
 
+/**
+ * The prose, once it has stopped typing itself out.
+ *
+ * `.cp-answer__caret` is drawn only when the last block of the answer is a
+ * paragraph, so an answer that ends in a bulleted list — which is every
+ * breakdown and every ranking — carries no caret at any moment, and waiting
+ * for one to disappear returns instantly, mid-word: "Open pipeline by stage:
+ * Proposal — $2". Two identical readings 400ms apart is the signal that holds
+ * for both shapes; the reveal steps every 16ms, so it cannot be still for that
+ * long while it is still going.
+ */
+const revealed = async (answer: ReturnType<Page['locator']>): Promise<string> => {
+  const body = answer.locator('.cp-answer__body');
+  await expect(body).not.toBeEmpty({ timeout: 40_000 });
+  let previous = '';
+  for (let i = 0; i < 75; i += 1) {
+    const now = (await body.innerText()).trim();
+    if (now && now === previous) return now;
+    previous = now;
+    await answer.page().waitForTimeout(400);
+  }
+  throw new Error(`the answer never stopped revealing:\n${previous}`);
+};
+
+/**
+ * The one sentence shape this engine prepares a stage write from.
+ *
+ * `write-stage` is matched from "Move <deal> to the <Stage> stage". "Move the
+ * <deal> deal to <Stage>" — which every write test in this file used to type —
+ * is refused with `slot_unbound`: the engine will not take "the … deal" as a
+ * deal name even when it can say which name is nearest. So every one of them
+ * sat out its forty seconds waiting for an approval card that was never going
+ * to be prepared. The phrasing is this file's setup, not its subject, so it
+ * is written once, here.
+ */
+const moveDeal = (dealName: string, stageLabel: string) => `Move ${dealName} to the ${stageLabel} stage`;
+
 /** A card sitting in a named column of the board. */
 const cardsIn = (page: Page, stage: string) => page.locator(`.pl-col[data-stage="${stage}"] .pl-card`);
 
@@ -525,12 +562,41 @@ test('a write the copilot prepares stops at an approval card, and approving it r
   }, { timeout: 20_000 }).toBe(true);
 });
 
-test('a refusal is rendered as a refusal, not as an answer', async ({ page }) => {
+/**
+ * A refusal wears the refusal, and the way out of it.
+ *
+ * The sentence this used to look for — "The engine refused to answer this one"
+ * — was a banner the card drew for itself. `answerCard` replaced every one of
+ * those banners with what the run actually recorded: the turn is marked
+ * refused, the engine's own reason sits under the prose, and the shapes it
+ * named as nearest are the chips. So the check is against the completion for
+ * the same question rather than against a sentence the client wrote.
+ */
+test('a refusal is rendered as a refusal, not as an answer', async ({ page, request }) => {
+  const question = 'How did we do tomorrow?';
+  const settled = await postJson<{
+    content: string;
+    analysis: { refusal: { code: string; why: string } | null; nearest: { example: string }[] };
+  }>(request, '/api/v1/ai/complete', { prompt: question, feature: 'copilot' });
+  expect(settled.analysis.refusal, 'the engine answered a question this test needs refused').not.toBeNull();
+
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
-  await page.getByLabel('Ask the copilot').fill('How did we do tomorrow?');
+  await page.getByLabel('Ask the copilot').fill(question);
   await page.getByRole('button', { name: 'Ask', exact: true }).click();
-  await expect(page.locator('.cp-answer').last()).toBeVisible({ timeout: 30_000 });
-  await expect(page.getByText('The engine refused to answer this one')).toBeVisible({ timeout: 30_000 });
+  const answer = page.locator('.cp-answer').last();
+  await expect(answer).toBeVisible({ timeout: 30_000 });
+
+  // Marked as a refusal on the card itself, not left to read like an answer.
+  await expect(answer).toHaveClass(/is-refused/, { timeout: 30_000 });
+  await expect(answer.locator('.ain-badge--warning', { hasText: 'refused' })).toBeVisible();
+  // The engine's own code, and its own list of nearest shapes, one press each.
+  await expect(answer.locator(`.cp-help[data-refusal="${settled.analysis.refusal!.code}"]`)).toBeVisible({ timeout: 30_000 });
+  await expect(answer.locator('.cp-help__chip span:not(:has(svg))')).toHaveText(
+    settled.analysis.nearest.map((row) => row.example),
+  );
+  // Nothing on it claims to be a measurement: no bound slots, no sources.
+  await expect(answer.locator('.cp-slot')).toHaveCount(0);
+  await expect(answer.locator('.cp-chip')).toHaveCount(0);
 });
 
 /* =============================== keyboard ================================= */
@@ -1241,12 +1307,15 @@ test('the copilot quotes a close date as the day it is stored, not the evening b
   const answer = page.locator('.cp-answer').last();
   await expect(answer).toBeVisible({ timeout: 40_000 });
   // The newest answer types itself in; reading it mid-reveal reads half a word.
-  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 30_000 });
+  await revealed(answer);
   const text = await answer.innerText();
 
+  // Three phrasings, because the account profile now closes on "The next close
+  // date is Oct 14, 2026." where it used to write the day before the words.
   const quoted = [
     ...text.matchAll(/clos(?:es|ing)\s+([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})/g),
     ...text.matchAll(/\b([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})\s+close date/g),
+    ...text.matchAll(/close date is\s+([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})/g),
   ].map((match) => match[1]);
   expect(quoted.length, `the answer quoted no close date at all:\n${text}`).toBeGreaterThan(0);
   for (const day of quoted) {
@@ -1323,7 +1392,12 @@ test('a first question that fails leaves no empty conversation behind', async ({
   const before = await count();
 
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
-  await page.route('**/api/v1/ai/threads/*/messages', (route) => route.fulfill({
+  // The turn is posted as `POST /v1/ai/complete` with the new thread's id — it
+  // is the only route that reports the engine and the nearest shapes, so the
+  // composer stopped using `/threads/:id/messages`. Breaking the route the
+  // client no longer calls let the question succeed and this test pass on a
+  // send that never failed.
+  await page.route('**/api/v1/ai/complete', (route) => route.fulfill({
     status: 500,
     contentType: 'application/json',
     body: JSON.stringify({ error: { type: 'api_error', code: 'engine_exploded', message: 'The reasoning engine fell over.' } }),
@@ -2186,17 +2260,14 @@ test('an answer reads as an answer, not as a console dump under one', async ({ p
   await composer.press('Enter');
 
   const answer = page.locator('.cp-answer').last();
-  await expect(answer).toContainText('open pipeline', { timeout: 30_000 });
-  // The by-stage figures no longer stand in the prose at all: they are lifted
-  // out and checked against the board's own columns, so what is on screen is
-  // either a reconciled list or the disagreement. Either way the answer has
-  // more than a single sentence in it.
-  await expect(
-    answer.locator('.cp-breakdown__list, .ain-banner--warning').first(),
-  ).toBeVisible({ timeout: 30_000 });
+  // "Open pipeline by stage:" — the measure is named on the card as well as in
+  // the prose, so the chip is where the case-insensitive claim belongs.
+  await expect(slotChips(answer).filter({ hasText: 'Open pipeline' })).toHaveCount(1, { timeout: 30_000 });
   // The answer is typed out; nothing about the prose can be judged until the
   // caret that marks the reveal in progress is gone.
-  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 30_000 });
+  await revealed(answer);
+  // More than a single sentence: the breakdown is the answer, one bucket a line.
+  await expect(answer.locator('.cp-answer__body')).toContainText('Open pipeline by stage:');
 
   const body = answer.locator('.cp-answer__body');
   await expect(body).not.toContainText('also returned');
@@ -2239,7 +2310,17 @@ test('the six-week card opens a board holding every deal it counted', async ({ p
 
   await expect(page.getByLabel('Pipeline')).toHaveValue('all');
   await expect(page.getByLabel('Close date')).toHaveValue('42');
-  // The board's own header counts the same deals the card counted.
+
+  // The board holds the same deals, by id. Comparing the two counts alone left
+  // a run reporting "expected 14, received 15" with no way to tell which deal
+  // the board had and the card had not, and the difference is the whole point
+  // of the test.
+  const drawn = await page.locator('.pl-card').evaluateAll(
+    (cards) => cards.map((card) => card.getAttribute('data-deal')),
+  );
+  const counted = matching.data.map((row) => row.id);
+  expect([...drawn].sort(), `the board drew ${drawn.length} cards for a card that counted ${counted.length}`)
+    .toEqual([...counted].sort());
   await expect(page.locator('.ain-page__subtitle, header p').first())
     .toContainText(`${matching.data.length} deals`);
   await expect(page.locator('.pl-summary')).toContainText(money(sumAmounts(matching.data)));
@@ -2344,8 +2425,7 @@ test('the copilot puts the caret where you type, on arrival and after an answer'
 
 /* ===================== the scope an answer was measured at ================= */
 
-/** Ask the copilot one question in a fresh thread and wait for the answer. */
-/** Ask, and return as soon as there is prose — before the scope row settles. */
+/** Ask, and return as soon as there is prose — before the slot chips settle. */
 const askCopilotUnchecked = async (page: Page, question: string) => {
   // Not `networkidle`: this one exists to watch the gap between the answer and
   // the reads it is captioned with, and waiting for the network to go quiet
@@ -2360,52 +2440,29 @@ const askCopilotUnchecked = async (page: Page, question: string) => {
 };
 
 /**
- * Whether the workspace vocabulary behind the scope row actually loaded.
+ * Ask, and return the answer once it has finished typing itself out.
  *
- * Every claim the scope row makes is read through the pipelines, teammates and
- * metric catalogue. When those reads fail — the platform's rate limiter fires
- * on a long suite — the card says so in its own words and checks nothing, and a
- * test that then asserts a scope claim is asserting against a surface that has
- * correctly declined to make one.
+ * The caption under an answer used to be a *scope row* the card composed for
+ * itself: `.cp-scope__chip`s reconciled out of `/v1/users`,
+ * `/v1/pipelines/deal` and `/v1/ai/metrics`, three reads that arrived after
+ * the prose and could fail on their own — which is what `scopeWasChecked` used
+ * to wait for and skip on. `answerCard` replaced the whole apparatus with the
+ * slot chips the completion already carries (`analysis.slots`, drawn as
+ * `.cp-slot`), so nothing is read after the answer and there is nothing left
+ * to wait for beyond the reveal.
  */
-const scopeIsChecked = async (answer: ReturnType<Page['locator']>): Promise<boolean> =>
-  (await answer.locator('.cp-scope__chip', { hasText: 'could not be read' }).count()) === 0
-  && (await answer.locator('.ain-banner', { hasText: 'The scope of this answer was not checked' }).count()) === 0;
-
-/**
- * The same, having given the failed reads another go first.
- *
- * The platform's rate limiter is 600 requests a real minute and this suite runs
- * close to it in one worker, so the four vocabulary reads behind the scope row
- * are the ones that get refused. Reloading the thread asks again — the same
- * thing the API helpers above do with `getJson` — and only a workspace that
- * will not answer at all is a reason to skip.
- */
-const scopeWasChecked = async (page: Page, answer: ReturnType<Page['locator']>): Promise<boolean> => {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    if (await scopeIsChecked(answer)) return true;
-    await page.waitForTimeout(3_000 * (attempt + 1));
-    await page.reload({ waitUntil: 'networkidle' });
-    await expect(answer.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
-    await expect(answer.locator('.cp-scope__chip', { hasText: 'reading this workspace' }))
-      .toHaveCount(0, { timeout: 20_000 });
-  }
-  return scopeIsChecked(answer);
-};
-
 const askCopilot = async (page: Page, question: string) => {
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
   const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
   await composer.fill(question);
   await composer.press('Enter');
   const answer = page.locator('.cp-answer').last();
-  await expect(answer.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
-  // The scope row names nothing until the pipelines, teammates and metric
-  // catalogue have been read — an owner id is `usr_seed01` until then — so a
-  // test that samples the chips once has to wait for that read to land.
-  await expect(answer.locator('.cp-scope__chip', { hasText: 'reading this workspace' })).toHaveCount(0, { timeout: 20_000 });
+  await revealed(answer);
   return answer;
 };
+
+/** The values this answer's plan was bound to, as the chips read them out. */
+const slotChips = (answer: ReturnType<Page['locator']>) => answer.locator('.cp-slot');
 
 /**
  * A pipeline question is either answered for that pipeline or labelled as not.
@@ -2414,11 +2471,13 @@ const askCopilot = async (page: Page, question: string) => {
  * $9,010,960 workspace total — six times the $1,463,440 that pipeline is worth
  * — in a confident sentence with no qualification anywhere on it, because
  * `business_metric` has no pipeline argument and the question's qualifier was
- * dropped on the way in. Whether the engine binds it or not, the surface may
- * never present the wider figure as the narrower one: either the scope says
- * Renewal, or the answer says out loud that it does not.
+ * dropped on the way in. The engine binds `pipeline` now — the plan carries it
+ * and the card reads the binding straight off the plan — so the check is the
+ * one that always mattered: the pipeline the question named is on the card as
+ * the thing that was measured, and the figure under it is that pipeline's, not
+ * the workspace's.
  */
-test('a pipeline question answered over every pipeline says so above the figure', async ({ page, request }) => {
+test('a pipeline question is answered for the pipeline it named, and says which', async ({ page, request }) => {
   const defs = await pipelines(request);
   const renewal = defs.find((p) => /renew/i.test(p.name)) ?? defs.find((p) => !p.is_default) ?? defs[0];
   const answer = await askCopilot(page, `What is the ${renewal.label} pipeline worth?`);
@@ -2427,40 +2486,31 @@ test('a pipeline question answered over every pipeline says so above the figure'
   // what to look for: "1,463,440" against "9,010,960".
   const grouped = (minor: number) => Math.round(minor / 100).toLocaleString('en-US');
   const total = defs.reduce((sum, def) => sum + (def.open_amount ?? 0), 0);
-  const scopedChip = answer.locator('.cp-scope__chip', { hasText: renewal.label });
-  if (await scopedChip.count() > 0) {
-    // Scoped means scoped: the workspace figure must not be the one on screen.
-    await expect(answer.locator('.cp-answer__body')).toContainText(grouped(renewal.open_amount ?? 0));
-    await expect(answer.locator('.cp-answer__body')).not.toContainText(grouped(total));
-  } else {
-    const warning = answer.locator('.ain-banner--danger').first();
-    await expect(warning).toBeVisible();
-    await expect(warning).toContainText(renewal.label);
-    // Above the number, not under it: a reader who has already taken
-    // "$9,010,960 in open pipeline" as the answer has already been misled.
-    const order = await answer.evaluate((node) => {
-      const banner = node.querySelector('.ain-banner--danger');
-      const body = node.querySelector('.cp-answer__body');
-      if (!banner || !body) return 'missing';
-      return banner.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING ? 'before' : 'after';
-    });
-    expect(order).toBe('before');
-    // And the widened dimension is on the scope row as well as in the banner.
-    await expect(answer.locator('.cp-scope__chip.is-wide')).toContainText('every pipeline');
-  }
+  expect(renewal.open_amount, 'the pipeline under test is worth nothing, so the two figures do not differ')
+    .not.toBe(total);
+
+  // The binding is on the card, named as a pipeline rather than left to the prose.
+  const bound = slotChips(answer).filter({ hasText: renewal.label });
+  await expect(bound, `no chip named ${renewal.label}: ${JSON.stringify(await slotChips(answer).allInnerTexts())}`)
+    .toHaveCount(1);
+  await expect(bound.locator('.cp-slot__key')).toHaveText('Pipeline');
+
+  // Scoped means scoped: the workspace figure must not be the one on screen.
+  await expect(answer.locator('.cp-answer__body')).toContainText(grouped(renewal.open_amount ?? 0));
+  await expect(answer.locator('.cp-answer__body')).not.toContainText(grouped(total));
 });
 
 /**
- * The scope row is read through this workspace's vocabulary, so it says nothing
+ * A slot chip is read through this workspace's vocabulary, so it says nothing
  * until that vocabulary is in.
  *
  * `/v1/users`, `/v1/pipelines/deal` and `/v1/ai/metrics` are three separate
- * reads, and the answer arrives before them. Rendered against a half-read
- * vocabulary the row states `OWNER usr_seed01` — a database id shown to a
- * person — and lists the eight open stage names as eight stage chips, when
- * together they are exactly "open deals" and narrow to nothing.
+ * reads, and the answer arrives before them. The plan's arguments are ids —
+ * `owner_id: "usr_seed01"` — and the chip is only a name once the read that
+ * knows the name has landed, so rendered against a half-read vocabulary the
+ * strip states `OWNER usr_seed01`, a database id shown to a person.
  */
-test('the scope row never names a record by its database id', async ({ page }) => {
+test('a slot chip never names a record by its database id', async ({ page }) => {
   for (const read of ['**/api/v1/users**', '**/api/v1/pipelines/deal**', '**/api/v1/ai/metrics**']) {
     await page.route(read, async (route) => {
       await new Promise((resolve) => setTimeout(resolve, 4_000));
@@ -2473,18 +2523,18 @@ test('the scope row never names a record by its database id', async ({ page }) =
   // as long as the slowest of the three reads took.
   const seen: string[] = [];
   for (let i = 0; i < 20; i += 1) {
-    seen.push(...await answer.locator('.cp-scope__chip').allInnerTexts());
+    seen.push(...await slotChips(answer).allInnerTexts());
     await page.waitForTimeout(150);
   }
   // Every prefix, not the three that were leaking when this was written: the
   // list itself was the defect the next time round, when `credits.balance` put
   // `ACCOUNT cus_dgqX6o9tM1BGxIWi` on a credit answer and this test watched it
   // happen without a word.
-  expect(seen.filter((chip) => /\b[a-z]{2,6}_[A-Za-z0-9]{4,}/.test(chip)), 'the scope row showed a record id')
+  expect(seen.filter((chip) => /\b[a-z]{2,6}_[A-Za-z0-9]{4,}/.test(chip)), 'a slot chip showed a record id')
     .toEqual([]);
 
   // And once the vocabulary is in, the owner is named.
-  await expect(answer.locator('.cp-scope__chip', { hasText: 'Dana Whitfield' })).toBeVisible({ timeout: 20_000 });
+  await expect(slotChips(answer).filter({ hasText: 'Dana Whitfield' })).toBeVisible({ timeout: 20_000 });
 });
 
 /**
@@ -2492,48 +2542,63 @@ test('the scope row never names a record by its database id', async ({ page }) =
  *
  * "How much pipeline does Marcus Ilori own?" has come back "Whitcombe Aerospace
  * is carrying $315,900 in open pipeline" — a real figure, for the wrong subject,
- * with the teammate's name nowhere in it.
+ * with the teammate's name nowhere in it. The engine binds the teammate now, so
+ * the chip is required rather than offered as one of two acceptable outcomes:
+ * an answer whose plan was not filtered to this owner has no business naming
+ * them, and one that was says so on the card.
  */
-test('an owner question answered for some other record names the record it used', async ({ page, request }) => {
+test('an owner question is answered for the teammate it named, and says so', async ({ page, request }) => {
   const users = await getJson<{ data: { id: string; name: string }[] }>(request, '/api/v1/users?limit=20');
   const owner = users.data.find((u) => u.name.split(' ').length > 1) ?? users.data[0];
   const answer = await askCopilot(page, `How much pipeline does ${owner.name} own?`);
 
-  const ownerChip = answer.locator('.cp-scope__chip', { hasText: owner.name });
-  if (await ownerChip.count() === 0) {
-    const warning = answer.locator('.ain-banner--danger').first();
-    await expect(warning).toBeVisible();
-    await expect(warning).toContainText(owner.name);
-  }
+  const ownerChip = slotChips(answer).filter({ hasText: owner.name });
+  await expect(ownerChip, `no chip named ${owner.name}: ${JSON.stringify(await slotChips(answer).allInnerTexts())}`)
+    .toHaveCount(1);
+  await expect(ownerChip.locator('.cp-slot__key')).toHaveText('Owner');
+  // And the prose is about the teammate, not about whichever record the engine
+  // reached for instead.
+  await expect(answer.locator('.cp-answer__body')).toContainText(owner.name);
 });
 
 /**
- * A by-stage breakdown either agrees with the board's columns or is withheld.
+ * Every caption in a by-stage answer is a column the board actually draws.
  *
  * The board draws thirteen open columns across three pipelines; the engine
- * groups on the bare stage name and returns eight buckets, four of them sums
+ * groups on the bare stage *name* and returns eight buckets, captioning each
+ * with the humanised name rather than a column label. Four of them are sums
  * across pipelines under a caption that belongs to one of them ("Qualification"
- * over New business *and* Expansion's "Expansion identified") or to none
- * ("Usage review" for a column called "Usage & value review"). Every figure
- * adds up and every caption is wrong, which is the worst way to be wrong.
+ * over New business *and* Expansion's "Expansion identified") and two name no
+ * column at all ("Usage review" for "Usage & value review", "Proposal" for two
+ * columns both called "Proposal sent"). Every figure adds up and the captions
+ * are wrong, which is the worst way for a number to be wrong.
+ *
+ * This used to be checked against a reconciliation surface — a `.cp-breakdown`
+ * list, or an "it does not line up with the board" banner — that the card no
+ * longer draws, and against a `Breakdown: A $1 · B $2` sentence the engine no
+ * longer writes. Both are gone, so the merged figures stand in the prose with
+ * nothing checking them, and the check is now the prose itself against
+ * `/v1/pipelines/deal`.
  */
-test('a by-stage breakdown that does not match the board is shown as a disagreement', async ({ page, request }) => {
-  const answer = await askCopilot(page, 'Break the open pipeline down by stage');
-  const runs = await getJson<{ data: { answer: string | null }[] }>(request, '/api/v1/ai/runs?limit=1');
-  const prose = runs.data[0]?.answer ?? '';
-  test.skip(!/Breakdown:/.test(prose), 'the engine returned no by-stage breakdown for this question');
+test('a by-stage breakdown captions every bucket with a column the board draws', async ({ page, request }) => {
+  const defs = await pipelines(request);
+  const columns = defs.flatMap((p) => p.stages.filter((s) => !s.is_closed).map((s) => ({ ...s, pipeline: p.label })));
+  expect(columns.length, 'this workspace draws no open columns').toBeGreaterThan(0);
 
-  // Whatever happens, the merged figures never stand as prose in the answer.
-  await expect(answer.locator('.cp-answer__body')).not.toContainText('Breakdown:');
+  const answer = await askCopilot(page, 'What is our open pipeline by stage?');
+  const prose = await answer.locator('.cp-answer__body').innerText();
+  const buckets = [...prose.matchAll(/^\s*(?:•\s*)?(.+?)\s+—\s+([^\s(]+)/gm)]
+    .map((m) => ({ caption: m[1].trim(), figure: m[2] }));
+  expect(buckets.length, `no by-stage bullets in:\n${prose}`).toBeGreaterThan(1);
 
-  const reconciled = await answer.locator('.cp-breakdown__list').count();
-  if (reconciled === 0) {
-    const warning = answer.locator('.ain-banner--warning', { hasText: 'does not line up with the board' });
-    await expect(warning).toBeVisible();
-    const defs = await pipelines(request);
-    const columns = defs.flatMap((p) => p.stages.filter((s) => !s.is_closed)).length;
-    await expect(warning).toContainText(String(columns));
-  }
+  const unknown = buckets
+    .filter((bucket) => !columns.some((column) => column.label === bucket.caption))
+    .map((bucket) => `${bucket.caption} ${bucket.figure}`);
+  expect(
+    unknown,
+    `the answer captioned buckets with names no column carries; the board's open columns are `
+      + JSON.stringify(columns.map((c) => `${c.pipeline}: ${c.label}`)),
+  ).toEqual([]);
 });
 
 /* ============================ keyboard and focus =========================== */
@@ -2619,7 +2684,11 @@ test('the keyboard lands on the outcome after a copilot write is approved', asyn
 test('every citation chip is reachable and activatable from the keyboard', async ({ page, request }) => {
   const company = (await getJson<{ data: { display_name: string }[] }>(
     request, '/api/v1/records/company?limit=1')).data[0];
-  const answer = await askCopilot(page, `Summarise the activity on ${company.display_name}`);
+  // "Summarise the activity on …" is not one of the shapes this engine answers
+  // any more, so it refused and cited nothing. `record-timeline` is the shape
+  // that reads the same records, and it is the one that cites the calls, notes,
+  // emails and tasks this test is about.
+  const answer = await askCopilot(page, `What happened recently at ${company.display_name}?`);
   await expect(answer.locator('.cp-chip').first()).toBeVisible({ timeout: 20_000 });
 
   const chips = await answer.locator('.cp-chip').evaluateAll((nodes) => nodes.map((node) => ({
@@ -2632,47 +2701,56 @@ test('every citation chip is reachable and activatable from the keyboard', async
     expect(chip.reachable, `“${chip.text}” cannot be reached with Tab`).toBe(true);
   }
 
-  // And one that links actually opens its record on Enter.
+  // And one that links actually opens its record on Enter. Not the href it
+  // carried: `/records/note/:id` is the generic address and CRM sends every
+  // object type that has a screen of its own to that screen instead, so a note
+  // chip lands on `/notes/:id`. What has to be true is that the record the chip
+  // named is what opens — the id in the path, and a screen rather than the 404.
   const link = answer.locator('a.cp-chip').first();
   expect(await link.count()).toBeGreaterThan(0);
-  const target = await link.getAttribute('href');
+  const id = (await link.getAttribute('href'))!.split('/').pop()!;
   await link.focus();
   await page.keyboard.press('Enter');
-  await expect.poll(() => new URL(page.url()).pathname, { timeout: 10_000 }).toBe(target);
+  await expect.poll(() => new URL(page.url()).pathname, { timeout: 10_000 }).toContain(id);
+  await expect(page.locator('h1')).not.toContainText('Nothing is registered at this address');
 });
 
 /**
- * A qualifier the engine says it dropped is on the screen, whatever its kind.
+ * A row cut-off is on the card when the person asked for one, and never when
+ * they did not.
  *
- * "What is our top 2 pipeline by value?" is settled by the engine as `limit "2"
- * waived` — its own words for a qualifier it read and did not use — and the
- * client's own list of kinds did not have `limit` on it. So the $9,010,960
- * workspace total arrived under a scope row with nothing red in it anywhere,
- * with the engine's admission demoted to a line of prose above the figure. That
- * is the same defect as the pipeline one, one kind to the left, which is why
- * the list is now checked against the engine's own union at compile time.
+ * "What is our top 2 pipeline by value?" was settled by the engine as `limit
+ * "2" waived` and answered with the $9,010,960 workspace total under a calm
+ * caption; the engine refuses that shape outright now, which is the loudest
+ * form of saying it did not cut. What is left of the same defect is the other
+ * direction, and it is live: every list tool carries `limit: 25` in its
+ * arguments, so a chip read straight off the arguments says "TOP 25" over a
+ * question that asked for no such thing. `numberAsked` exists to tell the two
+ * apart, and this is the pair that holds it.
  */
-test('a row cut-off the engine waived is stated as loudly as any other qualifier', async ({ page }) => {
-  const answer = await askCopilot(page, 'What is our top 2 pipeline by value?');
-  const warning = answer.locator('.ain-banner--danger').first();
-  await expect(warning).toBeVisible();
-  await expect(warning).toContainText('top 2');
+test('a row cut-off is drawn when it was asked for and never when it was not', async ({ page }) => {
+  // Asked for: the number the person typed is on the card, as a cut-off.
+  const ranked = await askCopilot(page, 'Top 3 customers by revenue');
+  const rankedChips = await slotChips(ranked).allInnerTexts();
+  expect(rankedChips.some((chip) => /top\s*3\b/i.test(chip)), `no cut-off chip in ${JSON.stringify(rankedChips)}`)
+    .toBe(true);
 
-  // Above the figure, not under it.
-  const order = await answer.evaluate((node) => {
-    const banner = node.querySelector('.ain-banner--danger');
-    const body = node.querySelector('.cp-answer__body');
-    if (!banner || !body) return 'missing';
-    return banner.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING ? 'before' : 'after';
-  });
-  expect(order).toBe('before');
+  // Not asked for: the page size in the plan's arguments is not a scope.
+  const listed = await askCopilot(page, 'Which invoices are overdue?');
+  const listedChips = await slotChips(listed).allInnerTexts();
+  expect(
+    listedChips.filter((chip) => /top\s*\d/i.test(chip)),
+    `a page size nobody asked for was stated as a cut-off: ${JSON.stringify(listedChips)}`,
+  ).toEqual([]);
 
-  // And on the scope row, in red: `limit: 2` really is in the arguments of the
-  // call that ran, so a chip read straight off the arguments would have said
-  // "Top 2" in the calm voice over a figure that was cut to nothing.
-  await expect(answer.locator('.cp-scope__chip.is-wide', { hasText: 'uncut' })).toBeVisible();
-  const cutChips = await answer.locator('.cp-scope__chip').allInnerTexts();
-  expect(cutChips.filter((chip) => /top\s*2\b/i.test(chip)), 'the inert cut-off was stated as a binding').toEqual([]);
+  // And the shape the engine cannot cut is refused rather than answered with
+  // the uncut workspace figure under a caption that does not mention it.
+  const waived = await askCopilot(page, 'What is our top 2 pipeline by value?');
+  const waivedChips = await slotChips(waived).allInnerTexts();
+  if (!waivedChips.some((chip) => /top\s*2\b/i.test(chip))) {
+    await expect(waived, 'an uncut figure was presented as the answer to a "top 2" question')
+      .toHaveClass(/is-refused/);
+  }
 });
 
 /**
@@ -2721,21 +2799,25 @@ test('a credit balance asked for in events states the unit it was answered in', 
 
   const answer = await askCopilot(page, `How many events of credit does ${customer.name} have left?`);
   const body = answer.locator('.cp-answer__body');
+  const prose = (await body.innerText()).trim();
 
-  if (await answer.locator('.ain-banner--danger').count() === 0) {
-    // No warning means the answer claims to be in events, so it has to be.
-    await expect(body).toContainText('events');
+  // No question shape in this workspace measures a credit balance, so the
+  // engine refuses — and a refusal is the one answer that cannot state the
+  // balance in the wrong denomination. What it may never do is put a money
+  // figure on screen in place of a balance held in events.
+  if (await answer.evaluate((node) => node.classList.contains('is-refused'))) {
+    expect(prose, `a refused credit question still printed a figure:\n${prose}`)
+      .not.toMatch(/[$€£]\s?\d/);
   } else {
-    await expect(answer.locator('.ain-banner--danger').first()).toContainText('events');
+    // Answered means answered in the unit the grant is held in.
+    expect(prose, `the balance is held in events and the answer read:\n${prose}`).toMatch(/\bevents?\b/);
   }
 
-  // Either way the scope row names the account the balance was read for, and
-  // never by the billing customer id the tool was actually called with — the
-  // one chip on this answer read `ACCOUNT cus_dgqX6o9tM1BGxIWi` before.
-  const chips = await answer.locator('.cp-scope__chip').allInnerTexts();
-  expect(chips.filter((chip) => /\b[a-z]{2,6}_[A-Za-z0-9]{4,}/.test(chip)), 'the scope row showed a record id')
+  // Either way no chip names the account by the billing customer id the tool
+  // was called with — the one chip on this answer read `ACCOUNT cus_…` before.
+  const chips = await slotChips(answer).allInnerTexts();
+  expect(chips.filter((chip) => /\b[a-z]{2,6}_[A-Za-z0-9]{4,}/.test(chip)), 'a slot chip showed a record id')
     .toEqual([]);
-  await expect(answer.locator('.cp-scope__chip', { hasText: customer.name })).toBeVisible();
 });
 
 /**
@@ -2751,7 +2833,7 @@ test('a credit balance asked for in events states the unit it was answered in', 
 test('a top-N ranking is not accused of measuring the dimension it ranked', async ({ page }) => {
   const answer = await askCopilot(page, 'What are our top 3 accounts by spend?');
   await expect(answer.locator('.ain-banner--danger')).toHaveCount(0);
-  const chips = await answer.locator('.cp-scope__chip').allInnerTexts();
+  const chips = await slotChips(answer).allInnerTexts();
   expect(chips.some((chip) => /top\s*3/i.test(chip)), `no cut-off chip in ${JSON.stringify(chips)}`).toBe(true);
   expect(chips.some((chip) => /Account/i.test(chip)), `no grouping chip in ${JSON.stringify(chips)}`).toBe(true);
 });
@@ -2789,6 +2871,7 @@ test('a write prepared against a sibling of the deal that was named is stopped',
   test.skip(accounts.length === 0, 'no account in this workspace carries two open deals');
 
   let misTargeted = 0;
+  let refused = 0;
   for (const [account, rows] of accounts) {
     for (const named of rows.filter((r) => r.properties.deal_status === 'open')) {
       const suffix = named.display_name.split('—').slice(1).join('—').trim();
@@ -2798,6 +2881,19 @@ test('a write prepared against a sibling of the deal that was named is stopped',
       await page.getByRole('switch', { name: 'Let it prepare writes' }).click();
       await page.getByRole('textbox', { name: 'Ask the copilot' }).fill(question);
       await page.getByRole('button', { name: 'Ask', exact: true }).click();
+
+      // The third outcome, and the safest one: the engine will not bind a deal
+      // it is not sure of, and says so instead of preparing anything. A
+      // refusal cannot mis-target, so the only thing to hold it to is that
+      // nothing was prepared.
+      const answer = page.locator('.cp-answer').last();
+      await expect(answer.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
+      if (await answer.evaluate((node) => node.classList.contains('is-refused'))) {
+        refused += 1;
+        await expect(page.getByText('Waiting for your approval'), `"${question}" was refused and still prepared a write`)
+          .toHaveCount(0);
+        continue;
+      }
       await expect(page.getByText('Waiting for your approval').first()).toBeVisible({ timeout: 40_000 });
 
       const card = page.locator('.ain-card', { hasText: 'Waiting for your approval' }).first();
@@ -2836,6 +2932,24 @@ test('a write prepared against a sibling of the deal that was named is stopped',
       }
     }
   }
+  // A sweep that refused every question would hold nothing about a write that
+  // is prepared, so the phrasing the engine does bind is asked too: it has to
+  // reach an approval card, on the deal that was named and no sibling of it.
+  const exact = accounts[0][1].find((r) => r.properties.deal_status === 'open')!;
+  const stage = (await pipelines(request))
+    .find((p) => p.name === exact.properties.pipeline)!.stages
+    .find((s) => !s.is_closed && s.name !== exact.properties.deal_stage)!;
+  await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
+  await page.getByRole('switch', { name: 'Let it prepare writes' }).click();
+  await page.getByRole('textbox', { name: 'Ask the copilot' })
+    .fill(moveDeal(exact.display_name, stage.label));
+  await page.getByRole('button', { name: 'Ask', exact: true }).click();
+  await expect(page.getByText('Waiting for your approval').first()).toBeVisible({ timeout: 40_000 });
+  const exactCard = page.locator('.ain-card', { hasText: 'Waiting for your approval' }).first();
+  await expect(exactCard.locator('.cp-approval__preview')).toContainText(exact.display_name);
+  await expect(exactCard.locator('.ain-banner--danger')).toHaveCount(0);
+  await exactCard.getByRole('button', { name: 'Decline' }).click();
+
   // Whether the engine still mis-resolves any of these is the engine's
   // business and it changes underneath this file, so the count is recorded
   // rather than required: what this test holds is the invariant either way —
@@ -2844,7 +2958,7 @@ test('a write prepared against a sibling of the deal that was named is stopped',
   // questions and the record each one actually resolved to are frozen.
   test.info().annotations.push({
     type: 'sweep',
-    description: `${accounts.length} accounts, ${misTargeted} write(s) prepared against a sibling`,
+    description: `${accounts.length} accounts, ${misTargeted} write(s) prepared against a sibling, ${refused} refused`,
   });
 });
 
@@ -2866,21 +2980,25 @@ test('a question about deals we closed is never captioned "open only" in silence
   });
   test.skip(closed.length === 0, 'nothing closed in Q2 2026 on this workspace');
 
-  const answer = await askCopilot(page, 'How many deals did we close in Q2 2026?');
-  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
-  test.skip(!await scopeWasChecked(page, answer), 'the workspace vocabulary did not load, so nothing was checked');
-  const body = (await answer.locator('.cp-answer__body').innerText()).trim();
-  const status = answer.locator('.cp-scope__chip', { hasText: 'Status' });
+  const won = closed.filter((row) => row.properties.deal_status === 'won').length;
+  const open = deals.data.filter((row) => row.properties.deal_status === 'open').length;
 
-  // Either the answer really is about closed deals, or the card says out loud
-  // that it measured something else.
-  const openOnly = (await status.count()) > 0 && /open/.test(await status.first().innerText());
-  if (openOnly || new RegExp(`\\b0 open deals\\b`).test(body)) {
-    const banner = answer.locator('.ain-banner--danger');
-    await expect(banner.first()).toBeVisible();
-    await expect(banner.first()).toContainText('closed deals');
-    await expect(banner.first()).toContainText('open deals');
-  }
+  const answer = await askCopilot(page, 'How many deals did we close in Q2 2026?');
+  const body = (await answer.locator('.cp-answer__body').innerText()).trim();
+
+  // Nothing on the card captions this as a question about open deals, and the
+  // figure is one of the two readings of "close" — won alone, or won and lost.
+  const chips = await slotChips(answer).allInnerTexts();
+  expect(
+    chips.filter((chip) => /status/i.test(chip) && /\bopen\b/i.test(chip)),
+    `a question that said "close" was captioned as open: ${JSON.stringify(chips)}`,
+  ).toEqual([]);
+  const counted = Number(/\b(\d[\d,]*)\b/.exec(body)?.[1].replace(/,/g, '') ?? NaN);
+  expect([won, closed.length], `the answer counted ${counted}; Q2 2026 closed ${won} won of ${closed.length}:\n${body}`)
+    .toContain(counted);
+  expect(counted, 'the closed count is the open count').not.toBe(open);
+  // And it says which closing it counted rather than leaving the reader to guess.
+  expect(body, `the answer never says what "close" was read as:\n${body}`).toMatch(/clos(?:ed|ing)/i);
 });
 
 /**
@@ -2905,20 +3023,25 @@ test('a lead source the question named is either filtered on or refused out loud
   const open = deals.data.filter((row) => row.properties.deal_status === 'open').length;
   test.skip(truth === open, 'every open deal carries this source, so there is nothing to drop');
 
-  const answer = await askCopilot(page, `How many open deals came from a ${option.label.toLowerCase()}?`);
-  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
-  test.skip(!await scopeWasChecked(page, answer), 'the workspace vocabulary did not load, so nothing was checked');
+  // "How many open deals came from a trade show?" is not a shape this engine
+  // binds — it refuses on the article — and a refusal cannot substitute the
+  // unqualified count for the filtered one, so the question that carries the
+  // claim is the one it does bind. `pipeline-from-source` filters on exactly
+  // this property, so the figure it prints is checkable against the records.
+  const answer = await askCopilot(page, `How much open pipeline came from ${option.label.toLowerCase()}s?`);
   const body = (await answer.locator('.cp-answer__body').innerText()).trim();
 
-  // The unqualified count is the substitution. If the answer is that number,
-  // the card has to name the dimension it dropped — in the banner and on the
-  // scope row — rather than presenting it as the answer.
-  if (new RegExp(`\\b${open}\\b`).test(body) && !new RegExp(`\\b${truth}\\b`).test(body)) {
-    const banner = answer.locator('.ain-banner--danger');
-    await expect(banner.first()).toContainText(option.label);
-    await expect(banner.first()).toContainText(source!.label);
-    await expect(answer.locator('.cp-scope__chip.is-wide', { hasText: source!.label })).toHaveCount(1);
-  }
+  // The source is named on the card, not dropped on the way in. The chip strip
+  // draws the plan's own dimensions and a record property is not one of them,
+  // so the prose is where this one is said — either is a reader being told.
+  const named = (await slotChips(answer).allInnerTexts()).some((chip) => chip.includes(option.label))
+    || new RegExp(option.label, 'i').test(body);
+  expect(named, `neither the prose nor the chips name ${option.label}:\n${body}`).toBe(true);
+
+  // And the figure is this source's deals, never every open deal in the workspace.
+  expect(body, `the answer counted every open deal (${open}) rather than the ${truth} from ${option.label}`)
+    .toMatch(new RegExp(`\\b${truth}\\b`));
+  if (truth !== open) expect(body).not.toMatch(new RegExp(`\\b${open}\\b(?!\\d)`));
 });
 
 /**
@@ -2927,24 +3050,32 @@ test('a lead source the question named is either filtered on or refused out loud
  * "How many tickets are in the Support pipeline?" answered "No deal pipeline in
  * this workspace is called 'Support'. … The pipelines Northwind Robotics has
  * are 'New business', 'Expansion' and 'Renewal'." `crm_pipelines` holds a
- * `support` pipeline of tickets. A correcting banner above the paragraph was
- * an improvement and still left the falsehood rendered verbatim underneath it.
+ * `crm_pipelines` holds a `support` pipeline of tickets. A correcting banner
+ * above the paragraph was an improvement and still left the falsehood rendered
+ * verbatim underneath it; the engine stopped writing the denial, so the client
+ * correction that used to rewrite it — and the "Open the ticket board" link it
+ * carried — went with it. What has to stay true is the claim itself: nothing on
+ * this card says the workspace has no such pipeline.
  */
-test('a ticket pipeline is not denied in the answer under a banner saying it exists', async ({ page, request }) => {
+test('a ticket pipeline is not denied in the answer', async ({ page, request }) => {
   const tickets = await getJson<{ data: PipelineDef[] }>(request, '/api/v1/pipelines/ticket');
   test.skip(tickets.data.length === 0, 'this workspace has no ticket pipeline');
   const support = tickets.data[0];
 
   const answer = await askCopilot(page, `How many tickets are in the ${support.label} pipeline?`);
-  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
-  test.skip(!await scopeWasChecked(page, answer), 'the workspace vocabulary did not load, so nothing was checked');
   const body = (await answer.locator('.cp-answer__body').innerText()).trim();
   expect(body, 'the answer still denies a pipeline this workspace has').not.toMatch(/No deal pipeline in this workspace is called/i);
   expect(body, 'the answer still lists the pipelines and leaves this one out').not.toMatch(/The pipelines .* has are/i);
-  // What is left says the true thing, and the banner above it still points at
-  // the screen where the tickets are.
+  // What is left names the pipeline that was asked about rather than talking
+  // past it, and offers a way on that is about tickets.
   expect(body).toContain(support.label);
-  await expect(answer.getByRole('link', { name: /Open the ticket/i })).toBeVisible();
+  const offered = await answer.locator('.cp-help__chip span:not(:has(svg))').allInnerTexts();
+  if (offered.length) {
+    expect(
+      offered.filter((chip) => /ticket/i.test(chip)),
+      `a ticket question was handed only these ways out: ${JSON.stringify(offered)}`,
+    ).not.toEqual([]);
+  }
 });
 
 /**
@@ -2974,13 +3105,22 @@ test('a write the tool refused is reported as a failure, not as written', async 
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
   await page.getByRole('switch', { name: 'Let it prepare writes' }).click();
   await page.getByRole('textbox', { name: 'Ask the copilot' })
-    .fill(`Move the ${victim!.display_name} deal to ${foreign!.label}`);
+    .fill(moveDeal(victim!.display_name, foreign!.label));
   await page.getByRole('button', { name: 'Ask', exact: true }).click();
   await expect(page.getByText('Waiting for your approval').first()).toBeVisible({ timeout: 40_000 });
 
   const card = page.locator('.ain-card', { hasText: 'Waiting for your approval' }).first();
-  if (await card.locator('.ain-check__input').count()) await card.locator('.ain-check__input').check();
-  await card.getByRole('button', { name: /^Approve/ }).click();
+  // The acknowledgement lands with the consequence the card worked out, a beat
+  // after the card itself. Counting the checkbox once found none, skipped the
+  // tick, and then spent the whole timeout clicking a disabled "Approve
+  // anyway" — so the button's own state is what decides whether to tick it.
+  const approve = card.getByRole('button', { name: /^Approve/ });
+  await expect(approve).toBeVisible();
+  if (!await approve.isEnabled()) {
+    await card.locator('.ain-check__input').check();
+    await expect(approve).toBeEnabled();
+  }
+  await approve.click();
 
   const resolution = page.locator('.cp-resolution').last();
   await expect(resolution).toBeVisible({ timeout: 30_000 });
@@ -3037,7 +3177,7 @@ test('a question about how many records is never quietly answered in money', asy
   // The answer types itself in. Reading it while the caret is still moving
   // reads a prefix — and a prefix of "$3,162,060 in open pipeline" has no
   // money glyph in it yet, which is a test that passes by being early.
-  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+  await revealed(answer);
   const body = (await answer.locator('.cp-answer__body').innerText()).trim();
   const banners = await answer.locator('.ain-banner--danger').count();
   // A money glyph in the answer to a counting question is either flagged or
@@ -3173,7 +3313,7 @@ test('a stage change that reopens a closed deal states it, and waits to be ackno
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
   await page.getByRole('switch', { name: 'Let it prepare writes' }).click();
   await page.getByRole('textbox', { name: 'Ask the copilot' })
-    .fill(`Move the ${lost!.display_name} deal to ${reopenTo!.label}`);
+    .fill(moveDeal(lost!.display_name, reopenTo!.label));
   await page.getByRole('button', { name: 'Ask', exact: true }).click();
   await expect(page.getByText('Waiting for your approval').first()).toBeVisible({ timeout: 40_000 });
 
@@ -3221,7 +3361,7 @@ test('a scope carried between questions is shown, and can be taken off', async (
     await expect(page.locator('.cp-answer').last().locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
     // The newest answer is typed out a character at a time, so its text is
     // empty for the first second and a half. The caret is what says it is done.
-    await expect(page.locator('.cp-answer').last().locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+    await revealed(page.locator('.cp-answer').last());
   }
 
   const carried = page.locator('.cp-carried').last();
@@ -3241,7 +3381,7 @@ test('a scope carried between questions is shown, and can be taken off', async (
   await answer.getByRole('button', { name: /Ask it without/ }).click();
   const fresh = page.locator('.cp-answer').last();
   await expect(fresh.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
-  await expect(fresh.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+  await revealed(fresh);
   await expect(page.locator('.cp-carried')).toHaveCount(0);
   expect((await fresh.locator('.cp-answer__body').innerText()).trim()).not.toBe(before);
 });
@@ -3263,7 +3403,6 @@ test('an answer measured with a filter nobody asked for is not shown as an answe
   test.skip(closed.length === 0, 'nothing closed in Q2 2026 on this workspace');
 
   const answer = await askCopilot(page, 'How many deals did we close in Q2 2026?');
-  test.skip(!await scopeWasChecked(page, answer), 'the workspace vocabulary did not load, so nothing was checked');
   const quarantine = answer.locator('.cp-quarantine');
   test.skip(await quarantine.count() === 0, 'this engine no longer invents the filter');
 
@@ -3271,25 +3410,25 @@ test('an answer measured with a filter nobody asked for is not shown as an answe
     .toContainText('not an answer to the question you asked');
   // The figure is kept and it is not in the answer slot: a closed disclosure.
   await expect(quarantine).not.toHaveAttribute('open', '');
-  await expect(answer.locator('.cp-answer__caret')).toHaveCount(0);
+  await revealed(answer);
 });
 
 /**
- * A correction that has not been read yet is not a correction.
+ * A refusal is not printed as one thing and then quietly replaced by another.
  *
- * "How many tickets are in the Support pipeline?" is refused, and the refusal
- * prose says "No deal pipeline in this workspace is called 'Support'" and then
- * lists three pipelines as though they were all of them. There is a Support
- * pipeline; it holds 35 tickets. The surface replaces that sentence — but only
- * once `/v1/pipelines/ticket` has answered, and the answer arrives first.
+ * "How many tickets are in the Support pipeline?" used to be refused with "No
+ * deal pipeline in this workspace is called 'Support'", and the surface
+ * rewrote that sentence — but only once `/v1/pipelines/ticket` had answered,
+ * and the answer arrived first. The falsehood sat on screen in the engine's own
+ * voice for as long as the read took, which is what made this the one test in
+ * the file that failed on load and passed on its own.
  *
- * A refused turn measures nothing, so the scope row renders nothing, so there
- * was not even a "reading this workspace…" chip to say the check had not run:
- * the falsehood sat on screen in the engine's own voice, for as long as the
- * read took. Under a full suite that is seconds, and it is what made this the
- * one test in this file that failed on load and passed on its own.
+ * The engine no longer writes the denial and the client no longer rewrites
+ * anything, so what this now holds is the shape of the fix rather than the fix:
+ * the read is made slow on purpose, and across the whole gap the card shows one
+ * refusal — never a denial, and never a sentence it takes back afterwards.
  */
-test('a refusal is not printed before the workspace vocabulary that corrects it is read', async ({ page, request }) => {
+test('a refusal is printed once and not taken back when a side read lands', async ({ page, request }) => {
   const tickets = await getJson<{ data: PipelineDef[] }>(request, '/api/v1/pipelines/ticket');
   test.skip(tickets.data.length === 0, 'this workspace has no ticket pipeline');
   const support = tickets.data[0];
@@ -3304,13 +3443,13 @@ test('a refusal is not printed before the workspace vocabulary that corrects it 
   await composer.fill(`How many tickets are in the ${support.label} pipeline?`);
   await composer.press('Enter');
   const answer = page.locator('.cp-answer').last();
-  await expect(answer).toBeVisible({ timeout: 40_000 });
+  await expect(answer.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
 
   // Sampled across the whole gap rather than once after it: the denial was on
   // screen for exactly as long as the ticket-pipeline read took.
   const seen: string[] = [];
   for (let i = 0; i < 24; i += 1) {
-    seen.push(...await answer.locator('.cp-answer__body').allInnerTexts());
+    seen.push((await answer.locator('.cp-answer__body').innerText()).trim());
     await page.waitForTimeout(150);
   }
   expect(
@@ -3318,35 +3457,46 @@ test('a refusal is not printed before the workspace vocabulary that corrects it 
     'the uncorrected denial was shown while the pipelines that disprove it were still being read',
   ).toEqual([]);
 
-  // And once the read lands the answer says the true thing.
-  await expect(answer.locator('.cp-answer__body')).toContainText(
-    `is a ticket pipeline in this workspace`,
-    { timeout: 20_000 },
-  );
+  // The prose only ever grows as it is revealed: every sample is a prefix of
+  // the one the reader is left with. A sentence swapped out mid-read is not.
+  const settled = seen[seen.length - 1];
+  const rewritten = seen.filter((body) => body && !settled.startsWith(body));
+  expect(rewritten, `the card replaced what it had already shown; it settled on:\n${settled}`).toEqual([]);
 });
 
 /**
  * The same read, failed rather than slow.
  *
- * A failed read never lands, so waiting is not the fix — the prose has to be
- * shown, and the card has to say that the workspace vocabulary behind its
- * corrections could not be read. Both disclosures were gated on the answer
- * having measured something, and a refusal measures nothing, so a refused turn
- * whose vocabulary failed said nothing at all.
+ * A failed read never lands, so waiting is not the fix: the refusal has to be
+ * shown in full anyway. `/v1/pipelines/ticket` is one of the reads behind the
+ * slot chips, and a refused turn binds no slots — so nothing on this card
+ * depends on it, and killing it may change nothing at all about what is said.
  */
-test('a refusal whose workspace vocabulary could not be read says so', async ({ page }) => {
+test('a refusal is shown in full when the workspace vocabulary cannot be read', async ({ page, request }) => {
+  const tickets = await getJson<{ data: PipelineDef[] }>(request, '/api/v1/pipelines/ticket');
+  test.skip(tickets.data.length === 0, 'this workspace has no ticket pipeline');
+  const support = tickets.data[0];
+  const question = `How many tickets are in the ${support.label} pipeline?`;
+  const settled = await postJson<{ content: string }>(
+    request, '/api/v1/ai/complete', { prompt: question, feature: 'copilot' },
+  );
+
   await page.route('**/api/v1/pipelines/ticket**', (route) => route.abort());
 
   await page.goto('/copilot?new=1', { waitUntil: 'domcontentloaded' });
   const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
-  await composer.fill('How many tickets are in the Support pipeline?');
+  await composer.fill(question);
   await composer.press('Enter');
   const answer = page.locator('.cp-answer').last();
   await expect(answer.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
+  await revealed(answer);
 
-  await expect(
-    answer.locator('.ain-banner', { hasText: 'could not be read' }).first(),
-  ).toContainText('pipelines that hold tickets', { timeout: 20_000 });
+  // Everything the engine said, with the failed read changing none of it — and
+  // still no denial of a pipeline this workspace has.
+  const body = (await answer.locator('.cp-answer__body').innerText()).trim();
+  const spoken = settled.content.split('\n\nTry one of these:')[0].trim();
+  expect(body, `the refusal was cut short by a failed side read:\n${body}`).toContain(spoken);
+  expect(body).not.toMatch(/No deal pipeline in this workspace is called/i);
 });
 
 /**
@@ -3377,7 +3527,7 @@ test('a measure carried from the question before it is named on the answer', asy
     await composer.fill(question);
     await composer.press('Enter');
     await expect(page.locator('.cp-answer').last().locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
-    await expect(page.locator('.cp-answer').last().locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+    await revealed(page.locator('.cp-answer').last());
   }
 
   const answer = page.locator('.cp-answer').last();
@@ -3405,21 +3555,24 @@ test('a measure carried from the question before it is named on the answer', asy
  * three lines apart, and the loud half was the wrong one: flip the switch and
  * the write really is prepared.
  *
- * The capability is real, so the banner is right with the switch on and wrong
- * with it off, and this pins both.
+ * The capability is real, so the switch is the whole difference, and this pins
+ * both halves of it.
+ *
+ * It used to ask "Set the amount on the … deal to $2,000,000", the one write
+ * the extractor could not read. That is no longer a shape the engine matches at
+ * all — it refuses on the template before any of this can happen — so the write
+ * it is asked for now is the one it does prepare, and the claim under test is
+ * the same one: with the switch off the card says the switch is why, and never
+ * that this is something the copilot cannot do.
  */
 test('a write blocked by the writes switch is not reported as something the copilot cannot do', async ({ page, request }) => {
-  // An account with exactly one deal, so the handoff link has one record to
-  // name rather than two siblings it must refuse to choose between.
+  const defs = await pipelines(request);
   const deals = await getJson<DealList>(request, '/api/v1/records/deal?limit=200');
-  const byAccount = new Map<string, DealRecord[]>();
-  for (const row of deals.data) {
-    const account = row.display_name.split(' — ')[0];
-    byAccount.set(account, [...(byAccount.get(account) ?? []), row]);
-  }
-  const solo = [...byAccount.values()].find((rows) => rows.length === 1)?.[0];
-  test.skip(!solo, 'every account in this workspace carries more than one deal');
-  const question = `Set the amount on the ${solo!.display_name} deal to $2,000,000`;
+  const target = deals.data.find((row) => row.properties.deal_status === 'open');
+  test.skip(!target, 'no open deal to move');
+  const stage = defs.find((p) => p.name === target!.properties.pipeline)!.stages
+    .find((s) => !s.is_closed && s.name !== target!.properties.deal_stage)!;
+  const question = moveDeal(target!.display_name, stage.label);
 
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
   const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
@@ -3427,25 +3580,29 @@ test('a write blocked by the writes switch is not reported as something the copi
   await composer.press('Enter');
   const readOnly = page.locator('.cp-answer').last();
   await expect(readOnly.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
-  await expect(readOnly.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+  await revealed(readOnly);
 
-  // The engine's own sentence is the true one, and it is the only one.
-  await expect(readOnly.locator('.cp-answer__body')).toContainText('Let it prepare writes');
+  // The switch is named as the reason, and it is the only reason offered.
+  await expect(readOnly.getByText('Asked with “Let it prepare writes” off')).toBeVisible();
+  await expect(readOnly.getByRole('button', { name: 'Turn it on and ask again' })).toBeVisible();
   await expect(
-    readOnly.getByText('The copilot cannot set the amount on a deal'),
+    readOnly.locator('.ain-banner', { hasText: 'The copilot cannot' }),
     'a read-only run was reported as a capability this product does not have',
   ).toHaveCount(0);
+  // Nothing was prepared and nothing was written.
+  await expect(readOnly.getByText('Waiting for your approval')).toHaveCount(0);
+  expect((await deal(request, target!.id)).properties.deal_stage).toBe(target!.properties.deal_stage);
 
-  // With the switch on the engine reaches its extractor, and the limit is real.
+  // With the switch on the same sentence really does prepare the write.
   await page.getByRole('switch', { name: /Let it prepare writes/i }).click();
   await composer.fill(question);
   await composer.press('Enter');
   const allowed = page.locator('.cp-answer').last();
   await expect(allowed.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
-  await expect(allowed.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
-  await expect(allowed.getByText('The copilot cannot set the amount on a deal')).toBeVisible();
-  await expect(allowed.getByRole('link', { name: new RegExp(`Set the amount on ${solo!.display_name.split(' — ')[0]}`) }))
-    .toBeVisible();
+  await expect(page.getByText('Waiting for your approval').first()).toBeVisible({ timeout: 40_000 });
+  const card = page.locator('.ain-card', { hasText: 'Waiting for your approval' }).first();
+  await expect(card.locator('.cp-approval__preview')).toContainText(target!.display_name);
+  await card.getByRole('button', { name: 'Decline' }).click();
 });
 
 /**
@@ -3473,7 +3630,7 @@ test('every question this workspace suggests either answers or hands back one th
     await composer.press('Enter');
     const answer = page.locator('.cp-answer').last();
     await expect(answer.locator('.cp-answer__body'), question).not.toBeEmpty({ timeout: 40_000 });
-    await expect(answer.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+    await revealed(answer);
 
     const broken = answer.locator('.ain-banner', { hasText: 'one of the suggested questions' });
     if (await broken.count() === 0) continue;
@@ -3486,7 +3643,7 @@ test('every question this workspace suggests either answers or hands back one th
 
     const second = page.locator('.cp-answer').last();
     await expect(second.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
-    await expect(second.locator('.cp-answer__caret')).toHaveCount(0, { timeout: 20_000 });
+    await revealed(second);
     await expect(
       second.locator('.ain-banner', { hasText: 'refused' }),
       `the rephrasing offered for “${question}” was refused too`,
@@ -3572,7 +3729,7 @@ test('a stage change approved through the copilot can be undone from its notific
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
   await page.getByRole('switch', { name: 'Let it prepare writes' }).click();
   await page.getByRole('textbox', { name: 'Ask the copilot' })
-    .fill(`Move the ${lost!.display_name} deal to ${reopenTo!.label}`);
+    .fill(moveDeal(lost!.display_name, reopenTo!.label));
   await page.getByRole('button', { name: 'Ask', exact: true }).click();
   await expect(page.getByText('Waiting for your approval').first()).toBeVisible({ timeout: 40_000 });
 

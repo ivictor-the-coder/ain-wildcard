@@ -11,19 +11,18 @@
 import { chromium } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { bool, int, parseArgs, text } from './lib/args.mjs';
 
-const argv = process.argv.slice(2);
-const arg = (name, def) => {
-  const i = argv.indexOf(`--${name}`);
-  return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : def;
-};
-const url = arg('url', 'http://127.0.0.1:8787').replace(/\/$/, '');
-const out = arg('out', '.artifacts/shots');
-const routes = arg('routes', '/').split(',').map((r) => r.trim()).filter(Boolean);
-const themes = arg('themes', 'light,dark').split(',').map((t) => t.trim());
-const width = Number(arg('width', 1512));
-const height = Number(arg('height', 950));
-const full = argv.includes('--full');
+// `--full` is the boolean here, and the same parser as preview.mjs reads it, so
+// `--routes /billing --full` and `--full --routes /billing` are one command.
+const { options } = parseArgs(process.argv.slice(2), { booleans: ['full'] });
+const url = text(options, 'url', 'http://127.0.0.1:8787').replace(/\/$/, '');
+const out = text(options, 'out', '.artifacts/shots');
+const routes = text(options, 'routes', '/').split(',').map((r) => r.trim()).filter(Boolean);
+const themes = text(options, 'themes', 'light,dark').split(',').map((t) => t.trim());
+const width = int(options, 'width', 1512);
+const height = int(options, 'height', 950);
+const full = bool(options, 'full');
 
 mkdirSync(out, { recursive: true });
 const problems = [];

@@ -102,8 +102,17 @@ export interface RecoveryTotals {
   amount_at_risk: number;
   recovered_amount: number;
   lost_amount: number;
-  /** Recovered / (recovered + lost), in basis points. Exact, not a float. */
-  recovery_rate_bps: number;
+  /**
+   * Recovered / (recovered + lost), in basis points. Exact, not a float.
+   *
+   * `null` when nothing has been decided yet: a book whose campaigns are all
+   * still running has recovered nothing and lost nothing, and 0 bps there
+   * reads as "we recover none of it" when the truth is that no campaign has
+   * finished. `recovery_rate_basis` says which of the two it is.
+   */
+  recovery_rate_bps: number | null;
+  /** How this row's rate was computed, or why there is not one. */
+  recovery_rate_basis: string;
 }
 
 /**
@@ -117,12 +126,24 @@ export const RECOVERY_RATE_BASIS =
   'Recovered ÷ (recovered + lost), over campaigns that have finished. recovered_amount is every payment that arrived ' +
   'while a campaign ran — a part payment included, whichever way the campaign ended — and lost_amount is what an ' +
   'exhausted campaign was still chasing when its schedule ran out. A campaign still recovering has no outcome yet and ' +
-  'is in neither figure; what it is still chasing is amount_at_risk.';
+  'is in neither figure; what it is still chasing is amount_at_risk. With recovered + lost at zero there is no rate ' +
+  'to state and the figure is null, never 0%.';
 
-/** Basis points, exact: a ratio of two integers scaled and rounded once. */
-export function recoveryRateBps(recovered: number, lost: number): number {
+/** Said of one book: how its rate was computed, or why it has none. */
+export const NO_RECOVERY_RATE_BASIS =
+  'No campaign has finished, so nothing has been recovered and nothing lost: recovered + lost is zero and the rate ' +
+  'is null rather than 0%. It becomes a rate the moment the first campaign is recovered or exhausted.';
+
+/**
+ * Basis points, exact: a ratio of two integers scaled and rounded once.
+ *
+ * `null` where nothing has been decided. Zero over zero is not zero — a book
+ * chasing money it has neither collected nor given up on has no recovery rate,
+ * and 0 bps is the one answer guaranteed to be read as the worst possible one.
+ */
+export function recoveryRateBps(recovered: number, lost: number): number | null {
   const decided = recovered + lost;
-  return decided > 0 ? Number(ratRound(ratMul(rat(recovered, decided), rat(10_000)))) : 0;
+  return decided > 0 ? Number(ratRound(ratMul(rat(recovered, decided), rat(10_000)))) : null;
 }
 
 export interface RecoverySummary {
@@ -359,13 +380,6 @@ export class DunningEngine {
     // who has to act and what happens when. The queue's job is to put that in
     // front of a person, with the one call they can make to end it.
     if (campaign.hold) {
-      const retry = `POST /v1/invoices/${campaign.invoice}/retry`;
-      if (campaign.hold.reason === 'reopened_by_refund') {
-        return {
-          action: `${campaign.hold.note} Raise a credit note if the bill should be smaller, or present ${amount} by hand with ${retry} once ${customerName} expects the charge. Nothing is charged automatically after a refund.`,
-          needsHuman: true,
-        };
-      }
       const code = campaign.last_failure_code;
       const why = code ? `${DECLINES[code].advice} ` : '';
       return {
@@ -448,12 +462,14 @@ export class DunningEngine {
       totals: perCurrency.map((row) => {
         const recovered = Number(row.recovered);
         const lost = Number(row.lost);
+        const bps = recoveryRateBps(recovered, lost);
         return {
           currency: row.currency,
           amount_at_risk: Number(row.at_risk),
           recovered_amount: recovered,
           lost_amount: lost,
-          recovery_rate_bps: recoveryRateBps(recovered, lost),
+          recovery_rate_bps: bps,
+          recovery_rate_basis: bps === null ? NO_RECOVERY_RATE_BASIS : RECOVERY_RATE_BASIS,
         };
       }),
       attempts: {
@@ -837,9 +853,8 @@ export class DunningEngine {
    * rather than left for a person to remember to click. It spends a window
    * like any other presentation, and whatever it comes back with — authorised,
    * a soft decline that restarts the schedule, another final one — is
-   * recorded against the same campaign. A campaign held for a refund is left
-   * alone: charging a card the moment one is attached, after money was just
-   * given back, is not what anyone attaching it expects.
+   * recorded against the same campaign. Any other hold is left alone: this is
+   * the answer to a card that cannot be charged, and to nothing else.
    */
   presentHeld(orgId: string, dunningId: string, methodId: string): void {
     this.ctx.atomic(() => {
@@ -851,48 +866,6 @@ export class DunningEngine {
       if (sub && (sub.status === 'unpaid' || sub.status === 'paused')) return;
       this.present(orgId, campaign, invoice, this.ctx.now(), methodId);
     });
-  }
-
-  /**
-   * A refund has put a paid bill back on the books.
-   *
-   * The bill is owed again, and by design nothing charges it: the automatic
-   * collection ran when it was raised, and a refund is a person's decision
-   * that the money should go back, not a decline. Left there, the bill is
-   * owed by nobody — open, collectable, on an active subscription, and in no
-   * queue. So the campaign for it is opened, or reopened, and held for the
-   * person who has to decide: a credit note if the bill was too large, a hand
-   * retry once the customer expects to be charged again. A schedule already
-   * chasing the bill only learns the new balance; a bill that was already
-   * open and owed was already somebody's problem and is left with them.
-   */
-  onRefundReopened(orgId: string, before: Invoice, after: Invoice, refund: Refund): void {
-    if (after.status !== 'open' || after.amount_due <= 0) return;
-    if (after.collection_method !== 'charge_automatically') return;
-    const existing = this.forInvoice(orgId, after.id);
-    if (existing?.status === 'recovering') {
-      if (existing.amount_at_risk !== after.amount_due) {
-        this.ctx.db.patch('payments_dunning', 'id', existing.id, { amount_at_risk: after.amount_due, updated: this.ctx.now() });
-      }
-      return;
-    }
-    if (before.status !== 'paid') return;
-    const org = this.orgFormat(orgId);
-    const now = this.ctx.now();
-    const show = (amount: number) => formatMoney(money(amount, after.currency), { locale: org.locale });
-    const campaign = this.open(orgId, after);
-    const hold: DunningHold = {
-      reason: 'reopened_by_refund',
-      until: null,
-      // Read on the recovery queue by whoever asks why a settled bill is back:
-      // the refund's reason is the answer, its id is not, and the id travels
-      // in the event data below for anything that needs to follow the row.
-      note: `${show(refund.amount)} of ${after.number} went back to the customer on ${formatDate(now, org)}, refunded as ${refund.reason.replace(/_/g, ' ')}, so ${show(after.amount_due)} is owed again on a bill that had been settled.`,
-    };
-    this.ctx.db.patch('payments_dunning', 'id', campaign.id, {
-      next_attempt_at: null, ...holdColumns(hold), updated: now,
-    });
-    this.placeHold(orgId, this.require(orgId, campaign.id), hold, { refund: refund.id, refunded: refund.amount });
   }
 
   private recordRecovery(

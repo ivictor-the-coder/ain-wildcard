@@ -22,10 +22,13 @@
  *     won over a bill since credited — lands on the customer's balance as an
  *     `invoice_overpayment` rather than being truncated away. Reversal is the
  *     same rule run backwards: a refund or a chargeback empties that credit
- *     before it touches `amount_paid`, so the one identity this file exists to
- *     keep — **net cash in === `amount_paid` + overpayment credit**, on every
- *     bill, after any sequence of collect, reverse, refund, dispute and
- *     overpay — survives money going out as well as money coming in.
+ *     before it touches the bill, so the one identity this file exists to keep
+ *     — **net cash in === (`amount_paid` - `amount_refunded`) + overpayment
+ *     credit**, on every bill, after any sequence of collect, reverse, refund,
+ *     dispute and overpay — survives money going out as well as money coming
+ *     in. A refund records what went back in `amount_refunded` and leaves a
+ *     settled bill settled; a chargeback is the network taking the cash, so it
+ *     runs `reverseCollection` and the bill is genuinely owed again.
  *  2. **A subscription's status is never written here.** Failure emits
  *     `invoice.payment_failed` and recovery emits `invoice.paid`, both of which
  *     billing already listens for and turns into a status change through its
@@ -1104,14 +1107,27 @@ export class Gateway {
       const excess = invoice.amount_paid - collectable;
       if (excess <= 0) return invoice;
       const now = opts.at ?? this.ctx.now();
+      // What the bill records collecting is not what it is holding: a refund
+      // leaves `amount_paid` where it is and records what went back beside it,
+      // because a bill the customer settled stays settled. So the part of the
+      // excess that has already gone back to the customer is written off the
+      // record rather than moved — it is not the bill's to move any more, and
+      // putting it on the account would credit them a second time for cash
+      // they already have. Only what the bill is really holding travels.
+      const refunded = Math.min(excess, invoice.amount_refunded);
+      const held = excess - refunded;
       this.ctx.db.patch('billing_invoices', 'id', invoiceId, {
-        amount_paid: collectable, amount_due: 0, payment_note: opts.note, updated: now,
+        amount_paid: collectable, amount_due: 0, amount_refunded: invoice.amount_refunded - refunded,
+        payment_note: opts.note, updated: now,
       });
       this.billing.invoices.assertBalanced(orgId, invoiceId);
-      let after = this.recordOverpayment(orgId, this.billing.invoices.require(orgId, invoiceId), excess, {
-        at: now, charge: null, meta: opts.meta,
-        reason: `${formatMoney(money(excess, invoice.currency), { locale: this.locale(orgId) })} of what had been collected against invoice ${invoice.number} is more than the bill is owed now that it has been credited. It is credit on the account and comes off the next bill.`,
-      });
+      let after = this.billing.invoices.require(orgId, invoiceId);
+      if (held > 0) {
+        after = this.recordOverpayment(orgId, after, held, {
+          at: now, charge: null, meta: opts.meta,
+          reason: `${formatMoney(money(held, invoice.currency), { locale: this.locale(orgId) })} of what had been collected against invoice ${invoice.number} is more than the bill is owed now that it has been credited. It is credit on the account and comes off the next bill.`,
+        });
+      }
       // What is left of the bill is covered, so it is settled — and `pay()` is
       // billing's to say, because `invoice.paid` has to reach the recovery
       // schedule and the timeline from where every other subscriber expects it.
@@ -1444,6 +1460,68 @@ export class Gateway {
 
   /* --------------------------------- refunds ------------------------------ */
 
+  /**
+   * Money going back on a refund, and what it does to the bill: nothing that
+   * was billed, and nothing to its status.
+   *
+   * Stripe's rule, and the right one — a bill the customer settled is settled.
+   * The cash is a fact about the payment, so it is recorded as `amount_refunded`
+   * on the invoice while `total`, `amount_paid`, `amount_due` and `status` all
+   * stand. A bill quietly reopened under a recovery campaign after a person
+   * decided to give money back is a bill the customer is chased for money
+   * somebody here chose to return; if they owe it again, they owe it on a new
+   * invoice. Reducing the bill itself — and the tax on it — is a credit note's
+   * job, and a chargeback is a different thing again: the network *takes* the
+   * cash, so `reverseCollection` runs and the bill really is owed again.
+   *
+   * What this does share with `reverseCollection` is the order, and it has to:
+   * cash that went *past* the bill is on the customer's balance, not in
+   * `amount_paid`, and it is the first thing money leaving comes out of. Take
+   * it off the bill instead and the refund pays the customer twice — the cash
+   * goes back and the credit that same cash created stays on the account.
+   */
+  private refundAgainstInvoice(
+    orgId: string, invoiceId: string, amount: number,
+    opts: { note: string; at?: number; refundId?: string; meta?: WriteMeta },
+  ): Invoice {
+    const invoice = this.billing.invoices.require(orgId, invoiceId);
+    if (amount <= 0) return invoice;
+    const now = opts.at ?? this.ctx.now();
+    const overpaid = this.overpaidOn(orgId, invoiceId);
+    // Being void is not on its own a reason to refuse: `voidInvoice` leaves
+    // whatever was collected in `amount_paid`, and a bill that was part paid
+    // before it was struck out still holds the customer's money.
+    if (invoice.status === 'void' && overpaid + invoice.amount_paid <= 0) {
+      throw conflict('invoice_void', `Invoice ${invoice.number} was voided, so there is no payment on it to reverse.`);
+    }
+    const fromCredit = Math.min(amount, overpaid);
+    let current = invoice;
+    if (fromCredit > 0) {
+      current = this.reverseOverpayment(orgId, invoice, fromCredit, { at: now, note: opts.note, meta: opts.meta });
+    }
+    const fromBill = amount - fromCredit;
+    if (fromBill > current.amount_paid - current.amount_refunded) {
+      // Neither the bill nor the account held what is leaving, which means the
+      // cash taken against this invoice and the cash recorded against it had
+      // already drifted apart before this call. Taking the transaction down
+      // beats paying out money the platform has no record of collecting.
+      throw internal(
+        `Invoice ${current.number} cannot give back ${amount}: ${current.amount_paid} is recorded as collected on the bill, ${current.amount_refunded} of it has already gone back, and ${overpaid} was on the account as credit.`,
+        {
+          invoice: invoiceId, amount, amount_paid: current.amount_paid,
+          amount_refunded: current.amount_refunded, amount_overpaid: overpaid,
+        },
+      );
+    }
+    if (fromBill <= 0) { this.assertCashHeld(orgId, invoiceId); return current; }
+    const after = this.billing.invoices.recordRefund(
+      orgId, invoiceId, fromBill,
+      { note: opts.note, refund: opts.refundId ?? null, at: now }, opts.meta,
+    );
+    this.assertCashHeld(orgId, invoiceId);
+    return after;
+  }
+
   createRefund(orgId: string, input: RefundInput, meta: WriteMeta = {}): Refund {
     return this.ctx.atomic(() => {
       const charge = this.resolveCharge(orgId, input);
@@ -1464,17 +1542,19 @@ export class Gateway {
       const shown = formatMoney(money(amount, charge.currency), { locale });
 
       let effect: string | null = null;
-      let reopened: { before: Invoice; after: Invoice } | null = null;
       if (charge.invoice) {
         const before = this.billing.invoices.require(orgId, charge.invoice);
-        const after = this.reverseCollection(orgId, charge.invoice, amount, {
+        const after = this.refundAgainstInvoice(orgId, charge.invoice, amount, {
           note: `${shown} refunded to the customer on ${formatDate(now, this.orgFormat(orgId))}.`,
-          at: now, meta,
+          at: now, refundId: id, meta,
         });
-        reopened = { before, after };
-        effect = after.status === 'open' && before.status === 'paid'
-          ? `Invoice ${after.number} is open again with ${formatMoney(money(after.amount_due, after.currency), { locale })} showing as due, because the money that settled it has gone back. Nothing charges it automatically: it is in the recovery queue for a person to credit or present by hand. Raise a credit note if the bill itself should be smaller.`
-          : `Invoice ${after.number} now records ${formatMoney(money(after.amount_paid, after.currency), { locale })} collected.`;
+        const offTheBill = after.amount_refunded - before.amount_refunded;
+        const offTheAccount = amount - offTheBill;
+        effect = offTheBill > 0
+          ? `Invoice ${after.number} stays ${after.status} and records ${formatMoney(money(after.amount_refunded, after.currency), { locale })} refunded against the ${formatMoney(money(after.amount_paid, after.currency), { locale })} collected on it${
+            offTheAccount > 0 ? `, after ${formatMoney(money(offTheAccount, after.currency), { locale })} came back off the account credit this bill's overpayment made` : ''
+          }. What was billed has not changed, and nothing is queued for collection: if the customer owes this money again, raise a new invoice for it. Raise a credit note if the bill itself should be smaller.`
+          : `Invoice ${after.number} is unchanged: ${formatMoney(money(amount, after.currency), { locale })} came back off the account credit its overpayment made, which the bill never held.`;
       }
 
       this.ctx.db.insert('payments_refunds', {
@@ -1495,9 +1575,6 @@ export class Gateway {
         objectId: charge.id, objectType: 'charge',
         actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
       });
-      // A bill this refund put back on the books is owed by somebody from
-      // here: nothing charges it automatically, and the recovery queue says so.
-      if (reopened) this.payments.dunning.onRefundReopened(orgId, reopened.before, reopened.after, record);
       return record;
     });
   }
