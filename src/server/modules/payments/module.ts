@@ -731,7 +731,7 @@ export default defineModule({
     router.post('/v1/refunds', (req: Req, c: Ctx) =>
       created(paymentsStore(c).gateway.createRefund(req.auth.orgId, req.body as RefundInput, writeMeta(req))), {
       summary: 'Refund a charge', tags: ['payments'], roles: ['member'], idempotent: true,
-      description: 'Moves cash back and takes it off what the invoice records as collected, which leaves the bill owed again. Nothing charges the reopened balance automatically — a card is never presented on the heels of a refund — so the bill goes into the recovery queue held for a person, who credits it or presents it by hand. A refund does not rewrite what was billed — to reduce the bill itself, and the tax on it, raise a credit note.',
+      description: 'Moves cash back to the customer and records it against the payment as amount_refunded. The invoice it settled is untouched — total, amount_paid, amount_due and status all stand — because a bill the customer settled is settled, and reopening it would chase them for money somebody here chose to return; if it is owed after all, it is owed on a new invoice. Nothing is re-collected and no card is presented. A refund does not rewrite what was billed — to reduce the bill itself, and the tax on it, raise a credit note. A chargeback is the other thing: the network takes the cash, so there the bill really is owed again.',
       body: refundCreateBody,
     });
 
@@ -790,16 +790,17 @@ export default defineModule({
     router.get('/v1/dunning', (req: Req, c: Ctx) => {
       const q = req.query as DunningListFilter;
       const queue = paymentsStore(c).dunning.queue(req.auth.orgId, {
-        status: q.status, customer: q.customer, subscription: q.subscription, limit: q.limit,
+        status: q.status, customer: q.customer, subscription: q.subscription, invoice: q.invoice, limit: q.limit,
       });
       return list(queue.data, { totalCount: queue.totalCount, url: '/v1/dunning' });
     }, {
       summary: 'The recovery queue', tags: ['payments'],
-      description: 'Every invoice being chased, ordered by the next attempt: what is at risk, how many attempts are left, what the issuer said last time, and what a human should do about it today.',
+      description: 'Every invoice being chased, ordered by the next attempt: what is at risk, how many attempts are left, what the issuer said last time, and what a human should do about it today. Narrow it with invoice, customer or subscription to ask whether one bill, account or agreement is being chased.',
       query: v.object({
         status: v.optional(v.enum(['open', 'recovering', 'recovered', 'exhausted', 'canceled', 'all'])),
         customer: v.optional(v.id('cus')),
         subscription: v.optional(v.id('sub')),
+        invoice: v.optional(v.id('in')),
         limit: v.optional(v.int({ min: 1, max: 200 })),
       }),
     });

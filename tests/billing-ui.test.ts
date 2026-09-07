@@ -9,6 +9,7 @@
  */
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
+import { readFileSync } from 'node:fs';
 
 import {
   balanceDrawn, collectionSettled, coversNoPeriod, describeAppliedChange, describeCreatedSubscription, describeDelete,
@@ -28,7 +29,7 @@ const invoice = (over: Partial<Invoice> = {}): Invoice => ({
   object: 'invoice', id: 'in_1', number: 'NR-000345', sequence: 345, customer: 'cus_1', subscription: 'sub_1',
   status: 'open', billing_reason: 'subscription_create', currency: 'usd', collection_method: 'charge_automatically',
   period: { start: NOW, end: NOW + 30 * DAY }, arrears_period: null, lines: [], subtotal: 9900, tax: 0, total_taxes: [],
-  balance_applied: 0, total: 9900, total_excluding_tax: 9900, amount_paid: 0, amount_due: 9900,
+  balance_applied: 0, total: 9900, total_excluding_tax: 9900, amount_paid: 0, amount_due: 9900, amount_refunded: 0,
   pre_payment_credit_notes_amount: 0, post_payment_credit_notes_amount: 0, starting_balance: 0, ending_balance: 0,
   due_date: null, finalized_at: NOW, paid_at: null, voided_at: null, marked_uncollectible_at: null, payment_note: null,
   footer: null, description: null, created: NOW, customer_name: 'Critic Test Co', subtotal_display: '$99.00',
@@ -341,5 +342,57 @@ describe('the annual figure', () => {
   });
   it('gives up rather than print a partial figure when a cadence cannot be read', () => {
     assert.equal(annualRecurring([{ mrr: 100, interval: 'fortnight', items: [{ amount: 100 }] }]), null);
+  });
+});
+
+/* ------------------- what a refund promises before it runs ---------------- */
+
+/**
+ * The refund dialog tells an operator what will happen before they act, so what
+ * it promises has to be what the gateway does. For a whole wave it promised the
+ * opposite: the gateway had been changed so a settled bill stays settled, while
+ * three screens and the route's own description still said the bill would be
+ * owed again and go into the recovery queue. Nothing failed, because no test
+ * compared the sentence to the behaviour.
+ *
+ * The gateway's rule lives in one docblock (`createRefund` in
+ * src/server/modules/payments/gateway.ts) and is unambiguous: a refund records
+ * `amount_refunded` and leaves `total`, `amount_paid`, `amount_due` and
+ * `status` standing. Only a chargeback reopens a bill. So no screen may tell a
+ * person that refunding will make a bill owed again, and the route that does it
+ * may not say so either.
+ */
+describe('no screen promises a refund reopens the bill', () => {
+  const read = (path: string) => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
+
+  it('the gateway still says a refund leaves a settled bill settled', () => {
+    const gateway = read('src/server/modules/payments/gateway.ts');
+    assert.match(gateway, /a bill the customer settled is settled/i,
+      'the rule this test guards has moved — reread createRefund and update these assertions from it');
+  });
+
+  it('no billing screen tells the operator the bill becomes owed again', () => {
+    for (const file of ['src/client/modules/billing/invoices.tsx', 'src/client/modules/billing/payments-book.tsx']) {
+      const source = read(file);
+      // "owed again" is allowed only where it describes a chargeback, which is
+      // the one reversal that really does reopen the bill.
+      for (const line of source.split('\n')) {
+        if (!/owed again/i.test(line)) continue;
+        assert.match(line, /chargeback|network takes/i,
+          `${file} promises a refund reopens the bill: ${line.trim()}`);
+      }
+      assert.doesNotMatch(source, /recovery queue held for a person/i,
+        `${file} says a refunded bill is queued for recovery; nothing queues it`);
+    }
+  });
+
+  it('the refund route describes what it actually does', () => {
+    const module = read('src/server/modules/payments/module.ts');
+    const [, description] = module.match(/description: '(Moves cash back[^']*)'/) ?? [];
+    assert.ok(description, 'the refund route description could not be found');
+    assert.match(description, /amount_refunded/, 'it does not say where the money is recorded');
+    assert.match(description, /status all stand|is untouched/, 'it does not say the bill is untouched');
+    assert.doesNotMatch(description, /leaves the bill owed again/,
+      'the refund route still claims it reopens the bill');
   });
 });

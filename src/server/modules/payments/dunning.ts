@@ -87,6 +87,13 @@ export interface DunningListFilter {
   status?: DunningStatus | 'open' | 'all';
   customer?: string;
   subscription?: string;
+  /**
+   * One bill. "Is this invoice being chased?" is the question the queue exists
+   * to answer, and asking it of a whole workspace's queue and filtering by eye
+   * is how a client ends up showing one account's campaign under another
+   * account's invoice.
+   */
+  invoice?: string;
   limit?: number;
 }
 
@@ -311,6 +318,7 @@ export class DunningEngine {
     else if (status !== 'all') { clauses.push('status = ?'); params.push(status); }
     if (filter.customer) { clauses.push('customer_id = ?'); params.push(filter.customer); }
     if (filter.subscription) { clauses.push('subscription_id = ?'); params.push(filter.subscription); }
+    if (filter.invoice) { clauses.push('invoice_id = ?'); params.push(filter.invoice); }
     const where = clauses.join(' AND ');
     const totalCount = this.ctx.db.count(`SELECT COUNT(*) FROM payments_dunning WHERE ${where}`, ...(params as any[]));
     const limit = Math.min(Math.max(filter.limit ?? 50, 1), 200);

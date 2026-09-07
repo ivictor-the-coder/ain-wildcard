@@ -4231,3 +4231,63 @@ describe('operator-facing prose', () => {
     assert.deepEqual(offenders, [], 'ids belong in event data, not in the sentence a person reads');
   });
 });
+
+/* --------------------- the queue answers about one bill ------------------- */
+
+/**
+ * "Is this bill being chased?" is the question the recovery queue exists to
+ * answer, and until now asking it got the whole workspace's queue back. The
+ * `invoice` parameter was not on the route, and an unknown query parameter is
+ * dropped rather than refused, so a caller that filtered by invoice was handed
+ * every campaign in the workspace and had no way to know. A screen that trusts
+ * it shows one account's recovery under another account's invoice — on a queue
+ * whose entire purpose is deciding who to chase for money.
+ */
+describe('the recovery queue can be asked about one bill', () => {
+  test('filtering by invoice returns that invoice’s campaign and nothing else', async () => {
+    const ws = await workspace();
+    try {
+      const chased = await ws.customer('Chased Co');
+      await ws.card(chased.id, 'insufficient_funds');
+      const failing = await ws.subscribe(chased.id);
+      await ws.tick();
+
+      // A second account being chased at the same time, so a queue that ignores
+      // the filter cannot pass by accident.
+      const other = await ws.customer('Other Chased Co');
+      await ws.card(other.id, 'insufficient_funds');
+      const alsoFailing = await ws.subscribe(other.id);
+      await ws.tick();
+
+      const whole = await ws.ok('GET', '/v1/dunning?status=all&limit=200');
+      assert.ok(whole.data.length >= 2, 'two accounts are being chased');
+
+      const mine = await ws.ok('GET', `/v1/dunning?status=all&invoice=${failing.invoice.id}`);
+      assert.deepEqual([...new Set(mine.data.map((row: { invoice: string }) => row.invoice))], [failing.invoice.id],
+        'the queue answered about another invoice as well as this one');
+      assert.equal(mine.total_count, mine.data.length, 'the count counts what the filter matched');
+      assert.ok(mine.data.length < whole.data.length, 'the filter narrowed nothing');
+
+      const theirs = await ws.ok('GET', `/v1/dunning?status=all&invoice=${alsoFailing.invoice.id}`);
+      assert.deepEqual([...new Set(theirs.data.map((row: { invoice: string }) => row.invoice))], [alsoFailing.invoice.id]);
+
+      // A bill nobody is chasing answers empty, rather than with the workspace.
+      const settled = await ws.customer('Settled Co');
+      await ws.card(settled.id);
+      const paid = await ws.subscribe(settled.id);
+      const quiet = await ws.ok('GET', `/v1/dunning?status=all&invoice=${paid.invoice.id}`);
+      assert.deepEqual(quiet.data, [], 'a bill nobody is chasing came back with somebody else’s campaign');
+    } finally {
+      ws.app.close();
+    }
+  });
+
+  test('an invoice id that does not exist is refused, not ignored', async () => {
+    const ws = await workspace();
+    try {
+      await ws.fail('GET', '/v1/dunning?invoice=not_an_invoice_id', undefined, 400, 'parameter_invalid');
+    } finally {
+      ws.app.close();
+    }
+  });
+});

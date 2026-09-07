@@ -2162,12 +2162,14 @@ function ChargeRow({ charge, method, onRefund }: { charge: Charge; method: strin
 /**
  * Send collected money back.
  *
- * The gateway does two things with a refund and the dialog says both before
- * they happen: the cash goes back to the customer, and the bill it settled is
- * owed again for that amount — nothing charges the reopened balance on its own,
- * so the invoice goes into the recovery queue held for a person. What it does
+ * The gateway does one thing with a refund and the dialog says it before it
+ * happens: the cash goes back to the customer, recorded against the payment as
+ * `amount_refunded`. The bill is untouched — total, collected, owed and status
+ * all stand — because a bill the customer settled is settled, and reopening it
+ * would chase them for money somebody here chose to return. What a refund does
  * *not* do is reduce the bill; that is a credit note, and the dialog points
- * there for anyone who reached for the wrong tool.
+ * there for anyone who reached for the wrong tool. A chargeback is the third
+ * thing again: the network takes the cash, so that one really is owed again.
  */
 function RefundDialog({ invoice, charge, open, onClose }: {
   invoice: Invoice; charge: Charge | null; open: boolean; onClose: () => void;
@@ -2233,8 +2235,12 @@ function RefundDialog({ invoice, charge, open, onClose }: {
   };
 
   const form = useDialogForm(open, !!chosen && !invalid && !action.busy, () => { void submit(); });
-  const owedAfter = invoice.amount_due + value;
-  const collectedAfter = Math.max(0, invoice.amount_paid - value);
+  // A refund is a fact about the payment, not about the bill: the gateway
+  // records what went back and leaves `total`, `amount_paid`, `amount_due` and
+  // `status` standing. What the customer is left owing is therefore whatever
+  // they owed before — unchanged — and this dialog may only promise that.
+  const owedAfter = invoice.amount_due;
+  const refundedAfter = (invoice.amount_refunded ?? 0) + value;
 
   return (
     <Modal
@@ -2303,9 +2309,11 @@ function RefundDialog({ invoice, charge, open, onClose }: {
               </Field>
               {!invalid && value > 0 && (
                 <Banner tone="warning" compact title="What this leaves">
-                  {`${money(value)} goes back to ${methodName(chosen.payment_method)}. ${invoice.number} then shows ${money(collectedAfter)} collected and `}
-                  {`${money(owedAfter)} owed again${invoice.status === 'paid' ? ' — it reopens' : ''}. Nothing charges that on its own: the bill goes to the `}
-                  {'recovery queue held for a person, who credits it or presents it by hand. To make the bill itself smaller, issue a credit note instead.'}
+                  {`${money(value)} goes back to ${methodName(chosen.payment_method)}. ${invoice.number} records ${money(refundedAfter)} refunded and `}
+                  {owedAfter > 0
+                    ? `stays ${humanize(invoice.status).toLowerCase()} with ${money(owedAfter)} still owed — the same ${money(owedAfter)} as before, because sending money back does not bill the customer again. `
+                    : `stays paid: what was billed and what was collected both stand, because sending money back does not bill the customer again. `}
+                  {'Nobody is chased for it and no card is presented. If the customer owes this money after all, it is owed on a new invoice. To make the bill itself smaller, and the tax on it, issue a credit note instead.'}
                 </Banner>
               )}
             </>

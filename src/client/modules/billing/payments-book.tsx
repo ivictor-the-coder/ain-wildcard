@@ -583,7 +583,7 @@ function RefundsBook({ names }: { names: Names }) {
             : (
               <EmptyList
                 title="Nothing has been refunded"
-                body="A refund is raised from the invoice that collected the money — open its Collection tab and choose Refund on the charge. The bill is owed again for the amount sent back."
+                body="A refund is raised from the invoice that collected the money — open its Collection tab and choose Refund on the charge. The bill itself is untouched: what it billed and what it collected both stand."
                 action={<Button variant="secondary" onClick={() => navigate('/billing/invoices?status=paid')}>Paid invoices</Button>}
               />
             )}
@@ -591,8 +591,9 @@ function RefundsBook({ names }: { names: Names }) {
         />
       </div>
       <p className="bl-gridnote">
-        A refund moves cash back and leaves the bill owed again for that amount; it never rewrites what was billed — that is
-        a credit note. Totals are one figure per currency and nothing is converted.
+        A refund moves cash back and records it against the payment; the bill it settled stays settled, and nothing is
+        re-collected. It never rewrites what was billed — that is a credit note. Totals are one figure per currency and
+        nothing is converted.
       </p>
     </>
   );

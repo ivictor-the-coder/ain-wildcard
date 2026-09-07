@@ -259,6 +259,13 @@ export interface Invoice {
   total_excluding_tax: number;
   amount_paid: number;
   amount_due: number;
+  /**
+   * Cash sent back against this bill's payments. It is recorded here and
+   * nowhere else on the invoice: a refund leaves `total`, `amount_paid`,
+   * `amount_due` and `status` standing, because a bill the customer settled is
+   * settled. Only a chargeback reopens one.
+   */
+  amount_refunded: number;
   pre_payment_credit_notes_amount: number;
   post_payment_credit_notes_amount: number;
   starting_balance: number;

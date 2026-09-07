@@ -2016,7 +2016,14 @@ test('an immediate change says which invoice it raised and what paid it', async 
   await expect(toast).toContainText('account balance');
 });
 
-test('a payment can be refunded from the invoice that collected it, and the bill is owed again', async ({ page }) => {
+/**
+ * A refund is a fact about the payment, not about the bill. The gateway records
+ * what went back and leaves what was billed, what was collected, what is owed
+ * and the status all standing — reopening a settled bill would chase the
+ * customer for money somebody here chose to return. Only a chargeback, where
+ * the network takes the cash, genuinely makes a bill owed again.
+ */
+test('a payment can be refunded from the invoice that collected it, and the settled bill stays settled', async ({ page }) => {
   const account = await (await page.request.post('/api/v1/customers', {
     data: { name: `Refund Me Co ${Date.now().toString().slice(-6)}`, currency: 'usd', invoice_settings: { days_until_due: 0 } },
   })).json();
@@ -2037,7 +2044,11 @@ test('a payment can be refunded from the invoice that collected it, and the bill
   await page.locator('.bl-row', { hasText: 'Authorised' }).first().getByRole('button', { name: /^Refund the/ }).click();
   const dialog = page.getByRole('dialog', { name: /Refund a payment on/ });
   await expect(dialog).toBeVisible();
-  await expect(dialog).toContainText('owed again');
+  // The dialog promises the operator an outcome before they act, so it has to
+  // be the outcome they get: the bill stays paid and nobody is chased for it.
+  await expect(dialog).toContainText('stays paid');
+  await expect(dialog).not.toContainText('owed again');
+  await expect(dialog).toContainText(/Nobody is chased for it/);
   await dialog.getByLabel('Amount to refund').fill('40');
   await dialog.getByRole('button', { name: /^Refund \$40\.00/ }).click();
 
@@ -2049,8 +2060,17 @@ test('a payment can be refunded from the invoice that collected it, and the bill
   const refunds = await json(page, `/v1/refunds?invoice=${invoiceId}`);
   expect(refunds.data).toHaveLength(1);
   expect(refunds.data[0].amount).toBe(4000);
-  await expect.poll(async () => (await json(page, `/v1/invoices/${invoiceId}`)).amount_due).toBe(4000);
-  await expect(page.locator('.ain-page__title')).toContainText('Open');
+  await expect.poll(async () => (await json(page, `/v1/invoices/${invoiceId}`)).amount_refunded).toBe(4000);
+  const settled = await json(page, `/v1/invoices/${invoiceId}`);
+  expect(settled.status, 'a settled bill stays settled after a refund').toBe('paid');
+  expect(settled.amount_due, 'and nothing is owed on it again').toBe(0);
+  expect(settled.amount_paid, 'what was collected still stands').toBe(9900);
+  await expect(page.locator('.ain-page__title')).toContainText('Paid');
+
+  // Nobody is sent after the money the workspace chose to give back.
+  const chased = await json(page, `/v1/dunning?invoice=${invoiceId}`);
+  expect((chased.data ?? []).filter((row: { status: string }) => row.status === 'recovering'))
+    .toHaveLength(0);
 
   // The register on the Payments screen lists both the charge and the refund.
   await page.goto(`/billing/payments?customer=${account.id}`, { waitUntil: 'networkidle' });
