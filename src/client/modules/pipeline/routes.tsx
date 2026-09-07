@@ -2,7 +2,7 @@
  * The deal surface: a kanban board that moves real deals, a table view of the
  * same set, and the deal record.
  */
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import type { CommandDef, NavItem, RouteDef, WidgetDef } from '@/client/kernel/registry-types';
 import { useRouter } from '@/client/kernel/router';
 import {
@@ -12,7 +12,7 @@ import { DealsPage } from './deals';
 import { DealRecordPage } from './record';
 import { ForecastPage } from './forecast';
 import {
-  ALL_PIPELINES, SIX_WEEK_DAYS, accountOf, dealAmount, dealCloseDate, needsYear, recordHref,
+  ALL_PIPELINES, accountOf, commitFilter, dealAmount, dealCloseDate, needsYear, overdueFilter, recordHref,
   useDealFormat, useDealSearch, type DealSearchBody,
 } from './api';
 import './pipeline.css';
@@ -53,29 +53,17 @@ const SHOWN = 6;
 const boardHref = (horizon: string) => `/deals?pipeline=${ALL_PIPELINES}&horizon=${horizon}`;
 
 /** The filter the card counts, run by the server so the total is the whole set. */
-const commitWindow: DealSearchBody = {
-  filter: {
-    op: 'and',
-    filters: [
-      { property: 'deal_status', operator: 'eq', value: 'open' },
-      { property: 'close_date', operator: 'between', values: ['today', `+${SIX_WEEK_DAYS}d`] },
-    ],
-  },
+const commitWindow = (today: number): DealSearchBody => ({
+  filter: commitFilter(today),
   sort: [{ property: 'close_date', direction: 'asc' }],
   expand: ['associations'],
-};
+});
 
 /** Open deals whose close date has already gone by — commit that is not commit. */
-const pastDue: DealSearchBody = {
-  filter: {
-    op: 'and',
-    filters: [
-      { property: 'deal_status', operator: 'eq', value: 'open' },
-      { property: 'close_date', operator: 'before', value: 'today' },
-    ],
-  },
+const pastDue = (today: number): DealSearchBody => ({
+  filter: overdueFilter(today),
   sort: [{ property: 'close_date', direction: 'asc' }],
-};
+});
 
 /**
  * The open deals closing inside the next six weeks, soonest first.
@@ -89,8 +77,12 @@ const pastDue: DealSearchBody = {
 function ClosingSoon() {
   const f = useDealFormat();
   const { navigate } = useRouter();
-  const commit = useDealSearch(commitWindow);
-  const overdue = useDealSearch(pastDue);
+  // The board draws its own window from the workspace's civil day; this card
+  // has to count the same one, so both windows start from that same day rather
+  // than from the server's idea of when today began.
+  const today = f.calendarToday();
+  const commit = useDealSearch(useMemo(() => commitWindow(today), [today]));
+  const overdue = useDealSearch(useMemo(() => pastDue(today), [today]));
 
   const rows = commit.deals.slice(0, SHOWN);
   const caption = commit.amount === null

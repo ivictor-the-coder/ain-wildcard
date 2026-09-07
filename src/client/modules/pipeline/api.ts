@@ -15,7 +15,8 @@ import { useFormat, type DateOptions, type Formatter } from '@/client/design';
 
 export {
   ALL_PIPELINES, BOARD_KEYS, DAY_MS, FORECAST_PERIODS, HORIZON_LABEL, HORIZONS, PERIOD_LABEL, SIX_WEEK_DAYS,
-  CUSTOM_SORT, SORTS, TABLE_SORT, boardHeadline, boardMove, boardTabStop, closedVerb, columnsFor, conditionsOf,
+  CUSTOM_SORT, SORTS, TABLE_SORT, boardHeadline, boardMove, boardTabStop, civilDay, closedVerb, columnsFor,
+  commitFilter, conditionsOf, overdueFilter,
   dateExample, dateOrderOf, describeBoardState, describeTableSort, moneyLine, outcomeWord, sortKeyOf,
   horizonWindow, isBoardKey, matchesHorizon, needsYear, parseTypedDate, quarterEnd, quarterName, quarterStart,
   reverseClearedSort, sameBoardState, stageKey, stateToView, viewToState,
@@ -25,7 +26,7 @@ export type {
   Horizon, OutcomeFilter, StoredView,
 } from './board-core';
 
-import { DAY_MS, stageKey, type FilterNode } from './board-core';
+import { DAY_MS, civilDay, stageKey, type FilterNode } from './board-core';
 
 /* -------------------------------- payloads ------------------------------- */
 
@@ -439,19 +440,6 @@ export type CalendarFormat = Formatter & {
   /** "today", "in 22 days", "3 days ago" — never "in -0 days". */
   calendarRelative(ts: number): string;
 };
-
-/** Midnight UTC of the civil day `now` falls on in `timeZone`. */
-export function civilDay(now: number, timeZone: string): number {
-  try {
-    const iso = new Intl.DateTimeFormat('en-CA', {
-      timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
-    }).format(now);
-    const parsed = Date.parse(`${iso}T00:00:00.000Z`);
-    if (Number.isFinite(parsed)) return parsed;
-  } catch { /* an unknown zone falls through to UTC */ }
-  const d = new Date(now);
-  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
-}
 
 /** The workspace formatter, plus the calendar-day helpers this module needs. */
 export function useDealFormat(): CalendarFormat {

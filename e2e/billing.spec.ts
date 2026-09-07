@@ -1575,7 +1575,13 @@ test('a grid still loading does not report zero rows underneath its skeletons', 
   // not answered.
   await page.route('**/api/v1/invoices?**', async (route) => {
     await new Promise((resolve) => setTimeout(resolve, 3000));
-    await route.continue();
+    // The route is removed below while this is still sleeping, and a handler
+    // unrouted mid-flight cannot hand its own request on any more: continuing
+    // it then throws "Route is already handled" and fails a test that was
+    // about the skeleton, not about the interception. The request is served
+    // either way — the poll below is what proves it — so only the throw is
+    // swallowed.
+    await route.continue().catch(() => { /* unrouted while this slept */ });
   });
   await page.goto('/billing/invoices', { waitUntil: 'domcontentloaded' });
 

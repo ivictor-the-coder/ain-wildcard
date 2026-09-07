@@ -192,6 +192,74 @@ export interface FilterCondition { property: string; operator: string; value?: u
 export interface FilterGroup { op: 'and' | 'or'; filters: (FilterGroup | FilterCondition)[] }
 export type FilterNode = FilterGroup | FilterCondition;
 
+/* -------------------------- the dashboard's window ------------------------ */
+
+/**
+ * Midnight UTC of the civil day `now` falls on in `timeZone`.
+ *
+ * Close dates are calendar days stored at midnight UTC, so the day a workspace
+ * is on is a stored-shaped number too — not the instant it is, and not the day
+ * Greenwich is on. Everything that compares a close date to "today" starts here.
+ */
+export function civilDay(now: number, timeZone: string): number {
+  try {
+    const iso = new Intl.DateTimeFormat('en-CA', {
+      timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(now);
+    const parsed = Date.parse(`${iso}T00:00:00.000Z`);
+    if (Number.isFinite(parsed)) return parsed;
+  } catch { /* an unknown zone falls through to UTC */ }
+  const d = new Date(now);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+
+/**
+ * The search the six-week card counts, as absolute calendar days.
+ *
+ * The card asks the server for its set and the board filters the same deals in
+ * the browser, so the two only agree while they mean the same thing by "today".
+ * They did not: the server resolves the `today` token to midnight *UTC*, and
+ * the board reads close dates against the workspace's own civil day — which for
+ * a New York workspace is the day before, every evening from eight o'clock. A
+ * deal closing today therefore sat on the board the card's own link opened and
+ * was missing from the number above it for four hours a night.
+ *
+ * So the window is computed once, here, from the civil day the board already
+ * uses, and sent as the two millisecond bounds `horizonWindow` draws. A saved
+ * view still stores the relative tokens — a view is a standing question and has
+ * to move with the calendar — but a card counting what a board draws right now
+ * must be measuring the same instant.
+ */
+export function commitFilter(today: number): FilterGroup {
+  const window = horizonWindow('42', today)!;
+  return {
+    op: 'and',
+    filters: [
+      { property: 'deal_status', operator: 'eq', value: 'open' },
+      { property: 'close_date', operator: 'between', values: [window.from, window.to] },
+    ],
+  };
+}
+
+/**
+ * The same card's overdue line: open deals whose close date has gone by.
+ *
+ * `before` is exclusive and close dates are midnight stamps, so this is exactly
+ * the board's `overdue` horizon (`close <= today - 1 day`) said the other way
+ * round — and it inherits the same civil day, because a deal that closes today
+ * is not late anywhere.
+ */
+export function overdueFilter(today: number): FilterGroup {
+  return {
+    op: 'and',
+    filters: [
+      { property: 'deal_status', operator: 'eq', value: 'open' },
+      { property: 'close_date', operator: 'before', value: today },
+    ],
+  };
+}
+
 /** The part of a saved view these two translators actually read. */
 export interface StoredView {
   filter: FilterNode | null;

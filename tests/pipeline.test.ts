@@ -5,12 +5,15 @@ import { describe, it } from 'node:test';
 import {
   ALL_PIPELINES, BOARD_KEYS, CUSTOM_SORT, DAY_MS, FORECAST_PERIODS, HORIZON_LABEL, HORIZONS, PERIOD_LABEL,
   SIX_WEEK_DAYS, SORTS, TABLE_SORT,
-  boardHeadline, boardMove, boardTabStop, closedVerb, columnsFor, dateExample, dateOrderOf, describeBoardState,
-  describeTableSort, isBoardKey, matchesHorizon, moneyLine, needsYear, horizonWindow, outcomeWord, parseTypedDate,
+  boardHeadline, boardMove, boardTabStop, closedVerb, columnsFor, commitFilter, conditionsOf, dateExample,
+  dateOrderOf, describeBoardState,
+  describeTableSort, isBoardKey, matchesHorizon, moneyLine, needsYear, horizonWindow, outcomeWord, overdueFilter,
+  parseTypedDate,
   quarterEnd, quarterName, quarterStart, reverseClearedSort, sameBoardState, sortKeyOf, stageKey, stateToView,
-  viewToState,
-  type BoardState, type FilterCondition,
+  viewToState, civilDay,
+  type BoardState, type FilterCondition, type FilterNode,
 } from '../src/client/modules/pipeline/board-core';
+import { resolveDate } from '../src/server/modules/crm/values';
 import {
   FORECAST_BUCKETS, UNASSIGNED, bucketOf, byOwner, byPipeline, composition, rollupForecast,
   type ForecastDeal,
@@ -87,6 +90,76 @@ describe('the six-week commit window', () => {
     assert.deepEqual(horizonWindow('overdue', TODAY), { from: null, to: TODAY - DAY_MS });
     assert.deepEqual(horizonWindow('quarter', TODAY), { from: quarterStart(TODAY), to: quarterEnd(TODAY) });
     assert.equal(horizonWindow('all', TODAY), null);
+  });
+});
+
+/* ------------- the card and the board, over one workspace day -------------- */
+
+/**
+ * The dashboard card counts a set the server picks and links to a board that
+ * picks its own, and the two only agree while they mean the same day by
+ * "today". They did not. The card sent the relative token, which the server
+ * resolves to midnight in Greenwich; the board reads close dates against the
+ * workspace's civil day, which for New York is the day before from eight in
+ * the evening. For those four hours a deal closing today sat on the board the
+ * card's own link opened and was missing from the count above it — the whole
+ * suite caught it once, at 03:08 UTC, as "the board drew 15 cards for a card
+ * that counted 14".
+ *
+ * Both windows are now built from the same civil day, so this pins the two
+ * against each other at the instant they used to disagree.
+ */
+describe('the six-week card counts the window its board draws', () => {
+  // 23:08 on the 6th in New York; Greenwich has already turned over to the 7th.
+  const EVENING = Date.parse('2026-09-07T03:08:00Z');
+  const ZONE = 'America/New_York';
+  const today = civilDay(EVENING, ZONE);
+
+  /** The close-date condition the card sends, as the server will read it. */
+  const asked = (filter: FilterNode): FilterCondition => {
+    const found = conditionsOf(filter).find((c) => c.property === 'close_date');
+    assert.ok(found, 'the card asked for no close-date window at all');
+    return found!;
+  };
+  const readBack = (value: unknown): number => {
+    const resolved = resolveDate(value, EVENING);
+    assert.ok(resolved !== null, `the server cannot read ${JSON.stringify(value)} as a date`);
+    return resolved!;
+  };
+
+  it('is asked at an instant where the two calendars really do differ', () => {
+    assert.equal(new Date(today).toISOString().slice(0, 10), '2026-09-06');
+    assert.equal(new Date(resolveDate('today', EVENING)!).toISOString().slice(0, 10), '2026-09-07');
+  });
+
+  it('asks the server for the days the board keeps, and no others', () => {
+    const window = horizonWindow('42', today)!;
+    const bounds = (asked(commitFilter(today)).values ?? []).map(readBack);
+    assert.deepEqual(bounds, [window.from, window.to]);
+  });
+
+  it('holds every deal the board draws, at both ends of the window', () => {
+    const [from, to] = (asked(commitFilter(today)).values ?? []).map(readBack);
+    for (const close of [today, today + DAY_MS, today + SIX_WEEK_DAYS * DAY_MS]) {
+      assert.equal(matchesHorizon(close, '42', today), true, `the board drops ${new Date(close).toISOString()}`);
+      assert.ok(from <= close && close <= to,
+        `the card leaves out ${new Date(close).toISOString()}, which the board draws`);
+    }
+    for (const close of [today - DAY_MS, today + (SIX_WEEK_DAYS + 1) * DAY_MS]) {
+      assert.equal(matchesHorizon(close, '42', today), false);
+      assert.equal(from <= close && close <= to, false,
+        `the card counts ${new Date(close).toISOString()}, which the board does not draw`);
+    }
+  });
+
+  it('calls the same deals overdue as the board does', () => {
+    const before = readBack(asked(overdueFilter(today)).value);
+    // A deal closing on the workspace's own today is late on neither surface.
+    assert.equal(matchesHorizon(today, 'overdue', today), false);
+    assert.equal(today < before, false, 'the card called a deal closing today overdue');
+    // Yesterday is late on both.
+    assert.equal(matchesHorizon(today - DAY_MS, 'overdue', today), true);
+    assert.equal(today - DAY_MS < before, true);
   });
 });
 

@@ -30,7 +30,17 @@ export interface AggregateSpec {
   /** Restrict to records whose date property falls inside [start, end). */
   window?: { property: string; start: number; end: number };
   measure?: { property: string; fn: Exclude<MeasureFn, 'count'> };
-  groupBy?: string;
+  /**
+   * One property to group on, or several at once.
+   *
+   * Several is what a dimension whose values are only unique *inside* another
+   * one needs: three pipelines here each have a stage called `qualification`,
+   * and one of them draws it as "Expansion identified". Grouping on the bare
+   * stage merged two columns of the board under one of their names. The key of
+   * a multi-property group is the values in the order given, separated by the
+   * unit separator, and `GROUP_KEY_SEPARATOR` is what splits it again.
+   */
+  groupBy?: string | string[];
   groupByDate?: { property: string; grain: WindowGrain };
   /** Only records associated with this record id (any association type). */
   associatedTo?: string;
@@ -49,6 +59,9 @@ export interface AggregateSpec {
   groupLimit?: number;
   sampleIds?: number;
 }
+
+/** What joins the values of a multi-property group key, and splits it again. */
+export const GROUP_KEY_SEPARATOR = '\u001f';
 
 export interface AggregateGroup {
   key: string;
@@ -189,9 +202,13 @@ export function aggregate(ctx: Ctx, orgId: string, spec: AggregateSpec): Aggrega
       groupExpr = `strftime('${format}', g.value_date / 1000, 'unixepoch')`;
     }
   } else if (spec.groupBy) {
-    joins.push(`LEFT JOIN crm_record_values g ON g.record_id = r.id AND g.property = ?`);
-    joinParams.push(spec.groupBy);
-    groupExpr = `COALESCE(g.value_text, CAST(g.value_number AS TEXT), '—')`;
+    const properties = Array.isArray(spec.groupBy) ? spec.groupBy : [spec.groupBy];
+    groupExpr = properties.map((property, index) => {
+      const alias = `g${index}`;
+      joins.push(`LEFT JOIN crm_record_values ${alias} ON ${alias}.record_id = r.id AND ${alias}.property = ?`);
+      joinParams.push(property);
+      return `COALESCE(${alias}.value_text, CAST(${alias}.value_number AS TEXT), '—')`;
+    }).join(` || char(${GROUP_KEY_SEPARATOR.charCodeAt(0)}) || `);
   }
 
   const whereSql = where.join(' AND ');

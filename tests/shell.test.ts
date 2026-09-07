@@ -746,3 +746,62 @@ describe('the top bar at 1024px', () => {
     assert.match(shell, /placeholder=\{roomy \? 'Search records, customers, price book…' : 'Search records…'\}/);
   });
 });
+
+/* ------------------ two tiles may not wear the same words ----------------- */
+
+/**
+ * The home screen is assembled from tiles it draws itself and widgets every
+ * module publishes, so nobody sees the whole of it while writing any one part.
+ * Two tiles ended up reading "Monthly recurring revenue": home's own, drawn
+ * from the subscriptions headline, and the revenue module's, drawn from
+ * whichever currency book the reader has selected. The same words over two
+ * figures that need not agree — $43,980.66 beside €15,279.17 — and the reader
+ * has no way to tell which is which.
+ *
+ * It surfaced as a Playwright strict-mode violation rather than as anything
+ * anybody read, which is why this is a test and not a note.
+ */
+describe('no two things on the home screen carry the same label', () => {
+  const modules = join(process.cwd(), 'src', 'client', 'modules');
+
+  const labelsIn = (source: string): string[] =>
+    [...source.matchAll(/label="([^"{}]+)"/g)].map(([, label]) => label);
+
+  /**
+   * Only the components a module actually publishes as widgets. Scanning the
+   * whole file flagged billing's own overview screen, which never appears on
+   * home — and a guard that cries wolf teaches people to ignore it.
+   */
+  const widgetLabelsIn = (file: string): string[] => {
+    const source = readFileSync(file, 'utf8');
+    const published = [...source.matchAll(/component:\s*([A-Z][A-Za-z0-9_]*)/g)].map(([, name]) => name);
+    const out: string[] = [];
+    for (const name of published) {
+      const start = source.search(new RegExp(`^(?:export )?function ${name}\\b`, 'm'));
+      if (start < 0) continue;
+      // To the next top-level declaration, which is where this component ends.
+      const rest = source.slice(start + 1);
+      const next = rest.search(/^(?:export )?(?:function|const) [A-Za-z]/m);
+      out.push(...labelsIn(next < 0 ? rest : rest.slice(0, next)));
+    }
+    return out;
+  };
+
+  it('home draws no tile whose words another module already publishes to it', () => {
+    const home = join(modules, 'home', 'routes.tsx');
+    const publishers = readdirSync(modules)
+      .map((name) => join(modules, name, 'routes.tsx'))
+      .filter((file) => statSync(file, { throwIfNoEntry: false })?.isFile()
+        && /export const widgets/.test(readFileSync(file, 'utf8')));
+
+    const mine = new Set(labelsIn(readFileSync(home, 'utf8')));
+    const clashes: string[] = [];
+    for (const file of publishers) {
+      for (const label of widgetLabelsIn(file)) {
+        if (mine.has(label)) clashes.push(`${label} — home and ${file.replace(`${modules}/`, '')}`);
+      }
+    }
+    assert.deepEqual(clashes, [],
+      'the same words label two figures on one screen; qualify one of them, or let the module own it');
+  });
+});

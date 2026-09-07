@@ -367,6 +367,11 @@ test('closing a deal stops at a confirmation that states the forecast change and
 
   const card = cardsIn(page, from.name).first();
   const id = await card.getAttribute('data-deal');
+  // Everything the close is about to overwrite, so the workspace can be put
+  // back exactly as it was found: a close restamps the close date to today, and
+  // a deal left with today's date on it is inside the six-week commit window
+  // that four later tests measure.
+  const before = await deal(request, id!);
   await card.getByRole('button', { name: /^Actions for / }).click();
   await page.getByRole('menuitem').filter({ hasText: won.label }).first().click();
 
@@ -389,8 +394,17 @@ test('closing a deal stops at a confirmation that states the forecast change and
   expect(after.properties.deal_status).toBe('won');
 
   await request.patch(`/api/v1/records/deal/${id}`, {
-    data: { properties: { deal_stage: from.name, close_reason: null } },
+    data: {
+      properties: {
+        deal_stage: from.name,
+        close_reason: before.properties.close_reason ?? null,
+        close_date: before.properties.close_date ?? null,
+      },
+    },
   });
+  const restored = await deal(request, id!);
+  expect(restored.properties.close_date ?? null, 'the close date this test moved was not put back')
+    .toBe(before.properties.close_date ?? null);
 });
 
 test('Escape closes the stage confirmation without writing anything', async ({ page, request }) => {

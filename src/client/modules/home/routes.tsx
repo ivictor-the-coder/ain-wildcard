@@ -46,6 +46,16 @@ interface CrmOverview {
 interface BillingOverview {
   subscriptions: number; live: number; mrr: number; arr: number; customers: number;
   delinquent_customers: number; renewing_next_30_days: number; by_status: Record<string, number>;
+  /**
+   * The headline is one book — the workspace's own currency — never a sum
+   * across books, which would be a figure in no currency at all. On a
+   * workspace that bills in several, saying "Monthly recurring revenue" over
+   * it presents one currency as the whole business, which is the falsehood the
+   * revenue module spent a wave removing from its own screens.
+   */
+  currency: string;
+  mixed_currency: boolean;
+  by_currency: { currency: string; mrr: number; arr: number }[];
 }
 interface MeteringOverview {
   meters: { id: string; name: string; unit_label: string; events_30d: number; customers_30d: number }[];
@@ -242,13 +252,23 @@ function Home() {
   const tiles = useMemo(() => {
     const out: { key: string; node: ReactNode }[] = [];
     if (billing.data) {
+      // Two tiles on this screen used to read "Monthly recurring revenue": this
+      // one, and the revenue module's own widget, which draws whichever book
+      // the reader has selected. Identical words over two figures that need not
+      // agree — $43,980.66 here and €15,279.17 there — so this one names its
+      // book, and says plainly when it is not the whole business.
+      const book = billing.data.currency.toUpperCase();
+      const others = (billing.data.by_currency ?? []).filter((row) => row.currency !== billing.data!.currency);
       out.push({
         key: 'mrr',
         node: <Stat
-          label="Monthly recurring revenue"
+          label={billing.data.mixed_currency ? `Monthly recurring revenue · ${book}` : 'Monthly recurring revenue'}
           value={f.money(billing.data.mrr)}
           icon={<Glyph name="repeat" />}
-          caption={`${f.money(billing.data.arr)} annualised · ${f.number(billing.data.customers)} billed accounts`}
+          caption={billing.data.mixed_currency
+            ? `${f.money(billing.data.arr)} annualised · ${f.number(billing.data.customers)} billed accounts · `
+              + `${f.plural(others.length, 'other book')} not counted here`
+            : `${f.money(billing.data.arr)} annualised · ${f.number(billing.data.customers)} billed accounts`}
         />,
       });
       out.push({

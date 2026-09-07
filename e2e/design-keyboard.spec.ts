@@ -188,7 +188,8 @@ test('a popover taller than the viewport never covers the chip that opened it', 
     //            box, and it sat at y=8 with its footer past the bottom edge.
     for (const top of [90, height - 60, -140]) {
       const landed = await parkChip(page, top);
-      expect(landed, `the chip could not be moved to ${top}`).toBe(top);
+      // Within a pixel: scroll offsets snap to the device pixel grid.
+      expect(Math.abs(landed - top), `the chip could not be moved to ${top}, it is at ${landed}`).toBeLessThanOrEqual(1);
       await expect.poll(() => popoverGeometry(page), { message: `1280x${height}, chip asked to ${top}` })
         .toEqual(ON_SCREEN);
     }
@@ -218,7 +219,7 @@ test('the columns popover stays inside a short window from every side', async ({
 
     for (const top of [60, height - 50, -160]) {
       const landed = await park(page, COLUMNS, top);
-      expect(landed, `the button could not be moved to ${top}`).toBe(top);
+      expect(Math.abs(landed - top), `the button could not be moved to ${top}, it is at ${landed}`).toBeLessThanOrEqual(1);
       await expect.poll(() => popoverGeometry(page, COLUMNS), { message: `${width}x${height}, button asked to ${top}` })
         .toEqual(ON_SCREEN);
     }
