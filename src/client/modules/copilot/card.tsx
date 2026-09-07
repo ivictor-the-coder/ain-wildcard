@@ -100,7 +100,15 @@ export function SlotChips({ slots, label = 'Bound to' }: { slots: SlotChip[]; la
       {slots.map((slot) => {
         const Glyph = Icons[SLOT_ICON[slot.kind] ?? 'tag'];
         return (
-          <span className="cp-slot" role="listitem" key={`${slot.kind}:${slot.value}`} title={`${slot.label}: ${slot.value}`} data-slot={slot.kind}>
+          <span
+            className="cp-slot"
+            role="listitem"
+            key={`${slot.kind}:${slot.id ?? slot.value}`}
+            // The title carries no id either: a tooltip is on screen too.
+            title={slot.pending ? `${slot.label}: looking up the name` : `${slot.label}: ${slot.value}`}
+            data-slot={slot.kind}
+            data-pending={slot.pending ? '' : undefined}
+          >
             <Glyph size={11} />
             <span className="cp-slot__key">{slot.label}</span>
             <span className="u-truncate">{slot.value}</span>

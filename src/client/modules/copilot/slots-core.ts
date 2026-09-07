@@ -23,6 +23,18 @@ export interface SlotChip {
   kind: string;
   label: string;
   value: string;
+  /**
+   * The record this chip is bound to is real, but nothing on screen can name
+   * it yet — the vocabulary or the citation that would is still in flight. The
+   * chip says what it is bound to without asserting a name it does not have.
+   */
+  pending?: true;
+  /**
+   * The id behind the chip, kept so the screen can go and read the record's
+   * name. It is never rendered: an id is not a name, and one on screen is the
+   * defect this field exists to avoid printing.
+   */
+  id?: string;
 }
 
 /** A template binding as a run may carry it. Tolerant: absent on the old engine. */
@@ -80,8 +92,8 @@ export function slotChipsFromBinding(binding: TemplateBinding): SlotChip[] {
 
 export interface SlotFormat {
   window(w: { start: number | null; end: number | null; label: string | null }): string;
-  /** A person or record id as its display name — or the id, when nothing knows it. */
-  name(id: string): string;
+  /** A person or record id as its display name, or null when nothing knows it yet. */
+  name(id: string): string | null;
 }
 
 /**
@@ -133,7 +145,10 @@ export function slotChipsFromPlan(
 ): SlotChip[] {
   const out: SlotChip[] = [];
   const push = (chip: SlotChip) => {
-    if (!out.some((c) => c.kind === chip.kind && c.value === chip.value)) out.push(chip);
+    // Two turns can bind the same record before and after its name arrives, so
+    // identity is the record, not the placeholder standing in for it.
+    const same = (c: SlotChip) => c.kind === chip.kind && (chip.id ? c.id === chip.id : c.value === chip.value);
+    if (!out.some(same)) out.push(chip);
   };
   for (const call of calls) {
     if (WRITES.test(call.name)) continue;
@@ -153,8 +168,8 @@ export function slotChipsFromPlan(
       });
     }
     if (scope.status) push({ kind: 'status', label: 'Status', value: scope.status });
-    if (scope.ownerId) push({ kind: 'owner', label: 'Owner', value: f.name(scope.ownerId) });
-    if (scope.subjectId) push({ kind: 'account', label: 'Account', value: f.name(scope.subjectId) });
+    if (scope.ownerId) push({ kind: 'owner', label: 'Owner', ...named(scope.ownerId, f) });
+    if (scope.subjectId) push({ kind: 'account', label: 'Account', ...named(scope.subjectId, f) });
     if (scope.objectType) push({ kind: 'object', label: 'Records', value: humanizeName(scope.objectType) });
     if (scope.groupBy) push({ kind: 'group', label: 'By', value: humanizeName(scope.groupBy) });
     if (scope.limit !== null && asked !== null && scope.limit === asked && cutsRows(scope)) {
@@ -166,16 +181,37 @@ export function slotChipsFromPlan(
 }
 
 /**
+ * Anything shaped like one of this platform's ids.
+ *
+ * Deliberately a shape and not a list of prefixes. The list was the defect
+ * twice: it named `cmp|con|deal|tkt`, so an owner's `usr_seed01` and an
+ * account's `cus_…` walked onto the screen past a guard written to stop
+ * exactly that. A new record type must not need this file edited to stay off
+ * the screen — the safe default is that an id-shaped value is never a name.
+ */
+export const looksLikeRecordId = (value: string): boolean => /^[a-z]{2,8}_[A-Za-z0-9_]{4,}$/.test(value);
+
+/** A name if the workspace knows one, else the chip is left pending. */
+const named = (id: string, f: SlotFormat): Pick<SlotChip, 'value' | 'pending' | 'id'> => {
+  const label = f.name(id);
+  return label && !looksLikeRecordId(label) ? { value: label, id } : { value: '…', pending: true, id };
+};
+
+/**
  * The chips still carrying a record id where a name belongs.
  *
  * A chip's names come from the citations and the teammates; a plan that
- * measured an account which cited nothing leaves `cmp_nw_42` on the chip. The
- * screen reads these records once and draws the chips again with the names.
+ * measured an account which cited nothing leaves `cmp_nw_42` unnamed. The
+ * screen reads those records once and draws the chips again with the names.
+ * Ids it cannot read this way stay pending rather than printing themselves.
  */
 export function rawRecordIds(slots: readonly SlotChip[]): string[] {
   const out: string[] = [];
   for (const slot of slots) {
-    if (/^(cmp|con|deal|tkt)_[A-Za-z0-9_]+$/.test(slot.value) && !out.includes(slot.value)) out.push(slot.value);
+    // Either shape of leak: a chip still waiting for a name, and a chip whose
+    // value is itself an id because something upstream handed one over.
+    const id = slot.pending ? slot.id : (looksLikeRecordId(slot.value) ? slot.value : undefined);
+    if (id && !out.includes(id)) out.push(id);
   }
   return out;
 }

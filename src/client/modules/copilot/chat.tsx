@@ -225,10 +225,13 @@ function AssistantMessage({
         dateRange: (start, end) => f.dateRange(start, end, { timeZone: 'UTC' }),
         date: (ts) => f.date(ts, { timeZone: 'UTC' }),
       }),
+      // No fallback to the id. Handing one back put `OWNER usr_seed01` in front
+      // of the operator for as long as the vocabulary read took, and a chip is
+      // read as a name. Nothing knowing it yet is a pending chip, not an id.
       name: (id) => known[id]
         ?? citations.find((c) => c.id === id)?.label
         ?? vocab.people.find((person) => person.id === id)?.name
-        ?? id,
+        ?? null,
     },
   }), [question, prose, message.tool_calls, run, remembered, templates, hosted, vocab, citations, f, known]);
 

@@ -145,7 +145,8 @@ const NAMES: Record<string, string> = {
 const iso = (ts: number) => new Date(ts).toISOString().slice(0, 10);
 const FORMAT: SlotFormat = {
   window: (w) => windowText(w, { dateRange: (start, end) => `${iso(start)} – ${iso(end)}`, date: (ts) => iso(ts) }),
-  name: (id) => NAMES[id] ?? id,
+  // Mirrors the screen: nothing knows it yet means nothing, never the id.
+  name: (id) => NAMES[id] ?? null,
 };
 
 /* ============================ the whitelist ============================== */
@@ -1624,7 +1625,33 @@ describe('the ids a slot chip is still wearing', () => {
     );
     assert.deepEqual(rawRecordIds(chips), ['cmp_nw_42']);
     assert.deepEqual(rawRecordIds([{ kind: 'account', label: 'Account', value: 'Brightline Foods' }]), []);
-    assert.deepEqual(rawRecordIds([{ kind: 'owner', label: 'Owner', value: 'usr_seed02' }]), [], 'teammates are named by the vocabulary');
+  });
+
+  /**
+   * This assertion used to read the other way — a teammate's id on a chip was
+   * expected to be ignored, "because teammates are named by the vocabulary".
+   * They are, once it arrives. Until then the chip was rendering `usr_seed01`
+   * at the operator, and this test watched it happen and called it correct.
+   * Any id shape is an id, whoever it belongs to.
+   */
+  it('finds a teammate id too, whatever the prefix', () => {
+    assert.deepEqual(rawRecordIds([{ kind: 'owner', label: 'Owner', value: 'usr_seed02' }]), ['usr_seed02']);
+    assert.deepEqual(rawRecordIds([{ kind: 'account', label: 'Account', value: 'cus_dgqX6o9tM1BGxIWi' }]), ['cus_dgqX6o9tM1BGxIWi']);
+    assert.deepEqual(rawRecordIds([{ kind: 'meter', label: 'Meter', value: 'mtr_nw_telemetry' }]), ['mtr_nw_telemetry']);
+  });
+
+  it('shows no id while the name is still being read, and keeps it for the lookup', () => {
+    const chips = slotChipsFromPlan(
+      [{ name: 'business_metric', arguments: { metric: 'open_pipeline', owner_id: 'usr_unknown_to_vocab', group_by: 'none' } }],
+      VOCAB,
+      FORMAT,
+    );
+    const owner = chips.find((chip) => chip.kind === 'owner');
+    assert.ok(owner, 'the answer was still bound to an owner, so the chip stays');
+    assert.equal(owner.pending, true);
+    assert.doesNotMatch(owner.value, /usr_/, 'the id reached the screen');
+    assert.equal(owner.id, 'usr_unknown_to_vocab', 'and the lookup lost the record it must read');
+    assert.deepEqual(rawRecordIds(chips), ['usr_unknown_to_vocab']);
   });
 });
 
