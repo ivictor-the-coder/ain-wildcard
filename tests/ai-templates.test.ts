@@ -121,6 +121,37 @@ function stageSets(): { open: string[]; won: string[]; lost: string[] } {
     lost: rows.filter((r) => r.is_closed && !r.is_won).map((r) => r.name),
   };
 }
+/**
+ * The columns the board actually draws: one per stage of each pipeline, with
+ * the name that pipeline gives it.
+ *
+ * A deal stage is not unique on its own — all three pipelines here have a
+ * `negotiation`, and `qualification` is drawn as "Expansion identified" on one
+ * of them — so a by-stage answer is checked against these rather than against
+ * the stored value, which is what merged two columns under one caption.
+ */
+interface StageColumn { pipeline: string; pipelineLabel: string; stage: string; label: string }
+const stageColumns = (): StageColumn[] =>
+  app.db.all<{ pipeline: string; stage: string; label: string; pipeline_label: string | null }>(
+    `SELECT s.pipeline, s.name AS stage, s.label,
+            (SELECT p.label FROM crm_pipelines p
+              WHERE p.org_id = s.org_id AND p.object_type = 'deal' AND p.name = s.pipeline) AS pipeline_label
+       FROM crm_pipeline_stages s
+      WHERE s.org_id = ? AND s.object_type = 'deal'
+      ORDER BY s.pipeline, s.position`, ORG,
+  ).map((r) => ({ pipeline: r.pipeline, pipelineLabel: r.pipeline_label ?? r.pipeline, stage: r.stage, label: r.label }));
+
+/** Those columns with the deals standing in them, biggest first, empty ones dropped. */
+const byColumn = (rows: Rec[], value: (held: Rec[]) => number) =>
+  stageColumns()
+    .map((column) => ({
+      ...column,
+      held: rows.filter((d) => str(d.p.pipeline) === column.pipeline && str(d.p.deal_stage) === column.stage),
+    }))
+    .filter((column) => column.held.length > 0)
+    .map((column) => ({ ...column, value: value(column.held) }))
+    .sort((a, b) => b.value - a.value);
+
 const isOpen = (d: Rec) => stageSets().open.includes(str(d.p.deal_stage));
 const isWon = (d: Rec) => stageSets().won.includes(str(d.p.deal_stage));
 const isLost = (d: Rec) => stageSets().lost.includes(str(d.p.deal_stage));
@@ -177,6 +208,25 @@ function stageByLabel(label: string): { value: string; pipeline: string | null }
   const scoped = generalLabel !== label.toLowerCase() && pipelines.length === 1 ? pipelines[0] : null;
   return { value, pipeline: scoped };
 }
+/**
+ * The boards that draw a column of this stage, in the order they are drawn.
+ *
+ * A question that names a stage and no pipeline is answered across every board
+ * that has one — three of them share `negotiation` here — and the answer has to
+ * say which, or the figure it quotes appears on no board at all.
+ */
+const boardsWithStage = (label: string): string[] => {
+  const stage = stageByLabel(label);
+  const rows = app.db.all<{ label: string; position: number }>(
+    `SELECT p.label, p.position FROM crm_pipelines p
+      WHERE p.org_id = ? AND p.object_type = 'deal' AND p.archived = 0
+        AND EXISTS (SELECT 1 FROM crm_pipeline_stages s
+                     WHERE s.org_id = p.org_id AND s.object_type = 'deal' AND s.pipeline = p.name AND s.name = ?
+                       AND (? IS NULL OR s.pipeline = ?))
+      ORDER BY p.position`, ORG, stage.value, stage.pipeline, stage.pipeline);
+  return rows.map((r) => r.label);
+};
+
 const dealsAtStage = (label: string): Rec[] => {
   const stage = stageByLabel(label);
   return recs('deal').filter((d) => str(d.p.deal_stage) === stage.value && (!stage.pipeline || str(d.p.pipeline) === stage.pipeline));
@@ -874,8 +924,27 @@ const CORPUS: CorpusRow[] = [
   { template: 'count-deals-at-stage', q: 'How many deals are sitting in Scoping?', expect: () => countRows(dealsAtStage('Scoping')) },
   { template: 'list-deals-at-stage', q: 'Which deals are at the Negotiation stage?', expect: () => listOf(dealsAtStage('Negotiation'), 'deal', 10) },
   { template: 'list-deals-at-stage', q: 'List the deals in Proposal sent', expect: () => listOf(dealsAtStage('Proposal sent'), 'deal', 10) },
-  { template: 'pipeline-at-stage', q: 'How much pipeline is at the Negotiation stage?', expect: () => dealMoney(dealsAtStage('Negotiation')) },
-  { template: 'pipeline-at-stage', q: 'What is our open pipeline at the Commercial terms stage?', expect: () => dealMoney(dealsAtStage('Commercial terms')) },
+  // A stage several boards share is answered across all of them, so the answer
+  // names them: $1,596,340 "at the Negotiation stage" is on no single board.
+  { template: 'pipeline-at-stage', q: 'How much pipeline is at the Negotiation stage?', expect: () => {
+    const boards = boardsWithStage('Negotiation');
+    assert.ok(boards.length > 1, 'fixture: only one board has a Negotiation column');
+    return {
+      ...dealMoney(dealsAtStage('Negotiation')),
+      also: (body) => assert.ok(
+        body.content.includes(`at the Negotiation stage on ${boards.slice(0, -1).join(', ')} and ${boards[boards.length - 1]}`),
+        `the answer does not say which boards it counted (${boards.join(', ')}):\n${body.content}`),
+    };
+  } },
+  // And a stage only one board has says nothing extra: there is nothing to
+  // disambiguate, and a sentence that explains itself anyway is noise.
+  { template: 'pipeline-at-stage', q: 'What is our open pipeline at the Commercial terms stage?', expect: () => {
+    assert.deepEqual(boardsWithStage('Commercial terms').length, 1, 'fixture: more than one board has Commercial terms');
+    return {
+      ...dealMoney(dealsAtStage('Commercial terms')),
+      also: (body) => assert.match(body.content, /at the Commercial terms stage is/),
+    };
+  } },
 
   /* --------------------------------- metrics --------------------------------- */
   { template: 'metric-snapshot', q: 'What is our ARR?', expect: () => moneyOf(recurringBooks(12)) },
@@ -897,7 +966,24 @@ const CORPUS: CorpusRow[] = [
   { template: 'metric-currency-snapshot', q: 'How much outstanding do we have in GBP?', expect: () => moneyOf(outstandingBooks(undefined, 'gbp')) },
   { template: 'metric-currency-period', q: 'What was our revenue in EUR in 2025?', expect: () => moneyOf(revenueBooks(YEAR(2025), undefined, 'eur'), [2025]) },
   { template: 'metric-currency-period', q: 'How much did we invoice in USD in Q2 2026?', expect: () => moneyOf(invoicedBooks(QUARTER(2, 2026), undefined, 'usd'), ['Q2 2026']) },
-  { template: 'breakdown-snapshot', q: 'What is our open pipeline by stage?', expect: () => breakdownOf([...groupBy(recs('deal').filter(isOpen), (d) => str(d.p.deal_stage)).values()].map((held) => ({ label: str(held[0].p.deal_stage), formatted: money(total(held)), count: held.length }))) },
+  // By stage is by *column*: the money under a caption has to be the money in
+  // the column of that name on that pipeline's board, not the sum of every
+  // pipeline's column that happens to store the same stage value.
+  { template: 'breakdown-snapshot', q: 'What is our open pipeline by stage?', expect: () => {
+    const columns = byColumn(recs('deal').filter(isOpen), total);
+    return {
+      ...breakdownOf(columns.map((c) => ({ label: c.label, formatted: money(c.value), count: c.held.length }))),
+      also: (body) => {
+        for (const column of columns) {
+          const line = `• ${column.label} — ${money2(column.value, 'usd')} (${n(column.held.length)} ${column.held.length === 1 ? 'deal' : 'deals'}) · ${column.pipelineLabel}`;
+          assert.ok(body.content.includes(line), `the answer does not state "${line}":\n${body.content}`);
+        }
+        assert.equal(
+          (body.content.match(/^•/gm) ?? []).length, columns.length,
+          `the answer draws a different number of rows than the board has columns:\n${body.content}`);
+      },
+    };
+  } },
   // A counted measure leads with its total, the way a grouped record count does; the groups follow.
   { template: 'breakdown-snapshot', q: 'Break down our open tickets by priority', expect: () => countedBreakdown(recs('ticket').filter(isOpenTicket).length, [...groupBy(recs('ticket').filter(isOpenTicket), (t) => str(t.p.priority)).entries()].map(([label, held]) => ({ label, formatted: n(held.length) }))) },
   // By account: every book is stated in its own currency, and a cut says how many rows it left out.
@@ -1059,7 +1145,22 @@ const CORPUS: CorpusRow[] = [
   } },
 
   /* -------------------------------- dimensions ------------------------------- */
-  { template: 'count-by-dimension', q: 'How many deals are there by stage?', expect: () => { const groups = [...groupBy(recs('deal'), (d) => str(d.p.deal_stage)).entries()]; return { figures: [countRe(recs('deal').length)], numbers: allow(recs('deal').length, ...groups.flatMap(([value, held]) => [held.length, optionLabel('deal', 'deal_stage', value)])) }; } },
+  // The same rule where the count comes from the record table rather than the
+  // metric catalogue: "6 in Qualification" was four New business deals plus two
+  // the Expansion board draws under a different word.
+  { template: 'count-by-dimension', q: 'How many deals are there by stage?', expect: () => {
+    const columns = byColumn(recs('deal'), (held) => held.length);
+    return {
+      figures: [countRe(recs('deal').length)],
+      numbers: allow(recs('deal').length, ...columns.flatMap((c) => [c.held.length, c.label, c.pipelineLabel])),
+      also: (body) => {
+        for (const column of columns) {
+          const line = `• ${column.label} — ${n(column.held.length)} · ${column.pipelineLabel}`;
+          assert.ok(body.content.includes(line), `the answer does not state "${line}":\n${body.content}`);
+        }
+      },
+    };
+  } },
   // Every industry is a row: the aggregate's own twelve-group cut dropped two of fourteen under a head that still counted every company.
   { template: 'count-by-dimension', q: 'Companies by industry', expect: () => { const groups = [...groupBy(recs('company'), (c) => str(c.p.industry)).entries()]; return { figures: [countRe(recs('company').length), ...groups.map(([value, held]) => `${optionLabel('company', 'industry', value)} — ${n(held.length)}`)], numbers: allow(recs('company').length, ...groups.flatMap(([value, held]) => [held.length, optionLabel('company', 'industry', value)])), also: (body) => assert.doesNotMatch(body.content, /…and \d+ more/, `all ${groups.length} industries fit under the cut:\n${body.content}`) }; } },
   { template: 'companies-in-industry', q: 'Which companies are in the consumer packaged goods industry?', expect: () => listOf(recs('company').filter((c) => str(c.p.industry) === optionValue('company', 'industry', 'Consumer packaged goods')), 'company', 25) },

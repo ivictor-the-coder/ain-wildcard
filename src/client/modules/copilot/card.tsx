@@ -35,6 +35,27 @@ export function EngineIndicator({ line }: { line: EngineLine }) {
 }
 
 /**
+ * What a bare follow-up inherited from the question before it.
+ *
+ * "And by owner?" is a breakdown of something, and the something is two turns
+ * up the screen. The card says which measure it carried and which question it
+ * came from — and offers no way to take it off, because a follow-up with its
+ * measure removed is not a question at all. (A carried *record* would be
+ * different, and this engine deliberately carries none.)
+ */
+export function CarriedMeasure({ carried }: { carried: { measure: string; from: string } }) {
+  const Corner = Icons['corner-down-right'];
+  return (
+    <p className="cp-carried">
+      {Corner && <Corner size={12} aria-hidden />}
+      <span className="cp-carried__key">Carried into this question</span>
+      <span className="cp-carried__measure">{carried.measure}</span>
+      <span className="cp-carried__from u-truncate" title={carried.from}>from “{carried.from}”</span>
+    </p>
+  );
+}
+
+/**
  * The way out of a refusal: the nearest shapes it does answer, one press each.
  *
  * This is the main interaction of the surface now. A refusal with nothing

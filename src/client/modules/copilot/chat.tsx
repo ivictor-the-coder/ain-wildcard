@@ -32,7 +32,7 @@ import {
   type Remembered, type StepNote, type ThreadDetail, type ToolEcho, type Vocabulary,
 } from './api';
 import { ApprovalCard, ApprovalResolution, CitationChips, ReasoningList, TraceSteps } from './trace';
-import { EngineIndicator, RefusalHelp, SlotChips } from './card';
+import { CarriedMeasure, EngineIndicator, RefusalHelp, SlotChips } from './card';
 import { TemplatePanel, TemplateStarters } from './templates';
 import { DraftDialog } from './draft';
 
@@ -354,6 +354,8 @@ function AssistantMessage({
             )}
           </Banner>
         )}
+
+        {card.carried && <CarriedMeasure carried={card.carried} />}
 
         <SlotChips slots={card.slots} />
 

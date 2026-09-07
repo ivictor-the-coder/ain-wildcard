@@ -468,6 +468,32 @@ describe('the card, over a corpus of correct template answers', () => {
     assert.deepEqual(answerCard(turn(RIGHT[2])).banners, []);
   });
 
+  it('names the measure a bare follow-up carried, from the completion and from the notes alike', () => {
+    const carried = { measure: 'Open pipeline', from: 'What is our open pipeline?' };
+    // From the completion this session saw…
+    const remembered = answerCard(turn(RIGHT[0], {
+      question: 'And by owner?',
+      remembered: { engine: 'template', nearest: null, template: null, analysis: { carried } },
+    }));
+    assert.deepEqual(remembered.carried, carried);
+    assert.deepEqual(remembered.banners, [], 'a carried measure is not a fault');
+
+    // …and from the run's own working notes, which is all a thread reopened a
+    // week later still has.
+    const reread = answerCard(turn(RIGHT[0], {
+      question: 'And by owner?',
+      remembered: null,
+      run: {
+        ...TEMPLATE_RUN,
+        reasoning: ['This question names no measure of its own; carried "Open pipeline" from "What is our open pipeline?".'],
+      },
+    }));
+    assert.deepEqual(reread.carried, carried);
+
+    // A question that named its own measure carries nothing.
+    assert.equal(answerCard(turn(RIGHT[0])).carried, null);
+  });
+
   it('says which engine answered when it was the model', () => {
     const card = answerCard(turn(RIGHT[0], {
       run: { ...TEMPLATE_RUN, provider: 'anthropic', model: 'claude-sonnet-4-5' },

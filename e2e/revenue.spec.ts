@@ -1194,6 +1194,58 @@ test('a meter the 30-day window has gone quiet on names its last event instead o
   await expect(page.locator('.ain-stat').filter({ hasText: 'Customers streaming' })).toContainText('last 30 days');
 });
 
+/**
+ * The record behind a quiet meter is read one row at a time, and the burst of
+ * those reads is exactly what the rate limiter answers 429 to. Whatever the
+ * reason a read is refused, the cell may not settle on its loading marker for
+ * the life of the page: the operator is left looking at "…" with nothing to
+ * click and no way to know it has stopped trying.
+ */
+test('a meter record the API refused is asked for again, not left on its loading marker', async ({ page }) => {
+  const stamp = Date.now();
+  const eventName = `pw_refused_${stamp}`;
+  const health = await json(page, '/v1/health');
+  const customers = await json(page, '/v1/customers?limit=5');
+  await page.request.post('/api/v1/meters', {
+    data: {
+      name: `Refused meter ${stamp}`, event_name: eventName, aggregation: 'sum', value_key: 'value',
+      customer_key: 'customer_id', unit_label: 'probe', acceptance_window_ms: 60 * 86_400_000,
+    },
+  });
+  // Old enough that the overview's window cannot answer for it, so the row has
+  // to go and read the meter's own record.
+  const sent = await page.request.post('/api/v1/meter-events', {
+    data: {
+      event_name: eventName, customer: customers.data[0].id, identifier: `${eventName}-1`, value: 7,
+      timestamp: (health.time as number) - 45 * 86_400_000, payload: { customer_id: customers.data[0].id, value: 7 },
+    },
+  });
+  expect(sent.ok()).toBe(true);
+
+  // Every record read is refused for the first two seconds, which is the shape
+  // of a limiter answering a burst — never a permanent outage.
+  let refused = 0;
+  const openedAt = Date.now();
+  await page.route('**/api/v1/meters/mtr_*', async (route) => {
+    if (Date.now() - openedAt < 2_000) {
+      refused += 1;
+      return route.fulfill({
+        status: 429,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: { type: 'rate_limit_error', code: 'rate_limit', message: 'Too many requests.', request_id: 'req_probe' } }),
+      });
+    }
+    return route.continue();
+  });
+
+  await page.goto('/revenue/usage', { waitUntil: 'networkidle' });
+  const row = page.locator('tbody tr', { hasText: eventName }).first();
+  await expect(row).toContainText('Nothing in the last 30 days', { timeout: 20_000 });
+  await expect(row).toContainText('Last event');
+  expect(refused, 'the refusal never happened, so nothing was proven').toBeGreaterThan(0);
+  await page.unroute('**/api/v1/meters/mtr_*');
+});
+
 /* ======================== who needs a person ============================= */
 
 test('the recovery queue’s "Needs a person" chip shows exactly the rows that wear the badge, and the tile counts them', async ({ page }) => {
@@ -1398,16 +1450,29 @@ test('a meter that does not exist says so, with the way back, and no raw request
 
 test('the campaign drawer names the subscription’s plan, never its id', async ({ page }) => {
   const all = await json(page, '/v1/dunning?status=all&limit=50');
-  const withSub = all.data.find((row: { subscription: string | null }) => row.subscription);
-  test.skip(!withSub, 'no campaign here belongs to a subscription');
-  const sub = await json(page, `/v1/subscriptions/${withSub.subscription}`);
-  const plan = sub.items.find((item: { metered: boolean }) => !item.metered)?.description ?? sub.items[0]?.description ?? sub.description;
+  // A campaign outlives the subscription it chased, and the workspace is full
+  // of subscriptions other specs have cancelled and deleted by the time this
+  // one runs. Take the first campaign whose subscription can still be read,
+  // rather than the first that merely names one.
+  let withSub: { subscription: string; invoice_number: string } | null = null;
+  let sub: { items?: { metered: boolean; description: string }[]; description?: string } | null = null;
+  for (const row of all.data as { subscription: string | null; invoice_number: string }[]) {
+    if (!row.subscription) continue;
+    const read = await page.request.get(`/api/v1/subscriptions/${row.subscription}`);
+    if (!read.ok()) continue;
+    withSub = { subscription: row.subscription, invoice_number: row.invoice_number };
+    sub = await read.json();
+    break;
+  }
+  test.skip(!withSub || !sub?.items?.length, 'no campaign here belongs to a subscription that still exists');
+  const items = sub!.items!;
+  const plan = items.find((item) => !item.metered)?.description ?? items[0]?.description ?? sub!.description!;
 
   await page.goto('/revenue/dunning?status=all', { waitUntil: 'networkidle' });
-  await page.locator('table tbody tr', { hasText: withSub.invoice_number }).first().click();
+  await page.locator('table tbody tr', { hasText: withSub!.invoice_number }).first().click();
   const drawer = page.getByRole('dialog');
   await expect(drawer).toContainText(plan);
-  await expect(drawer).not.toContainText(withSub.subscription);
+  await expect(drawer).not.toContainText(withSub!.subscription);
 });
 
 test('the recovery tiles never print a 0.00% rate over a book with no finished campaign', async ({ page }) => {

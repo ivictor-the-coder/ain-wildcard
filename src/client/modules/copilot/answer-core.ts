@@ -239,6 +239,35 @@ export function withoutApiInstruction(content: string): string {
   );
 }
 
+/**
+ * The measure this question inherited from the one before it.
+ *
+ * "And by owner?" names no measure, so the engine takes one from the previous
+ * turn and says so — in structure on the completion (`analysis.carried`) and in
+ * its working notes, which is all a thread reopened a week later still has. A
+ * breakdown whose subject came from a question that has scrolled off the top of
+ * the screen has to say where it came from, or the rows underneath it are of
+ * nothing in particular.
+ */
+export function carriedMeasure(
+  source: { reasoning?: string[] | null; analysis?: unknown } | undefined | null,
+): { measure: string; from: string } | null {
+  const analysis = source?.analysis;
+  if (analysis && typeof analysis === 'object' && !Array.isArray(analysis)) {
+    const carried = (analysis as Record<string, unknown>).carried;
+    if (carried && typeof carried === 'object' && !Array.isArray(carried)) {
+      const measure = (carried as Record<string, unknown>).measure;
+      const from = (carried as Record<string, unknown>).from;
+      if (typeof measure === 'string' && measure && typeof from === 'string' && from) return { measure, from };
+    }
+  }
+  for (const line of source?.reasoning ?? []) {
+    const match = /names no measure of its own; carried "([^"]+)" from "([^"]+)"/.exec(line);
+    if (match) return { measure: match[1], from: match[2] };
+  }
+  return null;
+}
+
 export function refusalOf(run: { reasoning?: string[] } | undefined | null): { code: string; message: string } | null {
   for (const line of run?.reasoning ?? []) {
     // "Refused (period_unresolved): …" and "Refused after the run

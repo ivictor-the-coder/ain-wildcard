@@ -12,7 +12,8 @@ import { DAY, formatDate } from '../../shared/time';
 import { money as formatAmount } from './answer';
 import { billingSources, entityIndex, schemaOf, type WorkspaceProfile } from './grounding';
 import { resolveEntities } from './resolve';
-import { aggregate, associatedRecords, fetchRecords, getRecord, type AggregateResult, type Condition, type RecordSummary } from './query';
+import { GROUP_KEY_SEPARATOR, aggregate, associatedRecords, fetchRecords, getRecord, type AggregateResult, type Condition, type RecordSummary } from './query';
+import { crmVocabulary, stageLabelIn } from './qualifiers';
 import { bucketGrain, type TimeWindow } from './dates';
 import { humanise, listPhrase, normalise } from './text';
 
@@ -59,6 +60,15 @@ export interface MetricGroup {
   formatted: string;
   /** The currency this row's money is in. Null for counts, rates and durations. */
   currency: string | null;
+  /**
+   * Where this row lives, when its label is not unique on its own.
+   *
+   * Two pipelines both draw a column called "Proposal sent" and both call the
+   * stage `proposal`, so a by-stage row has to say which board it is on or it
+   * names a figure the reader cannot go and look at. Null for a dimension whose
+   * labels stand alone.
+   */
+  qualifier: string | null;
 }
 
 /**
@@ -157,17 +167,36 @@ const formatValue = (value: number, unit: MetricUnit, workspace: WorkspaceProfil
   }
 };
 
-function groupsFrom(result: AggregateResult, unit: MetricUnit, workspace: WorkspaceProfile, labeller?: (key: string) => string): MetricGroup[] {
+/**
+ * How a group key reads: its name, and where it lives when the name is shared.
+ *
+ * A labeller may also rewrite the key, which is what the pipeline-qualified
+ * stage grouping needs — the key it is handed is two values in one string, and
+ * what leaves here has to be something a reader and a caller can both use.
+ */
+export interface GroupNaming { key?: string; label: string; qualifier?: string | null }
+type GroupLabeller = (key: string) => string | GroupNaming;
+
+const named = (labeller: GroupLabeller | undefined, key: string): GroupNaming => {
+  const named = labeller ? labeller(key) : humanise(key);
+  return typeof named === 'string' ? { label: named } : named;
+};
+
+function groupsFrom(result: AggregateResult, unit: MetricUnit, workspace: WorkspaceProfile, labeller?: GroupLabeller): MetricGroup[] {
   return result.groups
     .filter((g) => g.count > 0)
-    .map((g) => ({
-      key: g.key,
-      label: labeller ? labeller(g.key) : humanise(g.key),
-      value: g.value,
-      count: g.count,
-      formatted: formatValue(g.value, unit, workspace),
-      currency: unit === 'money' ? workspace.currency : null,
-    }));
+    .map((g) => {
+      const naming = named(labeller, g.key);
+      return {
+        key: naming.key ?? g.key,
+        label: naming.label,
+        value: g.value,
+        count: g.count,
+        formatted: formatValue(g.value, unit, workspace),
+        currency: unit === 'money' ? workspace.currency : null,
+        qualifier: naming.qualifier ?? null,
+      };
+    });
 }
 
 /**
@@ -309,12 +338,52 @@ function customerLabeller(input: MetricInput): (key: string) => string {
   return (key) => byId.get(key) ?? humanise(key);
 }
 
+/**
+ * A by-stage row reads as the column the board draws it as.
+ *
+ * The stage *value* is not a column: `qualification` is "Qualification" on New
+ * business and "Expansion identified" on Expansion, and `proposal` is drawn
+ * twice under the same words on two different boards. Grouping on the value
+ * alone summed columns across pipelines and captioned the total with one of
+ * their names — every figure added up and none of them could be found on any
+ * board. So the grouping is pipeline-and-stage, and each row is named by the
+ * pipeline that draws it.
+ */
+function stageLabeller(input: MetricInput): GroupLabeller {
+  const vocabulary = crmVocabulary(input.ctx, input.workspace.orgId);
+  const pipelines = new Map(vocabulary.pipelines.map((p) => [p.value, p.label]));
+  return (key) => {
+    const [pipeline, stage] = key.split(GROUP_KEY_SEPARATOR);
+    if (stage === undefined) return { label: stageLabelIn(vocabulary, key, null) ?? humanise(key) };
+    return {
+      key: pipeline && pipeline !== '—' ? `${pipeline}:${stage}` : stage,
+      label: stageLabelIn(vocabulary, stage, pipeline) ?? humanise(stage),
+      qualifier: pipelines.get(pipeline) ?? null,
+    };
+  };
+}
+
 function timeLabeller(): (key: string) => string {
   return (key) => {
     if (/^\d{4}-\d{2}-\d{2}$/.test(key)) return formatDate(Date.parse(`${key}T00:00:00Z`), { timeZone: 'UTC' });
     if (/^\d{4}-\d{2}$/.test(key)) return formatDate(Date.parse(`${key}-01T00:00:00Z`), { timeZone: 'UTC' }).replace(/\s\d+,/, '');
     return key;
   };
+}
+
+/**
+ * How each row of a breakdown is named, for the dimension it was grouped on.
+ *
+ * Every grouped metric asks here rather than deciding for itself, so a
+ * dimension whose keys are not readable — a month bucket, a pipeline-qualified
+ * stage — cannot reach an answer as the key the database grouped on.
+ */
+function labellerFor(input: MetricInput): GroupLabeller | undefined {
+  switch (input.groupBy) {
+    case 'time': return timeLabeller();
+    case 'stage': return stageLabeller(input);
+    default: return undefined;
+  }
 }
 
 function groupSpec(input: MetricInput, dateProperty: string): Partial<Parameters<typeof aggregate>[2]> {
@@ -324,7 +393,7 @@ function groupSpec(input: MetricInput, dateProperty: string): Partial<Parameters
   switch (input.groupBy) {
     case 'time': return { ...cap, groupByDate: { property: dateProperty, grain: bucketGrain(input.window) } };
     case 'owner': return {};
-    case 'stage': return { ...cap, groupBy: 'deal_stage' };
+    case 'stage': return { ...cap, groupBy: ['pipeline', 'deal_stage'] };
     case 'pipeline': return { ...cap, groupBy: 'pipeline' };
     case 'industry': return { ...cap, groupBy: 'industry' };
     case 'status': return { ...cap, groupBy: 'status' };
@@ -350,7 +419,7 @@ function groupByOwner(ctx: Ctx, orgId: string, objectType: string, conditions: C
   }
   const names = new Map(workspace.people.map((p) => [p.id, p.name]));
   return [...byOwner.entries()]
-    .map(([key, v]) => ({ key, label: names.get(key) ?? 'Unassigned', value: v.value, count: v.count, formatted: formatValue(v.value, unit, workspace), currency: unit === 'money' ? workspace.currency : null }))
+    .map(([key, v]) => ({ key, label: names.get(key) ?? 'Unassigned', value: v.value, count: v.count, formatted: formatValue(v.value, unit, workspace), currency: unit === 'money' ? workspace.currency : null, qualifier: null }))
     .sort((a, b) => b.value - a.value);
 }
 
@@ -663,6 +732,7 @@ function recurringRevenue(input: MetricInput, months: 1 | 12): MetricResult {
           count: row.count,
           formatted: formatValue(row.value, 'money', input.workspace, row.currency),
           currency: row.currency,
+          qualifier: null,
         }))
         .sort((a, b) => b.value - a.value || a.label.localeCompare(b.label))
         .filter((g) => {
@@ -758,6 +828,7 @@ function ratioGroups(
       count: bucket.decided,
       formatted: formatValue((bucket.won / bucket.decided) * 100, 'percent', input.workspace),
       currency: null,
+      qualifier: null,
     }))
     .sort((a, b) => (groupBy === 'time' ? a.key.localeCompare(b.key) : b.value - a.value || a.label.localeCompare(b.label)));
   if (!groups.length) return { groups, note: null };
@@ -807,6 +878,7 @@ function moneyIn(
         count: g.count,
         formatted: money(g.value, input.workspace, g.currency),
         currency: g.currency,
+        qualifier: null,
       })),
     });
   }
@@ -826,7 +898,7 @@ function moneyIn(
   });
   const groups = input.groupBy === 'owner'
     ? groupByOwner(input.ctx, input.workspace.orgId, 'deal', conditions, { property: 'close_date', start: input.window.start, end: input.window.end }, { property: 'amount', fn: 'sum' }, input.workspace, 'money', scope.associatedTo)
-    : groupsFrom(agg, 'money', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined);
+    : groupsFrom(agg, 'money', input.workspace, labellerFor(input));
   return result(input, { ...def, snapshot: false }, {
     value: agg.value,
     count: agg.count,
@@ -893,6 +965,7 @@ function retentionMetric(input: MetricInput, kind: 'churn' | 'nrr' | 'grr'): Met
       count: months,
       formatted: rate.percent,
       currency: part.currency,
+      qualifier: null,
     }))
     .sort((a, b) => b.value - a.value);
 
@@ -964,7 +1037,7 @@ const DEFS: MetricDefinition[] = [
       });
       const groups = input.groupBy === 'owner'
         ? groupByOwner(input.ctx, input.workspace.orgId, 'deal', conditions, undefined, { property: 'amount', fn: 'sum' }, input.workspace, 'money', scope.associatedTo)
-        : groupsFrom(agg, 'money', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined);
+        : groupsFrom(agg, 'money', input.workspace, labellerFor(input));
       return result(input, { snapshot: true, id: 'pipeline', label: 'Open pipeline', unit: 'money' }, {
         value: agg.value, count: agg.count, ids: agg.ids, groups, groupTotal: agg.groupTotal,
         source: `${agg.count} open ${agg.count === 1 ? 'deal' : 'deals'}`, sourceKind: 'deals',
@@ -988,7 +1061,7 @@ const DEFS: MetricDefinition[] = [
       });
       return result(input, { snapshot: true, id: 'weighted_pipeline', label: 'Weighted pipeline', unit: 'money' }, {
         value: agg.value, count: agg.count, ids: agg.ids,
-        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'money', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined),
+        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'money', input.workspace, labellerFor(input)),
         source: `${agg.count} open ${agg.count === 1 ? 'deal' : 'deals'} weighted by probability`, sourceKind: 'deals',
         note: 'Weighted pipeline is every open deal multiplied by its stage probability, as it stands today — a snapshot of the whole book, not a total for one close-date window.',
       });
@@ -1012,7 +1085,7 @@ const DEFS: MetricDefinition[] = [
       });
       const groups = input.groupBy === 'owner'
         ? groupByOwner(input.ctx, input.workspace.orgId, 'deal', conditions, window, { property: 'amount', fn: 'sum' }, input.workspace, 'money', scope.associatedTo)
-        : groupsFrom(agg, 'money', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined);
+        : groupsFrom(agg, 'money', input.workspace, labellerFor(input));
       return result(input, { id: 'closed_won', label: 'Closed-won bookings', unit: 'money' }, {
         value: agg.value, count: agg.count, ids: agg.ids, groups, groupTotal: agg.groupTotal,
         source: `${agg.count} closed-won ${agg.count === 1 ? 'deal' : 'deals'}`, sourceKind: 'deals',
@@ -1032,7 +1105,7 @@ const DEFS: MetricDefinition[] = [
       });
       return result(input, { id: 'closed_lost', label: 'Closed-lost value', unit: 'money' }, {
         value: agg.value, count: agg.count, ids: agg.ids,
-        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'money', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined),
+        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'money', input.workspace, labellerFor(input)),
         source: `${agg.count} closed-lost ${agg.count === 1 ? 'deal' : 'deals'}`, sourceKind: 'deals',
       });
     },
@@ -1103,7 +1176,7 @@ const DEFS: MetricDefinition[] = [
       });
       return result(input, { snapshot: true, id: 'deal_count', label: 'Deals', unit: 'count' }, {
         value: agg.count, count: agg.count, ids: agg.ids,
-        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace),
+        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace, labellerFor(input)),
         source: `${agg.count} open ${agg.count === 1 ? 'deal' : 'deals'}`, sourceKind: 'deals',
       });
     },
@@ -1119,7 +1192,7 @@ const DEFS: MetricDefinition[] = [
       });
       return result(input, { id: 'new_customers', label: 'New customers', unit: 'count' }, {
         value: agg.count, count: agg.count, ids: agg.ids,
-        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined),
+        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace, labellerFor(input)),
         source: `${agg.count} ${agg.count === 1 ? 'account that became a customer' : 'accounts that became customers'}`, sourceKind: 'records',
       });
     },
@@ -1133,7 +1206,7 @@ const DEFS: MetricDefinition[] = [
         sampleIds: 8, ...(input.groupBy === 'industry' ? { groupBy: 'industry' } : {}),
       });
       return result(input, { snapshot: true, id: 'customers', label: 'Customers', unit: 'count' }, {
-        value: agg.count, count: agg.count, ids: agg.ids, groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace),
+        value: agg.count, count: agg.count, ids: agg.ids, groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace, labellerFor(input)),
         source: `${agg.count} ${agg.count === 1 ? 'account' : 'accounts'} marked as a customer`, sourceKind: 'records',
       });
     },
@@ -1149,7 +1222,7 @@ const DEFS: MetricDefinition[] = [
       });
       return result(input, { snapshot: true, id: 'open_tickets', label: 'Open tickets', unit: 'count' }, {
         value: agg.count, count: agg.count, ids: agg.ids,
-        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace),
+        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace, labellerFor(input)),
         source: `${agg.count} ${agg.count === 1 ? 'ticket' : 'tickets'} not yet closed`, sourceKind: 'tickets',
       });
     },
@@ -1165,7 +1238,7 @@ const DEFS: MetricDefinition[] = [
       });
       return result(input, { id: 'tickets_created', label: 'Tickets raised', unit: 'count' }, {
         value: agg.count, count: agg.count, ids: agg.ids,
-        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace, input.groupBy === 'time' ? timeLabeller() : undefined),
+        groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace, labellerFor(input)),
         source: `${agg.count} ${agg.count === 1 ? 'ticket' : 'tickets'} raised in the period`, sourceKind: 'tickets',
       });
     },
@@ -1216,7 +1289,7 @@ const DEFS: MetricDefinition[] = [
         });
         total += agg.count;
         ids.push(...agg.ids);
-        if (agg.count) groups.push({ key: type, label: humanise(`${type}s`), value: agg.count, count: agg.count, formatted: String(agg.count), currency: null });
+        if (agg.count) groups.push({ key: type, label: humanise(`${type}s`), value: agg.count, count: agg.count, formatted: String(agg.count), currency: null, qualifier: null });
       }
       groups.sort((a, b) => b.value - a.value);
       return result(input, { id: 'activities', label: 'Logged activity', unit: 'count' }, {
@@ -1234,7 +1307,7 @@ const DEFS: MetricDefinition[] = [
         sampleIds: 6, ...subjectScope(input), groupBy: 'meeting_type',
       });
       return result(input, { id: 'meetings', label: 'Meetings held', unit: 'count' }, {
-        value: agg.count, count: agg.count, ids: agg.ids, groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace),
+        value: agg.count, count: agg.count, ids: agg.ids, groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace, labellerFor(input)),
         source: `${agg.count} ${agg.count === 1 ? 'meeting' : 'meetings'} on the timeline`, sourceKind: 'activities',
       });
     },
@@ -1259,7 +1332,7 @@ const DEFS: MetricDefinition[] = [
         ...(input.groupBy === 'industry' ? { groupBy: 'industry' } : {}),
       });
       return result(input, { snapshot: true, id: 'connected_assets', label: 'Connected assets', unit: 'count' }, {
-        value: agg.value, count: agg.count, ids: agg.ids, groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace),
+        value: agg.value, count: agg.count, ids: agg.ids, groupTotal: agg.groupTotal, groups: groupsFrom(agg, 'count', input.workspace, labellerFor(input)),
         source: `${agg.count} ${agg.count === 1 ? 'account' : 'accounts'} reporting telemetry`, sourceKind: 'records',
       });
     },
@@ -1323,7 +1396,7 @@ export function topAccounts(input: MetricInput, metric: MetricDefinition, limit 
     if (scoped.value > 0) {
       rows.push({
         key: company.id, label: company.display_name, value: scoped.value, count: scoped.count,
-        formatted: scoped.formatted, currency: scoped.currency,
+        formatted: scoped.formatted, currency: scoped.currency, qualifier: null,
       });
     }
   }

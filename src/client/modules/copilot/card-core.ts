@@ -7,7 +7,7 @@
  * a corpus of correct template answers can be run through it and the number
  * of banners counted: zero.
  */
-import { nearestFromReasoning, noWritePrepared, refusalOf, splitRefusalOffer, writeNeedsSwitch } from './answer-core';
+import { carriedMeasure, nearestFromReasoning, noWritePrepared, refusalOf, splitRefusalOffer, writeNeedsSwitch } from './answer-core';
 import { bindingOf, numberAsked, slotChips, type SlotChip, type SlotFormat } from './slots-core';
 import type { ToolCallLike, Vocabulary } from './scope-core';
 import {
@@ -99,6 +99,15 @@ export interface AnswerCard {
   noWrite: { tool: string; why: string } | null;
   /** A write asked for with "Let it prepare writes" off: the switch is the fix. */
   switchOff: { tool: string } | null;
+  /**
+   * The measure a bare follow-up inherited, and the question it came from.
+   *
+   * Stated, never offered as removable: taking the measure off "And by owner?"
+   * leaves nothing to ask. A carried *record* is a different thing and this
+   * engine does not carry one — a later question that named no subject was once
+   * answered for an earlier one's account, and the fix was to stop.
+   */
+  carried: { measure: string; from: string } | null;
   failed: string | null;
   /** Every banner the card will draw. A scoped answer draws none. */
   banners: CardBanner[];
@@ -132,6 +141,8 @@ export function answerCard(input: TurnInput): AnswerCard {
     };
   }
 
+  const carried = carriedMeasure({ reasoning: run?.reasoning ?? undefined, analysis: remembered?.analysis })
+    ?? carriedMeasure({ reasoning: run?.reasoning ?? undefined, analysis: run?.analysis });
   const noWrite = noWritePrepared(notes);
   const switchOff = writeNeedsSwitch({ reasoning: run?.reasoning ?? undefined, analysis: remembered?.analysis });
   const failed = run?.status === 'failed' ? (run.error ?? 'The run failed before it answered.') : null;
@@ -153,5 +164,5 @@ export function answerCard(input: TurnInput): AnswerCard {
   if (noWrite) banners.push('no_write');
   if (switchOff) banners.push('switch_off');
 
-  return { engine, indicator, refusal, slots, noWrite, switchOff, failed, banners };
+  return { engine, indicator, refusal, slots, noWrite, switchOff, failed, carried, banners };
 }

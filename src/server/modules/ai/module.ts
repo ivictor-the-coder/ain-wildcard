@@ -233,6 +233,7 @@ function describeAnalysis(completion: AinCompletion) {
     plan: analysis.plan,
     steps: analysis.steps,
     write_blocked: analysis.writeBlocked,
+    carried: analysis.carried,
     scoped_tools: analysis.scopedTools,
     budget_exhausted: analysis.budgetExhausted,
     facts: analysis.facts,

@@ -39,6 +39,12 @@ export interface EngineAnalysis {
   plan: PlanStep[];
   steps: { tool: string; ok: boolean; code: string | null; ms: number }[];
   writeBlocked: { wanted: string; reason: string } | null;
+  /**
+   * The measure this question inherited from the one before it, when it named
+   * none of its own — "And by owner?" after "What is our open pipeline?".
+   * Null when the question stood on its own words, which is almost always.
+   */
+  carried: { measure: string; from: string } | null;
   scopedTools: string[] | null;
   budgetExhausted: boolean;
   facts: Facts;
@@ -82,6 +88,49 @@ function labelOf(b: Bindings[string]): string {
     case 'ageing-bucket': return value.label;
     default: return b.text;
   }
+}
+
+/**
+ * A follow-up that names a dimension and nothing else: "And by owner?".
+ *
+ * The prefix is optional so "by stage?" on its own counts, and the rest of the
+ * sentence has to be the grouping — anything that carries its own subject is
+ * not a follow-up and is matched, or refused, on its own words.
+ */
+const FOLLOW_UP = /^(?:and|so|ok(?:ay)?|now|then|also|what about|how about)?[\s,]*((?:broken down |split )?by\s+\S.*?)\s*\??$/i;
+
+/**
+ * The question a bare follow-up is really asking.
+ *
+ * "And by owner?" names no measure, and the engine answers one question at a
+ * time — so it refused, three words after answering the question it is a
+ * follow-up to. The measure is taken from the previous turn by re-asking that
+ * question with this one's grouping on the end, which means the follow-up is
+ * matched, checked and planned by the same templates as anything else: nothing
+ * here decides what an answer is, only which sentence gets answered.
+ *
+ * Only a *measure* is inherited. A record — the account or teammate an earlier
+ * question named — is never carried: a later question that named no subject was
+ * answered for one account's $315,900 against a workspace book of $9,010,960,
+ * and the fix for that was to stop carrying it, not to warn about it.
+ */
+function carriedTurn(
+  question: string,
+  messages: readonly { role: string; content: string }[],
+  vocab: Vocabulary,
+  catalogue: Template[],
+): { outcome: ReturnType<typeof matchTemplates>; measure: string; from: string } | null {
+  const follow = FOLLOW_UP.exec(question.trim());
+  if (!follow) return null;
+  const asked = messages.filter((m) => m.role === 'user').map((m) => m.content.trim()).filter(Boolean);
+  // The last one is this question; the one before it is what it follows.
+  const previous = asked[asked.length - 2];
+  if (!previous) return null;
+  const outcome = matchTemplates(`${previous.replace(/[?\s]+$/, '')} ${follow[1].trim()}?`, vocab, catalogue);
+  if (!outcome.match) return null;
+  const metric = Object.values(outcome.match.bindings).find((b) => b.value.kind === 'metric');
+  if (!metric || metric.value.kind !== 'metric') return null;
+  return { outcome, measure: metric.value.label, from: previous };
 }
 
 async function runPlan(
@@ -136,7 +185,17 @@ export function builtinEngine(): AiProvider {
       reasoning.push(`Engine: template whitelist (${ENGINE_MODEL}); ${catalogue.length} question shapes reachable with ${reachable.length} ${reachable.length === 1 ? 'tool' : 'tools'}.`);
       runtime.note(call, 'provider', 'template-engine', `Matching against ${catalogue.length} shapes`);
 
-      const outcome = matchTemplates(question, vocab, catalogue);
+      let outcome = matchTemplates(question, vocab, catalogue);
+      let carried: EngineAnalysis['carried'] = null;
+      if (!outcome.match && catalogue.length) {
+        const carry = carriedTurn(question, req.messages, vocab, catalogue);
+        if (carry) {
+          outcome = carry.outcome;
+          carried = { measure: carry.measure, from: carry.from };
+          reasoning.push(`This question names no measure of its own; carried "${carry.measure}" from "${carry.from}".`);
+          runtime.note(call, 'plan', 'carry_measure', `${carry.measure} from "${carry.from}"`);
+        }
+      }
       const facts: Facts = { ...NO_FACTS };
       let content = '';
       let citations: Citation[] = [];
@@ -245,6 +304,7 @@ export function builtinEngine(): AiProvider {
         plan,
         steps: steps.map((s) => ({ tool: s.tool, ok: s.ok, code: s.error?.code ?? null, ms: s.ms })),
         writeBlocked,
+        carried,
         scopedTools,
         budgetExhausted,
         facts,

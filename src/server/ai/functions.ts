@@ -18,7 +18,7 @@ import {
   accountSnapshot, metricById, metricIds, stageSets, topAccounts,
   type GroupBy, type MetricResult, type MetricSubject,
 } from './metrics';
-import { aggregate, associatedRecords, fetchRecords, getRecord, propertyMap, type Condition, type RecordSummary } from './query';
+import { GROUP_KEY_SEPARATOR, aggregate, associatedRecords, fetchRecords, getRecord, propertyMap, type Condition, type RecordSummary } from './query';
 import { defaultWindow, previousWindow, type TimeWindow } from './dates';
 import { humanise, listPhrase, truncate } from './text';
 
@@ -859,7 +859,7 @@ export interface RecordAggregateResult {
    * with no currency symbol on it, in the same answer whose headline read
    * "$9,010,960" — one run, two ways of writing the same money.
    */
-  groups: { key: string; label: string; value: number; count: number; formatted: string }[];
+  groups: { key: string; label: string; value: number; count: number; formatted: string; qualifier: string | null }[];
   /** How many groups there are before `groups` was cut at 25; the rest are counted, never dropped in silence. */
   group_total: number;
   sample_ids: string[];
@@ -886,12 +886,17 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
     return { error: `Cannot group by "${args.group_by}" — no such property on ${args.object_type}.` };
   }
 
+  // A deal stage is only a column once its pipeline is known: `qualification`
+  // is "Qualification" on New business and "Expansion identified" on Expansion.
+  // Counting the bare value merged two columns of the board into one row and
+  // gave it one of their names — the same defect the metric catalogue had.
+  const byStage = args.object_type === 'deal' && args.group_by === 'deal_stage';
   const result = aggregate(ctx, orgId, {
     objectType: args.object_type,
     conditions: args.conditions ?? [],
     window: datedWindow(args),
     measure: measure === 'count' ? undefined : { property: args.property!, fn: measure },
-    groupBy: byOwner ? undefined : args.group_by,
+    groupBy: byOwner ? undefined : byStage ? ['pipeline', 'deal_stage'] : args.group_by,
     associatedTo: args.associated_to,
     associatedToAny: args.associated_to_any,
     // A rep named in the question is a filter on the count. Without it "how
@@ -923,6 +928,20 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
     : Number(value.toFixed(2)).toLocaleString(workspace.locale));
 
   const optionLabels = new Map((args.group_by && !byOwner ? properties.get(args.group_by)?.options ?? [] : []).map((o) => [o.value, o.label]));
+  const stages = byStage ? crmVocabulary(ctx, orgId) : null;
+  const pipelineLabels = new Map((stages?.pipelines ?? []).map((p) => [p.value, p.label]));
+  /** One grouped row, named the way the board draws it. */
+  const namedGroup = (key: string): { key: string; label: string; qualifier: string | null } => {
+    if (byOwner) return { key, label: personName(workspace, key) ?? 'Unassigned', qualifier: null };
+    if (!stages) return { key, label: optionLabels.get(key) ?? humanise(key), qualifier: null };
+    const [pipeline, stage] = key.split(GROUP_KEY_SEPARATOR);
+    if (stage === undefined) return { key, label: optionLabels.get(key) ?? humanise(key), qualifier: null };
+    return {
+      key: pipeline && pipeline !== '—' ? `${pipeline}:${stage}` : stage,
+      label: stageLabelIn(stages, stage, pipeline) ?? optionLabels.get(stage) ?? humanise(stage),
+      qualifier: pipelineLabels.get(pipeline) ?? null,
+    };
+  };
   // Owners live on the record row rather than in a property, so "by owner" is
   // grouped here from the rows themselves.
   const groups = byOwner
@@ -949,8 +968,7 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
     formatted: measure === 'count' ? String(result.count) : format(result.value),
     matched_records: result.count,
     groups: groups.map((g) => ({
-      key: g.key,
-      label: byOwner ? (personName(workspace, g.key) ?? 'Unassigned') : optionLabels.get(g.key) ?? humanise(g.key),
+      ...namedGroup(g.key),
       value: measure === 'count' ? g.count : g.value,
       count: g.count,
       formatted: measure === 'count' ? g.count.toLocaleString(workspace.locale) : format(g.value),

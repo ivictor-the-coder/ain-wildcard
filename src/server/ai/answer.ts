@@ -165,10 +165,16 @@ export function renderAggregateMeasure(result: RecordAggregateResult, measure: s
 export function renderGroupedCount(result: RecordAggregateResult, thing: string, dimension: string, workspace: WorkspaceProfile): Rendered {
   const [, pluralForm] = thing.split('|');
   const total = result.matched_records;
+  const qualified = result.groups.some((g) => g.qualifier);
   const head = total === 0
     ? `There are no ${pluralForm} to break down by ${dimension}.`
-    : `${n(total, workspace.locale)} ${pluralForm} by ${dimension}:`;
-  const lines = result.groups.map((g) => `• ${g.label} — ${g.formatted}`);
+    : `${n(total, workspace.locale)} ${pluralForm} by ${dimension}`
+      + (qualified ? ` — one row per ${dimension} column on the board, since two pipelines can carry the same ${dimension}` : '')
+      + ':';
+  // The same rule the metric breakdown follows: the caption is the column's
+  // own name and the pipeline that draws it follows the figure, because two
+  // pipelines can carry a stage of the same name.
+  const lines = result.groups.map((g) => `• ${g.label} — ${g.formatted}${g.qualifier ? ` · ${g.qualifier}` : ''}`);
   const rest = Math.max(result.group_total, result.groups.length) - result.groups.length;
   const tail = rest > 0 ? `…and ${n(rest, workspace.locale)} more.` : '';
   return {
@@ -239,7 +245,9 @@ export function renderMetric(result: MetricToolResult, workspace: WorkspaceProfi
 export function renderBreakdown(result: MetricToolResult, dimension: string, workspace: WorkspaceProfile, opts: { period?: string | null; limit?: number }): Rendered {
   const period = result.snapshot ? null : (opts.period ?? result.window.label);
   const limit = opts.limit ?? 25;
-  const groups = result.groups.length ? result.groups : result.top_accounts.map((a) => ({ key: a.id, label: a.label, formatted: a.formatted, count: 0, value: 0, currency: a.currency }));
+  const groups = result.groups.length
+    ? result.groups
+    : result.top_accounts.map((a) => ({ key: a.id, label: a.label, formatted: a.formatted, count: 0, value: 0, currency: a.currency, qualifier: null }));
   if (!groups.length) {
     return {
       content: `${result.label}${period ? ` ${periodPhrase(period)}` : ''} does not break down by ${dimension} in this workspace: nothing behind the figure carries that grouping.`,
@@ -249,7 +257,12 @@ export function renderBreakdown(result: MetricToolResult, dimension: string, wor
   }
   const isRate = result.unit === 'percent';
   const noun = rowNoun(result);
-  const line = (g: typeof groups[number]) => `• ${g.label} — ${g.formatted}${g.count && !isRate && result.unit !== 'count' ? ` (${n(g.count, workspace.locale)} ${plural(g.count, noun)})` : ''}`;
+  // Where the row lives follows the figure rather than leading it: the caption
+  // is the column's own name, so it can be looked for on the board, and the
+  // pipeline that draws that column is what tells two identical captions apart.
+  const line = (g: typeof groups[number]) => `• ${g.label} — ${g.formatted}`
+    + (g.count && !isRate && result.unit !== 'count' ? ` (${n(g.count, workspace.locale)} ${plural(g.count, noun)})` : '')
+    + (g.qualifier ? ` · ${g.qualifier}` : '');
   const books = new Map<string, typeof groups>();
   if (result.unit === 'money') {
     for (const g of groups) {
@@ -283,7 +296,19 @@ export function renderBreakdown(result: MetricToolResult, dimension: string, wor
   // as by the ten rows under it. Money and rates lead with the label only —
   // a sum across books or across rates is not a figure.
   const subject = result.unit === 'count' && result.value > 0 ? `${result.formatted} ${result.label.toLowerCase()}` : result.label;
-  const head = `${subject} by ${dimension}${period ? ` ${periodPhrase(period)}` : ''}${isRate ? ' — each row is its own rate, and the rows do not sum' : sectioned ? ' — one section per currency book, and the books are not added together' : ''}:`;
+  // A dimension whose labels are only unique inside another one has to say so.
+  // Three rows reading "Negotiation" are three columns on three boards, not a
+  // rendering fault — and the one thing this may never do is add them up under
+  // a caption belonging to one of them.
+  const qualified = shown.some((g) => g.qualifier);
+  const aside = isRate
+    ? ' — each row is its own rate, and the rows do not sum'
+    : sectioned
+      ? ' — one section per currency book, and the books are not added together'
+      : qualified
+        ? ` — one row per ${dimension} column on the board, since two pipelines can carry the same ${dimension}`
+        : '';
+  const head = `${subject} by ${dimension}${period ? ` ${periodPhrase(period)}` : ''}${aside}:`;
   return {
     content: [head, body, tail].filter(Boolean).join('\n\n'),
     citations: result.evidence.slice(0, 8),

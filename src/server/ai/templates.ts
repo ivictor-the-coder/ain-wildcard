@@ -537,6 +537,29 @@ const BREAKDOWNS: Record<string, string[]> = {
   open_tickets: ['status', 'priority'],
 };
 
+/**
+ * "at the Negotiation stage" — and which boards that is, when it is more than
+ * one of them.
+ *
+ * All three pipelines here have a `negotiation`, so a question that names the
+ * stage and no pipeline is answered over three columns at once: $1,596,340
+ * across boards that hold $1,062,740, $368,000 and $165,600. The figure is
+ * right and a reader who goes looking for it finds none of it, which is the
+ * same fault as captioning a merged bucket with one column's name. A stage the
+ * question narrowed to one pipeline — "Scoping" is Expansion's word — says
+ * nothing extra, because there is nothing to disambiguate.
+ */
+function atStage(stage: { value: string; label: string; pipeline: string | null }, v: Vocabulary): string {
+  const phrase = `at the ${stage.label} stage`;
+  if (stage.pipeline) return phrase;
+  const carried: string[] = [];
+  if (carried.length < 2) return phrase;
+  // In the order the boards themselves are drawn in, not the order the stage
+  // rows happened to come back in.
+  const names = v.crm.pipelines.filter((p) => carried.includes(p.value)).map((p) => p.label);
+  return `${phrase} on ${listPhrase(names.length ? names : carried)}`;
+}
+
 /** Which end of the year the examples point at: a completed one, with data in it. */
 const exampleYear = (v: Vocabulary): number => new Date(v.workspace.now).getUTCFullYear() - 1;
 
@@ -989,7 +1012,7 @@ export const TEMPLATES: Template[] = [
       const stage = slot(b, 'stage', 'stage');
       return [{ tool: 'record_aggregate', args: countArgs('deal', stage.conditions), why: `Count deals at the ${stage.label} stage.` }];
     },
-    render: (steps, b, v) => renderAggregateCount(resultOf<RecordAggregateResult>(steps), 'deal|deals', `at the ${slot(b, 'stage', 'stage').label} stage`, v.workspace),
+    render: (steps, b, v) => renderAggregateCount(resultOf<RecordAggregateResult>(steps), 'deal|deals', atStage(slot(b, 'stage', 'stage'), v), v.workspace),
   }),
   T({
     id: 'list-deals-at-stage', kind: 'list', intent: 'lookup',
@@ -1004,7 +1027,7 @@ export const TEMPLATES: Template[] = [
       const stage = slot(b, 'stage', 'stage');
       return [{ tool: 'record_search', args: searchArgs('deal', stage.conditions), why: `List deals at the ${stage.label} stage.` }];
     },
-    render: (steps, b, v) => renderList(resultOf<RecordSearchResult>(steps), 'deal|deals', `at the ${slot(b, 'stage', 'stage').label} stage`, v.workspace),
+    render: (steps, b, v) => renderList(resultOf<RecordSearchResult>(steps), 'deal|deals', atStage(slot(b, 'stage', 'stage'), v), v.workspace),
   }),
   T({
     id: 'pipeline-at-stage', kind: 'metric', intent: 'aggregate',
@@ -1020,7 +1043,7 @@ export const TEMPLATES: Template[] = [
       const stage = slot(b, 'stage', 'stage');
       return [{ tool: 'business_metric', args: { metric: 'pipeline', stage: stage.value, ...(stage.pipeline ? { pipeline: stage.pipeline } : {}), compare: false }, why: `Open pipeline narrowed to the ${stage.label} stage.` }];
     },
-    render: (steps, b, v) => renderMetric(resultOf<MetricToolResult>(steps), v.workspace, { scope: `at the ${slot(b, 'stage', 'stage').label} stage` }),
+    render: (steps, b, v) => renderMetric(resultOf<MetricToolResult>(steps), v.workspace, { scope: atStage(slot(b, 'stage', 'stage'), v) }),
   }),
 
   /* -------------------------------- metrics ------------------------------ */

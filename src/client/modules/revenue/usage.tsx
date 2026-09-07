@@ -99,6 +99,13 @@ interface MeterRow {
 }
 
 /**
+ * How many times a refused meter record is asked for again before the row stops
+ * trying. Four attempts spread over about seven seconds outlast the burst that
+ * causes the refusal in the first place.
+ */
+const LAST_SEEN_RETRIES = 4;
+
+/**
  * The true last event of every meter the overview's 30-day window has gone
  * quiet on.
  *
@@ -110,6 +117,8 @@ interface MeterRow {
  */
 function useMeterLastSeen(meters: Meter[], live: MeteringOverview | undefined): Map<string, number | null> {
   const [known, setKnown] = useState<Map<string, number | null>>(() => new Map());
+  /** Bumped to ask again for the records a read was refused on. */
+  const [round, setRound] = useState(0);
   const asked = useRef(new Set<string>());
   useEffect(() => {
     if (!live) return;
@@ -117,6 +126,7 @@ function useMeterLastSeen(meters: Meter[], live: MeteringOverview | undefined): 
     const quiet = meters.filter((m) => !recent.get(m.id) && !asked.current.has(m.id));
     if (quiet.length === 0) return;
     let cancelled = false;
+    let again: ReturnType<typeof setTimeout> | undefined;
     for (const meter of quiet) asked.current.add(meter.id);
     void Promise.all(quiet.map(async (meter) => {
       try {
@@ -124,7 +134,7 @@ function useMeterLastSeen(meters: Meter[], live: MeteringOverview | undefined): 
         return [meter.id, detail.ingestion.last_event_at] as const;
       } catch {
         // Left unanswered rather than answered wrong: the cell keeps saying
-        // the record has not been read, and the next render asks again.
+        // the record has not been read.
         asked.current.delete(meter.id);
         return null;
       }
@@ -135,9 +145,22 @@ function useMeterLastSeen(meters: Meter[], live: MeteringOverview | undefined): 
         for (const answer of answers) if (answer) next.set(answer[0], answer[1]);
         return next;
       });
+      // "The next render asks again" was the plan, and on a workspace with a
+      // handful of quiet meters it never came: the records are asked for in one
+      // burst, the limiter answers 429 to the tail of it, and nothing in these
+      // dependencies changes on its own afterwards. The rows it refused sat on
+      // "…" for the life of the page — a cell that never resolves is worse than
+      // one that says the wrong thing, because nobody knows it is waiting. So
+      // the asking is this hook's job: ask again, backing off, a bounded number
+      // of times, and stop once every record has answered.
+      if (answers.some((answer) => answer === null)) {
+        if (round < LAST_SEEN_RETRIES) again = setTimeout(() => setRound((n) => n + 1), 500 * 2 ** round);
+      } else if (round !== 0) {
+        setRound(0);
+      }
     });
-    return () => { cancelled = true; };
-  }, [meters, live]);
+    return () => { cancelled = true; if (again) clearTimeout(again); };
+  }, [meters, live, round]);
   return known;
 }
 

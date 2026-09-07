@@ -19,7 +19,11 @@ interface DealRecord {
   properties: Record<string, unknown>;
 }
 interface DealList { data: DealRecord[]; total_count: number }
-interface StageDef { name: string; label: string; probability: number; is_closed: boolean; is_won: boolean }
+interface StageDef {
+  name: string; label: string; probability: number; is_closed: boolean; is_won: boolean;
+  /** What the server totalled for this column: present on the pipeline read. */
+  record_count?: number; amount?: number;
+}
 interface PipelineDef { name: string; label: string; is_default: boolean; open_amount?: number; stages: StageDef[] }
 
 /**
@@ -2576,43 +2580,70 @@ test('an owner question is answered for the teammate it named, and says so', asy
 });
 
 /**
- * Every caption in a by-stage answer is a column the board actually draws.
+ * Every row of a by-stage answer is a column the board actually draws, holding
+ * that column's own money.
  *
  * The board draws thirteen open columns across three pipelines; the engine
- * groups on the bare stage *name* and returns eight buckets, captioning each
- * with the humanised name rather than a column label. Four of them are sums
- * across pipelines under a caption that belongs to one of them ("Qualification"
- * over New business *and* Expansion's "Expansion identified") and two name no
- * column at all ("Usage review" for "Usage & value review", "Proposal" for two
- * columns both called "Proposal sent"). Every figure adds up and the captions
- * are wrong, which is the worst way for a number to be wrong.
+ * grouped on the bare stage *name* and returned eight buckets, captioning each
+ * with the humanised name rather than a column label. Four of them were sums
+ * across pipelines under a caption belonging to one of them ("Qualification"
+ * over New business's column *and* Expansion's "Expansion identified") and two
+ * named no column at all ("Usage review" for "Usage & value review", "Proposal"
+ * for two columns both called "Proposal sent"). Every figure added up and the
+ * captions were wrong, which is the worst way for a number to be wrong: a
+ * reader who clicks through to the board cannot find what they were shown.
  *
  * This used to be checked against a reconciliation surface — a `.cp-breakdown`
  * list, or an "it does not line up with the board" banner — that the card no
  * longer draws, and against a `Breakdown: A $1 · B $2` sentence the engine no
- * longer writes. Both are gone, so the merged figures stand in the prose with
- * nothing checking them, and the check is now the prose itself against
- * `/v1/pipelines/deal`.
+ * longer writes. Both are gone, so the check is the prose itself against
+ * `/v1/pipelines/deal`: one row per column that holds a deal, named as that
+ * board names it, said to be on the pipeline that draws it, and quoting the
+ * money the server totalled for that column and no other.
  */
-test('a by-stage breakdown captions every bucket with a column the board draws', async ({ page, request }) => {
+test('a by-stage breakdown gives every column the board draws its own row', async ({ page, request }) => {
   const defs = await pipelines(request);
-  const columns = defs.flatMap((p) => p.stages.filter((s) => !s.is_closed).map((s) => ({ ...s, pipeline: p.label })));
+  const columns = defs.flatMap((p) => p.stages
+    .filter((s) => !s.is_closed)
+    .map((s) => ({ ...s, pipeline: p.label, row: `${p.label}: ${s.label}` })));
   expect(columns.length, 'this workspace draws no open columns').toBeGreaterThan(0);
+  const held = columns.filter((column) => (column.record_count ?? 0) > 0);
+  expect(held.length, 'no open column on any board holds a deal').toBeGreaterThan(1);
 
   const answer = await askCopilot(page, 'What is our open pipeline by stage?');
-  const prose = await answer.locator('.cp-answer__body').innerText();
-  const buckets = [...prose.matchAll(/^\s*(?:•\s*)?(.+?)\s+—\s+([^\s(]+)/gm)]
-    .map((m) => ({ caption: m[1].trim(), figure: m[2] }));
-  expect(buckets.length, `no by-stage bullets in:\n${prose}`).toBeGreaterThan(1);
+  const prose = await revealed(answer);
+  // `Caption — figure (n deals) · Pipeline`: the caption is the column's own
+  // name and the pipeline that draws it follows the figure, because two boards
+  // can each have a column called "Proposal sent".
+  // The card draws the bullets as a list, and `innerText` reads a list item
+  // without its marker — so the marker is optional and the shape is what says
+  // this is a row.
+  const rows = [...prose.matchAll(/^\s*(?:•\s*)?(.+?)\s+—\s+(\S+)\s*\((\d+) deals?\)\s*·\s*(.+?)\s*$/gm)]
+    .map((m) => ({ caption: m[1].trim(), figure: m[2], count: Number(m[3]), pipeline: m[4].trim() }));
+  expect(rows.length, `no by-stage rows in:\n${prose}`).toBeGreaterThan(1);
 
-  const unknown = buckets
-    .filter((bucket) => !columns.some((column) => column.label === bucket.caption))
-    .map((bucket) => `${bucket.caption} ${bucket.figure}`);
+  // Every row is one column of one board, and nothing else is.
+  const unknown = rows
+    .filter((row) => !columns.some((c) => c.label === row.caption && c.pipeline === row.pipeline))
+    .map((row) => `${row.pipeline}: ${row.caption} ${row.figure}`);
   expect(
     unknown,
-    `the answer captioned buckets with names no column carries; the board's open columns are `
-      + JSON.stringify(columns.map((c) => `${c.pipeline}: ${c.label}`)),
+    `the answer captioned rows with columns no board carries; the board's open columns are `
+      + JSON.stringify(columns.map((c) => c.row)),
   ).toEqual([]);
+
+  // And each one quotes that column's own total, not a sum across the pipelines
+  // that happen to store the same stage value.
+  for (const row of rows) {
+    const column = columns.find((c) => c.label === row.caption && c.pipeline === row.pipeline)!;
+    expect(row.figure, `${row.pipeline}: ${row.caption} does not quote its column's money`)
+      .toBe(money(column.amount ?? 0));
+    expect(row.count, `${row.pipeline}: ${row.caption} does not count its column's deals`)
+      .toBe(column.record_count);
+  }
+  // No column with deals in it is left out, and none is drawn twice.
+  expect([...rows.map((r) => `${r.pipeline}: ${r.caption}`)].sort())
+    .toEqual([...held.map((c) => c.row)].sort());
 });
 
 /* ============================ keyboard and focus =========================== */
@@ -3359,73 +3390,73 @@ test('a stage change that reopens a closed deal states it, and waits to be ackno
 });
 
 /**
- * A thread that narrows every later question to an earlier question's subject.
+ * A question that names its own subject is answered for that subject, whatever
+ * was asked two turns earlier.
  *
  * Ask about a teammate's pipeline, ask something unrelated, then ask "What is
- * our open pipeline?" and the answer is one carried-over record's — $315,900
- * against a workspace total of $9,010,960, with nothing on the card but a calm
- * grey chip. The scope has to be visible and it has to come off.
+ * our open pipeline?" and the answer used to be the carried-over record's —
+ * $315,900 against a workspace total of $9,010,960, with nothing on the card
+ * but a calm grey chip.
+ *
+ * The fix was to stop carrying the record at all rather than to warn about it,
+ * so the surface this used to check — a `.cp-carried` chip with a banner and an
+ * "Ask it without …" button — is gone, and the test that looked for it skipped
+ * silently in every run since. What it guards now is the behaviour that
+ * replaced it: the third question is measured over the workspace, the
+ * teammate's figure is nowhere in it, and nothing was inherited into a question
+ * that asked for everything.
  */
-test('a scope carried between questions is shown, and can be taken off', async ({ page }) => {
+test('a complete question is answered for the workspace, not for the record two turns back', async ({ page, request }) => {
+  const users = await getJson<{ data: { id: string; name: string }[] }>(request, '/api/v1/users?limit=20');
+  const deals = await getJson<DealList>(request, '/api/v1/records/deal?limit=200');
+  const open = deals.data.filter((row) => row.properties.deal_status === 'open');
+  const workspace = sumAmounts(open);
+  const owner = users.data
+    .map((user) => ({ user, held: open.filter((row) => row.owner_id === user.id) }))
+    .find((row) => row.held.length > 0 && sumAmounts(row.held) !== workspace);
+  expect(owner, 'no teammate carries a share of the open book, so nothing could be carried over').toBeTruthy();
+  const theirs = money(sumAmounts(owner!.held));
+
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
   const composer = page.getByRole('textbox', { name: 'Ask the copilot' });
-  for (const question of ['How much open pipeline does Marcus Ilori own?', 'How many tickets are escalated?', 'What is our open pipeline?']) {
+  for (const question of [
+    `How much open pipeline does ${owner!.user.name} own?`,
+    'How many tickets are escalated?',
+    'What is our open pipeline?',
+  ]) {
     await composer.fill(question);
     await composer.press('Enter');
     await expect(page.locator('.cp-answer').last().locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
-    // The newest answer is typed out a character at a time, so its text is
-    // empty for the first second and a half. The caret is what says it is done.
     await revealed(page.locator('.cp-answer').last());
   }
 
-  const carried = page.locator('.cp-carried').last();
-  test.skip(await carried.count() === 0, 'this engine carried nothing between the turns');
-  // The composer says what the conversation will put on the next question.
-  await expect(carried).toContainText('This conversation is scoped to');
-
-  // And the answer itself says the figure is not the workspace's.
   const answer = page.locator('.cp-answer').last();
-  await expect(answer.locator('.cp-carried').first()).toBeVisible();
-  await expect(answer.locator('.ain-banner--danger').first()).toContainText('scoped to a record you did not name');
-
-  // Taking it off re-asks the same question with nothing to inherit, and the
-  // figure changes to the workspace's own.
-  const before = (await answer.locator('.cp-answer__body').innerText()).trim();
-  expect(before, 'the carried answer never finished rendering').not.toBe('');
-  await answer.getByRole('button', { name: /Ask it without/ }).click();
-  const fresh = page.locator('.cp-answer').last();
-  await expect(fresh.locator('.cp-answer__body')).not.toBeEmpty({ timeout: 40_000 });
-  await revealed(fresh);
-  await expect(page.locator('.cp-carried')).toHaveCount(0);
-  expect((await fresh.locator('.cp-answer__body').innerText()).trim()).not.toBe(before);
+  const body = await revealed(answer);
+  expect(body, `the workspace's own open pipeline is ${money(workspace)}:\n${body}`).toContain(money(workspace));
+  expect(body, `the answer is ${owner!.user.name}'s book, carried over from two questions back:\n${body}`)
+    .not.toContain(theirs);
+  // And it says so: nothing was inherited into a question that named no subject.
+  await expect(answer.locator('.cp-carried')).toHaveCount(0);
 });
 
-/**
- * A filter the plan invented, ANDed in, and reported as the answer.
+/*
+ * "An answer measured with a filter nobody asked for is not shown as an answer"
+ * lived here, and it is gone rather than mended.
  *
- * "How many deals did we close in Q2 2026?" is planned over the eight *open*
- * stages and answers "0". No word of that sentence says "open". The banner
- * beside it was right and not enough: a reader who has read the 0 has taken it.
+ * It was written when "How many deals did we close in Q2 2026?" was planned
+ * over the eight *open* stages and answered "0", and it looked for the surface
+ * that fix shipped with: a `.cp-quarantine` disclosure holding the figure out
+ * of the answer slot, under a danger banner. The engine no longer invents that
+ * filter — it reads the question as a closing and answers 6 won, or 8 decided,
+ * naming which — so the quarantine was removed with the defect, and from then
+ * on the test skipped on its own guard in every run: a test nobody was running.
+ *
+ * The invariant it existed for is checked, on live data and without a skip, by
+ * "a question about deals we closed is never captioned \"open only\" in
+ * silence" four hundred lines above: the figure has to be one of the two
+ * readings of "close" the database holds, never the open count, and the answer
+ * has to say which one it counted.
  */
-test('an answer measured with a filter nobody asked for is not shown as an answer', async ({ page, request }) => {
-  const deals = await getJson<DealList>(request, '/api/v1/records/deal?limit=200');
-  const closed = deals.data.filter((row) => {
-    const at = Number(row.properties.close_date ?? 0);
-    return ['won', 'lost'].includes(String(row.properties.deal_status))
-      && at >= Date.UTC(2026, 3, 1) && at < Date.UTC(2026, 6, 1);
-  });
-  test.skip(closed.length === 0, 'nothing closed in Q2 2026 on this workspace');
-
-  const answer = await askCopilot(page, 'How many deals did we close in Q2 2026?');
-  const quarantine = answer.locator('.cp-quarantine');
-  test.skip(await quarantine.count() === 0, 'this engine no longer invents the filter');
-
-  await expect(answer.locator('.ain-banner--danger').first())
-    .toContainText('not an answer to the question you asked');
-  // The figure is kept and it is not in the answer slot: a closed disclosure.
-  await expect(quarantine).not.toHaveAttribute('open', '');
-  await revealed(answer);
-});
 
 /**
  * A refusal is not printed as one thing and then quietly replaced by another.
@@ -3522,18 +3553,25 @@ test('a refusal is shown in full when the workspace vocabulary cannot be read', 
  * by owner?" has no way to tell which measure the breakdown under it is of.
  */
 test('a measure carried from the question before it is named on the answer', async ({ page, request }) => {
-  // Whether this engine carries a measure between turns is the engine
-  // builder's business, so it is asked through the API first and the surface
-  // claim below is only made when it does.
+  // The engine's half of the claim, asked through the API: a follow-up that
+  // names only a grouping is answered by carrying the previous question's
+  // measure, and the run says so in its own notes. This used to be a
+  // `test.skip` guard, which meant the surface below went unchecked in every
+  // run from the day the engine stopped doing it — so it is an assertion now,
+  // and the engine that stops carrying fails here rather than going quiet.
   const thread = await postJson<{ id: string }>(request, '/api/v1/ai/threads', { title: 'carried measure' });
   await postJson(request, `/api/v1/ai/threads/${thread.id}/messages`, { content: 'What is our open pipeline?' });
-  const second = await postJson<{ reasoning: string[] }>(
+  const second = await postJson<{ reasoning: string[]; message: { content: string } }>(
     request, `/api/v1/ai/threads/${thread.id}/messages`, { content: 'And by owner?' },
   );
-  test.skip(
-    !(second.reasoning ?? []).some((line) => /names no measure of its own; carried /.test(line)),
-    'this engine carried no measure between the turns',
-  );
+  expect(
+    (second.reasoning ?? []).filter((line) => /names no measure of its own; carried "Open pipeline" from /.test(line)),
+    `"And by owner?" did not carry the measure of the question before it: ${JSON.stringify(second.reasoning)}`,
+  ).toHaveLength(1);
+  // And it is answered, not refused: the rows are the workspace's owners.
+  const owners = await getJson<{ data: { name: string }[] }>(request, '/api/v1/users?limit=20');
+  expect(owners.data.some((owner) => second.message.content.includes(owner.name)),
+    `the carried answer names no teammate:\n${second.message.content}`).toBe(true);
 
   await page.goto('/copilot?new=1', { waitUntil: 'networkidle' });
   const composer = page.getByRole('textbox', { name: 'Ask the copilot' });

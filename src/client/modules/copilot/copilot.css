@@ -307,6 +307,34 @@ a.cp-chip { text-decoration: none; }
   letter-spacing: var(--tracking-wide);
   color: var(--text-tertiary);
 }
+/*
+ * What a follow-up inherited. A quiet line above the answer rather than a
+ * banner: nothing is wrong here — the question really is a breakdown of the
+ * measure named — and the reader only needs to know which one, and from where.
+ */
+.cp-carried {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+.cp-carried__key {
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+}
+.cp-carried__measure {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+}
+.cp-carried__from { max-width: 340px; }
+
 .cp-reasons { margin: var(--space-2) 0 0; padding-left: var(--space-6); display: grid; gap: var(--space-2); list-style: disc; }
 .cp-reasons > li { display: list-item; }
 

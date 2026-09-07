@@ -1560,6 +1560,62 @@ describe('a conversation keeps its transcript honest past the third turn', () =>
     assert.equal(after.messages[after.messages.length - 1].run_id, attached.run_id);
   });
 
+  /**
+   * "And by owner?" is a question, and it was refused three words after the
+   * question it follows was answered — the engine reads one turn at a time and
+   * the follow-up names no measure. The measure is inherited now, from the
+   * previous turn only, and the run says which one and where it came from; the
+   * figures below are computed from `crm_records` so the carried answer is held
+   * to the same standard as the question it was carried from.
+   */
+  test('a bare follow-up inherits the measure of the question before it, and nothing else', async () => {
+    const open = recs('deal').filter(isOpen);
+    const names = people();
+    const owned = new Map<string, Rec[]>();
+    for (const deal of open) {
+      const owner = names.get(deal.owner ?? '') ?? 'Unassigned';
+      owned.set(owner, [...(owned.get(owner) ?? []), deal]);
+    }
+    assert.ok(owned.size > 1, 'fixture: the open book is carried by more than one teammate');
+
+    tick();
+    const thread = await expectOk('POST', '/v1/ai/threads', { message: 'What is our open pipeline?' });
+    // The surface asks through the same route with the thread on it, so this is
+    // the path the screen takes.
+    const reply = await ask('And by owner?', { thread_id: thread.id });
+
+    assert.equal(reply.analysis.refusal, null, `the follow-up was refused:\n${reply.content}`);
+    assert.deepEqual(reply.analysis.carried, { measure: 'Open pipeline', from: 'What is our open pipeline?' });
+    assert.ok(
+      (reply.reasoning as string[]).some((line) => line.includes('names no measure of its own; carried "Open pipeline"')),
+      `the run does not say what it carried: ${JSON.stringify(reply.reasoning)}`,
+    );
+    // Every teammate holding open pipeline is a row with their own book on it,
+    // and the rows print no figure that is not one of those books.
+    for (const [owner, held] of owned) {
+      assert.ok(reply.content.includes(`${owner} — ${money2(total(held), 'usd')}`),
+        `the carried breakdown does not state ${owner}'s ${money2(total(held), 'usd')}:\n${reply.content}`);
+    }
+    assertOnlyTheseNumbers(
+      reply.content,
+      allow(...[...owned.values()].flatMap((held) => [money2(total(held), 'usd'), held.length])),
+      'the carried breakdown',
+    );
+
+    // The measure is the only thing that travels. A follow-up with nothing
+    // behind it is refused, not answered out of thin air.
+    const alone = await ask('And by owner?');
+    assert.ok(alone.analysis.refusal, `a follow-up with nothing to follow was answered anyway:\n${alone.content}`);
+    assert.equal(alone.analysis.carried, null);
+
+    // And a question carrying its own measure inherits nothing, even three
+    // turns into a thread that named a different one.
+    const complete = await ask('How many open tickets are there?', { thread_id: thread.id });
+    assert.equal(complete.analysis.carried, null);
+    assert.equal(complete.analysis.refusal, null);
+    assert.ok(!complete.content.includes('pipeline'), `the ticket count inherited the earlier measure:\n${complete.content}`);
+  });
+
   test('an unknown thread is a 404 on every route that takes one', async () => {
     const reply = await call('POST', '/v1/ai/threads/thr_nope/messages', { content: 'hello' });
     assert.equal(reply.status, 404);
