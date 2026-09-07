@@ -7,7 +7,10 @@ import { DAY, HOUR, interval, periodFor, type IntervalUnit } from '../../../shar
 import v, { type Validator } from '../../../shared/validate';
 import { instant } from './query';
 import { METERING_MIGRATIONS } from './schema';
-import { seedMetering } from './seed';
+import {
+  FLEET_JOB, eventsInWindow, fleetDay, fleetJobKey, nextShift, resolveMeteredCustomers, resumeFleetJob, seedMetering,
+  shiftAt, shiftWindow, type FleetShiftJob,
+} from './seed';
 import {
   DEFAULT_ACCEPTANCE_WINDOW, DEFAULT_FUTURE_TOLERANCE, MAX_BATCH, Metering,
   type CancelEventInput, type ClosePeriodInput, type MeterListFilter,
@@ -287,6 +290,44 @@ function settleRebasedPeriodOnUpdate(event: AinEvent<UpdatedSubscriptionEvent>, 
   }
 }
 
+/**
+ * The little of billing the fleet needs: whether anything is still subscribed
+ * for an account. Structural rather than imported, like `AnchorReader`, so
+ * metering still boots in a build with no billing module — where nothing can
+ * cancel a fleet, so it streams.
+ */
+interface SubscriptionReader {
+  subscriptions(orgId: string, filter: { customer: string; status: 'active_like'; limit: number }): unknown[];
+}
+
+function fleetStillBilled(ctx: Ctx, orgId: string, customerId: string): boolean {
+  const billing = (ctx.svc as { billing?: SubscriptionReader }).billing;
+  if (!billing) return true;
+  return billing.subscriptions(orgId, { customer: customerId, status: 'active_like', limit: 1 }).length > 0;
+}
+
+/**
+ * The undo path of the fleet stopping: an account that comes back onto a plan
+ * streams again from the next roll-up. Only a fleet the demo knows how to run
+ * — the roster is the only source of its magnitudes — and only one that is
+ * not already running, so a second subscription on a live account changes
+ * nothing. An account that never streamed is not started here either; the
+ * seed is what starts a fleet.
+ */
+function resumeFleetOnSubscribe(event: AinEvent<{ customer?: string }>, ctx: Ctx): void {
+  const customerId = event.data?.customer;
+  if (!customerId) return;
+  const orgId = event.org_id;
+  const key = fleetJobKey(customerId);
+  if (ctx.db.count(`SELECT COUNT(*) FROM jobs WHERE org_id = ? AND idem_key = ? AND status = 'pending'`, orgId, key)) return;
+  const account = resolveMeteredCustomers(ctx, orgId).find((c) => c.billable && c.id === customerId);
+  if (!account) return;
+  const job = resumeFleetJob(ctx, orgId, account, ctx.now());
+  if (!job) return;
+  ctx.enqueue(orgId, FLEET_JOB, job, { runAt: shiftAt(job.first_day, job.day, job.shift), idemKey: key });
+  ctx.log.info('metering.fleet_resumed', { org: orgId, customer: customerId, company: account.company });
+}
+
 declare module '../../kernel/services' {
   interface ServiceRegistry { metering: MeteringService }
 }
@@ -491,6 +532,54 @@ export default defineModule({
         }
       }
       ctx.enqueue(orgId, 'metering.watch_silence', {}, { runAt: now + DAY, idemKey: 'metering.watch_silence' });
+    });
+
+    /**
+     * Northwind's fleet, streaming.
+     *
+     * One durable job per metered account, aimed at the next shift roll-up.
+     * It ingests that shift's window of the same deterministic fleet-day the
+     * history was written from — so history and stream tile into one
+     * continuous month — and re-enqueues itself for the shift after, on the
+     * same key, so there is never more than one pending per account. A demo
+     * with only history goes dark the moment the time machine moves; this is
+     * what keeps every usage screen, usage invoice line and credit burn-down
+     * moving with the clock instead.
+     *
+     * It stops the way a real gateway is switched off: once the account has
+     * no subscription left that the usage could be billed against, the roll-up
+     * is not ingested and no next one is scheduled.
+     */
+    ctx.jobs.handle(FLEET_JOB, (payload: FleetShiftJob, job) => {
+      const orgId = job.org_id;
+      if (!fleetStillBilled(ctx, orgId, payload.customer.id)) {
+        ctx.log.info('metering.fleet_stopped', {
+          org: orgId, customer: payload.customer.id, company: payload.customer.company,
+          reason: 'no subscription left to bill the usage against',
+        });
+        return;
+      }
+      const today = fleetDay(payload.customer, payload.day, payload.first_day + payload.day * DAY, payload.stored_gb);
+      const events = eventsInWindow(today, shiftWindow(payload.first_day, payload.day, payload.shift));
+      if (events.length) {
+        const failed = store.ingestBatch(orgId, events).results.filter((r) => r.error);
+        // A meter somebody has archived refuses its readings; that is the
+        // operator's decision, not a reason to stop the rest of the fleet.
+        if (failed.length) {
+          ctx.log.warn('metering.fleet_shift_partial', {
+            org: orgId, customer: payload.customer.id,
+            errors: failed.map((r) => `${r.identifier}: ${r.error?.message}`),
+          });
+        }
+      }
+      const next = nextShift(payload.day, payload.shift);
+      const following: FleetShiftJob = {
+        ...payload, day: next.day, shift: next.shift,
+        stored_gb: next.day === payload.day ? payload.stored_gb : today.stored_gb,
+      };
+      ctx.enqueue(orgId, FLEET_JOB, following, {
+        runAt: shiftAt(payload.first_day, next.day, next.shift), idemKey: fleetJobKey(payload.customer.id),
+      });
     });
   },
 
@@ -792,6 +881,7 @@ export default defineModule({
     'subscription.invoice_due': settleArrearsOnInvoice,
     'subscription.canceled': settleFinalPeriodOnCancel,
     'subscription.updated': settleRebasedPeriodOnUpdate,
+    'subscription.created': resumeFleetOnSubscribe,
   },
 
   tools(ctx) {

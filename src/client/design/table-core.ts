@@ -466,3 +466,61 @@ export function dateExtent<T>(rows: T[], columnId: string, accessor: (row: T, co
   }
   return Number.isFinite(min) && Number.isFinite(max) ? { min, max } : null;
 }
+
+/* ------------------------------ row controls ----------------------------- */
+
+/**
+ * The controls a row can hold, matched from the element a key landed on.
+ *
+ * The grid listens for keys on its body and used to answer Enter for every
+ * keydown that bubbled up to it — including the one aimed at the row's "Row
+ * actions" button, whose click it then suppressed: the row opened, the menu
+ * never appeared. Enter and Space on a control are the control's; the arrows,
+ * Home and End inside a text box belong to the caret. The row's own click
+ * handler already ignores the same set.
+ */
+export const ROW_CONTROL_SELECTOR =
+  'button, a, input, select, textarea, label, [role="menuitem"], [role="option"], [contenteditable="true"]';
+
+/** The shape of an event target the guard reads — a DOM element, or a stand-in for one in a test. */
+export interface KeyTarget {
+  closest?(selector: string): unknown;
+  tagName?: string;
+  type?: string;
+  isContentEditable?: boolean;
+}
+
+const BUTTON_LIKE_INPUT = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'range', 'color', 'file']);
+
+/** An element that owns the caret: every key means something to it. */
+export function isTypingControl(target: KeyTarget | null | undefined): boolean {
+  if (!target) return false;
+  if (target.isContentEditable) return true;
+  const tag = (target.tagName ?? '').toLowerCase();
+  if (tag === 'textarea' || tag === 'select') return true;
+  return tag === 'input' && !BUTTON_LIKE_INPUT.has((target.type ?? 'text').toLowerCase());
+}
+
+/**
+ * True when the grid must leave this key alone because it belongs to a control
+ * inside the row: Enter and Space on any control, every key inside a text box.
+ */
+export function keyBelongsToControl(key: string, target: KeyTarget | null | undefined): boolean {
+  if (!target) return false;
+  if (isTypingControl(target)) return true;
+  if (key !== 'Enter' && key !== ' ') return false;
+  return typeof target.closest === 'function' && !!target.closest(ROW_CONTROL_SELECTOR);
+}
+
+/* -------------------------------- toolbar -------------------------------- */
+
+/**
+ * Below this width the grid's own Filters, Columns and density controls fold
+ * into one "View" menu. Laid out one by one they wrapped under a module
+ * toolbar as a third row with a lone density toggle on it; as one group they
+ * take one row or one button, never a stray.
+ */
+export const TABLE_TOOLS_COLLAPSE_WIDTH = 720;
+
+/** `width` is the grid's own width; zero means it has not been measured yet, and nothing folds on a guess. */
+export const collapseTableTools = (width: number): boolean => width > 0 && width < TABLE_TOOLS_COLLAPSE_WIDTH;

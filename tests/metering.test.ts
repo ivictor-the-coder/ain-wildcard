@@ -6,6 +6,9 @@ import { DAY, HOUR, MINUTE, startOfDay } from '../src/shared/time';
 import { microToDecimal, microToWholeUnits, parseMicro, toMicro } from '../src/server/modules/metering/units';
 import { unitsWorthBurning } from '../src/server/modules/credits/burn';
 import type { BatchResult, MeterEventInput } from '../src/server/modules/metering/types';
+import {
+  FLEET_JOB, METERED_CUSTOMERS, NORTHWIND_METERS, SHIFTS, eventsInWindow, fleetDay, fleetJobKey, seedMetering, shiftWindow,
+} from '../src/server/modules/metering/seed';
 
 const ORG = 'org_demo';
 const DANA: Auth = { kind: 'session', orgId: ORG, userId: 'usr_seed01', role: 'owner', scopes: ['*'], livemode: true };
@@ -1232,3 +1235,176 @@ async function ingest(events: MeterEventInput[]): Promise<void> {
     assert.equal(failed, undefined, `fixture event rejected: ${failed?.error?.message}`);
   }
 }
+
+/* -------------------------- the fleet keeps streaming --------------------- */
+
+/**
+ * Northwind sells usage, so the demo has to keep using. A workspace whose
+ * meters read "nothing in the last 30 days" the moment the time machine moves
+ * is not a usage business, and every account a meter names has to be one an
+ * invoice can be sent to — the one-story rule, checked from the outside.
+ */
+describe('the Northwind fleet is one story, and it keeps streaming', () => {
+  let fresh: App;
+  const seededMeterIds = NORTHWIND_METERS.map((m) => m.id);
+  const ok = async (method: string, path: string, body?: unknown): Promise<any> => {
+    const res = await fresh.handle({ method, path, body, auth: DANA });
+    assert.ok(res.status < 400, `${method} ${path} → ${res.status} ${JSON.stringify(res.body)}`);
+    return res.body;
+  };
+  /** Billing customer id → name, for the whole book. */
+  const customerNames = async (): Promise<Map<string, string>> =>
+    new Map((await ok('GET', '/v1/customers?limit=200')).data.map((c: { id: string; name: string }) => [c.id, c.name]));
+  /**
+   * How many roster accounts a meter can hear from at all: exports are bought
+   * above Starter only, and a nine-robot fleet's alert rate — the busiest
+   * weekday at the top of the noise band — rounds to nothing.
+   */
+  const fleetOn = (meterId: string): number => METERED_CUSTOMERS.filter((c) =>
+    meterId === 'mtr_nw_export' ? c.plan !== 'starter'
+      : meterId === 'mtr_nw_alerts' ? Math.round(Math.round(c.robots * 1.02) * 0.012 * 1.5) >= 1
+        : true).length;
+  /** The most recent roll-up instant at or before `now`. */
+  const lastShiftAt = (now: number): number => {
+    const day = startOfDay(now);
+    const shipped = SHIFTS.filter((hour) => day + hour * HOUR <= now);
+    return shipped.length ? day + shipped[shipped.length - 1] * HOUR : day - DAY + SHIFTS[SHIFTS.length - 1] * HOUR;
+  };
+
+  before(async () => { fresh = await createApp({ db: 'memory', clock: frozenClock(T0), config: { env: 'test' } }); });
+  after(() => fresh.close());
+
+  test('every account on every meter is a billing customer, and every roster company streams', async () => {
+    const customers = await customerNames();
+    const streaming = new Set<string>();
+    for (const meterId of seededMeterIds) {
+      const rows = (await ok('GET', `/v1/meters/${meterId}/customers?limit=200`)).data as { customer: string; value: number }[];
+      assert.ok(rows.length > 0, `${meterId} has nobody streaming into it`);
+      for (const row of rows) {
+        const name = customers.get(row.customer);
+        assert.ok(name, `${meterId} streams for ${row.customer}, which is not a billing customer — no customer page can open it`);
+        streaming.add(name);
+      }
+    }
+    for (const account of METERED_CUSTOMERS) {
+      assert.ok(streaming.has(account.company), `${account.company} is on the roster but on no meter`);
+    }
+  });
+
+  test('the seeder refuses to stream for an account it cannot resolve to a billing customer', async () => {
+    // A workspace with no book of business, and the metering seed run on its
+    // own: every roster entry resolves to nothing, and nothing may be written
+    // under an invented id — not one reading, not one scheduled roll-up.
+    const empty = await createApp({ db: 'memory', seed: false, clock: frozenClock(T0), config: { env: 'test' } });
+    try {
+      seedMetering(empty.ctx, ORG);
+      const db = empty.ctx.db;
+      assert.equal(db.count(`SELECT COUNT(*) FROM billing_customers WHERE org_id = ?`, ORG), 0, 'fixture: nobody to invoice');
+      assert.equal(db.count(`SELECT COUNT(*) FROM meters WHERE org_id = ?`, ORG), seededMeterIds.length, 'the meters themselves are still defined');
+      assert.equal(db.count(`SELECT COUNT(*) FROM meter_events WHERE org_id = ?`, ORG), 0, 'usage was seeded for accounts nothing can invoice');
+      assert.equal(db.count(`SELECT COUNT(*) FROM jobs WHERE org_id = ? AND type = ?`, ORG, FLEET_JOB), 0, 'a fleet was scheduled for an account nothing can invoice');
+    } finally {
+      empty.close();
+    }
+  });
+
+  test('every reading a fleet-day produces lands in exactly one of its three shift windows', () => {
+    const firstDay = startOfDay(T0) - 40 * DAY;
+    for (const customer of METERED_CUSTOMERS) {
+      let stored = customer.robots * 1.4;
+      for (let day = 0; day < 14; day++) {
+        const today = fleetDay(customer, day, firstDay + day * DAY, stored);
+        stored = today.stored_gb;
+        const covered = SHIFTS.flatMap((_, shift) => eventsInWindow(today, shiftWindow(firstDay, day, shift)));
+        assert.equal(covered.length, today.events.length, `${customer.company} day ${day}: a reading falls outside every roll-up`);
+        assert.equal(new Set(covered.map((e) => e.identifier)).size, today.events.length, 'no reading is shipped twice');
+        assert.ok(today.events.every((e) => (e.timestamp as number) >= today.midnight + 2 * HOUR), 'nothing reports between the last roll-up and the nightly sweep');
+      }
+    }
+  });
+
+  test('ninety days on, every meter is still busy and the bills carry usage for periods the seed never saw', async () => {
+    const travelled = await fresh.travel(90 * DAY);
+    assert.equal(travelled.failed, 0, 'a fleet job failed');
+    const now = fresh.ctx.now();
+
+    const overview = await ok('GET', '/v1/metering/overview');
+    const seeded = overview.meters.filter((m: { id: string }) => seededMeterIds.includes(m.id));
+    assert.equal(seeded.length, seededMeterIds.length);
+    for (const meter of seeded) {
+      assert.ok(meter.events_30d > 0, `${meter.name}: nothing in the last 30 days once the clock moved`);
+      assert.ok(meter.customers_30d >= fleetOn(meter.id), `${meter.name}: only ${meter.customers_30d} of ${fleetOn(meter.id)} accounts still stream`);
+      // Exports run once a week; everything else reports every day.
+      const quietFor = now - Number(meter.last_hour_with_events);
+      assert.ok(quietFor <= (meter.id === 'mtr_nw_export' ? 8 : 4) * DAY, `${meter.name} went quiet ${Math.round(quietFor / DAY)} days ago`);
+    }
+    const telemetry = seeded.find((m: { id: string }) => m.id === 'mtr_nw_telemetry');
+    assert.equal(telemetry.last_hour_with_events, lastShiftAt(now), 'the last telemetry roll-up shipped at the last shift instant');
+
+    const customers = await customerNames();
+    const roster = (await ok('GET', '/v1/meters/mtr_nw_telemetry/customers?limit=200')).data as { customer: string; value: number }[];
+    assert.equal(roster.length, METERED_CUSTOMERS.length, 'every roster account streamed in the last 30 days');
+    for (const row of roster) {
+      assert.ok(row.value > 0);
+      assert.ok(customers.has(row.customer), `${row.customer} streams but cannot be invoiced`);
+    }
+
+    // A whole billing period after the seed instant, priced from the meter and
+    // put on an invoice: the line names the metered price and the period it
+    // settled, and that period began after the last historical reading.
+    let usageLines = 0;
+    for (const [customerId] of customers) {
+      const invoices = (await ok('GET', `/v1/invoices?customer=${customerId}&limit=200`)).data as { id: string; created: number }[];
+      for (const invoice of invoices.filter((i) => i.created > T0)) {
+        const full = await ok('GET', `/v1/invoices/${invoice.id}`);
+        const lines = (full.lines?.data ?? full.lines ?? []) as { price: string | null; quantity: number; period: { start: number } }[];
+        usageLines += lines.filter((l) => l.price === 'price_nw_telemetry_events' && l.quantity > 0 && l.period.start >= T0).length;
+      }
+    }
+    assert.ok(usageLines > 0, 'no invoice raised after the seed instant bills telemetry for a period the fleet streamed live');
+  });
+
+  test('the fleet stops the moment an account has nothing left to bill, and the rest keep streaming', async () => {
+    const customers = await customerNames();
+    const sableworks = [...customers].find(([, name]) => name === 'Sableworks Robotics')?.[0];
+    const meridian = [...customers].find(([, name]) => name === 'Meridian Forge Systems')?.[0];
+    assert.ok(sableworks && meridian, 'the roster accounts are billing customers');
+
+    const subs = (await ok('GET', `/v1/subscriptions?customer=${sableworks}&status=all&limit=50`)).data as { id: string; status: string }[];
+    for (const sub of subs) {
+      if (!['canceled', 'incomplete_expired'].includes(sub.status)) await ok('POST', `/v1/subscriptions/${sub.id}/cancel`, {});
+    }
+    const cancelledAt = fresh.ctx.now();
+    const travelled = await fresh.travel(5 * DAY);
+    assert.equal(travelled.failed, 0);
+
+    const db = fresh.ctx.db;
+    assert.equal(db.count(`SELECT COUNT(*) FROM meter_events WHERE org_id = ? AND customer_id = ? AND timestamp > ?`, ORG, sableworks, cancelledAt), 0,
+      'usage kept arriving for an account with no subscription to bill it against');
+    assert.equal(db.count(`SELECT COUNT(*) FROM jobs WHERE org_id = ? AND idem_key = ? AND status = 'pending'`, ORG, fleetJobKey(sableworks)), 0,
+      'the fleet job is still scheduled after the account was cancelled');
+    assert.ok(db.count(`SELECT COUNT(*) FROM meter_events WHERE org_id = ? AND customer_id = ? AND timestamp > ?`, ORG, meridian, cancelledAt) > 0,
+      'the other accounts stopped streaming too');
+    assert.equal(db.count(`SELECT COUNT(*) FROM jobs WHERE org_id = ? AND type = ? AND status = 'pending'`, ORG, FLEET_JOB), METERED_CUSTOMERS.length - 1,
+      'exactly one pending roll-up per account still on the books');
+
+    // The undo path: back onto a plan, the fleet streams again from the next
+    // roll-up, carrying on the day count so no identifier is reused.
+    const lastBefore = db.pluck<number>(`SELECT MAX(timestamp) FROM meter_events WHERE org_id = ? AND customer_id = ?`, ORG, sableworks) as number;
+    await ok('POST', '/v1/subscriptions', {
+      customer: sableworks,
+      items: [{ price: 'price_nw_starter_monthly', quantity: 1 }, { price: 'price_nw_telemetry_events', quantity: 1 }],
+    });
+    const resubscribedAt = fresh.ctx.now();
+    assert.equal(db.count(`SELECT COUNT(*) FROM jobs WHERE org_id = ? AND idem_key = ? AND status = 'pending'`, ORG, fleetJobKey(sableworks)), 1,
+      'the next roll-up is scheduled the moment the account is back on a plan');
+    const resumed = await fresh.travel(3 * DAY);
+    assert.equal(resumed.failed, 0);
+    const streamedSince = db.count(`SELECT COUNT(*) FROM meter_events WHERE org_id = ? AND customer_id = ? AND timestamp > ?`, ORG, sableworks, resubscribedAt);
+    assert.ok(streamedSince > 0, 'the fleet did not pick up again once there was a subscription to bill');
+    assert.equal(db.count(`SELECT COUNT(*) FROM meter_events WHERE org_id = ? AND customer_id = ? AND timestamp > ? AND timestamp <= ?`, ORG, sableworks, lastBefore, resubscribedAt), 0,
+      'nothing was back-filled for the days the account was off');
+    assert.equal(db.count(`SELECT COUNT(*) FROM jobs WHERE org_id = ? AND type = ? AND status = 'pending'`, ORG, FLEET_JOB), METERED_CUSTOMERS.length,
+      'the whole roster is streaming again, one pending roll-up each');
+  });
+});

@@ -7,11 +7,11 @@
  * actually escalated, the day the last meeting actually happened — and any
  * sentence whose fact is missing is dropped rather than padded with filler.
  */
-import { formatMoney } from '../../shared/money';
 import { DAY, formatDate } from '../../shared/time';
 import type { WorkspaceProfile } from './grounding';
 import type { AccountProfileResult, TimelineItem } from './functions';
-import { firstName, humanise, listPhrase, normalise, truncate } from './text';
+import { money as formatAmount } from './answer';
+import { COMMON_WORDS, STOPWORDS, firstName, humanise, listPhrase, normalise, truncate } from './text';
 
 export const DRAFT_KINDS = [
   'follow_up', 'intro', 'check_in', 'renewal', 'dunning', 'meeting_recap',
@@ -130,8 +130,7 @@ const signOff = (tone: Tone, sender: DraftSender | null, workspace: WorkspacePro
   }
 };
 
-const money = (workspace: WorkspaceProfile, amount: number) =>
-  formatMoney({ amount, currency: workspace.currency }, { locale: workspace.locale, trimZeroFraction: true });
+const money = (workspace: WorkspaceProfile, amount: number) => formatAmount(amount, workspace.currency, workspace);
 
 const day = (workspace: WorkspaceProfile, ts: number) =>
   formatDate(ts, { locale: workspace.locale, timeZone: workspace.timezone });
@@ -173,6 +172,43 @@ const COMPOSED_TAIL = [
   ' — support update', ' — worth another look?', ' — quick introduction', ' — payment outstanding',
 ];
 
+/**
+ * Words an activity title leads with when it is a description rather than a
+ * name: "Check-in on the rollout", "Discovery call with Priya", "Re: budget
+ * cycle". Inside a sentence those lose their capital; "Aconcagua — kickoff
+ * scheduling" and "QBR with the plant team" keep theirs.
+ */
+const TITLE_LEADS = new Set([
+  'check', 'checkin', 'check-in', 'follow', 'followup', 'follow-up', 'following', 'kickoff', 'kick', 'kick-off', 'intro',
+  'introduction', 'discovery', 'demo', 'proposal', 'pricing', 'security', 'renewal', 'review', 'site', 'quarterly',
+  'weekly', 'monthly', 'technical', 'commercial', 'contract', 'negotiation', 'onboarding', 'pilot', 'questions',
+  'question', 'quick', 'update', 're', 'recap', 'sync', 'catch', 'catch-up', 'planning', 'status', 'escalation',
+  'support', 'handover', 'implementation', 'rollout', 'training', 'workshop', 'walkthrough', 'invoice', 'budget',
+  'executive', 'exec', 'board', 'steering', 'cold', 'warm', 'uptime', 'downtime', 'data', 'numbers', 'notes', 'call',
+  'meeting', 'email', 'visit', 'tour', 'lunch', 'dinner', 'coffee', 'thanks', 'thank', 'next', 'first', 'second',
+]);
+
+/**
+ * An activity title as it reads inside a sentence.
+ *
+ * "Following up on our Check-in on the rollout" is a title pasted where a
+ * clause belongs. The capital goes when the title opens with an ordinary
+ * word; an acronym or a name at the front — "QBR with Priya", "Aconcagua —
+ * kickoff scheduling" — is left as it is, because lower-casing a proper noun
+ * is the worse mistake.
+ */
+export function titleInSentence(title: string): string {
+  const trimmed = title.trim();
+  const first = trimmed.split(/\s+/)[0] ?? '';
+  const bare = first.replace(/[^A-Za-z-]/g, '');
+  if (!bare) return trimmed;
+  if (bare.length > 1 && bare === bare.toUpperCase()) return trimmed;
+  const lead = bare.toLowerCase();
+  const stem = lead.split('-')[0];
+  const ordinary = TITLE_LEADS.has(lead) || TITLE_LEADS.has(stem) || COMMON_WORDS.has(lead) || STOPWORDS.has(lead) || COMMON_WORDS.has(stem);
+  return ordinary ? trimmed[0].toLowerCase() + trimmed.slice(1) : trimmed;
+}
+
 export function composedHere(title: string): boolean {
   const t = title.trim().toLowerCase();
   return COMPOSED_TAIL.some((tail) => t.endsWith(tail))
@@ -181,6 +217,12 @@ export function composedHere(title: string): boolean {
     || t.startsWith('recap — ')
     || t.startsWith('update — ');
 }
+
+/** The kinds of timeline entry that are a touch on the customer: something somebody did, not a link or a field edit. */
+const TOUCH_KINDS = new Set(['note', 'call', 'meeting', 'email', 'task']);
+
+/** An entry a draft may quote as the last thing that happened between us. */
+export const isTouch = (item: TimelineItem): boolean => TOUCH_KINDS.has(item.kind) && !composedHere(item.title);
 
 function gather(input: DraftInput): Facts {
   const account = input.account;
@@ -192,9 +234,9 @@ function gather(input: DraftInput): Facts {
     ?? null;
   const topDeal = account?.open_deals?.[0] ?? null;
   const ticket = account?.open_tickets?.[0] ?? null;
-  const lastTouch = input.timeline.find(
-    (item) => item.kind !== 'property_change' && !composedHere(item.title),
-  ) ?? null;
+  // "Following up on our linked to Onboarding" is a record's association
+  // rendered as a conversation: only an activity counts as the last touch.
+  const lastTouch = input.timeline.find(isTouch) ?? null;
   const used: string[] = [];
   if (account) used.push(`${account.name} — ${account.headline || account.object_type}`);
   if (contact) used.push(`${contact.name}${contact.title ? `, ${contact.title}` : ''}`);
@@ -213,8 +255,10 @@ export function composeDraft(input: DraftInput): DraftResult {
   const paragraphs: string[] = [];
   let subject = '';
 
+  // Outbound text carries a date the recipient can check, never "2 months
+  // ago", which is true on the day it is drafted and wrong from then on.
   const openerFromTouch = facts.lastTouch
-    ? `Following up on ${facts.lastTouch.title.toLowerCase().startsWith('the') ? '' : 'our '}${facts.lastTouch.title} (${facts.lastTouch.when})`
+    ? `Following up on ${/^(the|our|your)\b/i.test(facts.lastTouch.title) ? '' : 'our '}${titleInSentence(facts.lastTouch.title)} on ${day(workspace, facts.lastTouch.at)}`
     : `Following up on where we left things`;
 
   switch (kind) {
@@ -330,9 +374,9 @@ export function composeDraft(input: DraftInput): DraftResult {
     case 'meeting_recap': {
       subject = facts.lastTouch ? `Recap — ${facts.lastTouch.title}` : `${name} — recap and next steps`;
       paragraphs.push(facts.lastTouch
-        ? `Thanks for the time ${facts.lastTouch.when}. Here is what I took away.`
+        ? `Thanks for the time on ${day(workspace, facts.lastTouch.at)}. Here is what I took away.`
         : 'Thanks for the time today. Here is what I took away.');
-      const bullets = input.timeline.filter((i) => i.kind !== 'property_change' && !composedHere(i.title)).slice(0, 3)
+      const bullets = input.timeline.filter(isTouch).slice(0, 3)
         .map((i) => `• ${i.title}${i.body ? ` — ${truncate(i.body, 120)}` : ''}`);
       if (bullets.length) paragraphs.push(bullets.join('\n'));
       if (facts.topDeal) paragraphs.push(`On commercials: ${facts.topDeal.name} is at ${facts.topDeal.amount_formatted}${facts.topDeal.close_date ? `, targeting ${calendarDay(workspace, facts.topDeal.close_date)}` : ''}.`);
@@ -343,7 +387,7 @@ export function composeDraft(input: DraftInput): DraftResult {
     case 'meeting_notes': {
       subject = `${name} — ${kind === 'call_summary' ? 'call summary' : 'meeting notes'}`;
       const items = input.timeline.filter((i) => i.kind === (kind === 'call_summary' ? 'call' : 'meeting')).slice(0, 3);
-      const source = items.length ? items : input.timeline.filter((i) => !composedHere(i.title)).slice(0, 3);
+      const source = items.length ? items : input.timeline.filter(isTouch).slice(0, 3);
       paragraphs.push(source.length
         ? source.map((i) => `${day(workspace, i.at)} — ${i.title}${i.body ? `\n${truncate(i.body, 400)}` : ''}`).join('\n\n')
         : `No ${kind === 'call_summary' ? 'calls' : 'meetings'} are logged against ${name} yet, so there is nothing to summarise.`);
@@ -381,12 +425,11 @@ export function composeDraft(input: DraftInput): DraftResult {
       // happened on the account, which is a different subject and reads as this
       // one's status. Nothing else on the timeline is about this escalation.
       const latest = facts.ticket
-        ? input.timeline.find((i) => i.kind !== 'property_change' && !composedHere(i.title)
-            && normalise(i.title).includes(normalise(facts.ticket!.subject)))
+        ? input.timeline.find((i) => isTouch(i) && normalise(i.title).includes(normalise(facts.ticket!.subject)))
         : undefined;
       if (tone === 'apologetic') paragraphs.push('I am sorry this has taken as long as it has.');
       if (latest) {
-        paragraphs.push(`Where it stands: ${latest.title}${latest.body ? ` — ${truncate(latest.body.replace(/\s+/g, ' ').trim(), 220)}` : ''} (${latest.when}).`);
+        paragraphs.push(`Where it stands: ${latest.title}${latest.body ? ` — ${truncate(latest.body.replace(/\s+/g, ' ').trim(), 220)}` : ''} (as of ${day(workspace, latest.at)}).`);
       } else if (facts.ticket) {
         paragraphs.push(`Where it stands: the ticket is ${facts.ticket.status.toLowerCase().replace(/_/g, ' ')} at ${facts.ticket.priority.toLowerCase()} priority and nothing has been logged against it since it was raised, which is itself the thing I am chasing internally.`);
       }

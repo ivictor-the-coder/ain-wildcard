@@ -1537,16 +1537,30 @@ export class Crm {
 
   /* --------------------------------- views ------------------------------- */
 
-  views(orgId: string, objectType?: string): ViewDef[] {
+  /**
+   * The views a caller may see: every shared one, plus the private ones they
+   * own. `viewer` is who is asking — a user id, a key id, or `null` for a
+   * caller with no identity of its own (an agent, the system), who sees only
+   * what is shared. Leaving it `undefined` is the unrestricted read for the
+   * engine's own bookkeeping, never for a route.
+   */
+  views(orgId: string, objectType?: string, viewer?: string | null): ViewDef[] {
+    const visible = viewer === undefined ? '' : 'AND (shared = 1 OR owner_id = ?)';
+    const who = viewer === undefined ? [] : [viewer];
     const rows = objectType
-      ? this.ctx.db.all<any>(`SELECT * FROM crm_views WHERE org_id = ? AND object_type = ? ORDER BY position, name`, orgId, objectType)
-      : this.ctx.db.all<any>(`SELECT * FROM crm_views WHERE org_id = ? ORDER BY object_type, position, name`, orgId);
+      ? this.ctx.db.all<any>(`SELECT * FROM crm_views WHERE org_id = ? AND object_type = ? ${visible} ORDER BY position, name`, orgId, objectType, ...who)
+      : this.ctx.db.all<any>(`SELECT * FROM crm_views WHERE org_id = ? ${visible} ORDER BY object_type, position, name`, orgId, ...who);
     return rows.map(hydrateView);
   }
 
-  view(orgId: string, id: string): ViewDef {
+  /**
+   * A private view that is not yours does not exist as far as you are told:
+   * 404, never 403, so the id cannot be used to learn that a teammate keeps a
+   * view with that name.
+   */
+  view(orgId: string, id: string, viewer?: string | null): ViewDef {
     const row = this.ctx.db.get<any>(`SELECT * FROM crm_views WHERE org_id = ? AND id = ?`, orgId, id);
-    if (!row) throw notFound('view', id);
+    if (!row || (viewer !== undefined && !row.shared && row.owner_id !== viewer)) throw notFound('view', id);
     return hydrateView(row);
   }
 
@@ -1570,8 +1584,8 @@ export class Crm {
     return this.view(orgId, row.id);
   }
 
-  updateView(orgId: string, id: string, patch: Partial<ViewDef>): ViewDef {
-    const existing = this.view(orgId, id);
+  updateView(orgId: string, id: string, patch: Partial<ViewDef>, viewer?: string | null): ViewDef {
+    const existing = this.view(orgId, id, viewer);
     if (patch.filter) compileFilter(patch.filter, this.env(orgId, existing.object_type));
     if (patch.sort) compileSort(patch.sort, this.env(orgId, existing.object_type));
     this.assertColumns(orgId, existing.object_type, patch.columns);
@@ -1609,8 +1623,8 @@ export class Crm {
     }
   }
 
-  deleteView(orgId: string, id: string): void {
-    const existing = this.view(orgId, id);
+  deleteView(orgId: string, id: string, viewer?: string | null): void {
+    const existing = this.view(orgId, id, viewer);
     if (existing.system) throw badRequest('view_system', `"${existing.name}" ships with Ain and cannot be deleted. Duplicate it and edit the copy.`);
     this.ctx.db.run(`DELETE FROM crm_views WHERE org_id = ? AND id = ?`, orgId, id);
     this.ctx.emit(orgId, 'view.deleted', { id, name: existing.name }, { objectId: id, objectType: 'view' });

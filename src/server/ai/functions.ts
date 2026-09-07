@@ -10,7 +10,7 @@
  */
 import type { Ctx } from '../kernel/context';
 import { DAY, formatDate, formatRelative } from '../../shared/time';
-import { formatMoney } from '../../shared/money';
+import { money as formatAmount } from './answer';
 import { billingSources, entityIndex, hasTable, workspaceProfile, type WorkspaceProfile } from './grounding';
 import { crmVocabulary, stageLabelIn } from './qualifiers';
 import { resolveEntities, type ResolvedEntity } from './resolve';
@@ -104,7 +104,7 @@ export function accountProfile(ctx: Ctx, orgId: string, args: { id: string }): A
 
   const snapshot = accountSnapshot(ctx, workspace, record.id);
   const currency = workspace.currency;
-  const asMoney = (amount: number) => formatMoney({ amount, currency }, { locale: workspace.locale, trimZeroFraction: true });
+  const asMoney = (amount: number) => formatAmount(amount, currency, workspace);
   const lastActivityAt = Number(record.properties.last_activity_at ?? 0) || null;
   const recentActivity = recordTimeline(ctx, orgId, { record_id: record.id, limit: 1 }).items[0] ?? null;
 
@@ -618,7 +618,7 @@ export function delinquentCustomers(ctx: Ctx, orgId: string, args: { limit?: num
       name: customer.name,
       currency,
       outstanding,
-      outstanding_formatted: formatMoney({ amount: outstanding, currency }, { locale: workspace.locale }),
+      outstanding_formatted: formatAmount(outstanding, currency, workspace),
       open_invoices: invoices.length,
       oldest_due_at: oldest,
       days_overdue: oldest && oldest < ctx.now() ? Math.floor((ctx.now() - oldest) / DAY) : null,
@@ -673,7 +673,7 @@ export function staleAccounts(ctx: Ctx, orgId: string, args: { days?: number; li
       days_since_activity: last ? Math.floor((workspace.now - last) / DAY) : null,
       last_activity_at: last,
       open_pipeline: open,
-      open_pipeline_formatted: formatMoney({ amount: open, currency: workspace.currency }, { locale: workspace.locale, trimZeroFraction: true }),
+      open_pipeline_formatted: formatAmount(open, workspace.currency, workspace),
       type: typeof company.properties.type === 'string' ? company.properties.type : null,
     });
   }
@@ -774,7 +774,7 @@ export function invoiceSettlements(ctx: Ctx, orgId: string, ids: string[]): Map<
     `SELECT id, status, currency, amount_paid, total, paid_at, voided_at FROM ${sources.invoices.table}
       WHERE org_id = ? AND id IN (${ids.map(() => '?').join(', ')})`, orgId, ...ids);
   for (const row of rows) {
-    const show = (amount: number) => formatMoney({ amount: Math.round(amount), currency: row.currency }, { locale: workspace.locale });
+    const show = (amount: number) => formatAmount(amount, row.currency, workspace);
     if (row.status === 'paid') {
       out.set(row.id, `${show(row.amount_paid ?? row.total)} paid${row.paid_at ? ` on ${formatDate(row.paid_at, { locale: workspace.locale, timeZone: 'UTC' })}` : ''}`);
     } else if (row.status === 'void') {
@@ -919,7 +919,7 @@ export function recordAggregate(ctx: Ctx, orgId: string, args: {
   }
   const isMoney = definition?.type === 'currency';
   const format = (value: number) => (isMoney
-    ? formatMoney({ amount: Math.round(value), currency: workspace.currency }, { locale: workspace.locale, trimZeroFraction: true })
+    ? formatAmount(value, workspace.currency, workspace)
     : Number(value.toFixed(2)).toLocaleString(workspace.locale));
 
   const optionLabels = new Map((args.group_by && !byOwner ? properties.get(args.group_by)?.options ?? [] : []).map((o) => [o.value, o.label]));
@@ -1018,7 +1018,7 @@ export function describeRecord(workspace: WorkspaceProfile, record: RecordSummar
   const props = record.properties;
   const detail: string[] = [];
   if (record.object_type === 'deal') {
-    detail.push(formatMoney({ amount: Number(props.amount ?? 0), currency: workspace.currency }, { locale: workspace.locale, trimZeroFraction: true }));
+    detail.push(formatAmount(Number(props.amount ?? 0), workspace.currency, workspace));
     if (props.deal_stage) detail.push(humanise(String(props.deal_stage)));
     // `close_date` is a calendar day stored as midnight UTC, not an instant:
     // read back in a zone west of Greenwich it reports the evening before, so

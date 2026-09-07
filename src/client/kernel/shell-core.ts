@@ -5,7 +5,7 @@
  * jump table, the time-machine presets and route availability all live here so
  * they can be reasoned about and tested without mounting React.
  */
-import type { NavGroup, NavItem } from './registry-types';
+import type { NavGroup, NavItem, WorkspaceRole } from './registry-types';
 import { addInterval, DAY, WEEK } from '../../shared/time';
 
 /* ============================== navigation ================================ */
@@ -600,4 +600,50 @@ export function greetingFor(now: number, timeZone: string): string {
   if (hour < 12) return 'Good morning';
   if (hour < 18) return 'Good afternoon';
   return 'Good evening';
+}
+
+/* ================================ roles ================================== */
+
+/**
+ * The ladder the server gates every route on — `ROLE_RANK` in
+ * `src/server/kernel/http.ts`, minus the `system` rung no session holds. Kept
+ * in step by hand because the client must not import the server; the shell
+ * only ever reads it to decide what to *offer*, never what to allow.
+ */
+export const WORKSPACE_ROLE_RANK: Record<WorkspaceRole, number> = { owner: 90, admin: 80, member: 60, analyst: 40, readonly: 20 };
+
+/** An unknown or missing role ranks below everything, so nothing is offered on a guess. */
+export const roleAtLeast = (role: string | null | undefined, min: WorkspaceRole): boolean =>
+  (WORKSPACE_ROLE_RANK[role as WorkspaceRole] ?? 0) >= WORKSPACE_ROLE_RANK[min];
+
+/** Every write in the platform is gated at member or above; below it a session reads. */
+export const canWrite = (role: string | null | undefined): boolean => roleAtLeast(role, 'member');
+
+/**
+ * A command's `roles` is read the way the server reads a route's: any listed
+ * rung, at or above it. `['admin']` admits an owner; `['member']` admits an
+ * admin. No gate admits everyone.
+ */
+export function commandAllowed(roles: readonly WorkspaceRole[] | undefined, role: string | null | undefined): boolean {
+  if (!roles || roles.length === 0) return true;
+  return roles.some((min) => roleAtLeast(role, min));
+}
+
+/**
+ * Whether the palette shows an entry to this session at all. A "Create" verb
+ * is a write, so a reader is never offered one — "Create an API key" and
+ * "Invite a teammate" used to rank first for an analyst and end in a refusal
+ * on the screen they opened.
+ */
+export function paletteEntryAllowed(
+  entry: { group: string; roles?: readonly WorkspaceRole[] },
+  role: string | null | undefined,
+): boolean {
+  if (!commandAllowed(entry.roles, role)) return false;
+  return entry.group !== 'Create' || canWrite(role);
+}
+
+/** The nav destinations this role is shown: an item's `minRole` hides it from anyone below. */
+export function navForRole<T extends { minRole?: WorkspaceRole }>(items: readonly T[], role: string | null | undefined): T[] {
+  return items.filter((item) => !item.minRole || roleAtLeast(role, item.minRole));
 }

@@ -10,7 +10,9 @@ import { createHash } from 'node:crypto';
 import type { AiToolDef } from '../../kernel/ai';
 import type { Ctx } from '../../kernel/context';
 import v from '../../../shared/validate';
-import { DAY } from '../../../shared/time';
+import { DAY, formatDate } from '../../../shared/time';
+import { subjectOf } from '../../ai/text';
+import { recordStanding } from '../../ai/query';
 import {
   accountProfile, businessMetric, delinquentCustomers, meteredUsage, recordAggregate, recordSearch, recordTimeline,
   staleAccounts, subscriptionsOnProduct, workspaceSearch,
@@ -229,7 +231,7 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
     {
       name: 'schedule_followup',
       description:
-        'Schedule a follow-up on a record. At the chosen time the platform writes a note onto the record\'s timeline and raises an ai.followup.due event that workflows and notifications can pick up. ' +
+        'Schedule a follow-up on a record. A task is created on the record at once — with the note as its subject, the due date and the assignee — so it is findable today; when it comes due the platform completes the task, writes the note onto the record\'s timeline and raises an ai.followup.due event that workflows and notifications can pick up. ' +
         'This changes the workspace, so it needs a person to approve it.',
       readOnly: false,
       requiresApproval: true,
@@ -242,8 +244,18 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
         // field is the kind of thing an approval card must never be able to show.
         assignee_id: v.optional(v.id('usr')),
       }),
-      run: (args: { record_id: string; in_days: number; note: string; assignee_id?: string }, _c, meta) => {
-        const runAt = ctx.now() + args.in_days * DAY;
+      run: (args: { record_id: string; in_days: number; note: string; assignee_id?: string }, _c, meta) => ctx.atomic(() => {
+        const now = ctx.now();
+        const runAt = now + args.in_days * DAY;
+        const workspace = workspaceProfile(ctx, meta.orgId);
+        const assigneeId = args.assignee_id ?? meta.actorId ?? null;
+        // The person on whose authority this runs: the one who approved the
+        // card, or the caller who granted the write up front. Everything the
+        // follow-up writes is theirs, not "Agent's".
+        const approvedBy = meta.actorId ?? null;
+        const nameOf = (id: string | null) => workspace.people.find((p) => p.id === id)?.name ?? null;
+        const record = recordStanding(ctx, meta.orgId, args.record_id);
+        const dueDay = formatDate(runAt, { locale: workspace.locale, timeZone: workspace.timezone });
         // The key is the *write*, not the slot it lands in. Keyed on
         // `(record, runAt)` alone, two follow-ups a person had separately
         // approved — "send the renewal quote" and "chase the security
@@ -256,16 +268,58 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
         // one approved write is one job, so two writes are two jobs. An
         // identical repeat — a retried tool call — still collapses to one.
         const idemKey = `ai.followup:${args.record_id}:${runAt}:${createHash('sha256')
-          .update(JSON.stringify({ n: args.note, a: args.assignee_id ?? meta.actorId ?? null }))
+          .update(JSON.stringify({ n: args.note, a: assigneeId }))
           .digest('hex').slice(0, 16)}`;
+
+        // A retried call finds the job it already booked and the task that job
+        // carries; booking a second task for the same write would be the
+        // duplicate the key exists to prevent, one table over.
+        const standing = ctx.db.get<{ payload: string }>(
+          `SELECT payload FROM jobs WHERE org_id = ? AND idem_key = ? AND status = 'pending'`, meta.orgId, idemKey);
+        const already = standing ? (JSON.parse(String(standing.payload)) as { taskId?: string | null }).taskId ?? null : null;
+        const crm = ctx.svc.crm;
+        const subject = subjectOf(args.note);
+        const forWhom = nameOf(assigneeId) ?? 'nobody in particular';
+        const onWhat = record.name ?? 'a record';
+        const summary = `Follow up on ${onWhat} by ${dueDay}, for ${forWhom}: ${args.note}`;
+        let taskId: string | null = already && crm?.get(meta.orgId, 'task', already) ? already : null;
+        if (!taskId && crm) {
+          // The task is what a person opening the record today finds: the
+          // subject, the due date, who it is for. The note is what lands when
+          // it comes due. The two are the same follow-up, so they share words.
+          // An assignee who is not a member owns nothing — the CRM refuses the
+          // assignment, and unassigned is the honest outcome — while the
+          // write itself is the approver's, which is who the history names.
+          const owner = assigneeId && workspace.people.some((p) => p.id === assigneeId) ? assigneeId : null;
+          const write = { actorId: approvedBy, actorType: (approvedBy ? 'user' : 'agent') as 'user' | 'agent', source: 'agent' as const, requestId: meta.runId ?? null };
+          const task = crm.create(meta.orgId, 'task', {
+            subject,
+            body: `${args.note}\n\nScheduled from the copilot${nameOf(approvedBy) ? ` by ${nameOf(approvedBy)}` : ''}, due ${dueDay}. When it comes due, this note is written onto ${onWhat}'s timeline and the task is completed.`,
+            occurred_at: now,
+            due_at: runAt,
+            status: 'not_started',
+            task_type: 'follow_up',
+            priority: 'medium',
+          }, { ...write, ownerId: owner });
+          crm.associate(meta.orgId, { fromId: task.id, toId: args.record_id, associationType: 'activity_to_record' }, write);
+          taskId = task.id;
+        }
         ctx.enqueue(meta.orgId, 'ai.followup', {
-          recordId: args.record_id, note: args.note, assigneeId: args.assignee_id ?? meta.actorId ?? null, runId: meta.runId ?? null,
+          recordId: args.record_id, note: args.note, assigneeId, runId: meta.runId ?? null, taskId, approvedBy,
         }, { runAt, idemKey });
+        // Attributed to the person who approved it, and carrying what, when
+        // and for whom in `subject` — the field the record's timeline reads as
+        // an event's body — so the entry on the record says something.
         ctx.emit(meta.orgId, 'ai.followup.scheduled', {
-          record_id: args.record_id, due: runAt, note: args.note, run_id: meta.runId ?? null,
-        }, { objectId: args.record_id, objectType: 'record', actorType: 'agent', actorId: meta.actorId ?? null });
-        return { scheduled: true, record_id: args.record_id, due: runAt, note: args.note, idempotency_key: idemKey };
-      },
+          record_id: args.record_id, record_name: record.name, due: runAt, due_display: dueDay, note: args.note,
+          run_id: meta.runId ?? null, task_id: taskId, assignee_id: assigneeId, assignee_name: nameOf(assigneeId),
+          approved_by: approvedBy, subject: summary,
+        }, { objectId: args.record_id, objectType: 'record', actorType: approvedBy ? 'user' : 'agent', actorId: approvedBy });
+        return {
+          scheduled: true, record_id: args.record_id, due: runAt, note: args.note, task_id: taskId,
+          assignee_id: assigneeId, idempotency_key: idemKey,
+        };
+      }),
     },
   ];
 }

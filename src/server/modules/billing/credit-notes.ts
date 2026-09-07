@@ -61,6 +61,14 @@ export interface CreditNoteInput {
   reason?: CreditNoteReason;
   memo?: string | null;
   metadata?: Record<string, string>;
+  /**
+   * On a paid bill, where the money goes — Stripe's three-way split. The
+   * three add up to the note's total; left out entirely, all of it goes onto
+   * the customer's balance.
+   */
+  refund_amount?: number;
+  credit_amount?: number;
+  out_of_band_amount?: number;
 }
 
 export interface CreditNoteListFilter {
@@ -95,6 +103,10 @@ export interface CreditNoteDraft {
   /** What the invoice had left to credit before this note. */
   creditable_before: number;
   routing: 'pre_payment' | 'post_payment';
+  /** How a post-payment total is handed back; all zero on a pre-payment note. */
+  refund_amount: number;
+  credit_amount: number;
+  out_of_band_amount: number;
   reason: CreditNoteReason;
   memo: string | null;
 }
@@ -295,6 +307,12 @@ export class CreditNotes {
       );
     }
 
+    // Nothing has been collected on an open or written-off bill, so the credit
+    // reduces what is owed. On a paid one the money is already in, and the
+    // note says where it goes back to: the card, the balance, or outside.
+    const routing = invoice.status === 'paid' ? 'post_payment' : 'pre_payment';
+    const split = this.routeAfterPayment(invoice, total, routing, input, show);
+
     return {
       invoice,
       lines,
@@ -303,13 +321,74 @@ export class CreditNotes {
       total,
       creditable_before: creditableBefore,
       remaining_after: creditableBefore - total,
-      // Nothing has been collected on an open or written-off bill, so the credit
-      // reduces what is owed. On a paid one the money is already in, so the only
-      // honest place for it is the customer's balance.
-      routing: invoice.status === 'paid' ? 'post_payment' : 'pre_payment',
+      routing,
+      ...split,
       reason: input.reason ?? 'billing_error',
       memo: input.memo ?? null,
     };
+  }
+
+  /**
+   * Where a post-payment credit goes, Stripe's shape: `refund_amount` back to
+   * the card through the payments module, `credit_amount` onto the balance,
+   * `out_of_band_amount` settled outside the platform and only recorded. The
+   * three add up to the total or the note is refused — a note that says
+   * where some of the money went and not the rest is not a document anybody
+   * can reconcile. Nothing named leaves all of it on the balance, which is
+   * what every note before the split did.
+   */
+  private routeAfterPayment(
+    invoice: Invoice, total: number, routing: 'pre_payment' | 'post_payment', input: CreditNoteInput,
+    show: (amount: number) => string,
+  ): { refund_amount: number; credit_amount: number; out_of_band_amount: number } {
+    const named = (['refund_amount', 'credit_amount', 'out_of_band_amount'] as const).filter((key) => input[key] !== undefined);
+    if (routing === 'pre_payment') {
+      if (named.length) {
+        throw badRequest(
+          'credit_note_routing_not_applicable',
+          `Invoice ${invoice.number} is ${invoice.status}, so nothing has been collected on it and there is no money to route: the credit comes off what is owed. refund_amount, credit_amount and out_of_band_amount are for a bill that has been paid.`,
+          named[0],
+          { status: invoice.status },
+        );
+      }
+      return { refund_amount: 0, credit_amount: 0, out_of_band_amount: 0 };
+    }
+    if (!named.length) return { refund_amount: 0, credit_amount: total, out_of_band_amount: 0 };
+    const refund = input.refund_amount ?? 0;
+    const credit = input.credit_amount ?? 0;
+    const outOfBand = input.out_of_band_amount ?? 0;
+    for (const [key, value] of [['refund_amount', refund], ['credit_amount', credit], ['out_of_band_amount', outOfBand]] as const) {
+      if (value < 0) throw badRequest('credit_note_routing_negative', `${key} cannot be negative.`, key);
+    }
+    if (refund + credit + outOfBand !== total) {
+      throw badRequest(
+        'credit_note_routing_mismatch',
+        `This note credits ${show(total)}, but refund_amount ${show(refund)} + credit_amount ${show(credit)} + out_of_band_amount ${show(outOfBand)} is ${show(refund + credit + outOfBand)}. The three have to add up to the total, so every unit of it has somewhere to go.`,
+        'refund_amount',
+        { total, refund_amount: refund, credit_amount: credit, out_of_band_amount: outOfBand },
+      );
+    }
+    if (refund > 0) {
+      if (!this.ctx.svc.payments) {
+        throw badRequest(
+          'credit_note_refund_unavailable',
+          `${show(refund)} cannot be sent back to the card because no payments module is installed to move it. Record it as out_of_band_amount once it has been returned by other means, or credit it to the balance.`,
+          'refund_amount',
+        );
+      }
+      const refundable = invoice.amount_paid - invoice.amount_refunded;
+      if (refund > refundable) {
+        throw badRequest(
+          'credit_note_refund_exceeds_collected',
+          `${show(refund)} is more than invoice ${invoice.number} can give back: ${show(invoice.amount_paid)} was collected on it${
+            invoice.amount_refunded > 0 ? ` and ${show(invoice.amount_refunded)} has already been refunded` : ''
+          }, so at most ${show(Math.max(0, refundable))} can go back to the card. Put the rest on the balance with credit_amount.`,
+          'refund_amount',
+          { amount_paid: invoice.amount_paid, amount_refunded: invoice.amount_refunded, refundable: Math.max(0, refundable) },
+        );
+      }
+    }
+    return { refund_amount: refund, credit_amount: credit, out_of_band_amount: outOfBand };
   }
 
   private targetsFromLines(
@@ -468,6 +547,10 @@ export class CreditNotes {
       total: draft.total,
       pre_payment_amount: draft.routing === 'pre_payment' ? draft.total : 0,
       post_payment_amount: draft.routing === 'post_payment' ? draft.total : 0,
+      refund_amount: draft.refund_amount,
+      credit_amount: draft.credit_amount,
+      out_of_band_amount: draft.out_of_band_amount,
+      refund: null,
       balance_transaction: null,
       invoice_status_at_issue: draft.invoice.status,
       voided_at: null,
@@ -510,6 +593,10 @@ export class CreditNotes {
         total: draft.total,
         pre_payment_amount: draft.routing === 'pre_payment' ? draft.total : 0,
         post_payment_amount: draft.routing === 'post_payment' ? draft.total : 0,
+        refund_amount: draft.refund_amount,
+        credit_amount: draft.credit_amount,
+        out_of_band_amount: draft.out_of_band_amount,
+        refund_id: null,
         balance_transaction_id: null,
         invoice_status_at_issue: invoice.status,
         voided_at: null,
@@ -552,18 +639,27 @@ export class CreditNotes {
       if (draft.routing === 'pre_payment') {
         this.applyPrePayment(orgId, invoice, draft.total, number, now, meta);
       } else {
-        const txn = this.billing.adjustBalance(orgId, invoice.customer, -draft.total, {
-          type: 'credit_note',
-          description: `${show(draft.total)} credited by ${number} against invoice ${invoice.number}`,
-          subscription: invoice.subscription,
-          invoice: invoice.id,
-          createdAt: now,
-        });
+        // The whole note is credit after collection, whichever way it is
+        // handed back; only the balance share moves the balance, and only the
+        // refund share moves cash.
         this.ctx.db.patch('billing_invoices', 'id', invoice.id, {
           post_payment_credit_notes_amount: invoice.post_payment_credit_notes_amount + draft.total,
           updated: now,
         });
-        this.ctx.db.patch('billing_credit_notes', 'id', id, { balance_transaction_id: txn.id });
+        if (draft.credit_amount > 0) {
+          const txn = this.billing.adjustBalance(orgId, invoice.customer, -draft.credit_amount, {
+            type: 'credit_note',
+            description: `${show(draft.credit_amount)} credited by ${number} against invoice ${invoice.number}`,
+            subscription: invoice.subscription,
+            invoice: invoice.id,
+            createdAt: now,
+          });
+          this.ctx.db.patch('billing_credit_notes', 'id', id, { balance_transaction_id: txn.id });
+        }
+        if (draft.refund_amount > 0) {
+          const refund = this.refundThroughPayments(orgId, invoice, draft, number, show);
+          this.ctx.db.patch('billing_credit_notes', 'id', id, { refund_id: refund.id });
+        }
       }
 
       this.billing.invoices.assertBalanced(orgId, invoice.id);
@@ -574,6 +670,45 @@ export class CreditNotes {
       });
       return note;
     });
+  }
+
+  /**
+   * Send the refund share back to the card, through the one path by which
+   * money leaves this platform. The payments module owns the charge, the
+   * processor and the refund row; the note records the refund's id so the
+   * two documents point at each other.
+   *
+   * A bill settled outside the platform — a bank transfer recorded by hand —
+   * has no charge to refund, and the payments module says so; that is turned
+   * into the answer a finance user can act on, which is `out_of_band_amount`.
+   */
+  private refundThroughPayments(
+    orgId: string, invoice: Invoice, draft: CreditNoteDraft, number: string, show: (amount: number) => string,
+  ): { id: string } {
+    const payments = this.ctx.svc.payments;
+    if (!payments) {
+      throw badRequest('credit_note_refund_unavailable', `${show(draft.refund_amount)} cannot be sent back to the card because no payments module is installed to move it.`, 'refund_amount');
+    }
+    const reason = draft.reason === 'duplicate' || draft.reason === 'fraudulent' ? draft.reason : 'requested_by_customer';
+    try {
+      return payments.refund(orgId, {
+        invoice: invoice.id,
+        amount: draft.refund_amount,
+        reason,
+        description: `Credit note ${number} against invoice ${invoice.number}: ${show(draft.refund_amount)} refunded to the card.`,
+      });
+    } catch (e) {
+      const error = e as { code?: string; message?: string };
+      if (error.code === 'not_found' || error.code === 'charge_required' || /successful charge/i.test(error.message ?? '')) {
+        throw badRequest(
+          'credit_note_refund_no_charge',
+          `Invoice ${invoice.number} was settled outside the platform — there is no card charge on it to refund. If ${show(draft.refund_amount)} has been returned by bank transfer, record it as out_of_band_amount; otherwise credit it to the balance with credit_amount.`,
+          'refund_amount',
+          { invoice: invoice.id },
+        );
+      }
+      throw e;
+    }
   }
 
   /**
@@ -626,6 +761,16 @@ export class CreditNotes {
       const now = this.ctx.now();
       const locale = this.billing.locale(orgId);
       const show = (amount: number) => formatMoney(money(amount, note.currency), { locale });
+      // Cash that went back to the card is gone: a refund cannot be recalled,
+      // so a note that sent one stands. What the customer owes again is a new
+      // invoice's business.
+      if (note.refund_amount > 0) {
+        throw conflict(
+          'credit_note_refunded',
+          `${show(note.refund_amount)} of credit note ${note.number} went back to the customer's card, and a refund cannot be recalled, so the note cannot be withdrawn. If the customer owes this money again, raise a new invoice for it.`,
+          { refund: note.refund, refund_amount: note.refund_amount },
+        );
+      }
 
       this.ctx.db.patch('billing_credit_notes', 'id', id, { status: 'void', voided_at: now, updated: now });
 
@@ -644,13 +789,17 @@ export class CreditNotes {
         }
         this.ctx.db.patch('billing_invoices', 'id', invoice.id, changes);
       } else {
-        this.billing.adjustBalance(orgId, note.customer, note.post_payment_amount, {
-          type: 'credit_note_voided',
-          description: `${show(note.post_payment_amount)} taken back when credit note ${note.number} was voided`,
-          subscription: invoice.subscription,
-          invoice: invoice.id,
-          createdAt: now,
-        });
+        // Only the balance share was ever on the balance; an out-of-band
+        // share was recorded and nothing else, so there is nothing to take back.
+        if (note.credit_amount > 0) {
+          this.billing.adjustBalance(orgId, note.customer, note.credit_amount, {
+            type: 'credit_note_voided',
+            description: `${show(note.credit_amount)} taken back when credit note ${note.number} was voided`,
+            subscription: invoice.subscription,
+            invoice: invoice.id,
+            createdAt: now,
+          });
+        }
         this.ctx.db.patch('billing_invoices', 'id', invoice.id, {
           post_payment_credit_notes_amount: invoice.post_payment_credit_notes_amount - note.post_payment_amount,
           updated: now,

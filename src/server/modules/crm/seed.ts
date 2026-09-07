@@ -238,7 +238,7 @@ export function seedCrm(ctx: Ctx, crm: Crm, orgId: string): void {
     renewal: ['renewal_outreach', 'usage_review', 'commercial_terms', 'negotiation'],
   };
 
-  const deals: { id: string; companySlug: string; created: number; pipeline: string; stage: string; amount: number }[] = [];
+  const deals: { id: string; companySlug: string; created: number; pipeline: string; stage: string; amount: number; closedAt: number | null }[] = [];
   let dealSeq = 0;
 
   for (const seed of COMPANIES) {
@@ -266,6 +266,7 @@ export function seedCrm(ctx: Ctx, crm: Crm, orgId: string): void {
       const closeDate = stage === 'closed_won' || stage === 'closed_lost'
         ? startOfDay(created + between(45, 160) * DAY)
         : startOfDay(now + between(-12, 95) * DAY);
+      const closedAt = stage.startsWith('closed') ? closeDate + 15 * HOUR : null;
 
       crm.create(orgId, 'deal', {
         name: `${seed.name} — ${isRenewal ? 'renewal + asset uplift' : isExpansion ? pick(EXPANSION_SCOPES) : pick(DEAL_SCOPES)}`,
@@ -284,14 +285,14 @@ export function seedCrm(ctx: Ctx, crm: Crm, orgId: string): void {
         close_notes: stage === 'closed_lost'
           ? LOST_NOTES.budget_cut
           : stage === 'closed_won' ? `Signed on a ${assets}-asset commitment after a six-week pilot on the ${pick(['weld', 'assembly', 'packaging', 'machining'])} line.` : null,
-        closed_at: stage.startsWith('closed') ? closeDate + 15 * HOUR : null,
+        closed_at: closedAt,
       }, { ...write, id, createdAt: created, ownerId: TEAM[SALES[dealSeq % SALES.length]], actorId: TEAM[SALES[dealSeq % SALES.length]] });
 
       crm.associate(orgId, { fromId: id, toId: companyId, associationType: 'deal_to_company', primary: true }, { emit: false, createdAt: created });
       for (const contact of contacts.filter((c) => c.company.slug === seed.slug).slice(0, 3)) {
         crm.associate(orgId, { fromId: id, toId: contact.record.id, associationType: 'deal_to_contact' }, { emit: false, createdAt: created });
       }
-      deals.push({ id, companySlug: seed.slug, created, pipeline, stage, amount });
+      deals.push({ id, companySlug: seed.slug, created, pipeline, stage, amount, closedAt });
     }
 
     // Nobody wins everything. Historical losses make the win rate believable
@@ -299,8 +300,12 @@ export function seedCrm(ctx: Ctx, crm: Crm, orgId: string): void {
     if (['customer', 'opportunity', 'sales_qualified_lead'].includes(seed.lifecycle) && random() > 0.6) {
       dealSeq++;
       const id = `deal_nw_${String(dealSeq).padStart(2, '0')}`;
-      const created = now - Math.round(seed.createdDaysAgo * 0.95) * DAY;
-      const closeDate = startOfDay(created + between(40, 130) * DAY);
+      const ageDays = Math.round(seed.createdDaysAgo * 0.95);
+      const created = now - ageDays * DAY;
+      // A loss is history, so it closed before today whatever the account's
+      // age — a young account's attempt simply ran shorter.
+      const closeDate = startOfDay(created + between(40, Math.min(130, ageDays - 1)) * DAY);
+      const closedAt = closeDate + 16 * HOUR;
       const assets = Math.max(18, Math.round(seed.assets * 0.3));
       const reason = pick(['price', 'budget_cut', 'no_decision', 'competitor', 'product_gap', 'champion_left']);
       crm.create(orgId, 'deal', {
@@ -316,10 +321,10 @@ export function seedCrm(ctx: Ctx, crm: Crm, orgId: string): void {
         competitor: reason === 'competitor' ? pick(['sight_machine', 'tulip', 'litmus', 'cognite']) : 'none',
         close_reason: reason,
         close_notes: LOST_NOTES[reason],
-        closed_at: closeDate + 16 * HOUR,
+        closed_at: closedAt,
       }, { ...write, id, createdAt: created, ownerId: TEAM[SALES[dealSeq % SALES.length]], actorId: TEAM[SALES[dealSeq % SALES.length]] });
       crm.associate(orgId, { fromId: id, toId: companyId, associationType: 'deal_to_company', primary: true }, { emit: false, createdAt: created });
-      deals.push({ id, companySlug: seed.slug, created, pipeline: 'new_business', stage: 'closed_lost', amount: assets * 380 * 100 });
+      deals.push({ id, companySlug: seed.slug, created, pipeline: 'new_business', stage: 'closed_lost', amount: assets * 380 * 100, closedAt });
     }
   }
 
@@ -380,6 +385,21 @@ export function seedCrm(ctx: Ctx, crm: Crm, orgId: string): void {
       crm.associate(orgId, { fromId: id, toId: companyIds.get(seed.slug)!, associationType: 'ticket_to_company', primary: true }, { emit: false, createdAt: created });
       const requester = contacts.find((c) => c.company.slug === seed.slug);
       if (requester) crm.associate(orgId, { fromId: id, toId: requester.record.id, associationType: 'ticket_to_contact' }, { emit: false, createdAt: created });
+
+      // A ticket's status trail, like a deal's stage trail, has to agree with
+      // its stamps: it left "new" when the team first answered, and a closed
+      // one arrived at "closed" the moment it was resolved — not the moment
+      // it was raised, which is what the stamp would otherwise say.
+      if (firstResponse <= now && status !== 'new') {
+        const history = { actorId: owner, actorType: 'user' as const, source: 'user' as const };
+        if (resolvedAt) {
+          crm.recordHistory(orgId, 'ticket', id, 'status', 'new', 'waiting_on_us', firstResponse, history);
+          crm.recordHistory(orgId, 'ticket', id, 'status', 'waiting_on_us', 'closed', resolvedAt, history);
+        } else {
+          crm.recordHistory(orgId, 'ticket', id, 'status', 'new', status, firstResponse, history);
+        }
+        crm.setSystemProperties(orgId, id, { stage_entered_at: resolvedAt ?? firstResponse });
+      }
     }
   }
 
@@ -489,14 +509,26 @@ export function seedCrm(ctx: Ctx, crm: Crm, orgId: string): void {
 
   for (const deal of deals) {
     const path = OPEN_STAGES[deal.pipeline];
-    const closed = deal.stage === 'closed_won' || deal.stage === 'closed_lost';
+    const closedAt = deal.closedAt;
+    const closed = typeof closedAt === 'number';
     const target = closed ? path.length : path.indexOf(deal.stage);
-    const span = Math.max(2 * DAY, Math.floor((now - deal.created) * 0.75 / Math.max(1, target)));
+    // A closed deal's trail ends the moment it closed, not somewhere between
+    // then and today: its open stages are spaced back from `closed_at`, so
+    // the stamp, days-to-close and the stage history all tell one story. An
+    // open deal's trail runs three-quarters of the way to now, and the stage
+    // it is in takes the rest.
+    const span = closed
+      ? Math.max(2 * DAY, Math.floor((closedAt - deal.created) / Math.max(1, target)))
+      : Math.max(2 * DAY, Math.floor((now - deal.created) * 0.75 / Math.max(1, target)));
     const seedRow = COMPANIES.find((c) => c.slug === deal.companySlug)!;
     let enteredCurrentStage = deal.created;
     for (let step = 1; step <= target; step++) {
       const to = step === path.length ? deal.stage : path[step];
-      const at = deal.created + step * span + between(1, 8) * HOUR;
+      const jitter = between(1, 8) * HOUR;
+      // The last move of a closed deal is the close itself, to the millisecond.
+      const at = closed
+        ? (step === target ? closedAt : Math.min(deal.created + step * span + jitter, closedAt - HOUR))
+        : deal.created + step * span + jitter;
       crm.recordHistory(orgId, 'deal', deal.id, 'deal_stage', path[step - 1], to, at,
         { actorId: TEAM[seedRow.owner], actorType: 'user', source: 'user' });
       enteredCurrentStage = at;

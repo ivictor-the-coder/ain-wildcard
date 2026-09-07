@@ -27,7 +27,8 @@ import { ENGINE_MODEL } from '../src/server/ai/engine';
 import { anthropicProvider, toWire, toWireTools } from '../src/server/ai/anthropic';
 import { entityIndex, workspaceProfile } from '../src/server/ai/grounding';
 import { resolveEntities } from '../src/server/ai/resolve';
-import { businessMetric } from '../src/server/ai/functions';
+import { businessMetric, recordTimeline } from '../src/server/ai/functions';
+import { isTouch, titleInSentence } from '../src/server/ai/draft';
 import { accountUsage, estimateTokens } from '../src/server/ai/usage';
 import { formatMoney } from '../src/shared/money';
 import { DAY, formatDate } from '../src/shared/time';
@@ -856,6 +857,26 @@ describe('drafting writes from the record, or says it has nothing to write from'
     assert.ok(withDue.open.some((i) => named.body.includes(i.number)), `the account's real invoice is cited:\n${named.body}`);
   });
 
+  test('an outbound draft dates its last touch instead of counting back from today, and reads the title as a clause', async () => {
+    // The newest thing on the record that the composer will treat as a touch,
+    // found the way it finds it: newest first, skipping property changes and
+    // anything the composer itself wrote.
+    const candidates = recs('company').map((c) => ({
+      company: c,
+      touch: recordTimeline(app.ctx, ORG, { record_id: c.id, limit: 8 }).items.find(isTouch) ?? null,
+    })).filter((x) => x.touch && /^[A-Z][a-z]/.test(x.touch.title) && x.touch.title !== titleInSentence(x.touch.title));
+    assert.ok(candidates.length, 'fixture: an account whose last touch is an activity with an ordinary word up front');
+    const { company, touch } = candidates[0];
+    const draft = await expectOk('POST', '/v1/ai/draft', { kind: 'follow_up', record_id: company.id, instruction: 'Draft a follow-up email' });
+    const opener = draft.body.split('\n').find((line: string) => line.startsWith('Following up on '));
+    assert.ok(opener, `the draft opens on the last touch:\n${draft.body}`);
+    const expected = `Following up on our ${titleInSentence(touch!.title)} on ${formatDate(touch!.at, { locale: 'en-US', timeZone: TZ })}.`;
+    assert.equal(opener, expected);
+    assert.ok(!opener!.includes(touch!.title), 'the title is not pasted in with its capital');
+    assert.doesNotMatch(draft.body, /\b(ago|just now)\b/, `outbound text counts nothing back from today:\n${draft.body}`);
+    assert.doesNotMatch(draft.body, /\(\d+ (seconds?|minutes?|hours?|days?|weeks?|months?|years?) ago\)/);
+  });
+
   test('an escalation update has content where its heading promises content', async () => {
     const withTicket = recs('company').find((c) => associated(c.id, 'ticket').some((t) => ['new', 'waiting_on_us', 'waiting_on_customer', 'escalated'].includes(str(t.p.status))));
     assert.ok(withTicket, 'fixture: an account with an open ticket');
@@ -1619,7 +1640,17 @@ describe('money keeps its currency: the copilot\'s ledger figures reconcile with
     assert.equal(mrr.currency, null, 'no one currency is stamped on a figure that is in several');
     assert.equal(mrr.books.length, byCurrency.size, 'every currency the ledger bills in has its own book');
     for (const row of mrr.books) assert.equal(row.value, byCurrency.get(row.currency)?.mrr, `${row.currency.toUpperCase()} MRR disagrees with the overview`);
-    assert.notEqual(mrr.value, book.mrr, 'the cross-currency sum is never the figure');
+    // The overview's headline is the workspace-currency book, never every
+    // currency's minor units added together; the sum survives only under a
+    // name that says what it is, for this reconciliation to check against.
+    const crossSum = [...byCurrency.values()].reduce((sum, row) => sum + row.mrr, 0);
+    assert.equal(book.currency, 'usd');
+    assert.equal(book.mrr, byCurrency.get('usd')?.mrr, 'the headline MRR is the workspace-currency book');
+    assert.equal(book.arr, byCurrency.get('usd')?.arr);
+    assert.notEqual(book.mrr, crossSum, 'the headline is never the cross-currency sum');
+    assert.equal(book.cross_currency_sum_minor_units.mrr, crossSum, 'and the sum is kept only under its own name');
+    assert.match(String(book.mrr_note), /USD book alone/);
+    assert.notEqual(mrr.value, crossSum, 'the cross-currency sum is never the figure');
     for (const row of mrr.books) assert.ok(mrr.formatted.includes(row.formatted));
     const arr = (await runtime().execute('business_metric', { metric: 'arr' }, callContext())).result as { books: { currency: string; value: number }[] };
     for (const row of arr.books) assert.equal(row.value, byCurrency.get(row.currency)?.arr);
@@ -1635,8 +1666,36 @@ describe('money keeps its currency: the copilot\'s ledger figures reconcile with
       const books = [...byCurrency.entries()].map(([currency, row]) => spoken(row[key], currency));
       for (const figure of books) assert.ok(answer.content.includes(figure), `${figure} is missing from:\n${answer.content}`);
       assertOnlyTheseNumbers(answer.content, allow(...books, byCurrency.size, ...perBook), question);
-      assert.ok(!answer.content.includes(money(book[key])), `the cross-currency sum ${money(book[key])} must never be printed`);
+      const summed = book.cross_currency_sum_minor_units[key] as number;
+      for (const printed of [money(summed), money2(summed, 'usd')]) {
+        assert.ok(!answer.content.includes(printed), `the cross-currency sum ${printed} must never be printed`);
+      }
     }
+  });
+
+  test('money prints with its minor units everywhere in one thread, ranks and lines alike', async () => {
+    // Every open deal in the seed is priced in whole dollars, which is exactly
+    // the figure a formatter that trims the cents prints differently from an
+    // invoice line beside it.
+    const open = recs('deal').filter(isOpen);
+    const pipeline = total(open);
+    assert.ok(open.length > 0 && pipeline % 100 === 0, 'fixture: the open pipeline is a whole number of dollars');
+    const metric = businessMetric(app.ctx, ORG, { metric: 'pipeline' });
+    assert.ok(!('error' in metric), 'pipeline errored');
+    assert.equal(metric.value, pipeline);
+    assert.equal(metric.formatted, money2(pipeline, 'usd'), 'the metric states its cents');
+    assert.notEqual(metric.formatted, money(pipeline), 'and never the trimmed form');
+
+    const answer = await ask('What is our open pipeline?');
+    assert.equal(answer.analysis.refusal, null, answer.content);
+    assert.ok(answer.content.includes(money2(pipeline, 'usd')), `${money2(pipeline, 'usd')} is missing from:\n${answer.content}`);
+
+    // A ranked answer prints its figures the same way as the total above it.
+    const largest = [...open].sort((a, b) => amount(b) - amount(a))[0];
+    const ranked = await ask('What are our 5 biggest open deals?');
+    assert.equal(ranked.analysis.refusal, null, ranked.content);
+    assert.ok(ranked.content.includes(money2(amount(largest), 'usd')), `${money2(amount(largest), 'usd')} is missing from:\n${ranked.content}`);
+    assert.doesNotMatch(ranked.content, /\$\d[\d,]*(?![\d,.])/, `a figure without its cents in:\n${ranked.content}`);
   });
 
   test('every money metric held in several books refuses to sum them', () => {

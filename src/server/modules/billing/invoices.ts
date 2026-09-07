@@ -3,14 +3,16 @@
  *
  * Everything else in this module computes a number; this file is where those
  * numbers become something a customer can be charged. An invoice is assembled
- * from three sources and nothing else:
+ * from four sources and nothing else:
  *
  *  1. the subscription's own recurring lines for the period being entered,
  *     billed in advance and already scaled if the period is a partial one;
  *  2. the proration lines waiting in `billing_pending_items`, claimed here and
  *     stamped `invoiced` so no second invoice can pick them up;
  *  3. whatever the credits module has in its outbox for this customer — the
- *     usage it settled in arrears, the credit it covered, the packs it sold.
+ *     usage it settled in arrears, the credit it covered, the packs it sold;
+ *  4. the invoice items written by hand onto the customer — a setup fee, a
+ *     negotiated credit — claimed and stamped exactly as a proration is.
  *
  * Every line is then taxed by the customer's own rate before any of it is
  * written, so the subtotal this file records is a taxable base and never a
@@ -49,7 +51,7 @@ import {
 import type { Billing } from './store';
 import { TaxRates, type ResolvedRate, type TaxSplit } from './tax';
 import type {
-  AutomaticTaxStatus, CollectionMethod, Customer, Invoice, InvoiceBillingReason, InvoiceLine, InvoiceLineKind,
+  AutomaticTaxStatus, CollectionMethod, Customer, Invoice, InvoiceBillingReason, InvoiceItem, InvoiceLine, InvoiceLineKind,
   InvoiceLineSource, InvoiceLineTax, InvoiceStatus, LineTaxAmount, PauseBehavior, PendingInvoiceItem,
   RecurringLine, Subscription,
 } from './types';
@@ -75,6 +77,11 @@ export interface DraftLine {
   period: { start: number; end: number };
   fraction: { numerator: number; denominator: number } | null;
   breakdown: InvoiceLine['breakdown'];
+  /**
+   * The behaviour a line with no price behind it carries for itself. Left
+   * out, the line is taxed the way the price that produced it says.
+   */
+  taxBehavior?: TaxBehavior;
 }
 
 /**
@@ -137,6 +144,15 @@ export interface IssueInvoiceInput {
    * everything pending for the customer — which is what a cycle invoice does.
    */
   pendingItemIds?: string[];
+  /**
+   * Restrict the invoice-item sweep to these ids. Left out, the bill claims
+   * every item waiting for the customer — unless the proration sweep was
+   * narrowed, in which case a bill for exactly those prorations carries no
+   * hand-written items either.
+   */
+  invoiceItemIds?: string[];
+  /** False leaves the bill as a draft for a person to look over; the default finalises it at once. */
+  finalize?: boolean;
   /** Backdated history: the invoice was raised, and settled, on the day. */
   createdAt?: number;
   paidAt?: number | null;
@@ -303,16 +319,17 @@ export class Invoices {
   /**
    * Cash that actually settled this account's bills, over its life.
    *
-   * `amount_paid` is the honest column: a refund or a chargeback reverses it,
-   * a credit note taken off a bill before payment was never collected into
-   * it, and a withdrawn bill keeps whatever was collected on it so a refund
-   * can still reach that money — which, until one does, is real. An open
-   * bill's total is not in here, because a bill nobody has paid is not value
-   * this customer has brought in yet.
+   * `amount_paid` is what was collected and `amount_refunded` what went back:
+   * a chargeback reverses the first, a refund is carried in the second and
+   * leaves the bill paid, a credit note taken off a bill before payment was
+   * never collected into either, and a withdrawn bill keeps whatever was
+   * collected on it so a refund can still reach that money — which, until one
+   * does, is real. An open bill's total is not in here, because a bill nobody
+   * has paid is not value this customer has brought in yet.
    */
   lifetimeCollected(orgId: string, customerId: string): number {
     return this.ctx.db.count(
-      `SELECT COALESCE(SUM(amount_paid), 0) FROM billing_invoices WHERE org_id = ? AND customer_id = ?`,
+      `SELECT COALESCE(SUM(amount_paid - amount_refunded), 0) FROM billing_invoices WHERE org_id = ? AND customer_id = ?`,
       orgId, customerId,
     );
   }
@@ -335,7 +352,7 @@ export class Invoices {
       `SELECT
          currency,
          COALESCE(SUM(CASE WHEN status IN ('open','paid','uncollectible') THEN total ELSE 0 END), 0) AS billed,
-         COALESCE(SUM(amount_paid), 0) AS collected,
+         COALESCE(SUM(amount_paid - amount_refunded), 0) AS collected,
          COALESCE(SUM(CASE WHEN status IN ('draft','open') THEN amount_due ELSE 0 END), 0) AS outstanding,
          COALESCE(SUM(CASE WHEN status = 'uncollectible' THEN total ELSE 0 END), 0) AS written_off,
          COUNT(*) AS count,
@@ -430,6 +447,42 @@ export class Invoices {
   }
 
   /**
+   * Hand-written lines, priced by nobody. The explanation says so, and shows
+   * the arithmetic, because "Setup fee — $1,500.00" with nothing behind it is
+   * the one line on a bill a customer is most likely to ask about.
+   */
+  invoiceItemDrafts(orgId: string, items: InvoiceItem[], fallback: Period): DraftLine[] {
+    const locale = this.billing.locale(orgId);
+    return items.map((item) => {
+      const dated = item.period.end > item.period.start;
+      const period = dated ? item.period : fallback;
+      const show = (amount: number) => formatMoney(money(amount, item.currency), { locale });
+      const arithmetic = item.quantity === 1
+        ? show(item.amount)
+        : `${item.quantity} × ${show(item.unit_amount)} = ${show(item.amount)}`;
+      return {
+        source: { type: 'invoice_item' as InvoiceLineSource, id: item.id },
+        subscription: item.subscription,
+        subscriptionItem: null,
+        price: null,
+        kind: 'invoice_item' as InvoiceLineKind,
+        proration: false,
+        description: item.description,
+        explanation: `${arithmetic}: ${item.amount < 0 ? 'a credit' : 'a charge'} written by hand on ${longDate(item.created, locale)} rather than priced from the catalogue${
+          dated ? `, covering ${describeWindow(period, locale)}` : ''
+        }${item.tax_behavior === 'inclusive' ? '. The amount is what the customer pays, tax included' : ''}.`,
+        quantity: item.quantity,
+        amount: item.amount,
+        currency: item.currency,
+        period,
+        fraction: null,
+        breakdown: [],
+        taxBehavior: item.tax_behavior,
+      };
+    });
+  }
+
+  /**
    * What the credits module has been holding for this customer: usage it priced
    * when a period closed, the part of it prepaid credit already paid for, and
    * any credit packs bought since the last bill. `billed_amount` is what the
@@ -488,7 +541,8 @@ export class Invoices {
     const book = this.billing.book(orgId);
     const where = describeJurisdiction(customer, resolved);
     return drafts.map((draft) => {
-      const behavior: TaxBehavior = draft.price ? book.find(draft.price)?.tax_behavior ?? 'unspecified' : 'unspecified';
+      const behavior: TaxBehavior = draft.taxBehavior
+        ?? (draft.price ? book.find(draft.price)?.tax_behavior ?? 'unspecified' : 'unspecified');
       const split = rates.split(draft.amount, behavior, draft.currency, resolved);
       const taxes = snapshotTax(rates, split, where);
       return { ...draft, amount: split.base, taxes, tax: rollUpLineTax(taxes) };
@@ -509,7 +563,7 @@ export class Invoices {
    * it, and `base + tax` is the listed price either way.
    */
   taxTotals(
-    orgId: string, customer: Customer, lines: { price: string | null; amount: number; currency: string }[],
+    orgId: string, customer: Customer, lines: { price: string | null; amount: number; currency: string; taxBehavior?: TaxBehavior }[],
   ): { base: number; tax: number } {
     if (!lines.length) return { base: 0, tax: 0 };
     const taxed = this.taxDrafts(orgId, customer, lines.map((line) => ({
@@ -527,6 +581,7 @@ export class Invoices {
       period: { start: 0, end: 0 },
       fraction: null,
       breakdown: [],
+      taxBehavior: line.taxBehavior,
     })));
     return {
       base: taxed.reduce((total, line) => total + line.amount, 0),
@@ -576,6 +631,12 @@ export class Invoices {
     const claimed = this.billing.claimPendingItems(orgId, customer.id, id, {
       ids: input.pendingItemIds, currency: input.currency,
     });
+    // A bill narrowed to named prorations carries exactly those; every other
+    // bill sweeps the hand-written items too, because an item left waiting
+    // for "the next invoice" while one is being drawn may never be billed.
+    const items = this.billing.invoiceItems.claim(orgId, customer.id, id, {
+      ids: input.invoiceItemIds ?? (input.pendingItemIds ? [] : undefined), currency: input.currency,
+    });
     const outbox = this.creditsOutbox()?.drainOutbox(orgId, customer.id, id) ?? [];
     for (const item of outbox) {
       if (item.currency === input.currency) continue;
@@ -600,6 +661,7 @@ export class Invoices {
       ...this.recurringDrafts(orgId, input.subscription?.id ?? null, input.recurring),
       ...this.prorationDrafts(claimed),
       ...this.usageDrafts(orgId, outbox, input.subscription?.id ?? null, input.arrearsPeriod ?? fallbackWindow),
+      ...this.invoiceItemDrafts(orgId, items, fallbackWindow),
     ];
     if (!drafts.length) return null;
     const period: Period = input.subscription ? input.period : spanOf(drafts, fallbackWindow);
@@ -641,6 +703,7 @@ export class Invoices {
       balance_applied: balanceApplied,
       total,
       amount_paid: 0,
+      amount_refunded: 0,
       amount_due: total,
       pre_payment_credit_notes_amount: 0,
       post_payment_credit_notes_amount: 0,
@@ -735,6 +798,9 @@ export class Invoices {
     // paused; that is the whole point of `pause_collection.behavior`.
     if (input.pauseBehavior === 'keep_as_draft') return draft;
     if (input.pauseBehavior === 'void') return this.voidInvoice(orgId, id, input.meta, createdAt);
+    // A bill raised for a person to look over before it goes out. Stripe's
+    // auto_advance=false: it is a draft until POST /v1/invoices/:id/finalize.
+    if (input.finalize === false) return draft;
 
     // A bill Ain could not place is not sent. It stays a draft naming what is
     // missing, because a zero-rated invoice raised out of ignorance is a
@@ -959,6 +1025,70 @@ export class Invoices {
   }
 
   /**
+   * Record cash handed back on a bill, without reopening it.
+   *
+   * Stripe's rule, and the right one: a bill the customer settled is settled.
+   * The refund is a fact about the payment — it is recorded on the charge and
+   * carried here in `amount_refunded` — not a fact about what was billed, so
+   * `total`, `amount_paid` and `amount_due` do not move and `status` stays
+   * `paid`. Nothing is queued for collection, because nothing is owed: a
+   * customer who was given money back and then owes it again is owed it on a
+   * new invoice a person raises, not on the old one quietly reopened under a
+   * recovery campaign. Reducing the bill itself, and the tax on it, is a
+   * credit note's job.
+   *
+   * A part-paid open bill and a withdrawn bill holding cash can give money
+   * back the same way — the cash is real wherever the document stands — but
+   * never more than they collected and have not already returned.
+   */
+  recordRefund(
+    orgId: string, id: string, amount: number,
+    opts: { note?: string | null; refund?: string | null; at?: number } = {}, meta?: WriteMeta,
+  ): Invoice {
+    const invoice = this.require(orgId, id);
+    const locale = this.billing.locale(orgId);
+    const show = (value: number) => formatMoney(money(value, invoice.currency), { locale });
+    if (!Number.isInteger(amount) || amount <= 0) {
+      throw badRequest('amount_invalid', 'A refund has to be for a positive whole number of minor units.', 'amount');
+    }
+    const refundable = invoice.amount_paid - invoice.amount_refunded;
+    if (amount > refundable) {
+      throw badRequest(
+        'refund_exceeds_collected',
+        refundable <= 0
+          ? `Invoice ${invoice.number} holds no cash to give back: ${show(invoice.amount_paid)} was collected on it and ${show(invoice.amount_refunded)} has already gone back.`
+          : `${show(amount)} is more than invoice ${invoice.number} can give back. ${show(invoice.amount_paid)} was collected on it${
+            invoice.amount_refunded > 0 ? ` and ${show(invoice.amount_refunded)} has already gone back` : ''
+          }, so at most ${show(refundable)} can be refunded now.`,
+        'amount',
+        { invoice: id, amount_paid: invoice.amount_paid, amount_refunded: invoice.amount_refunded, refundable: Math.max(0, refundable) },
+      );
+    }
+    const now = opts.at ?? this.ctx.now();
+    const refunded = invoice.amount_refunded + amount;
+    this.ctx.db.patch('billing_invoices', 'id', id, {
+      amount_refunded: refunded,
+      payment_note: opts.note ?? invoice.payment_note,
+      updated: now,
+    });
+    this.assertBalanced(orgId, id);
+    const after = this.require(orgId, id);
+    this.ctx.emit(orgId, 'invoice.refunded', {
+      invoice: after.id, number: after.number, customer: after.customer, subscription: after.subscription,
+      amount, currency: after.currency, amount_refunded: after.amount_refunded, amount_paid: after.amount_paid,
+      amount_due: after.amount_due, status: after.status, refund: opts.refund ?? null, note: opts.note ?? null,
+      resolution: `${show(amount)} of what was collected on ${after.number} went back to the customer${
+        refunded >= after.amount_paid ? ', which is everything the bill collected' : ''
+      }. The bill stays ${after.status}: what was billed and what was paid are unchanged, and nothing is queued for collection. If the customer owes this money again, raise a new invoice for it.`,
+    }, {
+      objectId: id, objectType: 'invoice',
+      previous: { amount_refunded: invoice.amount_refunded },
+      actorId: meta?.actorId, actorType: meta?.actorType, requestId: meta?.requestId,
+    });
+    return after;
+  }
+
+  /**
    * Withdraw a bill that should never have been sent. The balance it drew down
    * goes back where it came from, because a voided invoice consumed nothing.
    *
@@ -1155,6 +1285,15 @@ export class Invoices {
         },
       );
     }
+    // Cash can only go back once, and only if it came in: a refund is carried
+    // beside `amount_paid` rather than taken off it, so the pair has to be
+    // asserted together or a bill could hand back money it never held.
+    if (invoice.amount_refunded < 0 || invoice.amount_refunded > invoice.amount_paid) {
+      throw internal(
+        `Invoice ${invoice.number} records ${invoice.amount_refunded} refunded against ${invoice.amount_paid} collected, so money has gone back that was never collected on it.`,
+        { invoice: id, amount_paid: invoice.amount_paid, amount_refunded: invoice.amount_refunded },
+      );
+    }
     // Nothing may be credited that was not billed. The ceiling is the bill
     // itself, so an invoice that account credit already paid down cannot hand
     // that same credit back a second time through a credit note.
@@ -1189,6 +1328,7 @@ export class Invoices {
         WHERE org_id = ? AND invoice_id = ? AND status = 'invoiced'`,
       orgId, invoiceId,
     );
+    this.billing.invoiceItems.release(orgId, invoiceId);
     this.ctx.db.run(
       `UPDATE billing_subscription_periods SET invoice_id = NULL WHERE org_id = ? AND invoice_id = ?`,
       orgId, invoiceId,

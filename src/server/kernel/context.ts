@@ -7,6 +7,7 @@ import type { Router, Auth } from './http';
 import type { ModuleDef } from './module';
 import type { AiRuntime } from './ai';
 import type { ServiceRegistry } from './services';
+import { currentOrgScope } from './org-scope';
 
 export interface Config {
   env: 'development' | 'test' | 'production';
@@ -68,8 +69,20 @@ export interface RequestCtx extends Ctx {
  * The clock is resolved per org, so draining has to be too: a handler reached
  * through `c.jobs` — `POST /v1/time/advance`, `POST /v1/jobs/drain` — must not
  * be able to run another tenant's renewals under this tenant's clock.
+ *
+ * It also names the actor to the workspace scope. Modules emit most of their
+ * events from the boot context, where there is no request to read, so an
+ * event handler that wants to say *who* changed a property or a tax setting
+ * has only the scope to ask. The stamp happens here because this is the one
+ * place every authenticated request passes through.
  */
 export function withAuth(ctx: Ctx, auth: Auth, requestId: string): RequestCtx {
+  const scope = currentOrgScope();
+  if (scope) {
+    scope.requestId = requestId;
+    scope.actorId = auth.userId ?? auth.keyId ?? null;
+    scope.actorType = auth.kind === 'api_key' ? 'api_key' : auth.kind === 'session' ? 'user' : 'system';
+  }
   return Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx, {
     auth, requestId, jobs: ctx.jobs.forOrg(auth.orgId),
   });

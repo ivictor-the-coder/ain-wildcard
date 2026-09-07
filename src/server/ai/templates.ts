@@ -22,7 +22,7 @@ import type {
 import type { DraftResult } from './draft';
 import { linkedCustomerIds } from './metrics';
 import { invoiceSettlements } from './functions';
-import { capitalise, plural, humanise, listPhrase } from './text';
+import { capitalise, plural, humanise, listPhrase, subjectOf } from './text';
 import {
   bind, bindsAnywhere, bound, candidates, describeSlot, slotSpan, stripPoliteness, tokenise,
   type Bindings, type Bound, type MovementBucket, type SlotKind, type SlotValue, type Token, type Vocabulary,
@@ -2737,13 +2737,6 @@ function sentenceCase(text: string): string {
   if (!trimmed) return trimmed;
   const capitalised = trimmed[0].toUpperCase() + trimmed.slice(1);
   return /[.!?]$/.test(capitalised) ? capitalised : `${capitalised}.`;
-}
-
-function subjectOf(body: string): string {
-  const first = body.split(/(?<=[.!?])\s+/)[0].replace(/[.!?]$/, '');
-  const trimmed = first.replace(/^(the|a|an)\s+/i, '');
-  const subject = trimmed[0] ? trimmed[0].toUpperCase() + trimmed.slice(1) : trimmed;
-  return subject.length > 80 ? `${subject.slice(0, 79).trimEnd()}…` : subject;
 }
 
 /** What a write step came to: done, waiting, or refused. */

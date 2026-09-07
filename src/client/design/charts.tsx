@@ -40,6 +40,8 @@ export interface ChartBaseProps {
   /** Show every Nth category label; defaults to a fit-based stride. */
   xTickStride?: number;
   yTickCount?: number;
+  /** The values are counts: the y axis steps by whole numbers, never 2.5. */
+  integer?: boolean;
 }
 
 const defaultFormat = (v: number) => formatCompact(v);
@@ -189,7 +191,7 @@ export interface LineChartProps extends ChartBaseProps {
 
 export function LineChart({
   series, categories, height = 240, title, description, valueFormat = defaultFormat,
-  legend = true, smooth = true, showDots, fill, partialLast, className, xTickStride, yTickCount = 5,
+  legend = true, smooth = true, showDots, fill, partialLast, className, xTickStride, yTickCount = 5, integer,
 }: LineChartProps) {
   const [ref, width] = useChartWidth();
   const [hidden, setHidden] = useState<Set<string>>(new Set());
@@ -203,7 +205,7 @@ export function LineChart({
 
   const all = visible.flatMap((s) => s.values);
   const { min, max } = extentOf(all.length ? all : [0, 1]);
-  const ticks = niceTicks(min, max, yTickCount);
+  const ticks = niceTicks(min, max, yTickCount, { integer });
   const y = linearScale([ticks[0], ticks[ticks.length - 1]], [margin.top + plotH, margin.top]);
   const x = pointScale(categories.length, [margin.left, margin.left + plotW]);
   const stride = xTickStride ?? xLabelStride(categories.length, plotW);
@@ -305,7 +307,7 @@ export interface AreaChartProps extends ChartBaseProps { stacked?: boolean; smoo
 
 export function AreaChart({
   series, categories, height = 240, title, description, valueFormat = defaultFormat,
-  legend = true, stacked = true, smooth = true, className, xTickStride, yTickCount = 5,
+  legend = true, stacked = true, smooth = true, className, xTickStride, yTickCount = 5, integer,
 }: AreaChartProps) {
   const [ref, width] = useChartWidth();
   const [tip, setTip] = useState<TipState | null>(null);
@@ -317,7 +319,7 @@ export function AreaChart({
 
   const stacks = useMemo(() => stackSeries(series.map((s) => s.values)), [series]);
   const maxValue = stacked ? stackedMax(series.map((s) => s.values)) : Math.max(...series.flatMap((s) => s.values), 0);
-  const ticks = niceTicks(0, maxValue, yTickCount);
+  const ticks = niceTicks(0, maxValue, yTickCount, { integer });
   const y = linearScale([ticks[0], ticks[ticks.length - 1]], [margin.top + plotH, margin.top]);
   const x = pointScale(categories.length, [margin.left, margin.left + plotW]);
   const stride = xTickStride ?? xLabelStride(categories.length, plotW);
@@ -388,7 +390,7 @@ export interface BarChartProps extends ChartBaseProps {
 
 export function BarChart({
   series, categories, height = 240, title, description, valueFormat = defaultFormat,
-  legend = true, stacked = false, horizontal = false, reference, className, xTickStride, yTickCount = 5,
+  legend = true, stacked = false, horizontal = false, reference, className, xTickStride, yTickCount = 5, integer,
 }: BarChartProps) {
   const [ref, width] = useChartWidth();
   const [tip, setTip] = useState<TipState | null>(null);
@@ -403,7 +405,7 @@ export function BarChart({
   const stacks = useMemo(() => stackSeries(series.map((s) => s.values)), [series]);
   const maxValue = stacked ? stackedMax(series.map((s) => s.values)) : Math.max(...series.flatMap((s) => s.values), 0);
   const minValue = Math.min(0, ...series.flatMap((s) => s.values));
-  const ticks = niceTicks(minValue, Math.max(maxValue, reference?.value ?? 0), yTickCount);
+  const ticks = niceTicks(minValue, Math.max(maxValue, reference?.value ?? 0), yTickCount, { integer });
   const domain: [number, number] = [ticks[0], ticks[ticks.length - 1]];
 
   if (horizontal) {

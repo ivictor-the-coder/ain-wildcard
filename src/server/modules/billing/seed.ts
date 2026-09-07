@@ -196,57 +196,14 @@ export function seedBilling(ctx: Ctx, orgId: string): void {
   )?.id ?? null;
 
   const customers = companies.map((company, index) => {
-    const slug = str(company, 'domain').split('.')[0];
-    const country = str(company, 'country');
-    const region = str(company, 'region');
-    const currency = currencyFor(country, region);
     const assets = num(company, 'connected_assets');
-    const rung = rungOf(assets);
-    const enterprise = rung === 'enterprise';
-    const taxId = taxIdFor(country, slug);
-    const createdAt = startOfDay(company.created + 7 * DAY);
-
-    const customer = billing.createCustomer(orgId, {
-      name: company.display_name,
-      email: `ap@${str(company, 'domain')}`,
+    const account = openAccount(ctx, billing, orgId, company, {
+      rung: rungOf(assets),
       description: `Billing account for ${company.display_name} — ${num(company, 'plant_count')} plants, ${assets} connected assets.`,
-      phone: str(company, 'phone') || null,
-      currency,
-      crm_record_id: company.id,
-      address: {
-        line1: str(company, 'street'), city: str(company, 'city'), state: str(company, 'state'),
-        postal_code: str(company, 'postal_code'), country,
-      },
-      tax_ids: taxId ? [taxId] : [],
-      invoice_settings: {
-        default_payment_method: enterprise ? null : `pm_card_${slug.slice(0, 10)}`,
-        days_until_due: enterprise ? 45 : 30,
-        custom_fields: enterprise ? [{ name: 'Purchase order', value: `PO-${slugDigits(slug).slice(0, 6)}` }] : [],
-        footer: enterprise
-          ? 'Payable by bank transfer under master services agreement NW-MSA-2024. Remittance advice to ar@northwind.io.'
-          : null,
-      },
-      preferred_locales: currency === 'eur' ? ['de-DE', 'en-GB'] : currency === 'gbp' ? ['en-GB'] : ['en-US'],
-      tax_exempt: company.id === exemptCompany ? 'exempt' : 'none',
-      metadata: { crm_company: company.id, region, rung, plants: String(num(company, 'plant_count')) },
-    }, { actorType: 'system' });
-
-    // Northwind's AP team checked every registration against its own register
-    // when the account was opened — which is the only thing that lets a B2B
-    // supply into the EU be reverse charged, and the reason the seeded German
-    // and Irish bills carry 0% with a sentence saying why.
-    if (taxId) {
-      billing.verifyTaxId(orgId, customer.id, {
-        value: taxId.value,
-        status: 'verified',
-        verified_name: company.display_name,
-        verified_address: `${str(company, 'street')}, ${str(company, 'city')}, ${country}`,
-      }, { actorType: 'system' });
-    }
-
-    ctx.db.patch('billing_customers', 'id', customer.id, { created: createdAt, updated: createdAt });
-    retimeEvents(ctx, orgId, customer.id, now, createdAt);
-    return { customer: billing.requireCustomer(orgId, customer.id), company, rung, currency, assets, index, slug };
+      taxExempt: company.id === exemptCompany,
+      now,
+    });
+    return { ...account, index };
   });
 
   /* ------------------------------ the plan mix ---------------------------- */
@@ -529,6 +486,57 @@ export function seedBilling(ctx: Ctx, orgId: string): void {
       now - 21 * DAY, goodwill.id, now - 21 * DAY);
   }
 
+  /* ------------------------------ paid pilots ----------------------------- */
+
+  /**
+   * Two enterprise prospects that stream telemetry before they are customers.
+   *
+   * Pemberton and Aldergate are the largest open opportunities in the
+   * pipeline, and each is running a paid pilot on Scale while the enterprise
+   * agreement is negotiated: one plant's fleet, invoiced monthly on net terms,
+   * metered like every other account. The CRM keeps them as opportunities
+   * because the enterprise deal is still open; the billing account is the
+   * pilot. They are in the book because the telemetry meter streams for both,
+   * and a fleet on a usage screen that no customer page can open is the
+   * one-story rule broken — the seat counts are the operators the roster
+   * says each pilot line runs.
+   */
+  const pilots = [
+    { domain: 'pembertonauto.com', seats: 41, months: 4, site: 'the Warren seating plant', terms: 'while the MES-wide enterprise agreement is negotiated' },
+    { domain: 'aldergatesemi.com', seats: 22, months: 3, site: 'Fab 2’s back-end tooling', terms: 'while the enterprise agreement clears their SPC team' },
+  ];
+  for (const pilot of pilots) {
+    const company = ctx.svc.crm.findBy(orgId, 'company', 'domain', pilot.domain);
+    if (!company) throw new Error(`Billing seed expects CRM company "${pilot.domain}" for its paid pilot`);
+    const account = openAccount(ctx, billing, orgId, company, {
+      rung: 'scale',
+      description: `Pilot billing account for ${company.display_name} — ${pilot.site} on Scale, ${pilot.terms}.`,
+      taxExempt: false,
+      now,
+      metadata: { component: 'pilot' },
+    });
+    const plan = byRung('scale');
+    const startDate = startOfDay(now - pilot.months * MONTH - Math.floor(random() * 12) * DAY);
+    const mark = ctx.now();
+    const sub = billing.createSubscription(orgId, {
+      customer: account.customer.id,
+      items: [
+        { price: priceOf(plan.base), quantity: 1 },
+        ...(plan.seat ? [{ price: priceOf(plan.seat), quantity: pilot.seats }] : []),
+        ...plan.metered.map((metered) => ({ price: priceOf(metered), quantity: 1 })),
+      ],
+      backdate_start_date: startDate,
+      billing_cycle_anchor: startDate,
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+      default_payment_method: null,
+      description: `${company.display_name} — Telemetry Cloud Scale, paid pilot at ${pilot.site}`,
+      metadata: { rung: 'scale', component: 'pilot', crm_company: company.id, region: str(company, 'region') },
+    }, { actorType: 'system' });
+    retimeEvents(ctx, orgId, sub.id, mark, startDate);
+    fastForward(ctx, billing, orgId, sub.id, now);
+  }
+
   /* ----------------------------- collections ------------------------------ */
 
   settleHistoricalInvoices(ctx, billing, orgId, now);
@@ -577,6 +585,78 @@ function settleHistoricalInvoices(ctx: Ctx, billing: Billing, orgId: string, now
 }
 
 /* --------------------------------- helpers -------------------------------- */
+
+interface Account {
+  customer: ReturnType<Billing['requireCustomer']>;
+  company: CrmRecord;
+  rung: Rung;
+  currency: string;
+  assets: number;
+  slug: string;
+}
+
+/**
+ * Open the billing account for one CRM company the way the AP team would have
+ * on the day it was won: the legal entity and its address from the record,
+ * the registration number in the shape its register issues, and the terms its
+ * rung of the ladder trades on. Dated a week after the company was first
+ * recorded, so the account is older than every bill raised against it.
+ */
+function openAccount(
+  ctx: Ctx, billing: Billing, orgId: string, company: CrmRecord,
+  opts: { rung: Rung; description: string; taxExempt: boolean; now: number; metadata?: Record<string, string> },
+): Account {
+  const slug = str(company, 'domain').split('.')[0];
+  const country = str(company, 'country');
+  const region = str(company, 'region');
+  const currency = currencyFor(country, region);
+  const assets = num(company, 'connected_assets');
+  const enterprise = opts.rung === 'enterprise';
+  const taxId = taxIdFor(country, slug);
+  const createdAt = startOfDay(company.created + 7 * DAY);
+
+  const customer = billing.createCustomer(orgId, {
+    name: company.display_name,
+    email: `ap@${str(company, 'domain')}`,
+    description: opts.description,
+    phone: str(company, 'phone') || null,
+    currency,
+    crm_record_id: company.id,
+    address: {
+      line1: str(company, 'street'), city: str(company, 'city'), state: str(company, 'state'),
+      postal_code: str(company, 'postal_code'), country,
+    },
+    tax_ids: taxId ? [taxId] : [],
+    invoice_settings: {
+      default_payment_method: enterprise ? null : `pm_card_${slug.slice(0, 10)}`,
+      days_until_due: enterprise ? 45 : 30,
+      custom_fields: enterprise ? [{ name: 'Purchase order', value: `PO-${slugDigits(slug).slice(0, 6)}` }] : [],
+      footer: enterprise
+        ? 'Payable by bank transfer under master services agreement NW-MSA-2024. Remittance advice to ar@northwind.io.'
+        : null,
+    },
+    preferred_locales: currency === 'eur' ? ['de-DE', 'en-GB'] : currency === 'gbp' ? ['en-GB'] : ['en-US'],
+    tax_exempt: opts.taxExempt ? 'exempt' : 'none',
+    metadata: { crm_company: company.id, region, rung: opts.rung, plants: String(num(company, 'plant_count')), ...opts.metadata },
+  }, { actorType: 'system' });
+
+  // Northwind's AP team checked every registration against its own register
+  // when the account was opened — which is the only thing that lets a B2B
+  // supply into the EU be reverse charged, and the reason the seeded German
+  // and Irish bills carry 0% with a sentence saying why.
+  if (taxId) {
+    billing.verifyTaxId(orgId, customer.id, {
+      value: taxId.value,
+      status: 'verified',
+      verified_name: company.display_name,
+      verified_address: `${str(company, 'street')}, ${str(company, 'city')}, ${country}`,
+    }, { actorType: 'system' });
+  }
+
+  ctx.db.patch('billing_customers', 'id', customer.id, { created: createdAt, updated: createdAt });
+  retimeEvents(ctx, orgId, customer.id, opts.now, createdAt);
+  return { customer: billing.requireCustomer(orgId, customer.id), company, rung: opts.rung, currency, assets, slug };
+}
 
 /**
  * Move the events a seeded write just emitted back to the date they belong to,

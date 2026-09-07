@@ -135,6 +135,46 @@ export function currencySymbol(currency: Currency = DEFAULT_LOCALE.currency, loc
   return parts.find((p) => p.type === 'currency')?.value ?? currency.toUpperCase();
 }
 
+export interface NumberSeparators { group: string; decimal: string }
+
+/** What the locale writes between thousands and before the fraction: "," and "." for en-US, "." and "," for de-DE. */
+export function numberSeparators(locale = DEFAULT_LOCALE.locale): NumberSeparators {
+  const parts = nf(locale, { useGrouping: true, minimumFractionDigits: 1, maximumFractionDigits: 1 }).formatToParts(1234567.8);
+  return {
+    group: parts.find((p) => p.type === 'group')?.value ?? ',',
+    decimal: parts.find((p) => p.type === 'decimal')?.value ?? '.',
+  };
+}
+
+/**
+ * Minor units as the text an amount field edits: grouped the way the locale
+ * groups, with the currency's own fraction and no symbol — "4,600,000,000.00",
+ * not "4600000000.00". Integer arithmetic throughout: the digits are split,
+ * never divided.
+ */
+export function moneyInputText(minor: number | null | undefined, currency: Currency = DEFAULT_LOCALE.currency, locale = DEFAULT_LOCALE.locale): string {
+  if (minor === null || minor === undefined || !Number.isFinite(minor)) return '';
+  const exp = exponentOf(currency);
+  const digits = String(Math.abs(Math.trunc(minor)));
+  const whole = exp > 0 ? digits.slice(0, -exp) || '0' : digits;
+  const fraction = exp > 0 ? digits.slice(-exp).padStart(exp, '0') : '';
+  const grouped = nf(locale, { useGrouping: true, maximumFractionDigits: 0 }).format(BigInt(whole));
+  const sign = minor < 0 ? '-' : '';
+  return exp > 0 ? `${sign}${grouped}${numberSeparators(locale).decimal}${fraction}` : `${sign}${grouped}`;
+}
+
+/**
+ * The reverse: text typed in the locale's notation — grouped, with its own
+ * decimal mark — back to minor units. `null` when it is not a number at all.
+ */
+export function parseMoneyText(raw: string, currency: Currency = DEFAULT_LOCALE.currency, locale = DEFAULT_LOCALE.locale): Money | null {
+  const { group, decimal } = numberSeparators(locale);
+  const plain = (group ? raw.split(group).join('') : raw)
+    .replace(/[\s\u00a0\u202f']/g, '')
+    .split(decimal).join('.');
+  return parseMoneyInput(plain, currency);
+}
+
 /* --------------------------------- time ---------------------------------- */
 
 export interface DateOptions {
@@ -178,8 +218,29 @@ export function formatMonth(ts: number, o: DateOptions = {}): string {
   }).format(ts);
 }
 
+const rtfCache = new Map<string, Intl.RelativeTimeFormat>();
+function rtf(locale: string): Intl.RelativeTimeFormat {
+  let f = rtfCache.get(locale);
+  if (!f) { f = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' }); rtfCache.set(locale, f); }
+  return f;
+}
+
+/** From a week to a quarter the day is the unit: "46 days ago", never "2 months ago". */
+export const RELATIVE_DAYS_FROM = 7 * DAY;
+export const RELATIVE_DAYS_UNTIL = 90 * DAY;
+
+/**
+ * Rounding to the nearest month from a week out is how a key created 46 days
+ * ago read "2 months ago" and a renewal 40 days off read "in 1 month" — a
+ * third of the truth gone, on the screens where the day is what matters.
+ * Under a week the shared helper's hours and "yesterday" stand; past a
+ * quarter, months are honest again.
+ */
 export function formatRelative(ts: number | null | undefined, now: number, locale = DEFAULT_LOCALE.locale): string {
   if (!isTimestamp(ts) || !isTimestamp(now)) return '—';
+  const diff = ts - now;
+  const abs = Math.abs(diff);
+  if (abs >= RELATIVE_DAYS_FROM && abs < RELATIVE_DAYS_UNTIL) return rtf(locale).format(Math.round(diff / DAY), 'day');
   return formatRelativeBase(ts, now, locale);
 }
 

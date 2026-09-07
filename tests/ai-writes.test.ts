@@ -22,7 +22,7 @@ import assert from 'node:assert/strict';
 import { createApp, type App } from '../src/server/app';
 import { frozenClock } from '../src/server/kernel/clock';
 import { aiRuntime, type AiCallContext } from '../src/server/ai/runtime';
-import { DAY } from '../src/shared/time';
+import { DAY, formatDate } from '../src/shared/time';
 
 const ORG = 'org_demo';
 const DANA = 'usr_seed01';
@@ -191,6 +191,154 @@ describe('an approval stores the write it will run, not the copy it shows', () =
     assert.equal(landed.length, 1,
       'the approval reported success and wrote a different note from the one it was given');
     assert.equal(landed[0].value_text, body);
+    app.close();
+  });
+});
+
+/* ------------------------------ a task today ------------------------------ */
+
+describe('a scheduled follow-up is a task a person can find today', () => {
+  // Longer than a subject line, so the subject is the note's first clause.
+  const NOTE = 'Send the renewal quote with the three-year option priced, and confirm the seat count before the QBR';
+  const SUBJECT = 'Send the renewal quote with the three-year option priced';
+
+  const taskFor = (app: App, recordId: string) =>
+    app.db.get<{ id: string; owner_id: string | null; properties: string; created: number }>(
+      `SELECT t.id, t.owner_id, t.properties, t.created FROM crm_records t
+         JOIN crm_associations a ON (a.from_id = t.id AND a.to_id = ?) OR (a.to_id = t.id AND a.from_id = ?)
+        WHERE t.org_id = ? AND t.object_type = 'task' AND t.archived = 0
+        ORDER BY t.created DESC, t.rowid DESC LIMIT 1`, recordId, recordId, ORG);
+  const tasksOn = (app: App, recordId: string) =>
+    app.db.count(
+      `SELECT COUNT(*) FROM crm_records t
+         JOIN crm_associations a ON (a.from_id = t.id AND a.to_id = ?) OR (a.to_id = t.id AND a.from_id = ?)
+        WHERE t.org_id = ? AND t.object_type = 'task' AND t.archived = 0`, recordId, recordId, ORG);
+  const org = (app: App) => app.db.get<{ locale: string; timezone: string }>(`SELECT locale, timezone FROM orgs WHERE id = ?`, ORG)!;
+  const nameOf = (app: App, id: string) => app.db.pluck<string>(`SELECT name FROM users WHERE id = ?`, id)!;
+
+  test('approving books a task on the record — subject, due date, owner — and the outcome names it', async () => {
+    const app = await boot();
+    const runtime = aiRuntime(app.ctx);
+    const tool = runtime.tool('schedule_followup')!;
+    const record = company(app);
+    const recordName = app.db.pluck<string>(`SELECT display_name FROM crm_records WHERE id = ?`, record)!;
+    const before = tasksOn(app, record);
+
+    const booked = await runtime.execute('schedule_followup', { record_id: record, in_days: 7, note: NOTE }, call(app, { approvals: ['schedule_followup'] }), tool);
+    assert.equal(booked.ok, true, booked.error?.message);
+    const outcome = booked.result as { scheduled: boolean; task_id: string | null; due: number };
+    assert.equal(tasksOn(app, record), before + 1, 'approving booked one task on the record');
+    const task = taskFor(app, record)!;
+    const props = JSON.parse(task.properties) as Record<string, unknown>;
+    assert.equal(outcome.task_id, task.id, 'the outcome carries the task, so the card can link it');
+    assert.ok(NOTE.length > 80 && SUBJECT.length < 80, 'fixture: the note runs past a subject line and its first clause does not');
+    assert.equal(props.subject, SUBJECT, 'the subject is the first clause of the note, not the whole note');
+    assert.equal(props.due_at, T0 + 7 * DAY);
+    assert.equal(props.status, 'not_started');
+    assert.equal(props.task_type, 'follow_up');
+    assert.equal(task.owner_id, DANA, 'assigned to the person who scheduled it');
+    assert.ok(String(props.body).includes(NOTE), 'the task body carries the whole note');
+    assert.ok(booked.span.summary.includes(`task_id=${task.id}`), `the span the client reads names the task:\n${booked.span.summary}`);
+
+    // The event on the record says what, when and for whom, in the words of
+    // the person who approved — not "Agent", and not an empty line.
+    const scheduled = app.ctx.events.list(ORG, { types: ['ai.followup.scheduled'], objectId: record, limit: 5 });
+    assert.equal(scheduled.length, 1);
+    assert.equal(scheduled[0].actor_type, 'user');
+    assert.equal(scheduled[0].actor_id, DANA);
+    const data = scheduled[0].data as { subject: string; task_id: string; assignee_id: string; due_display: string };
+    assert.equal(data.task_id, task.id);
+    assert.equal(data.assignee_id, DANA);
+    const { locale, timezone } = org(app);
+    const dueDay = formatDate(T0 + 7 * DAY, { locale, timeZone: timezone });
+    assert.equal(data.due_display, dueDay);
+    for (const expected of [recordName, dueDay, nameOf(app, DANA), NOTE]) {
+      assert.ok(data.subject.includes(expected), `the event body says "${expected}":\n${data.subject}`);
+    }
+
+    // A retried call finds its own booking rather than booking a second task.
+    await runtime.execute('schedule_followup', { record_id: record, in_days: 7, note: NOTE }, call(app, { approvals: ['schedule_followup'] }), tool);
+    assert.equal(tasksOn(app, record), before + 1, 'an identical repeat booked a second task');
+    assert.equal(followups(app).length, 1);
+    app.close();
+  });
+
+  test('when it comes due the task is completed, the note lands, and both speak for the approver', async () => {
+    const app = await boot();
+    const runtime = aiRuntime(app.ctx);
+    const tool = runtime.tool('schedule_followup')!;
+    const record = company(app);
+    const headers = await signIn(app);
+
+    const asked = await runtime.execute('schedule_followup', { record_id: record, in_days: 7, note: NOTE }, call(app), tool);
+    assert.equal(asked.error?.code, 'approval_required');
+    const card = app.db.get<{ id: string }>(`SELECT id FROM ai_approvals WHERE org_id = ? AND status = 'pending'`, ORG)!;
+    const decided = await app.handle({ method: 'POST', path: `/v1/ai/approvals/${card.id}`, body: { decision: 'approve' }, headers });
+    assert.equal(decided.status, 200, JSON.stringify(decided.body));
+    const task = taskFor(app, record)!;
+    assert.ok(String(decided.body.outcome).includes(`task_id=${task.id}`), `the approval outcome links the task:\n${decided.body.outcome}`);
+    assert.equal((JSON.parse(task.properties) as { status: string }).status, 'not_started');
+
+    await app.travel(8 * DAY);
+    const done = JSON.parse(app.db.pluck<string>(`SELECT properties FROM crm_records WHERE id = ?`, task.id)!) as Record<string, unknown>;
+    assert.equal(done.status, 'completed', 'the follow-up coming due completes the task it booked');
+    assert.ok(Number(done.completed_at) >= T0 + 7 * DAY);
+    const note = app.db.get<{ owner_id: string | null; properties: string }>(
+      `SELECT owner_id, properties FROM crm_records WHERE org_id = ? AND object_type = 'note' AND display_name LIKE 'Follow-up:%' ORDER BY created DESC, rowid DESC LIMIT 1`,
+      ORG)!;
+    assert.ok(note, 'the note landed');
+    assert.equal(note.owner_id, DANA);
+    assert.equal((JSON.parse(note.properties) as { body: string }).body, NOTE);
+
+    const due = app.ctx.events.list(ORG, { types: ['ai.followup.due'], objectId: record, limit: 5 });
+    assert.equal(due.length, 1);
+    assert.equal(due[0].actor_type, 'user', 'the due event speaks for the person who approved, not "Agent"');
+    assert.equal(due[0].actor_id, DANA);
+    const data = due[0].data as { subject: string; task_id: string; task_completed: boolean; note_id: string | null; approved_by: string };
+    assert.equal(data.task_id, task.id);
+    assert.equal(data.task_completed, true);
+    assert.equal(data.approved_by, DANA);
+    assert.ok(data.note_id);
+    assert.ok(data.subject.includes(NOTE) && data.subject.includes(nameOf(app, DANA)), `the due event says what and for whom:\n${data.subject}`);
+    app.close();
+  });
+});
+
+/* ---------------------------- a note's subject ---------------------------- */
+
+describe('a note without a subject gets one from its own first sentence', () => {
+  const cardFor = (app: App, runId: string) =>
+    JSON.parse(app.db.pluck<string>(`SELECT args FROM ai_approvals WHERE org_id = ? AND run_id = ? ORDER BY created DESC LIMIT 1`, ORG, runId)!) as { subject?: string; body: string };
+
+  test('one sentence is not its own subject twice; a long sentence stops at its first clause', async () => {
+    const app = await boot();
+    const runtime = aiRuntime(app.ctx);
+    const tool = runtime.tool('add_note')!;
+    const record = company(app);
+    const cases: [string, string][] = [
+      ['The pilot slipped to October.', 'Pilot slipped to October'],
+      ['Spoke with Priya about the rollout, she wants the renewal quote by Friday and asked us to chase the security questionnaire before the QBR.', 'Spoke with Priya about the rollout'],
+      ['Security review passed. Procurement wants the MSA redlines back by Thursday.', 'Security review passed'],
+    ];
+    for (const [body, subject] of cases) {
+      const context = call(app, { runId: `run_subject_${cases.findIndex(([b]) => b === body)}` });
+      const asked = await runtime.execute('add_note', { record_ids: [record], body }, context, tool);
+      assert.equal(asked.error?.code, 'approval_required');
+      const card = cardFor(app, context.runId!);
+      assert.equal(card.subject, subject, `the card a person approves carries the subject the note will land with`);
+      assert.equal(card.body, body, 'and the whole text as the body');
+      assert.notEqual(card.subject, card.body);
+    }
+
+    // What is approved is what lands: subject and body, distinct, on the record.
+    const headers = await signIn(app);
+    const first = app.db.get<{ id: string }>(`SELECT id FROM ai_approvals WHERE org_id = ? AND run_id = 'run_subject_1'`, ORG)!;
+    const decided = await app.handle({ method: 'POST', path: `/v1/ai/approvals/${first.id}`, body: { decision: 'approve' }, headers });
+    assert.equal(decided.status, 200, JSON.stringify(decided.body));
+    const landed = app.db.get<{ display_name: string; properties: string }>(
+      `SELECT display_name, properties FROM crm_records WHERE org_id = ? AND object_type = 'note' ORDER BY created DESC, rowid DESC LIMIT 1`, ORG)!;
+    assert.equal(landed.display_name, 'Spoke with Priya about the rollout');
+    assert.equal((JSON.parse(landed.properties) as { body: string }).body, cases[1][0]);
     app.close();
   });
 });

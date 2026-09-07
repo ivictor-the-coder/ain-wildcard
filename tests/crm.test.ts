@@ -2546,3 +2546,106 @@ describe('merging a record while a max rollup is defined', () => {
     assert.ok(res.status < 400, `merge failed with ${res.status}: ${JSON.stringify(res.body)}`);
   });
 });
+
+/* -------------------------- ownership on the record ----------------------- */
+
+describe('a private view belongs to whoever saved it', () => {
+  const SOFIA: Auth = { ...DANA, userId: 'usr_seed04', role: 'member' };
+
+  test('it is listed, served, edited and deleted only for its owner — to anyone else it does not exist', async () => {
+    const mine = await expectOk('POST', '/v1/views', {
+      object_type: 'company', name: 'Accounts I am nursing', columns: ['name', 'industry'], shared: false,
+    });
+    assert.equal(mine.shared, false);
+    assert.equal(mine.owner_id, DANA.userId, 'a view records who saved it');
+    const theirs = await expectOk('POST', '/v1/views', { object_type: 'company', name: 'Manufacturing accounts', columns: ['name'] });
+    assert.equal(theirs.shared, true, 'a view is shared unless it is saved otherwise');
+
+    const forSofia = (await expectOk('GET', '/v1/views?object_type=company', undefined, SOFIA)).data.map((v: { id: string }) => v.id);
+    assert.ok(!forSofia.includes(mine.id), 'Dana\'s private view was listed to Sofia');
+    assert.ok(forSofia.includes(theirs.id), 'a shared view is for everyone');
+    const forDana = (await expectOk('GET', '/v1/views?object_type=company')).data.map((v: { id: string }) => v.id);
+    assert.ok(forDana.includes(mine.id) && forDana.includes(theirs.id), 'the owner sees both');
+    const schema = await expectOk('GET', '/v1/objects/company', undefined, SOFIA);
+    assert.ok(!schema.views.some((v: { id: string }) => v.id === mine.id), 'the object schema leaked the private view');
+
+    // Holding the id is not holding the view: 404, never 403, so the id
+    // cannot be used to confirm that a teammate keeps a view by that name.
+    for (const [method, body] of [['GET', undefined], ['PATCH', { name: 'Renamed by Sofia' }], ['DELETE', undefined]] as const) {
+      const res = await call(method, `/v1/views/${mine.id}`, body, SOFIA);
+      assert.equal(res.status, 404, `${method} on Dana's private view answered ${res.status} to Sofia`);
+      assert.equal(res.body.error.code, 'resource_missing');
+    }
+    const applied = await call('GET', `/v1/records/company?view=${mine.id}`, undefined, SOFIA);
+    assert.equal(applied.status, 404, 'the private view still filtered a list for Sofia');
+    assert.equal(app.db.pluck(`SELECT name FROM crm_views WHERE id = ?`, mine.id), 'Accounts I am nursing', 'Sofia\'s edit or delete landed');
+
+    // The owner keeps every right, and sharing it makes it everyone's.
+    assert.equal((await call('GET', `/v1/views/${mine.id}`)).status, 200);
+    assert.equal((await call('GET', `/v1/records/company?view=${mine.id}`)).status, 200);
+    await expectOk('PATCH', `/v1/views/${mine.id}`, { shared: true });
+    assert.equal((await call('GET', `/v1/views/${mine.id}`, undefined, SOFIA)).status, 200, 'a view shared later is still hidden');
+    await expectOk('PATCH', `/v1/views/${mine.id}`, { shared: false });
+    assert.equal((await call('GET', `/v1/views/${mine.id}`, undefined, SOFIA)).status, 404);
+
+    assert.equal((await call('DELETE', `/v1/views/${mine.id}`)).status, 204);
+    assert.equal((await call('DELETE', `/v1/views/${theirs.id}`)).status, 204);
+  });
+});
+
+describe('what a timeline says an activity came through', () => {
+  test('a record\'s own activities are its own, even when its company is a target too', async () => {
+    // A note linked to both a contact and that contact's company, read off the seed.
+    const linked = app.db.get<{ note: string; contact: string; company: string }>(
+      `SELECT c.from_id AS note, c.to_id AS contact, k.to_id AS company
+         FROM crm_associations c
+         JOIN crm_associations k ON k.from_id = c.from_id AND k.association_type = 'activity_to_record'
+         JOIN crm_records rc ON rc.id = c.to_id AND rc.object_type = 'contact'
+         JOIN crm_records rk ON rk.id = k.to_id AND rk.object_type = 'company'
+         JOIN crm_records n ON n.id = c.from_id AND n.object_type = 'note' AND n.archived = 0
+        WHERE c.org_id = ? AND c.association_type = 'activity_to_record' LIMIT 1`, ORG);
+    assert.ok(linked, 'the seed should log at least one note against a contact and their company together');
+
+    const onContact = await expectOk('GET', `/v1/records/contact/${linked.contact}/timeline?roll_up=true&limit=200&kinds=activity`);
+    const contactItem = onContact.data.find((i: { id: string }) => i.id === linked.note);
+    assert.ok(contactItem, 'the note is on the contact\'s timeline');
+    assert.equal(contactItem.via, null, `the contact's own note was attributed via ${JSON.stringify(contactItem.via)}`);
+
+    const onCompany = await expectOk('GET', `/v1/records/company/${linked.company}/timeline?roll_up=true&limit=200&kinds=activity`);
+    const companyItem = onCompany.data.find((i: { id: string }) => i.id === linked.note);
+    assert.ok(companyItem, 'the note is on the company\'s timeline');
+    assert.equal(companyItem.via, null, 'the company is a direct target of the note, so it did not come "via" anyone');
+
+    // What only reaches the account through a person still says so.
+    const only = await expectOk('POST', `/v1/records/contact/${linked.contact}/activities`, {
+      type: 'note', subject: 'Called about the spare parts quote', body: 'Wants it split across two POs.',
+    });
+    const rolled = await expectOk('GET', `/v1/records/company/${linked.company}/timeline?roll_up=true&limit=200&kinds=activity`);
+    const viaContact = rolled.data.find((i: { id: string }) => i.id === only.id);
+    assert.equal(viaContact?.via?.id, linked.contact, 'a note logged on the contact alone rolls up via the contact');
+  });
+});
+
+describe('a member may archive a record but not destroy it', () => {
+  // The file-wide PRIYA carries Dana's role; this is Priya as the workspace seats her.
+  const PRIYA_MEMBER: Auth = { ...DANA, userId: 'usr_seed03', role: 'member' };
+
+  test('permanent deletion is the admin\'s bar, the same as deleting a property', async () => {
+    assert.equal(app.db.pluck(`SELECT role FROM memberships WHERE org_id = ? AND user_id = ?`, ORG, PRIYA_MEMBER.userId), 'member');
+    const company = await expectOk('POST', '/v1/records/company', {
+      properties: { name: 'Halvorsen Marine Fabrication', domain: 'halvorsen-marine.test' },
+    });
+    const refused = await call('DELETE', `/v1/records/company/${company.id}?permanent=true`, undefined, PRIYA_MEMBER);
+    assert.equal(refused.status, 403, `a member destroyed a record (${refused.status})`);
+    assert.equal(refused.body.error.type, 'permission_error');
+    assert.match(String(refused.body.error.message), /archive .* but not delete it permanently/);
+    assert.equal(app.db.count(`SELECT COUNT(*) FROM crm_records WHERE id = ?`, company.id), 1, 'the refusal still deleted the row');
+
+    assert.equal((await call('DELETE', `/v1/records/company/${company.id}`, undefined, PRIYA_MEMBER)).status, 204, 'a member may archive');
+    assert.equal(app.db.pluck(`SELECT archived FROM crm_records WHERE id = ?`, company.id), 1);
+    assert.equal((await call('POST', `/v1/records/company/${company.id}/restore`, undefined, PRIYA_MEMBER)).status, 200, 'and un-archive');
+
+    assert.equal((await call('DELETE', `/v1/records/company/${company.id}?permanent=true`, undefined, MARCUS)).status, 204, 'an admin may destroy');
+    assert.equal(app.db.count(`SELECT COUNT(*) FROM crm_records WHERE id = ?`, company.id), 0);
+  });
+});

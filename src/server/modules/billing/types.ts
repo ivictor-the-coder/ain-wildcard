@@ -465,12 +465,51 @@ export type InvoiceBillingReason = (typeof INVOICE_BILLING_REASONS)[number];
  */
 export const INVOICE_LINE_KINDS = [
   'recurring', 'unused_time', 'remaining_time', 'immediate',
-  'usage', 'credit_covered', 'topup', 'true_up',
+  'usage', 'credit_covered', 'topup', 'true_up', 'invoice_item',
 ] as const;
 export type InvoiceLineKind = (typeof INVOICE_LINE_KINDS)[number];
 
-export const INVOICE_LINE_SOURCES = ['subscription_item', 'pending_item', 'billable_item'] as const;
+export const INVOICE_LINE_SOURCES = ['subscription_item', 'pending_item', 'billable_item', 'invoice_item'] as const;
 export type InvoiceLineSource = (typeof INVOICE_LINE_SOURCES)[number];
+
+/* ------------------------------- invoice items ---------------------------- */
+
+/**
+ * `pending` is waiting for the customer's next bill, `invoiced` has been
+ * claimed by one, `deleted` was withdrawn before any bill picked it up.
+ */
+export const INVOICE_ITEM_STATUSES = ['pending', 'invoiced', 'deleted'] as const;
+export type InvoiceItemStatus = (typeof INVOICE_ITEM_STATUSES)[number];
+
+/**
+ * A hand-written line waiting for an invoice — Stripe's invoice item. A one-off
+ * charge, a setup fee, a negotiated credit: no price behind it, so it carries
+ * its own amount and tax behaviour, and it lands on the next invoice raised for
+ * the customer exactly as a proration does.
+ */
+export interface InvoiceItem {
+  object: 'invoice_item';
+  id: string;
+  customer: string;
+  subscription: string | null;
+  description: string;
+  quantity: number;
+  /** Signed minor units per unit — a negative item is a credit line. */
+  unit_amount: number;
+  /** `unit_amount * quantity`, signed. */
+  amount: number;
+  currency: string;
+  tax_behavior: TaxBehavior;
+  /** The window the line covers; defaults to the day it was written. */
+  period: { start: number; end: number };
+  status: InvoiceItemStatus;
+  /** The bill that claimed it, once one has. */
+  invoice: string | null;
+  metadata: Record<string, string>;
+  created: number;
+  updated: number;
+  livemode: boolean;
+}
 
 export interface InvoiceLine {
   object: 'invoice_line_item';
@@ -625,6 +664,13 @@ export interface Invoice {
   /** `total - tax`. What the service on this bill was worth. */
   total_excluding_tax: number;
   amount_paid: number;
+  /**
+   * Cash handed back to the customer on this bill. A refund is recorded on the
+   * payment and carried here; it never reopens a bill the customer settled —
+   * `amount_paid` stays what was collected, `status` stays `paid`, and what
+   * happens next is a person's decision.
+   */
+  amount_refunded: number;
   amount_due: number;
   /** Credited before anything was collected — it came off `amount_due`. */
   pre_payment_credit_notes_amount: number;
@@ -732,8 +778,16 @@ export interface CreditNote {
   total: number;
   /** Taken off `amount_due` because nothing had been collected yet. */
   pre_payment_amount: number;
-  /** Put onto the customer's balance because the bill had been paid. */
+  /** Put back to the customer because the bill had been paid: the three amounts below add up to it. */
   post_payment_amount: number;
+  /** Sent back to the card through the payments module. */
+  refund_amount: number;
+  /** Put onto the customer's balance, to come off the next bill. */
+  credit_amount: number;
+  /** Settled outside the platform — a bank transfer, a cheque — and only recorded here. */
+  out_of_band_amount: number;
+  /** The payments module's refund row, when part of the note went back to the card. */
+  refund: string | null;
   /** The balance movement, when the credit went to the account. */
   balance_transaction: string | null;
   /** What the invoice's status was when this note was written. */

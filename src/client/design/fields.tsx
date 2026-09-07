@@ -8,8 +8,8 @@ import { AlertCircleIcon, ChevronDownIcon, ChevronUpIcon, ChevronsUpDownIcon, Ey
 import { IconButton, type ControlSize } from './controls';
 import { Popover } from './overlays';
 import { Spinner } from './feedback';
-import { currencySymbol, formatMoney, formatNumber, parseMoneyInput } from './format';
-import { exponentOf, type Currency } from '../../shared/money';
+import { currencySymbol, formatMoney, formatNumber, moneyInputText, parseMoneyText } from './format';
+import type { Currency } from '../../shared/money';
 import { scrollIntoViewport, useCopyToClipboard, useDebouncedValue } from './hooks';
 import './fields.css';
 
@@ -305,15 +305,17 @@ export interface MoneyInputProps extends Omit<InputProps, 'value' | 'onChange' |
 
 /**
  * Edits money without ever holding a float: the text is parsed straight into
- * minor units through `shared/money`, and re-formatted on blur.
+ * minor units through `shared/money`, and re-formatted on blur — grouped the
+ * way the workspace locale groups, as the display formatter does, so a
+ * $4.6B figure reads "4,600,000,000.00" in the field and not as eleven digits
+ * to count by eye.
  */
 export function MoneyInput({
   value, onChange, currency = 'usd', locale = 'en-US', min, max, wrapperClassName, ...rest
 }: MoneyInputProps) {
-  const exp = exponentOf(currency);
   const toText = useCallback(
-    (minor: number | null) => (minor === null ? '' : (minor / 10 ** exp).toFixed(exp)),
-    [exp],
+    (minor: number | null) => moneyInputText(minor, currency, locale),
+    [currency, locale],
   );
   const [text, setText] = useState(() => toText(value));
   const last = useRef(value);
@@ -323,7 +325,7 @@ export function MoneyInput({
 
   const commit = (raw: string) => {
     if (raw.trim() === '') { last.current = null; onChange(null); return; }
-    const parsed = parseMoneyInput(raw, currency);
+    const parsed = parseMoneyText(raw, currency, locale);
     if (!parsed) { setText(toText(value)); return; }
     let minor = parsed.amount;
     if (min !== undefined) minor = Math.max(min, minor);
@@ -339,7 +341,7 @@ export function MoneyInput({
       type="text"
       inputMode="decimal"
       value={text}
-      placeholder={rest.placeholder ?? (0).toFixed(exp)}
+      placeholder={rest.placeholder ?? moneyInputText(0, currency, locale)}
       wrapperClassName={cx('ain-input--number', wrapperClassName)}
       prefix={currencySymbol(currency, locale)}
       suffix={<span style={{ textTransform: 'uppercase', fontSize: 'var(--text-xs)' }}>{currency}</span>}
@@ -497,6 +499,8 @@ export interface ComboboxProps {
   disabled?: boolean;
   invalid?: boolean;
   size?: ControlSize;
+  /** Put the caret in the field as it mounts — an inline editor opening onto a picklist. */
+  autoFocus?: boolean;
   id?: string;
   className?: string;
   'aria-label'?: string;
@@ -517,7 +521,7 @@ function Highlight({ text, query }: { text: string; query: string }) {
 
 export function Combobox({
   value, onChange, options, onSearch, multiple, placeholder = 'Select…', emptyMessage = 'No matches',
-  onCreate, createLabel = (q) => `Create “${q}”`, disabled, invalid, size = 'md', id, className, ...aria
+  onCreate, createLabel = (q) => `Create “${q}”`, disabled, invalid, size = 'md', autoFocus, id, className, ...aria
 }: ComboboxProps) {
   const field = useFieldControl({ id, invalid, disabled });
   const anchor = useRef<HTMLDivElement>(null);
@@ -627,6 +631,7 @@ export function Combobox({
           aria-describedby={field['aria-describedby']}
           aria-invalid={field.invalid || undefined}
           disabled={disabled}
+          autoFocus={autoFocus}
           value={open ? query : singleLabel || query}
           placeholder={selected.length ? (multiple ? '' : singleLabel) : placeholder}
           onFocus={() => setOpen(true)}
@@ -648,8 +653,16 @@ export function Combobox({
               e.preventDefault();
               if (active === enabled.length && canCreate) { onCreate?.(query.trim()); setQuery(''); }
               else if (enabled[active]) commit(enabled[active]);
-            } else if (e.key === 'Escape') { e.stopPropagation(); setOpen(false); setQuery(''); }
-            else if (e.key === 'Backspace' && !query && multiple && selected.length) {
+            } else if (e.key === 'Escape') {
+              // With the list open, Escape is this field's to close. With it
+              // closed the key must travel: stopping it here left an inline
+              // editor around a picklist with no way to cancel — Seniority
+              // stayed in edit mode however many times it was pressed.
+              if (!open) return;
+              e.stopPropagation();
+              setOpen(false);
+              setQuery('');
+            } else if (e.key === 'Backspace' && !query && multiple && selected.length) {
               (onChange as (x: string[]) => void)(selected.slice(0, -1));
             } else if (e.key === 'Tab') setOpen(false);
           }}

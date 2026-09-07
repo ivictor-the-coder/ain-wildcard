@@ -20,19 +20,35 @@ export function extentOf(values: number[], includeZero = true): Extent {
   return { min, max };
 }
 
+export interface TickOptions {
+  /**
+   * Whole-number steps only — 1, 2, 5 × 10ⁿ, never 2.5. For counts: five
+   * ticks over 0–10 stepped by 2.5 printed as "0, 3, 5, 8, 10, 13", an axis
+   * of rounded fractions on a chart of things that cannot be fractional.
+   */
+  integer?: boolean;
+}
+
 /**
  * Axis ticks on human numbers (1, 2, 2.5, 5 × 10ⁿ), covering the domain and
  * landing on round values so a reader can do arithmetic in their head.
  */
-export function niceTicks(min: number, max: number, count = 5): number[] {
+export function niceTicks(min: number, max: number, count = 5, options: TickOptions = {}): number[] {
   if (!Number.isFinite(min) || !Number.isFinite(max)) return [0, 1];
-  if (min === max) { min = Math.min(0, min); max = max || 1; }
   if (min > max) [min, max] = [max, min];
+  // A domain with nothing in it has one honest tick. Widened to 0–1 it drew
+  // five gridlines on an axis with no figure on it — in minor units, five
+  // labels reading "$0.01 $0.01 $0.01 $0 $0".
+  if (min === 0 && max === 0) return [0];
+  if (min === max) { min = Math.min(0, min); max = max || 1; }
   const span = max - min || 1;
   const rough = span / Math.max(1, count);
   const magnitude = 10 ** Math.floor(Math.log10(rough));
   const normalised = rough / magnitude;
-  const step = (normalised >= 5 ? 10 : normalised >= 2.5 ? 5 : normalised >= 1.5 ? 2.5 : normalised >= 1.2 ? 2 : 1) * magnitude;
+  const rung = options.integer
+    ? (normalised >= 5 ? 10 : normalised >= 2.5 ? 5 : normalised >= 1.2 ? 2 : 1)
+    : (normalised >= 5 ? 10 : normalised >= 2.5 ? 5 : normalised >= 1.5 ? 2.5 : normalised >= 1.2 ? 2 : 1);
+  const step = options.integer ? Math.max(1, rung * magnitude) : rung * magnitude;
   const start = Math.floor(min / step) * step;
   const end = Math.ceil(max / step) * step;
   const ticks: number[] = [];

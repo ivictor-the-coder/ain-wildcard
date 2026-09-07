@@ -31,6 +31,7 @@ import {
   resolveInterval, sameCadence, snapToAnchorDay, subscriptionMrr, type PricedItem,
 } from './cycle';
 import { InvoiceHolds, type InvoiceHold } from './holds';
+import { InvoiceItems, type InvoiceItemInput } from './invoice-items';
 import { Invoices, describeWindow, type DraftLine } from './invoices';
 import { previewChange, prorate, type ItemState, type ProrationSet } from './proration';
 import { assertTransition, countsAsRevenue, isTerminal, transitionEvent } from './status';
@@ -83,10 +84,14 @@ export class Billing {
   /** Bills waiting for the metered window they settle before they are drawn. */
   readonly holds: InvoiceHolds;
 
+  /** Lines written by hand, waiting for a bill. */
+  readonly invoiceItems: InvoiceItems;
+
   constructor(private readonly ctx: Ctx) {
     this.invoices = new Invoices(ctx, this);
     this.creditNotes = new CreditNotes(ctx, this);
     this.holds = new InvoiceHolds(ctx, this);
+    this.invoiceItems = new InvoiceItems(ctx, this);
   }
 
   book(orgId: string): Pricebook { return new Pricebook(this.ctx, orgId); }
@@ -912,9 +917,14 @@ export class Billing {
       // What an `always_invoice` bill sweeps up besides its own lines: the
       // items already waiting for this customer, in the currency the bill can
       // carry — exactly the claim `issue()` will make.
-      waitingLines: this.pendingItems(orgId, { customer: customer.id, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE })
-        .filter((item) => item.currency === sub.currency)
-        .map((item) => ({ price: item.price, amount: item.amount, currency: item.currency })),
+      waitingLines: [
+        ...this.pendingItems(orgId, { customer: customer.id, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE })
+          .filter((item) => item.currency === sub.currency)
+          .map((item) => ({ price: item.price, amount: item.amount, currency: item.currency })),
+        ...this.invoiceItems.pending(orgId, customer.id)
+          .filter((item) => item.currency === sub.currency)
+          .map((item) => ({ price: null, amount: item.amount, currency: item.currency, taxBehavior: item.tax_behavior })),
+      ],
     });
 
     return {
@@ -1897,7 +1907,15 @@ export class Billing {
    */
   invoiceNow(
     orgId: string, customerId: string,
-    opts: { subscription?: string | null; description?: string | null; meta?: WriteMeta } = {},
+    opts: {
+      subscription?: string | null;
+      description?: string | null;
+      /** Lines written inline: each becomes an invoice item on the customer and goes straight onto this bill. */
+      items?: Omit<InvoiceItemInput, 'customer'>[];
+      /** False leaves the bill as a draft to look over; the default finalises it at once. */
+      finalize?: boolean;
+      meta?: WriteMeta;
+    } = {},
   ): Invoice {
     return this.ctx.atomic(() => {
       const customer = this.requireCustomer(orgId, customerId);
@@ -1908,6 +1926,17 @@ export class Billing {
           `Subscription ${sub.id} belongs to ${sub.customer}, not to ${customer.id}.`,
           'subscription',
         );
+      }
+      // Written before the bill is drawn, so a line given inline is the same
+      // object as one raised through POST /v1/invoice_items — it has an id, it
+      // is claimed by this bill, and it goes back to waiting if the bill is
+      // voided. Everything already waiting for the customer is swept with it.
+      for (const line of opts.items ?? []) {
+        this.invoiceItems.create(orgId, {
+          ...line,
+          customer: customer.id,
+          subscription: line.subscription ?? sub?.id,
+        }, opts.meta);
       }
       const now = this.ctx.now();
       const invoice = this.invoices.issue(orgId, {
@@ -1923,12 +1952,13 @@ export class Billing {
         collectionMethod: sub?.collection_method ?? 'send_invoice',
         daysUntilDue: sub?.days_until_due ?? customer.invoice_settings.days_until_due,
         pauseBehavior: null,
+        finalize: opts.finalize,
         meta: opts.meta,
       });
       if (!invoice) {
         throw conflict(
           'nothing_to_invoice',
-          `${customer.name} has nothing waiting to be billed — no unbilled prorations, no settled usage and no credit purchases. The next charge lands when the current period renews.`,
+          `${customer.name} has nothing waiting to be billed — no unbilled prorations, no settled usage, no credit purchases and no invoice items. Add a line with POST /v1/invoice_items, or send it inline as items; otherwise the next charge lands when the current period renews.`,
         );
       }
       return invoice;
@@ -1975,10 +2005,12 @@ export class Billing {
     // set that nets negative, which reaches the bill as credit lines and is
     // taxed there rather than being netted off in the balance.
     const waiting = this.pendingItems(orgId, { customer: customer.id, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE });
+    const written = this.invoiceItems.pending(orgId, customer.id).filter((item) => item.currency === sub.currency);
     const proposed = preview.lines;
     const drafts: DraftLine[] = [
       ...this.invoices.recurringDrafts(orgId, sub.id, upcoming),
       ...this.invoices.prorationDrafts(waiting),
+      ...this.invoices.invoiceItemDrafts(orgId, written, period),
       ...proposed.map((line) => ({
         source: { type: 'pending_item' as const, id: null },
         subscription: line.subscription,
@@ -2057,6 +2089,7 @@ export class Billing {
       post_payment_credit_notes_amount: 0,
       total,
       amount_paid: 0,
+      amount_refunded: 0,
       amount_due: total,
       starting_balance: starting,
       ending_balance: starting - balanceApplied,

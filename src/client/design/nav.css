@@ -31,13 +31,18 @@
 .ain-tabs__scroll::-webkit-scrollbar { display: none; }
 
 /* ============================== Breadcrumbs =============================== */
-.ain-crumbs { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-sm); min-width: 0; flex-wrap: wrap; }
-.ain-crumbs__item { color: var(--text-tertiary); display: inline-flex; align-items: center; gap: var(--space-2); }
+/* One line, always. Wrapping put a record's name on a second line under a
+   52px top bar, and the search beside it shrank to "Search recor". The parents
+   keep their width; the current crumb — the record's name, the long one — is
+   what gives way, to an ellipsis. */
+.ain-crumbs { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-sm); min-width: 0; flex-wrap: nowrap; white-space: nowrap; overflow: hidden; }
+.ain-crumbs__item { color: var(--text-tertiary); display: inline-flex; align-items: center; gap: var(--space-2); flex: 0 0 auto; min-width: 0; }
+.ain-crumbs__item:last-child { flex: 0 1 auto; }
 .ain-crumbs__link { color: var(--text-secondary); border-radius: var(--radius-xs); padding: 1px var(--space-1); }
 .ain-crumbs__link:hover { color: var(--text-primary); text-decoration: none; background: var(--bg-hover); }
 .ain-crumbs__link:focus-visible { box-shadow: var(--focus-ring); outline: none; }
-.ain-crumbs__sep { color: var(--text-placeholder); display: inline-flex; }
-.ain-crumbs__current { color: var(--text-primary); font-weight: var(--weight-medium); }
+.ain-crumbs__sep { color: var(--text-placeholder); display: inline-flex; flex: 0 0 auto; }
+.ain-crumbs__current { color: var(--text-primary); font-weight: var(--weight-medium); min-width: 3ch; overflow: hidden; text-overflow: ellipsis; }
 
 /* =============================== Pagination =============================== */
 .ain-pagination { display: flex; align-items: center; gap: var(--space-3); }

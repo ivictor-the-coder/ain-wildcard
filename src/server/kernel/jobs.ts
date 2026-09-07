@@ -1,6 +1,7 @@
 import type { Db } from './db';
 import { parseJson } from './db';
 import type { Logger } from './logger';
+import { runInOrgScope } from './org-scope';
 import { newId } from '../../shared/ids';
 
 /**
@@ -100,6 +101,28 @@ export class JobQueue {
     ).changes;
   }
 
+  /**
+   * Put a failed job back on the queue, due now, with its attempt count intact.
+   *
+   * A retry is an operator saying "the cause is fixed, try once more" — not a
+   * reset. The attempts already made stay on the row so the history reads
+   * true, and because `runOne` fails a job outright once it is at or past
+   * `max_attempts`, one more failure sends it straight back to `failed` rather
+   * than into another backoff ladder. Only a `failed` job qualifies: a pending
+   * one is already going to run, a running one is mid-flight, and a done or
+   * cancelled one has nothing to try. The org filter is part of the WHERE so a
+   * scoped caller cannot re-queue another tenant's work by id.
+   */
+  retry(orgId: string, id: string, now: number): JobRow | null {
+    const changed = this.db.run(
+      `UPDATE jobs SET status = 'pending', run_at = ?, updated = ? WHERE org_id = ? AND id = ? AND status = 'failed'`,
+      now, now, orgId, id,
+    ).changes;
+    if (changed !== 1) return null;
+    const row = this.db.get<any>(`SELECT * FROM jobs WHERE org_id = ? AND id = ?`, orgId, id);
+    return row ? { ...row, payload: parseJson(row.payload, {}) } : null;
+  }
+
   due(now: number, limit = 100): JobRow[] {
     const scope = this.orgId ? 'AND org_id = ?' : '';
     const params = this.orgId ? [now, this.orgId, limit] : [now, limit];
@@ -180,7 +203,11 @@ export class JobQueue {
       return 'failed';
     }
     try {
-      await handler(job.payload, job);
+      // A job is the system acting on its own behalf. It runs in a scope of
+      // its own — the row's workspace, no actor, no request — so a renewal
+      // drained under `POST /v1/time/advance` is not attributed to whoever
+      // pressed the button, and its events are not stamped with that request.
+      await runInOrgScope({ orgId: job.org_id }, () => handler(job.payload, job));
       this.db.patch('jobs', 'id', job.id, { status: 'done', updated: now, last_error: null });
       return 'ok';
     } catch (e) {

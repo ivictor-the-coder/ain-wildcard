@@ -2413,3 +2413,134 @@ describe('every seeded grant names an account that exists', () => {
     }
   });
 });
+
+/* ------------------------ the seeded workspace's story -------------------- */
+
+/**
+ * The demo is one company's story told from three modules at once: the CRM
+ * company, the invoicing customer and the metered fleet are the same account,
+ * a deal that closed a year ago closed a year ago on every screen, and the
+ * credit an account was sold keeps being spent as its fleet keeps streaming.
+ * These checks read across the modules the way an operator's eye does.
+ */
+describe('the seeded workspace tells one story', () => {
+  const ok = async (target: App, method: string, path: string, body?: unknown): Promise<any> => {
+    const res = await target.handle({ method, path, body, auth: DANA });
+    assert.ok(res.status < 400, `${method} ${path} → ${res.status} ${JSON.stringify(res.body)}`);
+    return res.body;
+  };
+
+  test('the credits screen names no unknown account — Aldergate’s renewal goodwill included', async () => {
+    const fresh = await createApp({ db: 'memory', clock: frozenClock(T0), config: { env: 'test' } });
+    try {
+      const customers = new Map<string, string>(
+        (await ok(fresh, 'GET', '/v1/customers?limit=200')).data.map((c: { id: string; name: string }) => [c.id, c.name]));
+      const grants: CreditGrant[] = (await ok(fresh, 'GET', '/v1/credit-grants?limit=200')).data;
+      const goodwill = grants.find((g) => g.name === 'Renewal goodwill — Q4');
+      assert.ok(goodwill, 'Aldergate’s renewal goodwill is granted now that the account can be invoiced');
+      assert.equal(customers.get(goodwill.customer), 'Aldergate Semiconductor');
+      assert.equal(goodwill.amount, 150_000);
+      const unknown: string[] = [];
+      for (const grant of grants) if (!customers.has(grant.customer)) unknown.push(`grant "${grant.name}" → ${grant.customer}`);
+      for (const meter of (await ok(fresh, 'GET', '/v1/meters')).data as { id: string; name: string }[]) {
+        const rows = (await ok(fresh, 'GET', `/v1/meters/${meter.id}/customers?limit=200`)).data as { customer: string }[];
+        for (const row of rows) if (!customers.has(row.customer)) unknown.push(`meter "${meter.name}" → ${row.customer}`);
+      }
+      assert.deepEqual(unknown, [], 'an account the credits screen would have to show as "Unknown account"');
+    } finally {
+      fresh.close();
+    }
+  });
+
+  test('credit keeps burning down as the fleet streams through the time machine', async () => {
+    const fresh = await createApp({ db: 'memory', clock: frozenClock(T0), config: { env: 'test' } });
+    try {
+      const before: CreditGrant[] = (await ok(fresh, 'GET', '/v1/credit-grants?limit=200')).data;
+      const goodwillBefore = before.find((g) => g.name === 'Renewal goodwill — Q4');
+      assert.ok(goodwillBefore);
+      const travelled = await fresh.travel(90 * DAY);
+      assert.equal(travelled.failed, 0);
+
+      // Periods that began after the last historical reading, so the only
+      // usage they can hold is what the fleet streamed under the clock.
+      const settlements: Settlement[] = (await ok(fresh, 'GET', '/v1/credit-settlements?limit=200')).data;
+      const live = settlements.filter((s) => s.period_start >= T0);
+      assert.ok(live.length > 0, 'no metered period after the seed instant was ever settled');
+      assert.ok(live.some((s) => s.full_amount > 0), 'every period after the seed instant settled at zero usage');
+      const covered = live.filter((s) => s.covered_amount > 0);
+      assert.ok(covered.length > 0, 'no prepaid or promotional credit was spent on a period the fleet streamed live');
+      for (const s of covered) assert.equal(s.covered_amount + s.charged_amount, s.full_amount);
+
+      // Aldergate's goodwill starts a week in and its pilot streams every day,
+      // so the pilot's first renewal draws on it — and a Scale fleet's month
+      // is worth far more than the goodwill, so the draw takes all of it.
+      const after: CreditGrant[] = (await ok(fresh, 'GET', '/v1/credit-grants?limit=200')).data;
+      const goodwillAfter = after.find((g) => g.id === goodwillBefore.id);
+      assert.ok(goodwillAfter);
+      assert.ok(goodwillAfter.balance < goodwillBefore.balance, 'Aldergate’s goodwill was never drawn on');
+      const ledger: LedgerEntry[] = (await ok(fresh, 'GET', `/v1/credit-grants/${goodwillAfter.id}/ledger`)).entries;
+      const burned = ledger.filter((e) => e.type === 'burn');
+      assert.ok(burned.length >= 1, 'the balance moved without a burn entry saying why');
+      assert.equal(burned.reduce((sum, e) => sum + e.delta, 0), goodwillAfter.balance - goodwillBefore.balance,
+        'the burn entries account for exactly what left the grant');
+    } finally {
+      fresh.close();
+    }
+  });
+
+  test('every seeded closed deal’s stage trail ends the moment it closed', async () => {
+    const now = app.ctx.now();
+    const deals = (await ok(app, 'GET', '/v1/records/deal?limit=200')).data as {
+      id: string; display_name: string; created: number; properties: Record<string, unknown>;
+    }[];
+    const closed = deals.filter((d) => Number(d.properties.closed_at) > 0);
+    assert.ok(closed.length >= 10, 'the demo has a book of closed deals to check');
+    for (const deal of closed) {
+      const closedAt = Number(deal.properties.closed_at);
+      const label = deal.display_name;
+      assert.equal(deal.properties.stage_entered_at, closedAt, `${label}: entered its closed stage at a different moment than it closed`);
+      assert.equal(deal.properties.days_to_close, Math.round((closedAt - deal.created) / DAY), `${label}: days to close`);
+
+      const spells = (await ok(app, 'GET', `/v1/records/deal/${deal.id}/stage-history`)).data as {
+        stage: string; is_closed: boolean; is_current: boolean; entered_at: number; exited_at: number | null; duration_ms: number; days_in_stage: number;
+      }[];
+      const current = spells.filter((s) => s.is_current);
+      assert.equal(current.length, 1, `${label}: one current stage`);
+      assert.equal(current[0].is_closed, true, `${label}: the current stage is the closed one`);
+      assert.equal(current[0].entered_at, closedAt, `${label}: the closed stage began at the close`);
+      assert.equal(current[0].days_in_stage, Math.round((now - closedAt) / DAY), `${label}: "and counting" counts the days since the close, no more`);
+
+      const open = spells.filter((s) => !s.is_current);
+      assert.ok(open.length >= 1, `${label}: it went through the pipeline before it closed`);
+      for (const spell of open) assert.ok((spell.exited_at as number) <= closedAt, `${label}: a stage was left after the close`);
+      const inPipeline = open.reduce((ms, s) => ms + s.duration_ms, 0);
+      assert.equal(inPipeline, closedAt - deal.created, `${label}: the open stages account for exactly the time from creation to close`);
+      assert.equal(Math.round(inPipeline / DAY), deal.properties.days_to_close, `${label}: days in the pipeline equal days to close`);
+    }
+  });
+
+  test('every seeded closed ticket arrived at "closed" the moment it was resolved', async () => {
+    const now = app.ctx.now();
+    const tickets = (await ok(app, 'GET', '/v1/records/ticket?limit=200')).data as {
+      id: string; display_name: string; created: number; properties: Record<string, unknown>;
+    }[];
+    const closed = tickets.filter((t) => t.properties.status === 'closed');
+    assert.ok(closed.length >= 10, 'the demo has a book of resolved tickets to check');
+    for (const ticket of closed) {
+      const resolvedAt = Number(ticket.properties.resolved_at);
+      const label = ticket.display_name;
+      assert.ok(resolvedAt > ticket.created, `${label}: resolved before it was raised`);
+      assert.equal(ticket.properties.stage_entered_at, resolvedAt, `${label}: entered "closed" at a different moment than it was resolved`);
+      const spells = (await ok(app, 'GET', `/v1/records/ticket/${ticket.id}/stage-history`)).data as {
+        stage: string; is_closed: boolean; is_current: boolean; entered_at: number; exited_at: number | null; duration_ms: number;
+      }[];
+      const current = spells.find((s) => s.is_current);
+      assert.ok(current && current.is_closed && current.stage === 'closed', `${label}: the current status is not the close`);
+      assert.equal(current.entered_at, resolvedAt, `${label}: "closed" began at the resolution`);
+      assert.equal(current.duration_ms, Math.max(0, now - resolvedAt), `${label}: closed for exactly as long as since it was resolved`);
+      const open = spells.filter((s) => !s.is_current);
+      assert.ok(open.length >= 1 && open[0].stage === 'new', `${label}: it was raised as new`);
+      assert.equal(open.reduce((ms, s) => ms + s.duration_ms, 0), resolvedAt - ticket.created, `${label}: the open statuses account for exactly the time to resolution`);
+    }
+  });
+});

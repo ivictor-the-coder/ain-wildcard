@@ -17,7 +17,7 @@ import type {
   AutomaticTax, AutomaticTaxStatus, BalanceTransaction, BalanceTransactionType, BilledPeriod,
   CancellationReason, CollectionMethod,
   CreditNote, CreditNoteLine, CreditNoteLineTaxAmount, CreditNoteReason, CreditNoteStatus,
-  Customer, Invoice, InvoiceBillingReason, InvoiceLine, InvoiceLineKind, InvoiceLineSource,
+  Customer, Invoice, InvoiceBillingReason, InvoiceItem, InvoiceItemStatus, InvoiceLine, InvoiceLineKind, InvoiceLineSource,
   InvoiceLineTax, InvoiceStatus, LineTaxAmount, PaymentBehavior, PendingInvoiceItem, PendingItemStatus,
   PeriodStatus, Subscription, SubscriptionItem, SubscriptionStatus, TaxId, TaxIdVerification, TrialEndBehavior,
 } from './types';
@@ -326,6 +326,28 @@ export function hydratePendingItem(row: any): PendingInvoiceItem {
   };
 }
 
+export function hydrateInvoiceItem(row: any): InvoiceItem {
+  return {
+    object: 'invoice_item',
+    id: row.id,
+    customer: row.customer_id,
+    subscription: row.subscription_id ?? null,
+    description: row.description,
+    quantity: Number(row.quantity),
+    unit_amount: Number(row.unit_amount),
+    amount: Number(row.amount),
+    currency: row.currency,
+    tax_behavior: (row.tax_behavior as TaxBehavior) ?? 'unspecified',
+    period: { start: Number(row.period_start), end: Number(row.period_end) },
+    status: row.status as InvoiceItemStatus,
+    invoice: row.invoice_id ?? null,
+    metadata: parseJson<Record<string, string>>(row.metadata, {}),
+    created: Number(row.created),
+    updated: Number(row.updated),
+    livemode: asBool(row.livemode),
+  };
+}
+
 export function hydrateBalanceTransaction(row: any): BalanceTransaction {
   return {
     object: 'customer_balance_transaction',
@@ -584,6 +606,14 @@ export function hydrateCreditNote(row: any, lines: CreditNoteLine[]): CreditNote
     total: Number(row.total),
     pre_payment_amount: Number(row.pre_payment_amount ?? 0),
     post_payment_amount: Number(row.post_payment_amount ?? 0),
+    refund_amount: Number(row.refund_amount ?? 0),
+    // Notes written before the split existed put the whole post-payment
+    // amount on the balance, and a null here is that note saying so.
+    credit_amount: row.credit_amount === null || row.credit_amount === undefined
+      ? Number(row.post_payment_amount ?? 0)
+      : Number(row.credit_amount),
+    out_of_band_amount: Number(row.out_of_band_amount ?? 0),
+    refund: row.refund_id ?? null,
     balance_transaction: row.balance_transaction_id ?? null,
     invoice_status_at_issue: row.invoice_status_at_issue as InvoiceStatus,
     voided_at: row.voided_at === null || row.voided_at === undefined ? null : Number(row.voided_at),
@@ -666,6 +696,7 @@ export function hydrateInvoice(row: any, lines: InvoiceLine[], automaticTaxEnabl
     total: Number(row.total),
     total_excluding_tax: Number(row.total) - Number(row.tax ?? 0),
     amount_paid: Number(row.amount_paid),
+    amount_refunded: Number(row.amount_refunded ?? 0),
     amount_due: Number(row.amount_due),
     pre_payment_credit_notes_amount: Number(row.pre_payment_credit_notes_amount ?? 0),
     post_payment_credit_notes_amount: Number(row.post_payment_credit_notes_amount ?? 0),

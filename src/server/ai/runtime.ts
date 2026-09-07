@@ -6,6 +6,7 @@ import { isApiError } from '../../shared/errors';
 import { newId, randomId } from '../../shared/ids';
 import { builtinEngine, type EngineAnalysis } from './engine';
 import { anthropicProvider } from './anthropic';
+import { subjectOf } from './text';
 
 /**
  * The model gateway and the tool runtime.
@@ -204,6 +205,25 @@ export interface AinAiRuntime extends AiRuntime {
 
 /** Narrow the kernel-typed runtime to this implementation's richer surface. */
 export const aiRuntime = (ctx: Ctx): AinAiRuntime => ctx.ai as AinAiRuntime;
+
+/* --------------------------------- writes -------------------------------- */
+
+/**
+ * The arguments a write runs with, completed the way a person would complete
+ * them. A note handed over with a body and no subject used to reach the CRM
+ * that way, and the CRM's fallback — the first line, whole — made the subject
+ * the body again, so every one-sentence note read twice on the timeline. The
+ * subject is the note's first sentence or clause, decided here, before the
+ * approval card is drawn from these same arguments, so what a person approves
+ * is what lands.
+ */
+export function completeWriteArgs(tool: string, parsed: unknown): unknown {
+  if (tool !== 'add_note' || !parsed || typeof parsed !== 'object') return parsed;
+  const args = parsed as { subject?: unknown; body?: unknown };
+  if (typeof args.subject === 'string' && args.subject.trim()) return parsed;
+  if (typeof args.body !== 'string' || !args.body.trim()) return parsed;
+  return { ...args, subject: subjectOf(args.body) };
+}
 
 /* ------------------------------- redaction ------------------------------- */
 
@@ -428,7 +448,7 @@ export function createAiRuntime(config: Config): AinAiRuntime {
 
       let parsed: unknown;
       try {
-        parsed = tool.input.parse(args ?? {});
+        parsed = completeWriteArgs(name, tool.input.parse(args ?? {}));
       } catch (e) {
         const apiError = isApiError(e) ? e : null;
         return fail({

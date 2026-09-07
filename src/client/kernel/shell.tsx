@@ -23,9 +23,9 @@ import { invalidate, lastRequestId, useQuery, useRateLimit, type ApiClientError,
 import { COMMANDS, NAV, ROUTES, SETTINGS_PAGES } from '../generated/registry';
 import type { NavItem, RouteDef } from './registry-types';
 import {
-  TIME_JUMPS, activeNavItem, avatarSrc, clockOutcome, crumbsFor, eventSubject, eventTitle, fillParams,
-  firstRegistered, groupNav, isPathActive, jumpBindings, navLabelIndex, railState, recordRouteCandidates,
-  shortcutSheet, withCurrentLabel,
+  TIME_JUMPS, activeNavItem, avatarSrc, canWrite, clockOutcome, crumbsFor, eventSubject, eventTitle, fillParams,
+  firstRegistered, groupNav, isPathActive, jumpBindings, navForRole, navLabelIndex, paletteEntryAllowed, railState,
+  recordRouteCandidates, shortcutSheet, withCurrentLabel,
 } from './shell-core';
 import { usePlatform, useCreateActions, useGlobalSearch, useSearchSources, useTimeMachine } from './platform';
 import { typeaheadTargets, type SearchSource, type TypeaheadTarget } from './search-core';
@@ -173,7 +173,11 @@ function SignedInShell() {
   const createActions = useCreateActions(platform, sources);
   const { advance } = useTimeMachine(() => { invalidate(); session.refresh(); });
 
-  const sections = useMemo(() => groupNav(NAV), []);
+  // What this session is offered follows its role: a destination declared
+  // `minRole: 'admin'` and a command gated `roles: ['admin']` are not shown
+  // to a member, and a reader is never handed a Create.
+  const role = session.me?.role ?? null;
+  const sections = useMemo(() => groupNav(navForRole(NAV, role)), [role]);
   const flatNav = useMemo(() => sections.flatMap((section) => section.items), [sections]);
   const jumps = useMemo(() => jumpBindings(flatNav), [flatNav]);
   const jumpKeyFor = useMemo(() => new Map(jumps.map((jump) => [jump.item.id, jump.key])), [jumps]);
@@ -264,18 +268,21 @@ function SignedInShell() {
       run: () => navigate('/search'),
     });
 
-    for (const action of createActions) {
-      entries.push({
-        id: action.id,
-        title: action.label,
-        group: 'Create',
-        verb: 'Create',
-        icon: action.icon,
-        run: () => navigate(action.to),
-      });
+    if (canWrite(role)) {
+      for (const action of createActions) {
+        entries.push({
+          id: action.id,
+          title: action.label,
+          group: 'Create',
+          verb: 'Create',
+          icon: action.icon,
+          run: () => navigate(action.to),
+        });
+      }
     }
 
     for (const command of COMMANDS) {
+      if (!paletteEntryAllowed({ group: command.group || 'Run', roles: command.roles }, role)) continue;
       entries.push({
         id: `cmd.${command.id}`,
         title: command.title,
@@ -375,7 +382,7 @@ function SignedInShell() {
     });
 
     return entries;
-  }, [flatNav, jumpKeyFor, createActions, navigate, session, rail, narrow, toggleRail, refreshAll, toast, advance, f]);
+  }, [flatNav, jumpKeyFor, createActions, navigate, session, role, rail, narrow, toggleRail, refreshAll, toast, advance, f]);
 
   /* ------------------------------ breadcrumbs ----------------------------- */
 
@@ -915,6 +922,9 @@ function TopSearch({ inputRef, sources, onPalette }: {
   const listId = useId();
   const listRef = useRef<HTMLDivElement>(null);
   const rowId = (id: string) => `${listId}-${id}`;
+  // The field keeps a floor of 280px beside the crumb; at that width the full
+  // placeholder is cut mid-word, so the shorter one takes over.
+  const roomy = useMediaQuery('(min-width: 1181px)');
 
   const search = useGlobalSearch(value, sources, { perSource: 4, limit: 24, delay: 140 });
   const typed = value.trim();
@@ -1005,7 +1015,7 @@ function TopSearch({ inputRef, sources, onPalette }: {
         ref={inputRef}
         className="shell-search__input"
         value={value}
-        placeholder="Search records, customers, price book…"
+        placeholder={roomy ? 'Search records, customers, price book…' : 'Search records…'}
         aria-label="Search everything"
         role="combobox"
         aria-expanded={panelOpen}

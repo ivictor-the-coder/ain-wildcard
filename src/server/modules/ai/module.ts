@@ -6,7 +6,6 @@ import { badRequest, forbidden, notFound } from '../../../shared/errors';
 import type { SchemaNode } from '../../../shared/validate';
 import v from '../../../shared/validate';
 import { DAY, dayKey, formatDate } from '../../../shared/time';
-import { formatMoney } from '../../../shared/money';
 import { AI_MIGRATIONS } from './schema';
 import { AiStore, publicApproval, publicMessage, publicRun, publicSpan, publicThread, recordNamer } from './store';
 import { aiTools, metricCatalogue } from './tools';
@@ -21,6 +20,7 @@ import { accountProfile, recordTimeline, type AccountProfileResult } from '../..
 import { recordStanding, type RecordStanding } from '../../ai/query';
 import { composeDraft, detectDraftKind, detectTone, DRAFT_KINDS, TONES, type DraftKind, type DraftResult, type OutstandingInvoice, type Tone } from '../../ai/draft';
 import { truncate } from '../../ai/text';
+import { money } from '../../ai/answer';
 import { normaliseResponseSchema, schemaNamesNoFields } from '../../ai/extract';
 import { vocabulary } from '../../ai/slots';
 import { publishTemplates, TEMPLATES } from '../../ai/templates';
@@ -202,7 +202,7 @@ function outstandingFor(ctx: Ctx, orgId: string, account: AccountProfileResult |
     .filter((invoice) => invoice.amount_due > 0)
     .map((invoice) => ({
       number: invoice.number,
-      amount_due_formatted: formatMoney({ amount: invoice.amount_due, currency: invoice.currency }, { locale: workspace.locale }),
+      amount_due_formatted: money(invoice.amount_due, invoice.currency, workspace),
       due_at: invoice.due_date ?? null,
       days_overdue: invoice.due_date && invoice.due_date < ctx.now() ? Math.floor((ctx.now() - invoice.due_date) / DAY) : null,
       status: invoice.status,
@@ -499,7 +499,11 @@ export default defineModule({
     ctx.provide('ai', service);
 
     /* A scheduled follow-up is a durable job, so the time machine replays it. */
-    ctx.jobs.handle('ai.followup', (payload: { recordId: string; note: string; assigneeId: string | null; runId: string | null }, job) => {
+    ctx.jobs.handle('ai.followup', (payload: {
+      recordId: string; note: string; assigneeId: string | null; runId: string | null;
+      /** The task booked at approval, and the person who approved. Jobs booked before either existed carry neither. */
+      taskId?: string | null; approvedBy?: string | null;
+    }, job) => {
       // The record is asked about here for the same reason `POST
       // /v1/ai/approvals/:id` asks about it: "a note written onto a record that
       // is gone is a write nobody asked for landing where nobody will read it."
@@ -533,19 +537,44 @@ export default defineModule({
       const assignee = payload.assigneeId && isMember(ctx, job.org_id, payload.assigneeId)
         ? payload.assigneeId
         : null;
+      // The person who approved the follow-up is who the note and the event
+      // speak for. "Agent" on a timeline entry is nobody; the operator who
+      // said yes is somebody a colleague can ask.
+      const approvedBy = payload.approvedBy && isMember(ctx, job.org_id, payload.approvedBy) ? payload.approvedBy : null;
+      const actor = { actorId: approvedBy ?? assignee, actorType: (approvedBy ? 'user' : 'agent') as 'user' | 'agent' };
+      const workspace = workspaceProfile(ctx, job.org_id);
+      const nameOf = (id: string | null) => workspace.people.find((p) => p.id === id)?.name ?? null;
+      const now = ctx.now();
       const crm = ctx.svc.crm;
+      let noteId: string | null = null;
+      let taskCompleted = false;
       if (crm) {
-        crm.logActivity(job.org_id, {
-          type: 'note',
+        // The task booked at approval is done by the note landing: completing
+        // it is what takes the follow-up off the assignee's list. A task since
+        // deleted or already closed by hand is left as the person left it.
+        const task = payload.taskId ? crm.get(job.org_id, 'task', payload.taskId) : null;
+        if (task && task.properties.status !== 'completed') {
+          crm.update(job.org_id, 'task', task.id, { status: 'completed', completed_at: now }, { ...actor, source: 'agent' });
+          taskCompleted = true;
+        }
+        // Written directly rather than through `logActivity`, whose owner
+        // falls back to the actor: the note is owned by the assignee or by
+        // nobody, and the approver is its author either way.
+        const note = crm.create(job.org_id, 'note', {
           subject: `Follow-up: ${truncate(payload.note, 80)}`,
           body: payload.note,
-          occurredAt: ctx.now(),
-          associateTo: [payload.recordId],
-        }, { actorId: assignee, actorType: 'agent', source: 'agent' });
+          occurred_at: now,
+        }, { ...actor, source: 'agent', ownerId: assignee });
+        crm.associate(job.org_id, { fromId: note.id, toId: payload.recordId, associationType: 'activity_to_record' }, { ...actor, source: 'agent' });
+        noteId = note.id;
       }
+      const forWhom = nameOf(assignee);
       ctx.emit(job.org_id, 'ai.followup.due', {
-        record_id: payload.recordId, note: payload.note, assignee_id: assignee, run_id: payload.runId,
-      }, { objectId: payload.recordId, objectType: 'record', actorType: 'agent' });
+        record_id: payload.recordId, record_name: standing.name, note: payload.note, assignee_id: assignee, assignee_name: forWhom,
+        run_id: payload.runId, task_id: payload.taskId ?? null, task_completed: taskCompleted, note_id: noteId,
+        approved_by: approvedBy,
+        subject: `Follow-up due on ${standing.name ?? 'a record'}${forWhom ? ` for ${forWhom}` : ''}: ${payload.note}`,
+      }, { objectId: payload.recordId, objectType: 'record', ...actor });
     });
 
     /* Seeded conversations are real runs, executed once the queue first drains. */

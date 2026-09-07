@@ -1,11 +1,11 @@
 {
-  "updated": "2026-09-05T22:19:11.637Z",
-  "headline": "Every client surface has now been judged on screen by a fresh critic: Operability 0.94–1.00, every figure checked matched the API. The gaps were operational, not arithmetic — financial writes with no confirmation, an invite that promised a sign-in nobody can make, a credits card contradicting itself, closed deals dressed as open ones. All fixed with fail-before-pass tests. What remains crosses ownership lines: the shell and design system carry seven defects every module worked around, and the server owes an invitation path, invoice items, private views, a task from a booked follow-up, and a seed whose usage does not go dark when the clock moves.",
+  "updated": "2026-09-07T00:47:06.447Z",
+  "headline": "Wave 10 closed what crossed the ownership lines. The shell and design system gave up eleven defects the modules had been working around; an invited teammate can finally sign in; a private view is private; and the demo no longer goes dark when the clock moves — usage streams from a durable job, 3,081 of them across 90 days. Two briefs are still out: the revenue and payments leftovers, and the end-to-end suite.",
   "stats": {
     "server modules": 10,
     "client modules": 8,
-    "ai templates": 100,
-    "tests": "1,939/1,939",
+    "api routes": 253,
+    "tests": "2,013/2,013",
     "ci": "green"
   },
   "waves": [
@@ -373,6 +373,49 @@
           "operability": 1,
           "debt": 3,
           "note": "Eleven of twelve had already landed with the Wave 9a builders. Found and fixed here: six more operator-facing sentences in payments carried raw ids, and four repeated transitions (detach, attach, close a dispute, cancel an intent) answered 200 with a different story — each now refuses with a Stripe-shaped code. Open: the subscriptions overview headline still sums across currencies; it needs the AI suite’s assertion and the client changed together."
+        }
+      ]
+    },
+    {
+      "name": "Wave 10 · Across the ownership lines",
+      "status": "active",
+      "note": "Everything the module builders could not reach: the shell and design-system defects six modules worked around, the server halves of the screen findings, and a demo whose usage went dark the moment the clock moved.",
+      "pieces": [
+        {
+          "id": "kernel-kit",
+          "title": "The shell and the design system",
+          "status": "done",
+          "rounds": 1,
+          "operability": 1,
+          "debt": 0,
+          "note": "Eleven defects every module had been working around. Enter on a control inside a row no longer fires the row action; Combobox releases Escape when its list is closed; the palette forgets its last query and hides commands the role cannot run; the record crumb holds one line at 1024; integer axes step in whole units and a zero domain draws one zero; 46 days reads as 46 days. SectionError and StatusPill are now the kit’s, so three modules stop owning a status vocabulary."
+        },
+        {
+          "id": "core-crm-server",
+          "title": "Invitations, privacy and the trail",
+          "status": "done",
+          "rounds": 1,
+          "operability": 1,
+          "debt": 1,
+          "note": "An invited teammate can now actually join: the seat is created in state “invited” with a one-time token, POST /v1/auth/accept sets a password, the token is refused the second time, and the seat becomes active. A private view is served only to its owner. A record’s own activities are no longer attributed “via” its company. A member may no longer hard-delete what an admin will not let them define. Settings-class writes reach the audit trail, teammate changes name the person who made them, and a failed job can be retried."
+        },
+        {
+          "id": "seeds-metering",
+          "title": "A demo that keeps running",
+          "status": "done",
+          "rounds": 1,
+          "operability": 1,
+          "debt": 0,
+          "note": "The seeder wrote history and scheduled nothing, so a usage-priced company showed no usage the moment the clock moved. Ingestion is now a durable re-enqueuing job per metered account: 3,081 jobs replay across 90 days where 895 did before, and usage in the last 30 days holds steady through a 45-day jump. Every meter customer is a billing customer — Pemberton and Aldergate are real accounts now, worth $5,107.00 of MRR between them. Every closed deal’s stage history begins at its close date."
+        },
+        {
+          "id": "ai-billing-server",
+          "title": "Invoice items and the write that lands",
+          "status": "done",
+          "rounds": 1,
+          "operability": 1,
+          "debt": 2,
+          "note": "A one-off invoice with a hand-written line can be raised: POST /v1/invoice_items then POST /v1/invoices, finalised and taxed like any other. A booked follow-up creates a task a person can open, reassign or cancel. A note’s subject is its first sentence, not its whole body. Money in answer prose prints one way, with cents, everywhere."
         }
       ]
     }

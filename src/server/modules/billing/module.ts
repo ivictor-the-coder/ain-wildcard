@@ -4,7 +4,7 @@ import { created, list, status as httpStatus, type Req } from '../../kernel/http
 import { notFound } from '../../../shared/errors';
 import { formatMoney, money } from '../../../shared/money';
 import v from '../../../shared/validate';
-import { PRORATION_BEHAVIORS, type ProrationBehavior } from '../catalog/types';
+import { PRORATION_BEHAVIORS, TAX_BEHAVIORS, type ProrationBehavior } from '../catalog/types';
 import { BILLING_MIGRATIONS } from './schema';
 import { HOLD_RELEASE_JOB } from './holds';
 import { describeCadence, describeInterval, isMetered, longDate, Pricebook, recurringLines, recurringSubtotal, subscriptionMrr } from './cycle';
@@ -15,6 +15,7 @@ import type {
   SubscriptionUpdateInput,
 } from './records';
 import type { CreditNoteInput, CreditNoteListFilter } from './credit-notes';
+import type { InvoiceItemInput, InvoiceItemListFilter } from './invoice-items';
 import { renderInvoice } from './render';
 import { Schedules, type ScheduleCreateInput, type ScheduleListFilter, type ScheduleUpdateInput } from './schedules';
 import {
@@ -29,8 +30,9 @@ import {
   INVOICE_BILLING_REASONS,
   INVOICE_STATUSES, PAUSE_BEHAVIORS,
   PAYMENT_BEHAVIORS, SCHEDULE_END_BEHAVIORS, SCHEDULE_STATUSES, SUBSCRIPTION_STATUSES, TRIAL_END_BEHAVIORS,
+  INVOICE_ITEM_STATUSES,
   type BalanceTransaction, type BilledPeriod, type ChangePreview, type CreditNote, type Customer,
-  type Invoice, type InvoiceStatus, type PendingInvoiceItem,
+  type Invoice, type InvoiceItem, type InvoiceStatus, type PendingInvoiceItem,
   type Subscription, type SubscriptionSchedule, type SubscriptionStatus,
 } from './types';
 
@@ -76,9 +78,20 @@ export interface BillingService {
   invoices(orgId: string, filter?: InvoiceListFilter): Invoice[];
   invoice(orgId: string, id: string): Invoice | null;
   /** Bill everything an account currently owes, without re-billing the period. */
-  invoiceNow(orgId: string, customerId: string, opts?: { subscription?: string | null }): Invoice;
+  invoiceNow(orgId: string, customerId: string, opts?: { subscription?: string | null; items?: Omit<InvoiceItemInput, 'customer'>[]; finalize?: boolean }): Invoice;
   /** The next invoice as it stands, or as a proposed change would leave it. */
   previewInvoice(orgId: string, subscriptionId: string, input?: SubscriptionUpdateInput): Invoice;
+  /**
+   * Cash handed back on a bill, recorded without reopening it: `amount_paid`
+   * and `status` stand, `amount_refunded` carries what went back, and nothing
+   * is queued for collection. The payments module calls this when it refunds
+   * a charge; a chargeback is a different thing and is not this.
+   */
+  recordInvoiceRefund(orgId: string, invoiceId: string, amount: number, opts?: { note?: string | null; refund?: string | null }): Invoice;
+
+  /** A hand-written line for a customer's next bill — a setup fee, a goodwill credit. */
+  createInvoiceItem(orgId: string, input: InvoiceItemInput): InvoiceItem;
+  invoiceItems(orgId: string, filter?: InvoiceItemListFilter): InvoiceItem[];
 
   /** Proration lines waiting to be swept onto an invoice. */
   pendingItems(orgId: string, filter?: { customer?: string; subscription?: string }): PendingInvoiceItem[];
@@ -309,7 +322,25 @@ const creditNoteBody = v.object({
   reason: v.optional(v.enum(CREDIT_NOTE_REASONS)),
   memo: v.optional(v.string({ max: 600 })),
   metadata: v.metadata(),
+  refund_amount: v.optional(v.int({ min: 0, max: 1_000_000_000, description: 'On a paid invoice: how much of the total goes back to the card, through the payments module.' })),
+  credit_amount: v.optional(v.int({ min: 0, max: 1_000_000_000, description: 'On a paid invoice: how much of the total goes onto the customer balance, to come off the next bill.' })),
+  out_of_band_amount: v.optional(v.int({ min: 0, max: 1_000_000_000, description: 'On a paid invoice: how much was returned outside the platform — a bank transfer, a cheque — and is only recorded here.' })),
 }, { strict: true });
+
+/** One hand-written line, whether raised on its own or inline on a bill. */
+const invoiceItemFields = {
+  description: v.string({ min: 1, max: 300, description: 'What the line is for, in the words the customer will read on the bill.' }),
+  amount: v.optional(v.int({ min: -1_000_000_000, max: 1_000_000_000, description: 'The whole line in minor units, signed — negative is a credit. Send this, or unit_amount with quantity.' })),
+  unit_amount: v.optional(v.int({ min: -1_000_000_000, max: 1_000_000_000, description: 'Per unit, in minor units, signed. Multiplied by quantity.' })),
+  quantity: v.optional(v.int({ min: 1, max: 1_000_000 })),
+  currency: v.optional(v.string({ min: 3, max: 3, description: 'Must be the customer\u2019s own currency; defaults to it.' })),
+  tax_behavior: v.optional(v.enum(TAX_BEHAVIORS)),
+  period: v.optional(v.object({ start: v.timestamp(), end: v.timestamp() }, { strict: true })),
+  subscription: v.optional(v.id('sub')),
+  metadata: v.metadata(),
+};
+const invoiceItemBody = v.object({ customer: v.id('cus'), ...invoiceItemFields }, { strict: true });
+const inlineInvoiceItemBody = v.object(invoiceItemFields, { strict: true });
 
 const balanceBody = v.object({
   amount: v.int({ min: -100_000_000, max: 100_000_000, description: 'Signed minor units. Negative grants credit.' }),
@@ -457,6 +488,11 @@ export default defineModule({
       invoice: (orgId, id) => billing.invoices.invoice(orgId, id),
       invoiceNow: (orgId, customerId, opts) => billing.invoiceNow(orgId, customerId, opts ?? {}),
       previewInvoice: (orgId, subscriptionId, input) => billing.previewInvoice(orgId, subscriptionId, input ?? {}),
+      recordInvoiceRefund: (orgId, invoiceId, amount, opts) =>
+        ctx.atomic(() => billing.invoices.recordRefund(orgId, invoiceId, amount, opts ?? {}, { actorType: 'system' })),
+
+      createInvoiceItem: (orgId, input) => billing.invoiceItems.create(orgId, input),
+      invoiceItems: (orgId, filter) => billing.invoiceItems.list(orgId, { limit: 200, ...filter }).data,
 
       pendingItems: (orgId, filter) => billing.pendingItems(orgId, { ...filter, status: 'pending', limit: 500 }),
       claimPendingItems: (orgId, customerId, invoiceId, opts) => billing.claimPendingItems(orgId, customerId, invoiceId, opts),
@@ -761,6 +797,14 @@ export default defineModule({
       const mixed = currencies.length > 1;
       const currency = s.defaultCurrency(orgId);
       const live = subs.filter((sub) => !isTerminal(sub.status));
+      // The headline is one book's figures, never minor units added across
+      // currencies: on a mixed book it is the workspace's own currency's book,
+      // and a workspace whose own currency has no subscription yet has a zero
+      // headline, which is a true figure in that currency. The cross-book sum
+      // is kept beside it under a name that says what it is, for a reader
+      // reconciling "nothing was lost" — it is not money and is never shown.
+      const headline = (byCurrency.length === 1 ? byCurrency[0] : byCurrency.find((row) => row.currency === currency))
+        ?? { currency, subscriptions: 0, live: 0, mrr: 0, trial_mrr: 0, arr: 0, average_revenue_per_account: 0 };
       const invoices = s.invoices.totals(orgId);
       const prorations = c.db.all<{ currency: string; amount: number | string }>(
         `SELECT currency, COALESCE(SUM(amount), 0) AS amount FROM billing_pending_items
@@ -773,25 +817,29 @@ export default defineModule({
       return {
         object: 'billing_overview',
         as_of: now,
-        /** The workspace's own currency. It is not a label for `mrr`. */
-        currency,
+        /** The currency `mrr`, `arr`, `trial_mrr` and `average_revenue_per_account` are stated in: the workspace's own. */
+        currency: headline.currency,
         currencies,
         mixed_currency: mixed,
         subscriptions: subs.length,
         live: live.length,
         by_status: byStatus,
-        /** Minor units summed across every currency billed. Read `by_currency`. */
-        mrr,
-        // A mixed sum is never dressed up as one currency: a figure with a $ in
-        // front of it is a claim about dollars, and this one would not be true.
-        mrr_display: mixed ? null : formatMoney(money(mrr, currency), { locale }),
+        /** The workspace-currency book's MRR, in that currency's minor units. `by_currency` carries every book. */
+        mrr: headline.mrr,
+        mrr_display: formatMoney(money(headline.mrr, headline.currency), { locale }),
         mrr_note: mixed
-          ? `This book bills in ${currencies.join(', ')}, so mrr, arr, trial_mrr and average_revenue_per_account are every currency's minor units added together — a figure in no currency at all. by_currency is the one to read, and to show.`
+          ? `This book bills in ${currencies.join(', ')}. mrr, arr, trial_mrr and average_revenue_per_account are the ${headline.currency.toUpperCase()} book alone — the workspace's own currency — not a sum across currencies, which would be a figure in no currency at all. by_currency carries every book, and is the one to show.`
           : null,
-        arr: mrr * 12,
-        trial_mrr: trialMrr,
-        average_revenue_per_account: live.length ? Math.round(mrr / live.length) : 0,
+        arr: headline.arr,
+        trial_mrr: headline.trial_mrr,
+        average_revenue_per_account: headline.average_revenue_per_account,
         by_currency: byCurrency,
+        /**
+         * Every currency's minor units added together — not money, kept only
+         * so a reconciliation can check that the books add up to what was
+         * counted. Null on a single-currency book, where `mrr` already is that.
+         */
+        cross_currency_sum_minor_units: mixed ? { mrr, arr: mrr * 12, trial_mrr: trialMrr } : null,
         customers: c.db.count(`SELECT COUNT(*) FROM billing_customers WHERE org_id = ?`, orgId),
         delinquent_customers: c.db.count(`SELECT COUNT(*) FROM billing_customers WHERE org_id = ? AND delinquent = 1`, orgId),
         renewing_next_30_days: live.filter((sub) => sub.current_period_end <= now + 30 * 86_400_000).length,
@@ -834,7 +882,7 @@ export default defineModule({
     }, {
       summary: 'The subscription book at a glance', tags: ['billing'],
       description:
-        'Live count, MRR and ARR normalised across every interval, what renews in the next 30 days and what is set to cancel — over the whole book, not a page of it. Money is bucketed by the currency it is billed in; on a mixed book the invoice and proration headlines are the workspace\'s own currency\'s book, named in `currency`, never a sum across books, and mrr_note says what the MRR figures are.',
+        'Live count, MRR and ARR normalised across every interval, what renews in the next 30 days and what is set to cancel — over the whole book, not a page of it. Money is bucketed by the currency it is billed in; on a mixed book every headline figure — MRR, ARR, trial MRR, revenue per account, the invoice and proration totals — is the workspace\'s own currency\'s book, named in `currency`, never a sum across books, and mrr_note says so. by_currency carries every book.',
     });
 
     router.get('/v1/subscriptions', (req: Req, c: Ctx) => {
@@ -992,17 +1040,70 @@ export default defineModule({
     });
 
     router.post('/v1/invoices', (req: Req, c: Ctx) => {
-      const body = req.body as { customer: string; subscription?: string };
+      const body = req.body as {
+        customer: string; subscription?: string; items?: Omit<InvoiceItemInput, 'customer'>[]; auto_advance?: boolean;
+      };
       return created(invoicePayload(c, req.auth.orgId,
         billingStore(c).billing.invoiceNow(req.auth.orgId, body.customer, {
-          subscription: body.subscription ?? null, meta: writeMeta(req),
+          subscription: body.subscription ?? null,
+          items: body.items,
+          finalize: body.auto_advance !== false,
+          meta: writeMeta(req),
         })));
     }, {
-      summary: 'Bill what this account already owes', tags: ['billing'], roles: ['member'], idempotent: true,
+      summary: 'Raise an invoice for what this account owes', tags: ['billing'], roles: ['member'], idempotent: true,
       description:
-        'Sweeps up every proration waiting, the usage the credits module has settled and any credit packs bought, applies the balance and finalises the bill. The recurring fee is not billed again — that happened when the period opened — so this can never double-charge a cycle.',
-      body: v.object({ customer: v.id('cus'), subscription: v.optional(v.id('sub')) }, { strict: true }),
+        'Sweeps up every proration waiting, the usage the credits module has settled, any credit packs bought and every invoice item written for the customer — plus any lines sent inline as items, which become invoice items of their own — applies the balance and finalises the bill. auto_advance=false leaves it as a draft to look over first; POST /v1/invoices/:id/finalize sends it. The recurring fee is not billed again — that happened when the period opened — so this can never double-charge a cycle. An account with nothing waiting and no lines given is refused with nothing_to_invoice.',
+      body: v.object({
+        customer: v.id('cus'),
+        subscription: v.optional(v.id('sub')),
+        items: v.optional(v.array(inlineInvoiceItemBody, { min: 1, max: 100 })),
+        auto_advance: v.optional(v.boolean()),
+      }, { strict: true }),
     });
+
+    /* ------------------------------ invoice items ------------------------- */
+
+    router.get('/v1/invoice_items', (req: Req, c: Ctx) => {
+      const q = req.query as InvoiceItemListFilter;
+      const page = billingStore(c).billing.invoiceItems.list(req.auth.orgId, { ...q, cursor: q.cursor ?? null });
+      return list(page.data.map((item) => invoiceItemPayload(c, req.auth.orgId, item)), {
+        hasMore: page.hasMore, nextCursor: page.nextCursor, totalCount: page.totalCount, url: '/v1/invoice_items',
+      });
+    }, {
+      summary: 'List invoice items', tags: ['billing'],
+      description: 'Lines written by hand for a customer\u2019s next bill. Pending by default; status=invoiced shows the ones a bill has already claimed, status=all everything including withdrawn items.',
+      query: v.object({
+        customer: v.optional(v.id('cus')),
+        subscription: v.optional(v.id('sub')),
+        invoice: v.optional(v.id('in')),
+        status: v.optional(v.enum([...INVOICE_ITEM_STATUSES, 'all'] as const)),
+        limit: v.optional(v.int({ min: 1, max: 200 })),
+        cursor: v.optional(v.string({ max: 200 })),
+      }),
+    });
+
+    router.post('/v1/invoice_items', (req: Req, c: Ctx) =>
+      created(invoiceItemPayload(c, req.auth.orgId,
+        billingStore(c).billing.invoiceItems.create(req.auth.orgId, req.body as InvoiceItemInput, writeMeta(req)))),
+      {
+        summary: 'Write a line for a customer\u2019s next invoice', tags: ['billing'], roles: ['member'], idempotent: true,
+        body: invoiceItemBody,
+        description:
+          'A one-off charge or credit with no price behind it — a setup fee, an amount agreed on the phone, a goodwill credit. It waits, then lands on the next invoice raised for the customer, whether that is the renewal or a bill raised now with POST /v1/invoices, and it is taxed there by the customer\u2019s own rate under the tax_behavior it carries. Priced as one amount, or as unit_amount times quantity; a negative line is a credit. It has to be in the customer\u2019s currency, because that is the only currency a bill of theirs can carry.',
+      });
+
+    router.get('/v1/invoice_items/:id', (req: Req, c: Ctx) =>
+      invoiceItemPayload(c, req.auth.orgId, billingStore(c).billing.invoiceItems.require(req.auth.orgId, req.params.id)),
+      { summary: 'Retrieve an invoice item', tags: ['billing'] });
+
+    router.del('/v1/invoice_items/:id', (req: Req, c: Ctx) =>
+      invoiceItemPayload(c, req.auth.orgId,
+        billingStore(c).billing.invoiceItems.delete(req.auth.orgId, req.params.id, writeMeta(req))),
+      {
+        summary: 'Withdraw an invoice item no bill has picked up', tags: ['billing'], roles: ['member'],
+        description: 'Only a pending item can be withdrawn. One already on a bill is refused with invoice_item_invoiced: void the draft to release it, or credit the line on a finalised bill.',
+      });
 
     router.get('/v1/invoices/:id', (req: Req, c: Ctx) =>
       invoicePayload(c, req.auth.orgId, billingStore(c).billing.invoices.require(req.auth.orgId, req.params.id)),
@@ -1677,6 +1778,8 @@ function invoicePayload(ctx: Ctx, orgId: string, invoice: Invoice) {
     total_display: display(invoice.total),
     total_excluding_tax_display: display(invoice.total_excluding_tax),
     amount_due_display: display(invoice.amount_due),
+    amount_paid_display: display(invoice.amount_paid),
+    amount_refunded_display: display(invoice.amount_refunded),
     balance_applied_display: display(invoice.balance_applied),
     total_taxes: invoice.total_taxes.map((row) => ({ ...row, amount_display: display(row.amount) })),
     lines: invoice.lines.map((line) => ({
@@ -1709,9 +1812,41 @@ function creditNotePayload(ctx: Ctx, orgId: string, note: CreditNote) {
     // What is left on the bill after this note, so a caller never has to guess
     // how much more it could still credit.
     remaining_creditable: invoice ? store.creditNotes.creditable(orgId, invoice) : 0,
+    refund_amount_display: display(note.refund_amount),
+    credit_amount_display: display(note.credit_amount),
+    out_of_band_amount_display: display(note.out_of_band_amount),
     routing_detail: note.post_payment_amount > 0
-      ? `${display(note.post_payment_amount)} was put onto the customer's balance, because the invoice had already been paid. It comes off the next one.`
+      ? describeRouting(note, display)
       : `${display(note.pre_payment_amount)} came off what the invoice asks for; nothing had been collected yet.`,
+  };
+}
+
+/** Where a post-payment note's money went, one clause per destination that took any. */
+function describeRouting(note: CreditNote, display: (amount: number) => string): string {
+  const parts: string[] = [];
+  if (note.refund_amount > 0) parts.push(`${display(note.refund_amount)} went back to the customer\u2019s card through the payments module`);
+  if (note.credit_amount > 0) parts.push(`${display(note.credit_amount)} was put onto the customer\u2019s balance and comes off the next invoice`);
+  if (note.out_of_band_amount > 0) parts.push(`${display(note.out_of_band_amount)} was returned outside the platform and is only recorded here`);
+  return `The invoice had already been paid, so the credit was handed back: ${parts.join('; ')}.`;
+}
+
+function invoiceItemPayload(ctx: Ctx, orgId: string, item: InvoiceItem) {
+  const locale = localeOf(ctx, orgId);
+  const display = (amount: number) => formatMoney(money(amount, item.currency), { locale });
+  const store = billingStore(ctx).billing;
+  const invoice = item.invoice ? store.invoices.invoice(orgId, item.invoice) : null;
+  const customerName = store.customer(orgId, item.customer)?.name ?? null;
+  return {
+    ...item,
+    customer_name: customerName,
+    invoice_number: invoice?.number ?? null,
+    amount_display: display(item.amount),
+    unit_amount_display: display(item.unit_amount),
+    status_detail: item.status === 'pending'
+      ? `Waiting for ${customerName ?? 'the customer'}\u2019s next invoice. It goes on the next bill raised for them, or on one raised now with POST /v1/invoices.`
+      : item.status === 'invoiced'
+        ? `On invoice ${invoice?.number ?? item.invoice}${invoice ? ` (${invoice.status})` : ''}.`
+        : 'Withdrawn before any bill picked it up.',
   };
 }
 
@@ -1735,13 +1870,19 @@ function describeInvoiceStatus(invoice: Invoice, locale: string): string {
       // there while the account sat without a country on it.
       return invoice.automatic_tax.status === 'requires_location_inputs' && invoice.automatic_tax.enabled
         ? 'Held as a draft — Ain could not place this account’s address, so the tax on it could not be worked out and nothing has been sent. It needs a country, and a state in a country whose tax is registered state by state. Complete the address and finalise it.'
-        : 'Held as a draft — collection is paused on this subscription, so nothing has been sent.';
+        : invoice.billing_reason === 'manual'
+          ? 'Draft — raised on request and not yet sent. Finalise it to send it, or void it.'
+          : 'Held as a draft — collection is paused on this subscription, so nothing has been sent.';
     case 'open':
       return invoice.due_date
         ? `Owed, due ${longDate(invoice.due_date, locale)}.`
         : 'Owed, payable on receipt.';
-    case 'paid':
-      return invoice.paid_at ? `Paid ${longDate(invoice.paid_at, locale)}.` : 'Paid.';
+    case 'paid': {
+      const paid = invoice.paid_at ? `Paid ${longDate(invoice.paid_at, locale)}.` : 'Paid.';
+      if (invoice.amount_refunded <= 0) return paid;
+      const refunded = formatMoney(money(invoice.amount_refunded, invoice.currency), { locale });
+      return `${paid} ${invoice.amount_refunded >= invoice.amount_paid ? `Everything collected on it, ${refunded}, has since been refunded` : `${refunded} of it has since been refunded`}; the bill stands as paid.`;
+    }
     case 'uncollectible':
       return 'Written off. It was billed, and it is not going to be collected.';
     case 'void':

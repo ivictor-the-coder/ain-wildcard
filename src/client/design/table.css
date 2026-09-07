@@ -15,6 +15,9 @@
   background: var(--bg-surface); min-height: 50px;
 }
 .ain-table__bar--filters { background: var(--bg-subtle); padding: var(--space-3) var(--space-5); gap: var(--space-3); }
+/* The grid's own view controls, and a module's `toolbarEnd`, as one flex item:
+   when the bar folds they move to the next row together, right-aligned. */
+.ain-table__tools { display: flex; align-items: center; gap: var(--space-2); flex: 0 0 auto; margin-inline-start: auto; }
 
 /* ---------------------------- bulk-action bar ---------------------------- */
 .ain-table__bulk {
@@ -76,6 +79,11 @@
 .ain-table--pinned th.is-pinned, .ain-table--pinned td.is-pinned {
   position: sticky; inset-inline-start: 0; z-index: 2; background: inherit;
 }
+/* With a checkbox column the pinned data column sits beside it, not over it:
+   both stuck at 0, the name column slid across the checkboxes on the first
+   scroll and every row's selection was out of reach. */
+.ain-table--pinned.ain-table--selectable th.is-pinned:not(.ain-table__selectcell),
+.ain-table--pinned.ain-table--selectable td.is-pinned:not(.ain-table__selectcell) { inset-inline-start: 40px; }
 .ain-table--pinned thead th.is-pinned { z-index: 4; background: var(--bg-subtle); }
 .ain-table--pinned .is-pinned::after {
   content: ''; position: absolute; top: 0; bottom: 0; inset-inline-end: -1px; width: 1px; background: var(--border-default);
@@ -100,7 +108,16 @@
 .ain-table--pinned tfoot td.is-pinned { background: var(--bg-subtle); }
 
 /* ------------------------------- states ---------------------------------- */
-.ain-table__state { padding: 0; }
+/* A state cell spans the whole table; the box it is read in can be half that
+   wide. The inner box is the box's width and sticks to its near edge, so the
+   message is centred in view and never behind the pinned column. The cell
+   itself must not clip: a cell with `overflow: hidden` is a scroll container
+   of its own, and the inner box would stick to the cell instead of the box. */
+.ain-table tbody td.ain-table__state { padding: 0; overflow: visible; }
+.ain-table__stateinner {
+  position: sticky; inset-inline-start: 0; width: var(--box-width, 100%); max-width: 100%;
+  white-space: normal;
+}
 .ain-table__skelrow td { height: var(--row-height); }
 .ain-table__pager {
   display: flex; align-items: center; gap: var(--space-4); justify-content: space-between;

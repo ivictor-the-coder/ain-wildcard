@@ -289,6 +289,31 @@ export function sentenceJoin(parts: string[]): string {
   return parts.map((p) => p.trim()).filter(Boolean).map((p) => (/[.!?]$/.test(p) ? p : `${p}.`)).join(' ');
 }
 
+/**
+ * The subject a note gets from its own body: the first sentence, or — when
+ * that runs past the limit — the first clause of it, cut where a comma, a
+ * semicolon, a colon or a dash already breaks it, and at a word otherwise.
+ * "The pilot slipped to October." becomes "Pilot slipped to October"; a
+ * one-sentence note is not its own subject repeated word for word.
+ */
+export function subjectOf(body: string, max = 80): string {
+  const first = sentences(body)[0] ?? String(body).trim();
+  let subject = first.replace(/[.!?]+$/, '').replace(/^(the|a|an)\s+/i, '').trim();
+  if (subject.length > max) {
+    const head = subject.slice(0, max);
+    const clause = Math.max(
+      head.lastIndexOf(', '), head.lastIndexOf('; '), head.lastIndexOf(': '), head.lastIndexOf(' — '), head.lastIndexOf(' - '),
+    );
+    // A clause that is a real fragment of the sentence, not its first two words.
+    if (clause >= Math.min(24, max / 3)) subject = head.slice(0, clause).trim();
+    else {
+      const word = head.lastIndexOf(' ');
+      subject = `${(word > 0 ? head.slice(0, word) : head).trimEnd()}…`;
+    }
+  }
+  return capitalise(subject);
+}
+
 /** Split prose into sentences without a regex that eats abbreviations. */
 export function sentences(text: string): string[] {
   return String(text)

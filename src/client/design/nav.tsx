@@ -103,6 +103,17 @@ export function TabPanel({ id, active, children }: { id: string; active: boolean
 
 /* ============================== Breadcrumbs =============================== */
 
+/**
+ * The shell owns the trail.
+ *
+ * Inside the app every screen's breadcrumb is drawn by the shell's top bar
+ * from the route and the nav registry, and a record screen names its own
+ * crumb through `useCurrentCrumb` — never by rendering this. `Breadcrumbs`
+ * is the same trail as a component, for the surfaces the shell does not
+ * frame: a `bare` layout such as a customer portal, and the style guide,
+ * where it stands in for the shell's. Both draw one line: the trail never
+ * wraps, and the current crumb ellipsises when the room runs out.
+ */
 export interface Crumb {
   label: ReactNode;
   href?: string;

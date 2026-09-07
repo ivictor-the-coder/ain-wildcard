@@ -7,11 +7,10 @@
  * is built from those rows: one figure per book, the workspace currency first,
  * and nothing added across books — there is no exchange rate to add with.
  */
-import { formatMoney } from '../../shared/money';
 import type { WorkspaceProfile } from './grounding';
 import { listPhrase, plural } from './text';
 import type { AgeingBucketId, MovementBucket } from './slots';
-import { NO_FACTS, periodPhrase, type Rendered } from './answer';
+import { NO_FACTS, money as formatAmount, periodPhrase, type Rendered } from './answer';
 
 /* --------------------------------- shapes -------------------------------- */
 
@@ -93,9 +92,8 @@ export const monthName = (key: string): string => {
   return `${SHORT_MONTHS[(month || 1) - 1]} ${year}`;
 };
 
-/** Formatted the way the revenue tools format their own display strings, so one answer reads in one style. */
-const fmt = (amount: number, currency: string, workspace: WorkspaceProfile): string =>
-  formatMoney({ amount: Math.round(amount), currency }, { locale: workspace.locale });
+/** The one money rule every answer follows, so a revenue figure reads like every other figure. */
+const fmt = (amount: number, currency: string, workspace: WorkspaceProfile): string => formatAmount(amount, currency, workspace);
 
 const code = (currency: string): string => currency.toUpperCase();
 

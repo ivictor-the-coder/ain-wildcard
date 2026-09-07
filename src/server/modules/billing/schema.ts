@@ -459,4 +459,52 @@ CREATE INDEX idx_billing_invoice_holds_subscription ON billing_invoice_holds(org
 ALTER TABLE billing_credit_note_lines ADD COLUMN tax_amounts TEXT NOT NULL DEFAULT '[]';
 `,
   },
+  {
+    id: 'billing.0008_invoice_items_and_refunds',
+    sql: `
+-- A hand-written line waiting for a bill: a one-off charge, a setup fee, a
+-- goodwill credit, an amount agreed on the phone. Stripe's invoice item. It
+-- has no price behind it, so it carries its own tax behaviour, and it is
+-- swept onto the customer's next invoice exactly the way a proration is —
+-- claimed, stamped with the bill, and released again if that bill is voided.
+CREATE TABLE billing_invoice_items (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  customer_id TEXT NOT NULL REFERENCES billing_customers(id) ON DELETE CASCADE,
+  subscription_id TEXT,
+  description TEXT NOT NULL,
+  quantity INTEGER NOT NULL DEFAULT 1,
+  unit_amount INTEGER NOT NULL,
+  amount INTEGER NOT NULL,
+  currency TEXT NOT NULL,
+  tax_behavior TEXT NOT NULL DEFAULT 'unspecified',
+  period_start INTEGER NOT NULL,
+  period_end INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  invoice_id TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL,
+  livemode INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX idx_billing_invoice_items_customer ON billing_invoice_items(org_id, customer_id, status, created);
+CREATE INDEX idx_billing_invoice_items_invoice ON billing_invoice_items(org_id, invoice_id);
+
+-- Cash handed back on a bill that stays paid. A refund is recorded on the
+-- payment and carried here; it never reopens the bill, because a bill the
+-- customer settled is settled — what happens next is a person's decision, and
+-- a new invoice if they make one. Bills raised before this column had nothing
+-- refunded through it.
+ALTER TABLE billing_invoices ADD COLUMN amount_refunded INTEGER NOT NULL DEFAULT 0;
+
+-- Where a post-payment credit went, Stripe's three-way split: back to the card
+-- through the payments module, onto the customer's balance, or settled outside
+-- the platform and only recorded. Notes written before this carried the whole
+-- of post_payment_amount as balance credit, which is what the default says.
+ALTER TABLE billing_credit_notes ADD COLUMN refund_amount INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE billing_credit_notes ADD COLUMN credit_amount INTEGER;
+ALTER TABLE billing_credit_notes ADD COLUMN out_of_band_amount INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE billing_credit_notes ADD COLUMN refund_id TEXT;
+`,
+  },
 ];

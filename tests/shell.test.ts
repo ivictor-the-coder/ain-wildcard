@@ -4,10 +4,11 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
-  NAV_GROUP_ORDER, TIME_JUMPS, activeNavItem, avatarSrc, civilDayStart, crumbsFor, describeOffset, eventSubject,
-  eventTitle, fillParams, firstRegistered, fuzzyScore, greetingFor, groupNav, humanizeSegment,
-  isPathActive, jumpBindings, jumpDays, jumpTarget, navLabelIndex, normalizePath, orderSetup, pushRecent, rankEntries,
-  pluralType, recordRouteCandidates, routeSetFrom, scoreEntry, serves, setupProgress, shortcutSheet, withCurrentLabel,
+  NAV_GROUP_ORDER, TIME_JUMPS, activeNavItem, avatarSrc, canWrite, civilDayStart, commandAllowed, crumbsFor,
+  describeOffset, eventSubject, eventTitle, fillParams, firstRegistered, fuzzyScore, greetingFor, groupNav,
+  humanizeSegment, isPathActive, jumpBindings, jumpDays, jumpTarget, navForRole, navLabelIndex, normalizePath,
+  orderSetup, paletteEntryAllowed, pushRecent, rankEntries, pluralType, recordRouteCandidates, roleAtLeast,
+  routeSetFrom, scoreEntry, serves, setupProgress, shortcutSheet, withCurrentLabel,
   type SetupStep,
 } from '../src/client/kernel/shell-core';
 import {
@@ -623,5 +624,77 @@ describe('the modules stay one product', () => {
     const revenueCommon = source(join(modulesDir, 'revenue', 'common.tsx'));
     assert.doesNotMatch(revenueCommon, /function StatusChip/);
     assert.match(revenueCommon, /StatusPill as StatusChip.*from '\.\.\/billing\/common'/);
+  });
+});
+
+/* ======================= what the critics found, held ===================== */
+
+describe('what the palette offers follows the role', () => {
+  it('reads a command gate the way the server reads a route’s: any listed rung, at or above it', () => {
+    assert.equal(roleAtLeast('admin', 'member'), true);
+    assert.equal(roleAtLeast('analyst', 'member'), false);
+    assert.equal(roleAtLeast(undefined, 'readonly'), false, 'no role is offered nothing on a guess');
+    assert.equal(commandAllowed(['admin'], 'owner'), true);
+    assert.equal(commandAllowed(['admin'], 'member'), false);
+    assert.equal(commandAllowed(['member'], 'admin'), true);
+    assert.equal(commandAllowed(undefined, 'readonly'), true);
+    assert.equal(commandAllowed([], 'readonly'), true);
+  });
+
+  it('never hands a reader a Create', () => {
+    // "Create an API key" and "Invite a teammate" ranked first for an analyst
+    // and ended in a refusal on the screen they opened.
+    assert.equal(paletteEntryAllowed({ group: 'Create' }, 'analyst'), false);
+    assert.equal(paletteEntryAllowed({ group: 'Create' }, 'readonly'), false);
+    assert.equal(paletteEntryAllowed({ group: 'Create' }, 'member'), true);
+    assert.equal(paletteEntryAllowed({ group: 'Create', roles: ['admin'] }, 'member'), false);
+    assert.equal(paletteEntryAllowed({ group: 'Go to' }, 'readonly'), true);
+    assert.equal(paletteEntryAllowed({ group: 'Run', roles: ['member'] }, 'readonly'), false);
+    assert.equal(canWrite('member'), true);
+    assert.equal(canWrite('analyst'), false);
+  });
+
+  it('hides a nav destination from anyone below its minRole', () => {
+    const items = [nav('model', 'Data model', '/records', 'crm'), { ...nav('contacts', 'Contacts', '/contacts', 'crm'), minRole: 'admin' as const }];
+    assert.deepEqual(navForRole(items, 'member').map((i) => i.id), ['model']);
+    assert.deepEqual(navForRole(items, 'admin').map((i) => i.id), ['model', 'contacts']);
+  });
+
+  it('is what the shell asks before listing a command, a create action or a nav row', () => {
+    const shell = readFileSync(join(process.cwd(), 'src', 'client', 'kernel', 'shell.tsx'), 'utf8');
+    assert.match(shell, /for \(const command of COMMANDS\) \{\s*if \(!paletteEntryAllowed\(\{ group: command\.group \|\| 'Run', roles: command\.roles \}, role\)\) continue;/);
+    assert.match(shell, /if \(canWrite\(role\)\) \{\s*for \(const action of createActions\)/);
+    assert.match(shell, /groupNav\(navForRole\(NAV, role\)\)/);
+    const types = readFileSync(join(process.cwd(), 'src', 'client', 'kernel', 'registry-types.ts'), 'utf8');
+    assert.match(types, /roles\?: readonly WorkspaceRole\[\];/, 'CommandDef carries the gate');
+  });
+});
+
+describe('the palette starts every opening empty', () => {
+  const palette = readFileSync(join(process.cwd(), 'src', 'client', 'kernel', 'palette.tsx'), 'utf8');
+
+  it('clears the query when a command runs', () => {
+    // Type "forecast", Enter, ⌘K: the input still read "forecast" and the
+    // next command typed became "forecastevery pipeline".
+    const run = /const run = \(entry: PaletteEntry\) => \{([\s\S]*?)\n  \};/.exec(palette)?.[1] ?? '';
+    assert.match(run, /setQuery\(''\);/);
+    assert.ok(run.indexOf("setQuery('')") < run.indexOf('entry.run()'), 'cleared before the command moves the screen');
+  });
+
+  it('clears the query when the palette closes, not on the next open', () => {
+    assert.match(palette, /useEffect\(\(\) => \{ if \(!open\) \{ setQuery\(''\); setActive\(0\); \} \}, \[open\]\);/);
+    assert.doesNotMatch(palette, /if \(open\) \{ setQuery\(''\)/, 'an on-open reset paints the stale query for a frame and searches for it');
+  });
+});
+
+describe('the top bar at 1024px', () => {
+  it('keeps the search readable and the crumb on one line', () => {
+    const css = readFileSync(join(process.cwd(), 'src', 'client', 'kernel', 'shell.css'), 'utf8');
+    assert.match(css, /\.shell-top__search:not\(:empty\) \{ min-width: 280px; \}/);
+    const crumbs = readFileSync(join(process.cwd(), 'src', 'client', 'design', 'nav.css'), 'utf8');
+    assert.match(crumbs, /\.ain-crumbs \{[^}]*flex-wrap: nowrap;/);
+    assert.doesNotMatch(crumbs, /\.ain-crumbs \{[^}]*flex-wrap: wrap;/);
+    const shell = readFileSync(join(process.cwd(), 'src', 'client', 'kernel', 'shell.tsx'), 'utf8');
+    assert.match(shell, /placeholder=\{roomy \? 'Search records, customers, price book…' : 'Search records…'\}/);
   });
 });

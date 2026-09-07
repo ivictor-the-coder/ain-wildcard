@@ -294,8 +294,14 @@
   background: var(--bg-nav);
   border-bottom: 1px solid var(--border-subtle);
 }
+/* The crumb gives way before the search does. Both could shrink to nothing,
+   and at 1024px the crumb wrapped onto a second line while the field beside
+   it was 80px of "Search recor": the search keeps a floor a placeholder can
+   be read in, and the crumb takes what is left, on one line, with an
+   ellipsis on the record's name. */
 .shell-top__crumbs { min-width: 0; flex: 0 1 auto; overflow: hidden; }
 .shell-top__search { flex: 1 1 auto; display: flex; justify-content: center; min-width: 0; }
+.shell-top__search:not(:empty) { min-width: 280px; }
 .shell-top__actions { display: flex; align-items: center; gap: var(--space-2); flex: 0 0 auto; }
 .shell-top__divider { width: 1px; height: 18px; background: var(--border-default); margin-inline: var(--space-2); }
 

@@ -27,7 +27,7 @@
  */
 import { formatMoney, money } from '../../../shared/money';
 import { addInterval, formatDuration, type Interval, type Period } from '../../../shared/time';
-import type { LineBreakdownRow, Price, ProrationBehavior } from '../catalog/types';
+import type { LineBreakdownRow, Price, ProrationBehavior, TaxBehavior } from '../catalog/types';
 import {
   describeCadence, isMetered, longDate, Pricebook, recurringLines, recurringSubtotal, remainingMillis,
   sameCadence, shortDate, type PricedItem,
@@ -275,7 +275,7 @@ export interface PreviewInput extends ProrateInput {
    * figure taken off the price list and shown to a human as "collected now" is
    * short by the tax on every exclusive-priced account in the book.
    */
-  taxOf(lines: { price: string | null; amount: number; currency: string }[]): { base: number; tax: number };
+  taxOf(lines: { price: string | null; amount: number; currency: string; taxBehavior?: TaxBehavior }[]): { base: number; tax: number };
   /**
    * Whether a bill for this account can be placed. Read from the same call the
    * invoice makes, so a preview cannot promise a collection the bill it
@@ -287,7 +287,7 @@ export interface PreviewInput extends ProrateInput {
    * `always_invoice` change sweeps them onto the bill it raises, so they are
    * part of what that bill collects — and of `amount_due_now`.
    */
-  waitingLines?: { price: string | null; amount: number; currency: string }[];
+  waitingLines?: { price: string | null; amount: number; currency: string; taxBehavior?: TaxBehavior }[];
 }
 
 /**

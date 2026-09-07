@@ -3411,11 +3411,22 @@ describe('the subscription overview', () => {
     assert.ok(all.length > 200, `the book has to reach past one page to prove anything, got ${all.length}`);
     const overview = await ws.ok('GET', '/v1/subscriptions/overview');
     assert.equal(overview.subscriptions, all.length, 'the overview counted every subscription');
+    // The demo book bills in dollars, euros and pounds, so the headline is the
+    // dollar book — every dollar subscription, not the first two hundred — and
+    // the cross-currency sum is kept beside it under a name that says what it is.
+    assert.equal(overview.mixed_currency, true, 'fixture: the demo book bills in more than one currency');
+    assert.equal(overview.currency, 'usd');
+    const dollars = all.filter((sub) => sub.currency === 'usd');
+    assert.ok(dollars.length > 200, `the dollar book alone reaches past one page, got ${dollars.length}`);
     assert.equal(
-      overview.mrr, all.reduce((total, sub) => total + sub.mrr, 0),
-      'and its MRR is every subscription’s, not the first two hundred',
+      overview.mrr, dollars.reduce((total, sub) => total + sub.mrr, 0),
+      'and its MRR is every dollar subscription’s, not the first two hundred',
     );
     assert.equal(overview.arr, overview.mrr * 12);
+    assert.equal(
+      overview.cross_currency_sum_minor_units.mrr, all.reduce((total, sub) => total + sub.mrr, 0),
+      'the reconciliation figure is every subscription’s minor units, whatever they are in',
+    );
   });
 
   test('a book in three currencies is never added up and labelled in one', async () => {
@@ -3444,13 +3455,25 @@ describe('the subscription overview', () => {
     );
 
     assert.equal(overview.mixed_currency, true);
-    assert.equal(overview.mrr_display, null, 'a mixed sum never gets a currency symbol in front of it');
-    assert.ok(String(overview.mrr_note).includes('by_currency'), 'and it says where the real figures are');
+    // The headline is the workspace's own book, stated in its own currency —
+    // never the yen, euro and dollar minor units added up and given a $ sign.
+    const dollars = byCurrency.find((row) => row.currency === 'usd');
+    assert.ok(dollars);
+    assert.equal(overview.currency, 'usd', 'the headline names the currency it is in');
+    assert.equal(overview.mrr, dollars.mrr, 'the headline MRR is the dollar book');
+    assert.equal(overview.mrr_display, dollars.mrr_display, 'and it is displayed as that book, with its own symbol');
+    assert.equal(overview.arr, dollars.mrr * 12);
+    assert.equal(overview.trial_mrr, (dollars as { trial_mrr?: number }).trial_mrr ?? 0);
+    assert.equal(overview.average_revenue_per_account, Math.round(dollars.mrr / dollars.live));
+    assert.notEqual(overview.mrr, byCurrency.reduce((total, row) => total + row.mrr, 0), 'the headline is never the cross-currency sum');
+    assert.ok(String(overview.mrr_note).includes('by_currency'), 'and it says where the other books are');
+    assert.ok(String(overview.mrr_note).includes('USD'), 'and which book the headline is');
     assert.deepEqual([...overview.currencies].sort(), byCurrency.map((row) => row.currency).sort());
     assert.equal(
-      byCurrency.reduce((total, row) => total + row.mrr, 0), overview.mrr,
-      'nothing is lost: the buckets are the same minor units the total holds',
+      byCurrency.reduce((total, row) => total + row.mrr, 0), overview.cross_currency_sum_minor_units.mrr,
+      'nothing is lost: the buckets are the same minor units the reconciliation figure holds',
     );
+    assert.equal(overview.cross_currency_sum_minor_units.arr, overview.cross_currency_sum_minor_units.mrr * 12);
   });
 });
 
@@ -5820,5 +5843,444 @@ describe('a bill raised outside a cycle', () => {
         assert.ok(line.period.end > line.period.start, `"${line.description}" is supplied for no time at all`);
       }
     } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * Invoice items: a one-off invoice with a hand-written line
+ * ========================================================================== */
+
+describe('invoice items — a one-off invoice with a hand-written line', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 9, 1, 10)); });
+  after(() => ws.close());
+
+  /** Texas is 6.25% in the seeded register; every figure below is chosen so the tax divides exactly. */
+  const TEXAS = {
+    address: { line1: '901 Congress Avenue', city: 'Austin', state: 'Texas', postal_code: '78701', country: 'United States' },
+  };
+  const pendingFor = async (customerId: string, status = 'pending') =>
+    (await ws.ok('GET', `/v1/invoice_items?customer=${customerId}&status=${status}`)).data as { id: string; status: string; invoice: string | null }[];
+
+  test('a setup fee waits as an invoice item and is billed, taxed and collected on a bill raised for it', async () => {
+    const customer = await ws.customer('Brazos Valley Foods', TEXAS);
+    const item = await ws.ok('POST', '/v1/invoice_items', {
+      customer: customer.id, description: 'Commissioning — on-site setup of two gateways', amount: 150_000,
+    });
+    assert.equal(item.object, 'invoice_item');
+    assert.equal(item.status, 'pending');
+    assert.equal(item.amount, 150_000);
+    assert.equal(item.unit_amount, 150_000);
+    assert.equal(item.quantity, 1);
+    assert.equal(item.currency, 'usd');
+    assert.equal(item.tax_behavior, 'unspecified');
+    assert.equal(item.invoice, null);
+    assert.equal(item.amount_display, '$1,500.00');
+    assert.match(item.status_detail, /next invoice/);
+    assert.deepEqual((await pendingFor(customer.id)).map((row) => row.id), [item.id]);
+
+    // The bill: exactly that line, taxed by the customer's own rate, open and owed.
+    const invoice: Invoice = await ws.ok('POST', '/v1/invoices', { customer: customer.id });
+    assert.equal(invoice.status, 'open');
+    assert.equal(invoice.billing_reason, 'manual');
+    assert.equal(invoice.subscription, null);
+    assert.equal(invoice.lines.length, 1);
+    const line = invoice.lines[0];
+    assert.equal(line.kind, 'invoice_item');
+    assert.deepEqual(line.source, { type: 'invoice_item', id: item.id });
+    assert.equal(line.price, null);
+    assert.equal(line.description, 'Commissioning — on-site setup of two gateways');
+    assert.equal(line.amount, 150_000);
+    assert.equal(line.tax.amount, 9_375, '6.25% of $1,500.00, to the cent');
+    assert.equal(line.tax.percentage, '6.25');
+    assert.match(line.explanation, /written by hand/);
+    assert.ok(line.explanation.includes('$1,500.00'), line.explanation);
+    assert.equal(invoice.subtotal, 150_000);
+    assert.equal(invoice.tax, 9_375);
+    assert.equal(invoice.total, 159_375);
+    assert.equal(invoice.amount_due, 159_375);
+    assert.equal((invoice as unknown as { reconciles: boolean }).reconciles, true);
+
+    // The item is claimed by that bill, and only that bill.
+    const claimed = await ws.ok('GET', `/v1/invoice_items/${item.id}`);
+    assert.equal(claimed.status, 'invoiced');
+    assert.equal(claimed.invoice, invoice.id);
+    assert.equal(claimed.invoice_number, invoice.number);
+    assert.deepEqual(await pendingFor(customer.id), [], 'nothing is left waiting');
+    assert.deepEqual((await pendingFor(customer.id, 'invoiced')).map((row) => row.id), [item.id]);
+    const again = await ws.fail('POST', '/v1/invoices', { customer: customer.id }, 409, 'nothing_to_invoice');
+    assert.match(again.message, /invoice items/);
+
+    // And it collects like any other bill.
+    const paid: Invoice = await ws.ok('POST', `/v1/invoices/${invoice.id}/pay`, { note: 'Bank transfer.' });
+    assert.equal(paid.status, 'paid');
+    assert.equal(paid.amount_paid, 159_375);
+    const document = await ws.call('GET', `/v1/invoices/${invoice.id}/render`);
+    assert.equal(document.status, 200);
+    assert.ok(String(document.body).includes('Added by hand'), 'the document names the line for what it is');
+    assert.ok(String(document.body).includes('Commissioning — on-site setup of two gateways'));
+  });
+
+  test('lines sent inline become invoice items of their own, and the bill can wait as a draft', async () => {
+    const customer = await ws.customer('Pedernales Bottling', TEXAS);
+    const draft: Invoice = await ws.ok('POST', '/v1/invoices', {
+      customer: customer.id,
+      items: [
+        { description: 'Integration engineering', unit_amount: 16_000, quantity: 3 },
+        { description: 'Goodwill credit for the August outage', amount: -8_000 },
+      ],
+      auto_advance: false,
+    });
+    assert.equal(draft.status, 'draft');
+    assert.match((draft as unknown as { status_detail: string }).status_detail, /raised on request/);
+    assert.equal(draft.lines.length, 2);
+    const [engineering, goodwill] = draft.lines;
+    assert.equal(engineering.kind, 'invoice_item');
+    assert.equal(engineering.quantity, 3);
+    assert.equal(engineering.amount, 48_000);
+    assert.ok(engineering.explanation.includes('3 × $160.00 = $480.00'), engineering.explanation);
+    assert.equal(engineering.tax.amount, 3_000, '6.25% of $480.00');
+    assert.equal(goodwill.amount, -8_000);
+    assert.equal(goodwill.tax.amount, -500, 'a credit line reverses its tax too');
+    assert.match(goodwill.explanation, /a credit written by hand/);
+    assert.equal(draft.subtotal, 40_000);
+    assert.equal(draft.tax, 2_500);
+    assert.equal(draft.total, 42_500);
+    assert.equal(sumLines(draft), draft.subtotal);
+    assert.equal(sumTax(draft), draft.tax);
+
+    // Each inline line is a real invoice item, claimed by this bill.
+    const items = (await ws.ok('GET', `/v1/invoice_items?invoice=${draft.id}&status=all`)).data as { id: string; status: string; description: string }[];
+    assert.equal(items.length, 2);
+    assert.ok(items.every((item) => item.status === 'invoiced'));
+    assert.deepEqual(items.map((item) => item.id).sort(), draft.lines.map((line) => line.source.id).sort());
+
+    const open: Invoice = await ws.ok('POST', `/v1/invoices/${draft.id}/finalize`);
+    assert.equal(open.status, 'open');
+    assert.equal(open.amount_due, 42_500);
+  });
+
+  test('an inclusive line keeps the customer’s price and gives up the tax inside it', async () => {
+    const customer = await ws.customer('Llano Estacado Grain', TEXAS);
+    await ws.ok('POST', '/v1/invoice_items', {
+      customer: customer.id, description: 'Site licence, tax included', amount: 106_250, tax_behavior: 'inclusive',
+    });
+    const invoice: Invoice = await ws.ok('POST', '/v1/invoices', { customer: customer.id });
+    assert.equal(invoice.lines[0].amount, 100_000, 'the base is what is left once 6.25% comes out of $1,062.50');
+    assert.equal(invoice.lines[0].tax.amount, 6_250);
+    assert.equal(invoice.lines[0].tax.behavior, 'inclusive');
+    assert.equal(invoice.total, 106_250, 'the customer pays exactly the listed price');
+  });
+
+  test('what an invoice item refuses, with the parameter named', async () => {
+    const customer = await ws.customer('Refusals Inc');
+    const base = { customer: customer.id, description: 'Anything' };
+    assert.equal((await ws.fail('POST', '/v1/invoice_items', { ...base, amount: 1_000, currency: 'eur' }, 400, 'invoice_item_currency_mismatch')).param, 'currency');
+    assert.equal((await ws.fail('POST', '/v1/invoice_items', { ...base, amount: 1_000, unit_amount: 500 }, 400, 'invoice_item_amount_or_unit_amount')).param, 'unit_amount');
+    assert.equal((await ws.fail('POST', '/v1/invoice_items', base, 400, 'invoice_item_amount_or_unit_amount')).param, 'amount');
+    await ws.fail('POST', '/v1/invoice_items', { ...base, amount: 0 }, 400, 'invoice_item_amount_zero');
+    assert.equal((await ws.fail('POST', '/v1/invoice_items', { ...base, amount: 1_000, quantity: 3 }, 400, 'invoice_item_amount_with_quantity')).param, 'quantity');
+    await ws.fail('POST', '/v1/invoice_items', { ...base, amount: 1_000, period: { start: UTC(2026, 9, 2), end: UTC(2026, 9, 1) } }, 400, 'invoice_item_period_invalid');
+    await ws.fail('POST', '/v1/invoice_items', { ...base, customer: 'cus_nobody', amount: 1_000 }, 404);
+    await ws.fail('POST', '/v1/invoice_items', { ...base, amount: 1_000, price: 'growth_monthly' }, 400, 'parameter_invalid');
+    assert.deepEqual(await pendingFor(customer.id), [], 'none of the refusals wrote anything');
+  });
+
+  test('withdrawing an item, and the bill that lets one go again', async () => {
+    const customer = await ws.customer('Withdrawn Lines');
+    const first = await ws.ok('POST', '/v1/invoice_items', { customer: customer.id, description: 'Never mind', amount: 2_000 });
+    const withdrawn = await ws.ok('DELETE', `/v1/invoice_items/${first.id}`);
+    assert.equal(withdrawn.status, 'deleted');
+    await ws.fail('POST', '/v1/invoices', { customer: customer.id }, 409, 'nothing_to_invoice');
+    await ws.fail('DELETE', `/v1/invoice_items/${first.id}`, undefined, 400, 'invoice_item_already_deleted');
+    assert.equal((await ws.ok('GET', `/v1/invoice_items?customer=${customer.id}&status=all`)).data.length, 1, 'withdrawn is a status, not a deletion');
+
+    // An item on a bill is the bill's now: the way off is the bill's void,
+    // which hands the item back to waiting so a replacement can carry it.
+    const second = await ws.ok('POST', '/v1/invoice_items', { customer: customer.id, description: 'Rush delivery', amount: 3_000 });
+    const invoice: Invoice = await ws.ok('POST', '/v1/invoices', { customer: customer.id });
+    assert.equal(invoice.lines[0].source.id, second.id);
+    const refused = await ws.fail('DELETE', `/v1/invoice_items/${second.id}`, undefined, 409, 'invoice_item_invoiced');
+    assert.match(refused.message, new RegExp(invoice.number));
+    const voided: Invoice = await ws.ok('POST', `/v1/invoices/${invoice.id}/void`);
+    assert.ok(voided.lines.every((line) => line.released));
+    const released = await ws.ok('GET', `/v1/invoice_items/${second.id}`);
+    assert.equal(released.status, 'pending', 'the voided bill let go of the item');
+    assert.equal(released.invoice, null);
+    const replacement: Invoice = await ws.ok('POST', '/v1/invoices', { customer: customer.id });
+    assert.equal(replacement.lines[0].source.id, second.id, 'the replacement carries the same item, not a copy');
+    assert.equal(replacement.subtotal, 3_000);
+    assert.equal((await ws.ok('GET', `/v1/invoice_items/${second.id}`)).invoice, replacement.id);
+
+    // A draft lets go the same way, and the message says so.
+    const third = await ws.ok('POST', '/v1/invoice_items', { customer: customer.id, description: 'Still thinking', amount: 4_000 });
+    const draft: Invoice = await ws.ok('POST', '/v1/invoices', { customer: customer.id, auto_advance: false });
+    assert.equal(draft.status, 'draft');
+    assert.match((await ws.fail('DELETE', `/v1/invoice_items/${third.id}`, undefined, 409, 'invoice_item_invoiced')).message, /Void the draft/);
+    await ws.ok('POST', `/v1/invoices/${draft.id}/void`);
+    assert.equal((await ws.ok('DELETE', `/v1/invoice_items/${third.id}`)).status, 'deleted');
+  });
+
+  test('the renewal sweeps a waiting item, and the upcoming invoice shows it first', async () => {
+    const customer = await ws.customer('Sweep Me Up');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price: 'growth_monthly' }] });
+    const item = await ws.ok('POST', '/v1/invoice_items', {
+      customer: customer.id, description: 'Replacement gateway, expedited', amount: 12_345,
+    });
+
+    const upcoming: Invoice = await ws.ok('POST', '/v1/invoices/create_preview', { subscription: sub.id });
+    const previewed = upcoming.lines.find((line) => line.source.id === item.id);
+    assert.ok(previewed, 'the upcoming invoice already shows the line');
+    assert.equal(previewed.kind, 'invoice_item');
+    assert.equal(upcoming.subtotal, GROWTH + 12_345);
+
+    await ws.travelTo(sub.current_period_end + 60_000);
+    const renewal = (await allInvoices(ws, `&subscription=${sub.id}`)).find((invoice) => invoice.billing_reason === 'subscription_cycle');
+    assert.ok(renewal, 'the cycle raised its bill');
+    const swept = renewal.lines.find((line) => line.source.id === item.id);
+    assert.ok(swept, 'the renewal carried the item');
+    assert.equal(renewal.subtotal, GROWTH + 12_345, 'the recurring fee and the hand-written line, nothing else');
+    assert.equal((await ws.ok('GET', `/v1/invoice_items/${item.id}`)).invoice, renewal.id);
+  });
+
+  test('an always_invoice change sweeps a waiting item, and previews the same figure', async () => {
+    const customer = await ws.customer('Change And Sweep');
+    const growth = await priceIdOf(ws, 'growth_monthly');
+    const starter = await priceIdOf(ws, 'starter_monthly');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price: growth }] });
+    const item = await ws.ok('POST', '/v1/invoice_items', { customer: customer.id, description: 'Training day', amount: 30_000 });
+
+    const change = { items: [{ id: sub.items[0].id, price: starter }], proration_date: midpointOf(sub), proration_behavior: 'always_invoice' as const };
+    const preview: ChangePreview = await ws.ok('POST', `/v1/subscriptions/${sub.id}/preview`, change);
+    // Growth to Starter at the midpoint nets −$200.00; the $300.00 line on top
+    // leaves $100.00 to collect, and the preview says so before the change.
+    assert.equal(preview.net, -20_000);
+    assert.equal(preview.amount_due_now, 10_000);
+
+    await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, change);
+    const raised = (await allInvoices(ws, `&subscription=${sub.id}`)).find((invoice) => invoice.billing_reason === 'subscription_update');
+    assert.ok(raised, 'the change raised a bill');
+    assert.ok(raised.lines.some((line) => line.source.id === item.id), 'the bill swept the item');
+    assert.equal(raised.amount_due, preview.amount_due_now, 'the figure previewed is the figure collected');
+    assert.equal((await ws.ok('GET', `/v1/invoice_items/${item.id}`)).status, 'invoiced');
+  });
+});
+
+/* ========================================================================== *
+ * Credit notes on a paid invoice: where the money goes
+ * ========================================================================== */
+
+describe('credit notes on a paid invoice — where the money goes', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 9, 1)); });
+  after(() => ws.close());
+
+  const paidBill = async (name: string) => {
+    const customer = await ws.customer(name);
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], collection_method: 'send_invoice', days_until_due: 30,
+    });
+    const open = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    const invoice: Invoice = await ws.ok('POST', `/v1/invoices/${open.id}/pay`, { note: 'Bank transfer.' });
+    assert.equal(invoice.status, 'paid');
+    assert.equal(invoice.total, GROWTH);
+    return { customer, sub, invoice };
+  };
+
+  test('a note names its split, and only the balance share moves the balance', async () => {
+    const { customer, invoice } = await paidBill('Split Three Ways');
+    const body = { invoice: invoice.id, amount: 30_000, reason: 'service_credit', credit_amount: 20_000, out_of_band_amount: 10_000 };
+    const preview = await ws.ok('POST', '/v1/credit_notes/preview', body);
+    const note = await ws.ok('POST', '/v1/credit_notes', body);
+    for (const doc of [preview, note]) {
+      assert.equal(doc.post_payment_amount, 30_000);
+      assert.equal(doc.refund_amount, 0);
+      assert.equal(doc.credit_amount, 20_000);
+      assert.equal(doc.out_of_band_amount, 10_000);
+      assert.equal(doc.refund, null);
+    }
+    assert.ok(note.balance_transaction, 'the balance share is a row in the ledger');
+    assert.equal(note.credit_amount_display, '$200.00');
+    assert.match(note.routing_detail, /\$200\.00 was put onto the customer’s balance/);
+    assert.match(note.routing_detail, /\$100\.00 was returned outside the platform/);
+
+    assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, -20_000, 'only the balance share is on the account');
+    const after: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(after.post_payment_credit_notes_amount, 30_000, 'the whole note is credit after payment');
+    assert.equal(after.status, 'paid');
+    assert.equal(after.amount_paid, invoice.total, 'what was collected stays collected');
+    assert.equal(after.amount_due, 0);
+
+    // Withdrawing the note takes back exactly what was on the balance.
+    await ws.ok('POST', `/v1/credit_notes/${note.id}/void`);
+    assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0);
+    const ledger = (await ws.ok('GET', `/v1/customers/${customer.id}/balance_transactions`)).data as { type: string; amount: number }[];
+    assert.equal(ledger[0].type, 'credit_note_voided');
+    assert.equal(ledger[0].amount, 20_000, 'the out-of-band share was never on the balance, so it does not come back off it');
+    assert.equal((await ws.ok('GET', `/v1/invoices/${invoice.id}`)).post_payment_credit_notes_amount, 0);
+  });
+
+  test('left unnamed, the whole note goes onto the balance, as every note before the split did', async () => {
+    const { customer, invoice } = await paidBill('Balance By Default');
+    const note = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 5_000, reason: 'billing_error' });
+    assert.equal(note.credit_amount, 5_000);
+    assert.equal(note.refund_amount, 0);
+    assert.equal(note.out_of_band_amount, 0);
+    assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, -5_000);
+  });
+
+  test('the split is refused when it does not add up, on a bill nothing was collected on, and for a refund with no charge behind it', async () => {
+    const { invoice } = await paidBill('Refused Splits');
+    const short = await ws.fail('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 30_000, credit_amount: 20_000 }, 400, 'credit_note_routing_mismatch');
+    assert.match(short.message, /\$300\.00/);
+    assert.match(short.message, /\$200\.00/);
+    assert.deepEqual(short.detail, { total: 30_000, refund_amount: 0, credit_amount: 20_000, out_of_band_amount: 0 });
+    await ws.fail('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 30_000, credit_amount: -1, out_of_band_amount: 30_001 }, 400, 'parameter_invalid');
+
+    // Paid by bank transfer: there is no card charge to send money back to.
+    const noCharge = await ws.fail('POST', '/v1/credit_notes', { invoice: invoice.id, amount: 1_000, refund_amount: 1_000 }, 400, 'credit_note_refund_no_charge');
+    assert.equal(noCharge.param, 'refund_amount');
+    assert.match(noCharge.message, /out_of_band_amount/);
+    assert.equal((await ws.ok('GET', `/v1/credit_notes?invoice=${invoice.id}`)).total_count, 0, 'the refusal wrote no note');
+
+    // An open bill has collected nothing, so there is nothing to route.
+    const customer = await ws.customer('Nothing Collected');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], collection_method: 'send_invoice', days_until_due: 30,
+    });
+    const open = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    assert.equal(open.status, 'open');
+    const notApplicable = await ws.fail('POST', '/v1/credit_notes', { invoice: open.id, amount: 1_000, credit_amount: 1_000 }, 400, 'credit_note_routing_not_applicable');
+    assert.equal(notApplicable.param, 'credit_amount');
+  });
+
+  test('the refund share goes back through the payments module, and the note points at the refund', async () => {
+    const customer = await ws.customer('Card On File');
+    await ws.ok('POST', '/v1/payment_methods', {
+      type: 'card', customer: customer.id, brand: 'visa', exp_month: 4, exp_year: 2031, simulated_behavior: 'succeeds',
+    });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], collection_method: 'charge_automatically',
+    });
+    await ws.travelTo(ws.now() + 60_000);
+    const invoice = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    assert.equal(invoice.status, 'paid', 'fixture: the card on file settled the first bill');
+    const charged = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+    assert.equal(charged.cash_collected, invoice.total);
+
+    const note = await ws.ok('POST', '/v1/credit_notes', {
+      invoice: invoice.id, amount: 10_000, reason: 'product_unsatisfactory', refund_amount: 10_000,
+    });
+    assert.equal(note.refund_amount, 10_000);
+    assert.equal(note.credit_amount, 0);
+    assert.match(String(note.refund), /^re_/, 'the note points at the payments module’s refund row');
+    assert.match(note.routing_detail, /\$100\.00 went back to the customer’s card/);
+    const refunds = (await ws.ok('GET', `/v1/refunds?invoice=${invoice.id}`)).data as { id: string; amount: number; description: string | null }[];
+    assert.equal(refunds.length, 1);
+    assert.equal(refunds[0].id, note.refund);
+    assert.equal(refunds[0].amount, 10_000);
+    assert.ok(String(refunds[0].description).includes(note.number), 'the refund names the note that raised it');
+    const view = await ws.ok('GET', `/v1/invoices/${invoice.id}/payments`);
+    assert.equal(view.amount_refunded, 10_000, 'the refund is carried on the payment');
+    assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0, 'nothing went onto the balance');
+    const after: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(after.post_payment_credit_notes_amount, 10_000);
+    assert.equal((after as unknown as { reconciles: boolean }).reconciles, true);
+
+    // A refund cannot be recalled, so neither can the note that sent it.
+    const refused = await ws.fail('POST', `/v1/credit_notes/${note.id}/void`, undefined, 409, 'credit_note_refunded');
+    assert.match(refused.message, /raise a new invoice/i);
+    assert.equal((await ws.ok('GET', `/v1/credit_notes/${note.id}`)).status, 'issued');
+  });
+});
+
+/* ========================================================================== *
+ * A refund leaves the bill paid
+ * ========================================================================== */
+
+describe('a refund leaves the bill paid', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 9, 1)); });
+  after(() => ws.close());
+
+  const paidBill = async (name: string) => {
+    const customer = await ws.customer(name);
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], collection_method: 'send_invoice', days_until_due: 30,
+    });
+    const open = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    const invoice: Invoice = await ws.ok('POST', `/v1/invoices/${open.id}/pay`, { note: 'Bank transfer.' });
+    return { customer, sub, invoice };
+  };
+
+  test('recording a refund carries it on the invoice and on the collected figures, and reopens nothing', async () => {
+    const { customer, invoice } = await paidBill('Refund Stays Paid');
+    assert.equal(invoice.amount_paid, GROWTH);
+    const billing = ws.app.ctx.svc.billing!;
+    const collectedBefore = (await ws.ok('GET', '/v1/subscriptions/overview')).invoices.collected as number;
+    const valueBefore = (await ws.ok('GET', `/v1/customers/${customer.id}/summary`)).lifetime_value.amount as number;
+    assert.equal(valueBefore, GROWTH, 'fixture: the paid bill is the account’s whole lifetime value');
+
+    const after = billing.recordInvoiceRefund(ORG, invoice.id, 10_000, { note: 'Goodwill after the August outage.' });
+    assert.equal(after.status, 'paid', 'a bill the customer settled is settled');
+    assert.equal(after.amount_paid, GROWTH, 'what was collected stays what was collected');
+    assert.equal(after.amount_due, 0, 'nothing is owed again');
+    assert.equal(after.amount_refunded, 10_000);
+    assert.equal(after.paid_at, invoice.paid_at);
+    assert.equal(after.amount_paid + after.pre_payment_credit_notes_amount + after.amount_due, after.total);
+
+    const shown = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(shown.amount_refunded, 10_000);
+    assert.equal(shown.amount_refunded_display, '$100.00');
+    assert.match(shown.status_detail, /\$100\.00 of it has since been refunded; the bill stands as paid/);
+    assert.equal(shown.reconciles, true);
+    const document = await ws.call('GET', `/v1/invoices/${invoice.id}/render`);
+    assert.ok(String(document.body).includes('Refunded since'), 'the document shows the refund under the settled bill');
+
+    // The refund is a fact about the payment: an event of its own, no reversal,
+    // and nothing queued for recovery — what happens next is a person's decision.
+    const refunded = ws.app.ctx.events.list(ORG, { types: ['invoice.refunded'], objectId: invoice.id, limit: 5 });
+    assert.equal(refunded.length, 1);
+    assert.equal((refunded[0].data as { amount: number }).amount, 10_000);
+    assert.deepEqual(refunded[0].previous, { amount_refunded: 0 });
+    assert.match(String((refunded[0].data as { resolution: string }).resolution), /raise a new invoice/);
+    assert.equal(ws.app.ctx.events.list(ORG, { types: ['invoice.payment_reversed'], objectId: invoice.id, limit: 5 }).length, 0, 'nothing was reversed');
+    assert.equal(ws.app.ctx.svc.payments!.dunningForInvoice(ORG, invoice.id), null, 'nothing is in recovery');
+    assert.deepEqual((await ws.ok('GET', `/v1/dunning?status=all&customer=${customer.id}`)).data, []);
+
+    // Collected figures are net of what went back — the workspace's and the account's.
+    const collectedAfter = (await ws.ok('GET', '/v1/subscriptions/overview')).invoices.collected as number;
+    assert.equal(collectedAfter, collectedBefore - 10_000, 'the workspace collected figure is net of the refund');
+    const summary = await ws.ok('GET', `/v1/customers/${customer.id}/summary`);
+    assert.equal(summary.lifetime_value.amount, valueBefore - 10_000, 'so is the account’s lifetime value');
+    assert.equal(summary.lifetime_value.label, 'Collected, net of refunds and credit notes');
+  });
+
+  test('a bill can give back everything it collected and not a unit more', async () => {
+    const { invoice } = await paidBill('Refund Ceiling');
+    const billing = ws.app.ctx.svc.billing!;
+    billing.recordInvoiceRefund(ORG, invoice.id, 10_000);
+    const whole = billing.recordInvoiceRefund(ORG, invoice.id, GROWTH - 10_000);
+    assert.equal(whole.amount_refunded, GROWTH);
+    assert.equal(whole.status, 'paid');
+    assert.match((await ws.ok('GET', `/v1/invoices/${invoice.id}`)).status_detail, /Everything collected on it, \$499\.00, has since been refunded/);
+    assert.throws(
+      () => billing.recordInvoiceRefund(ORG, invoice.id, 1),
+      (error: { code: string; message: string; detail: { refundable: number } }) =>
+        error.code === 'refund_exceeds_collected' && error.detail.refundable === 0 && /holds no cash to give back/.test(error.message),
+    );
+    assert.throws(() => billing.recordInvoiceRefund(ORG, invoice.id, 0), (error: { code: string }) => error.code === 'amount_invalid');
+
+    // A bill nothing was collected on has nothing to give back.
+    const customer = await ws.customer('Unpaid Refund');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], collection_method: 'send_invoice', days_until_due: 30,
+    });
+    const open = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    assert.throws(
+      () => billing.recordInvoiceRefund(ORG, open.id, 100),
+      (error: { code: string; detail: { amount_paid: number } }) => error.code === 'refund_exceeds_collected' && error.detail.amount_paid === 0,
+    );
+    assert.equal((await ws.ok('GET', `/v1/invoices/${open.id}`)).amount_refunded, 0, 'the refusal wrote nothing');
   });
 });

@@ -49,8 +49,15 @@ export const NO_FACTS: Facts = {
   value: null, formatted: null, unit: null, currency: null, count: null, label: null, period: null, subject: null, subjectId: null, rows: [], mixed: false,
 };
 
-export const money = (amount: number, currency: string, workspace: WorkspaceProfile): string =>
-  formatMoney({ amount: Math.round(amount), currency }, { locale: workspace.locale, trimZeroFraction: true });
+/**
+ * The one way money is written in an answer: through the workspace's
+ * formatter, with the minor units always shown. "£27,420" in one sentence and
+ * "£27,420.00" in the next — a rank without cents beside an invoice line with
+ * them — reads as two different numbers, so every figure the copilot prints
+ * comes through here, whichever file computed it.
+ */
+export const money = (amount: number, currency: string, workspace: Pick<WorkspaceProfile, 'locale'>): string =>
+  formatMoney({ amount: Math.round(amount), currency }, { locale: workspace.locale });
 
 export const dateOf = (ts: number, workspace: WorkspaceProfile, tz: string = 'UTC'): string =>
   formatDate(ts, { locale: workspace.locale, timeZone: tz });

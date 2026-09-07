@@ -11,11 +11,11 @@ import { Menu, MenuButton, Popover, type MenuSection } from './overlays';
 import { EmptyState, ErrorState, Skeleton } from './feedback';
 import { ErrorBoundary } from './error-boundary';
 import { formatNumber, humanize, useFormat } from './format';
-import { scrollIntoViewport, useDocumentDensity, useIsomorphicLayoutEffect, useVirtualRows } from './hooks';
+import { scrollIntoViewport, useDocumentDensity, useIsomorphicLayoutEffect, useResizeObserver, useVirtualRows } from './hooks';
 import { DAY, startOfDay } from '../../shared/time';
 import {
-  EMPTY_TABLE_STATE, activeFilterCount, dateExtent, describeFilter, extendSelection, filterRows,
-  isFilterEmpty, rangeBetween, searchRows, selectionState, sortRows, splitSelection, sumColumn,
+  EMPTY_TABLE_STATE, activeFilterCount, collapseTableTools, dateExtent, describeFilter, extendSelection, filterRows,
+  isFilterEmpty, keyBelongsToControl, rangeBetween, searchRows, selectionState, sortRows, splitSelection, sumColumn,
   toggleId, toggleSort, valueCounts,
   type CellValue, type ColumnFilter, type DateOperator, type FilterKind, type FilterMap,
   type NumberOperator, type SortState, type TableState, type TextOperator,
@@ -84,6 +84,12 @@ export interface DataTableProps<T> {
   bulkActions?: (ids: string[]) => ReactNode;
   /** Extra controls on the left of the toolbar, before search. */
   toolbar?: ReactNode;
+  /**
+   * Extra controls on the right of the toolbar, after the grid's own Filters,
+   * Columns and density — an export, a column preset. They share the row and
+   * the fold with the grid's controls instead of wrapping around them.
+   */
+  toolbarEnd?: ReactNode;
   searchable?: boolean;
   searchPlaceholder?: string;
   initialSort?: SortState | null;
@@ -174,7 +180,7 @@ export function DataTable<T>(props: DataTableProps<T>) {
 function DataTableGrid<T>({
   rows, columns, getRowId, caption, loading, error, onRetry, empty, emptyFiltered,
   onRowClick, rowActions, rowTone, selectable, selected, onSelectionChange, bulkActions,
-  toolbar, searchable = true, searchPlaceholder = 'Search this table…', initialSort = null,
+  toolbar, toolbarEnd, searchable = true, searchPlaceholder = 'Search this table…', initialSort = null,
   value, onChange,
   density: densityProp, onDensityChange, showDensityToggle = true, showColumnToggle = true,
   showFilters = true, stickyFooter = true, maxHeight = 560, virtualiseAfter = 120, plain, footer, className,
@@ -216,12 +222,20 @@ function DataTableGrid<T>({
   const [scrolledX, setScrolledX] = useState(false);
   const [columnsOpen, setColumnsOpen] = useState(false);
 
+  const wrapRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const columnsAnchor = useRef<HTMLButtonElement>(null);
   const addAnchor = useRef<HTMLButtonElement>(null);
   const bodyRef = useRef<HTMLTableSectionElement>(null);
   const headRef = useRef<HTMLTableSectionElement>(null);
   const footRef = useRef<HTMLTableSectionElement>(null);
+
+  // The grid's own width decides whether its view controls fold into one
+  // menu; the scroll box's width is what an empty or failed state is centred
+  // in. Neither is the table's width, which can be twice the box.
+  const { width: wrapWidth } = useResizeObserver(wrapRef);
+  const { width: boxWidth } = useResizeObserver(scrollRef);
+  const collapsedTools = collapseTableTools(wrapWidth);
 
   const workspaceDensity = useDocumentDensity();
   // The workspace setting wins until someone overrides it for this table.
@@ -347,6 +361,9 @@ function DataTableGrid<T>({
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTableSectionElement>) => {
+    // Enter on the row's "Row actions" button is the button's — it opens the
+    // menu. Answered here it opened the row instead and swallowed the click.
+    if (keyBelongsToControl(e.key, e.target as Element | null)) return;
     if (!processed.length) return;
     const from = focusIndex >= 0 ? focusIndex : virtual.startIndex;
     // A page is the rows that actually fit between the sticky header and the
@@ -415,6 +432,61 @@ function DataTableGrid<T>({
   const hasTotals = stickyFooter && visibleColumns.some((c) => c.total);
   const showFilterBar = showFilters && filterableColumns.length > 0 && (filtersOpen || chipFilters.length > 0);
 
+  const setColumnVisible = (columnId: string, visible: boolean) => setHiddenColumns((prev) => {
+    const next = new Set(prev);
+    if (visible) next.delete(columnId);
+    else next.add(columnId);
+    return next;
+  });
+
+  /**
+   * The grid's view controls as one menu, for a grid too narrow to lay them
+   * out: the same filters toggle, column checkboxes and density choice, and
+   * the same Clear, one button wide.
+   */
+  const viewSections: MenuSection[] = [];
+  if (showFilters && filterableColumns.length > 0) {
+    viewSections.push({
+      id: 'filters',
+      items: [{
+        id: 'filters',
+        label: filterCount ? `Filters · ${filterCount} active` : 'Filters',
+        icon: <Icons.filter size={14} />,
+        checked: showFilterBar,
+        onSelect: () => { setFiltersOpen((v) => !v); setOpenFilterId(null); },
+      }],
+    });
+  }
+  if (showColumnToggle) {
+    viewSections.push({
+      id: 'columns',
+      label: 'Columns',
+      items: columns.map((column) => ({
+        id: `column-${column.id}`,
+        label: column.headerTitle ?? (typeof column.header === 'string' ? column.header : column.id),
+        checked: !hiddenColumns.has(column.id),
+        disabled: column.hideable === false || column.pinned,
+        onSelect: () => setColumnVisible(column.id, hiddenColumns.has(column.id)),
+      })),
+    });
+  }
+  if (showDensityToggle) {
+    viewSections.push({
+      id: 'density',
+      label: 'Rows',
+      items: [
+        { id: 'comfortable', label: 'Comfortable rows', icon: <Icons.list size={14} />, checked: density === 'comfortable', onSelect: () => setDensity('comfortable') },
+        { id: 'compact', label: 'Compact rows', icon: <Icons.menu size={14} />, checked: density === 'compact', onSelect: () => setDensity('compact') },
+      ],
+    });
+  }
+  if (filtersActive) {
+    viewSections.push({
+      id: 'clear',
+      items: [{ id: 'clear', label: 'Clear search and filters', icon: <FilterXIcon size={14} />, onSelect: clearAll }],
+    });
+  }
+
   const addSections: MenuSection[] = useMemo(() => [{
     id: 'properties',
     label: 'Filter by property',
@@ -433,10 +505,11 @@ function DataTableGrid<T>({
 
   return (
     <div
+      ref={wrapRef}
       className={cx('ain-table-wrap', plain && 'ain-table-wrap--plain', className)}
-      style={{ ['--row-height' as string]: `${rowHeight}px` }}
+      style={{ ['--row-height' as string]: `${rowHeight}px`, ...(boxWidth > 0 ? { ['--box-width' as string]: `${boxWidth}px` } : {}) }}
     >
-      {(toolbar || searchable || showDensityToggle || showColumnToggle || showFilters) && (
+      {(toolbar || toolbarEnd || searchable || showDensityToggle || showColumnToggle || showFilters) && (
         <div className="ain-table__bar">
           {toolbar}
           {searchable && (
@@ -450,83 +523,98 @@ function DataTableGrid<T>({
             />
           )}
           <span className="u-spacer" />
-          {filtersActive && (
-            <Button
-              size="sm"
-              variant="ghost"
-              iconLeft={<FilterXIcon size={14} />}
-              onClick={clearAll}
-            >
-              Clear
-            </Button>
-          )}
-          {showFilters && filterableColumns.length > 0 && (
-            <Button
-              size="sm"
-              variant={showFilterBar ? 'secondary' : 'ghost'}
-              iconLeft={<Icons.filter size={14} />}
-              aria-pressed={showFilterBar}
-              aria-label={filterCount ? `Filters, ${filterCount} active` : 'Filters'}
-              onClick={() => { setFiltersOpen((v) => !v); setOpenFilterId(null); }}
-            >
-              Filters
-              {filterCount > 0 && <span className="ain-table__filtercount">{filterCount}</span>}
-            </Button>
-          )}
-          {showColumnToggle && (
-            <>
-              <Button
-                ref={columnsAnchor}
+          {/* One group, so the controls wrap as a unit — never a lone density
+              toggle on a third row under a module toolbar that folded. */}
+          <div className="ain-table__tools">
+            {collapsedTools ? (
+              <MenuButton
                 size="sm"
-                variant="ghost"
-                iconLeft={<Icons.columns size={14} />}
-                aria-haspopup="dialog"
-                aria-expanded={columnsOpen}
-                onClick={() => setColumnsOpen((v) => !v)}
-              >
-                Columns
-              </Button>
-              <Popover
-                open={columnsOpen}
-                onClose={() => setColumnsOpen(false)}
-                anchor={columnsAnchor}
+                label="View"
+                icon={<Icons.sliders size={14} />}
+                sections={viewSections}
                 placement="bottom-end"
-                title="Visible columns"
-                flush
-                className="ain-colpop"
               >
-                <div className="ain-table__colmenu">
-                  {columns.map((column) => (
-                    <label className="ain-table__colitem" key={column.id} onFocus={revealRow}>
-                      <Checkbox
-                        checked={!hiddenColumns.has(column.id)}
-                        disabled={column.hideable === false || column.pinned}
-                        onChange={(checked) => setHiddenColumns((prev) => {
-                          const next = new Set(prev);
-                          if (checked) next.delete(column.id);
-                          else next.add(column.id);
-                          return next;
-                        })}
-                        label={column.headerTitle ?? (typeof column.header === 'string' ? column.header : column.id)}
-                      />
-                    </label>
-                  ))}
-                </div>
-              </Popover>
-            </>
-          )}
-          {showDensityToggle && (
-            <SegmentedControl
-              size="sm"
-              aria-label="Row density"
-              value={density}
-              onChange={(d) => setDensity(d)}
-              options={[
-                { value: 'comfortable', label: <Icons.list size={14} />, title: 'Comfortable rows' },
-                { value: 'compact', label: <Icons.menu size={14} />, title: 'Compact rows' },
-              ]}
-            />
-          )}
+                View
+                {filterCount > 0 && <span className="ain-table__filtercount">{filterCount}</span>}
+              </MenuButton>
+            ) : (
+              <>
+                {filtersActive && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    iconLeft={<FilterXIcon size={14} />}
+                    onClick={clearAll}
+                  >
+                    Clear
+                  </Button>
+                )}
+                {showFilters && filterableColumns.length > 0 && (
+                  <Button
+                    size="sm"
+                    variant={showFilterBar ? 'secondary' : 'ghost'}
+                    iconLeft={<Icons.filter size={14} />}
+                    aria-pressed={showFilterBar}
+                    aria-label={filterCount ? `Filters, ${filterCount} active` : 'Filters'}
+                    onClick={() => { setFiltersOpen((v) => !v); setOpenFilterId(null); }}
+                  >
+                    Filters
+                    {filterCount > 0 && <span className="ain-table__filtercount">{filterCount}</span>}
+                  </Button>
+                )}
+                {showColumnToggle && (
+                  <>
+                    <Button
+                      ref={columnsAnchor}
+                      size="sm"
+                      variant="ghost"
+                      iconLeft={<Icons.columns size={14} />}
+                      aria-haspopup="dialog"
+                      aria-expanded={columnsOpen}
+                      onClick={() => setColumnsOpen((v) => !v)}
+                    >
+                      Columns
+                    </Button>
+                    <Popover
+                      open={columnsOpen}
+                      onClose={() => setColumnsOpen(false)}
+                      anchor={columnsAnchor}
+                      placement="bottom-end"
+                      title="Visible columns"
+                      flush
+                      className="ain-colpop"
+                    >
+                      <div className="ain-table__colmenu">
+                        {columns.map((column) => (
+                          <label className="ain-table__colitem" key={column.id} onFocus={revealRow}>
+                            <Checkbox
+                              checked={!hiddenColumns.has(column.id)}
+                              disabled={column.hideable === false || column.pinned}
+                              onChange={(checked) => setColumnVisible(column.id, checked)}
+                              label={column.headerTitle ?? (typeof column.header === 'string' ? column.header : column.id)}
+                            />
+                          </label>
+                        ))}
+                      </div>
+                    </Popover>
+                  </>
+                )}
+                {showDensityToggle && (
+                  <SegmentedControl
+                    size="sm"
+                    aria-label="Row density"
+                    value={density}
+                    onChange={(d) => setDensity(d)}
+                    options={[
+                      { value: 'comfortable', label: <Icons.list size={14} />, title: 'Comfortable rows' },
+                      { value: 'compact', label: <Icons.menu size={14} />, title: 'Compact rows' },
+                    ]}
+                  />
+                )}
+              </>
+            )}
+            {toolbarEnd}
+          </div>
         </div>
       )}
 
@@ -629,7 +717,7 @@ function DataTableGrid<T>({
         onScroll={(e) => setScrolledX(e.currentTarget.scrollLeft > 0)}
       >
         <table
-          className={cx('ain-table', columns.some((c) => c.pinned) && 'ain-table--pinned', scrolledX && 'ain-table--scrolled')}
+          className={cx('ain-table', columns.some((c) => c.pinned) && 'ain-table--pinned', selectable && 'ain-table--selectable', scrolledX && 'ain-table--scrolled')}
           aria-rowcount={processed.length}
         >
           {caption && <caption className="u-visually-hidden">{caption}</caption>}
@@ -759,12 +847,14 @@ function DataTableGrid<T>({
             {!loading && error && (
               <tr>
                 <td colSpan={columnCount} className="ain-table__state">
-                  <ErrorState
-                    message={error.message}
-                    requestId={error.requestId}
-                    code={error.code}
-                    action={onRetry ? <Button variant="secondary" iconLeft={<Icons.refresh size={14} />} onClick={onRetry}>Try again</Button> : undefined}
-                  />
+                  <div className="ain-table__stateinner">
+                    <ErrorState
+                      message={error.message}
+                      requestId={error.requestId}
+                      code={error.code}
+                      action={onRetry ? <Button variant="secondary" iconLeft={<Icons.refresh size={14} />} onClick={onRetry}>Try again</Button> : undefined}
+                    />
+                  </div>
                 </td>
               </tr>
             )}
@@ -772,17 +862,25 @@ function DataTableGrid<T>({
             {!loading && !error && processed.length === 0 && (
               <tr>
                 <td colSpan={columnCount} className="ain-table__state">
-                  {filtersActive
-                    ? (emptyFiltered ?? (
-                      <EmptyState
-                        size="sm"
-                        illustration={null}
-                        title="No rows match those filters"
-                        body="Loosen a filter or clear the search to see the full list again."
-                        action={<Button variant="secondary" size="sm" iconLeft={<FilterXIcon size={14} />} onClick={clearAll}>Clear filters</Button>}
-                      />
-                    ))
-                    : (empty ?? <EmptyState title="Nothing here yet" body="Rows will appear as soon as there is data to show." />)}
+                  {/* The cell spans the table, which can be twice as wide as
+                      the box it scrolls in — centred in that, the message sat
+                      off to the right and, once the box was scrolled to reach
+                      it, the columns' headers slid under the pinned one. The
+                      inner box sticks to the visible edge and is as wide as
+                      the box, so the state is centred where the reader is. */}
+                  <div className="ain-table__stateinner">
+                    {filtersActive
+                      ? (emptyFiltered ?? (
+                        <EmptyState
+                          size="sm"
+                          illustration={null}
+                          title="No rows match those filters"
+                          body="Loosen a filter or clear the search to see the full list again."
+                          action={<Button variant="secondary" size="sm" iconLeft={<FilterXIcon size={14} />} onClick={clearAll}>Clear filters</Button>}
+                        />
+                      ))
+                      : (empty ?? <EmptyState title="Nothing here yet" body="Rows will appear as soon as there is data to show." />)}
+                  </div>
                 </td>
               </tr>
             )}

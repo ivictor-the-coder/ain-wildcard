@@ -115,6 +115,7 @@ const KIND_LABEL: Record<InvoiceLine['kind'], string> = {
   credit_covered: 'Covered by prepaid credit',
   topup: 'Prepaid credit purchase',
   true_up: 'Usage true-up',
+  invoice_item: 'Added by hand',
 };
 
 /** 'Grand Rapids, Michigan 49504' — how a postal address is actually written. */
@@ -415,6 +416,9 @@ function totals(invoice: Invoice, show: (n: number) => string): string {
   }
   if (invoice.amount_paid !== 0) rows.push(['Paid', `-${show(invoice.amount_paid)}`, false]);
   rows.push(['Amount due', show(invoice.amount_due), true]);
+  // A refund is a fact about the payment, shown under the settled bill: what
+  // was billed and what was paid stand, and the customer has this much back.
+  if (invoice.amount_refunded !== 0) rows.push(['Refunded since', show(invoice.amount_refunded), false]);
 
   return `
 <section class='totals'>

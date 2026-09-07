@@ -233,11 +233,13 @@ function collect(ctx: Ctx, crm: Crm, orgId: string, record: CrmRecord, options: 
       for (const [rid, row] of readActivities(
         ctx, orgId, record.id, anchors.slice(start, start + ANCHOR_BATCH), activityTypes, before, cursor, limit,
       )) {
-        // An activity linked to both a contact and its company arrives twice;
-        // keep the row that names the contact so the account timeline reads
-        // "via Elena" rather than pointing back at the account itself.
+        // An activity linked to both a contact and its company arrives twice.
+        // The edge to the record itself wins: a note logged on this record is
+        // its own, and reads as such — "via Elena" is for what only reached
+        // it through a neighbour. Preferring the neighbour told a contact her
+        // own notes came via her company.
         const existing = best.get(rid);
-        if (!existing || (existing.via_id === record.id && row.via_id !== record.id)) best.set(rid, row);
+        if (!existing || (existing.via_id !== record.id && row.via_id === record.id)) best.set(rid, row);
       }
     }
     const viaRecords = new Map<string, CrmRecord>();
@@ -560,7 +562,7 @@ function readActivities(
     if (!rows.length) return best;
     for (const row of rows) {
       const existing = best.get(row.rid);
-      if (!existing || (existing.via_id === subjectId && row.via_id !== subjectId)) best.set(row.rid, row);
+      if (!existing || (existing.via_id !== subjectId && row.via_id === subjectId)) best.set(row.rid, row);
     }
     const last: ActivityRow = rows[rows.length - 1];
     // A full window may have cut between two edges pointing at the same

@@ -14,7 +14,8 @@
  * — so the vocabulary is exactly what the database holds, no more.
  */
 import type { Ctx } from '../kernel/context';
-import { exponentOf, formatMoney } from '../../shared/money';
+import { exponentOf } from '../../shared/money';
+import { money as formatAmount } from './answer';
 import { entityIndex, hasTable, workspaceProfile, type WorkspaceProfile } from './grounding';
 import { crmVocabulary, currencyBooks, type QualifierKind, type QualifierVocabulary } from './qualifiers';
 import { METRICS, stageSets, type MetricUnit, type StageSets, type GroupBy } from './metrics';
@@ -899,7 +900,7 @@ function bindMoney(tokens: Token[], start: number, len: number, vocab: Vocabular
   const major = Number(match[2]) * scale;
   if (!Number.isFinite(major) || major <= 0) return [];
   const amount = Math.round(major * 10 ** exponentOf(code));
-  return [{ kind: 'money', amount, currency: code, formatted: formatMoney({ amount, currency: code }, { locale: vocab.workspace.locale, trimZeroFraction: true }) }];
+  return [{ kind: 'money', amount, currency: code, formatted: formatAmount(amount, code, vocab.workspace) }];
 }
 
 function bindQuantity(tokens: Token[], start: number, len: number): SlotValue[] {

@@ -5,7 +5,9 @@ import {
   currencySymbol, formatCompact, formatDate, formatDelta, formatFileSize, formatMoney,
   formatNumber, formatOrdinal, formatPercent, formatRelative, humanize, initials, plural,
   pluralize, titleCase, truncateMiddle, createFormatter, formatDateRange,
+  moneyInputText, numberSeparators, parseMoneyText,
 } from '../src/client/design/format';
+import { STATUS_COPY, statusLabel, statusTone } from '../src/client/design/status-core';
 import { hashString, toneOf, toneForStatus, vizColor, AVATAR_TONE_COUNT } from '../src/client/design/color';
 import {
   arcPath, areaPath, bandScale, extentOf, funnelLayout, heatScale, linePath, linearScale,
@@ -13,10 +15,11 @@ import {
   stackedMax, trendSlope, waterfallLayout,
 } from '../src/client/design/chart-core';
 import {
-  activeFilterCount, compareValues, dateExtent, decodeFilters, decodeTableState, describeFilter,
-  encodeFilters, encodeTableState, extendSelection, filterRows, fold, isFilterEmpty, matchesFilter,
-  rangeBetween, searchRows, selectionState, sortRows, splitSelection, sumColumn, toggleId,
-  toggleSort, uniqueValues, valueCounts, type ColumnFilter, type FilterMap,
+  activeFilterCount, collapseTableTools, compareValues, dateExtent, decodeFilters, decodeTableState, describeFilter,
+  encodeFilters, encodeTableState, extendSelection, filterRows, fold, isFilterEmpty, isTypingControl,
+  keyBelongsToControl, matchesFilter, rangeBetween, searchRows, selectionState, sortRows, splitSelection,
+  sumColumn, toggleId, toggleSort, uniqueValues, valueCounts, TABLE_TOOLS_COLLAPSE_WIDTH,
+  type ColumnFilter, type FilterMap, type KeyTarget,
 } from '../src/client/design/table-core';
 import { contrastGrade, contrastRatio, parseColor, relativeLuminance } from '../src/client/design/color';
 import { readFileSync } from 'node:fs';
@@ -1284,5 +1287,231 @@ describe('token contrast', () => {
         assert.ok(!physical.test(line), `${file} uses a physical inline property, which cannot mirror for RTL:\n  ${line.trim()}`);
       }
     }
+  });
+});
+
+/* ======================= what the critics found, held ===================== */
+
+const designSource = (file: string) => readFileSync(new URL(`../src/client/design/${file}`, import.meta.url), 'utf8');
+
+describe('axis ticks for counts and for nothing', () => {
+  it('steps by whole numbers when told the values are counts', () => {
+    // Five ticks over 0–10 used to step by 2.5 and print "0, 3, 5, 8, 10, 13".
+    const ticks = niceTicks(0, 10, 5, { integer: true });
+    assert.deepEqual(ticks, [0, 2, 4, 6, 8, 10]);
+    for (const domain of [[0, 3], [0, 13], [0, 47], [0, 1], [0, 250]] as const) {
+      const got = niceTicks(domain[0], domain[1], 5, { integer: true });
+      assert.ok(got.every(Number.isInteger), `${domain.join('–')} → ${got.join(', ')}`);
+      assert.ok(got[got.length - 1] >= domain[1] && got[0] <= domain[0], 'still covers the domain');
+      assert.ok(got.length >= 2);
+    }
+  });
+
+  it('keeps the 2.5 rung for measures, where a fraction is a number', () => {
+    assert.ok(niceTicks(0, 10, 5).includes(2.5));
+  });
+
+  it('gives a domain with nothing in it a single zero, never a 0–1 axis of five labels', () => {
+    // In minor units the widened axis read "$0.01 $0.01 $0.01 $0 $0".
+    assert.deepEqual(niceTicks(0, 0), [0]);
+    assert.deepEqual(niceTicks(0, 0, 5, { integer: true }), [0]);
+    // A flat series that is not zero still gets an axis to sit on.
+    assert.ok(niceTicks(5, 5, 4).length >= 2);
+  });
+
+  it('is what the bar chart hands its y axis', () => {
+    const charts = designSource('charts.tsx');
+    assert.match(charts, /integer\?: boolean;/, 'the chart props carry the option');
+    assert.match(charts, /niceTicks\(minValue, Math\.max\(maxValue, reference\?\.value \?\? 0\), yTickCount, \{ integer \}\)/);
+  });
+});
+
+describe('relative time keeps the day between a week and a quarter', () => {
+  const now = Date.UTC(2026, 8, 5, 12, 0, 0);
+
+  it('says 46 days, not 2 months', () => {
+    assert.equal(formatRelative(now - 46 * DAY, now), '46 days ago');
+    assert.equal(formatRelative(now + 40 * DAY, now), 'in 40 days');
+    assert.equal(formatRelative(now - 7 * DAY, now), '7 days ago');
+    assert.equal(formatRelative(now - 89 * DAY, now), '89 days ago');
+  });
+
+  it('leaves the hours under a week and the months past a quarter to the shared helper', () => {
+    assert.equal(formatRelative(now - 6 * DAY, now), '6 days ago');
+    assert.equal(formatRelative(now - DAY, now), 'yesterday');
+    assert.equal(formatRelative(now - 3 * 3_600_000, now), '3 hours ago');
+    assert.equal(formatRelative(now - 90 * DAY, now), '3 months ago');
+    assert.equal(formatRelative(now - 400 * DAY, now), 'last year');
+  });
+
+  it('follows the workspace locale', () => {
+    assert.equal(formatRelative(now - 46 * DAY, now, 'de-DE'), 'vor 46 Tagen');
+  });
+});
+
+describe('an amount field edits grouped text', () => {
+  it('groups minor units the way the locale groups, without a symbol', () => {
+    assert.equal(moneyInputText(460000000000, 'usd', 'en-US'), '4,600,000,000.00');
+    assert.equal(moneyInputText(460000000000, 'eur', 'de-DE'), '4.600.000.000,00');
+    assert.equal(moneyInputText(1248, 'jpy', 'en-US'), '1,248');
+    assert.equal(moneyInputText(-2500, 'usd'), '-25.00');
+    assert.equal(moneyInputText(5, 'usd'), '0.05');
+    assert.equal(moneyInputText(0, 'usd'), '0.00');
+    assert.equal(moneyInputText(null), '');
+  });
+
+  it('reads the same notation back into minor units', () => {
+    assert.equal(parseMoneyText('4,600,000,000.00', 'usd', 'en-US')?.amount, 460000000000);
+    assert.equal(parseMoneyText('4.600.000.000,00', 'eur', 'de-DE')?.amount, 460000000000);
+    assert.equal(parseMoneyText('1 248', 'jpy', 'fr-FR')?.amount, 1248);
+    assert.equal(parseMoneyText('12.5', 'usd', 'en-US')?.amount, 1250);
+    assert.equal(parseMoneyText('not money', 'usd'), null);
+    assert.deepEqual(numberSeparators('de-DE'), { group: '.', decimal: ',' });
+  });
+
+  it('is the text MoneyInput shows and commits', () => {
+    const fields = designSource('fields.tsx');
+    assert.match(fields, /moneyInputText\(minor, currency, locale\)/);
+    assert.match(fields, /parseMoneyText\(raw, currency, locale\)/);
+    assert.doesNotMatch(fields, /\.toFixed\(exp\)/, 'no ungrouped float text');
+  });
+});
+
+describe('the grid leaves a control its own keys', () => {
+  const inside = (matches: boolean, extra: Partial<KeyTarget> = {}): KeyTarget =>
+    ({ tagName: 'BUTTON', closest: () => (matches ? {} : null), ...extra });
+
+  it('hands Enter and Space on a row button to the button', () => {
+    assert.equal(keyBelongsToControl('Enter', inside(true)), true);
+    assert.equal(keyBelongsToControl(' ', inside(true)), true);
+  });
+
+  it('keeps the arrows on a button so the grid still moves rows', () => {
+    assert.equal(keyBelongsToControl('ArrowDown', inside(true)), false);
+    assert.equal(keyBelongsToControl('Home', inside(true)), false);
+  });
+
+  it('answers Enter on a cell, and nothing on nothing', () => {
+    assert.equal(keyBelongsToControl('Enter', { tagName: 'TD', closest: () => null }), false);
+    assert.equal(keyBelongsToControl('Enter', null), false);
+  });
+
+  it('leaves every key to a text box inside a row, and Enter to a checkbox', () => {
+    const text: KeyTarget = { tagName: 'INPUT', type: 'text', closest: () => ({}) };
+    const checkbox: KeyTarget = { tagName: 'INPUT', type: 'checkbox', closest: () => ({}) };
+    assert.equal(isTypingControl(text), true);
+    assert.equal(isTypingControl(checkbox), false);
+    assert.equal(keyBelongsToControl('ArrowDown', text), true);
+    assert.equal(keyBelongsToControl('ArrowDown', checkbox), false);
+    assert.equal(keyBelongsToControl(' ', checkbox), true);
+    assert.equal(keyBelongsToControl('a', { tagName: 'DIV', isContentEditable: true }), true);
+  });
+
+  it('runs the guard before the body answers Enter', () => {
+    // The live check is e2e/settings.spec.ts "Enter on a row’s “Row actions”
+    // opens its menu, and only its menu", and e2e/design-keyboard.spec.ts
+    // against the style guide's grid, which carries no module workaround.
+    const table = designSource('table.tsx');
+    const guard = table.indexOf('if (keyBelongsToControl(e.key, e.target as Element | null)) return;');
+    const enter = table.indexOf("e.key === 'Enter' && focusIndex >= 0");
+    assert.ok(guard > 0, 'the body key handler asks the guard');
+    assert.ok(enter > guard, 'and asks it first');
+  });
+});
+
+describe('the grid toolbar folds as one', () => {
+  it('folds the view controls into one menu only below a measured width', () => {
+    assert.equal(collapseTableTools(0), false, 'unmeasured is not narrow');
+    assert.equal(collapseTableTools(TABLE_TOOLS_COLLAPSE_WIDTH - 1), true);
+    assert.equal(collapseTableTools(TABLE_TOOLS_COLLAPSE_WIDTH), false);
+    assert.equal(collapseTableTools(1100), false);
+  });
+
+  it('groups Filters, Columns, density and the module’s end slot into one flex item', () => {
+    const table = designSource('table.tsx');
+    const css = designSource('table.css');
+    assert.match(table, /toolbarEnd\?: ReactNode;/);
+    assert.match(table, /<div className="ain-table__tools">/);
+    assert.match(table, /collapsedTools \? \(\s*<MenuButton[\s\S]*?label="View"/);
+    assert.match(table, /\{toolbarEnd\}\s*<\/div>/, 'the end slot shares the group');
+    assert.match(css, /\.ain-table__tools \{[^}]*margin-inline-start: auto/);
+  });
+
+  it('centres an empty or failed state in the box, and seats a pinned column beside the checkboxes', () => {
+    const table = designSource('table.tsx');
+    const css = designSource('table.css');
+    assert.match(table, /<div className="ain-table__stateinner">/);
+    assert.match(table, /\['--box-width' as string\]: `\$\{boxWidth\}px`/);
+    assert.match(css, /\.ain-table__stateinner \{[^}]*position: sticky; inset-inline-start: 0; width: var\(--box-width, 100%\)/);
+    // With the body cell clipping, the cell is the inner box's scroll container and the sticky never leaves it.
+    assert.match(css, /\.ain-table tbody td\.ain-table__state \{ padding: 0; overflow: visible; \}/);
+    assert.match(css, /\.ain-table--pinned\.ain-table--selectable td\.is-pinned:not\(\.ain-table__selectcell\) \{ inset-inline-start: 40px; \}/);
+    assert.match(table, /selectable && 'ain-table--selectable'/);
+  });
+});
+
+describe('pickers inside an inline editor', () => {
+  it('the combobox lets Escape through when its list is closed, so the editor can cancel', () => {
+    const fields = designSource('fields.tsx');
+    const escape = /e\.key === 'Escape'\) \{[\s\S]*?\}/.exec(fields.slice(fields.indexOf('export function Combobox')))?.[0] ?? '';
+    assert.match(escape, /if \(!open\) return;/);
+    assert.match(escape, /e\.stopPropagation\(\);/);
+    assert.ok(escape.indexOf('if (!open) return;') < escape.indexOf('e.stopPropagation();'), 'closed: the key travels; open: it closes the list');
+  });
+
+  it('the date pickers keep an open calendar’s Escape to themselves, and only then', () => {
+    const picker = designSource('datepicker.tsx');
+    const contained = picker.match(/onKeyDown=\{\(e\) => \{ if \(e\.key === 'Escape'\) \{ e\.stopPropagation\(\); setOpen\(false\); anchor\.current\?\.focus\(\); \} \}\}/g) ?? [];
+    assert.equal(contained.length, 2, 'the single and the range picker');
+  });
+
+  it('the combobox and the date pickers take autoFocus and hand it to their control', () => {
+    const fields = designSource('fields.tsx');
+    const picker = designSource('datepicker.tsx');
+    assert.match(fields.slice(fields.indexOf('export interface ComboboxProps')), /autoFocus\?: boolean;/);
+    assert.match(fields.slice(fields.indexOf('export function Combobox')), /autoFocus=\{autoFocus\}/);
+    assert.equal((picker.match(/autoFocus=\{autoFocus\}/g) ?? []).length, 2);
+  });
+});
+
+describe('the kit owns the pieces three modules copied', () => {
+  it('exports SectionError with the shared title, the request under the message and a primary retry', () => {
+    const section = designSource('section-error.tsx');
+    assert.match(section, /export function SectionError\(\{ error, path, onRetry/);
+    assert.match(section, /title="That did not load"/);
+    assert.match(section, /code=\{`\$\{error\.status\} \$\{path\}`\}/);
+    assert.match(section, /variant="primary"[\s\S]*?onClick=\{onRetry\}>Try again</);
+    assert.match(designSource('index.ts'), /export \* from '\.\/section-error';/);
+  });
+
+  it('exports StatusPill on the one label and tone map', () => {
+    assert.match(designSource('status.tsx'), /export function StatusPill\(\{ status, title/);
+    assert.match(designSource('index.ts'), /export \* from '\.\/status';/);
+    assert.equal(statusLabel('uncollectible'), 'Written off');
+    assert.equal(statusLabel('void'), 'Voided');
+    assert.equal(statusLabel('requires_payment_method'), 'Declined');
+    assert.equal(statusLabel('some_new_state'), 'Some new state');
+    assert.equal(statusTone('past_due'), 'warning');
+    assert.equal(statusTone('requires_payment_method'), 'danger');
+    assert.equal(statusTone('scheduled'), 'info');
+    assert.equal(statusTone('won'), 'success', 'a word the billing map lacks still takes the product ramp');
+    assert.equal(statusTone('nonsense'), 'neutral');
+  });
+
+  it('carries every word the billing module’s map carries, spelled the same', () => {
+    const billing = readFileSync(new URL('../src/client/modules/billing/common.tsx', import.meta.url), 'utf8');
+    const block = /const STATUS_COPY: Record<string, string> = \{([\s\S]*?)\n\};/.exec(billing)?.[1] ?? '';
+    const pairs = [...block.matchAll(/(\w+): '([^']+)'/g)];
+    assert.ok(pairs.length >= 30, 'the billing map was read');
+    for (const [, key, label] of pairs) assert.equal(STATUS_COPY[key], label, key);
+  });
+});
+
+describe('the trail is the shell’s', () => {
+  it('says so on the Breadcrumbs component, and draws one line with an ellipsis', () => {
+    assert.match(designSource('nav.tsx'), /The shell owns the trail\./);
+    const css = designSource('nav.css');
+    assert.match(css, /\.ain-crumbs \{[^}]*flex-wrap: nowrap;[^}]*overflow: hidden;/);
+    assert.match(css, /\.ain-crumbs__current \{[^}]*text-overflow: ellipsis;/);
   });
 });

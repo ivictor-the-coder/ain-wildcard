@@ -53,7 +53,12 @@ export function CommandPalette({ open, onClose, entries, sources, onOpenSearch }
 
   const search = useGlobalSearch(query, sources, { perSource: 4, limit: 24 });
 
-  useEffect(() => { if (open) { setQuery(''); setActive(0); } }, [open]);
+  // The query belongs to one opening. It is cleared the moment a command runs
+  // and again whenever the palette closes — not on the next open, which
+  // painted the last query for a frame, searched the records for it again,
+  // and left the caret at its end so the next command typed was
+  // "forecastevery pipeline".
+  useEffect(() => { if (!open) { setQuery(''); setActive(0); } }, [open]);
   useEffect(() => { setActive(0); }, [query, search.hits.length]);
 
   const recordEntries = useMemo<PaletteEntry[]>(() => search.groups.flatMap((group) => group.hits.map((hit) => ({
@@ -109,6 +114,8 @@ export function CommandPalette({ open, onClose, entries, sources, onOpenSearch }
 
   const run = (entry: PaletteEntry) => {
     setRecents(pushRecent(recents, entry.id));
+    setQuery('');
+    setActive(0);
     onClose();
     entry.run();
   };

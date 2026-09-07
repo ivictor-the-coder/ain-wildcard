@@ -159,6 +159,8 @@ export interface DatePickerProps {
   clearable?: boolean;
   /** Quick action under the calendar; defaults to "Today". */
   footer?: ReactNode;
+  /** Put the caret on the control as it mounts — an inline editor opening onto a date. */
+  autoFocus?: boolean;
   id?: string;
   className?: string;
   'aria-label'?: string;
@@ -166,7 +168,7 @@ export interface DatePickerProps {
 
 export function DatePicker({
   value, onChange, min, max, placeholder = 'Pick a date', disabled, invalid, clearable = true,
-  footer, id, className, ...aria
+  footer, autoFocus, id, className, ...aria
 }: DatePickerProps) {
   const fmt = useFormat();
   const field = useFieldControl({ id, invalid, disabled });
@@ -184,6 +186,7 @@ export function DatePicker({
         type="button"
         id={field.id}
         disabled={disabled}
+        autoFocus={autoFocus}
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-label={aria['aria-label']}
@@ -210,24 +213,30 @@ export function DatePicker({
         )}
       </button>
       <Popover open={open} onClose={() => setOpen(false)} anchor={anchor} placement="bottom-start" flush ariaLabel="Choose a date" initialFocus={day}>
-        <Calendar
-          dayRef={day}
-          value={value}
-          month={month}
-          onMonthChange={setMonth}
-          onSelect={(ts) => { onChange(ts); setOpen(false); }}
-          min={min}
-          max={max}
-          locale={fmt.locale}
-          today={fmt.now()}
-        />
-        <div className="ain-cal__foot" style={{ padding: '0 var(--space-5) var(--space-5)' }}>
-          {footer ?? (
-            <>
-              <Button size="sm" variant="ghost" onClick={() => { onChange(startOfDay(fmt.now())); setOpen(false); }}>Today</Button>
-              {clearable && <Button size="sm" variant="ghost" onClick={() => { onChange(null); setOpen(false); }}>Clear</Button>}
-            </>
-          )}
+        {/* Escape with the calendar open closes the calendar and nothing else.
+            The popover is portaled, but React still bubbles the keystroke up
+            this tree — to an inline editor whose Escape would throw the whole
+            edit away. With the calendar closed the key is the editor's. */}
+        <div onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); setOpen(false); anchor.current?.focus(); } }}>
+          <Calendar
+            dayRef={day}
+            value={value}
+            month={month}
+            onMonthChange={setMonth}
+            onSelect={(ts) => { onChange(ts); setOpen(false); }}
+            min={min}
+            max={max}
+            locale={fmt.locale}
+            today={fmt.now()}
+          />
+          <div className="ain-cal__foot" style={{ padding: '0 var(--space-5) var(--space-5)' }}>
+            {footer ?? (
+              <>
+                <Button size="sm" variant="ghost" onClick={() => { onChange(startOfDay(fmt.now())); setOpen(false); }}>Today</Button>
+                {clearable && <Button size="sm" variant="ghost" onClick={() => { onChange(null); setOpen(false); }}>Clear</Button>}
+              </>
+            )}
+          </div>
         </div>
       </Popover>
     </>
@@ -245,13 +254,14 @@ export interface DateRangePickerProps {
   /** Named ranges down the left edge; pass `[]` to hide them. */
   presets?: typeof RANGE_PRESETS;
   placeholder?: string;
+  autoFocus?: boolean;
   id?: string;
   className?: string;
   'aria-label'?: string;
 }
 
 export function DateRangePicker({
-  value, onChange, min, max, disabled, presets = RANGE_PRESETS, placeholder = 'Select a period', id, className, ...aria
+  value, onChange, min, max, disabled, presets = RANGE_PRESETS, placeholder = 'Select a period', autoFocus, id, className, ...aria
 }: DateRangePickerProps) {
   const fmt = useFormat();
   const anchor = useRef<HTMLButtonElement>(null);
@@ -285,6 +295,7 @@ export function DateRangePicker({
         type="button"
         id={id}
         disabled={disabled}
+        autoFocus={autoFocus}
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-label={aria['aria-label'] ?? 'Date range'}
@@ -299,6 +310,7 @@ export function DateRangePicker({
         <ChevronDownIcon size={14} className="ain-input__icon" />
       </button>
       <Popover open={open} onClose={() => setOpen(false)} anchor={anchor} placement="bottom-start" flush ariaLabel="Choose a date range" initialFocus={day}>
+        <div onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); setOpen(false); anchor.current?.focus(); } }}>
         <div className="ain-daterange__body" style={{ padding: 'var(--space-5)' }}>
           {presets.length > 0 && (
             <div className="ain-daterange__presets">
@@ -352,6 +364,7 @@ export function DateRangePicker({
           </span>
           <Button size="sm" variant="ghost" onClick={() => { onChange({ start: null, end: null }); setOpen(false); }}>Clear</Button>
           <Button size="sm" variant="secondary" onClick={() => setOpen(false)}>Done</Button>
+        </div>
         </div>
       </Popover>
     </>

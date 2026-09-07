@@ -8,8 +8,8 @@
  * says so and offers the nearest honest substitute instead of guessing.
  */
 import type { Ctx } from '../kernel/context';
-import { formatMoney } from '../../shared/money';
 import { DAY, formatDate } from '../../shared/time';
+import { money as formatAmount } from './answer';
 import { billingSources, entityIndex, schemaOf, type WorkspaceProfile } from './grounding';
 import { resolveEntities } from './resolve';
 import { aggregate, associatedRecords, fetchRecords, getRecord, type AggregateResult, type Condition, type RecordSummary } from './query';
@@ -144,7 +144,7 @@ export interface MetricDefinition {
 /* -------------------------------- helpers -------------------------------- */
 
 const money = (amount: number, workspace: WorkspaceProfile, currency?: string | null) =>
-  formatMoney({ amount: Math.round(amount), currency: currency ?? workspace.currency }, { locale: workspace.locale, trimZeroFraction: true });
+  formatAmount(amount, currency ?? workspace.currency, workspace);
 
 const formatValue = (value: number, unit: MetricUnit, workspace: WorkspaceProfile, currency?: string | null): string => {
   switch (unit) {

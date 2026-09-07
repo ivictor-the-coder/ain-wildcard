@@ -179,9 +179,27 @@ describe('MRR and ARR', () => {
     // knows about is still accounted for — one currency at a time.
     assert.equal(revenue.totals.mrr, null, 'a mixed book publishes no scalar MRR');
     assert.equal(revenue.currency, null, 'and labels nothing with a currency it is not in');
-    const sum = (rows: any[], key: string) => rows.reduce((total: number, row: any) => total + row[key], 0);
-    assert.equal(sum(revenue.by_currency, 'mrr'), billing.mrr, 'nothing is lost: the parts are billing\'s own total');
-    assert.equal(sum(revenue.not_yet_revenue.by_currency, 'trialing_mrr'), billing.trial_mrr);
+
+    // Billing's headline is the workspace's own currency book, never a sum
+    // across books — adding euros to dollars produces a figure in no currency
+    // at all. So the two modules are reconciled book by book, which is a
+    // stronger statement than the totals agreeing: every book has to match.
+    const bookOf = (rows: any[], currency: string) => rows.find((row: any) => row.currency === currency);
+    assert.deepEqual(
+      revenue.by_currency.map((row: any) => row.currency).sort(),
+      billing.by_currency.map((row: any) => row.currency).sort(),
+      'both modules see the same set of books',
+    );
+    for (const row of revenue.by_currency) {
+      assert.equal(row.mrr, bookOf(billing.by_currency, row.currency).mrr,
+        `the ${row.currency} book is the same figure in both modules`);
+    }
+    assert.equal(billing.mrr, bookOf(billing.by_currency, billing.currency).mrr,
+      'the headline is the workspace-currency book itself');
+    for (const row of revenue.not_yet_revenue.by_currency) {
+      assert.equal(row.trialing_mrr, bookOf(billing.by_currency, row.currency).trial_mrr,
+        `trialing ${row.currency} agrees book for book`);
+    }
 
     const usd = await ws.ok('GET', '/v1/revenue/mrr?currency=usd');
     const fromMixed = revenue.by_currency.find((row: any) => row.currency === 'usd');
@@ -977,10 +995,13 @@ describe('a year through the time machine', () => {
 
     const mrr = await ws.ok('GET', '/v1/revenue/mrr?months=36');
     const billing = await ws.ok('GET', '/v1/subscriptions/overview');
-    assert.equal(
-      mrr.by_currency.reduce((sum: number, row: any) => sum + row.mrr, 0), billing.mrr,
-      'revenue still agrees with billing a year later, currency by currency',
-    );
+    for (const row of mrr.by_currency) {
+      const book = billing.by_currency.find((entry: any) => entry.currency === row.currency);
+      assert.equal(row.mrr, book.mrr,
+        `revenue still agrees with billing a year later on the ${row.currency} book`);
+    }
+    assert.equal(billing.mrr, billing.by_currency.find((row: any) => row.currency === billing.currency).mrr,
+      'and the headline is still one book, not a sum across them');
     const usd = await ws.ok('GET', '/v1/revenue/mrr?months=36&currency=usd');
     assert.equal(movement.series[movement.series.length - 1].closing, usd.totals.mrr);
 
@@ -1125,10 +1146,22 @@ describe('a book in more than one currency', () => {
       Object.keys(mixed).filter((key) => key.endsWith('_display')), [],
       'a mixed book gets no formatted total to read out',
     );
-    const usdRow = mixed.by_currency.find((row: any) => row.currency === 'usd');
-    assert.equal(usdRow.mrr_display, '$38,873.66');
-    assert.equal(mixed.by_currency.find((row: any) => row.currency === 'eur').mrr_display, '€15,279.17');
-    assert.equal(mixed.by_currency.find((row: any) => row.currency === 'gbp').mrr_display, '£2,285.00');
+    // The figure the copilot would read out has to be the book billing keeps,
+    // formatted the way billing formats it. Pinning the string to a literal
+    // pinned the seed instead: adding two metered accounts moved the dollar
+    // book and the assertion failed for a reason that was not a defect. So the
+    // tool is checked against the other module's own figure and its own
+    // rendering of it, and separately against the shape a money figure takes.
+    const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+    const bookOf = (rows: any[], currency: string) => rows.find((row: any) => row.currency === currency);
+    for (const currency of ['usd', 'eur', 'gbp']) {
+      const tool = bookOf(mixed.by_currency, currency);
+      const billed = bookOf(overview.by_currency, currency);
+      assert.equal(tool.mrr, billed.mrr, `the ${currency} book the copilot is handed is billing's own`);
+      assert.equal(tool.mrr_display, billed.mrr_display, `and it is written the way billing writes it`);
+      assert.match(tool.mrr_display, /^[$€£][\d,]+\.\d\d$/, `${currency} is rendered as money, with its symbol and its cents`);
+    }
+    const usdRow = bookOf(mixed.by_currency, 'usd');
     assert.ok(mixed.currency_note.includes('no exchange-rate table'));
 
     const single = await run('revenue_summary', { currency: 'usd' });

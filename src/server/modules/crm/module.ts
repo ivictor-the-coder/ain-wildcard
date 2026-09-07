@@ -1,7 +1,7 @@
 import { defineModule } from '../../kernel/module';
 import type { Ctx } from '../../kernel/context';
-import { created, list, noContent, type Req } from '../../kernel/http';
-import { ApiError, badRequest, isApiError, notFound } from '../../../shared/errors';
+import { created, list, noContent, roleAtLeast, type Req } from '../../kernel/http';
+import { ApiError, badRequest, forbidden, isApiError, notFound } from '../../../shared/errors';
 import v from '../../../shared/validate';
 import { CRM_MIGRATIONS } from './schema';
 import { Crm, type AssociationWrite, type HistoryQuery } from './store';
@@ -111,6 +111,13 @@ export function crmEngine(ctx: Ctx): Crm {
   if (!engine) { engine = new Crm(ctx); engines.set(ctx, engine); }
   return engine;
 }
+
+/**
+ * Who is looking, for the reads that depend on it. The same identity a write
+ * records as its actor — a person through a session, the key through a key —
+ * so a private view is visible to exactly the credential that saved it.
+ */
+const viewerOf = (req: Req): string | null => req.auth.userId ?? req.auth.keyId ?? null;
 
 const writeOptions = (req: Req, source?: ChangeSource): WriteOptions => ({
   actorId: req.auth.userId ?? req.auth.keyId ?? null,
@@ -334,7 +341,7 @@ export default defineModule({
       return {
         object: 'object_type', ...type,
         properties: crm.properties(req.auth.orgId, type.name),
-        views: crm.views(req.auth.orgId, type.name),
+        views: crm.views(req.auth.orgId, type.name, viewerOf(req)),
         ...(crm.pipelines.binding(req.auth.orgId, type.name) ? { pipelines: crm.pipelines.list(req.auth.orgId, type.name) } : {}),
         associations: crm.associationTypes(req.auth.orgId).filter((a) => a.from_object === type.name || a.to_object === type.name || a.from_object === '*'),
         record_count: ctx.db.count(`SELECT COUNT(*) FROM crm_records WHERE org_id = ? AND object_type = ? AND archived = 0 AND merged_into IS NULL`, req.auth.orgId, type.name),
@@ -737,7 +744,7 @@ export default defineModule({
       let properties: string[] | undefined;
 
       if (q.view) {
-        const view = crm.view(req.auth.orgId, q.view);
+        const view = crm.view(req.auth.orgId, q.view, viewerOf(req));
         if (view.object_type !== objectType) {
           throw badRequest('view_object_mismatch', `The view "${view.name}" belongs to ${view.object_type}, not ${objectType}.`, 'view');
         }
@@ -995,6 +1002,13 @@ export default defineModule({
     router.del('/v1/records/:type/:id', (req: Req) => {
       const orgId = req.auth.orgId;
       const permanent = String(req.query.permanent) === 'true';
+      // Archiving is reversible and belongs to whoever works the record.
+      // Destroying it — the row, its history, its edges — is the same class of
+      // act as deleting a property from the schema, which only an admin may
+      // do; a member may not destroy what they may not define.
+      if (permanent && !roleAtLeast(req.auth.role, 'admin')) {
+        throw forbidden(`Your role (${req.auth.role}) can archive a ${req.params.type} but not delete it permanently — that removes its history for everyone, and needs an admin. Archive it, or ask an admin to delete it.`);
+      }
       const record = crm.require(orgId, req.params.type, req.params.id);
       ctx.atomic(() => {
         if (permanent) crm.destroy(orgId, req.params.type, req.params.id, writeOptions(req));
@@ -1010,6 +1024,7 @@ export default defineModule({
       return noContent();
     }, {
       summary: 'Archive a record, or delete it permanently with ?permanent=true', tags: ['crm'], roles: ['member'],
+      description: 'Archiving hides the record and is reversible with `POST /v1/records/:type/:id/restore`; any member may do it. `?permanent=true` destroys the record, its history and its associations, and is admin-only — the same bar as deleting a property.',
       query: v.object({ permanent: v.optional(v.boolean()) }, { strict: true }),
     });
 
@@ -1308,10 +1323,11 @@ export default defineModule({
     /* --------------------------------- views ------------------------------ */
 
     router.get('/v1/views', (req: Req) => {
-      const views = crm.views(req.auth.orgId, req.query.object_type);
+      const views = crm.views(req.auth.orgId, req.query.object_type, viewerOf(req));
       return list(views, { totalCount: views.length });
     }, {
       summary: 'List saved views', tags: ['crm'],
+      description: 'Every shared view, plus the private views saved by the caller. A private view belongs to the credential that saved it and is listed, served, edited and deleted only for that credential; to anyone else it does not exist.',
       query: v.object({ object_type: v.optional(v.string({ max: 60 })) }, { strict: true }),
     });
 
@@ -1334,11 +1350,11 @@ export default defineModule({
       }, { strict: true }),
     });
 
-    router.get('/v1/views/:id', (req: Req) => crm.view(req.auth.orgId, req.params.id),
+    router.get('/v1/views/:id', (req: Req) => crm.view(req.auth.orgId, req.params.id, viewerOf(req)),
       { summary: 'Retrieve a saved view', tags: ['crm'] });
 
     router.patch('/v1/views/:id', (req: Req) =>
-      ctx.atomic(() => crm.updateView(req.auth.orgId, req.params.id, req.body as Partial<ViewDef>)), {
+      ctx.atomic(() => crm.updateView(req.auth.orgId, req.params.id, req.body as Partial<ViewDef>, viewerOf(req))), {
       summary: 'Update a saved view', tags: ['crm'], roles: ['member'],
       body: v.object({
         name: v.optional(v.string({ min: 1, max: 80 })),
@@ -1356,7 +1372,7 @@ export default defineModule({
     });
 
     router.del('/v1/views/:id', (req: Req) => {
-      ctx.atomic(() => crm.deleteView(req.auth.orgId, req.params.id));
+      ctx.atomic(() => crm.deleteView(req.auth.orgId, req.params.id, viewerOf(req)));
       return noContent();
     }, { summary: 'Delete a saved view', tags: ['crm'], roles: ['member'] });
   },
