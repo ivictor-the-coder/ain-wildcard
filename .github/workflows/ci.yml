@@ -42,3 +42,68 @@ jobs:
         # against a real in-process app — the check that catches what unit
         # tests miss.
         run: npx tsx scripts/verify.ts
+
+  e2e:
+    name: end to end
+    runs-on: ubuntu-latest
+    # 396 tests in one worker against one database took 16 minutes on the
+    # development box. The ceiling is generous because a run that is merely
+    # slow must not be reported as a product failure.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Boot a preview and run every spec against it
+        # The platform's per-principal limiter is 600 requests a real minute,
+        # and one worker driving 396 tests runs into it. `useQuery` keeps a
+        # refusal rather than retrying, so whichever screen was loading when
+        # the bucket emptied draws nothing for the rest of that test — which
+        # reads as a product defect and is not one. No test asserts a 429, so
+        # the limit is raised for the run rather than worked around in specs.
+        env:
+          AIN_RATE_LIMIT: '20000'
+          PORT: '8976'
+        run: |
+          set -uo pipefail
+          node scripts/preview.mjs --fresh --port 8976 --name ci-e2e > preview.log 2>&1 &
+          SERVER=$!
+          for _ in $(seq 1 240); do
+            curl -sf -o /dev/null http://127.0.0.1:8976/api/v1/health && break
+            sleep 1
+          done
+          curl -sf -o /dev/null http://127.0.0.1:8976/api/v1/health || {
+            echo "the preview never came up — this says nothing about the product"
+            tail -40 preview.log; kill $SERVER 2>/dev/null; exit 1
+          }
+          AIN_BASE_URL=http://127.0.0.1:8976 npx playwright test
+          STATUS=$?
+          # A server that died under the run turns every remaining test red for
+          # one reason. Say which it was rather than reporting 396 defects.
+          if ! curl -sf -o /dev/null http://127.0.0.1:8976/api/v1/health; then
+            echo "the preview died during the run — the results above say nothing about the product"
+            tail -40 preview.log
+            kill $SERVER 2>/dev/null
+            exit 1
+          fi
+          kill $SERVER 2>/dev/null
+          exit $STATUS
+
+      - name: Keep what a failure left behind
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure
+          path: |
+            test-results/
+            preview.log
+          retention-days: 7
