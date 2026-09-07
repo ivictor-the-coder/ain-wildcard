@@ -158,6 +158,33 @@ export function formatDuration(ms: number, maxParts = 2): string {
 
 export const startOfDay = (ts: Millis): Millis => { const d = new Date(ts); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
 export const endOfDay = (ts: Millis): Millis => startOfDay(ts) + DAY - 1;
+
+/**
+ * The calendar day a workspace is on, as a stored-shaped number.
+ *
+ * A date property is a calendar day held at midnight UTC, so "the day it is
+ * here" has to be that shape too — not the instant, and not the day Greenwich
+ * is on. Between 8pm and midnight in New York those are different days, and
+ * anything comparing a stored date to "today" through `startOfDay` is a full
+ * day out for those four hours every evening: a saved view filtering on
+ * `today` selects a different set of records than the board it was saved from.
+ *
+ * An unknown zone falls back to UTC rather than throwing. A filter that
+ * silently answers about the wrong day is worse than one that answers about
+ * Greenwich, but a filter that fails outright is worse than both.
+ */
+export function civilDay(ts: Millis, timeZone: string | undefined): Millis {
+  if (timeZone) {
+    try {
+      const ymd = new Intl.DateTimeFormat('en-CA', {
+        timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(ts);
+      const parsed = Date.parse(`${ymd}T00:00:00.000Z`);
+      if (Number.isFinite(parsed)) return parsed;
+    } catch { /* fall through to UTC */ }
+  }
+  return startOfDay(ts);
+}
 export const startOfMonth = (ts: Millis): Millis => { const d = new Date(ts); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1); };
 export const endOfMonth = (ts: Millis): Millis => { const d = new Date(ts); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) - 1; };
 export const monthKey = (ts: Millis): string => new Date(ts).toISOString().slice(0, 7);

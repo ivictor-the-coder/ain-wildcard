@@ -822,7 +822,7 @@ export class Crm {
         continue;
       }
       if (prop.read_only && !MAINTAINED_SOURCES.has(opts.source ?? 'api')) throw this.readOnlyError(orgId, objectType, prop);
-      const coerced = coerceValue(prop, raw, { now, path: 'properties' });
+      const coerced = coerceValue(prop, raw, { now, path: 'properties', timeZone: this.timeZone(orgId) });
       if (!isEmptyValue(coerced)) values[prop.name] = coerced;
       else if (prop.required) throw badRequest('property_required', `${prop.label} is required to create a ${objectDef.label.toLowerCase()}.`, `properties.${prop.name}`);
     }
@@ -893,7 +893,7 @@ export class Crm {
         );
       }
       if (prop.read_only && !MAINTAINED_SOURCES.has(opts.source ?? 'user')) throw this.readOnlyError(orgId, objectType, prop);
-      const coerced = coerceValue(prop, raw, { now, path: 'properties' });
+      const coerced = coerceValue(prop, raw, { now, path: 'properties', timeZone: this.timeZone(orgId) });
       if (valuesEqual(existing.properties[name] ?? null, coerced)) continue;
       previous[name] = existing.properties[name] ?? null;
       if (isEmptyValue(coerced)) delete values[name];
@@ -1252,9 +1252,18 @@ export class Crm {
       orgId,
       objectType,
       now: this.ctx.now(),
+      timeZone: this.timeZone(orgId),
       propertiesOf: (type) => this.propertyIndex(orgId, type),
       resolveAssociation: (fromObject, association) => this.resolveAssociation(orgId, fromObject, association),
     };
+  }
+
+  /**
+   * The workspace's zone. A filter that says `today` means the day it is where
+   * the business is, not where the server happens to keep its clock.
+   */
+  private timeZone(orgId: string): string | undefined {
+    try { return this.ctx.svc.core.org(orgId).timezone || undefined; } catch { return undefined; }
   }
 
   resolveAssociation(orgId: string, fromObject: string, association: string): { objectTypes: string[]; associationTypes: string[] } {

@@ -33,6 +33,11 @@ export interface CompileEnv {
   orgId: string;
   objectType: string;
   now: number;
+  /**
+   * The workspace's zone, so a day token means the day it is here. Absent
+   * falls back to UTC, which is only right for a workspace actually on it.
+   */
+  timeZone?: string;
   /** Properties of an object type, or a merged map for a category alias. */
   propertiesOf(objectType: string): PropertyIndex;
   /** Resolve `deal` / `deal_to_company` / `activity` / `any` into concrete edges. */
@@ -169,7 +174,7 @@ class Compiler {
   private coerce(prop: PropertyDef, raw: unknown, param: string): string | number {
     switch (prop.type) {
       case 'date': case 'datetime': {
-        const ts = resolveDate(raw, this.env.now);
+        const ts = resolveDate(raw, this.env.now, this.env.timeZone);
         if (ts === null) throw badRequest('filter_value_invalid', `${prop.label} needs a date value — millis, ISO-8601 or a token like "start_of_quarter".`, param);
         return ts;
       }

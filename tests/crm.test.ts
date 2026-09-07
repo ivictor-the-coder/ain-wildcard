@@ -2722,3 +2722,73 @@ describe('a member may archive a record but not destroy it', () => {
     assert.equal(app.db.count(`SELECT COUNT(*) FROM crm_records WHERE id = ?`, company.id), 0);
   });
 });
+
+/* ------------- a day token means the day it is where the business is ------ */
+
+/**
+ * A saved view that filters on `today` used to resolve it against Greenwich.
+ * Northwind is in New York, so between 8pm and midnight there — 00:00 to 04:00
+ * UTC — the CRM's "today" was tomorrow: a view saved from the deal board and
+ * read back in the evening selected a different set of deals than the board it
+ * was saved from. The board had already committed to the workspace's own day.
+ *
+ * The instants below straddle that boundary deliberately. Nothing here is
+ * pinned to the seed: the expected day is computed from the same calendar the
+ * operator reads.
+ */
+describe('a relative date resolves in the workspace’s own calendar', () => {
+  const dayIn = (ts: number, timeZone: string) =>
+    new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(ts);
+
+  test('“today” is the day the workspace is on, not the day Greenwich is on', async () => {
+    const { resolveDate } = await import('../src/server/modules/crm/values');
+    const zone = 'America/New_York';
+
+    // 21:00 and 23:30 in New York, both of which are already tomorrow in UTC.
+    for (const at of [Date.UTC(2026, 8, 8, 1, 0), Date.UTC(2026, 8, 8, 3, 30)]) {
+      const resolved = resolveDate('today', at, zone);
+      assert.ok(resolved !== null);
+      assert.equal(
+        new Date(resolved).toISOString().slice(0, 10), dayIn(at, zone),
+        `at ${new Date(at).toISOString()} the workspace is on ${dayIn(at, zone)}`,
+      );
+      // And it is a stored-shaped day: midnight, so it compares to a date property.
+      assert.equal(resolved % 86_400_000, 0, 'a day token must be midnight, the shape a date property is stored in');
+    }
+
+    // Midday, where the two calendars agree, must not move.
+    const midday = Date.UTC(2026, 8, 7, 16, 0);
+    assert.equal(
+      new Date(resolveDate('today', midday, zone) as number).toISOString().slice(0, 10),
+      dayIn(midday, zone),
+    );
+
+    // A workspace actually on UTC is unchanged, and so is one whose zone is unknown.
+    assert.equal(resolveDate('today', Date.UTC(2026, 8, 8, 1, 0), 'UTC'), Date.UTC(2026, 8, 8));
+    assert.equal(resolveDate('today', Date.UTC(2026, 8, 8, 1, 0), 'Mars/Olympus'), Date.UTC(2026, 8, 8));
+  });
+
+  test('yesterday, tomorrow and the week hang off that same day', async () => {
+    const { resolveDate } = await import('../src/server/modules/crm/values');
+    const zone = 'America/New_York';
+    const at = Date.UTC(2026, 8, 8, 2, 0); // 22:00 Sep 7 in New York
+    const today = resolveDate('today', at, zone) as number;
+    assert.equal(resolveDate('yesterday', at, zone), today - 86_400_000);
+    assert.equal(resolveDate('tomorrow', at, zone), today + 86_400_000);
+    // The week containing the workspace's day, not the one containing UTC's.
+    const weekStart = resolveDate('start_of_week', at, zone) as number;
+    assert.ok(weekStart <= today && today - weekStart < 7 * 86_400_000);
+  });
+
+  test('the month a filter means is the month the workspace is in', async () => {
+    const { resolveDate } = await import('../src/server/modules/crm/values');
+    const zone = 'America/New_York';
+    // 21:00 on the last of September in New York — already October in UTC.
+    const at = Date.UTC(2026, 9, 1, 1, 0);
+    assert.equal(dayIn(at, zone), '2026-09-30', 'the fixture straddles the month boundary');
+    assert.equal(
+      new Date(resolveDate('start_of_month', at, zone) as number).toISOString().slice(0, 10), '2026-09-01',
+      'the workspace is still in September; a month anchored on the instant had already rolled over',
+    );
+  });
+});

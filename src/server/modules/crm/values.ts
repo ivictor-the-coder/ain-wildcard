@@ -1,5 +1,5 @@
 import { badRequest } from '../../../shared/errors';
-import { DAY, HOUR, MINUTE, WEEK, addInterval, startOfDay, startOfMonth } from '../../../shared/time';
+import { DAY, HOUR, MINUTE, WEEK, addInterval, civilDay, startOfDay, startOfMonth } from '../../../shared/time';
 import type { PropertyDef, PropertyNormaliser, PropertyValue, RelativeUnit } from './types';
 
 /**
@@ -46,33 +46,45 @@ const UNIT_ALIAS: Record<string, RelativeUnit> = {
 /**
  * Accepts unix millis, an ISO-8601 string, or one of the relative tokens saved
  * views rely on (`today`, `start_of_quarter`, `-30d`, `+2w`).
+ *
+ * Day tokens resolve against the workspace's own calendar, not Greenwich's.
+ * They used to use `startOfDay`, which is UTC: between 8pm and midnight in New
+ * York that is tomorrow, so a view saved from a board and read back in the
+ * evening selected a different set of records than the board itself drew. The
+ * board had already committed to the workspace's day; this is the same rule on
+ * the server side of the same question.
  */
-export function resolveDate(raw: unknown, now: number): number | null {
+export function resolveDate(raw: unknown, now: number, timeZone?: string): number | null {
   if (raw === null || raw === undefined || raw === '') return null;
   if (typeof raw === 'number') return Number.isFinite(raw) ? Math.trunc(raw) : null;
   if (typeof raw !== 'string') return null;
   const token = raw.trim().toLowerCase();
+  // Every day-shaped token hangs off this one reading of the workspace's day.
+  const today = civilDay(now, timeZone);
 
   switch (token) {
     case 'now': return now;
-    case 'today': case 'start_of_day': return startOfDay(now);
-    case 'end_of_day': return startOfDay(now) + DAY - 1;
-    case 'yesterday': return startOfDay(now) - DAY;
-    case 'tomorrow': return startOfDay(now) + DAY;
+    case 'today': case 'start_of_day': return today;
+    case 'end_of_day': return today + DAY - 1;
+    case 'yesterday': return today - DAY;
+    case 'tomorrow': return today + DAY;
     case 'start_of_week': {
-      const d = new Date(startOfDay(now));
-      return startOfDay(now) - ((d.getUTCDay() + 6) % 7) * DAY;
+      const d = new Date(today);
+      return today - ((d.getUTCDay() + 6) % 7) * DAY;
     }
     case 'end_of_week': {
-      const d = new Date(startOfDay(now));
-      return startOfDay(now) + (7 - ((d.getUTCDay() + 6) % 7)) * DAY - 1;
+      const d = new Date(today);
+      return today + (7 - ((d.getUTCDay() + 6) % 7)) * DAY - 1;
     }
-    case 'start_of_month': return startOfMonth(now);
-    case 'end_of_month': return addInterval(startOfMonth(now), { unit: 'month', count: 1 }) - 1;
-    case 'start_of_quarter': return QUARTER_START(now);
-    case 'end_of_quarter': return addInterval(QUARTER_START(now), { unit: 'month', count: 3 }) - 1;
-    case 'start_of_year': return Date.UTC(new Date(now).getUTCFullYear(), 0, 1);
-    case 'end_of_year': return Date.UTC(new Date(now).getUTCFullYear() + 1, 0, 1) - 1;
+    // The coarser windows hang off the workspace's day for the same reason: at
+    // 9pm on the last of the month in New York, a month anchored on the instant
+    // has already rolled over and `start_of_month` names the next one.
+    case 'start_of_month': return startOfMonth(today);
+    case 'end_of_month': return addInterval(startOfMonth(today), { unit: 'month', count: 1 }) - 1;
+    case 'start_of_quarter': return QUARTER_START(today);
+    case 'end_of_quarter': return addInterval(QUARTER_START(today), { unit: 'month', count: 3 }) - 1;
+    case 'start_of_year': return Date.UTC(new Date(today).getUTCFullYear(), 0, 1);
+    case 'end_of_year': return Date.UTC(new Date(today).getUTCFullYear() + 1, 0, 1) - 1;
   }
 
   const offset = RELATIVE_OFFSET.exec(token);
@@ -170,6 +182,11 @@ export interface CoerceContext {
   now: number;
   /** Property path prefix used in validation errors (`properties.amount`). */
   path?: string;
+  /**
+   * The workspace's zone. Writing `today` into a date property must mean the
+   * day it is where the business is, for the same reason reading it does.
+   */
+  timeZone?: string;
 }
 
 /** Normalise one incoming value to its property's canonical shape, or throw. */
@@ -207,7 +224,7 @@ export function coerceValue(prop: PropertyDef, raw: unknown, ctx: CoerceContext)
     }
     case 'date':
     case 'datetime': {
-      const ts = resolveDate(raw, ctx.now);
+      const ts = resolveDate(raw, ctx.now, ctx.timeZone);
       if (ts === null) reject(`${prop.label} must be a date — unix millis, an ISO-8601 string, or a token like "today".`);
       return prop.type === 'date' ? startOfDay(ts as number) : (ts as number);
     }
