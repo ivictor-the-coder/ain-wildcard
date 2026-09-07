@@ -13,7 +13,7 @@ import {
   Button, EmptyState, ErrorState, Field, Icons, Inline, Input, MoneyInput, Popover, SearchInput, Select,
   Loading, SectionError, Stack, StatusPill, TAX_ID_STATUS, TaxIdStatusPill,
   currencySymbol, decodeTableState, encodeTableState, filterRows, parseMoneyInput, searchRows,
-  statusLabel, taxIdStatusLabel, useFormat, useToast,
+  statusLabel, taxIdStatusLabel, useFocusFirstField, useFormat, useToast,
   type CellValue, type DateOptions, type Formatter, type TableState, type SortState,
 } from '../../design';
 import {
@@ -1428,13 +1428,7 @@ export interface DialogForm {
   };
 }
 
-const FOCUSABLE = [
-  'input:not([type="hidden"]):not([disabled])',
-  'select:not([disabled])',
-  'textarea:not([disabled])',
-  'button:not([disabled])',
-  '[tabindex]:not([tabindex="-1"])',
-].join(',');
+
 
 const SUBMIT_ON_ENTER = new Set(['INPUT']);
 
@@ -1469,19 +1463,9 @@ export function useDialogForm(open: boolean, canSubmit: boolean, onSubmit: () =>
   const submit = useRef(onSubmit);
   submit.current = onSubmit;
 
-  useEffect(() => {
-    if (!open) return;
-    const frame = requestAnimationFrame(() => {
-      const root = ref.current;
-      if (!root) return;
-      const first = root.querySelector<HTMLElement>(FOCUSABLE);
-      // Only take focus back from the header. If the operator has already
-      // clicked into the form, leave them where they are.
-      const active = document.activeElement;
-      if (first && (!active || !root.contains(active))) first.focus({ preventScroll: true });
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [open]);
+  // One home for this: the same defect existed in the settings dialogs, so the
+  // rule and its reasoning live in the kit rather than in two modules.
+  useFocusFirstField(open, ref);
 
   const onKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key !== 'Enter' || e.defaultPrevented || e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;

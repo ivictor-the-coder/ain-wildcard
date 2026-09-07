@@ -19,6 +19,7 @@ export * from './position';
 export * from './toast';
 export * from './feedback';
 export * from './section-error';
+export * from './dialog-focus';
 export * from './status';
 export * from './status-core';
 export * from './error-boundary';

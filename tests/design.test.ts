@@ -23,6 +23,7 @@ import {
 } from '../src/client/design/table-core';
 import { contrastGrade, contrastRatio, parseColor, relativeLuminance } from '../src/client/design/color';
 import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { computePosition, repositionFloating, type FloatingElement, type PositionResult, type Size } from '../src/client/design/position';
 import {
   addDays, addMonths, monthMatrix, nextRange, RANGE_PRESETS, startOfMonthUtc, weekdayLabels,
@@ -1649,5 +1650,60 @@ describe('the trail is the shell’s', () => {
     const css = designSource('nav.css');
     assert.match(css, /\.ain-crumbs \{[^}]*flex-wrap: nowrap;[^}]*overflow: hidden;/);
     assert.match(css, /\.ain-crumbs__current \{[^}]*text-overflow: ellipsis;/);
+  });
+});
+
+/* ------------- a dialog opens on its first field, not on Close ------------ */
+
+/**
+ * The modal's focus trap leaves focus on Close, which is right for a dialog
+ * that announces something and wrong for one that asks for something: the
+ * operator types, presses Enter, and the one control that discards the work is
+ * what has focus.
+ *
+ * Billing found and fixed this; settings had the same defect and did not know,
+ * because each module owned its own dialog wrapper. The rule lives in the kit
+ * now, so a third module cannot quietly grow a fourth copy of it — or, worse,
+ * a wrapper that never learned the rule at all.
+ */
+describe('the rule that a dialog opens on its first field', () => {
+  const clientRoot = join(process.cwd(), 'src', 'client');
+
+  const filesUnder = (dir: string): string[] => {
+    const out: string[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) out.push(...filesUnder(full));
+      else if (/\.tsx?$/.test(entry.name)) out.push(full);
+    }
+    return out;
+  };
+
+  it('lives in the kit, and no module keeps its own copy', () => {
+    const kit = readFileSync(join(clientRoot, 'design', 'dialog-focus.ts'), 'utf8');
+    assert.match(kit, /export function useFocusFirstField/, 'the kit no longer owns the rule');
+
+    const offenders: string[] = [];
+    for (const file of filesUnder(join(clientRoot, 'modules'))) {
+      const source = readFileSync(file, 'utf8');
+      // A module hand-rolling the same walk: its own focusable list, or its own
+      // "move focus off the header" effect.
+      if (/const FOCUSABLE\s*=/.test(source)) offenders.push(`${file} declares its own focusable list`);
+      if (/querySelector<HTMLElement>\(FOCUSABLE\)/.test(source)) offenders.push(`${file} walks for the first field itself`);
+    }
+    assert.deepEqual(offenders, [], 'import useFocusFirstField from the kit instead');
+  });
+
+  it('every dialog wrapper a module exports takes focus', () => {
+    const wrappers = filesUnder(join(clientRoot, 'modules'))
+      .filter((file) => /export function DialogForm|export function useDialogForm/.test(readFileSync(file, 'utf8')));
+    assert.ok(wrappers.length >= 2, 'the wrappers this guards have moved or been renamed');
+    for (const file of wrappers) {
+      // A call, not a mention: the first version of this test matched the
+      // import line, so a wrapper that imported the hook and never called it
+      // passed. Proving a guard fails is the only way to know it guards.
+      assert.match(readFileSync(file, 'utf8'), /useFocusFirstField\s*\(/,
+        `${file} wraps a dialog's fields but never moves focus off Close`);
+    }
   });
 });

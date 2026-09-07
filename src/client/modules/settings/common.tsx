@@ -15,7 +15,7 @@ import { Link, useLocation, useSearchParam } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
 import {
   Badge, Banner, Button, EmptyState, Icons, Loading, Page, SectionError,
-  useCopyToClipboard, useToast,
+  useCopyToClipboard, useFocusFirstField, useToast,
   type Tone,
 } from '../../design';
 import type { Role } from './types';
@@ -168,11 +168,19 @@ export function SettingsShell({ title, subtitle, actions, children }: SettingsSh
  * valid; an invalid form does nothing on Enter, the way the disabled button
  * does nothing on click.
  */
-export function DialogForm({ onSubmit, children, className }: {
+export function DialogForm({ onSubmit, children, className, open = true }: {
   onSubmit: () => void;
   children: ReactNode;
   className?: string;
+  /** Whether the dialog holding this form is on screen, so focus can be placed. */
+  open?: boolean;
 }) {
+  // The modal's trap leaves focus on Close. Without this, the operator's first
+  // Enter dismisses the dialog and throws away what they typed — the same
+  // defect the billing dialogs had, fixed there and now shared from the kit
+  // rather than written twice.
+  const form = useRef<HTMLFormElement | null>(null);
+  useFocusFirstField(open, form);
   const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); onSubmit(); };
   const onKeyDown = (event: KeyboardEvent<HTMLFormElement>) => {
     if (event.key !== 'Enter' || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.nativeEvent.isComposing) return;
@@ -184,7 +192,7 @@ export function DialogForm({ onSubmit, children, className }: {
     event.preventDefault();
     onSubmit();
   };
-  return <form className={className} noValidate onSubmit={submit} onKeyDown={onKeyDown}>{children}</form>;
+  return <form ref={form} className={className} noValidate onSubmit={submit} onKeyDown={onKeyDown}>{children}</form>;
 }
 
 /* ================================= roles ================================== */
