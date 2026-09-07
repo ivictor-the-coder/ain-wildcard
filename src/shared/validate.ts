@@ -221,6 +221,26 @@ export const object = <S extends Record<string, Validator<any>>>(shape: S, o: Ob
   });
 };
 
+/**
+ * Refuse keys a shape does not declare, for a value parsed somewhere else.
+ *
+ * `object(..., { strict: true })` does this while parsing. A query string is
+ * parsed by the router against a shape the route hands it, and there was no
+ * moment to say "strict" — so an unknown query parameter was dropped in
+ * silence. `?statuss=open` came back as the unfiltered list, which reads as a
+ * filter that matched everything. Same wording and same error shape as the
+ * strict object, because to a caller it is the same mistake.
+ */
+export const refuseUnknown = (validator: Validator<any>, input: Record<string, unknown>): void => {
+  const node = validator.describe();
+  if (node.type !== 'object' || !node.fields) return;
+  const fields = node.fields;
+  const unknown = Object.keys(input).filter((key) => !(key in fields));
+  if (unknown.length) {
+    throw badRequest('parameter_invalid', `Received unknown parameter: ${unknown[0]}.`, unknown[0], { unknown });
+  }
+};
+
 export const union = <T extends readonly Validator<any>[]>(...options: T): Validator<Infer<T[number]>> =>
   make<Infer<T[number]>>({ type: 'union', fields: Object.fromEntries(options.map((o, i) => [String(i), o.describe()])) }, (raw, path) => {
     const errors: string[] = [];

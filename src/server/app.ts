@@ -12,6 +12,7 @@ import type { ModuleDef } from './kernel/module';
 import { CORE_MIGRATIONS } from './kernel/core-schema';
 import { createAiRuntime } from './ai/runtime';
 import { ApiError, badRequest, conflict, forbidden, notFound, unauthorized } from '../shared/errors';
+import { refuseUnknown } from '../shared/validate';
 import { newId, randomId } from '../shared/ids';
 import { MODULES } from './generated/registry';
 
@@ -427,7 +428,15 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
         method: input.method.toUpperCase(), path, params, query: parsedQuery.flat, queryAll: parsedQuery.all,
         body: input.body ?? {}, headers, requestId, auth, ip: input.ip || '127.0.0.1',
       };
-      if (route.meta.query) req.query = route.meta.query.parse(parsedQuery.flat) as any;
+      if (route.meta.query) {
+        // A mis-typed filter is the one failure a list endpoint must not answer
+        // with plausible rows: an unknown body parameter has always been
+        // refused, and an unknown query parameter used to be dropped without a
+        // word, so `?statuss=open` returned every row and looked like a filter
+        // that matched them all.
+        refuseUnknown(route.meta.query, parsedQuery.flat);
+        req.query = route.meta.query.parse(parsedQuery.flat) as any;
+      }
       if (route.meta.body) req.body = route.meta.body.parse(input.body ?? {});
 
       idemKey = headers['idempotency-key'] || '';

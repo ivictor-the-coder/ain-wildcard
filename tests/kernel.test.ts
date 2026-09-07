@@ -1258,3 +1258,47 @@ describe('the client cache revalidates behind what is on screen', () => {
     assert.equal(peekCache('/api/v1/me')?.stale, true, 'an invalidation with no prefix marks everything, and forgets nothing');
   });
 });
+
+/* ---------------- a filter nobody declared is not a filter ---------------- */
+
+/**
+ * A mis-typed filter used to come back as the whole list.
+ *
+ * Unknown *body* parameters have always been refused. Unknown *query*
+ * parameters were dropped without a word, so `?statuss=open` answered with
+ * every row — plausible rows, under a filter that did nothing, which is the
+ * one failure a list endpoint must not have. `GET /v1/dunning?invoice=…` was
+ * found this way: the route had no `invoice` parameter, the caller thought it
+ * did, and the campaigns of some other invoice came back looking like an
+ * answer.
+ */
+describe('a query parameter the route never declared', () => {
+  test('is refused by name, the way an unknown body parameter is', async () => {
+    const app = await createApp({ db: 'memory', seed: true, config: { env: 'test' } });
+    try {
+      const orgId = app.ctx.config.defaultOrgId;
+      const auth: Auth = { kind: 'session', orgId, userId: 'usr_seed01', role: 'owner', scopes: ['*'], livemode: true };
+
+      const ok = await app.handle({ method: 'GET', path: '/v1/invoices', query: { limit: '3' }, auth });
+      assert.equal(ok.status, 200, 'a declared parameter still works');
+
+      const typo = await app.handle({ method: 'GET', path: '/v1/invoices', query: { statuss: 'open' }, auth });
+      assert.equal(typo.status, 400, 'the misspelling came back as an answer');
+      assert.equal(typo.body.error.code, 'parameter_invalid');
+      assert.equal(typo.body.error.param, 'statuss');
+      assert.match(typo.body.error.message, /Received unknown parameter: statuss\./);
+
+      // The same shape as the body's refusal, because to a caller it is the
+      // same mistake made in a different place.
+      const body = await app.handle({
+        method: 'POST', path: '/v1/prices',
+        body: { product: 'prod_x', currency: 'usd', unit_amount: 1, nickname: 'x', notaparam: 1 },
+        auth,
+      });
+      assert.equal(body.status, 400);
+      assert.equal(body.body.error.code, 'parameter_invalid');
+    } finally {
+      app.close();
+    }
+  });
+});
