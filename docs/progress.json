@@ -1,5 +1,5 @@
 {
-  "updated": "2026-09-07T10:05:00.000Z",
+  "updated": "2026-09-07T18:30:00.000Z",
   "headline": "The end-to-end suite runs in CI, and it earned its place on the first run: the dashboard was printing \"Monthly recurring revenue\" twice from two different queries, and Escape could throw away an inline edit in the frame before focus reached the calendar. Both are fixed at the cause. Three figures that looked right were not — a credit balance that stopped counting at 500 grants, an invoice drain that deferred a customer's remainder, and a mistyped filter that came back as the whole list. And the copilot's scope reconciliation is gone: 2,548 lines the answer path stopped calling a wave ago, kept alive only by its own tests.",
   "stats": {
     "server modules": 10,
@@ -143,21 +143,21 @@
         {
           "id": "invoicing-tax",
           "title": "Invoicing, credit notes & tax",
-          "status": "critique",
-          "rounds": 3,
-          "note": "Every one of 43 invoices reconciled to the cent across stacked, inclusive, reverse-charged, prorated and credited cases. Two P1s fixed: metered usage now lands on the renewal that names its window (the bill waits for the settlement it says it settles), and a cancellation sweeps every pending proration into a final invoice. Open: the subscriptions overview still adds euros to dollars in its headline — a change that crosses three owners.",
-          "operability": 0.9,
-          "debt": 6,
+          "status": "rework",
+          "rounds": 4,
+          "note": "Tax is priced once, when the draft is written, and nothing re-prices it at the moment the document becomes real. That single gate (invoices.ts:864, which only re-prices a bill that had no tax location at all) is the difference between a billing engine and a tax engine: correct a customer's address, or retire a rate, between raising and finalising a draft, and AIN will finalise and send a bill that charges Ohio sales tax to a customer whose own address block on the same page says Austin, Texas. Everything downstream of that number — the credit note that reverses it, the render that reconciles i",
+          "operability": 0.94,
+          "debt": 13,
           "verdict": "The invoice arithmetic is Stripe-grade, but usage billed a month late, cancelled subscriptions left prorations unbilled, and the overview added euros to dollars."
         },
         {
           "id": "payments",
           "title": "Payments, retries & dunning",
-          "status": "critique",
-          "rounds": 3,
-          "note": "199 invoices, every ledger and every schedule reconciled to the row. Three P1s fixed: a card that needs its holder is held in past_due for the window the retries would have run in, not written off in a millisecond; a refund that reopens a paid bill hands it to a campaign; the do-not-retry family (stolen, lost, pickup, fraudulent, restricted) exists and is never presented twice.",
-          "operability": 0.96,
-          "debt": 4,
+          "status": "done",
+          "rounds": 4,
+          "note": "There is no merchant-side money at all. AIN records what the issuer said — charges, refunds, disputes, recovery — but has no balance, no settlement, no processing fees and no payouts anywhere in the API (I searched the whole OpenAPI document for balance/payout/fee/transfer/settle: the only hits are the *customer's* credit balance and credit settlements). So the one question a finance team asks of a payments product — \"how much cash actually reached our bank, on what date, net of fees, and which charges made up that deposit\" — cannot be answered here at all. Stripe's payments product is insepar",
+          "operability": 0.93,
+          "debt": 8,
           "verdict": "The money never lies here, but the recovery policy was harsher and narrower than Stripe’s: a 3DS card written off in a millisecond, a refunded bill owed by nobody, and no card-stolen family of declines."
         },
         {
@@ -172,10 +172,10 @@
         {
           "id": "revenue",
           "title": "Revenue reporting",
-          "status": "critique",
-          "rounds": 3,
-          "note": "Three P0s fixed: contract history is read from the event log so a schedule phase no longer rewrites closed months (Halstead’s April stays 9,900); credit notes reduce recognised and deferred from the day they are issued; usage \"charged\" is invoice money, not settlement-ledger money. A collection pause is a pause, not churn. Open: the module’s three copilot tools are not reachable from any template.",
-          "operability": 0.67,
+          "status": "done",
+          "rounds": 4,
+          "note": "Churn. It is the one number a revenue team is judged on, and it is both structurally under-reported and unconfigurable. Movement/churn are computed as a per-customer month-open vs month-close snapshot diff, so any customer whose whole life falls inside one calendar month contributes nothing to either new business or churn — I signed a $99/mo logo on 2026-09-07, cancelled it on 2026-09-17, and after September closed the report showed zero churned MRR, zero churned accounts and no trace of the account at all, while the cohort matrix in the same module reported that cohort at 66.67% month-0 logo ",
+          "operability": 0.85,
           "debt": 6,
           "verdict": "The arithmetic on today’s book is exact, but the history underneath it was not durable: one un-prorated plan change rewrote five closed months, credit notes never reached recognition, and usage \"charged\" was money no invoice carried."
         }
@@ -189,41 +189,41 @@
         {
           "id": "billing-screens",
           "title": "Subscriptions, customers & invoices",
-          "status": "critique",
-          "rounds": 3,
-          "operability": 0.97,
-          "debt": 7,
-          "note": "94 claimed, 91 drivable; every figure reconciled with the API and the proration preview equals the invoice raised. The critic’s biggest gap: financial writes fired from list menus with no confirmation. Every list and bulk entry now goes through the record page’s priced dialogs (cancel, pause, bill now, bulk bill, bulk void/pay/finalise); Total is what was billed, before the balance; menus offer only the actions an invoice’s state allows; ARR is the yearly fee, not twelve rounded twelfths.",
+          "status": "rework",
+          "rounds": 4,
+          "operability": 0.88,
+          "debt": 12,
+          "note": "The price book has no screen. Everything downstream of the catalogue — customers, subscriptions, invoices, payments, prorations, credit notes, dunning — is built to a genuinely high standard, and the money arithmetic held up under every hand-check I did. But you cannot see, create, or change a product or a price anywhere in the UI; the catalogue only ever appears as strings inside three dropdowns. The product knows it: the global search says \"These match, but no module on this workspace registers a screen for them yet\" and the result is a dead link. That means a business running on AIN can ope",
           "verdict": "Numbers are trustworthy end to end, but the billing surface let an operator cancel or bill from a list menu with no confirmation and cannot raise a one-off invoice — the last needs an invoice-items route the server does not have yet."
         },
         {
           "id": "crm-screens",
           "title": "Contacts, companies & record pages",
-          "status": "critique",
-          "rounds": 3,
-          "operability": 0.95,
-          "debt": 4,
-          "note": "96 claimed, 91 drivable, every figure checked matched the API. Activity records (notes, calls, emails, meetings, tasks) were rendered as if they were companies — the rail said “Not linked to anything yet” beside a timeline saying the opposite. They now show what they were logged on and offer nothing only a record can do; an unknown object slug gets the door to the data model; Esc cancels a picklist edit; a private view stays out of a teammate’s bar; tickets show time in status.",
+          "status": "rework",
+          "rounds": 4,
+          "operability": 0.93,
+          "debt": 12,
+          "note": "The saved-view lifecycle. Saved views are the spine of a CRM list screen, and AIN breaks at the exact moment a user creates one: it writes the view, then fires \"That view is not available — it was deleted, or a teammate kept it to themselves\", resets the URL and discards the filter the user just spent time building. The filter engine underneath it is genuinely better than most (nineteen operators, moving dates, nested groups and cross-association counts, all of which I verified return the right rows), which makes it worse that the one gesture that turns a filter into a durable, shareable artef",
           "verdict": "A genuinely operable CRM surface let down by a half-finished activity record page, an error state that dead-ends on a bad slug, and a privacy checkbox the platform ignores — the server still serves private views to every member."
         },
         {
           "id": "pipeline-copilot",
           "title": "Deals board & deal record",
-          "status": "critique",
-          "rounds": 5,
-          "operability": 1,
-          "debt": 2,
-          "note": "62 of 62 capabilities drivable; 19 of 19 stage rows, every tile, forecast cell and CSV equal the API before and after every write. Closed deals now wear their outcome (“Won Oct 21, 2025”, the reason) instead of a stage timer and a $0.00 chip; the lost-deals landing draws the lost column; table and toolbar sorts agree; a filtered all-pipelines board collapses pipelines with nothing to show.",
+          "status": "done",
+          "rounds": 6,
+          "operability": 0.89,
+          "debt": 4,
+          "note": "The copilot has no model behind it. /v1/ai/status reports provider \"builtin\", engine \"template\", anthropic \"available: false\" — so it answers exactly 100 declared question shapes and refuses everything else. Within those shapes it is excellent and its arithmetic is exact, but the three things a sales team actually opens a deal copilot for all refuse outright, which I reproduced: \"Summarise the ZPCP Bulk 1 deal and tell me what to do next\" → \"I can't answer that as asked\"; \"Why did we lose Ferro Norte Siderurgia?\" → refused; and there is no free-text reasoning over a record at all. Its write su",
           "verdict": "Fully operable and arithmetically airtight; the remaining debt was eight rough edges, led by closed deals still dressed as open ones. Two are the shell’s: the palette keeps its last query, and the crumb wraps at 1024."
         },
         {
           "id": "revenue-screens",
           "title": "Revenue, usage, credits & dunning",
-          "status": "critique",
-          "rounds": 2,
-          "note": "Every headline figure equals its API value across 45 and 90 simulated days and the movement identity holds every month. The credits burn-down card contradicted itself (covered $0.00 beside “88.56% charged”) and went stale after a pack sale; it now reads the settled split and every credit write invalidates one shared list. The retry-policy form no longer rewrites 0 to 1 and saves it as a success; billed periods open to what they were frozen at.",
-          "operability": 0.94,
-          "debt": 5,
+          "status": "rework",
+          "rounds": 3,
+          "note": "The board contradicts itself and then certifies that it doesn't. On one screen, at one instant, the headline says MRR is $52,364.66 across 25 accounts and the MRR movement block 300px lower closes the same month at $49,562.66 across 26 accounts — with a green \"Reconciled\" badge on that month and \"Every figure reconciles\" on the home widget. The reconciliation is real but narrow: it proves movement's computed closing equals movement's reported closing, both derived from the same walk-back, and never checks either against the live book the headline is read from. So the single feature this produc",
+          "operability": 0.87,
+          "debt": 11,
           "verdict": "A revenue surface whose every figure reconciles, let down by one credits card that contradicted itself and a policy form that saved a number the user did not type."
         }
       ]
@@ -288,11 +288,11 @@
         {
           "id": "settings",
           "title": "Settings & administration",
-          "status": "critique",
-          "rounds": 3,
-          "operability": 0.95,
-          "debt": 9,
-          "note": "100 of 105 drivable; the time machine and the API-key flow beat Stripe. The invite dialog promised a sign-in the platform cannot give — it now says exactly what happens; a failed read shows a dash, never a zero; Enter on a row menu opens the menu; Enter in a dialog field submits; a domain must be a hostname; the audit trail names a removed teammate; the roster lists the owner first.",
+          "status": "rework",
+          "rounds": 4,
+          "operability": 0.87,
+          "debt": 10,
+          "note": "There is no webhook surface at all. Every screen in this area leans on the event log as the thing integrations consume — the Events page is titled around it (\"Webhooks, workflow triggers, record timelines and the audit trail all read from it\"), the payload pane shows you \"exactly what a webhook would receive\", the API keys page explains how a machine authenticates — and then there is nowhere to register an endpoint, no signing secret, no delivery attempts, no failure queue, no replay. Across all 253 routes in the OpenAPI document there is not one webhook path. So the platform can emit beautifu",
           "verdict": "Inviting a teammate produces a person who can never sign in — the server has no invitation link, password or accept route. That is the next server change."
         },
         {
@@ -314,20 +314,20 @@
         {
           "id": "template-engine",
           "title": "The template whitelist engine",
-          "status": "critique",
-          "rounds": 3,
-          "note": "458 questions priced by a fresh critic against the database: one substitution class, not 28. \"How many tickets does Rheinwerk have?\" answered the open subset because \"(open|)\" was optional in two patterns. Fixed as a literal with three whole-count shapes; four P1s (truncated breakdowns, \"in the last quarter\", \"carries\", \"by industry\") fixed with corpus rows. Nine P2s open.",
-          "operability": 0.95,
-          "debt": 9,
+          "status": "rework",
+          "rounds": 4,
+          "note": "Coverage, and the fact that the coverage boundary is drawn by hand rather than by capability. On 30 unscripted questions a real HubSpot/Stripe user would type (\"What is our pipeline coverage this quarter?\", \"Which deals slipped their close date?\", \"Which subscriptions renew in the next 60 days?\", \"How much MRR churned last month?\" — only the last one landed) the engine answered 2. Every refusal was honest and offered three near-misses, which is genuinely better behaviour than a hallucinating copilot — but 2/30 is the practical hit rate, and the misses are not exotic: the engine already parses ",
+          "operability": 0.8,
+          "debt": 29,
           "verdict": "117 engine windows matched an independently resolved window, and \"last quarter\" moved after time travel. Zero period substitutions, zero cross-currency sums. The one P0 was a single optional word."
         },
         {
           "id": "copilot-templates",
           "title": "Copilot",
-          "status": "critique",
-          "rounds": 2,
-          "note": "81 of 82 drivable; every figure in every answer matched the API. A follow-up the copilot books is now called what it is — scheduled, not written — until the job lands; a Sources chip for an account billing never created is flat with the reason in its name; declines name who declined; stage previews use the board’s words; trace rows read as sentences; the tools tab speaks to a person.",
-          "operability": 0.99,
+          "status": "done",
+          "rounds": 3,
+          "note": "The copilot cannot answer anything outside a fixed whitelist of 100 question shapes, and it cannot carry context from one turn to the next. Those two together mean the only questions that work are the ones you could have expressed as a saved filter — \"How many deals are at the Negotiation stage?\", \"What is our MRR in EUR?\" — while everything a revenue leader actually opens a copilot for is refused: \"Which customers are most likely to churn next quarter?\", \"How did our closed-won bookings compare and why?\", \"And in EUR?\", \"Why?\", \"Show me the rest\". The chrome around the refusal is genuinely ex",
+          "operability": 0.85,
           "debt": 6,
           "verdict": "Honest answers, refusals and approval cards; it loses to Breeze only where a write it calls “written” leaves nothing findable on the record — the server should create a task — and in a dozen seams of formatting."
         },
@@ -486,6 +486,67 @@
           "operability": 1,
           "debt": 0,
           "note": "2,548 lines that once caught an engine which parsed a qualifier out of a question, failed to bind it, and stated the unqualified result as the answer. The engine is a template whitelist now — it binds every slot or refuses — so there is no unbound qualifier left to catch, and the answer card was rebuilt around that a wave ago. The suite said so itself, in a test whose comment read \"the unplugged machinery … kept as a library for the board's tests; nothing on the answer path calls it\", and which flagged a correct answer when run."
+        }
+      ]
+    },
+    {
+      "name": "Wave 13 · Judged against live software",
+      "status": "active",
+      "note": "Fourteen fresh critics drove the running product rather than reading the build's own account of itself, and every P0/P1 they raised went to an adversarial verifier told to refute it. Ten of fifty-nine agents' findings were refuted and dropped. What survived is below: the engines are strong and the seams between them were never built.",
+      "pieces": [
+        {
+          "id": "cross-module-story",
+          "title": "The modules were never made into one product",
+          "status": "rework",
+          "rounds": 1,
+          "operability": 0.65,
+          "debt": 30,
+          "note": "Billing does not read entitlements — grep finds zero references across billing, metering and credits — so the included allowance the catalogue sells and the Features screen displays is decorative. The flagship account is over-billed by about $7,400 in a single period, under a screen captioned \"never out of step with the bill\". Following one company across every surface, the engines each work and the seams do not: a company record with no path to its money, a $127,840 receivable no collections surface knows about."
+        },
+        {
+          "id": "identity",
+          "title": "One password, every workspace",
+          "status": "rework",
+          "rounds": 1,
+          "operability": 0.6,
+          "debt": 30,
+          "note": "Per-object isolation and RBAC are genuinely strong: no cross-tenant read or write, no role escalation, removal cascades revoke sessions and descendant keys. But identity is a single global user row, and the invitation-accept flow lets any workspace admin confirm a platform user by email, read their PII, and set that shared password — which is a login into every other workspace that user belongs to. Strong walls around each object do not matter if you can walk in as the owner."
+        },
+        {
+          "id": "nothing-leaves",
+          "title": "Nothing ever leaves the building",
+          "status": "rework",
+          "rounds": 1,
+          "operability": 0.5,
+          "debt": 20,
+          "note": "No email, webhook, PDF, hosted page or outbound anything — while the product says otherwise in shipped copy. Every draft invoice reads \"Finalise it to send it\"; finalising sends nothing. Dunning retries a card on days 3, 5 and 7 and never tells the payer. Settings → Events offers to show \"exactly what a webhook would receive\" over a feature with no endpoint, no delivery and no table. The AI writes a chase letter whose only button is Log."
+        },
+        {
+          "id": "no-discounts",
+          "title": "There is no discount, anywhere",
+          "status": "rework",
+          "rounds": 1,
+          "operability": 0.0,
+          "debt": 10,
+          "note": "No coupon, promotion code or discount exists in the server; the invoice has no discount line and the subscription no discount. The id prefixes are reserved and unbuilt. A shipped refusal message tells the operator to \"discount with a coupon\" — a feature that does not exist. Nothing downstream can express \"20% off year one\", which every negotiated contract in the demo's own pipeline would carry."
+        },
+        {
+          "id": "preview-vs-bill",
+          "title": "The estimate is not the bill",
+          "status": "rework",
+          "rounds": 1,
+          "operability": 0.9,
+          "debt": 3,
+          "note": "Everything that actually charges money reconciles to the cent — proration, tiering, credit burn, tax, credit notes, MRR — audited longhand against the product's own figures. But the upcoming-invoice preview is a second, poorer implementation that drops accrued metered usage and committed proration: $99.00 shown against $3,019.00 actually coming, on a usage-priced product where most subscriptions carry a metered item."
+        },
+        {
+          "id": "claims-unchecked",
+          "title": "Nothing checks that a claimed mechanism exists",
+          "status": "rework",
+          "rounds": 1,
+          "operability": 0.76,
+          "debt": 9,
+          "note": "2,384 tests, an in-process smoke of every GET route, a reconciliation that can genuinely fail, and static guards against a seventh status vocabulary — every one of them checks a value, a label or a vocabulary. Not one asks whether there is code behind a sentence the product says on screen. That is exactly why the architectural falsehoods survived while the numeric ones did not."
         }
       ]
     }
