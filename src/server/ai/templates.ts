@@ -552,7 +552,7 @@ const BREAKDOWNS: Record<string, string[]> = {
 function atStage(stage: { value: string; label: string; pipeline: string | null }, v: Vocabulary): string {
   const phrase = `at the ${stage.label} stage`;
   if (stage.pipeline) return phrase;
-  const carried: string[] = [];
+  const carried = v.crm.stages.find((term) => term.value === stage.value)?.pipelines ?? [];
   if (carried.length < 2) return phrase;
   // In the order the boards themselves are drawn in, not the order the stage
   // rows happened to come back in.

@@ -2285,7 +2285,10 @@ test('an answer reads as an answer, not as a console dump under one', async ({ p
   // caret that marks the reveal in progress is gone.
   await revealed(answer);
   // More than a single sentence: the breakdown is the answer, one bucket a line.
-  await expect(answer.locator('.cp-answer__body')).toContainText('Open pipeline by stage:');
+  // The head names the measure and the dimension; what follows the dash — the
+  // note that a stage two pipelines share gets a row each — is the breakdown's
+  // own business and is checked where that rule is checked.
+  await expect(answer.locator('.cp-answer__body')).toContainText('Open pipeline by stage');
 
   const body = answer.locator('.cp-answer__body');
   await expect(body).not.toContainText('also returned');

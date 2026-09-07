@@ -21,7 +21,7 @@ import {
   type AiRun, type AiUsageBucket, type RunDetail, type RunOutcome,
 } from './api';
 import { ApprovalQueue, CitationChips, ReasoningList, RunFacts, TraceSteps } from './trace';
-import { EngineIndicator, RefusalHelp, SlotChips } from './card';
+import { CarriedMeasure, EngineIndicator, RefusalHelp, SlotChips } from './card';
 import { filterTools, tagLabel, toolSummary } from './tools-core';
 import { dayStart, everyDay } from './usage-core';
 
@@ -866,6 +866,7 @@ export function RunDetailPage({ id }: { id: string }) {
         <div className="cp-answer__head" style={{ marginBottom: 'var(--space-4)' }}>
           <EngineIndicator line={card.indicator} />
         </div>
+        {card.carried && <CarriedMeasure carried={card.carried} />}
         <SlotChips slots={card.slots} />
         {showAnswer && (
           detail.answer
