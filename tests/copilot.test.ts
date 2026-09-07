@@ -25,9 +25,7 @@ register(
   import.meta.url,
 );
 
-import {
-  inventedFilters, isWiderName, reconcileScope, recordPhraseMismatch, type Vocabulary,
-} from '../src/client/modules/copilot/scope-core';
+import { isWiderName, recordPhraseMismatch, type Vocabulary } from '../src/client/modules/copilot/scope-core';
 import {
   nearestFromReasoning, noWritePrepared, propertyAsked, refusalOf, splitRefusalOffer, withoutApiInstruction, writeNeedsSwitch,
 } from '../src/client/modules/copilot/answer-core';
@@ -449,24 +447,6 @@ describe('the card, over a corpus of correct template answers', () => {
     assert.deepEqual(drew, []);
   });
 
-  it('is quiet where the reconciliation it replaced still cries wolf', () => {
-    // The unplugged machinery, run over the same corpus with the prose a
-    // template would write. It still reads the noun "customers" as the
-    // Customers measure and flags an invoice total as having never measured
-    // it — the false alarm the critic named. Kept as a library for the board's
-    // tests; nothing on the answer path calls it.
-    const PROSE: Record<string, string> = {
-      'What have our customers been invoiced in 2026?': 'Northwind Robotics invoiced its customers $3,812,400 in 2026.',
-    };
-    const wolf = RIGHT.filter((probe) => {
-      const input = { question: probe.question, prose: PROSE[probe.question] ?? '', toolCalls: [...probe.toolCalls], reasoning: ['Ran the plan.'], vocab: VOCAB, resolveId: () => null };
-      const report = reconcileScope(input);
-      const invented = inventedFilters({ question: probe.question, answering: report.answering, verdicts: report.verdicts, vocab: VOCAB });
-      return report.unscoped.length + invented.length > 0;
-    }).map((probe) => probe.question);
-    assert.deepEqual(wolf, ['What have our customers been invoiced in 2026?']);
-    assert.deepEqual(answerCard(turn(RIGHT[2])).banners, []);
-  });
 
   it('names the measure a bare follow-up carried, from the completion and from the notes alike', () => {
     const carried = { measure: 'Open pipeline', from: 'What is our open pipeline?' };
