@@ -557,7 +557,8 @@ describe('the retry policy form', () => {
 
 /* -------------------------------- a quiet meter's age --------------------- */
 
-import { daysAgoCopy, isUnitAbbreviation } from '../src/client/modules/revenue/meter-copy';
+import { isUnitAbbreviation } from '../src/client/modules/revenue/meter-copy';
+import { formatRelative } from '../src/client/design/format';
 
 describe('a unit’s own noun', () => {
   it('leaves a symbol uninflected — "43.68 GB", never "GBs" — and still pluralises a word', () => {
@@ -568,13 +569,21 @@ describe('a unit’s own noun', () => {
 
 describe('how long ago a quiet meter last streamed', () => {
   const now = Date.UTC(2026, 9, 20);
-  it('counts days between a week and a quarter, where "2 months ago" hides 46 from 75', () => {
-    assert.equal(daysAgoCopy(now - 46 * 86_400_000, now), '46 days ago');
-    assert.equal(daysAgoCopy(now - 75 * 86_400_000, now), '75 days ago');
+  it('counts days between a week and a quarter — the kit\u2019s own relative form, not a second one', () => {
+    // The module used to carry `daysAgoCopy` because `formatRelative` rounded
+    // to months from a week out and read "2 months ago" for both of these.
+    assert.equal(formatRelative(now - 46 * 86_400_000, now), '46 days ago');
+    assert.equal(formatRelative(now - 75 * 86_400_000, now), '75 days ago');
   });
-  it('defers to the ordinary relative form under a week and past a quarter', () => {
-    assert.equal(daysAgoCopy(now - 3 * 86_400_000, now), null);
-    assert.equal(daysAgoCopy(now - 120 * 86_400_000, now), null);
+  it('leaves the coarse form under a week and past a quarter', () => {
+    assert.equal(formatRelative(now - 3 * 86_400_000, now), '3 days ago');
+    assert.equal(formatRelative(now - 120 * 86_400_000, now), '4 months ago');
+  });
+  it('leaves no second copy of the rule in the module', () => {
+    const copy = readFileSync(new URL('../src/client/modules/revenue/meter-copy.ts', import.meta.url), 'utf8');
+    assert.doesNotMatch(copy, /daysAgoCopy/);
+    const usage = readFileSync(new URL('../src/client/modules/revenue/usage.tsx', import.meta.url), 'utf8');
+    assert.doesNotMatch(usage, /daysAgoCopy/);
   });
 });
 
