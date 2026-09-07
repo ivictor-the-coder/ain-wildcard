@@ -84,7 +84,7 @@ export function bindingOf(source: { template?: unknown; analysis?: unknown } | n
 }
 
 /** The binding as chips: one per slot the template filled. */
-export function slotChipsFromBinding(binding: TemplateBinding): SlotChip[] {
+function slotChipsFromBinding(binding: TemplateBinding): SlotChip[] {
   return Object.entries(binding.slots)
     .filter(([, value]) => value !== null && value !== '')
     .map(([name, value]) => ({ kind: name, label: humanizeName(name), value: String(value) }));

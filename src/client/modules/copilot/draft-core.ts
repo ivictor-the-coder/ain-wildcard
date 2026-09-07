@@ -116,7 +116,7 @@ const CODE_AFTER = new RegExp(`(${NUMBER})\\s?([A-Za-z]{3})(?![A-Za-z])`, 'g');
 const BARE_DECIMAL = /(?<![\d.,$€£¥A-Za-z])(\d[\d,]*\.\d{1,2})(?![\d.%A-Za-z])/g;
 
 /** The currency codes a letter may write a figure in and have it read as one. */
-export const booksReadable = (currencies: readonly string[]): Set<string> =>
+const booksReadable = (currencies: readonly string[]): Set<string> =>
   new Set([...Object.values(SYMBOL_BOOK), ...currencies.map((code) => code.toLowerCase())]);
 
 /**
@@ -152,7 +152,7 @@ export function figuresIn(text: string, currencies: readonly string[]): DraftFig
 }
 
 /** What a figure is worth in a given book, in minor units — or null when it does not parse. */
-export function amountIn(figure: Pick<DraftFigure, 'digits'>, currency: string): number | null {
+function amountIn(figure: Pick<DraftFigure, 'digits'>, currency: string): number | null {
   try { return parseMoney(figure.digits, currency).amount; } catch { return null; }
 }
 

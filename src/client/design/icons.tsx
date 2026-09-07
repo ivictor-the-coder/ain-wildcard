@@ -217,67 +217,23 @@ export const Icons = Object.fromEntries(ICON_NAMES.map((n) => [n, make(n)])) as 
 /** Look an icon up by name; unknown names fall back to a neutral dot. */
 export const iconByName = (name: string): IconComponent => Icons[name as IconName] ?? Icons.more;
 
-export const DashboardIcon = Icons.dashboard;
-export const ContactsIcon = Icons.contacts;
-export const CompaniesIcon = Icons.companies;
-export const BuildingIcon = Icons.building;
-export const DealsIcon = Icons.deals;
-export const InboxIcon = Icons.inbox;
-export const TicketsIcon = Icons.tickets;
-export const CampaignsIcon = Icons.campaigns;
-export const WorkflowsIcon = Icons.workflows;
-export const AgentsIcon = Icons.agents;
-export const SparklesIcon = Icons.sparkles;
-export const BotIcon = Icons.bot;
-export const BrainIcon = Icons.brain;
-export const InvoiceIcon = Icons.invoice;
+/**
+ * Named aliases, for the icons something imports by name.
+ *
+ * `Icons` above is the catalogue and every icon is in it, so an alias buys
+ * nothing but a second way to say the same thing. There were 138 of them and
+ * 25 were imported anywhere; the other 113 made the kit look larger than it is
+ * and gave a reader a third spelling to choose between. An icon that needs a
+ * name here can have one — `export const FooIcon = Icons.foo;` — and an icon
+ * used once is `Icons.foo` at the call site.
+ */
+
 export const CreditCardIcon = Icons['credit-card'];
-export const ReceiptIcon = Icons.receipt;
-export const CoinsIcon = Icons.coins;
-export const WalletIcon = Icons.wallet;
-export const PercentIcon = Icons.percent;
-export const GaugeIcon = Icons.gauge;
-export const TargetIcon = Icons.target;
-export const ChartLineIcon = Icons['chart-line'];
-export const ChartBarIcon = Icons['chart-bar'];
-export const ChartAreaIcon = Icons['chart-area'];
-export const ChartPieIcon = Icons['chart-pie'];
-export const TrendingUpIcon = Icons['trending-up'];
-export const TrendingDownIcon = Icons['trending-down'];
-export const ActivityIcon = Icons.activity;
-export const FunnelIcon = Icons.funnel;
-export const LayersIcon = Icons.layers;
-export const SearchIcon = Icons.search;
-export const FilterIcon = Icons.filter;
 export const FilterXIcon = Icons['filter-x'];
-export const SlidersIcon = Icons.sliders;
-export const PlusIcon = Icons.plus;
-export const PlusCircleIcon = Icons['plus-circle'];
-export const MinusIcon = Icons.minus;
-export const CheckIcon = Icons.check;
 export const CheckCircleIcon = Icons['check-circle'];
-export const CheckDoubleIcon = Icons['check-double'];
 export const XIcon = Icons.x;
 export const XCircleIcon = Icons['x-circle'];
-export const EditIcon = Icons.edit;
-export const TrashIcon = Icons.trash;
-export const CopyIcon = Icons.copy;
-export const ClipboardIcon = Icons.clipboard;
-export const DownloadIcon = Icons.download;
-export const UploadIcon = Icons.upload;
-export const SendIcon = Icons.send;
-export const RefreshIcon = Icons.refresh;
 export const RotateCcwIcon = Icons['rotate-ccw'];
-export const RepeatIcon = Icons.repeat;
-export const PlayIcon = Icons.play;
-export const PauseIcon = Icons.pause;
-export const ShareIcon = Icons.share;
-export const LinkIcon = Icons.link;
-export const ExternalIcon = Icons.external;
-export const PaperclipIcon = Icons.paperclip;
-export const PinIcon = Icons.pin;
-export const PrintIcon = Icons.print;
-export const WandIcon = Icons.wand;
 export const ChevronUpIcon = Icons['chevron-up'];
 export const ChevronDownIcon = Icons['chevron-down'];
 export const ChevronLeftIcon = Icons['chevron-left'];
@@ -290,68 +246,10 @@ export const ArrowDownIcon = Icons['arrow-down'];
 export const ArrowLeftIcon = Icons['arrow-left'];
 export const ArrowRightIcon = Icons['arrow-right'];
 export const ArrowUpRightIcon = Icons['arrow-up-right'];
-export const ArrowDownRightIcon = Icons['arrow-down-right'];
-export const CornerDownRightIcon = Icons['corner-down-right'];
 export const GitBranchIcon = Icons['git-branch'];
-export const CalendarIcon = Icons.calendar;
-export const CalendarCheckIcon = Icons['calendar-check'];
-export const ClockIcon = Icons.clock;
-export const MailIcon = Icons.mail;
-export const PhoneIcon = Icons.phone;
 export const MessageSquareIcon = Icons['message-square'];
-export const MessageCircleIcon = Icons['message-circle'];
-export const NoteIcon = Icons.note;
-export const FileTextIcon = Icons['file-text'];
-export const FolderIcon = Icons.folder;
-export const BookIcon = Icons.book;
-export const CodeIcon = Icons.code;
-export const TerminalIcon = Icons.terminal;
-export const DatabaseIcon = Icons.database;
-export const ServerIcon = Icons.server;
-export const GlobeIcon = Icons.globe;
-export const MapPinIcon = Icons['map-pin'];
-export const TagIcon = Icons.tag;
-export const BriefcaseIcon = Icons.briefcase;
-export const GiftIcon = Icons.gift;
-export const StarIcon = Icons.star;
-export const BookmarkIcon = Icons.bookmark;
-export const FlagIcon = Icons.flag;
-export const ZapIcon = Icons.zap;
-export const CpuIcon = Icons.cpu;
-export const KeyIcon = Icons.key;
-export const LockIcon = Icons.lock;
-export const ShieldIcon = Icons.shield;
-export const EyeIcon = Icons.eye;
 export const EyeOffIcon = Icons['eye-off'];
-export const BellIcon = Icons.bell;
-export const UserIcon = Icons.user;
-export const UsersIcon = Icons.users;
-export const LogoutIcon = Icons.logout;
-export const LoginIcon = Icons.login;
-export const SettingsIcon = Icons.settings;
-export const CommandIcon = Icons.command;
-export const MenuIcon = Icons.menu;
-export const ListIcon = Icons.list;
-export const GridIcon = Icons.grid;
-export const ColumnsIcon = Icons.columns;
-export const TableIcon = Icons.table;
-export const GripIcon = Icons.grip;
-export const MoreIcon = Icons.more;
-export const MoreVerticalIcon = Icons['more-vertical'];
-export const SortAscIcon = Icons['sort-asc'];
 export const SortDescIcon = Icons['sort-desc'];
-export const MaximizeIcon = Icons.maximize;
-export const MinimizeIcon = Icons.minimize;
-export const SunIcon = Icons.sun;
-export const MoonIcon = Icons.moon;
-export const SmileIcon = Icons.smile;
-export const ThumbsUpIcon = Icons['thumbs-up'];
 export const AlertTriangleIcon = Icons['alert-triangle'];
 export const AlertCircleIcon = Icons['alert-circle'];
-export const AlertOctagonIcon = Icons['alert-octagon'];
-export const InfoIcon = Icons.info;
-export const HelpIcon = Icons.help;
-export const HashIcon = Icons.hash;
 export const AtSignIcon = Icons['at-sign'];
-export const HomeIcon = Icons.home;
-export const BoltIcon = Icons.bolt;

@@ -28,13 +28,6 @@ export function normalise(input: string): string {
     .trim();
 }
 
-/** Like `normalise` but keeps `@`, `.` and `_` so emails, domains and ids survive. */
-export function normaliseLoose(input: string): string {
-  return foldAccents(String(input).toLowerCase())
-    .replace(/[^a-z0-9@._+-]+/g, ' ')
-    .trim();
-}
-
 export const words = (input: string): string[] => normalise(input).split(' ').filter(Boolean);
 
 /**
@@ -162,9 +155,6 @@ export function jaccard(a: Set<string>, b: Set<string>): number {
   return shared / (a.size + b.size - shared);
 }
 
-/** Trigram Dice coefficient between two raw strings. */
-export const trigramSimilarity = (a: string, b: string): number => dice(trigrams(a), trigrams(b));
-
 /** Bounded Levenshtein — returns `max + 1` as soon as it is certain to exceed. */
 export function levenshtein(a: string, b: string, max = 8): number {
   if (a === b) return 0;
@@ -228,18 +218,6 @@ export function stem(word: string): string {
 
 export const stems = (input: string): Set<string> => new Set(contentWords(input).map(stem));
 
-/** Overlap of stemmed content words, normalised by the shorter side. */
-export function tokenOverlap(a: string, b: string): number {
-  const x = stems(a);
-  const y = stems(b);
-  if (!x.size || !y.size) return 0;
-  let shared = 0;
-  for (const t of x) if (y.has(t)) shared++;
-  return shared / Math.min(x.size, y.size);
-}
-
-/* ------------------------------ prose helpers ---------------------------- */
-
 export function truncate(input: string, max: number): string {
   const s = String(input).trim();
   if (s.length <= max) return s;
@@ -283,10 +261,6 @@ export function listPhrase(items: string[], conjunction = 'and'): string {
   if (parts.length === 1) return parts[0];
   if (parts.length === 2) return `${parts[0]} ${conjunction} ${parts[1]}`;
   return `${parts.slice(0, -1).join(', ')} ${conjunction} ${parts[parts.length - 1]}`;
-}
-
-export function sentenceJoin(parts: string[]): string {
-  return parts.map((p) => p.trim()).filter(Boolean).map((p) => (/[.!?]$/.test(p) ? p : `${p}.`)).join(' ');
 }
 
 /**
@@ -335,17 +309,10 @@ export function formatPercent(value: number, digits = 1): string {
   return `${rounded > 0 ? '' : ''}${rounded}%`;
 }
 
-export function formatSignedPercent(value: number, digits = 1): string {
-  const rounded = Number(value.toFixed(digits));
-  return `${rounded > 0 ? '+' : ''}${rounded}%`;
-}
-
 export const EMAIL_PATTERN = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
 export const DOMAIN_PATTERN = /\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:com|io|net|org|co|ai|dev|de|fr|jp|kr|cn|br|nl|se|it|es|pl|tr|in)\b/gi;
 export const ID_PATTERN = /\b[a-z][a-z_]{1,12}_[A-Za-z0-9]{6,40}\b/g;
 export const QUOTED_PATTERN = /["“”']([^"“”']{2,80})["“”']/g;
-export const MONEY_PATTERN = /(?:[$€£¥])\s?([0-9][0-9,.]*)\s?([kmb]|thousand|million|billion)?/gi;
-
 /** Contiguous runs of Capitalised words — how people name accounts in prose. */
 export function properNounSpans(text: string): string[] {
   const out: string[] = [];

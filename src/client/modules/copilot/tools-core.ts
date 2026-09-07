@@ -9,7 +9,7 @@
 /** One row of `GET /v1/ai/tools`, as much of it as the catalogue reads. */
 export interface ToolRow { name: string; description: string; read_only: boolean; tags: string[] }
 
-export const humanToolName = (tool: string): string => {
+const humanToolName = (tool: string): string => {
   const words = tool.replace(/_/g, ' ');
   return words.charAt(0).toUpperCase() + words.slice(1);
 };
