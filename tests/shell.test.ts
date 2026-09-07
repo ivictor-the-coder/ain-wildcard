@@ -764,8 +764,25 @@ describe('the top bar at 1024px', () => {
 describe('no two things on the home screen carry the same label', () => {
   const modules = join(process.cwd(), 'src', 'client', 'modules');
 
-  const labelsIn = (source: string): string[] =>
-    [...source.matchAll(/label="([^"{}]+)"/g)].map(([, label]) => label);
+  /**
+   * Both spellings a label is written in: `label="…"`, and the string
+   * literals inside `label={…}`. Reading only the first is how the guard
+   * passed over the very tile it was written for — the fix made home's label
+   * a conditional expression, and the pattern stopped seeing it.
+   *
+   * A template literal contributes its fixed part: `Monthly recurring revenue
+   * · ${book}` is still, to a reader scanning the screen, the same headline as
+   * `Monthly recurring revenue`.
+   */
+  const labelsIn = (source: string): string[] => {
+    const out = [...source.matchAll(/label="([^"{}]+)"/g)].map(([, label]) => label);
+    for (const [, expr] of source.matchAll(/label=\{((?:[^{}]|\{[^{}]*\})*)\}/g)) {
+      for (const [, single] of expr.matchAll(/'([^'\\]+)'/g)) out.push(single);
+      for (const [, double] of expr.matchAll(/"([^"\\]+)"/g)) out.push(double);
+      for (const [, tpl] of expr.matchAll(/`([^`]*)`/g)) out.push(tpl.split('${')[0]);
+    }
+    return out.map((label) => label.replace(/[\s·|,\-–—:]+$/, '').trim()).filter((label) => label.length > 5);
+  };
 
   /**
    * Only the components a module actually publishes as widgets. Scanning the
@@ -794,11 +811,17 @@ describe('no two things on the home screen carry the same label', () => {
       .filter((file) => statSync(file, { throwIfNoEntry: false })?.isFile()
         && /export const widgets/.test(readFileSync(file, 'utf8')));
 
-    const mine = new Set(labelsIn(readFileSync(home, 'utf8')));
+    // Containment, not equality. Qualifying one of two identical labels does
+    // not separate them: "Monthly recurring revenue · USD" beside "Monthly
+    // recurring revenue" still reads as one headline printed twice, and a
+    // Playwright `hasText` still matches both.
+    const mine = labelsIn(readFileSync(home, 'utf8')).map((label) => label.toLowerCase());
     const clashes: string[] = [];
     for (const file of publishers) {
       for (const label of widgetLabelsIn(file)) {
-        if (mine.has(label)) clashes.push(`${label} — home and ${file.replace(`${modules}/`, '')}`);
+        const theirs = label.toLowerCase();
+        const clash = mine.find((ours) => ours.includes(theirs) || theirs.includes(ours));
+        if (clash) clashes.push(`${label} — home and ${file.replace(`${modules}/`, '')}`);
       }
     }
     assert.deepEqual(clashes, [],

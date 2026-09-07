@@ -2349,6 +2349,40 @@ describe('a top-up charges first and grants second', () => {
     assert.equal(settlement.charged_amount, 10_000);
   });
 
+  /**
+   * The overview read 500 grants and counted what came back, so the 501st was
+   * money the workspace held and the screen did not report — a total that is
+   * wrong while looking exactly like one that is right. Nothing said a figure
+   * had been cut short, which is what made it worth a test rather than a note.
+   */
+  test('the overview counts every grant in the book, not the first page of them', async () => {
+    const isolated = await createApp({ db: 'memory', clock: frozenClock(T0), config: { env: 'test' } });
+    try {
+      const before = await expectOk('GET', '/v1/credits/overview', undefined, isolated);
+      const beforeUsd = before.outstanding.find((row: { currency: string }) => row.currency === 'usd');
+
+      const customer = nextName('cus');
+      const made = 501;
+      for (let i = 0; i < made; i += 1) {
+        await expectOk('POST', '/v1/credit-grants', {
+          customer, kind: 'monetary', currency: 'usd', amount: 100, category: 'promotional', name: `Page probe ${i}`,
+        }, isolated);
+      }
+
+      const after = await expectOk('GET', '/v1/credits/overview', undefined, isolated);
+      assert.equal(after.grants.total, before.grants.total + made, 'every grant is counted');
+      assert.equal(after.grants.active, before.grants.active + made);
+      const afterUsd = after.outstanding.find((row: { currency: string }) => row.currency === 'usd');
+      assert.equal(
+        afterUsd.monetary_outstanding,
+        (beforeUsd?.monetary_outstanding ?? 0) + made * 100,
+        'and every one of them is in the outstanding balance',
+      );
+    } finally {
+      isolated.close();
+    }
+  });
+
   test('the overview ages the unbilled purchase so it can be alerted on', async () => {
     const isolated = await createApp({ db: 'memory', clock: frozenClock(T0), config: { env: 'test' } });
     try {

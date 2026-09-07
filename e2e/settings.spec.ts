@@ -12,6 +12,7 @@
  */
 import { readFile } from 'node:fs/promises';
 import { test, expect, type Page } from '@playwright/test';
+import { getJson, past429, postJson } from './api';
 
 const signIn = async (page: Page) => {
   await page.goto('/', { waitUntil: 'networkidle' });
@@ -20,18 +21,9 @@ const signIn = async (page: Page) => {
   await page.waitForSelector('.ain-stat');
 };
 
-/**
- * A read, retried past a rate limit. The suite makes a few hundred API reads in
- * one session and the platform's limiter answers 429 to the tail of them; a
- * test that reads `undefined` off one is a flake, not a finding.
- */
-const json = async (page: Page, path: string): Promise<any> => { // eslint-disable-line @typescript-eslint/no-explicit-any
-  for (let attempt = 0; ; attempt++) {
-    const res = await page.request.get(`/api${path}`);
-    if (res.ok() || attempt === 3) return res.json();
-    await new Promise((resolve) => setTimeout(resolve, 1200 * (attempt + 1)));
-  }
-};
+/** A read, retried past the limiter — and a refusal reported where it happened. */
+const json = async (page: Page, path: string): Promise<any> => // eslint-disable-line @typescript-eslint/no-explicit-any
+  getJson(page.request, `/api${path}`);
 
 /** Open a settings screen and wait for its own heading rather than the shell's. */
 const openSettings = async (page: Page, path: string, heading: string) => {
@@ -1233,14 +1225,13 @@ test('the trail names a removed teammate, and their link lands on a roster that 
   // rather than the page's, because `POST /v1/auth/accept` answers with a
   // session cookie and that would sign the browser in as the new teammate.
   const email = `e2e.gone.${stamp()}@northwind.io`;
-  const seating = await page.request.post('/api/v1/users', { data: { email, name: 'E2E Departed', role: 'analyst' } });
-  const created = await seating.json();
-  expect(created.id, `the seat was created — ${seating.status()} ${JSON.stringify(created)}`).toBeTruthy();
+  const created: any = await postJson(page.request, '/api/v1/users', { email, name: 'E2E Departed', role: 'analyst' }); // eslint-disable-line @typescript-eslint/no-explicit-any
+  expect(created.id, 'the seat was created').toBeTruthy();
   expect(created.invitation?.token, 'the seat came with a one-time invitation token').toBeTruthy();
-  expect((await request.post('/api/v1/auth/accept', {
+  expect((await past429(() => request.post('/api/v1/auth/accept', {
     data: { token: created.invitation.token, password: 'demo1234' },
-  })).status()).toBe(200);
-  expect((await page.request.delete(`/api/v1/users/${created.id}`)).status()).toBe(204);
+  }))).status()).toBe(200);
+  expect((await past429(() => page.request.delete(`/api/v1/users/${created.id}`))).status()).toBe(204);
 
   // The width the critic read "Workspace setti…" at.
   await page.setViewportSize({ width: 1440, height: 960 });

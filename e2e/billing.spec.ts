@@ -11,6 +11,7 @@
  *   AIN_BASE_URL=http://127.0.0.1:8851 npx playwright test e2e/billing.spec.ts
  */
 import { test, expect, type Page } from '@playwright/test';
+import { getJson, postJson } from './api';
 
 const signIn = async (page: Page) => {
   await page.goto('/', { waitUntil: 'networkidle' });
@@ -19,20 +20,9 @@ const signIn = async (page: Page) => {
   await page.waitForSelector('.ain-stat');
 };
 
-/**
- * A read, retried once past a rate limit.
- *
- * The suite makes a few hundred API reads in one session and the platform's
- * limiter answers 429 to the tail of them. A 429 is the right answer; a test
- * that reads `undefined.data` off one is a flake, not a finding.
- */
-const json = async (page: Page, path: string): Promise<any> => { // eslint-disable-line @typescript-eslint/no-explicit-any
-  for (let attempt = 0; ; attempt++) {
-    const res = await page.request.get(`/api${path}`);
-    if (res.ok() || attempt === 3) return res.json();
-    await new Promise((resolve) => setTimeout(resolve, 1200 * (attempt + 1)));
-  }
-};
+/** A read, retried past the limiter — and a refusal reported where it happened. */
+const json = async (page: Page, path: string): Promise<any> => // eslint-disable-line @typescript-eslint/no-explicit-any
+  getJson(page.request, `/api${path}`);
 
 /**
  * A fixture written through the API, past the same limiter.
@@ -43,14 +33,8 @@ const json = async (page: Page, path: string): Promise<any> => { // eslint-disab
  * fixture are retried the way reads are, and a write that is still refused
  * says so here rather than a screen away.
  */
-const post = async (page: Page, path: string, data: unknown): Promise<any> => { // eslint-disable-line @typescript-eslint/no-explicit-any
-  for (let attempt = 0; ; attempt++) {
-    const res = await page.request.post(`/api${path}`, { data });
-    if (res.ok()) return res.json();
-    if (attempt === 3) throw new Error(`POST ${path} → ${res.status()} ${await res.text()}`);
-    await new Promise((resolve) => setTimeout(resolve, 1200 * (attempt + 1)));
-  }
-};
+const post = async (page: Page, path: string, data: unknown): Promise<any> => // eslint-disable-line @typescript-eslint/no-explicit-any
+  postJson(page.request, `/api${path}`, data);
 
 /** The "nothing was presented" option in the payment dialog, worded once. */
 const BY_HAND_LABEL = 'Recorded by hand — nothing is presented';

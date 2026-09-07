@@ -32,7 +32,7 @@ import {
   unitsWorthBurning, type Candidate,
 } from './burn';
 import {
-  ALL_CHARGES, type Applicability, type BalanceBucket, type BillableItem, type BillableItemKind,
+  ALL_CHARGES, GRANT_STATUSES, type Applicability, type BalanceBucket, type BillableItem, type BillableItemKind,
   type BillableItemStatus, type ChargeTarget, type CreditApplication, type CreditBalance,
   type CreditGrant, type CreditKind, type GrantInput, type GrantStatus, type LedgerEntry,
   type LedgerEntryType, type Settlement, type SettlementDrift, type SettlementResult,
@@ -152,6 +152,30 @@ const GRANT_STATE_SQL = `
   LEFT JOIN credit_billable_items p
          ON g.source = 'topup' AND p.id = g.source_ref AND p.org_id = g.org_id`;
 
+/** One page of the grant walk. Big enough that most workspaces need one. */
+const GRANT_PAGE = 500;
+/** "Expiring soon" on the overview: a week, the window the screen names. */
+const SOON = 7 * DAY;
+/** One page of the outbox drain. `billableItems` will not answer with more. */
+const ITEM_PAGE = 500;
+
+/** The pending outbox, folded — see `pendingItemTotals`. */
+export interface PendingItemTotals {
+  count: number;
+  billed_total: number;
+  credit_applied_total: number;
+  oldest_at: number | null;
+}
+
+/** Every grant in the workspace, folded — see `grantTotals`. */
+export interface GrantTotals {
+  total: number;
+  counts: Record<GrantStatus, number>;
+  outstanding: { currency: string; monetary_outstanding: number; unit_pots: number }[];
+  /** Active grants with an expiry inside the week, soonest first. */
+  expiring_soon: CreditGrant[];
+}
+
 export interface GrantListFilter {
   customer?: string;
   status?: GrantStatus;
@@ -211,6 +235,56 @@ export class Credits {
     const now = this.ctx.now();
     const grants = rows.map((row) => this.hydrateGrant(row, now, orgId));
     return filter.status ? grants.filter((g) => g.status === filter.status) : grants;
+  }
+
+  /**
+   * Every grant the workspace holds, folded — never a page of them.
+   *
+   * The overview used to read 500 grants and count what came back, so a
+   * workspace holding more than that reported fewer grants and a smaller
+   * outstanding balance than it owed, with nothing on the screen saying a
+   * figure had been cut short. A wrong money total that looks like a right one
+   * is the worst kind.
+   *
+   * Status is derived per grant — from its balance, its expiry, a void, a
+   * top-up still unbilled — so the fold hydrates each row rather than
+   * re-deriving the rule in SQL: one place decides what "active" means. The
+   * walk is keyed on the primary key, so a grant written while it runs is seen
+   * once or not at all, never twice.
+   */
+  grantTotals(orgId: string): GrantTotals {
+    const now = this.ctx.now();
+    const counts = Object.fromEntries(GRANT_STATUSES.map((status) => [status, 0])) as Record<GrantStatus, number>;
+    const byCurrency = new Map<string, { currency: string; monetary_outstanding: number; unit_pots: number }>();
+    const expiringSoon: CreditGrant[] = [];
+    let total = 0;
+    let after = '';
+    for (;;) {
+      const rows = this.ctx.db.all<GrantState>(
+        `${GRANT_STATE_SQL} WHERE g.org_id = ? AND g.id > ? GROUP BY g.id ORDER BY g.id ASC LIMIT ?`,
+        orgId, after, GRANT_PAGE,
+      );
+      if (!rows.length) break;
+      for (const row of rows) {
+        const grant = this.hydrateGrant(row, now, orgId);
+        total += 1;
+        counts[grant.status] += 1;
+        if (grant.status !== 'active') continue;
+        const bucket = byCurrency.get(grant.currency)
+          ?? { currency: grant.currency, monetary_outstanding: 0, unit_pots: 0 };
+        if (grant.kind === 'monetary') bucket.monetary_outstanding += grant.balance; else bucket.unit_pots += 1;
+        byCurrency.set(grant.currency, bucket);
+        if (grant.expires_at !== null && grant.expires_at <= now + SOON) expiringSoon.push(grant);
+      }
+      after = String(rows[rows.length - 1].id);
+      if (rows.length < GRANT_PAGE) break;
+    }
+    return {
+      total,
+      counts,
+      outstanding: [...byCurrency.values()].sort((a, b) => a.currency.localeCompare(b.currency)),
+      expiring_soon: expiringSoon.sort((a, b) => (a.expires_at ?? 0) - (b.expires_at ?? 0)),
+    };
   }
 
   grant(orgId: string, id: string): CreditGrant | null {
@@ -1737,6 +1811,32 @@ export class Credits {
   }
 
   /**
+   * The pending outbox, folded — the same rule as `grantTotals`, on the lines
+   * rather than the grants. A count taken from a page of 500 stops at 500 and
+   * says so nowhere, and this one is read as "how far behind is invoicing",
+   * which is precisely the question a capped answer gets wrong.
+   *
+   * These figures are stored columns, not derived, so the database does the
+   * arithmetic and no page size enters into it.
+   */
+  pendingItemTotals(orgId: string): PendingItemTotals {
+    const row = this.ctx.db.get<{ count: number; billed: number; applied: number; oldest: number | null }>(
+      `SELECT COUNT(*) AS count,
+              COALESCE(SUM(billed_amount), 0) AS billed,
+              COALESCE(SUM(credit_applied), 0) AS applied,
+              MIN(created) AS oldest
+         FROM credit_billable_items WHERE org_id = ? AND status = 'pending'`,
+      orgId,
+    );
+    return {
+      count: Number(row?.count ?? 0),
+      billed_total: Number(row?.billed ?? 0),
+      credit_applied_total: Number(row?.applied ?? 0),
+      oldest_at: row?.oldest == null ? null : Number(row.oldest),
+    };
+  }
+
+  /**
    * Everything this customer's credits owe an invoice, claimed in one go.
    *
    * This is what an invoice being drawn should trigger, and the credits module
@@ -1745,9 +1845,18 @@ export class Credits {
    */
   drainOutbox(orgId: string, customerId: string, invoiceId: string): BillableItem[] {
     return this.ctx.atomic(() => {
-      const pending = this.billableItems(orgId, { customer: customerId, status: 'pending', limit: 500 });
-      if (!pending.length) return [];
-      return this.markInvoiced(orgId, pending.map((item) => item.id), invoiceId);
+      // Until it is empty. One read claimed a page and left the rest for the
+      // next invoice, so a customer with more waiting lines than a page holds
+      // was billed for some of what they owed and not the remainder — money
+      // quietly deferred by a number nobody chose for that reason.
+      const claimed: BillableItem[] = [];
+      for (;;) {
+        const pending = this.billableItems(orgId, { customer: customerId, status: 'pending', limit: ITEM_PAGE });
+        if (!pending.length) break;
+        claimed.push(...this.markInvoiced(orgId, pending.map((item) => item.id), invoiceId));
+        if (pending.length < ITEM_PAGE) break;
+      }
+      return claimed;
     });
   }
 

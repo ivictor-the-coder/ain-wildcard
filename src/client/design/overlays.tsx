@@ -56,6 +56,57 @@ function isTopLayer(el: HTMLElement | null): boolean {
   return hosts.length === 0 || hosts[hosts.length - 1].contains(el);
 }
 
+/**
+ * Escape closes the topmost overlay.
+ *
+ * Bound in both phases, because one is not enough. React attaches its
+ * listeners at the root container, a descendant of `document`, so a
+ * bubble-phase listener here runs *after* every React `onKeyDown` on the path
+ * up from the focused element — and after any of them calls `stopPropagation`
+ * it never runs at all. Focus arrives in a freshly opened overlay a frame
+ * late, and in that frame the keystroke still belongs to whatever was focused
+ * before: opening the calendar on an inline row and pressing Escape straight
+ * away threw the whole edit away instead of closing the calendar. On a fast
+ * machine the frame was usually won; on a loaded CI runner it was not, which
+ * is the shape of a race and not of a flake.
+ *
+ * So a keystroke from *outside* the overlay is claimed in capture, before
+ * anything else sees it. One from inside is left to bubble: a search field
+ * clearing itself, a combobox closing its list, a calendar folding back to its
+ * trigger — those are the field's Escape, not this layer's, and they get first
+ * refusal exactly as before. An overlay that never takes focus (`autoFocus`
+ * off — the picklist's own list) claims nothing from outside, because outside
+ * is where its reader still is.
+ */
+function useEscapeToClose(
+  active: boolean,
+  ref: RefObject<HTMLElement | null>,
+  onClose: () => void,
+  claimsFromOutside = true,
+): void {
+  useEffect(() => {
+    if (!active) return;
+    const claim = (e: KeyboardEvent, fromOutside: boolean) => {
+      if (e.key !== 'Escape') return;
+      const el = ref.current;
+      // Only the topmost overlay reacts, so Escape peels one layer at a time.
+      if (!isTopLayer(el)) return;
+      const inside = !!el && e.target instanceof Node && el.contains(e.target);
+      if (fromOutside === inside) return;
+      e.stopPropagation();
+      onClose();
+    };
+    const onCapture = (e: KeyboardEvent) => { if (claimsFromOutside) claim(e, true); };
+    const onBubble = (e: KeyboardEvent) => claim(e, false);
+    document.addEventListener('keydown', onCapture, true);
+    document.addEventListener('keydown', onBubble);
+    return () => {
+      document.removeEventListener('keydown', onCapture, true);
+      document.removeEventListener('keydown', onBubble);
+    };
+  }, [active, ref, onClose, claimsFromOutside]);
+}
+
 function useLayer(active: boolean, base = 600): number {
   const [depth, setDepth] = useState(0);
   useEffect(() => {
@@ -104,18 +155,7 @@ export function Modal({
   useScrollLock(open);
   useFocusTrap(dialogRef, open, { initialFocus });
 
-  useEffect(() => {
-    if (!open || !dismissable) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      // Only the topmost overlay reacts, so Esc peels one layer at a time.
-      if (!isTopLayer(dialogRef.current)) return;
-      e.stopPropagation();
-      onClose();
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [open, dismissable, onClose]);
+  useEscapeToClose(open && dismissable, dialogRef, onClose);
 
   if (!open) return null;
 
@@ -251,12 +291,7 @@ export function Drawer({
   useScrollLock(open);
   useFocusTrap(ref, open);
 
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.stopPropagation(); onClose(); } };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [open, onClose]);
+  useEscapeToClose(open, ref, onClose);
 
   if (!open) return null;
 
@@ -396,18 +431,7 @@ export function Popover({
     return () => observer.disconnect();
   }, [open, reposition]);
 
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      // A submenu raised from this popover is the layer Escape belongs to;
-      // it closes, this one stays, and focus lands back on the row that opened it.
-      if (e.key !== 'Escape' || !isTopLayer(ref.current)) return;
-      e.stopPropagation();
-      onClose();
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [open, onClose]);
+  useEscapeToClose(open, ref, onClose, autoFocus);
 
   if (!open) return null;
 

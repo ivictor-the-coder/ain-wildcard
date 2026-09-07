@@ -11,6 +11,7 @@
  *   AIN_BASE_URL=http://127.0.0.1:8854 npx playwright test e2e/pipeline.spec.ts
  */
 import { test, expect, type APIRequestContext, type Page } from '@playwright/test';
+import { getJson, postJson } from './api';
 
 interface DealRecord {
   id: string;
@@ -35,42 +36,6 @@ const signIn = async (page: Page, request: APIRequestContext) => {
   await request.post('/api/v1/auth/demo');
   await page.goto('/', { waitUntil: 'domcontentloaded' });
   await page.request.post('/api/v1/auth/demo');
-};
-
-/**
- * Read JSON from the API, once the API is willing to answer.
- *
- * Every assertion below checks the server rather than the screen, so a refused
- * read is not a failing product — it is a failing question. The platform's
- * per-principal rate limiter is 600 requests a real minute and a 69-test suite
- * in one worker runs close to it, which used to surface as `undefined.find` and
- * "expected 5, received 0" on whichever test was unlucky. Asking again after a
- * moment is what the retry-after header is for.
- */
-const getJson = async <T = unknown>(request: APIRequestContext, url: string): Promise<T> => {
-  for (let attempt = 0; ; attempt += 1) {
-    const response = await request.get(url);
-    if (response.ok()) return (await response.json()) as T;
-    if (attempt >= 3) throw new Error(`${response.status()} ${url}: ${await response.text()}`);
-    await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)));
-  }
-};
-
-/** The same, for the writes and searches a test sets itself up with. */
-const postJson = async <T = unknown>(
-  request: APIRequestContext, url: string, data: unknown,
-): Promise<T> => {
-  for (let attempt = 0; ; attempt += 1) {
-    const response = await request.post(url, { data });
-    if (response.ok()) return (await response.json()) as T;
-    // Only a rate limit is worth repeating: a POST that failed for any other
-    // reason may well have written something, and asking twice would write it
-    // twice.
-    if (attempt >= 3 || response.status() !== 429) {
-      throw new Error(`${response.status()} ${url}: ${await response.text()}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)));
-  }
 };
 
 /**
@@ -4152,6 +4117,20 @@ test('a close date can be typed into the record, in the workspace’s own date o
     await page.keyboard.press('Escape');
     await expect(page.getByRole('dialog', { name: 'Choose a date' })).toHaveCount(0);
     await expect(page.locator('.pl-inline--editing')).toHaveCount(1);
+
+    // And Escape pressed before focus has reached the calendar closes the
+    // calendar too. Focus arrives a frame after the box opens, so a fast hand
+    // presses the key while it is still on the field — and that keystroke used
+    // to reach the row's own Escape and throw the whole edit away. Which frame
+    // won depended on the machine, so the state is set here rather than raced
+    // for.
+    await page.getByRole('button', { name: 'Close date calendar' }).click();
+    await expect(page.getByRole('dialog', { name: 'Choose a date' })).toBeVisible();
+    await page.locator('.pl-inline--editing').getByLabel('Close date', { exact: true }).focus();
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('dialog', { name: 'Choose a date' })).toHaveCount(0);
+    await expect(page.locator('.pl-inline--editing')).toHaveCount(1);
+    expect((await deal(request, made.id)).properties.close_date).toBe(Date.UTC(year, 10, 30));
   } finally {
     await request.delete(`/api/v1/records/deal/${made.id}?permanent=true`);
   }

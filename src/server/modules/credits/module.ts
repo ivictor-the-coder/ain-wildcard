@@ -10,7 +10,7 @@ import type { SettlePeriodJob } from '../metering/module';
 import { BURN_ORDER } from './burn';
 import { CREDITS_MIGRATIONS } from './schema';
 import { seedCredits } from './seed';
-import { Credits, type GrantListFilter, type ItemListFilter, type SettlementListFilter } from './store';
+import { Credits, type GrantListFilter, type GrantTotals, type ItemListFilter, type PendingItemTotals, type SettlementListFilter } from './store';
 import {
   BILLABLE_ITEM_KINDS, BILLABLE_ITEM_STATUSES, CREDIT_CATEGORIES, CREDIT_KINDS, GRANT_STATUSES,
   ROLLOVER_POLICIES, SETTLEMENT_STATUSES,
@@ -28,6 +28,10 @@ import {
  */
 export interface CreditsService {
   grants(orgId: string, filter?: GrantListFilter): CreditGrant[];
+  /** Every grant, folded. The overview's figures, uncapped by any page size. */
+  grantTotals(orgId: string): GrantTotals;
+  /** The pending outbox, folded. Likewise uncapped. */
+  pendingItemTotals(orgId: string): PendingItemTotals;
   grant(orgId: string, id: string): CreditGrant | null;
   requireGrant(orgId: string, id: string): CreditGrant;
   createGrant(orgId: string, input: GrantInput): CreditGrant;
@@ -353,6 +357,8 @@ export default defineModule({
     const store = creditsStore(ctx);
     const service: CreditsService = {
       grants: (orgId, filter) => store.grants(orgId, filter),
+      grantTotals: (orgId) => store.grantTotals(orgId),
+      pendingItemTotals: (orgId) => store.pendingItemTotals(orgId),
       grant: (orgId, id) => store.grant(orgId, id),
       requireGrant: (orgId, id) => store.requireGrant(orgId, id),
       createGrant: (orgId, input) => store.createGrant(orgId, input),
@@ -758,32 +764,25 @@ export default defineModule({
     router.get('/v1/credits/overview', (req: Req, c: Ctx) => {
       const orgId = req.auth.orgId;
       const now = c.now();
-      const grants = c.svc.credits.grants(orgId, { limit: 500 });
-      const live = grants.filter((g) => g.status === 'active');
-      const byCurrency = new Map<string, { currency: string; monetary_outstanding: number; unit_pots: number }>();
-      for (const grant of live) {
-        const row = byCurrency.get(grant.currency) ?? { currency: grant.currency, monetary_outstanding: 0, unit_pots: 0 };
-        if (grant.kind === 'monetary') row.monetary_outstanding += grant.balance; else row.unit_pots += 1;
-        byCurrency.set(grant.currency, row);
-      }
-      const pending = c.svc.credits.billableItems(orgId, { status: 'pending', limit: 500 });
+      // Folded over every grant in the book, not over the first page of them:
+      // reading 500 and counting what came back reported a smaller balance
+      // than the workspace owed, and said nothing about having stopped.
+      const totals = c.svc.credits.grantTotals(orgId);
+      const pending = c.svc.credits.pendingItemTotals(orgId);
       return {
         object: 'credits_overview',
         as_of: now,
         burn_order: BURN_ORDER,
-        grants: { total: grants.length, active: live.length, scheduled: grants.filter((g) => g.status === 'scheduled').length, expired: grants.filter((g) => g.status === 'expired').length },
-        outstanding: [...byCurrency.values()].sort((a, b) => a.currency.localeCompare(b.currency)).map((row) => ({
+        grants: { total: totals.total, active: totals.counts.active, scheduled: totals.counts.scheduled, expired: totals.counts.expired },
+        outstanding: totals.outstanding.map((row) => ({
           ...row,
           monetary_outstanding_display: formatMoney(money(row.monetary_outstanding, row.currency)),
         })),
-        expiring_within_7_days: grants.filter((g) => g.status === 'active' && g.expires_at !== null && g.expires_at <= now + 7 * DAY)
+        expiring_within_7_days: totals.expiring_soon
           .map((g) => ({ id: g.id, customer: g.customer, name: g.name, balance: g.balance, balance_decimal: g.balance_decimal, expires_at: g.expires_at })),
         pending_invoice_lines: {
-          count: pending.length,
-          billed_total: pending.reduce((acc, i) => acc + i.billed_amount, 0),
-          credit_applied_total: pending.reduce((acc, i) => acc + i.credit_applied, 0),
-          oldest_at: pending.length ? Math.min(...pending.map((i) => i.created)) : null,
-          oldest_age_ms: pending.length ? now - Math.min(...pending.map((i) => i.created)) : 0,
+          ...pending,
+          oldest_age_ms: pending.oldest_at === null ? 0 : now - pending.oldest_at,
         },
         // A purchase nobody has charged for is the one line here that holds a
         // customer's credit hostage: the grant it bought is unspendable until
