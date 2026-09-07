@@ -733,7 +733,10 @@ export function DealsPage() {
 
   const ownerOptions = useMemo<SelectOption[]>(() => [
     { value: '', label: 'Every owner' },
-    ...(users.data?.data ?? []).map((user) => ({ value: user.id, label: user.name })),
+    ...(users.data?.data ?? []).map((user) => ({
+      value: user.id,
+      label: user.status === 'invited' ? `${user.name} · invited` : user.name,
+    })),
   ], [users.data]);
 
   const forecastOptions = useMemo<SelectOption[]>(() => {

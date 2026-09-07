@@ -19,7 +19,7 @@ import {
 import { ArrowUpRightIcon, XCircleIcon } from '../../design';
 import {
   BookFooter, EmptyList, ExportCsvButton, ListFailure, LoadFailedEmpty, MoneyRangeFilter, MoneyTotals, RecordLink,
-  StatusPill, TableSearch, csvAmount, csvInstant, customerHref, decodeRange, encodeRange, invoiceHref, keepRowMenuKeys,
+  StatusPill, TableSearch, csvAmount, csvInstant, customerHref, decodeRange, encodeRange, invoiceHref, 
   matchesRange, moneyRank, rangeActive, statusLabel, totalsByCurrency, useAction, useBillingFormat, useBookList,
   useBookTotal, useCurrencyChoices, useDebounced, useTableView, visibleRows,
 } from './common';
@@ -337,7 +337,7 @@ function PaymentsBook({ names }: { names: Names }) {
   return (
     <>
       {book.error && <ListFailure error={book.error} path="GET /v1/payment_intents" onRetry={book.retry} />}
-      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'} onKeyDownCapture={keepRowMenuKeys}>
+      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'}>
         <DataTable
           rows={rows}
           columns={columns}
@@ -539,7 +539,7 @@ function RefundsBook({ names }: { names: Names }) {
   return (
     <>
       {book.error && <ListFailure error={book.error} path="GET /v1/refunds" onRetry={book.retry} />}
-      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'} onKeyDownCapture={keepRowMenuKeys}>
+      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'}>
         <DataTable
           rows={book.rows}
           columns={columns}

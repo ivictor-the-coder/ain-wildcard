@@ -994,14 +994,20 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
       const target = body.to ? body.to : before + (body.days ?? 0) * DAY + (body.hours ?? 0) * 3_600_000;
       const worked = await drainUntil(c, target);
       const org = c.svc.core.org(req.auth.orgId);
-      const landed = formatDateTime(c.now(), { locale: org.locale, timeZone: org.timezone });
+      // Where the clock landed is read once. The offset is fixed but the wall
+      // clock under it is not, so asking three times — for the sentence, for
+      // the audit row and for the answer — reports three instants that differ
+      // by whatever the drain's last milliseconds cost, and the trail then
+      // disagrees with the receipt the operator was handed.
+      const now = c.now();
+      const landed = formatDateTime(now, { locale: org.locale, timeZone: org.timezone });
       c.audit({
         orgId: req.auth.orgId, ...actorOf(c, req.auth), action: 'time.advanced',
         summary: `Advanced the workspace clock to ${landed} — ${worked.ran} ${worked.ran === 1 ? 'job' : 'jobs'} run, ${worked.failed} failed`,
-        before: { now: before }, after: { now: c.now(), jobs_run: worked.ran, jobs_failed: worked.failed },
+        before: { now: before }, after: { now, jobs_run: worked.ran, jobs_failed: worked.failed },
         requestId: req.requestId, ip: req.ip,
       });
-      return { object: 'clock', now: c.now(), previous: before, offset_ms: c.clock.offset, jobs_run: worked.ran, jobs_failed: worked.failed };
+      return { object: 'clock', now, previous: before, offset_ms: c.clock.offset, jobs_run: worked.ran, jobs_failed: worked.failed };
     }, {
       summary: 'Move the workspace clock forward and run everything that becomes due', tags: ['system'], roles: ['admin'],
       description: 'The time machine replays renewals, dunning, credit expiry, workflow delays and scheduled agent runs exactly as they would happen.',

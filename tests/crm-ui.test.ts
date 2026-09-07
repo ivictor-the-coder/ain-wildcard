@@ -142,8 +142,8 @@ describe('the merge preview', () => {
 
 describe('the CSV import', () => {
   const users: WorkspaceUser[] = [
-    { id: 'usr_dana', name: 'Dana Whitfield', email: 'dana@northwind.io', title: null, role: 'owner', avatar_url: null },
-    { id: 'usr_marcus', name: 'Marcus Ilori', email: 'marcus@northwind.io', title: null, role: 'member', avatar_url: null },
+    { id: 'usr_dana', name: 'Dana Whitfield', email: 'dana@northwind.io', title: null, role: 'owner', avatar_url: null, status: 'active' },
+    { id: 'usr_marcus', name: 'Marcus Ilori', email: 'marcus@northwind.io', title: null, role: 'member', avatar_url: null, status: 'active' },
   ];
   const ctx = { users, currency: 'usd' };
   const properties = [

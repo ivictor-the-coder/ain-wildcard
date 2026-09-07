@@ -141,6 +141,9 @@ export function UserChip({ user, id, size = 20 }: { user: WorkspaceUser | undefi
     <span className="crm-userchip">
       <Avatar name={user?.name ?? id} seed={id} size={size} />
       <span className="u-truncate">{user?.name ?? id}</span>
+      {/* Work assigned to a seat nobody has signed in to is work nobody is
+          doing. The roster says so; so does every place the name appears. */}
+      {user?.status === 'invited' && <Badge size="sm" tone="warning">invited</Badge>}
     </span>
   );
 }
@@ -249,27 +252,22 @@ export interface EditorProps {
 }
 
 const userOptions = (users: WorkspaceUser[]): ComboOption[] =>
-  users.map((u) => ({ value: u.id, label: u.name, description: u.title ?? u.email }));
+  users.map((u) => ({
+    value: u.id,
+    label: u.name,
+    description: u.status === 'invited' ? 'Invitation not accepted yet' : u.title ?? u.email,
+  }));
 
 /**
- * Whether a picker inside `root` currently has its list or calendar open. Both
- * the combobox input and the date button carry `aria-expanded`, which is the
- * one fact the boundary below needs.
- */
-export const pickerIsOpen = (root: HTMLElement | null): boolean =>
-  !!root?.querySelector('[aria-expanded="true"]');
-
-/**
- * Esc for the editors that are not a plain text box.
+ * Esc, and the caret, for the editors that are not a plain text box.
  *
- * The combobox and the date picker handle Escape themselves — to close their
- * own list — and stop it there, so on a picklist the key never reached the
- * inline editor and Seniority stayed in edit mode however many times it was
- * pressed. This wrapper listens in the capture phase, ahead of the control:
- * with the list open, Esc is the control's to close; with it closed, Esc
- * cancels the edit, the way it already does on a string or a number. It also
- * puts the caret in the control on open, since the pickers take no
- * `autoFocus` of their own.
+ * A Switch and the record picker take no `autoFocus` of their own, so the
+ * caret is put in the control here. Escape is the plain bubble path: the
+ * combobox and the date picker stop the key while their own list is open and
+ * let it travel once it is closed, so by the time it reaches this wrapper it
+ * means "cancel the edit" and nothing else. It used to be answered in the
+ * capture phase against an `aria-expanded` probe, because the kit's pickers
+ * swallowed Escape whatever their state — they do not any more.
  */
 function EscapeBoundary({ onCancel, autoFocus, children }: { onCancel?: () => void; autoFocus?: boolean; children: React.ReactNode }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -281,9 +279,8 @@ function EscapeBoundary({ onCancel, autoFocus, children }: { onCancel?: () => vo
   return (
     <div
       ref={ref}
-      className="crm-editor"
-      onKeyDownCapture={(e) => {
-        if (e.key !== 'Escape' || !onCancel || pickerIsOpen(ref.current)) return;
+      onKeyDown={(e) => {
+        if (e.key !== 'Escape' || !onCancel) return;
         e.preventDefault();
         e.stopPropagation();
         onCancel();

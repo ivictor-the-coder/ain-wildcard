@@ -14,7 +14,7 @@ import { invalidate, type ApiClientError } from '../../kernel/api';
 import { Link, useLocation, useSearchParam } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
 import {
-  Badge, Banner, Button, EmptyState, ErrorState, Icons, Page, Spinner,
+  Badge, Banner, Button, EmptyState, Icons, Loading, Page, SectionError,
   useCopyToClipboard, useToast,
   type Tone,
 } from '../../design';
@@ -143,38 +143,13 @@ export interface SettingsShellProps {
   children: ReactNode;
 }
 
-/**
- * Enter on a row's "Row actions" button must open its menu — and nothing else.
- *
- * `DataTable` listens for keys on its `<tbody>` and, on Enter with a focused
- * row, calls `preventDefault()` and fires `onRowClick`. It does not look at
- * where the key landed, so Enter on the "…" button inside that row had its
- * native click suppressed (no menu) while the row's own action ran: on the
- * team screen the change-role dialog for the first teammate opened with no
- * menu ever shown, and on Tax nothing happened at all. Only Space opened it.
- * The fix belongs in `DataTable`'s handler — ignore keys whose target is a
- * control inside the row — and is recorded for the design system. Until it
- * lands, the frame stops that one keystroke from reaching the grid's handler,
- * in the capture phase, before the button's own click is dispatched.
- */
-export function shieldsRowMenuEnter(event: KeyboardEvent<HTMLElement>): boolean {
-  if (event.key !== 'Enter') return false;
-  const target = event.target as HTMLElement | null;
-  return !!target?.closest?.('.ain-table__actioncell');
-}
-
 /** The frame: one page header, the rail on the left, the screen on the right. */
 export function SettingsShell({ title, subtitle, actions, children }: SettingsShellProps) {
   return (
     <Page title={title} eyebrow="Settings" subtitle={subtitle} actions={actions} width="wide">
       <div className="st-frame">
         <SettingsRail />
-        <div
-          className="st-body"
-          onKeyDownCapture={(event) => { if (shieldsRowMenuEnter(event)) event.stopPropagation(); }}
-        >
-          {children}
-        </div>
+        <div className="st-body">{children}</div>
       </div>
     </Page>
   );
@@ -426,18 +401,6 @@ export const idem = (): string => (
 
 /* ============================ states and shells ========================== */
 
-function SectionError({ error, path, onRetry }: { error: ApiClientError; path: string; onRetry: () => void }) {
-  return (
-    <ErrorState
-      title="That did not load"
-      message={error.body.message}
-      code={`${error.status} ${path}`}
-      requestId={error.body.request_id ?? null}
-      action={<Button size="sm" variant="primary" iconLeft={<Icons.refresh size={13} />} onClick={onRetry}>Try again</Button>}
-    />
-  );
-}
-
 /**
  * A list's failure, rendered above the grid rather than inside it. `DataTable`
  * puts its error in a `<td colSpan>` inside a horizontally scrolling body, so a
@@ -448,14 +411,7 @@ export function ListFailure({ error, path, onRetry }: { error: ApiClientError; p
   return <div className="st-listfail"><SectionError error={error} path={path} onRetry={onRetry} /></div>;
 }
 
-export function Loading({ label }: { label: string }) {
-  return (
-    <div className="st-loading" role="status">
-      <Spinner size={16} />
-      <span>{label}</span>
-    </div>
-  );
-}
+export { Loading };
 
 /**
  * The screen an operator without the role sees — and only where the *read* is

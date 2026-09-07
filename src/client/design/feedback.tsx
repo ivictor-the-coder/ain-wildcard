@@ -30,6 +30,31 @@ export function Spinner({ size = 16, className, label }: SpinnerProps) {
   );
 }
 
+/* =============================== Loading ================================== */
+
+export interface LoadingProps {
+  /** What is being read, in the words the reader would use — "Reading the meter…". */
+  label: string;
+  size?: number;
+  className?: string;
+}
+
+/**
+ * A panel that is still reading, with the sentence saying what.
+ *
+ * Billing and settings each grew one of these, sized and aligned differently,
+ * so a dialog in one module and a card in the next spun at 18px centred and
+ * 16px left of the same width of card. One figure, one place.
+ */
+export function Loading({ label, size = 16, className }: LoadingProps) {
+  return (
+    <div className={cx('ain-loading', className)} role="status">
+      <Spinner size={size} />
+      <span className="ain-loading__label">{label}</span>
+    </div>
+  );
+}
+
 /* =============================== Skeleton ================================= */
 
 export interface SkeletonProps {

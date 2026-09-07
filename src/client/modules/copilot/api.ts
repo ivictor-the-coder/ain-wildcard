@@ -297,14 +297,22 @@ export interface ScheduledFollowup {
   /** When the note lands, as the engine stamped it. */
   due: number;
   note: string;
+  /**
+   * The task the booking created on the record, openable today. The tool
+   * creates one at once — subject, due date, assignee — and returns its id;
+   * the card used to read past it and tell the reader there was nothing to
+   * look at until the job fired.
+   */
+  taskId: string | null;
 }
 
 /**
  * The follow-up an approved write booked, or null for every other write.
  *
  * `scheduled=true record_id=cmp_nw_42 due=1789219881805 note=Chase the MSA.
- * idempotency_key=…` is the whole of what the tool hands back, and every fact
- * the resolution card can state — the day, the record, the words — is in it.
+ * task_id=task_… idempotency_key=…` is the whole of what the tool hands back,
+ * and every fact the resolution card can state — the day, the record, the
+ * words, the task — is in it.
  */
 export function scheduledFollowup(approval: Pick<AiApproval, 'status' | 'outcome'>): ScheduledFollowup | null {
   if (approval.status !== 'approved' || !approval.outcome) return null;
@@ -312,7 +320,8 @@ export function scheduledFollowup(approval: Pick<AiApproval, 'status' | 'outcome
   if (!fields || fields.scheduled !== 'true') return null;
   const due = Number(fields.due);
   if (!Number.isFinite(due) || due <= 0) return null;
-  return { recordId: fields.record_id ?? null, due, note: (fields.note ?? '').trim() };
+  const taskId = fields.task_id && fields.task_id !== 'null' ? fields.task_id : null;
+  return { recordId: fields.record_id ?? null, due, note: (fields.note ?? '').trim(), taskId };
 }
 
 const FAILED_OUTCOME = /^\s*(?:failed|error)\b/i;
@@ -465,8 +474,13 @@ export function outcomeSummary(approval: AiApproval, ctx: OutcomeContext = {}): 
     const day = ctx.when ? ctx.when(booked.due) : new Date(booked.due).toISOString().slice(0, 10);
     const assigned = ctx.assignee ? `, assigned to ${ctx.assignee}` : '';
     const quoted = booked.note ? ` “${booked.note}”` : '';
+    // The tool creates the task immediately and the note on the timeline only
+    // when the job fires. Saying "nothing is on the record yet" was true of the
+    // note and false of the task a person can open and work right now.
     return {
-      text: `${headline} is booked for ${day}${assigned}. Nothing is on ${target}’s timeline yet: the note${quoted} is written there when it comes due.`,
+      text: booked.taskId
+        ? `${headline} is booked for ${day}${assigned}. The task is on ${target} now; the note${quoted} is written onto its timeline when it comes due.`
+        : `${headline} is booked for ${day}${assigned}. Nothing is on ${target}’s timeline yet: the note${quoted} is written there when it comes due.`,
       raw,
     };
   }

@@ -26,7 +26,7 @@ import {
   Amount, BookFooter, DialogFields, EmptyList, ExportCsvButton, FieldRow, FixedQuantity, InlineEdit, ListFailure, ListFooter,
   LoadFailedEmpty, Loading, MoneyField, MoneyRangeFilter, MoneyTotals, PreviewFailure, QuantityField, RecordLink,
   RecordMissing, SectionError, StatusPill, TableSearch, breakdownLabel, copyFormat, customerHref, decodeRange, encodeRange, idem,
-  invoiceHref, keepRowMenuKeys, lineWhy, matchesRange, moneyRank, prorationCopy, rangeActive, readUntilSettled, statusLabel,
+  invoiceHref,  lineWhy, matchesRange, moneyRank, prorationCopy, rangeActive, readUntilSettled, statusLabel,
   subscriptionHref,
   csvAmount, csvDay, totalsByCurrency, useAction, useBillingFormat, useBookList, useBookTotal, useCurrencyChoices, useDebounced,
   useDialogForm,
@@ -2032,7 +2032,7 @@ export function SubscriptionsPage() {
       }
     >
       {book.error && <ListFailure error={book.error} path="GET /v1/subscriptions" onRetry={book.retry} />}
-      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'} onKeyDownCapture={keepRowMenuKeys}>
+      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'}>
       <DataTable
         rows={rows}
         columns={columns}

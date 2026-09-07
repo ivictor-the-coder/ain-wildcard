@@ -23,22 +23,23 @@
  * is also killing the CI credential that engineer created, and the confirmation
  * says so before it happens rather than the audit log saying so afterwards.
  *
- * And the least comfortable honest part is the invitation itself. `POST
- * /v1/users` creates the seat with `password_hash: null`, sends nothing, and
- * the platform has no invitation link, no accept route and no password route —
- * `POST /v1/auth/login` answers 401 to the new address forever. The dialog used
- * to promise an immediate join; it now says what actually happens, so an admin
- * is not left telling a colleague to sign in to a seat nobody can sign in to.
- * The seat still holds a name, a role and teams, which is what the rest of the
- * product needs it for.
+ * And the invitation is a real invitation now. `POST /v1/users` mints a
+ * one-time token and answers with it exactly once; `/accept?token=…` is where
+ * the person sets a password and lands inside the workspace. So the token is
+ * handled the way this module already handles the one other secret it shows —
+ * the API key: its own panel, masked until revealed, copied, acknowledged
+ * before the dialog will close. A seat sits at `invited` until the link is
+ * redeemed, and the roster says so on every row that is in that state, with
+ * "Send a fresh link" and "Cancel the invitation" where the ordinary seat
+ * actions are.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, useQuery, type ListEnvelope } from '../../kernel/api';
 import { useNavigate } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
 import {
-  Avatar, Badge, Banner, Button, Card, DataTable, EmptyState, Field, Icons, Inline, Input, Modal,
-  RadioGroup, Stack, Tooltip,
+  Avatar, Badge, Banner, Button, Card, Checkbox, CopyField, DataTable, EmptyState, Field, Icons, Inline, Input, Modal,
+  RadioGroup, Stack, StatusPill, Tooltip,
   useFormat, useToast,
   type DataTableColumn, type MenuSection, type TableState,
   AlertTriangleIcon,
@@ -47,17 +48,21 @@ import {
   DialogForm, ListFailure, ROLE_GRANTS, ROLE_ORDER, ROLE_RANK, ReadOnlyForYou, RoleBadge, SettingsShell, useAction,
   useConsumeQuery, useOpenFromQuery,
 } from './common';
-import type { Member, Role } from './types';
+import type { InvitedMember, Member, Role } from './types';
 
 /**
- * The one sentence that has to be true before anyone presses the button. There
- * is no way for the person to get in yet; saying so in the dialog is what
- * stops the admin promising them one.
+ * The one sentence that has to be true before anyone presses the button. The
+ * platform mints the link but sends no mail, and an admin who does not know
+ * that will invite six people and wonder why nobody arrives.
  */
 export const INVITE_TRUTH =
-  'A seat is created at the role you choose and appears on the roster straight away. Nothing is sent, and they cannot '
-  + 'sign in: the platform has no invitation link, no password route and no accept step yet, so the seat holds their '
-  + 'name, role and teams until one exists.';
+  'A seat is created at the role you choose and a one-time invitation link is minted. Ain does not send email, so the '
+  + 'link is shown to you once, here, and it is yours to pass on. The seat stays “invited” until they open it and set '
+  + 'a password.';
+
+/** Where an invitation is redeemed. Absolute, because it is going into someone else’s inbox. */
+export const invitationUrl = (token: string): string =>
+  `${typeof window === 'undefined' ? '' : window.location.origin}/accept?token=${encodeURIComponent(token)}`;
 
 const ADMIN_ONLY = new Set<Role>(['owner', 'admin']);
 
@@ -93,6 +98,8 @@ export function TeamPage() {
   const members = useQuery<ListEnvelope<Member>>('/v1/users');
 
   const [inviting, setInviting] = useState(false);
+  /** The seat whose one-time link is on screen — from a fresh invitation or a re-send. */
+  const [minted, setMinted] = useState<InvitedMember | null>(null);
   const [editing, setEditing] = useState<Member | null>(null);
   const [removing, setRemoving] = useState<Member | null>(null);
   const [view, setView] = useState<TableState>({ query: '', sort: { columnId: 'role', direction: 'asc' }, filters: {} });
@@ -158,6 +165,24 @@ export function TeamPage() {
         </Inline>
       ),
     },
+    {
+      id: 'status',
+      header: 'Seat',
+      width: 130,
+      filter: 'set',
+      accessor: (row) => row.status,
+      filterOptionLabel: (value) => (value === 'invited' ? 'Invited' : 'Active'),
+      cell: (row) => (
+        <StatusPill
+          status={row.status}
+          title={row.status === 'invited'
+            ? (row.invitation
+              ? `Invited ${f.relative(row.invitation.created)}. The link expires ${f.date(row.invitation.expires, { withYear: true })}.`
+              : 'Invited. The link has expired or was cancelled — send a fresh one.')
+            : undefined}
+        />
+      ),
+    },
     { id: 'title', header: 'Job title', accessor: (row) => row.title ?? '', cell: (row) => row.title ?? <span className="st-sub">—</span> },
     {
       id: 'role',
@@ -193,15 +218,52 @@ export function TeamPage() {
       align: 'right',
       width: 150,
       accessor: (row) => row.last_seen ?? 0,
-      cell: (row) => (row.last_seen
-        ? <Tooltip content={f.dateTime(row.last_seen)}><span>{f.relative(row.last_seen)}</span></Tooltip>
-        : <span className="st-sub">Never signed in</span>),
+      cell: (row) => {
+        if (row.last_seen) {
+          return <Tooltip content={f.dateTime(row.last_seen)}><span>{f.relative(row.last_seen)}</span></Tooltip>;
+        }
+        // "Never signed in" is what an abandoned seat reads; an invited one has
+        // not been given the chance yet, and the useful fact is the deadline.
+        if (row.status === 'invited' && row.invitation) {
+          return (
+            <Tooltip content={`Invitation sent ${f.dateTime(row.invitation.created)}`}>
+              <span className="st-sub">{`Link expires ${f.relative(row.invitation.expires)}`}</span>
+            </Tooltip>
+          );
+        }
+        return <span className="st-sub">{row.status === 'invited' ? 'Invitation lapsed' : 'Never signed in'}</span>;
+      },
     },
   ], [f, myId]);
+
+  /** A fresh token, the old one voided. The link comes back once, so it opens the same panel a new invitation does. */
+  const reinvite = async (row: Member) => {
+    const seat = await action.run(
+      api.post<InvitedMember>(`/v1/users/${row.id}/reinvite`, {}),
+      {
+        success: `A fresh link for ${row.name}`,
+        description: 'The previous link stopped working the moment this one was minted.',
+        failure: 'No new link was minted',
+      },
+      ['/v1/users', '/v1/audit-log'],
+    );
+    if (seat) setMinted(seat);
+  };
 
   const rowActions = (row: Member): MenuSection[] => [{
     id: 'seat',
     items: [
+      ...(row.status === 'invited'
+        ? [
+          {
+            id: 'reinvite',
+            label: 'Send a fresh link…',
+            icon: <Icons.refresh size={14} />,
+            disabled: !admin,
+            onSelect: () => { action.clear(); void reinvite(row); },
+          },
+        ]
+        : []),
       {
         id: 'role',
         label: 'Change role…',
@@ -211,7 +273,7 @@ export function TeamPage() {
       },
       {
         id: 'remove',
-        label: 'Remove from workspace…',
+        label: row.status === 'invited' ? 'Cancel the invitation…' : 'Remove from workspace…',
         icon: <Icons.trash size={14} />,
         danger: true,
         disabled: !admin || row.id === myId || !grantable(row.role),
@@ -220,10 +282,13 @@ export function TeamPage() {
     ],
   }];
 
+  const invitedCount = rows.filter((row) => row.status === 'invited').length;
+
   return (
     <SettingsShell
       title="Team"
-      subtitle={`${f.plural(rows.length, 'teammate')} in ${session.me?.org.name ?? 'this workspace'}.`}
+      subtitle={`${f.plural(rows.length, 'teammate')} in ${session.me?.org.name ?? 'this workspace'}${
+        invitedCount ? `, ${invitedCount} still to accept an invitation` : ''}.`}
       actions={admin
         ? (
           <Button variant="primary" iconLeft={<Icons.plus size={15} />} onClick={() => { action.clear(); setInviting(true); }}>
@@ -262,6 +327,14 @@ export function TeamPage() {
             reads="GET /v1/users"
             writes="Inviting, changing a role and removing a seat are gated at admin"
           />
+        )}
+
+        {admin && invitedCount > 0 && (
+          <Banner tone="info" compact title={`${f.plural(invitedCount, 'invitation')} still open`}>
+            {'Ain mints the link but sends no mail, so an invitation only travels once somebody passes it on. Nobody '
+              + 'on an invited seat can sign in, own a record or hold a key until they open theirs and set a password. '
+              + '“Send a fresh link” on the row mints a new one and voids the old.'}
+          </Banner>
         )}
 
         {admin && adminCount === 1 && (
@@ -324,7 +397,10 @@ export function TeamPage() {
         myRole={myRole}
         action={action}
         onClose={() => setInviting(false)}
+        onInvited={setMinted}
       />
+
+      <InvitationLinkDialog seat={minted} onClose={() => setMinted(null)} />
 
       <RoleDialog
         member={admin ? editing : null}
@@ -350,12 +426,14 @@ export function TeamPage() {
 
 type Action = ReturnType<typeof useAction>;
 
-function InviteDialog({ open, grantable, myRole, action, onClose }: {
+function InviteDialog({ open, grantable, myRole, action, onClose, onInvited }: {
   open: boolean;
   grantable: (role: Role) => boolean;
   myRole: Role;
   action: Action;
   onClose: () => void;
+  /** Hands the seat back with its one-time token, which is shown once and never again. */
+  onInvited: (seat: InvitedMember) => void;
 }) {
   const [email, setEmail] = useState('');
   const [name, setName] = useState('');
@@ -370,7 +448,7 @@ function InviteDialog({ open, grantable, myRole, action, onClose }: {
   const submit = async () => {
     if (!valid || action.busy) return;
     const saved = await action.run(
-      api.post<Member>('/v1/users', {
+      api.post<InvitedMember>('/v1/users', {
         email: email.trim().toLowerCase(),
         name: name.trim(),
         role,
@@ -379,14 +457,14 @@ function InviteDialog({ open, grantable, myRole, action, onClose }: {
       {
         success: `${name.trim() || email.trim()} has a seat`,
         description:
-          `Seated as ${role} — ${ROLE_GRANTS[role].summary.toLowerCase()}. They cannot sign in yet: no invitation or `
-          + 'password route exists, so nothing was sent.',
+          `Seated as ${role} — ${ROLE_GRANTS[role].summary.toLowerCase()}. Their invitation link is on screen now, and `
+          + 'this is the only time it is shown.',
         failure: 'The invitation was refused',
         inlineOnly: true,
       },
       ['/v1/users', '/v1/me', '/v1/audit-log'],
     );
-    if (saved) close();
+    if (saved) { reset(); onClose(); onInvited(saved); }
   };
 
   return (
@@ -406,7 +484,7 @@ function InviteDialog({ open, grantable, myRole, action, onClose }: {
             disabled={!valid}
             onClick={() => void submit()}
           >
-            Add to workspace
+            Invite and show me the link
           </Button>
         </>
       }
@@ -416,12 +494,12 @@ function InviteDialog({ open, grantable, myRole, action, onClose }: {
           {action.error && !action.error.body.param && (
             <Banner tone="danger" compact title="The invitation was refused">{action.error.body.message}</Banner>
           )}
-          <Banner tone="warning" compact title="No way in yet">
+          <Banner tone="info" compact title="You will be handed the link, once">
             <code className="st-mono">POST /v1/users</code>
-            {' stores the seat with no password, and '}
-            <code className="st-mono">POST /v1/auth/login</code>
-            {' answers 401 to an address with none. Until the platform gains an invitation or password route, the seat '
-              + 'is a name on the roster with a role — the row will read “Never signed in”, and that is accurate.'}
+            {' answers with a one-time token; Ain stores only its hash and no route ever reads it back. Send the link '
+              + 'to them yourself — it is good for seven days, and '}
+            <code className="st-mono">POST /v1/auth/accept</code>
+            {' spends it the moment they set a password. Lose it and “Send a fresh link” on their row mints another.'}
           </Banner>
           <Field label="Work email" required error={action.errorFor('email')}>
             <Input
@@ -456,6 +534,98 @@ function InviteDialog({ open, grantable, myRole, action, onClose }: {
           </Field>
         </Stack>
       </DialogForm>
+    </Modal>
+  );
+}
+
+/* ============================ the one-time link =========================== */
+
+/**
+ * The invitation link, on screen for the only moment it exists.
+ *
+ * This is the API-key dialog's pattern, deliberately: the same masked field,
+ * the same copy control, the same acknowledgement before Esc or the backdrop
+ * will close it. A person who has met one of these on the API keys screen
+ * knows exactly what this one is, and that dismissing it by accident is how
+ * a secret is lost.
+ */
+function InvitationLinkDialog({ seat, onClose }: { seat: InvitedMember | null; onClose: () => void }) {
+  const f = useFormat();
+  const [acknowledged, setAcknowledged] = useState(false);
+  const [seeded, setSeeded] = useState<string | null>(null);
+
+  if (seat && seeded !== seat.invitation.id) { setSeeded(seat.invitation.id); setAcknowledged(false); }
+  if (!seat) return null;
+
+  const url = invitationUrl(seat.invitation.token);
+  return (
+    <Modal
+      open
+      dismissable={acknowledged}
+      showClose={acknowledged}
+      onClose={onClose}
+      title={`${seat.name}’s invitation is ready`}
+      description="This is the only time this link exists outside your clipboard."
+      icon={<Icons.mail size={18} />}
+      iconTone="warning"
+      size="md"
+      footer={
+        <Button variant="primary" disabled={!acknowledged} onClick={onClose}>
+          {acknowledged ? 'Done' : 'Copy it first'}
+        </Button>
+      }
+    >
+      <Stack gap={5}>
+        <div className="st-secret">
+          <div>
+            <div style={{ fontWeight: 'var(--weight-semibold)' }}>Send this to {seat.email}</div>
+            <div className="st-sub">
+              {'Ain stores only a hash of the token in it. Nobody — not you, not an owner — can read it back. If it is '
+                + 'lost, “Send a fresh link” on their row mints another and voids this one.'}
+            </div>
+          </div>
+          <CopyField
+            value={url}
+            secret
+            // The address is the part an operator checks before sending; the
+            // token is the part nobody else may read over their shoulder.
+            maskAfter={url.length - seat.invitation.token.length}
+            mono
+            label="Copy the invitation link"
+          />
+        </div>
+
+        <div className="st-rows">
+          <div className="st-row">
+            <div className="st-row__main">
+              <div className="st-row__title">What it does</div>
+              <div className="st-row__sub">
+                {`Opens /accept, where they set a password and land in ${seat.role === 'owner' ? 'the workspace as an owner' : `the workspace as ${seat.role === 'admin' || seat.role === 'analyst' ? 'an' : 'a'} ${seat.role}`}. It works once.`}
+              </div>
+            </div>
+          </div>
+          <div className="st-row">
+            <div className="st-row__main">
+              <div className="st-row__title">Good until</div>
+              <div className="st-row__sub">{`${f.dateTime(seat.invitation.expires)} · ${f.relative(seat.invitation.expires)}`}</div>
+            </div>
+            <div className="st-row__aside"><Badge tone="warning" pill>expires</Badge></div>
+          </div>
+          <div className="st-row">
+            <div className="st-row__main">
+              <div className="st-row__title">Until they open it</div>
+              <div className="st-row__sub">Their row on the roster reads “Invited”. They own nothing and can sign in to nothing.</div>
+            </div>
+            <div className="st-row__aside"><StatusPill status="invited" /></div>
+          </div>
+        </div>
+
+        <Checkbox
+          checked={acknowledged}
+          onChange={setAcknowledged}
+          label="I have copied the link and can get it to them."
+        />
+      </Stack>
     </Modal>
   );
 }
@@ -628,7 +798,15 @@ function RemoveDialog({ member, action, onClose }: { member: Member | null; acti
   if (member && seeded !== member.id) { setSeeded(member.id); setTyped(''); }
   if (!member) return null;
 
-  const confirmed = typed.trim().toLowerCase() === member.email.toLowerCase();
+  /**
+   * The same route, two very different acts. On an active seat `DELETE` ends
+   * sessions and revokes keys; on an invited one there is nothing yet to end —
+   * it voids a link nobody has opened. Asking an admin to type an address to
+   * cancel an invitation that has done nothing is friction with no risk behind
+   * it, so only the destructive half asks.
+   */
+  const pending = member.status === 'invited';
+  const confirmed = pending || typed.trim().toLowerCase() === member.email.toLowerCase();
 
   const submit = async () => {
     if (!confirmed || action.busy) return;
@@ -638,9 +816,11 @@ function RemoveDialog({ member, action, onClose }: { member: Member | null; acti
     const done = await action.run(
       api.del<void>(`/v1/users/${member.id}`).then(() => true),
       {
-        success: `${member.name} was removed`,
-        description: 'Their sessions were ended and every API key they minted was revoked.',
-        failure: 'They were not removed',
+        success: pending ? `${member.name}’s invitation was cancelled` : `${member.name} was removed`,
+        description: pending
+          ? 'Their link stopped working. Inviting the same address again mints a fresh one.'
+          : 'Their sessions were ended and every API key they minted was revoked.',
+        failure: pending ? 'The invitation was not cancelled' : 'They were not removed',
         inlineOnly: true,
       },
       ['/v1/users', '/v1/api-keys', '/v1/me', '/v1/audit-log'],
@@ -652,15 +832,15 @@ function RemoveDialog({ member, action, onClose }: { member: Member | null; acti
     <Modal
       open
       onClose={onClose}
-      title={`Remove ${member.name}?`}
+      title={pending ? `Cancel ${member.name}’s invitation?` : `Remove ${member.name}?`}
       icon={<AlertTriangleIcon size={18} />}
-      iconTone="danger"
+      iconTone={pending ? 'warning' : 'danger'}
       size="md"
       footer={
         <>
-          <Button variant="ghost" onClick={onClose}>Keep the seat</Button>
+          <Button variant="ghost" onClick={onClose}>{pending ? 'Leave it open' : 'Keep the seat'}</Button>
           <Button variant="danger" loading={action.busy} disabled={!confirmed} onClick={() => void submit()}>
-            Remove and revoke
+            {pending ? 'Cancel the invitation' : 'Remove and revoke'}
           </Button>
         </>
       }
@@ -668,26 +848,39 @@ function RemoveDialog({ member, action, onClose }: { member: Member | null; acti
       <DialogForm onSubmit={() => void submit()}>
         <Stack gap={5}>
           {action.error && (
-            <Banner tone="danger" compact title="They were not removed">{action.error.body.message}</Banner>
+            <Banner tone="danger" compact title={pending ? 'The invitation was not cancelled' : 'They were not removed'}>
+              {action.error.body.message}
+            </Banner>
           )}
-          <Banner tone="danger" compact title="This ends three things at once">
-            {'The membership goes, every session it holds is deleted, and every API key this person ever minted is '
-              + 'revoked — including keys other integrations are using right now. Re-inviting the same address later '
-              + 'creates a fresh seat; it does not bring the keys back.'}
-          </Banner>
-          <Field
-            label={`Type ${member.email} to confirm`}
-            required
-            hint="An address is harder to type by accident than a click is to make."
-          >
-            <Input
-              value={typed}
-              autoFocus
-              placeholder={member.email}
-              onChange={(e) => setTyped(e.target.value)}
-              aria-label={`Type ${member.email} to confirm removal`}
-            />
-          </Field>
+          {pending ? (
+            <Banner tone="warning" compact title="Their link stops working">
+              {`${member.name} has not accepted yet, so there are no sessions to end and no API keys to revoke. The seat `
+                + 'goes and the link they were sent is void. Inviting '}
+              <span className="st-mono">{member.email}</span>
+              {' again creates a new seat with a new link.'}
+            </Banner>
+          ) : (
+            <Banner tone="danger" compact title="This ends three things at once">
+              {'The membership goes, every session it holds is deleted, and every API key this person ever minted is '
+                + 'revoked — including keys other integrations are using right now. Re-inviting the same address later '
+                + 'creates a fresh seat; it does not bring the keys back.'}
+            </Banner>
+          )}
+          {!pending && (
+            <Field
+              label={`Type ${member.email} to confirm`}
+              required
+              hint="An address is harder to type by accident than a click is to make."
+            >
+              <Input
+                value={typed}
+                autoFocus
+                placeholder={member.email}
+                onChange={(e) => setTyped(e.target.value)}
+                aria-label={`Type ${member.email} to confirm removal`}
+              />
+            </Field>
+          )}
         </Stack>
       </DialogForm>
     </Modal>

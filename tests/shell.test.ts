@@ -611,6 +611,44 @@ describe('the modules stay one product', () => {
     assert.deepEqual(duplicates, []);
   });
 
+  it('every nav destination and every palette command lands on a route the app registers', () => {
+    // A control that leads out of the shell is a control that does nothing.
+    // The registry is generated from the same files, so the check reads them:
+    // every `to:` in a nav block and every path a "Go to" command navigates to
+    // has to be a path some module — or the kernel — actually claims.
+    const registered = new Set<string>();
+    for (const file of routeFiles) {
+      const block = /export const routes[\s\S]*?\n\];/.exec(source(file))?.[0] ?? '';
+      for (const match of block.matchAll(/\bpath:\s*'([^']+)'/g)) registered.add(match[1]);
+    }
+    const kernel = source(join(root, 'kernel', 'routes.tsx'));
+    for (const match of kernel.matchAll(/\bpath:\s*'([^']+)'/g)) registered.add(match[1]);
+    assert.ok(registered.has('/billing') && registered.has('/login') && registered.has('/accept'), 'the route tables were read');
+
+    /** `/deals/:id` serves `/deals/deal_1`; a literal serves only itself. */
+    const serves = (path: string): boolean => {
+      const parts = normalizePath(path).split('/').filter(Boolean);
+      return [...registered].some((route) => {
+        const shape = route.split('/').filter(Boolean);
+        if (shape.length !== parts.length) return false;
+        return shape.every((segment, i) => segment.startsWith(':') || segment === parts[i]);
+      });
+    };
+
+    const dead: string[] = [];
+    for (const file of routeFiles) {
+      const nav = /export const nav[\s\S]*?\n\];/.exec(source(file))?.[0] ?? '';
+      for (const match of nav.matchAll(/\bto:\s*'([^']+)'/g)) {
+        if (!serves(match[1])) dead.push(`${rel(file)} nav → ${match[1]}`);
+      }
+      const commands = /export const commands[\s\S]*?\n\];/.exec(source(file))?.[0] ?? '';
+      for (const match of commands.matchAll(/=>\s*\w+\(\s*['`]([^'`?]+)(?:\?[^'`]*)?['`]\s*\)/g)) {
+        if (match[1].startsWith('/') && !serves(match[1])) dead.push(`${rel(file)} command → ${match[1]}`);
+      }
+    }
+    assert.deepEqual(dead, []);
+  });
+
   it('activity is marked read on the workspace clock, never the machine’s', () => {
     // Events are stamped on the workspace clock; after a jump forward, a
     // read-marker taken from `Date.now()` left every one of them unread.
@@ -618,12 +656,22 @@ describe('the modules stay one product', () => {
     assert.doesNotMatch(shell, /setReadAt\(\s*Date\.now\(\)/);
   });
 
-  it('every status pill the revenue screens draw comes from the one map', () => {
-    // Revenue used to carry its own tone table, so a "Scheduled" grant was an
-    // amber chip on Credits and a neutral pill on the customer's page.
-    const revenueCommon = source(join(modulesDir, 'revenue', 'common.tsx'));
-    assert.doesNotMatch(revenueCommon, /function StatusChip/);
-    assert.match(revenueCommon, /StatusPill as StatusChip.*from '\.\.\/billing\/common'/);
+  it('no module takes a shared presentational piece out of another module’s common file', () => {
+    // Revenue drew its own status pill, then re-exported billing's under a
+    // third name; settings imported one component out of billing to draw a tax
+    // badge. A piece two modules share belongs to the kit, not to whichever
+    // module wrote it first — otherwise a word added for one screen reaches
+    // one of the three. Composing another module's *feature* — the deal record
+    // opening the copilot's draft dialog — is a product decision and stays.
+    const crossings = moduleFiles
+      .filter((file) => file.endsWith('.tsx') || file.endsWith('.ts'))
+      .flatMap((file) => {
+        const dir = rel(file).split(/[\\/]/)[1];
+        return [...source(file).matchAll(/from '\.\.\/([a-z-]+)\/(common|values|status|format)'/g)]
+          .filter((match) => match[1] !== dir)
+          .map((match) => `${rel(file)} takes ${match[2]} out of ${match[1]}`);
+      });
+    assert.deepEqual(crossings, []);
   });
 });
 

@@ -261,6 +261,17 @@ export function coversNoPeriod(invoice: Pick<Invoice, 'period' | 'billing_reason
   return invoice.billing_reason === 'manual' && span <= ONE_DAY;
 }
 
+/**
+ * The same rule one level down. A hand-written line carries the day it was
+ * raised as its period, so the document's header read "One-off — no service
+ * period" while the line under it printed "Sep 7 – Sep 8, 2026": the header
+ * and the line disagreeing about the same fact, on the same screen.
+ */
+export function lineCoversNoPeriod(line: { kind: string; period: { start: number; end: number } }): boolean {
+  if (line.kind !== 'invoice_item') return false;
+  return line.period.end - line.period.start <= ONE_DAY;
+}
+
 /* ----------------------------- deleting an account ------------------------ */
 
 export interface DeleteFacts {

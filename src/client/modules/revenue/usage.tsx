@@ -21,12 +21,12 @@ import {
 } from '../../design';
 import {
   BasisNote, ChartSkeleton, CustomerName, EmptyBody, ExportCsvButton, LiveNumberInput, Loading,
-  SectionError, StatusChip, boundaryDate, boundaryRange, csvInstant, moneyIn, rateText, signedMoneyIn,
+  SectionError, StatusPill, boundaryDate, boundaryRange, csvInstant, moneyIn, rateText, signedMoneyIn,
   unitRateText, units, useCustomerNames, useDefaultCurrency, useTabParam, useUrlTableState,
   visibleRows,
   type CsvColumn,
 } from './common';
-import { NEVER_COPY, OVERVIEW_WINDOW_DAYS, QUIET_COPY, daysAgoCopy, lastSeen, lastSeenAt, type LastSeen } from './meter-copy';
+import { NEVER_COPY, OVERVIEW_WINDOW_DAYS, QUIET_COPY, lastSeen, lastSeenAt, type LastSeen } from './meter-copy';
 import type {
   CreditSettlement, Meter, MeterDetail, MeterEvent, MeterEventAdjustment, MeterEventResult, MeterLateArrival,
   MeterPeriodClosure, MeterPeriodClosureDetail, MeterUsage, MeteringOverview, PriceLite, RevenueUsage, SummaryBucket,
@@ -217,7 +217,7 @@ export function UsagePage() {
       width: 170,
     },
     { id: 'unit', header: 'Unit', accessor: (row) => row.meter.unit_label ?? '—', width: 100 },
-    { id: 'status', header: 'Status', accessor: (row) => row.meter.status, filter: 'set', cell: (row) => <StatusChip status={row.meter.status} />, width: 120 },
+    { id: 'status', header: 'Status', accessor: (row) => row.meter.status, filter: 'set', cell: (row) => <StatusPill status={row.meter.status} />, width: 120 },
     {
       id: 'events_30d', header: 'Events · 30d', align: 'right', accessor: (row) => row.live?.events_30d ?? 0,
       cell: (row) => <span className="rv-num">{formatNumber(row.live?.events_30d ?? 0)}</span>,
@@ -407,14 +407,18 @@ function LastSeenCell({ seen }: { seen: LastSeen }) {
     return (
       <div className="rv-cell">
         <span className="rv-cell__top rv-muted">{QUIET_COPY}</span>
-        <span className="rv-cell__sub" title={f.dateTime(seen.at)}>{`Last event ${daysAgoCopy(seen.at, f.now()) ?? f.relative(seen.at)} · ${f.date(seen.at, { withYear: true })}`}</span>
+        <span className="rv-cell__sub" title={f.dateTime(seen.at)}>{`Last event ${f.relative(seen.at)} · ${f.date(seen.at, { withYear: true })}`}</span>
       </div>
     );
   }
   return (
     <div className="rv-cell">
       <span className="rv-cell__top">{f.relative(seen.at)}</span>
-      <span className="rv-cell__sub">{seen.stalled ? 'Stalled — nothing for two days' : f.dateTime(seen.at)}</span>
+      {/* "Nothing for two days" is the threshold, not the gap: it read that on a
+          meter whose row said "3 days ago" one line above. The instant is the
+          fact worth keeping, so the stall is a prefix on it, never a duration
+          of its own. */}
+      <span className="rv-cell__sub">{seen.stalled ? `Stalled — nothing since ${f.dateTime(seen.at)}` : f.dateTime(seen.at)}</span>
     </div>
   );
 }
@@ -1063,7 +1067,7 @@ function LateArrivalsTable({ meter, limit, names }: { meter: string; limit: numb
       id: 'amount', header: 'Worth', align: 'right', accessor: (row) => row.amount ?? 0,
       cell: (row) => <span className="rv-num">{row.amount === null ? '—' : moneyIn(f, row.amount, row.currency)}</span>,
     },
-    { id: 'resolution', header: 'Resolution', accessor: (row) => row.resolution, filter: 'set', cell: (row) => <StatusChip status={row.resolution} />, width: 150 },
+    { id: 'resolution', header: 'Resolution', accessor: (row) => row.resolution, filter: 'set', cell: (row) => <StatusPill status={row.resolution} />, width: 150 },
     { id: 'note', header: 'Note', accessor: (row) => row.note ?? '—', cell: (row) => <span className="rv-sub">{row.note ?? '—'}</span> },
   ], [f, names]);
 
@@ -1420,7 +1424,7 @@ export function MeterDetailPage() {
     <Page
       title={m.name}
       eyebrow="Meter"
-      badge={<span style={{ marginInlineStart: 'var(--space-4)' }}><StatusChip status={m.status} /></span>}
+      badge={<span style={{ marginInlineStart: 'var(--space-4)' }}><StatusPill status={m.status} /></span>}
       subtitle={m.description ?? `Listening for ${m.event_name}, aggregated by ${m.aggregation}.`}
       actions={
         <Inline gap={3}>

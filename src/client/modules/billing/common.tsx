@@ -10,10 +10,10 @@ import {
 import { api, invalidate, useQuery, type ApiClientError, type ListEnvelope, type QueryResult } from '../../kernel/api';
 import { Link, useRouter, useSearchParam } from '../../kernel/router';
 import {
-  Badge, Button, EmptyState, ErrorState, Field, Icons, Inline, Input, MoneyInput, Popover, SearchInput, Select,
-  Spinner, Stack, Tooltip,
-  currencySymbol, decodeTableState, encodeTableState, filterRows, humanize, parseMoneyInput, searchRows,
-  useFormat, useToast,
+  Button, EmptyState, ErrorState, Field, Icons, Inline, Input, MoneyInput, Popover, SearchInput, Select,
+  Loading, SectionError, Stack, StatusPill, TAX_ID_STATUS, TaxIdStatusPill,
+  currencySymbol, decodeTableState, encodeTableState, filterRows, parseMoneyInput, searchRows,
+  statusLabel, taxIdStatusLabel, useFormat, useToast,
   type CellValue, type DateOptions, type Formatter, type TableState, type SortState,
 } from '../../design';
 import {
@@ -270,26 +270,6 @@ export async function readUntilSettled<T>(
   return last;
 }
 
-/**
- * Let the row-actions button answer the keyboard.
- *
- * The grid's body handles Enter as "open the focused row" and Space as
- * "select it", and it handles them for every keydown that bubbles up to it —
- * including the ones aimed at the "…" button inside the row, which is how
- * Enter on "Row actions" navigated away and Space ticked the checkbox instead
- * of opening the menu the button exists for. This runs in the capture phase on
- * the grid's wrapper, before the body's handler, and stops those two keys
- * there when they are aimed at a menu button; the button's own default action —
- * the click that opens its menu — is untouched.
- */
-export function keepRowMenuKeys(e: React.KeyboardEvent<HTMLElement>): void {
-  if (e.key !== 'Enter' && e.key !== ' ') return;
-  const target = e.target as HTMLElement | null;
-  if (!target || typeof target.closest !== 'function') return;
-  if (!target.closest('tbody')) return;
-  if (target.closest('button[aria-haspopup="menu"]')) e.stopPropagation();
-}
-
 /* --------------------------------- links --------------------------------- */
 
 export const customerHref = (id: string) => `/billing/customers/${id}`;
@@ -303,76 +283,16 @@ export function RecordLink({ to, children, mono }: { to: string; children: React
 /* -------------------------------- statuses ------------------------------- */
 
 /**
- * One label map for every status the revenue side of the product shows —
- * subscriptions, invoices, credit notes, dunning campaigns, grants, meters,
- * settlements and late arrivals alike. The revenue screens read it too, so a
- * grant that is "Scheduled" on the customer's page is "Scheduled" in the same
- * tone on the Credits screen, rather than a neutral pill there and an amber
- * chip here.
- *
- * Two rules it exists to keep. Casing is uniform, so a credit note never reads
- * a lowercase "void" beside an invoice's title-cased "Void". And the record's
- * word is the operator's word: the menu item says "Write it off", so the badge
- * says "Written off" rather than the wire value `uncollectible`.
+ * The lifecycle vocabulary is the design system's — `statusLabel`, `statusTone`
+ * and `StatusPill` in `@/client/design`. Billing wrote the first copy of it;
+ * revenue re-exported billing's and settings kept a third, so a word added for
+ * one screen reached two of the three. Re-exported here only so the screens
+ * that import it from this file keep one import list.
  */
-const STATUS_COPY: Record<string, string> = {
-  trialing: 'Trialing', active: 'Active', past_due: 'Past due', paused: 'Paused',
-  canceled: 'Canceled', unpaid: 'Unpaid', incomplete: 'Incomplete', incomplete_expired: 'Expired',
-  draft: 'Draft', open: 'Open', paid: 'Paid', void: 'Voided', voided: 'Voided', uncollectible: 'Written off',
-  issued: 'Issued', recovering: 'Recovering', recovered: 'Recovered', exhausted: 'Given up',
-  succeeded: 'Succeeded', failed: 'Failed', skipped: 'Skipped', pending: 'Pending',
-  scheduled: 'Scheduled', expired: 'Expired', settled: 'Settled', invoiced: 'Invoiced',
-  inactive: 'Inactive', archived: 'Archived',
-  credited: 'Credited', ignored: 'Ignored', rebilled: 'Rebilled', withdrawn: 'Withdrawn',
-  // A payment instruction's own states. `requires_payment_method` is where a
-  // declined intent goes — "Declined" is what happened, and calling it
-  // "Requires payment method" hides that money was refused.
-  requires_payment_method: 'Declined', requires_confirmation: 'Ready to present',
-  requires_action: 'Needs the cardholder', processing: 'With the bank',
-};
+export { statusLabel, StatusPill };
 
-export const statusLabel = (status: string): string => STATUS_COPY[status] ?? humanize(status);
-
-export function StatusPill({ status, title }: { status: string; title?: string }) {
-  const pill = <Badge tone={toneFor(status)} dot pill>{statusLabel(status)}</Badge>;
-  return title ? <Tooltip content={title}><span className="bl-pill">{pill}</span></Tooltip> : pill;
-}
-
-/** The billing words the shared status ramp does not already carry. */
-function toneFor(status: string): 'neutral' | 'success' | 'warning' | 'danger' | 'info' {
-  switch (status) {
-    case 'active': case 'paid': case 'succeeded': case 'recovered': case 'settled': case 'credited': case 'rebilled':
-      return 'success';
-    case 'trialing': case 'open': case 'issued': case 'processing': case 'scheduled': case 'invoiced':
-      return 'info';
-    case 'past_due': case 'paused': case 'incomplete': case 'requires_action': case 'recovering': case 'pending':
-      return 'warning';
-    case 'unpaid': case 'canceled': case 'uncollectible': case 'requires_payment_method': case 'failed':
-    case 'exhausted': case 'expired': case 'voided':
-      return 'danger';
-    default: return 'neutral';
-  }
-}
-
-/**
- * What a register said about a customer's tax number — a different vocabulary
- * from a record's lifecycle, and shared by the account page and Settings › Tax
- * so the same number never reads "Unverified" on one and "Register said no"
- * on the other.
- */
-export const TAX_ID_STATUS: Record<string, { label: string; tone: 'success' | 'warning' | 'danger' | 'neutral' }> = {
-  verified: { label: 'Verified', tone: 'success' },
-  pending: { label: 'Not checked', tone: 'neutral' },
-  unverified: { label: 'Register said no', tone: 'warning' },
-  unavailable: { label: 'Register silent', tone: 'neutral' },
-};
-
-export const taxIdStatusLabel = (status: string): string => TAX_ID_STATUS[status]?.label ?? humanize(status);
-
-export function TaxIdStatusPill({ status, title }: { status: string; title?: string }) {
-  const pill = <Badge tone={TAX_ID_STATUS[status]?.tone ?? 'neutral'} dot pill>{taxIdStatusLabel(status)}</Badge>;
-  return title ? <Tooltip content={title}><span className="bl-pill">{pill}</span></Tooltip> : pill;
-}
+/** The tax-register vocabulary is the kit's too; re-exported for this module's own import list. */
+export { TAX_ID_STATUS, TaxIdStatusPill, taxIdStatusLabel };
 
 /* ------------------------------ presentation ----------------------------- */
 
@@ -394,17 +314,7 @@ export function FieldRow({ label, children, hint }: { label: ReactNode; children
   );
 }
 
-export function SectionError({ error, path, onRetry }: { error: ApiClientError; path: string; onRetry: () => void }) {
-  return (
-    <ErrorState
-      title="That did not load"
-      message={error.body.message}
-      code={`${error.status} ${path}`}
-      requestId={error.body.request_id ?? null}
-      action={<Button size="sm" variant="primary" iconLeft={<Icons.refresh size={13} />} onClick={onRetry}>Try again</Button>}
-    />
-  );
-}
+export { SectionError };
 
 /**
  * The list's failure, rendered outside the grid.
@@ -708,15 +618,8 @@ export async function post<T>(path: string, body: unknown): Promise<T> {
   return api.post<T>(path, body);
 }
 
-/** The one loading figure the revenue screens share: the kit's spinner and a sentence. */
-export function Loading({ label }: { label: string }) {
-  return (
-    <Stack gap={4} align="center" className="bl-loading" role="status">
-      <Spinner size={18} />
-      <span className="bl-loading__label">{label}</span>
-    </Stack>
-  );
-}
+/** The kit's, re-exported so the screens importing it from here keep one import list. */
+export { Loading };
 
 /* ------------------------------ record tabs ------------------------------ */
 

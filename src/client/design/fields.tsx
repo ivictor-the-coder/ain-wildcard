@@ -829,14 +829,21 @@ export interface CopyFieldProps {
   label?: string;
   /** Mask the value until revealed — for API keys and other secrets. */
   secret?: boolean;
+  /**
+   * How much of the head stays legible while masked. The default suits a
+   * prefixed key (`sk_test_…`); an invitation link needs its address readable
+   * and only the token behind dots, or the masked form reads "http://••••".
+   */
+  maskAfter?: number;
   mono?: boolean;
   className?: string;
 }
 
-export function CopyField({ value, label = 'Copy', secret, mono = true, className }: CopyFieldProps) {
+export function CopyField({ value, label = 'Copy', secret, maskAfter = 7, mono = true, className }: CopyFieldProps) {
   const [copied, copy] = useCopyToClipboard();
   const [revealed, setRevealed] = useState(!secret);
-  const shown = revealed ? value : `${value.slice(0, 7)}${'•'.repeat(Math.max(4, Math.min(18, value.length - 7)))}`;
+  const head = Math.max(0, Math.min(maskAfter, value.length));
+  const shown = revealed ? value : `${value.slice(0, head)}${'•'.repeat(Math.max(4, Math.min(18, value.length - head)))}`;
   return (
     <div className={cx('ain-copyfield', !revealed && 'ain-copyfield--masked', className)}>
       <span className="ain-copyfield__value" style={mono ? undefined : { fontFamily: 'var(--font-sans)' }} title={revealed ? value : undefined}>

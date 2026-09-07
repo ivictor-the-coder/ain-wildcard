@@ -35,7 +35,8 @@ import { citationHref, citationResolution, dedupeCitations, needsProbe, writeTar
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { filterTools, tagLabel, toolSummary } from '../src/client/modules/copilot/tools-core';
-import { everyDay, integerTickCount } from '../src/client/modules/copilot/usage-core';
+import { everyDay } from '../src/client/modules/copilot/usage-core';
+import { niceTicks } from '../src/client/design/chart-core';
 import { threadErrorCopy } from '../src/client/modules/copilot/thread-core';
 import { spanDigest } from '../src/client/modules/copilot/trace-core';
 import {
@@ -1722,28 +1723,52 @@ const FOLLOWUP: AiApproval = {
   args: { record_id: 'cmp_nw_42', in_days: 7, note: 'Chase the signed MSA.' },
   preview: ['Follow-up on Aconcagua Alimentos', 'Due in 7 days', 'Assigned to you', 'Chase the signed MSA.'],
   reason: 'schedule_followup changes workspace data, so a person approves it before it runs.',
-  outcome: 'scheduled=true record_id=cmp_nw_42 due=1789219881805 note=Chase the signed MSA. idempotency_key=ai.followup:cmp_nw_42:1789219881805:1fe7ed30f32e8ae0',
+  outcome: 'scheduled=true record_id=cmp_nw_42 due=1789219881805 note=Chase the signed MSA. task_id=task_nw_8812 idempotency_key=ai.followup:cmp_nw_42:1789219881805:1fe7ed30f32e8ae0',
 };
 
 describe('a follow-up the copilot booked, not wrote', () => {
   it('is scheduled — its own outcome, neither written nor pending', () => {
     assert.equal(approvalOutcome(FOLLOWUP), 'scheduled');
-    assert.deepEqual(scheduledFollowup(FOLLOWUP), { recordId: 'cmp_nw_42', due: 1789219881805, note: 'Chase the signed MSA.' });
+    assert.deepEqual(scheduledFollowup(FOLLOWUP), {
+      recordId: 'cmp_nw_42', due: 1789219881805, note: 'Chase the signed MSA.', taskId: 'task_nw_8812',
+    });
+    // The tool hands back `task_id` only since it started creating the task; a
+    // booking read from before that carries none, and the card says so.
+    assert.equal(scheduledFollowup({ ...FOLLOWUP, outcome: FOLLOWUP.outcome!.replace(' task_id=task_nw_8812', '') })?.taskId, null);
     assert.equal(scheduledFollowup(NOTE_WRITE), null, 'a note that landed is not a booking');
     assert.equal(scheduledFollowup({ ...FOLLOWUP, status: 'pending', outcome: null }), null);
     assert.equal(approvalOutcome(NOTE_WRITE), 'written', 'a landed note is still written');
   });
 
-  it('says the day, the assignee, and that nothing is on the record yet', () => {
+  it('says the day, the assignee, and that the task is already there', () => {
+    // `schedule_followup` creates the task at once and writes the note when the
+    // job fires. "Nothing is on the record yet" was true of the note and false
+    // of the task a person can open and work today.
     const { text, raw } = outcomeSummary(FOLLOWUP, { when: () => 'Sep 12, 2026 (in 7 days)', assignee: 'you' });
     assert.equal(
       text,
       'Follow-up on Aconcagua Alimentos is booked for Sep 12, 2026 (in 7 days), assigned to you. '
-      + 'Nothing is on Aconcagua Alimentos’s timeline yet: the note “Chase the signed MSA.” is written there when it comes due.',
+      + 'The task is on Aconcagua Alimentos now; the note “Chase the signed MSA.” is written onto its timeline when it comes due.',
     );
     assert.doesNotMatch(text, /— written\./, 'the sentence the critic read');
     assert.equal(raw, FOLLOWUP.outcome, 'the wire line stays under “Show what ran”');
     assert.match(outcomeSummary(FOLLOWUP).text, /booked for 2026-09-12/, 'with no formatter the day is still a day, not a timestamp');
+
+    // A booking with no task behind it keeps the older, still-true sentence.
+    const taskless = { ...FOLLOWUP, outcome: FOLLOWUP.outcome!.replace(' task_id=task_nw_8812', '') };
+    assert.match(outcomeSummary(taskless, { when: () => 'Sep 12, 2026' }).text, /Nothing is on Aconcagua Alimentos’s timeline yet/);
+  });
+
+  it('links the task on the resolution card, not only the record it hangs off', () => {
+    const source = readFileSync(join(MODULES, 'copilot', 'trace.tsx'), 'utf8');
+    assert.match(source, /booked\?\.taskId \? \[booked\.taskId\] : \[\]/, 'the task joins the chips');
+    assert.match(source, /'The follow-up task'/);
+    // …and the record chip beside it keeps its name: `writtenToLabel` falls back
+    // to the raw id whenever the write named more than one target, so the task
+    // must not be counted as one.
+    assert.match(source, /writtenToLabel\(approval, id, written\.length\)/);
+    const citations = readFileSync(join(MODULES, 'copilot', 'citations.ts'), 'utf8');
+    assert.match(citations, /task: 'task'/, 'and a task id resolves to a screen');
   });
 
   it('badges the turn and the run as scheduled, in the info tone', () => {
@@ -2022,15 +2047,18 @@ describe('a trace step, in words', () => {
 /* ============ NIT · the usage chart’s ticks read 0, 3, 5, 8, 10, 13 ======== */
 
 describe('the usage chart’s ticks', () => {
-  it('asks for a count whose step is a whole credit', () => {
-    // 12 credits on five ticks steps at 2.5 — 0, 2.5, 5, 7.5, 10, 12.5 — and
-    // the axis rounds each to "0, 3, 5, 8, 10, 13". Four ticks step at 5.
-    assert.equal(integerTickCount(12), 4);
-    assert.equal(integerTickCount(20), 5);
-    assert.equal(integerTickCount(7), 5);
-    assert.equal(integerTickCount(9), 3);
-    assert.equal(integerTickCount(0), 5, 'nothing charged, the default');
+  it('asks the kit for whole-credit ticks rather than computing a count of its own', () => {
+    // 12 credits on five ticks used to step at 2.5 — 0, 2.5, 5, 7.5, 10, 12.5 —
+    // and the axis rounded each to "0, 3, 5, 8, 10, 13". The module carried its
+    // own `integerTickCount` to dodge it; `niceTicks` takes `integer` now, so
+    // the chart is asked directly and the module holds no second rule.
+    assert.deepEqual(niceTicks(0, 12, 5, { integer: true }), [0, 2, 4, 6, 8, 10, 12]);
+    assert.deepEqual(niceTicks(0, 7, 5, { integer: true }), [0, 2, 4, 6, 8]);
+    assert.ok(niceTicks(0, 9, 5, { integer: true }).every(Number.isInteger), 'every tick is a whole credit');
     const runsSource = readFileSync(join(MODULES, 'copilot', 'runs.tsx'), 'utf8');
-    assert.match(runsSource, /yTickCount=\{integerTickCount\(/, 'the chart is asked for it');
+    assert.match(runsSource, /\n\s+integer\n/, 'the chart is asked for it');
+    assert.doesNotMatch(runsSource, /integerTickCount/, 'and the workaround is gone');
+    const usageCore = readFileSync(join(MODULES, 'copilot', 'usage-core.ts'), 'utf8');
+    assert.doesNotMatch(usageCore, /integerTickCount|niceStep/);
   });
 });

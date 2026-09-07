@@ -19,7 +19,7 @@ import {
   AlertTriangleIcon, ArrowRightIcon,
 } from '../../design';
 import {
-  EmptyBody, ExportCsvButton, LiveNumberInput, Loading, SectionError, StatusChip, csvAmount,
+  EmptyBody, ExportCsvButton, LiveNumberInput, Loading, SectionError, StatusPill, csvAmount,
   csvInstant, moneyIn, useUrlTableState, visibleRows,
   type CsvColumn,
 } from './common';
@@ -203,7 +203,7 @@ export function DunningPage() {
         )),
       width: 150,
     },
-    { id: 'status', header: 'Status', accessor: (row) => row.status, filter: 'set', cell: (row) => <StatusChip status={row.status} />, width: 124 },
+    { id: 'status', header: 'Status', accessor: (row) => row.status, filter: 'set', cell: (row) => <StatusPill status={row.status} />, width: 124 },
     {
       id: 'attempts', header: 'Attempts', align: 'right', accessor: (row) => row.attempt_count,
       cell: (row) => (
@@ -713,7 +713,7 @@ function CampaignDrawer({
                         : subscription.error ? 'Could not be read' : '…'}
                     </span>
                     {(row.subscription_status || subscription.data?.status) && (
-                      <StatusChip status={row.subscription_status ?? subscription.data?.status ?? ''} />
+                      <StatusPill status={row.subscription_status ?? subscription.data?.status ?? ''} />
                     )}
                     <Button size="sm" variant="ghost" iconRight={<ArrowRightIcon size={13} />} onClick={() => navigate(`/billing/subscriptions/${row.subscription}`)}>Open</Button>
                   </Inline>

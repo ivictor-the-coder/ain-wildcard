@@ -258,7 +258,7 @@ function Home() {
           value={f.number(billing.data.renewing_next_30_days)}
           icon={<Glyph name="calendar-check" />}
           caption={billing.data.delinquent_customers
-            ? `${f.number(billing.data.delinquent_customers)} accounts are past due`
+            ? `${f.plural(billing.data.delinquent_customers, 'account')} ${billing.data.delinquent_customers === 1 ? 'is' : 'are'} past due`
             : 'No account is past due'}
         />,
       });
@@ -341,8 +341,16 @@ function Home() {
     }, {
       id: 'team',
       label: 'Teammates invited',
-      detail: `${session.me?.teammates.length ?? 0} people can sign in to this workspace.`,
-      done: (session.me?.teammates.length ?? 0) > 1,
+      // An invited seat is not somebody who can sign in — the link is still in
+      // an inbox — so it is counted as what it is rather than as a colleague.
+      detail: (() => {
+        const seats = session.me?.teammates ?? [];
+        const active = seats.filter((mate) => mate.status !== 'invited').length;
+        const invited = seats.length - active;
+        const waiting = invited === 1 ? '1 invitation is still open' : `${invited} invitations are still open`;
+        return `${f.plural(active, 'person')} can sign in to this workspace${invited ? `, and ${waiting}` : ''}.`;
+      })(),
+      done: (session.me?.teammates ?? []).filter((mate) => mate.status !== 'invited').length > 1,
       to: firstRegistered(routePaths, ['/settings/team', '/settings/users']) ?? undefined,
     }];
     if (catalog.data) list.push({

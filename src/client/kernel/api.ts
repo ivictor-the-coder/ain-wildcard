@@ -135,8 +135,17 @@ let authLoss: AuthLoss | null = null;
 let rateLimited: RateLimited | null = null;
 let networkFailure: NetworkFailure | null = null;
 
-/** `/v1/health` answers signed out, so its 401 would never mean anything. */
-const PUBLIC_PATH = /\/v1\/health(\?|$)/;
+/**
+ * Routes the server serves without a session, so a 401 from one of them says
+ * nothing about the session — and, just as importantly, a *held* auth loss
+ * must not short-circuit them. `/accept?token=…` is opened by someone who has
+ * no session by definition; with the invitation lookup missing from this set,
+ * the 401 from `/v1/me` on that page was stamped straight into its cache entry
+ * and every invitation read "This link cannot be used" without a request ever
+ * leaving the browser. Sign-in and sign-out are deliberately *not* here: one
+ * getting through is the proof the session is back.
+ */
+const PUBLIC_PATH = /\/v1\/health(\?|$)|\/v1\/auth\/invitations\//;
 /** A wrong password is a 401 about that form, not about the session. */
 const AUTH_PATH = /\/v1\/auth\//;
 

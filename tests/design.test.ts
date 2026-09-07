@@ -22,7 +22,7 @@ import {
   type ColumnFilter, type FilterMap, type KeyTarget,
 } from '../src/client/design/table-core';
 import { contrastGrade, contrastRatio, parseColor, relativeLuminance } from '../src/client/design/color';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { computePosition, repositionFloating, type FloatingElement } from '../src/client/design/position';
 import {
   addDays, addMonths, monthMatrix, nextRange, RANGE_PRESETS, startOfMonthUtc, weekdayLabels,
@@ -1498,12 +1498,55 @@ describe('the kit owns the pieces three modules copied', () => {
     assert.equal(statusTone('nonsense'), 'neutral');
   });
 
-  it('carries every word the billing module’s map carries, spelled the same', () => {
-    const billing = readFileSync(new URL('../src/client/modules/billing/common.tsx', import.meta.url), 'utf8');
-    const block = /const STATUS_COPY: Record<string, string> = \{([\s\S]*?)\n\};/.exec(billing)?.[1] ?? '';
-    const pairs = [...block.matchAll(/(\w+): '([^']+)'/g)];
-    assert.ok(pairs.length >= 30, 'the billing map was read');
-    for (const [, key, label] of pairs) assert.equal(STATUS_COPY[key], label, key);
+  it('exports one Loading figure, so a card in one module and a dialog in the next spin the same', () => {
+    assert.match(designSource('feedback.tsx'), /export function Loading\(\{ label, size = 16, className \}: LoadingProps\)/);
+    assert.match(designSource('feedback.css'), /\.ain-loading \{/);
+  });
+
+  /**
+   * The guard, not the migration. Billing owned the status vocabulary, revenue
+   * re-exported billing's under a third name and settings kept a private
+   * SectionError; a word added for one screen reached one of the three. No
+   * module may declare any of these again.
+   */
+  it('no module declares a status vocabulary, a status pill, a failed-read panel or a loading figure of its own', () => {
+    const modulesDir = new URL('../src/client/modules/', import.meta.url);
+    const offences: string[] = [];
+    const banned: [RegExp, string][] = [
+      // Any spelling of a lifecycle label or tone map — `STATUS_COPY`,
+      // `SCHEDULE_STATUS_COPY`, `scheduleStatusTone`, `STATUS_LABEL`.
+      [/^\s*(?:export\s+)?const \w*STATUS_(?:COPY|LABEL|TONE)\b/m, 'a status label or tone map'],
+      [/^\s*(?:export\s+)?const \w*[Ss]tatus(?:Tone|Copy|Label)\s*[:=]/m, 'a status label or tone map'],
+      [/^\s*(?:export\s+)?const TAX_ID_STATUS\b/m, 'a tax-register label map'],
+      [/^\s*(?:export\s+)?function (?:StatusPill|StatusChip|TaxIdStatusPill)\b/m, 'a status pill'],
+      [/^\s*(?:export\s+)?function SectionError\b/m, 'a failed-read panel'],
+      [/^\s*(?:export\s+)?function Loading\b/m, 'a loading figure'],
+    ];
+    for (const dir of readdirSync(modulesDir)) {
+      if (dir === 'design-lab') continue; // the style guide draws the kit's own pieces to show them
+      for (const file of readdirSync(new URL(`${dir}/`, modulesDir))) {
+        if (!/\.tsx?$/.test(file)) continue;
+        const text = readFileSync(new URL(`${dir}/${file}`, modulesDir), 'utf8');
+        for (const [pattern, what] of banned) {
+          if (pattern.test(text)) offences.push(`${dir}/${file} declares ${what}`);
+        }
+      }
+    }
+    assert.deepEqual(offences, []);
+  });
+
+  it('every module that shows one takes it from the kit, under the kit’s name', () => {
+    const modulesDir = new URL('../src/client/modules/', import.meta.url);
+    for (const dir of readdirSync(modulesDir)) {
+      for (const file of readdirSync(new URL(`${dir}/`, modulesDir))) {
+        if (!/\.tsx?$/.test(file)) continue;
+        const text = readFileSync(new URL(`${dir}/${file}`, modulesDir), 'utf8');
+        // In code, not in a comment recording why the name is gone.
+        assert.ok(!/<StatusChip|StatusChip[,}]|as StatusChip/.test(text), `${dir}/${file} still calls the status pill a chip`);
+      }
+    }
+    const revenue = readFileSync(new URL('../src/client/modules/revenue/common.tsx', import.meta.url), 'utf8');
+    assert.match(revenue, /export \{ Loading, SectionError, StatusPill \} from '\.\.\/\.\.\/design';/);
   });
 });
 

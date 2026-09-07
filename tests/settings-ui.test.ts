@@ -379,11 +379,36 @@ describe('the time machine screen renders counts only through the tally', () => 
 describe('what the settings screens say', () => {
   const read = (file: string) => readFileSync(`src/client/modules/settings/${file}`, 'utf8');
 
-  it('the invitation no longer promises a sign-in the platform cannot give', () => {
+  it('the invitation is an invitation: a one-time link, shown once, with a screen that redeems it', () => {
+    // The screen used to say the platform had "no invitation link, no password
+    // route and no accept step". All three exist; leaving that sentence up was
+    // the loudest false thing in Settings.
     const team = read('team.tsx');
-    assert.ok(!team.includes('join this workspace immediately'), 'the false promise is gone');
-    assert.ok(/cannot sign in/.test(team), 'the dialog says they cannot sign in');
-    assert.ok(/no invitation link, no password route/.test(team), 'and says why');
+    assert.ok(!team.includes('join this workspace immediately'), 'the old false promise is gone');
+    assert.ok(!/cannot sign in/.test(team), 'and so is the newer one');
+    assert.ok(!/no invitation link, no password route/.test(team));
+    assert.ok(/invitationUrl/.test(team) && /\/accept\?token=/.test(team), 'the dialog builds the real link');
+    assert.ok(/CopyField/.test(team) && /secret/.test(team), 'shown the way a secret is shown');
+    assert.ok(/acknowledged/.test(team), 'and acknowledged before the dialog will close');
+    assert.ok(/reinvite/.test(team), 'a fresh link can be minted');
+    const accept = readFileSync('src/client/kernel/accept.tsx', 'utf8');
+    assert.ok(/\/v1\/auth\/accept/.test(accept) && /v1\/auth\/invitations/.test(accept));
+    const routes = readFileSync('src/client/kernel/routes.tsx', 'utf8');
+    assert.ok(/path: '\/accept'[\s\S]*?layout: 'bare'/.test(routes), 'and it is public — the invitee has no session');
+  });
+
+  it('the roster shows the invited state everywhere it lists people', () => {
+    const team = read('team.tsx');
+    assert.ok(/id: 'status'/.test(team) && /<StatusPill\s+status=\{row\.status\}/.test(team), 'the seat column');
+    assert.ok(/Invitation lapsed|Link expires/.test(team), '“Never signed in” is not what an invited seat reads');
+    for (const [file, needle] of [
+      ['../crm/values.tsx', /status === 'invited'/],
+      ['../crm/record.tsx', /status === 'invited'/],
+      ['../pipeline/deals.tsx', /status === 'invited'/],
+      ['../home/routes.tsx', /status !== 'invited'/],
+    ] as const) {
+      assert.match(read(file), needle, `${file} knows an invited seat is not a colleague yet`);
+    }
   });
 
   it('the roster sorts the role column by rank, not by the alphabet', () => {
@@ -407,10 +432,19 @@ describe('what the settings screens say', () => {
     }
   });
 
-  it('the frame shields Enter on a row menu from the grid’s row handler', () => {
+  it('leaves Enter on a row menu to the grid, which now answers it correctly itself', () => {
+    // The frame used to stop that keystroke in the capture phase because
+    // `DataTable` answered Enter for every keydown that bubbled to its body,
+    // including the one aimed at the row's "…" button. The grid reads
+    // `keyBelongsToControl` now, so a second guard over it is one more thing
+    // that can disagree.
     const common = read('common.tsx');
-    assert.ok(common.includes('export function shieldsRowMenuEnter'), 'the predicate exists');
-    assert.ok(/onKeyDownCapture=\{\(event\) => \{ if \(shieldsRowMenuEnter\(event\)\) event\.stopPropagation\(\); \}\}/.test(common), 'the frame applies it in the capture phase');
+    assert.ok(!common.includes('shieldsRowMenuEnter'), 'the workaround is gone');
+    assert.ok(!/onKeyDownCapture/.test(common), 'and the frame captures nothing');
+    const table = readFileSync(new URL('../src/client/design/table-core.ts', import.meta.url), 'utf8');
+    assert.match(table, /export function keyBelongsToControl/, 'the kit owns the rule');
+    const grid = readFileSync(new URL('../src/client/design/table.tsx', import.meta.url), 'utf8');
+    assert.match(grid, /if \(keyBelongsToControl\(e\.key, e\.target as Element \| null\)\) return;/);
   });
 
   it('every dialog with fields submits on Enter through DialogForm', () => {

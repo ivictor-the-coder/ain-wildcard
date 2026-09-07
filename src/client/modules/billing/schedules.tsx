@@ -26,7 +26,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { api, useQuery } from '../../kernel/api';
 import {
   Badge, Banner, Button, Card, ConfirmDialog, Divider, Field, Grid, GridItem, Icons, Inline, Modal,
-  NumberInput, Select, Stack, Textarea, humanize,
+  NumberInput, Select, Stack, StatusPill, Textarea, humanize,
 } from '../../design';
 import {
   DialogFields, FieldRow, Loading, PreviewFailure, SectionError, idem, useAction, useBillingFormat, useDialogForm,
@@ -34,22 +34,10 @@ import {
 } from './common';
 import { useActivePrices } from './subscriptions';
 import type {
-  CatalogEstimate, Price, ScheduleStatus, SchedulePhase, Subscription, SubscriptionSchedule,
+  CatalogEstimate, Price, SchedulePhase, Subscription, SubscriptionSchedule,
 } from './types';
 
 /* ------------------------------- shared bits ------------------------------ */
-
-const scheduleStatusTone: Record<ScheduleStatus, 'success' | 'info' | 'neutral' | 'warning'> = {
-  active: 'success', not_started: 'info', completed: 'neutral', released: 'neutral', canceled: 'warning',
-};
-
-const SCHEDULE_STATUS_COPY: Record<ScheduleStatus, string> = {
-  not_started: 'Not started',
-  active: 'Running',
-  completed: 'Completed',
-  released: 'Released',
-  canceled: 'Canceled',
-};
 
 /** What the schedule does when the last phase ends, as a sentence. */
 const endBehaviorCopy = (schedule: SubscriptionSchedule): string =>
@@ -130,7 +118,7 @@ export function ScheduleTab({ scheduleId, subscription }: { scheduleId: string; 
         <div className="bl-schedmeta">
           <FieldRow label="Status">
             <Inline gap={3}>
-              <Badge tone={scheduleStatusTone[data.status] ?? 'neutral'} dot pill>{SCHEDULE_STATUS_COPY[data.status] ?? humanize(data.status)}</Badge>
+              <StatusPill status={data.status} />
               {data.status === 'not_started' && data.starts_in_days > 0 && (
                 <span className="bl-sub">{`Starts ${f.day(data.start_date)} — in ${data.starts_in_days === 1 ? 'a day' : `${data.starts_in_days} days`}.`}</span>
               )}

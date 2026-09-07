@@ -49,19 +49,6 @@ export const QUIET_COPY = `Nothing in the last ${OVERVIEW_WINDOW_DAYS} days`;
 export const NEVER_COPY = 'Never — nothing has arrived';
 
 /**
- * "46 days ago", where the design system's relative time says "2 months ago".
- * Under a week the coarse form is right ("3 days ago"); past a quarter, months
- * are the honest unit. In between, a meter that went quiet 46 days ago is a
- * different fact from one that went quiet 75 days ago, and both read
- * "2 months ago". Null means: use the ordinary relative form.
- */
-export function daysAgoCopy(at: number, now: number): string | null {
-  const days = Math.floor((now - at) / DAY_MS);
-  if (days < 7 || days >= 90) return null;
-  return `${days} days ago`;
-}
-
-/**
  * "43.68 GBs" is what a plural rule does to a unit symbol. A short label
  * carrying a capital — GB, MB, kWh, API — is an abbreviation, and abbreviations
  * do not inflect; "events", "seats" and "robots" still do.

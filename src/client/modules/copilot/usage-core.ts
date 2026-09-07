@@ -36,32 +36,3 @@ export function everyDay(
   }
   return out;
 }
-
-/**
- * The axis step the chart will choose for a domain, mirroring the design
- * system's own rule: a human step of 1, 2, 2.5 or 5 × 10ⁿ.
- */
-const niceStep = (max: number, count: number): number => {
-  const rough = Math.max(max, 1) / Math.max(1, count);
-  const magnitude = 10 ** Math.floor(Math.log10(rough));
-  const normalised = rough / magnitude;
-  return (normalised >= 5 ? 10 : normalised >= 2.5 ? 5 : normalised >= 1.5 ? 2.5 : normalised >= 1.2 ? 2 : 1) * magnitude;
-};
-
-/**
- * How many ticks to ask the chart for, so every one is a whole number.
- *
- * Credits are integers, and a 12-credit day drawn on five ticks stepped at 2.5
- * read "0, 3, 5, 8, 10, 13" once each tick was rounded for the axis. The step
- * is a property of the domain and the count together, so the count is chosen
- * to make it whole; five ticks when five happen to be whole, otherwise the
- * nearest count that is.
- */
-export function integerTickCount(max: number, preferred = 5): number {
-  if (!Number.isFinite(max) || max <= 0) return preferred;
-  for (const count of [preferred, preferred - 1, preferred + 1, preferred - 2, preferred + 2]) {
-    if (count < 2) continue;
-    if (Number.isInteger(niceStep(max, count))) return count;
-  }
-  return preferred;
-}

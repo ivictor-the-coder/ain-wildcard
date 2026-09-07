@@ -10,7 +10,7 @@
  * on the page rather than an assumption inside it.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { useQuery, type ApiClientError, type ListEnvelope, type QueryResult } from '../../kernel/api';
+import { useQuery, type ListEnvelope, type QueryResult } from '../../kernel/api';
 import { useRouter, useSearchParam } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
 import {
@@ -106,14 +106,13 @@ export const unitNoun = (count: number, label: string | null | undefined): strin
 /* --------------------------------- states --------------------------------- */
 
 /**
- * The loading figure, the failed-read panel and the status pill are the
- * billing module's. This surface used to draw its own three — "This did not
- * load" beside billing's "That did not load", the request path in the sentence
- * rather than under it, a small square chip where every other revenue screen
- * shows a pill — and a person reading a grant on the customer page and again
- * on Credits met two products.
+ * The loading figure, the failed-read panel and the status pill are the design
+ * system's. Revenue drew its own three, then re-exported billing's under a
+ * third name — `StatusChip` — so the same lifecycle word was a "pill" on one
+ * screen and a "chip" on the next, and the two teams reading them believed
+ * they were looking at two components. One name, one place.
  */
-export { Loading, SectionError, StatusPill as StatusChip } from '../billing/common';
+export { Loading, SectionError, StatusPill } from '../../design';
 
 export function ChartSkeleton({ height = 240 }: { height?: number }) {
   return (
@@ -696,12 +695,6 @@ export function useTabParam<T extends string>(
 export function moneyAxis(f: Formatter, currency: string, values: number[]): (value: number) => string {
   const code = (currency || f.currency).toLowerCase();
   const finite = values.filter((value) => Number.isFinite(value));
-  // An all-zero series gives the chart a 0–1 domain in minor units, and five
-  // gridlines reading "$0.01 $0.01 $0.01 $0 $0". Nothing on that axis is a
-  // figure, so every tick reads as the zero it is.
-  if (finite.every((value) => value === 0)) {
-    return () => formatMoney(0, { locale: f.locale, currency: code, compact: true, trimZeroFraction: true });
-  }
   const ticks = niceTicks(Math.min(0, ...finite), Math.max(0, ...finite), 5);
   const distinct = new Set(ticks).size;
   const candidates: ((value: number) => string)[] = [

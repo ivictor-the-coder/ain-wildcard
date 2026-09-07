@@ -61,12 +61,13 @@ export function citationHref(citation: Citation): string | null {
 /**
  * Whether a chip's record has to be asked about before it is drawn as a link.
  *
- * The metering module cites the customer id its events carry, and its seed
- * meters accounts billing never created: `cus_nw_pemberton` streams 21 million
- * events and answers 404 at `/v1/customers/cus_nw_pemberton`. A billing chip
- * is the one kind of citation whose id can come from a module other than the
- * one that owns the screen, so those are checked; a CRM record is cited by the
- * module that holds it.
+ * A billing chip is the one kind of citation whose id can come from a module
+ * other than the one that owns the screen — the metering module cites whatever
+ * customer id its events carry, which need not be a customer billing holds. So
+ * those are asked about before they are drawn as links; a CRM record is cited
+ * by the module that holds it and needs no probe. Every meter customer in this
+ * workspace is a real billing customer today; the probe is what keeps that
+ * from being an assumption.
  */
 export const needsProbe = (citation: Citation): boolean => citation.type === 'customer';
 
@@ -111,10 +112,14 @@ export const CITATION_ICON: Record<string, string> = {
   meter: 'gauge',
   price: 'tag',
   product: 'tag',
+  task: 'check-circle',
 };
 
 
-const ID_PREFIX: Record<string, string> = { cmp: 'company', con: 'contact', deal: 'deal', tkt: 'ticket' };
+// `task` is here because a booked follow-up creates one immediately and hands
+// back its id: the chip on the resolution card opens the task a person works
+// today, not the note that lands on the timeline next week.
+const ID_PREFIX: Record<string, string> = { cmp: 'company', con: 'contact', deal: 'deal', tkt: 'ticket', task: 'task' };
 
 /** The records a queued write names, so the conversation can link to them. */
 export function writeTargets(args: Record<string, unknown>): string[] {

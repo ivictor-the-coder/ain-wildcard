@@ -4,6 +4,10 @@ import { api, invalidate, useAuthLoss, useQuery, type ApiClientError, type AuthL
 export interface SessionUser {
   id: string; email: string; name: string; avatar_url: string | null; title: string | null;
 }
+
+/** A seat is `invited` until the person redeems their link and sets a password. */
+export type SeatStatus = 'invited' | 'active';
+
 export interface SessionOrg {
   id: string; name: string; slug: string; domain: string | null; logo_url: string | null;
   brand_color: string; default_currency: string; timezone: string; locale: string;
@@ -15,7 +19,7 @@ export interface Me {
   auth_kind: string;
   org: SessionOrg;
   clock: { kind: string; offset_ms: number; now: number };
-  teammates: (SessionUser & { role: string })[];
+  teammates: (SessionUser & { role: string; status: SeatStatus })[];
 }
 
 export type Theme = 'light' | 'dark' | 'system';

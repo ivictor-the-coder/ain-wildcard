@@ -23,7 +23,7 @@ import {
 import { ApprovalQueue, CitationChips, ReasoningList, RunFacts, TraceSteps } from './trace';
 import { EngineIndicator, RefusalHelp, SlotChips } from './card';
 import { filterTools, tagLabel, toolSummary } from './tools-core';
-import { dayStart, everyDay, integerTickCount } from './usage-core';
+import { dayStart, everyDay } from './usage-core';
 
 /** How many runs one read of the log brings back, and how far each “show more” goes. */
 const PAGE = 100;
@@ -606,7 +606,7 @@ function UsagePanel() {
                 categories={days.map((row) => f.date(dayStart(row.key), { timeZone: 'UTC' }))}
                 series={[{ id: 'credits', label: 'Credits', values: days.map((row) => row.credits) }]}
                 valueFormat={(value) => f.number(value)}
-                yTickCount={integerTickCount(Math.max(0, ...days.map((row) => row.credits)))}
+                integer
                 legend={false}
                 height={200}
               />

@@ -21,7 +21,7 @@ import {
 import { AlertTriangleIcon, ArrowUpRightIcon } from '../../design';
 import {
   BookFooter, DialogFields, EmptyList, FieldRow, InlineEdit, ListFailure, LoadFailedEmpty, Loading,
-  balanceWords, copyFormat, csvAmount, csvDay, ExportCsvButton, invoiceClockNote, keepRowMenuKeys, useBookTotal,
+  balanceWords, copyFormat, csvAmount, csvDay, ExportCsvButton, invoiceClockNote,  useBookTotal,
   MoneyRangeFilter, MoneyTotals, RecordLink, RecordMissing, SectionError, StatusPill, TableSearch, customerHref,
   decodeRange, encodeRange, idem, invoiceHref, matchesRange, moneyRank, prorationCopy, rangeActive, subscriptionHref,
   totalsByCurrency, useAction, useBillingFormat, useBookList, useCurrencyChoices, useDebounced, useDialogForm,
@@ -264,7 +264,7 @@ export function CustomersPage() {
           </Banner>
         )}
         {book.error && <ListFailure error={book.error} path="GET /v1/customers" onRetry={book.retry} />}
-        <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'} onKeyDownCapture={keepRowMenuKeys}>
+        <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'}>
         <DataTable
           /* The grid decides which columns start hidden once, on its first
              render. The revenue columns only exist after `/v1/system/map`

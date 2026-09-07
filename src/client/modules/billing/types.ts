@@ -329,6 +329,38 @@ export interface CreditNote {
   routing_detail: string;
 }
 
+/**
+ * A line written by hand for a customer's next bill — a commissioning day, an
+ * amount agreed on the phone, a goodwill credit. It waits until a bill is
+ * raised for that customer and lands on it, taxed at their own rate.
+ *
+ * `GET /v1/customers/:id/pending_items` does *not* carry these: it reports what
+ * a subscription has priced and nothing else. So a screen that shows what the
+ * next invoice will hold has to read both lists.
+ */
+export interface InvoiceItem {
+  object: 'invoice_item';
+  id: string;
+  customer: string;
+  subscription: string | null;
+  description: string;
+  quantity: number;
+  unit_amount: number;
+  amount: number;
+  currency: string;
+  tax_behavior: string;
+  period: { start: number; end: number };
+  status: 'pending' | 'invoiced' | 'withdrawn';
+  invoice: string | null;
+  created: number;
+  updated: number;
+  customer_name: string | null;
+  invoice_number: string | null;
+  amount_display: string;
+  unit_amount_display: string;
+  status_detail: string;
+}
+
 export interface PendingItem {
   object: 'pending_invoice_item';
   id: string;

@@ -19,9 +19,9 @@ import { api, invalidate, useQuery, type ApiClientError, type ListEnvelope } fro
 import { useNavigate, useSearchParam } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
 import {
-  Badge, Banner, Button, Card, ConfirmDialog, DataTable, Drawer, EmptyState, Icons, Inline, KeyValue,
-  Stat, Stack, Tabs, Tooltip,
-  useFormat, useToast,
+  Banner, Button, Card, ConfirmDialog, DataTable, Drawer, EmptyState, Icons, Inline, KeyValue,
+  Stat, Stack, StatusPill, Tabs, Tooltip,
+  statusLabel, useFormat, useToast,
   type DataTableColumn, type TabDef,
 } from '../../design';
 import { JsonBlock, ListFailure, SettingsShell } from './common';
@@ -33,13 +33,6 @@ const PAGE = 200;
 
 const STATUSES: JobStatus[] = ['pending', 'running', 'failed', 'done', 'cancelled'];
 
-const STATUS_TONE: Record<JobStatus, 'info' | 'warning' | 'danger' | 'success' | 'neutral'> = {
-  pending: 'info', running: 'warning', failed: 'danger', done: 'success', cancelled: 'neutral',
-};
-
-const STATUS_LABEL: Record<JobStatus, string> = {
-  pending: 'Pending', running: 'Running', failed: 'Failed', done: 'Done', cancelled: 'Cancelled',
-};
 
 export function JobsPage() {
   const f = useFormat();
@@ -111,7 +104,7 @@ export function JobsPage() {
 
   const tabs: TabDef<JobStatus>[] = STATUSES.map((status) => ({
     id: status,
-    label: STATUS_LABEL[status],
+    label: statusLabel(status),
     count: status === 'pending' ? pendingTotal : (byStatus[status].data?.data.length ?? 0),
   }));
 
@@ -162,7 +155,7 @@ export function JobsPage() {
       header: 'Status',
       width: 130,
       accessor: (row) => row.status,
-      cell: (row) => <Badge tone={STATUS_TONE[row.status]} pill dot>{STATUS_LABEL[row.status]}</Badge>,
+      cell: (row) => <StatusPill status={row.status} />,
     },
     {
       id: 'last_error',
@@ -279,7 +272,7 @@ export function JobsPage() {
             rows={rows}
             columns={columns}
             getRowId={(row) => row.id}
-            caption={`${STATUS_LABEL[tab]} jobs`}
+            caption={`${statusLabel(tab)} jobs`}
             loading={current.loading}
             searchable
             searchPlaceholder="Search by handler, idempotency key or error"
@@ -361,7 +354,7 @@ export function JobsPage() {
         onClose={() => setOpen(null)}
         size="md"
         title={open?.type ?? ''}
-        description={open ? `${STATUS_LABEL[open.status]} · scheduled for ${f.dateTime(open.run_at)}` : undefined}
+        description={open ? `${statusLabel(open.status)} · scheduled for ${f.dateTime(open.run_at)}` : undefined}
       >
         {open && (
           <Stack gap={6}>
@@ -369,7 +362,7 @@ export function JobsPage() {
               <Stack gap={3}>
                 <KeyValue label="Job id" value={<span className="st-mono">{open.id}</span>} />
                 <KeyValue label="Handler" value={<span className="st-mono">{open.type}</span>} />
-                <KeyValue label="Status" value={<Badge tone={STATUS_TONE[open.status]} pill dot>{STATUS_LABEL[open.status]}</Badge>} />
+                <KeyValue label="Status" value={<StatusPill status={open.status} />} />
                 <KeyValue label="Runs at" value={f.dateTime(open.run_at)} />
                 <KeyValue label="Attempts" value={`${f.number(open.attempts)} of ${f.number(open.max_attempts)}`} />
                 <KeyValue label="Enqueued" value={f.dateTime(open.created)} />

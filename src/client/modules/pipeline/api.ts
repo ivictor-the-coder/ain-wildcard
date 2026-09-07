@@ -114,6 +114,12 @@ export interface WorkspaceUser {
   title: string | null;
   avatar_url: string | null;
   role: string;
+  /**
+   * `invited` until the person redeems their invitation link. A seat in that
+   * state can own a record — the CRM will assign to it — but nobody is reading
+   * the queue, so every picker that offers it says so.
+   */
+  status: 'invited' | 'active';
 }
 
 export interface TimelineItem {

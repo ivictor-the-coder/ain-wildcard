@@ -13,13 +13,13 @@ import {
   Badge, Banner, BarChart, Button, Card, DataTable, DatePicker, DescriptionList, Drawer,
   EmptyState, Field, Grid, Icons, Inline, Input, Modal, Page, Section,
   SegmentedControl, Select, Skeleton, Spinner, Stack, Stat, formatNumber, humanize, pluralize,
-  useDebouncedValue, useFormat, useToast,
+  statusLabel, useDebouncedValue, useFormat, useToast,
   type DataTableColumn, type MenuSection,
   AlertTriangleIcon, ArrowRightIcon, CreditCardIcon, RotateCcwIcon,
 } from '../../design';
 import {
   BasisNote, ChartSkeleton, CurrencyControl, CustomerName, EmptyBody, ExportCsvButton, LiveMoneyInput,
-  LiveNumberInput, Loading, RangeControl, SectionError, StatusChip, boundaryDate, boundaryRange,
+  LiveNumberInput, Loading, RangeControl, SectionError, StatusPill, boundaryDate, boundaryRange,
   csvAmount, csvDay, csvInstant, moneyAxis, monthLabel, moneyIn, rateText, signedMoneyIn, unitNoun,
   units, useCustomerNames, useDefaultCurrency, useRevenueRange, useSticky, useTabParam,
   useUrlTableState, visibleRows,
@@ -65,7 +65,9 @@ function grantBreakdown(grants: CreditGrant[], total: number): string {
   for (const grant of grants) counts.set(grant.status, (counts.get(grant.status) ?? 0) + 1);
   const parts = GRANT_STATES
     .filter((state) => (counts.get(state) ?? 0) > 0)
-    .map((state) => `${counts.get(state)} ${state}`);
+    // The wire word, not the reader's: the tile counted "1 exhausted" over a
+    // table whose pill for that same grant reads "Given up". One vocabulary.
+    .map((state) => `${counts.get(state)} ${statusLabel(state).toLowerCase()}`);
   if (!parts.length) return 'none issued yet';
   const counted = [...counts.values()].reduce((sum, n) => sum + n, 0);
   // The list read is capped; say so rather than print a breakdown of a subset
@@ -145,7 +147,7 @@ export function CreditsPage() {
       ),
       width: 260,
     },
-    { id: 'status', header: 'Status', accessor: (row) => row.status, filter: 'set', cell: (row) => <StatusChip status={row.status} />, width: 130 },
+    { id: 'status', header: 'Status', accessor: (row) => row.status, filter: 'set', cell: (row) => <StatusPill status={row.status} />, width: 130 },
     { id: 'category', header: 'Category', accessor: (row) => row.category, filter: 'set', cell: (row) => <Badge tone={row.category === 'paid' ? 'brand' : 'neutral'} size="sm">{humanize(row.category)}</Badge>, width: 130 },
     { id: 'currency', header: 'Currency', accessor: (row) => row.currency.toUpperCase(), filter: 'set', width: 110, defaultHidden: true },
     {
@@ -706,7 +708,7 @@ function SettlementsTable({ names, onSettle }: { names: ReturnType<typeof useCus
   const columns: DataTableColumn<CreditSettlement>[] = useMemo(() => [
     { id: 'customer', header: 'Customer', pinned: true, accessor: (row) => names.name(row.customer), cell: (row) => <CustomerName id={row.customer} names={names} />, width: 210 },
     { id: 'period', header: 'Period', accessor: (row) => row.period_start, cell: (row) => <span className="rv-nowrap">{boundaryRange(f, row.period_start, row.period_end)}</span>, width: 200 },
-    { id: 'status', header: 'Status', accessor: (row) => row.status, filter: 'set', cell: (row) => <StatusChip status={row.status} />, width: 120 },
+    { id: 'status', header: 'Status', accessor: (row) => row.status, filter: 'set', cell: (row) => <StatusPill status={row.status} />, width: 120 },
     { id: 'quantity', header: 'Quantity', align: 'right', accessor: (row) => row.quantity, cell: (row) => <span className="rv-num">{formatNumber(row.quantity)}</span> },
     { id: 'full_amount', header: 'Worth', align: 'right', accessor: (row) => row.full_amount, cell: (row) => <span className="rv-num">{moneyIn(f, row.full_amount, row.currency)}</span> },
     { id: 'covered_amount', header: 'Covered', align: 'right', accessor: (row) => row.covered_amount, cell: (row) => <span className="rv-num rv-num--pos">{moneyIn(f, row.covered_amount, row.currency)}</span> },

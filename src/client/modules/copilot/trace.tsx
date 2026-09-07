@@ -659,8 +659,14 @@ export function ApprovalCard({ approval, question, onDecided }: {
 export function WrittenTo({ approval }: { approval: AiApproval }) {
   const { navigate } = useRouter();
   const f = useFormat();
-  const targets = writeTargets(approval.args);
   const booked = scheduledFollowup(approval);
+  const written = writeTargets(approval.args);
+  // A booking creates the task at once and writes the note when it comes due,
+  // so the chip a person actually wants is the task — it is where the work is.
+  // `writtenToLabel` still counts only the write's own targets: a name can be
+  // matched to an id when the write named one record, and the task it created
+  // is not a second one.
+  const targets = [...written, ...(booked?.taskId ? [booked.taskId] : [])];
   if (!targets.length) return null;
   return (
     <div className="cp-chips" data-written={booked ? 'scheduled' : 'written'}>
@@ -668,10 +674,13 @@ export function WrittenTo({ approval }: { approval: AiApproval }) {
       {targets.map((id) => {
         const link = recordLink(id);
         const Glyph = iconByName(CITATION_ICON[link?.type ?? ''] ?? 'link');
-        const name = writtenToLabel(approval, id, targets.length);
-        const opens = booked
-          ? `Open ${name} — the follow-up note lands on its timeline on ${f.date(booked.due)}`
-          : `Open ${name}`;
+        const task = id === booked?.taskId;
+        const name = task ? 'The follow-up task' : writtenToLabel(approval, id, written.length);
+        const opens = task
+          ? `Open the task — due ${f.date(booked.due)}, with the note as its subject`
+          : booked
+            ? `Open ${name} — the follow-up note lands on its timeline on ${f.date(booked.due)}`
+            : `Open ${name}`;
         const body = (
           <>
             <Glyph size={12} />

@@ -7,6 +7,20 @@
 
 export type Role = 'owner' | 'admin' | 'member' | 'analyst' | 'readonly';
 
+export type SeatStatus = 'invited' | 'active';
+
+/**
+ * A pending invitation as the roster carries it. The token is not here: it is
+ * returned exactly once, by the call that minted it, and stored hashed.
+ */
+export interface Invitation {
+  object: 'invitation';
+  id: string;
+  created: number;
+  expires: number;
+  invited_by: string | null;
+}
+
 export interface Member {
   object: 'user';
   id: string;
@@ -18,6 +32,14 @@ export interface Member {
   last_seen: number | null;
   role: Role;
   teams: string[];
+  /** `invited` until the person redeems their link and sets a password. */
+  status: SeatStatus;
+  invitation: Invitation | null;
+}
+
+/** What `POST /v1/users` and `POST /v1/users/:id/reinvite` answer: the seat, plus the one-time token. */
+export interface InvitedMember extends Member {
+  invitation: Invitation & { token: string };
 }
 
 export interface ApiKey {

@@ -501,7 +501,16 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
                 <Select
                   value={data.owner_id ?? ''}
                   onChange={(next) => { void setOwner(next || null); }}
-                  options={[{ value: '', label: 'Unassigned' }, ...(users.data?.data ?? []).map((u) => ({ value: u.id, label: u.name }))]}
+                  options={[
+                    { value: '', label: 'Unassigned' },
+                    // A seat that has not accepted its invitation can hold a
+                    // record and nobody would be working it; the picker says so
+                    // before the assignment, not the roster afterwards.
+                    ...(users.data?.data ?? []).map((u) => ({
+                      value: u.id,
+                      label: u.status === 'invited' ? `${u.name} · invited` : u.name,
+                    })),
+                  ]}
                   aria-label="Record owner"
                   size="sm"
                   disabled={busyOwner}

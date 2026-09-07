@@ -27,14 +27,13 @@ import { useNavigate } from '../../kernel/router';
 import { useSession } from '../../kernel/session';
 import {
   Badge, Banner, Button, Card, ConfirmDialog, DataTable, EmptyState, Field, Icons, Inline, Input,
-  Modal, Select, Stat, Stack, Switch, Tooltip,
-  humanize, useFormat,
+  Modal, Select, Stat, Stack, Switch, TaxIdStatusPill, Tooltip,
+  humanize, taxIdStatusLabel, useFormat,
   type DataTableColumn, type MenuSection, type TableState,
   CheckCircleIcon, XCircleIcon,
 } from '../../design';
 import { DialogForm, ListFailure, SettingsShell, idem, useAction, useConsumeQuery } from './common';
 import { tileOf } from './tiles';
-import { TaxIdStatusPill, taxIdStatusLabel } from '../billing/common';
 import type { AutomaticTaxSettings, CustomerLite, CustomerTaxId, TaxRate } from './types';
 
 const TAX_TYPES = ['vat', 'gst', 'sales_tax', 'hst', 'pst', 'qst', 'jct', 'igst', 'service_tax', 'other'] as const;

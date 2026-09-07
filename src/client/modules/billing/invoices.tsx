@@ -16,7 +16,7 @@ import { usePlatform } from '../../kernel/platform';
 import { useCurrentCrumb } from '../../kernel/shell';
 import {
   Badge, Banner, Button, Card, Checkbox, ConfirmDialog, DataTable, Divider, Drawer, EmptyState, Field, Grid,
-  GridItem, Icons, Inline, Input, Modal, Page, Select, Stack, Tabs, Textarea, Tooltip, humanize, useToast,
+  GridItem, Icons, Inline, Input, Modal, NumberInput, Page, Select, Stack, Tabs, Textarea, Tooltip, humanize, useToast,
   type DataTableColumn, type MenuSection, type TableState,
 } from '../../design';
 import { AlertTriangleIcon, ArrowUpRightIcon, CheckCircleIcon, ChevronDownIcon, ChevronUpIcon, CreditCardIcon, XCircleIcon } from '../../design';
@@ -24,7 +24,7 @@ import { ActionMenu, CreditDialog, CustomerPicker, Headline } from './subscripti
 import { PaymentMethodDialog } from './payments';
 import {
   BookFooter, DialogFields, EmptyList, ExportCsvButton, FieldRow, ListFailure, ListFooter, LoadFailedEmpty, Loading, MoneyField,
-  MoneyRangeFilter, copyFormat, keepRowMenuKeys,
+  MoneyRangeFilter, copyFormat, 
   MoneyTotals, RecordLink, RecordMissing, SectionError, StatusPill, TableSearch, breakdownLabel, decodeRange,
   encodeRange,
   formatUnitRate, invoiceStatusDetail, lineWhy, matchesRange, prorationCopy, rangeActive,
@@ -33,11 +33,11 @@ import {
   csvAmount, csvDay, csvInstant, useBookTotal,
   useCursorList, useDebounced, useDialogForm, useOpenOnQuery, useRecord, useRecordTab, useTableView, visibleRows,
 } from './common';
-import { billedTotal, bulkSkipReason, coversNoPeriod, humaniseNote, invoiceActions, type BulkInvoiceKind } from './copy';
+import { billedTotal, bulkSkipReason, coversNoPeriod, humaniseNote, invoiceActions, lineCoversNoPeriod, type BulkInvoiceKind } from './copy';
 import type { CsvColumn } from './common';
 import type {
-  Charge, CreditNote, Customer, Invoice, InvoiceDunning, InvoiceLine, InvoicePayments, PaymentIntent, PaymentMethod,
-  PaymentSettings, PendingItem, Refund,
+  Charge, CreditNote, Customer, Invoice, InvoiceDunning, InvoiceItem, InvoiceLine, InvoicePayments, PaymentIntent,
+  PaymentMethod, PaymentSettings, PendingItem, Refund,
 } from './types';
 
 /** Everything a payment moves, so one write refreshes every screen reading it. */
@@ -330,7 +330,7 @@ export function InvoicesPage() {
       }
     >
       {book.error && <ListFailure error={book.error} path="GET /v1/invoices" onRetry={book.retry} />}
-      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'} onKeyDownCapture={keepRowMenuKeys}>
+      <div className={book.loading ? 'bl-grid is-loading' : 'bl-grid'}>
       <DataTable
         rows={rows}
         columns={columns}
@@ -696,14 +696,30 @@ export function BillNowDialog({ open, onClose, customer, subscription }: {
     undefined,
     { enabled: open && !!customerId },
   );
+  /**
+   * And the lines written by hand, which `pending_items` does not report — it
+   * answers for what a subscription has priced and nothing else. Both lists
+   * land on the same document, so the preview reads both or it is not a
+   * preview: a commissioning day added a moment ago was invisible here right
+   * up until it appeared on the finished bill.
+   */
+  const written = useQuery<ListEnvelope<InvoiceItem>>(
+    customerId ? '/v1/invoice_items' : null,
+    { customer: customerId, status: 'pending', limit: 100 },
+    { enabled: open && !!customerId },
+  );
   // The account carries the currency, and the dialog needs it even when there
   // is nothing pending to read one off.
   const account = useQuery<Customer>(customerId ? `/v1/customers/${customerId}` : null, undefined, { enabled: open && !!customerId });
   const items = pending.data?.data ?? [];
-  const currency = items[0]?.currency ?? account.data?.currency ?? 'usd';
-  const total = items.reduce((sum, item) => sum + item.amount, 0);
-  const nothing = !pending.loading && !pending.error && !!customerId && items.length === 0;
+  const hand = written.data?.data ?? [];
+  const currency = items[0]?.currency ?? hand[0]?.currency ?? account.data?.currency ?? 'usd';
+  const total = items.reduce((sum, item) => sum + item.amount, 0) + hand.reduce((sum, item) => sum + item.amount, 0);
+  const lineCount = items.length + hand.length;
+  const reading = pending.loading || written.loading;
+  const nothing = !reading && !pending.error && !written.error && !!customerId && lineCount === 0;
   const [oneOff, setOneOff] = useState(false);
+  const [writing, setWriting] = useState(false);
 
   const submit = async () => {
     const invoice = await action.run(
@@ -713,12 +729,32 @@ export function BillNowDialog({ open, onClose, customer, subscription }: {
       }, { idempotencyKey: idem() }),
       {
         success: 'Invoice raised',
-        description: 'Every proration waiting, the usage already settled and the account balance are on it.',
+        // Naming what actually went on it. The old sentence promised prorations
+        // and settled usage on a bill that carried one hand-written line.
+        description: hand.length && !items.length
+          ? `${f.plural(hand.length, 'line')} written by hand, ${f.money(total, { currency })} before tax, and the account balance.`
+          : hand.length
+            ? `${f.plural(items.length, 'priced line')}, ${f.plural(hand.length, 'line')} written by hand, and the account balance.`
+            : 'Every proration waiting, the usage already settled and the account balance are on it.',
         failure: 'Nothing could be billed',
       },
-      ['/v1/invoices', '/v1/customers', '/v1/subscriptions'],
+      ['/v1/invoices', '/v1/customers', '/v1/subscriptions', '/v1/invoice_items'],
     );
     if (invoice) { onClose(); navigate(invoiceHref(invoice.id)); }
+  };
+
+  /** A mistyped amount would otherwise land on a real bill; only a pending item can be taken back. */
+  const withdraw = async (item: InvoiceItem) => {
+    await action.run(
+      api.del<void>(`/v1/invoice_items/${item.id}`).then(() => true),
+      {
+        success: 'The line was withdrawn',
+        description: `${item.description} — ${item.amount_display} — will not be billed.`,
+        failure: 'The line was not withdrawn',
+      },
+      ['/v1/invoice_items', '/v1/customers'],
+    );
+    written.refetch();
   };
 
   const form = useDialogForm(open, !!customerId && !nothing && !action.busy, () => { void submit(); });
@@ -729,7 +765,7 @@ export function BillNowDialog({ open, onClose, customer, subscription }: {
       onClose={onClose}
       size="lg"
       title="Bill what this account owes"
-      description="The recurring fee is not billed again — that happened when the period opened. This sweeps up everything waiting on top of it."
+      description="The recurring fee is not billed again — that happened when the period opened. This sweeps up every proration and settled usage waiting on top of it, plus any line you write here by hand."
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
@@ -739,7 +775,7 @@ export function BillNowDialog({ open, onClose, customer, subscription }: {
             disabled={!customerId || nothing}
             onClick={() => { void submit(); }}
           >
-            {items.length ? `Raise the invoice · ${f.money(total, { currency })}` : 'Raise the invoice'}
+            {lineCount ? `Raise the invoice · ${f.money(total, { currency })}` : 'Raise the invoice'}
           </Button>
         </>
       }
@@ -774,18 +810,20 @@ export function BillNowDialog({ open, onClose, customer, subscription }: {
             body="Everything the next invoice would pick up is listed here before you raise it."
           />
         )}
-        {customerId && pending.loading && <Loading label="Reading what is waiting…" />}
+        {customerId && reading && <Loading label="Reading what is waiting…" />}
         {customerId && pending.error && (
           <SectionError error={pending.error} path={`GET /v1/customers/${customerId}/pending_items`} onRetry={pending.refetch} />
+        )}
+        {customerId && written.error && (
+          <SectionError error={written.error} path="GET /v1/invoice_items" onRetry={written.refetch} />
         )}
         {nothing && (
           <Banner tone="info" title="Nothing is waiting on this account">
             <div>
-              No proration and no settled usage is unbilled here, so raising an invoice now would be refused.
-              The recurring fee is billed when the next period opens. An invoice here only ever carries what a
-              subscription has priced — there is no route that puts a hand-written line on one.
+              No proration and no settled usage is unbilled here, and no line has been written by hand, so raising an
+              invoice now would be refused. The recurring fee is billed when the next period opens.
             </div>
-            {/* Where a hand-written charge went. Without this the dialog says
+            {/* Where a balance adjustment went. Without this the dialog says
                 "nothing is waiting" straight after one was carried, and the
                 money looks lost. */}
             {!!account.data && account.data.balance > 0 && (
@@ -795,64 +833,107 @@ export function BillNowDialog({ open, onClose, customer, subscription }: {
                 {'.'}
               </div>
             )}
-            {/* A refusal that names no next move is a dead end. This platform
-                bills a hand-written amount by carrying it on the account
-                balance, which the next invoice draws down — so that is offered
-                here, in the same dialog, rather than left to be found. It is
-                named for what it does: the button used to say "Charge", and a
-                balance debit raises no document and collects nothing today. */}
-            <Inline gap={3} style={{ marginTop: 'var(--space-4)' }}>
-              <Button size="sm" variant="secondary" iconLeft={<Icons.percent size={13} />} onClick={() => setOneOff(true)}>
-                Adjust the balance instead…
-              </Button>
-            </Inline>
           </Banner>
         )}
-        {items.length > 0 && (
+        {customerId && !reading && !pending.error && !written.error && (
           <Stack gap={4}>
-            <div className="bl-tablewrap">
-              <table className="bl-lines">
-                <thead>
-                  <tr><th>What would be billed</th><th>Period</th><th className="bl-num">Amount</th></tr>
-                </thead>
-                <tbody>
-                  {items.map((item) => (
-                    <tr key={item.id} className={item.amount < 0 ? 'bl-lines__row--credit' : undefined}>
-                      <td>
-                        <div>{item.description}</div>
-                        {/* The server's explanation carries both halves — the
-                            sentence and the unreduced rational behind it. The
-                            sentence belongs on the line; a ten-digit fraction
-                            printed inline is how a bill starts reading like a
-                            stack trace, so it goes where the invoice lines put
-                            it, behind the same disclosure. */}
-                        <PendingWhy item={item} />
-                      </td>
-                      <td className="bl-nowrap">{f.dayRange(item.period.start, item.period.end)}</td>
-                      <td className="bl-num">{f.money(item.amount, { currency: item.currency })}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="bl-totals">
-              <div className="bl-total bl-total--grand">
-                <span className="bl-total__label">{f.plural(items.length, 'line')} before tax</span>
-                <span className="bl-total__value">{f.money(total, { currency })}</span>
-              </div>
-            </div>
-            <div className="bl-sub">
-              Tax and the account balance are applied when the bill is raised, so the total on the invoice may differ from this subtotal.
-            </div>
+            {lineCount > 0 && (
+              <>
+                <div className="bl-tablewrap">
+                  <table className="bl-lines">
+                    <thead>
+                      <tr><th>What would be billed</th><th>Period</th><th className="bl-num">Amount</th><th /></tr>
+                    </thead>
+                    <tbody>
+                      {items.map((item) => (
+                        <tr key={item.id} className={item.amount < 0 ? 'bl-lines__row--credit' : undefined}>
+                          <td>
+                            <div>{item.description}</div>
+                            {/* The server's explanation carries both halves — the
+                                sentence and the unreduced rational behind it. The
+                                sentence belongs on the line; a ten-digit fraction
+                                printed inline is how a bill starts reading like a
+                                stack trace, so it goes where the invoice lines put
+                                it, behind the same disclosure. */}
+                            <PendingWhy item={item} />
+                          </td>
+                          <td className="bl-nowrap">{f.dayRange(item.period.start, item.period.end)}</td>
+                          <td className="bl-num">{f.money(item.amount, { currency: item.currency })}</td>
+                          <td />
+                        </tr>
+                      ))}
+                      {hand.map((item) => (
+                        <tr key={item.id} className={item.amount < 0 ? 'bl-lines__row--credit' : undefined}>
+                          <td>
+                            <div>{item.description}</div>
+                            <div className="bl-lines__why">
+                              {/* The engine stamps this sentence on the finished
+                                  bill in the UTC calendar; printing it here in
+                                  the workspace's timezone made the preview and
+                                  the document disagree by a day. */}
+                              {item.quantity > 1
+                                ? `Written by hand on ${f.day(item.created)} — ${f.number(item.quantity)} × ${f.money(item.unit_amount, { currency: item.currency })}.`
+                                : `Written by hand on ${f.day(item.created)}, not priced from the catalogue.`}
+                            </div>
+                          </td>
+                          {/* A hand-written line covers no service period; the
+                              engine stamps it on the day it was raised, and
+                              printing "Sep 7 to Sep 7" reads as a one-day
+                              subscription that never existed. */}
+                          <td className="bl-nowrap"><span className="bl-sub">No period</span></td>
+                          <td className="bl-num">{f.money(item.amount, { currency: item.currency })}</td>
+                          <td className="bl-num">
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              iconLeft={<Icons.trash size={12} />}
+                              disabled={action.busy}
+                              onClick={() => { void withdraw(item); }}
+                            >
+                              Withdraw
+                            </Button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="bl-totals">
+                  <div className="bl-total bl-total--grand">
+                    <span className="bl-total__label">{f.plural(lineCount, 'line')} before tax</span>
+                    <span className="bl-total__value">{f.money(total, { currency })}</span>
+                  </div>
+                </div>
+                <div className="bl-sub">
+                  Tax and the account balance are applied when the bill is raised, so the total on the invoice may differ from this subtotal.
+                </div>
+              </>
+            )}
             <Inline gap={3}>
+              <Button size="sm" variant="secondary" iconLeft={<Icons.plus size={13} />} onClick={() => setWriting(true)}>
+                Add a one-off line…
+              </Button>
+              {/* Two different acts, named for what each does. A line raises a
+                  document today; a balance adjustment raises none and is drawn
+                  down by whatever bill comes next. */}
               <Button size="sm" variant="ghost" iconLeft={<Icons.percent size={13} />} onClick={() => setOneOff(true)}>
-                Adjust the balance first…
+                Adjust the account balance instead…
               </Button>
             </Inline>
           </Stack>
         )}
       </Stack>
       </DialogFields>
+      {customerId && (
+        <OneOffLineDialog
+          customer={customerId}
+          customerName={account.data?.name ?? null}
+          currency={currency}
+          open={writing}
+          onClose={() => setWriting(false)}
+          onWritten={() => { setWriting(false); written.refetch(); }}
+        />
+      )}
       {customerId && (
         <CreditDialog
           customer={customerId}
@@ -862,9 +943,144 @@ export function BillNowDialog({ open, onClose, customer, subscription }: {
           initialDirection="debit"
           description={'A debit here is carried on the account balance, not charged: the next invoice raised for this '
             + 'account draws it down as a line of its own, and the reason you type shows on the balance ledger. Nothing '
-            + 'is presented to a card and no document is raised today.'}
+            + 'is presented to a card and no document is raised today. To bill an amount today, add a one-off line '
+            + 'instead — that one goes on a document the customer receives.'}
         />
       )}
+    </Modal>
+  );
+}
+
+/* =========================== a line written by hand ======================= */
+
+/**
+ * The one-off charge, priced before it is written.
+ *
+ * `POST /v1/invoice_items` writes a line and nothing else — it raises no
+ * document and presents nothing to a card. The line then waits for a bill:
+ * either the renewal, or the one the dialog behind this raises now. Both
+ * facts are on the form, because "Charge a one-off amount" was the old name
+ * for a control that did neither.
+ */
+function OneOffLineDialog({ customer, customerName, currency, open, onClose, onWritten }: {
+  customer: string;
+  customerName: string | null;
+  currency: string;
+  open: boolean;
+  onClose: () => void;
+  onWritten: () => void;
+}) {
+  const f = useBillingFormat();
+  const action = useAction();
+  const [description, setDescription] = useState('');
+  const [unit, setUnit] = useState<number | null>(null);
+  const [quantity, setQuantity] = useState(1);
+  const [credit, setCredit] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setDescription('');
+    setUnit(null);
+    setQuantity(1);
+    setCredit(false);
+    action.clear();
+  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const magnitude = unit === null ? 0 : Math.abs(unit) * Math.max(1, quantity);
+  const amount = credit ? -magnitude : magnitude;
+  const valid = description.trim().length > 0 && magnitude > 0;
+
+  const submit = async () => {
+    if (!valid || action.busy) return;
+    const written = await action.run(
+      api.post<InvoiceItem>('/v1/invoice_items', {
+        customer,
+        description: description.trim(),
+        currency,
+        ...(quantity > 1
+          ? { unit_amount: credit ? -Math.abs(unit ?? 0) : Math.abs(unit ?? 0), quantity }
+          : { amount }),
+      }, { idempotencyKey: idem() }),
+      {
+        success: credit ? 'The credit line is waiting' : 'The line is waiting',
+        description: `${description.trim()} — it goes on the next bill raised for ${customerName ?? 'this account'}.`,
+        failure: 'The line was not written',
+        inlineOnly: true,
+      },
+      ['/v1/invoice_items', '/v1/customers'],
+    );
+    if (written) onWritten();
+  };
+
+  const form = useDialogForm(open, valid && !action.busy, () => { void submit(); });
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="md"
+      title={credit ? 'Credit a one-off amount' : 'Charge a one-off amount'}
+      description="A line with no price behind it — a commissioning day, an amount agreed on the phone, a goodwill credit."
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>Cancel</Button>
+          <Button variant="primary" loading={action.busy} disabled={!valid} onClick={() => { void submit(); }}>
+            {valid ? `Add the line · ${f.money(amount, { currency })}` : 'Add the line'}
+          </Button>
+        </>
+      }
+    >
+      <DialogFields form={form}>
+        <Stack gap={5}>
+          {action.error && !action.error.body.param && (
+            <Banner tone="danger" compact title="The line was not written">{action.error.body.message}</Banner>
+          )}
+          <Field
+            label="What the customer will read"
+            required
+            hint="This is the wording on the invoice, so write it for them and not for the ledger."
+            error={action.errorFor('description')}
+          >
+            <Input
+              value={description}
+              autoFocus
+              placeholder="Commissioning day — Line 4, 12 September"
+              invalid={!!action.errorFor('description')}
+              onChange={(e) => setDescription(e.target.value)}
+              aria-label="What the customer will read"
+            />
+          </Field>
+          <Inline gap={4} align="end">
+            <Field label={quantity > 1 ? 'Per unit' : 'Amount'} required error={action.errorFor('amount') ?? action.errorFor('unit_amount')}>
+              <MoneyField value={unit} onChange={setUnit} currency={currency} min={0} label={quantity > 1 ? 'Per unit' : 'Amount'} />
+            </Field>
+            <Field label="Quantity" hint="Days, licences, units.">
+              <NumberInput
+                value={quantity}
+                onChange={(next: number | null) => setQuantity(Math.max(1, Math.round(next ?? 1)))}
+                min={1}
+                aria-label="Quantity"
+              />
+            </Field>
+          </Inline>
+          <Field label="Direction">
+            <Select
+              value={credit ? 'credit' : 'charge'}
+              onChange={(next) => setCredit(next === 'credit')}
+              options={[
+                { value: 'charge', label: 'Charge — adds to what they owe' },
+                { value: 'credit', label: 'Credit — comes off the bill' },
+              ]}
+              aria-label="Direction"
+            />
+          </Field>
+          <Banner tone="info" compact title="What happens when you press it">
+            {`The line is written and waits. It is billed in ${currency.toUpperCase()} and taxed at ${customerName ?? 'this account'}’s own rate on the `
+              + 'document it lands on — the invoice raised behind this dialog, or the next renewal if you close without '
+              + 'raising one. Nothing is presented to a card today.'}
+          </Banner>
+        </Stack>
+      </DialogFields>
     </Modal>
   );
 }
@@ -2253,7 +2469,9 @@ function LineRow({ line, open, onToggle }: { line: InvoiceLine; open: boolean; o
             </button>
           )}
         </td>
-        <td className="bl-nowrap">{f.dayRange(line.period.start, line.period.end)}</td>
+        <td className="bl-nowrap">
+          {lineCoversNoPeriod(line) ? <span className="bl-muted">No period</span> : f.dayRange(line.period.start, line.period.end)}
+        </td>
         <td className="bl-num">{f.number(line.quantity)}</td>
         <td className="bl-num">
           {line.tax.percentage
