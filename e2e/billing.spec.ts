@@ -1355,12 +1355,53 @@ test('a dialog opens on its first field and Enter creates the record', async ({ 
 test('Enter does not submit a dialog whose primary action is disabled', async ({ page }) => {
   const before = await json(page, '/v1/customers?limit=1');
   await page.goto('/billing/customers', { waitUntil: 'networkidle' });
+
+  /**
+   * "Enter does nothing here" is two rules, and only one of them is about the
+   * handler. The other is about where the focus is when the key is pressed: a
+   * modal traps focus on its first focusable child, which is Close, and the
+   * dialog moves it onto the first field afterwards. For as long as that hand-
+   * over takes, Enter is a click on Close and the dialog the operator just
+   * opened is gone — no submit, but the work thrown away all the same.
+   *
+   * The hand-over is one animation frame wide, so on an idle machine it is
+   * invisible and on a loaded one — a whole suite in one worker — it is not.
+   * The browser is slowed so a frame is long enough to watch, and what is
+   * watched is the invariant: from the moment the dialog takes focus, focus
+   * never rests on a control that would discard the dialog.
+   */
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Emulation.setCPUThrottlingRate', { rate: 20 });
+  await page.evaluate(() => {
+    const w = window as unknown as { __focusTrail?: string[]; __focusTimer?: number };
+    w.__focusTrail = [];
+    w.__focusTimer = window.setInterval(() => {
+      const el = document.activeElement as HTMLElement | null;
+      if (!el || !el.closest('[role="dialog"]')) return;
+      const label = `${el.tagName}:${(el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 20)}`;
+      const trail = w.__focusTrail as string[];
+      if (trail[trail.length - 1] !== label) trail.push(label);
+    }, 2);
+  });
+
   await page.getByRole('button', { name: 'New customer' }).click();
   const dialog = page.getByRole('dialog');
-  await expect(dialog.getByRole('button', { name: 'Create customer' })).toBeDisabled();
+  await expect(dialog.getByRole('button', { name: 'Create customer' })).toBeDisabled({ timeout: 30_000 });
 
   await page.keyboard.press('Enter');
-  await expect(dialog).toBeVisible();       // it neither submitted nor closed
+  await expect(dialog).toBeVisible({ timeout: 30_000 });       // it neither submitted nor closed
+
+  const trail = await page.evaluate(() => {
+    const w = window as unknown as { __focusTrail: string[]; __focusTimer: number };
+    window.clearInterval(w.__focusTimer);
+    return w.__focusTrail;
+  });
+  await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 });
+  // A probe that saw nothing proves nothing.
+  expect(trail.length).toBeGreaterThan(0);
+  expect(trail[0]).toMatch(/^INPUT/);
+  expect(trail.join(' → ')).not.toMatch(/Close|Cancel/);
+
   const after = await json(page, '/v1/customers?limit=1');
   expect(after.total_count).toBe(before.total_count);
 });
@@ -1814,9 +1855,11 @@ test('the payment dialog is operable from the keyboard alone', async ({ page }) 
  * the one that attaches the card.
  */
 async function customerWithDecliningCard(page: Page, name: string): Promise<{ id: string; name: string }> {
-  const customer = await (await page.request.post('/api/v1/customers', {
+  const res0 = await page.request.post('/api/v1/customers', {
     data: { name, currency: 'usd', invoice_settings: { days_until_due: 0 } },
-  })).json();
+  });
+  const customer = await res0.json();
+  if (!customer.id) throw new Error(`DIAG customer create ${res0.status()} ${JSON.stringify(customer)}`);
   await page.request.post('/api/v1/payment_methods', {
     data: { customer: customer.id, type: 'card', brand: 'visa', last4: '0002', exp_month: 12, exp_year: 2030, simulated_behavior: 'card_declined', set_default: true },
   });

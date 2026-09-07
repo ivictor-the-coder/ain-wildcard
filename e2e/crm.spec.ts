@@ -495,6 +495,9 @@ test('a column added for a glance is still there after a reload, and can be put 
 });
 
 test('the primary link on an association can actually be set', async ({ page }) => {
+  // The surname is the fixture: the combobox is driven by typing, and a prefix
+  // short enough to match a contact some earlier run left behind picks that one
+  // instead of this one. It is unique per run and typed whole.
   const stamp = `Primary${Date.now()}`;
   const created = await (await page.request.post('/api/v1/records/contact', {
     data: { properties: { first_name: 'Zeta', last_name: stamp, email: `zeta.${stamp}@example.com` } },
@@ -504,7 +507,7 @@ test('the primary link on an association can actually be set', async ({ page }) 
   await page.getByRole('button', { name: 'Link another record' }).click();
   const dialog = page.getByRole('dialog');
   await dialog.getByRole('combobox', { name: 'Record to link' }).click();
-  await page.keyboard.type(`Zeta ${stamp}`.slice(0, 14));
+  await page.keyboard.type(stamp);
   await expect(dialog.getByRole('button', { name: 'Link', exact: true })).toBeDisabled();
   await page.waitForTimeout(600);
   await page.keyboard.press('Enter');
@@ -518,9 +521,56 @@ test('the primary link on an association can actually be set', async ({ page }) 
   await expect(page.getByRole('status', { name: 'Primary link set' })).toBeVisible();
 
   const edges = (await (await page.request.get('/api/v1/records/company/cmp_nw_45/associations')).json()).data as
-    { record_id: string; is_primary: boolean }[];
-  expect(edges.find((e) => e.record_id === created.id)?.is_primary).toBe(true);
+    { record_id: string; is_primary: boolean; association_type: string }[];
+  const edge = edges.find((e) => e.record_id === created.id)!;
+  expect(edge.is_primary).toBe(true);
   await expect(row.locator('.crm-assoc__primary')).toHaveAttribute('aria-pressed', 'true');
+
+  // The star is one POST, and the route promises `is_primary` is "the field you
+  // read back". Sending it against a link that already exists used to answer
+  // with the row as it was *before* the flag moved, so the screen only looked
+  // right because it threw the answer away and asked again.
+  const promoted = await (await page.request.post('/api/v1/associations', {
+    data: { from_id: created.id, to_id: 'cmp_nw_45', association_type: edge.association_type, primary: true },
+  })).json() as { is_primary: boolean };
+  expect(promoted.is_primary).toBe(true);
+});
+
+test('moving the primary link to another record stands the first one down', async ({ page }) => {
+  const stamp = `Movable${Date.now()}`;
+  const contact = await (await page.request.post('/api/v1/records/contact', {
+    data: { properties: { first_name: 'Wren', last_name: stamp, email: `wren.${stamp}@example.com` } },
+  })).json() as { id: string; display_name: string };
+  const [first, second] = await Promise.all(['A', 'B'].map(async (suffix) =>
+    (await (await page.request.post('/api/v1/records/company', {
+      data: { properties: { name: `${stamp} Holdings ${suffix}`, domain: `${stamp.toLowerCase()}-${suffix.toLowerCase()}.test` } },
+    })).json()) as { id: string; display_name: string }));
+
+  await page.request.post('/api/v1/associations', { data: { from_id: contact.id, to_id: first.id, primary: true } });
+  await page.request.post('/api/v1/associations', { data: { from_id: contact.id, to_id: second.id } });
+
+  await page.goto(`/contacts/${contact.id}`, { waitUntil: 'networkidle' });
+  const rowFor = (name: string) => page.locator('.crm-assoc__row').filter({ hasText: name });
+  await expect(rowFor(first.display_name).locator('.crm-assoc__primary')).toHaveAttribute('aria-pressed', 'true');
+  await expect(rowFor(second.display_name).locator('.crm-assoc__primary')).toHaveAttribute('aria-pressed', 'false');
+
+  await rowFor(second.display_name).locator('.crm-assoc__primary').click();
+  await expect(page.getByRole('status', { name: 'Primary link set' })).toBeVisible();
+
+  // One link of a kind is primary, so moving the star has to take it off the
+  // other row — on the screen and in the book behind it.
+  await expect(rowFor(second.display_name).locator('.crm-assoc__primary')).toHaveAttribute('aria-pressed', 'true');
+  await expect(rowFor(first.display_name).locator('.crm-assoc__primary')).toHaveAttribute('aria-pressed', 'false');
+  const edges = (await (await page.request.get(`/api/v1/records/contact/${contact.id}/associations?object_type=company`)).json()).data as
+    { record_id: string; is_primary: boolean }[];
+  expect(edges.filter((e) => e.is_primary).map((e) => e.record_id)).toEqual([second.id]);
+
+  // And the move is on the record's own history, the way linking and unlinking
+  // are — a star nobody can audit is a change that never happened.
+  const timeline = (await (await page.request.get(`/api/v1/records/contact/${contact.id}/timeline?limit=50&kinds=event`)).json()).data as
+    { title: string; data: { type?: string } }[];
+  const moved = timeline.find((i) => i.data?.type === 'association.primary_set');
+  expect(moved?.title).toContain(second.display_name);
 });
 
 test('a duplicate’s confidence is a percentage a person could believe', async ({ page }) => {

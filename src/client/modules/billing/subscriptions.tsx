@@ -1495,7 +1495,11 @@ export function SubscriptionCreateDialog({ open, onClose, customer }: {
     if (!created) return;
     setSettling(true);
     const detail = { expand: 'customer' };
-    let settled: Subscription = created;
+    // Null until the record has been read back from the address the next
+    // screen opens on. `created` is not that reading: it answers a POST that
+    // asked for no expansion, so it carries no customer to name, and it
+    // answers it before the collector has run.
+    let settled: Subscription | null = null;
     let bill: Invoice | null = null;
     let payments: InvoicePayments | null = null;
     try {
@@ -1513,15 +1517,21 @@ export function SubscriptionCreateDialog({ open, onClose, customer }: {
         }
       }
     } catch {
-      // The create landed. What the POST returned is the best available reading.
+      // Every read was refused. The create landed, so the sentence is worded
+      // from what the POST returned — but nothing is put in front of the next
+      // screen, which asks for itself.
     } finally {
       setSettling(false);
     }
     // Everything that counts this subscription has moved since the create
-    // returned, and the record the next screen opens on is the settled one.
+    // returned. The record the next screen opens on is the one that was read
+    // back from that screen's own address, and only that one: priming the key
+    // with the POST's answer put a subscription with no expanded customer and
+    // a pre-collection status on screen — the account rendered as its raw
+    // cus_… id, under the word "Active", over a card that had been declined.
     invalidate('/v1/subscriptions', '/v1/customers', '/v1/invoices', '/v1/revenue');
-    primeCache(buildUrl(`/v1/subscriptions/${created.id}`, detail), settled);
-    const copy = describeCreatedSubscription(settled, copyFormat(f), bill, payments);
+    if (settled) primeCache(buildUrl(`/v1/subscriptions/${created.id}`, detail), settled);
+    const copy = describeCreatedSubscription(settled ?? created, copyFormat(f), bill, payments);
     toast[copy.tone](copy.title, copy.description, copy.tone === 'success' ? undefined : { duration: 0 });
     onClose();
     navigate(subscriptionHref(created.id));

@@ -117,34 +117,90 @@ test('a submenu takes the keyboard and hands it back', async ({ page }) => {
 
 /* =========================== Anchored placement =========================== */
 
+/**
+ * `/design` does not scroll the window — the shell's main region is the scroller
+ * — so parking the chip means scrolling whatever box actually holds it. Walking
+ * up from the chip finds it without this file naming the shell's own markup.
+ */
+const parkChip = (page: Page, viewportTop: number) => page.evaluate((top) => {
+  const chip = document.querySelector('.ain-table__bar--filters .ain-chip__main')!;
+  let el: HTMLElement | null = chip.parentElement;
+  while (el && el !== document.documentElement) {
+    const style = getComputedStyle(el);
+    if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight) break;
+    el = el.parentElement;
+  }
+  const scroller: Element = el ?? document.scrollingElement!;
+  scroller.scrollTop += chip.getBoundingClientRect().top - top;
+}, viewportTop);
+
+/** Open the Issued date filter on the styleguide's table and leave it open. */
+const openIssuedFilter = async (page: Page) => {
+  await openSection(page, 'table');
+  await page.locator('#table button:has-text("Filters")').first().click();
+  await page.locator('#table button.ain-table__addfilter').first().click();
+  await page.locator('.ain-menu__item', { hasText: 'Issued' }).first().click();
+  await expect(page.locator('.ain-table__bar--filters .ain-chip__main')).toBeVisible();
+};
+
+/** Where the open popover sits, against the chip and against the window. */
+const popoverGeometry = (page: Page) => page.evaluate(() => {
+  const anchor = document.querySelector('.ain-table__bar--filters .ain-chip__main')!.getBoundingClientRect();
+  const pop = [...document.querySelectorAll<HTMLElement>('.ain-popover')]
+    .find((p) => getComputedStyle(p).visibility !== 'hidden')!.getBoundingClientRect();
+  return {
+    overlaps: pop.top < anchor.bottom && pop.bottom > anchor.top,
+    offBottom: pop.bottom > window.innerHeight - 7,
+    offTop: pop.top < 7,
+    offLeft: pop.left < 7,
+    offRight: pop.right > window.innerWidth - 7,
+  };
+});
+const ON_SCREEN = { overlaps: false, offBottom: false, offTop: false, offLeft: false, offRight: false };
+
 test('a popover taller than the viewport never covers the chip that opened it', async ({ page }) => {
   for (const height of [400, 460, 480, 520]) {
     await page.setViewportSize({ width: 1280, height });
     await page.goto(DESIGN, { waitUntil: 'networkidle' });
-    await openSection(page, 'table');
+    await openIssuedFilter(page);
 
-    await page.locator('#table button:has-text("Filters")').first().click();
-    await page.locator('#table button.ain-table__addfilter').first().click();
-    await page.locator('.ain-menu__item', { hasText: 'Issued' }).first().click();
-    await expect(page.locator('.ain-table__bar--filters .ain-chip__main')).toBeVisible();
+    // Three places the chip can be while its 508px editor is open, all of them
+    // one scroll apart. The editor is taller than any of these windows, so it
+    // is clamped every time and the only question is where the clamp puts it.
+    //
+    //  90        room below, none above — it stays under the chip
+    //  height-60 no room below — it flips over the chip
+    //  -140      the chip has scrolled clear of the top edge, which is what a
+    //            list moving under an open popover does. The room "below" an
+    //            anchor above the window is not room: measured as a bare
+    //            subtraction it came out in the thousands, nothing clamped the
+    //            box, and it sat at y=8 with its footer past the bottom edge.
+    for (const [where, top] of [['under the chip', 90], ['flipped over it', height - 60], ['chip scrolled away', -140]] as const) {
+      await parkChip(page, top);
+      await expect.poll(() => popoverGeometry(page), { message: `1280x${height}, ${where}` }).toEqual(ON_SCREEN);
+    }
+  }
+});
 
-    // Park the chip 90px down and let the popover re-place itself: the pass that
-    // used to clamp with the box's natural height and slide it to y=8.
-    const chip = await page.locator('.ain-table__bar--filters .ain-chip__main').boundingBox();
-    await page.evaluate((dy) => window.scrollBy(0, dy), Math.round((chip?.y ?? 0) - 90));
+test('a popover near the right edge of a narrow window stays inside it', async ({ page }) => {
+  // The same arithmetic one axis over: the chip is pushed to the right-hand end
+  // of a window narrower than the editor wants to be.
+  await page.setViewportSize({ width: 480, height: 900 });
+  await page.goto(DESIGN, { waitUntil: 'networkidle' });
+  await openIssuedFilter(page);
+  await parkChip(page, 120);
+  await expect.poll(() => popoverGeometry(page), { message: '480x900' }).toEqual(ON_SCREEN);
+});
 
-    const measure = () => page.evaluate(() => {
-      const anchor = document.querySelector('.ain-table__bar--filters .ain-chip__main')!.getBoundingClientRect();
-      const pop = [...document.querySelectorAll<HTMLElement>('.ain-popover')]
-        .find((p) => getComputedStyle(p).visibility !== 'hidden')!.getBoundingClientRect();
-      return {
-        overlaps: pop.top < anchor.bottom && pop.bottom > anchor.top,
-        offBottom: pop.bottom > window.innerHeight - 7,
-        offTop: pop.top < 7,
-      };
-    });
-    await expect.poll(measure, { message: `1280x${height}` })
-      .toEqual({ overlaps: false, offBottom: false, offTop: false });
+test('a popover with no room on either axis is clamped on both', async ({ page }) => {
+  // Narrow and short at once, with the chip out of the window above: neither
+  // axis may be given the distance to an off-screen anchor as if it were room.
+  await page.setViewportSize({ width: 460, height: 420 });
+  await page.goto(DESIGN, { waitUntil: 'networkidle' });
+  await openIssuedFilter(page);
+  for (const top of [80, -200]) {
+    await parkChip(page, top);
+    await expect.poll(() => popoverGeometry(page), { message: `460x420, chip at ${top}` }).toEqual(ON_SCREEN);
   }
 });
 

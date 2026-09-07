@@ -259,14 +259,25 @@ export async function readUntilSettled<T>(
 ): Promise<T> {
   const tries = opts.tries ?? 6;
   const gap = opts.gapMs ?? 500;
-  let last = await read();
-  for (let i = 1; i < tries && !settled(last); i++) {
-    await new Promise((resolve) => setTimeout(resolve, gap));
+  let last: T | undefined;
+  let refused: unknown = null;
+  for (let attempt = 0; attempt < tries; attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, gap));
     // One refused read — a rate limit, a dropped connection — is not a reason
-    // to fall back to the answer from before the money moved. Keep the last
-    // good reading and ask again.
-    try { last = await read(); } catch { /* the next pass reads again */ }
+    // to fall back to the answer from before the money moved. That was true of
+    // every read here except the one it mattered most for: the first. It was
+    // awaited outside the loop, so a single 429 — which is what a busy minute
+    // answers, and the honest answer — threw out the whole wait, and the
+    // caller reported the write from the response it already had: "nothing
+    // collected yet" over a card that was declined, on a screen that opened on
+    // the pre-collection record. Every attempt is now the same attempt.
+    try { last = await read(); } catch (error) { refused = error; continue; }
+    refused = null;
+    if (settled(last)) return last;
   }
+  // Nothing was ever read. The caller has no reading to word anything from, so
+  // it hears the refusal rather than a stale record dressed up as an answer.
+  if (last === undefined) throw refused ?? new Error('the record could not be read');
   return last;
 }
 
@@ -1437,12 +1448,21 @@ const SUBMIT_ON_ENTER = new Set(['INPUT']);
  * `<input>` submits nothing unless something wires it, so the house rule
  * "Enter submits" was true of no dialog in this module.
  *
- * Focus is therefore moved onto the first real field a frame after the trap has
- * placed it (the trap runs in a child effect, this one in the parent's, so this
- * lands last and wins), and Enter from any single-line field runs the primary
- * action — guarded by the same condition that disables the primary button, so
- * Enter can never commit what the button would have refused. Textareas,
- * selects, checkboxes and anything with an open listbox keep their own Enter.
+ * Focus is therefore moved onto the first real field in the same frame the trap
+ * places it, and Enter from any single-line field runs the primary action —
+ * guarded by the same condition that disables the primary button, so Enter can
+ * never commit what the button would have refused. Textareas, selects,
+ * checkboxes and anything with an open listbox keep their own Enter.
+ *
+ * *In the same frame* is the whole of it. Both effects run in one commit, the
+ * child's first, so both callbacks sit in one animation frame's queue in that
+ * order: the trap puts focus on Close, this puts it on the field, and no task
+ * — no keystroke — can run between two callbacks of the same frame. Waiting an
+ * extra frame instead, as this did, opens a real one: on a loaded machine a
+ * frame is not 16ms, and for the whole of it the dialog's focus sits on Close
+ * with the operator already typing. Enter there closes the dialog the click
+ * would have — which is exactly the "focus on the one control that throws the
+ * work away" this hook exists to prevent, only now with a gap you cannot see.
  */
 export function useDialogForm(open: boolean, canSubmit: boolean, onSubmit: () => void): DialogForm {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -1451,19 +1471,16 @@ export function useDialogForm(open: boolean, canSubmit: boolean, onSubmit: () =>
 
   useEffect(() => {
     if (!open) return;
-    let inner = 0;
-    const outer = requestAnimationFrame(() => {
-      inner = requestAnimationFrame(() => {
-        const root = ref.current;
-        if (!root) return;
-        const first = root.querySelector<HTMLElement>(FOCUSABLE);
-        // Only take focus back from the header. If the operator has already
-        // clicked into the form, leave them where they are.
-        const active = document.activeElement;
-        if (first && (!active || !root.contains(active))) first.focus({ preventScroll: true });
-      });
+    const frame = requestAnimationFrame(() => {
+      const root = ref.current;
+      if (!root) return;
+      const first = root.querySelector<HTMLElement>(FOCUSABLE);
+      // Only take focus back from the header. If the operator has already
+      // clicked into the form, leave them where they are.
+      const active = document.activeElement;
+      if (first && (!active || !root.contains(active))) first.focus({ preventScroll: true });
     });
-    return () => { cancelAnimationFrame(outer); cancelAnimationFrame(inner); };
+    return () => cancelAnimationFrame(frame);
   }, [open]);
 
   const onKeyDown = useCallback((e: React.KeyboardEvent) => {

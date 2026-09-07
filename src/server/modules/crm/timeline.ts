@@ -284,7 +284,9 @@ function collect(ctx: Ctx, crm: Crm, orgId: string, record: CrmRecord, options: 
   }
 
   if (wanted.has('event')) {
-    const objectTypeNames = new Set(crm.objectTypes(orgId).map((t) => t.name));
+    const objectTypeDefs = crm.objectTypes(orgId);
+    const objectTypeNames = new Set(objectTypeDefs.map((t) => t.name));
+    const objectTypeLabels = new Map(objectTypeDefs.map((t) => [t.name, t.label]));
     const associationLabels = new Map(crm.associationTypes(orgId).map((t) => [t.name, t]));
     const eventRows = readEvents(ctx, orgId, record.id, before, cursor, limit);
     // The association lane renders every link that still exists, so a
@@ -297,7 +299,7 @@ function collect(ctx: Ctx, crm: Crm, orgId: string, record: CrmRecord, options: 
     for (const row of eventRows) {
       const data = parseJson<Record<string, unknown>>(row.data, {});
       if (row.type === 'association.created' && typeof data.id === 'string' && shadowed.has(data.id)) continue;
-      const link = linkEvent(row.type, data, record.id, associationLabels);
+      const link = linkEvent(row.type, data, record.id, associationLabels, objectTypeLabels);
       const summary = summarise(data);
       items.push({
         object: 'timeline_item',
@@ -674,8 +676,9 @@ function titleForEvent(type: string, objectTypes: Set<string>): string {
 function linkEvent(
   type: string, data: Record<string, unknown>, subjectId: string,
   labels: Map<string, { label: string; inverse_label: string }>,
+  objectLabels: Map<string, string>,
 ): { title: string; body: string | null; data: Record<string, unknown> } | null {
-  if (type !== 'association.created' && type !== 'association.deleted') return null;
+  if (type !== 'association.created' && type !== 'association.deleted' && type !== 'association.primary_set') return null;
   const endpoint = (side: unknown): { id: string; object_type: string; display_name: string } | null => {
     if (!side || typeof side !== 'object') return null;
     const row = side as Record<string, unknown>;
@@ -691,8 +694,20 @@ function linkEvent(
   const associationType = typeof data.association_type === 'string' ? data.association_type : '';
   const type_ = labels.get(associationType);
   const relationship = (outgoing ? type_?.label : type_?.inverse_label) ?? associationType;
+  // The star reads differently from each end — the record page's own tooltip
+  // makes the same distinction — so the timeline says which claim was made.
+  // The noun is the object type ("company", "contact"), never the association
+  // label, which is a relationship phrase: "is now the primary works at" is not
+  // a sentence anybody wrote.
+  const noun = (objectType: string, fallback: string) =>
+    (objectLabels.get(objectType) ?? fallback).toLowerCase();
+  const primaryTitle = outgoing
+    ? `${other.display_name} is now the primary ${noun(other.object_type, 'link')}`
+    : `Now ${other.display_name}\u2019s primary ${noun(to?.object_type ?? '', 'link')}`;
   return {
-    title: type === 'association.created' ? `Linked to ${other.display_name}` : `Unlinked ${other.display_name}`,
+    title: type === 'association.created' ? `Linked to ${other.display_name}`
+      : type === 'association.deleted' ? `Unlinked ${other.display_name}`
+      : primaryTitle,
     body: relationship || null,
     data: {
       association_type: associationType,

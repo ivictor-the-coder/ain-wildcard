@@ -23,7 +23,7 @@ import {
 } from '../src/client/design/table-core';
 import { contrastGrade, contrastRatio, parseColor, relativeLuminance } from '../src/client/design/color';
 import { readFileSync, readdirSync } from 'node:fs';
-import { computePosition, repositionFloating, type FloatingElement } from '../src/client/design/position';
+import { computePosition, repositionFloating, type FloatingElement, type PositionResult, type Size } from '../src/client/design/position';
 import {
   addDays, addMonths, monthMatrix, nextRange, RANGE_PRESETS, startOfMonthUtc, weekdayLabels,
 } from '../src/client/design/calendar-core';
@@ -508,6 +508,99 @@ describe('overlay positioning', () => {
       assert.equal(result.placement, 'top-start');
       assert.equal(result.y, 8);
       assert.equal(result.y + result.maxHeight, low.y - 6, 'the clamped box ends exactly at the gap above the anchor');
+    });
+  });
+
+  /**
+   * A popover stays open while the surface behind it scrolls — `Popover` binds
+   * `reposition` to every scroll in the document — so the anchor it is placed
+   * against is routinely a rectangle that is no longer on screen. The room on a
+   * side was measured as a bare subtraction, so an anchor 5,000px above the
+   * window claimed 5,000px of room *below* it: nothing clamped the box, the
+   * cross-axis clamp collapsed to the padding, and a 508px date editor sat at
+   * y=8 on a 400px window with 116px of itself, its footer included, below the
+   * bottom edge.
+   */
+  describe('an anchor the surface has scrolled out of the window', () => {
+    const PADDING = 8;
+    const OFFSET = 6;
+    /** The box as it will really render: its content, clipped by the clamp. */
+    const rendered = (result: PositionResult, natural: Size) => ({
+      top: result.y,
+      bottom: result.y + Math.min(natural.height, result.maxHeight),
+      left: result.x,
+      right: result.x + Math.min(natural.width, result.maxWidth),
+    });
+    const onScreen = (result: PositionResult, natural: Size, viewport: Size, what: string) => {
+      const box = rendered(result, natural);
+      assert.ok(box.top >= PADDING, `${what}: top ${box.top} is above the ${PADDING}px margin`);
+      assert.ok(box.bottom <= viewport.height - PADDING, `${what}: bottom ${box.bottom} runs past ${viewport.height - PADDING}`);
+      assert.ok(box.left >= PADDING, `${what}: left ${box.left} is outside the ${PADDING}px margin`);
+      assert.ok(box.right <= viewport.width - PADDING, `${what}: right ${box.right} runs past ${viewport.width - PADDING}`);
+    };
+
+    it('keeps a box that is taller than the window inside it at every short viewport', () => {
+      const natural = { width: 294, height: 508 };
+      for (const height of [400, 460, 480, 520]) {
+        const viewport = { width: 1280, height };
+        // The chip has scrolled clear of the top edge, so every pixel of the
+        // window is "below" it — but the window is all there ever is.
+        const gone = { x: 522, y: -5446, width: 91, height: 24 };
+        const result = computePosition(gone, natural, viewport, { placement: 'bottom-start' });
+        onScreen(result, natural, viewport, `1280x${height}`);
+        // And the clamp it hands the box is the window itself, not the anchor's
+        // imaginary distance from it.
+        assert.ok(
+          result.maxHeight <= height - PADDING * 2,
+          `1280x${height}: told the box it could be ${result.maxHeight}px tall in a ${height}px window`,
+        );
+      }
+    });
+
+    it('keeps a box inside the window when the anchor has scrolled off the bottom instead', () => {
+      const viewport = { width: 1280, height: 400 };
+      const natural = { width: 294, height: 508 };
+      const below = { x: 522, y: viewport.height + 900, width: 91, height: 24 };
+      const result = computePosition(below, natural, viewport, { placement: 'bottom-start' });
+      assert.equal(result.placement, 'top-start', 'nothing is below an anchor under the fold');
+      onScreen(result, natural, viewport, 'anchor below the fold');
+    });
+
+    it('does the same on the other axis, for a submenu whose row has scrolled aside', () => {
+      const viewport = { width: 1000, height: 800 };
+      const natural = { width: 900, height: 200 };
+      for (const x of [-1400, viewport.width + 1400]) {
+        const gone = { x, y: 200, width: 100, height: 32 };
+        const result = computePosition(gone, natural, viewport, { placement: 'right-start' });
+        onScreen(result, natural, viewport, `anchor at x=${x}`);
+        assert.ok(
+          result.maxWidth <= viewport.width - PADDING * 2,
+          `x=${x}: told the box it could be ${result.maxWidth}px wide in a ${viewport.width}px window`,
+        );
+      }
+    });
+
+    it('clamps both axes at once for a box larger than the window in both', () => {
+      const viewport = { width: 700, height: 420 };
+      const natural = { width: 900, height: 620 };
+      const gone = { x: -2000, y: -2000, width: 100, height: 32 };
+      const result = computePosition(gone, natural, viewport, { placement: 'bottom-start' });
+      onScreen(result, natural, viewport, 'oversized box, anchor off both edges');
+    });
+
+    it('still measures a visible anchor against the anchor, not the whole window', () => {
+      // The clamp must not become "the viewport" for every box: a chip near the
+      // bottom of a tall window still gets the room above it and no more.
+      const viewport = { width: 1512, height: 950 };
+      const chip = { x: 300, y: viewport.height - 120, width: 96, height: 24 };
+      const natural = { width: 260, height: 286 };
+      const result = computePosition(chip, natural, viewport, { placement: 'bottom-start' });
+      assert.equal(result.placement, 'top-start');
+      assert.equal(rendered(result, natural).bottom, chip.y - OFFSET, 'the box ends at the gap above the chip');
+      assert.equal(
+        result.maxHeight, chip.y - PADDING - OFFSET,
+        'and the room it is offered is the room above the chip, not the whole window',
+      );
     });
   });
 

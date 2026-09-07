@@ -522,6 +522,79 @@ describe('associations', () => {
     assert.equal(edges.data[0].record_id, second.id);
   });
 
+  /**
+   * The star on the record page is a `POST /v1/associations` with `primary:
+   * true` against a link that already exists. The route documents `is_primary`
+   * as “the field you read back is the field you can send”, and every other
+   * write on this module answers with the row it wrote.
+   */
+  test('promoting a link that already exists answers with the row it just wrote, on both ends', async () => {
+    const company = await expectOk('POST', '/v1/records/company', {
+      properties: { name: 'Primary Flag Co', domain: 'primary-flag.test' },
+    });
+    const other = await expectOk('POST', '/v1/records/company', {
+      properties: { name: 'Primary Flag Two', domain: 'primary-flag-two.test' },
+    });
+    const contact = await expectOk('POST', '/v1/records/contact', {
+      properties: { first_name: 'Nadia', last_name: 'Halloran', email: 'nadia@primary-flag.test' },
+    });
+
+    // Linked from the company's own page, which sends the company as `from`.
+    const linked = await expectOk('POST', '/v1/associations', { from_id: company.id, to_id: contact.id });
+    assert.equal(linked.is_primary, false, 'a plain link starts unflagged');
+
+    const promoted = await expectOk('POST', '/v1/associations', {
+      from_id: contact.id, to_id: company.id, association_type: linked.association_type, primary: true,
+    });
+    const readBack = await expectOk('GET', `/v1/records/company/${company.id}/associations`);
+    const stored = readBack.data.find((e: { record_id: string }) => e.record_id === contact.id);
+    assert.equal(stored.is_primary, true, 'the flag has to reach the database');
+    assert.equal(
+      promoted.is_primary, stored.is_primary,
+      'the write answered with a different flag than the one it stored',
+    );
+
+    // The move: the same contact's primary company goes to the other account,
+    // and the first one stands down. Both edges hang off the contact, so this
+    // is the case the flag is scoped by.
+    await expectOk('POST', '/v1/associations', { from_id: contact.id, to_id: other.id, primary: true });
+    const afterMove = await expectOk('GET', `/v1/records/contact/${contact.id}/associations?object_type=company`);
+    const flags = new Map(afterMove.data.map((e: { record_id: string; is_primary: boolean }) => [e.record_id, e.is_primary]));
+    assert.equal(flags.get(other.id), true, 'the star moved');
+    assert.equal(flags.get(company.id), false, 'and stood the old one down');
+  });
+
+  test('a link promoted to primary is on the event stream, the way creating one is', async () => {
+    const company = await expectOk('POST', '/v1/records/company', {
+      properties: { name: 'Primary Event Co', domain: 'primary-event.test' },
+    });
+    const contact = await expectOk('POST', '/v1/records/contact', {
+      properties: { first_name: 'Ivo', last_name: 'Mercer', email: 'ivo@primary-event.test' },
+    });
+    const link = await expectOk('POST', '/v1/associations', { from_id: contact.id, to_id: company.id });
+    assert.equal(link.is_primary, false);
+
+    await expectOk('POST', '/v1/associations', {
+      from_id: contact.id, to_id: company.id, association_type: link.association_type, primary: true,
+    });
+
+    // The timeline is the event stream rendered, so asking it also proves the
+    // event is readable prose rather than a dot-separated type and an id.
+    const timeline = await expectOk('GET', `/v1/records/contact/${contact.id}/timeline?limit=50&kinds=event`);
+    const entry = timeline.data.find((i: { data?: { type?: string } }) => i.data?.type === 'association.primary_set');
+    assert.ok(entry, 'making a link primary changed a record and said nothing about it');
+    assert.ok(entry.title.includes(company.display_name), `the title has to name the account: ${entry.title}`);
+    assert.ok(!/[a-z]{3}_[A-Za-z0-9]{8,}/.test(`${entry.title} ${entry.body ?? ''}`), `no raw id on screen: ${entry.title}`);
+
+    // The event is scoped to the `from` record, exactly as `association.created`
+    // is; the account on the other end carries the link in its association lane,
+    // and that lane has to agree the link is now the primary one.
+    const theirs = await expectOk('GET', `/v1/records/company/${company.id}/timeline?limit=50&kinds=association`);
+    const lane = theirs.data.find((i: { record_id?: string }) => i.record_id === contact.id);
+    assert.ok(lane, 'the company timeline lost the link itself');
+    assert.equal(lane.data.is_primary, true, 'the other end still calls the link secondary');
+  });
+
   test('rejects nonsense associations with a helpful message', async () => {
     const company = (await expectOk('GET', '/v1/records/company?limit=1')).data[0] as CrmRecord;
     const self = await call('POST', '/v1/associations', { from_id: company.id, to_id: company.id });

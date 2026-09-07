@@ -72,13 +72,29 @@ function place(anchor: Rect, size: Size, side: Side, align: Alignment, offset: n
   return { x, y };
 }
 
+/**
+ * The room on one side of the anchor, as a box can actually use it.
+ *
+ * The raw subtraction is unbounded in both directions, and neither end of it is
+ * room. An anchor scrolled above the window reports thousands of pixels *below*
+ * it — a popover stays open while the list under it scrolls, so this is the
+ * ordinary case, not a freak one — and an anchor scrolled below the window
+ * reports the same above. The box still has to fit between the two edges of the
+ * viewport either way. Believing the raw figure is what let a 508px date editor
+ * keep its natural height on a 400px window: nothing clamped it, `viewport -
+ * height - padding` went negative, the cross-axis clamp collapsed to `padding`,
+ * and it landed at y=8 hanging 116px off the bottom with its own footer
+ * unreachable. So a side never offers more than the viewport minus its two
+ * margins, and never offers less than nothing.
+ */
 function spaceOn(anchor: Rect, side: Side, viewport: Size, padding: number): number {
-  switch (side) {
-    case 'top': return anchor.y - padding;
-    case 'bottom': return viewport.height - (anchor.y + anchor.height) - padding;
-    case 'left': return anchor.x - padding;
-    case 'right': return viewport.width - (anchor.x + anchor.width) - padding;
-  }
+  const vertical = side === 'top' || side === 'bottom';
+  const raw = side === 'top' ? anchor.y - padding
+    : side === 'bottom' ? viewport.height - (anchor.y + anchor.height) - padding
+    : side === 'left' ? anchor.x - padding
+    : viewport.width - (anchor.x + anchor.width) - padding;
+  const whole = (vertical ? viewport.height : viewport.width) - padding * 2;
+  return Math.max(0, Math.min(raw, whole));
 }
 
 export function computePosition(
