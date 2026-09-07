@@ -3935,6 +3935,89 @@ describe('a card that arrives after the bill', () => {
     } finally { ws.close(); }
   });
 
+  /**
+   * The one caller that has to be able to say "not this one".
+   *
+   * Handing a bill nobody could charge to the first method that arrives is
+   * right, and it is what the test above holds. It is wrong for exactly one
+   * caller: the person who attached that method *in order to* present the bill
+   * themselves, for a figure only they know. An AR clerk taking a part payment
+   * attaches the bank account the wire came from, and the sweep charged that
+   * account the whole balance before they had typed what arrived — the same
+   * "settled in full" over money that never came the part-payment dialog
+   * exists to prevent, arriving through the back door.
+   */
+  test('an attach that says it will present the bill itself presents nothing, and the part payment still lands', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Alderley Gearworks');
+      const { invoice } = await ws.bill(customer.id);
+
+      const method = await ws.card(customer.id, 'succeeds', { present_open_invoices: false });
+      assert.equal(method.default_for_customer, true, 'it is still the account’s method — only the sweep stood down');
+      assert.equal(
+        ws.app.ctx.db.count(
+          `SELECT COUNT(*) FROM jobs WHERE org_id = ? AND idem_key = ?`,
+          ORG, `payments.collect_invoice:${invoice.id}`,
+        ),
+        0,
+        'a presentation was queued for a bill whose own caller said it was presenting it',
+      );
+      assert.equal((await ws.travel(2 * DAY)).failed, 0);
+      const held = await ws.invoice(invoice.id);
+      assert.equal(held.amount_paid, 0, `${held.number} was collected out from under the caller that asked to present it`);
+      assert.equal(held.amount_due, invoice.amount_due);
+      assert.equal(held.status, 'open');
+      assert.equal((await ws.dunning(customer.id)).length, 0, 'and nothing was refused, so nothing is chasing it');
+
+      // What the operator actually received. Half the balance in whole major
+      // units, so the arithmetic below is the bill's own and not a literal.
+      const part = Math.floor(held.amount_due / 200) * 100;
+      assert.ok(part > 0, 'the fixture bill is too small to be part paid');
+      await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, amount: part,
+        payment_method: method.id, confirm: true, off_session: false,
+      });
+      const part_paid = await ws.invoice(invoice.id);
+      assert.equal(part_paid.amount_paid, part, 'the bill took exactly what arrived');
+      assert.equal(part_paid.amount_due, invoice.amount_due - part, 'and the rest is still owed');
+      assert.equal(part_paid.status, 'open');
+      assert.equal(part_paid.paid_at, null, 'a part payment is not a settlement');
+      await assertReconciled(ws, customer.id, 'after a part payment on an unswept bill');
+    } finally { ws.close(); }
+  });
+
+  /**
+   * The sibling: the same answer on the route that puts a method that already
+   * exists back onto an account. Default unchanged on both, because a flag that
+   * quietly turns the sweep off for everyone is the opposite fix.
+   */
+  test('re-attaching answers the same question, and both routes still sweep when nobody says otherwise', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Ravenhill Tooling');
+      const { invoice } = await ws.bill(customer.id);
+
+      const method = await ws.card(customer.id, 'succeeds', { present_open_invoices: false });
+      await ws.ok('POST', `/v1/payment_methods/${method.id}/detach`, {});
+      await ws.ok('POST', `/v1/payment_methods/${method.id}/attach`, {
+        customer: customer.id, present_open_invoices: false,
+      });
+      assert.equal((await ws.travel(DAY)).failed, 0);
+      assert.equal((await ws.invoice(invoice.id)).amount_paid, 0, 'the re-attach presented a bill it was told not to');
+
+      // And with nobody saying otherwise, the same re-attach is what collects
+      // it — the behaviour the flag narrows, not the behaviour it replaces.
+      await ws.ok('POST', `/v1/payment_methods/${method.id}/detach`, {});
+      await ws.ok('POST', `/v1/payment_methods/${method.id}/attach`, { customer: customer.id });
+      assert.equal((await ws.travel(DAY)).failed, 0);
+      const collected = await ws.invoice(invoice.id);
+      assert.equal(collected.status, 'paid', `${collected.number} was not presented to a card that arrived with no instructions`);
+      assert.equal(collected.amount_paid, invoice.amount_due);
+      await assertReconciled(ws, customer.id, 'after a re-attach with no instructions collected the bill');
+    } finally { ws.close(); }
+  });
+
   test('a stop lifted while there was nothing to charge is not the end of the bill either', async () => {
     const ws = await workspace();
     try {

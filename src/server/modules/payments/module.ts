@@ -85,6 +85,33 @@ const collectionStoppedFor = (ctx: Ctx, orgId: string, subscriptionId: string | 
 };
 
 /**
+ * Whether the attach happening right now may sweep the account's un-reached
+ * bills onto the method that just arrived.
+ *
+ * The sweep hangs off `payment_method.attached`, and the caller's answer
+ * cannot travel on the event: that payload is the payment method itself and it
+ * goes out over webhooks, where a private flag has no business. It travels
+ * beside the call instead. Everything from the insert to the dispatch is
+ * synchronous — `ctx.atomic` publishes the moment it commits — so the window
+ * this is open for is exactly one attach, and the `finally` closes it however
+ * that attach ends.
+ *
+ * It is opened by `present_open_invoices: false`, which is a person saying "I
+ * am presenting this bill myself, for an amount I am about to name". The AR
+ * clerk who attaches the bank account a part payment arrived from is the whole
+ * case: without this, attaching it charged that account the entire balance
+ * before they had typed a figure, and the part payment they were recording
+ * became a settlement in full nobody asked for.
+ */
+let sweepOnAttach = true;
+
+const attaching = <T>(sweep: boolean, write: () => T): T => {
+  const outer = sweepOnAttach;
+  sweepOnAttach = sweep;
+  try { return write(); } finally { sweepOnAttach = outer; }
+};
+
+/**
  * Put a bill back in front of the automatic charge, on exactly the terms
  * `invoice.finalized` would present it on today.
  *
@@ -135,6 +162,7 @@ const methodCreateBody = v.object({
   billing_name: v.optional(v.string({ max: 200 })),
   billing_email: v.optional(v.email()),
   set_default: v.optional(v.boolean()),
+  present_open_invoices: v.optional(v.boolean()),
   metadata: v.metadata(),
 });
 
@@ -396,6 +424,11 @@ export default defineModule({
      * chased does not spend one of its attempts early.
      */
     ctx.events.on('payment_method.attached', (event) => {
+      // The caller is presenting this account's bills itself. That answer
+      // covers every open bill on the account, not just the one it was given
+      // for: "I am taking this payment" is not an instruction to charge the
+      // other four in the same instant.
+      if (!sweepOnAttach) return;
       const method = event.data as PaymentMethod | null;
       if (!method?.customer || method.status !== 'attached') return;
       const held = billing.invoices.list(event.org_id, {
@@ -575,10 +608,13 @@ export default defineModule({
       }),
     });
 
-    router.post('/v1/payment_methods', (req: Req, c: Ctx) =>
-      created(paymentsStore(c).methods.create(req.auth.orgId, req.body as MethodInput, writeMeta(req))), {
+    router.post('/v1/payment_methods', (req: Req, c: Ctx) => {
+      const body = req.body as MethodInput;
+      return created(attaching(body.present_open_invoices !== false,
+        () => paymentsStore(c).methods.create(req.auth.orgId, body, writeMeta(req))));
+    }, {
       summary: 'Attach a payment method', tags: ['payments'], roles: ['member'], idempotent: true,
-      description: 'This is a simulated processor and never accepts a card number. Give it a brand, an expiry and the outcome you want it to produce: simulated_behavior decides every charge against it, and simulated_decline_count says how many of the next attempts decline before it starts succeeding. Pass an id only when migrating a book of business whose subscriptions already name their pm_… methods.',
+      description: 'This is a simulated processor and never accepts a card number. Give it a brand, an expiry and the outcome you want it to produce: simulated_behavior decides every charge against it, and simulated_decline_count says how many of the next attempts decline before it starts succeeding. Pass an id only when migrating a book of business whose subscriptions already name their pm_… methods. An account whose open bills the automatic charge could never reach — there was nothing on file — has them presented to this method the moment it arrives; send present_open_invoices false when a person is about to present one of those bills themselves for an amount they name, and nothing is charged until they do.',
       body: methodCreateBody,
     });
 
@@ -594,11 +630,14 @@ export default defineModule({
       body: methodUpdateBody,
     });
 
-    router.post('/v1/payment_methods/:id/attach', (req: Req, c: Ctx) =>
-      paymentsStore(c).methods.attach(req.auth.orgId, req.params.id, (req.body as { customer: string }).customer, writeMeta(req)), {
+    router.post('/v1/payment_methods/:id/attach', (req: Req, c: Ctx) => {
+      const body = req.body as { customer: string; present_open_invoices?: boolean };
+      return attaching(body.present_open_invoices !== false,
+        () => paymentsStore(c).methods.attach(req.auth.orgId, req.params.id, body.customer, writeMeta(req)));
+    }, {
       summary: 'Attach a method to a customer', tags: ['payments'], roles: ['member'],
-      description: 'A detached method comes back onto an account; a method already on another account is refused with payment_method_in_use, one already on this account with payment_method_already_attached, and a card whose expiry has passed with expired_card. Attaching never changes which method is the default unless the account had none.',
-      body: v.object({ customer: v.id('cus') }),
+      description: 'A detached method comes back onto an account; a method already on another account is refused with payment_method_in_use, one already on this account with payment_method_already_attached, and a card whose expiry has passed with expired_card. Attaching never changes which method is the default unless the account had none. It presents the account’s un-reached open bills to the method exactly as POST /v1/payment_methods does, and takes present_open_invoices false for the same reason.',
+      body: v.object({ customer: v.id('cus'), present_open_invoices: v.optional(v.boolean()) }),
     });
 
     router.post('/v1/payment_methods/:id/detach', (req: Req, c: Ctx) =>

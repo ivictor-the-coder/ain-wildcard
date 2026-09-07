@@ -124,6 +124,42 @@ describe('the ledger is the balance', () => {
     assert.equal(reread.status, 'voided');
   });
 
+  /**
+   * The spent case above is the one that was covered. Voiding credit nobody has
+   * touched is the other half: the whole grant leaves the book in one entry,
+   * and the summary on the grant has to be the sum of the book, not a second
+   * opinion about it.
+   */
+  test('voiding an unused balance takes the whole grant out and still reconciles', async () => {
+    const customer = nextName('cus');
+    const amount = 5_000;
+    const grant: CreditGrant = await expectOk('POST', '/v1/credit-grants', {
+      customer, kind: 'monetary', currency: 'usd', amount, category: 'promotional', name: 'Untouched',
+    });
+    assert.equal(grant.balance, amount);
+
+    const opening = await expectOk('GET', `/v1/credit-grants/${grant.id}/ledger`);
+    const sum = (entries: LedgerEntry[]) => entries.reduce((total, entry) => total + entry.delta, 0);
+    assert.equal(sum(opening.entries), amount, 'the book starts at what was granted');
+
+    await expectOk('POST', `/v1/credit-grants/${grant.id}/void`, { reason: 'Pilot ended without conversion' });
+
+    const closing = await expectOk('GET', `/v1/credit-grants/${grant.id}/ledger`);
+    assert.equal(closing.reconciled, true);
+    assert.equal(sum(closing.entries), 0);
+    const voids = closing.entries.filter((e: LedgerEntry) => e.type === 'void');
+    assert.deepEqual(voids.map((e: LedgerEntry) => e.delta), [-amount], 'one entry, for exactly what was unspent');
+    assert.equal(voids[0].reason, 'Pilot ended without conversion');
+
+    const reread: CreditGrant = await expectOk('GET', `/v1/credit-grants/${grant.id}`);
+    assert.equal(reread.balance, sum(closing.entries), 'the summary and the book must be the same number');
+    assert.equal(reread.status, 'voided');
+
+    // And nothing that adds this customer's credit up still counts it.
+    const balance = await expectOk('GET', `/v1/customers/${customer}/credit-balance`);
+    assert.ok(!JSON.stringify(balance).includes(grant.id), 'a voided grant is still being offered as spendable');
+  });
+
   test('there is no balance column anywhere in the schema', () => {
     const columns = app.ctx.db.all<{ name: string }>(`PRAGMA table_info(credit_grants)`).map((c) => c.name);
     assert.ok(!columns.includes('balance'), 'a stored balance is a balance that can drift');

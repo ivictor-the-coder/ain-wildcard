@@ -3037,7 +3037,11 @@ function RecordPaymentDialog({ invoice, open, onClose }: { invoice: Invoice; ope
         <PaymentMethodDialog
           customer={account.data}
           open={attaching}
-          onClose={() => { setAttaching(false); methods.refetch(); }}
+          forPresentation
+          // The bill can move while this is open — a campaign's own window can
+          // come round — so the balance this dialog is priced against is read
+          // again rather than assumed to be the one it opened with.
+          onClose={() => { setAttaching(false); methods.refetch(); invalidate('/v1/invoices'); }}
         />
       )}
     </Modal>

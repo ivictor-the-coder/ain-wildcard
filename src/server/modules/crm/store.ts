@@ -1369,28 +1369,27 @@ export class Crm {
       `SELECT * FROM crm_associations WHERE org_id = ? AND association_type = ? AND from_id = ? AND to_id = ?`,
       orgId, type.name, from.id, to.id);
     if (existing) {
-      // Promoting a link that is already there is the star on the record page,
-      // and it is a write like any other: the row it answers with has to be the
-      // row it just wrote. Summarising the pre-update `existing` reported
-      // `is_primary: false` on the very call that set it — the route promises
-      // "the field you read back is the field you can send" — and it left the
-      // change with no event, so the move showed on neither timeline, went into
-      // no audit trail and woke no workflow, while creating the same link did
-      // all three.
-      if (input.primary && !existing.is_primary) {
+      // The star on a record page is this call, against a link that is already
+      // there, and it is a write like any other. It used to answer by
+      // summarising the row as it stood *before* the flag moved — `is_primary:
+      // false` on the very call that set it, from a route that promises "the
+      // field you read back is the field you can send" — and it wrote no event,
+      // so a change of primary account showed on no timeline, entered no audit
+      // trail and woke no workflow, while creating the same link did all three.
+      const promote = !!input.primary && !existing.is_primary;
+      if (promote) {
         this.setPrimary(orgId, type.name, from.id, existing.id);
-        const promoted = this.ctx.db.get<any>(
-          `SELECT * FROM crm_associations WHERE org_id = ? AND id = ?`, orgId, existing.id) ?? { ...existing, is_primary: 1 };
         if (opts.emit !== false) {
           this.ctx.emit(orgId, 'association.primary_set', {
-            id: promoted.id, association_type: type.name, label: type.label,
+            id: existing.id, association_type: type.name, label: type.label,
             from: { id: from.id, object_type: from.object_type, display_name: from.display_name },
             to: { id: to.id, object_type: to.object_type, display_name: to.display_name },
           }, { objectId: from.id, objectType: from.object_type, actorId: opts.actorId ?? null, actorType: opts.actorType ?? 'user' });
         }
-        return { ...this.summarise(promoted, to, type, 'outgoing'), replaced: [] };
       }
-      return { ...this.summarise(existing, to, type, 'outgoing'), replaced: [] };
+      // `setPrimary` writes one column, so this is the row as it now stands.
+      const row = promote ? { ...existing, is_primary: 1 } : existing;
+      return { ...this.summarise(row, to, type, 'outgoing'), replaced: [] };
     }
 
     // `many_to_one` and `one_to_one` labels hold a single edge; replacing is the

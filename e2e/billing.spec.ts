@@ -1600,10 +1600,29 @@ test('a grid still loading does not report zero rows underneath its skeletons', 
  * write one down, leave the bill open for the rest, and say what is still owed.
  */
 test('a part payment is recorded for what actually arrived, and the bill stays open for the rest', async ({ page }) => {
-  const open = await json(page, '/v1/invoices?status=open&limit=20');
-  const candidates = (await notBeingChased(page, open.data)).filter((row) => row.amount_due >= 200);
-  const invoice = candidates[0];
-  test.skip(!invoice, 'nothing large enough is owed in this workspace');
+  /**
+   * Its own account and its own bill.
+   *
+   * The flow this exists for is the one where the account has nothing on file
+   * and the operator attaches the instrument the money came from — and whether
+   * the book's first open invoice happens to be such an account is decided by
+   * whatever ran before this. Picked from the book, this test drove the attach
+   * flow on some runs and skipped it on others, and passed either way while the
+   * attach was quietly settling the bill in full.
+   */
+  const account = await post(page, '/v1/customers', {
+    name: `Part Payment Co ${Date.now().toString().slice(-6)}`, currency: 'usd',
+  });
+  const sub = await post(page, '/v1/subscriptions', {
+    customer: account.id,
+    items: [{ price: 'price_nw_starter_monthly', quantity: 1 }],
+    collection_method: 'charge_automatically',
+  });
+  const invoice: InvoiceRow = await json(page, `/v1/invoices/${sub.latest_invoice.id}`);
+  expect(invoice.status).toBe('open');
+  expect(invoice.amount_paid).toBe(0);
+  // Two whole major units at least, so half of it is still a real part payment.
+  expect(invoice.amount_due).toBeGreaterThanOrEqual(200);
 
   // A presentation needs something to present against. Attaching one is a
   // first-class flow on this dialog, so the test drives it the same way.
@@ -1612,12 +1631,24 @@ test('a part payment is recorded for what actually arrived, and the bill stays o
   const dialog = page.getByRole('dialog', { name: /Take a payment on/ });
   await expect(dialog).toBeVisible();
 
-  if (await dialog.getByLabel('How it was taken').locator('option').count() <= 1) {
-    await dialog.getByRole('button', { name: /Attach a card or bank account/ }).click();
-    const attach = page.getByRole('dialog', { name: /payment method/i });
-    await attach.getByRole('button', { name: /^Attach/ }).click();
-    await expect(attach).toBeHidden();
-  }
+  expect(await dialog.getByLabel('How it was taken').locator('option').count()).toBe(1);
+  await dialog.getByRole('button', { name: /Attach a card or bank account/ }).click();
+  const attach = page.getByRole('dialog', { name: /payment method/i });
+  await attach.getByRole('button', { name: /^Attach/ }).click();
+  await expect(attach).toBeHidden();
+
+  // Attaching something to present against presents nothing. The account had
+  // no method, so this bill is one the automatic charge could never reach —
+  // and the platform hands such a bill to the first method that arrives, which
+  // here would collect the whole balance a moment before the operator says how
+  // much of it actually turned up.
+  // A wait, because what is being asserted is that nothing happened: the
+  // presentation this used to trigger is a job, and a job runs on a tick.
+  await page.waitForTimeout(3000);
+  const untouched = await json(page, `/v1/invoices/${invoice.id}`);
+  expect(untouched.amount_paid).toBe(0);
+  expect(untouched.amount_due).toBe(invoice.amount_due);
+  expect(untouched.status).toBe('open');
 
   // Half of what is still owed, rounded to whole major units so the arithmetic
   // is readable in the assertion.
@@ -1636,9 +1667,21 @@ test('a part payment is recorded for what actually arrived, and the bill stays o
   expect(after.amount_due).toBe(invoice.amount_due - half);
   expect(after.status).toBe('open');
 
+  // And the bill's own figures are the money the ledger holds, not a second
+  // opinion about it: what the charges took, less what went back.
+  const book = await json(page, `/v1/invoices/${invoice.id}/payments`);
+  const collected = (book.charges as { status: string; amount: number; amount_refunded: number }[])
+    .filter((row) => row.status === 'succeeded')
+    .reduce((sum, row) => sum + row.amount - row.amount_refunded, 0);
+  expect(collected).toBe(half);
+  expect(book.amount_paid).toBe(collected);
+  expect(book.amount_due).toBe(book.total - collected);
+
   // And the screen says so rather than calling a part payment a settlement.
   await page.reload({ waitUntil: 'networkidle' });
   await expect(page.locator('.bl-headline', { hasText: 'Collected' })).toContainText('Part paid');
+
+  await removeAccount(page, account.id);
 });
 
 /**

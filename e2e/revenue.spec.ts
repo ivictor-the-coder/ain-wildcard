@@ -498,8 +498,16 @@ test('a usage period can be settled from the credits screen, drawing the grants 
   await expect(banner).toBeVisible();
   const said = (await banner.textContent()) ?? '';
   const after = await json(page, '/v1/credit-settlements?status=all&limit=200');
-  if (/already covers/.test(said)) {
-    expect(said).toMatch(/Settlement \w+ already covers/);
+  if (/already settled/.test(said)) {
+    // The refusal is the screen's own sentence, not the API's. This used to
+    // look for "Settlement <id> already covers …", which is what
+    // `/v1/credit-settlements` answers a developer with — asserting it meant
+    // asserting that an operator was shown a raw settlement id and two ISO
+    // stamps. The dialog names the window, the price and the money instead, so
+    // that is what is checked, ids and stamps included out.
+    expect(said).toMatch(/is already settled on .+would draw credit twice/s);
+    expect(said, 'a refusal an operator reads must not carry a raw id').not.toMatch(/\b[a-z]{2,}_[A-Za-z0-9]{8,}\b/);
+    expect(said, 'nor an ISO timestamp').not.toMatch(/\d{4}-\d{2}-\d{2}T/);
     expect(after.data.length).toBe(before.data.length);
   } else {
     expect(said).toContain('priced at');

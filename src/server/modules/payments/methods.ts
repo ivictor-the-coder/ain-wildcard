@@ -47,6 +47,13 @@ export interface MethodInput {
   billing_name?: string;
   billing_email?: string;
   set_default?: boolean;
+  /**
+   * Whether attaching this presents the account's open automatic bills to it
+   * straight away. Read by the route, not by this store — the sweep it governs
+   * lives on `payment_method.attached` — but it is declared here because it is
+   * part of what a caller sends to attach a method.
+   */
+  present_open_invoices?: boolean;
   metadata?: Record<string, string>;
 }
 

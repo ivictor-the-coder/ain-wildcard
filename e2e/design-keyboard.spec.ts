@@ -118,21 +118,32 @@ test('a submenu takes the keyboard and hands it back', async ({ page }) => {
 /* =========================== Anchored placement =========================== */
 
 /**
- * `/design` does not scroll the window — the shell's main region is the scroller
- * — so parking the chip means scrolling whatever box actually holds it. Walking
- * up from the chip finds it without this file naming the shell's own markup.
+ * Put an anchor a given number of pixels down the window, and answer with where
+ * it actually landed.
+ *
+ * `/design` does not scroll the window — the shell's main region is the
+ * scroller — so this walks up from the element to whatever box actually holds
+ * it rather than naming the shell's own markup. It is a nudge and not a
+ * guarantee: the styleguide is 25,000px of demos and some of them pull the
+ * scroller back to themselves, which is why every assertion below is written
+ * to hold *wherever* the anchor is rather than assuming it stayed put. An
+ * anchor the page has scrolled away from is the case that mattered anyway.
  */
-const parkChip = (page: Page, viewportTop: number) => page.evaluate((top) => {
-  const chip = document.querySelector('.ain-table__bar--filters .ain-chip__main')!;
-  let el: HTMLElement | null = chip.parentElement;
+const park = (page: Page, selector: string, viewportTop: number) => page.evaluate(([sel, top]) => {
+  const anchor = document.querySelector(sel as string)!;
+  let el: HTMLElement | null = anchor.parentElement;
   while (el && el !== document.documentElement) {
     const style = getComputedStyle(el);
     if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight) break;
     el = el.parentElement;
   }
   const scroller: Element = el ?? document.scrollingElement!;
-  scroller.scrollTop += chip.getBoundingClientRect().top - top;
-}, viewportTop);
+  scroller.scrollTop += anchor.getBoundingClientRect().top - (top as number);
+  return Math.round(anchor.getBoundingClientRect().top);
+}, [selector, viewportTop] as [string, number]);
+
+const CHIP = '.ain-table__bar--filters .ain-chip__main';
+const parkChip = (page: Page, viewportTop: number) => park(page, CHIP, viewportTop);
 
 /** Open the Issued date filter on the styleguide's table and leave it open. */
 const openIssuedFilter = async (page: Page) => {
@@ -143,9 +154,9 @@ const openIssuedFilter = async (page: Page) => {
   await expect(page.locator('.ain-table__bar--filters .ain-chip__main')).toBeVisible();
 };
 
-/** Where the open popover sits, against the chip and against the window. */
-const popoverGeometry = (page: Page) => page.evaluate(() => {
-  const anchor = document.querySelector('.ain-table__bar--filters .ain-chip__main')!.getBoundingClientRect();
+/** Where the open popover sits, against its anchor and against the window. */
+const popoverGeometry = (page: Page, selector = CHIP) => page.evaluate((sel) => {
+  const anchor = document.querySelector(sel)!.getBoundingClientRect();
   const pop = [...document.querySelectorAll<HTMLElement>('.ain-popover')]
     .find((p) => getComputedStyle(p).visibility !== 'hidden')!.getBoundingClientRect();
   return {
@@ -155,7 +166,7 @@ const popoverGeometry = (page: Page) => page.evaluate(() => {
     offLeft: pop.left < 7,
     offRight: pop.right > window.innerWidth - 7,
   };
-});
+}, selector);
 const ON_SCREEN = { overlaps: false, offBottom: false, offTop: false, offLeft: false, offRight: false };
 
 test('a popover taller than the viewport never covers the chip that opened it', async ({ page }) => {
@@ -164,43 +175,53 @@ test('a popover taller than the viewport never covers the chip that opened it', 
     await page.goto(DESIGN, { waitUntil: 'networkidle' });
     await openIssuedFilter(page);
 
-    // Three places the chip can be while its 508px editor is open, all of them
-    // one scroll apart. The editor is taller than any of these windows, so it
-    // is clamped every time and the only question is where the clamp puts it.
+    // Three places to put the chip while its 508px editor is open, each a
+    // scroll apart. The editor is taller than any of these windows, so it is
+    // clamped every time and the only question is where the clamp puts it.
     //
-    //  90        room below, none above — it stays under the chip
-    //  height-60 no room below — it flips over the chip
+    //  90        room below, none above — it belongs under the chip
+    //  height-60 no room below — it belongs over the chip
     //  -140      the chip has scrolled clear of the top edge, which is what a
     //            list moving under an open popover does. The room "below" an
     //            anchor above the window is not room: measured as a bare
     //            subtraction it came out in the thousands, nothing clamped the
     //            box, and it sat at y=8 with its footer past the bottom edge.
-    for (const [where, top] of [['under the chip', 90], ['flipped over it', height - 60], ['chip scrolled away', -140]] as const) {
-      await parkChip(page, top);
-      await expect.poll(() => popoverGeometry(page), { message: `1280x${height}, ${where}` }).toEqual(ON_SCREEN);
+    for (const top of [90, height - 60, -140]) {
+      const landed = await parkChip(page, top);
+      expect(landed, `the chip could not be moved to ${top}`).toBe(top);
+      await expect.poll(() => popoverGeometry(page), { message: `1280x${height}, chip asked to ${top}` })
+        .toEqual(ON_SCREEN);
     }
   }
 });
 
-test('a popover near the right edge of a narrow window stays inside it', async ({ page }) => {
-  // The same arithmetic one axis over: the chip is pushed to the right-hand end
-  // of a window narrower than the editor wants to be.
-  await page.setViewportSize({ width: 480, height: 900 });
-  await page.goto(DESIGN, { waitUntil: 'networkidle' });
-  await openIssuedFilter(page);
-  await parkChip(page, 120);
-  await expect.poll(() => popoverGeometry(page), { message: '480x900' }).toEqual(ON_SCREEN);
-});
+/**
+ * The second anchored box on this screen, and a different shape of the same
+ * question: its button sits at the right-hand end of the toolbar and it aligns
+ * `bottom-end`, so it grows leftwards from an anchor near the right edge, where
+ * the chip's editor grows rightwards from one near the left. Both are checked
+ * on all four sides. A window narrow enough to squeeze either box horizontally
+ * is out of reach here — the styleguide's table stops drawing its toolbar below
+ * about 900px — so the width arithmetic is pinned in `tests/design.test.ts`,
+ * where an anchor can be put anywhere at all.
+ */
+test('the columns popover stays inside a short window from every side', async ({ page }) => {
+  // `park` and the measurement run inside the page, where `:has-text` is not a
+  // selector, so the open button is addressed by what it says about itself.
+  const COLUMNS = '#table .ain-table__bar:not(.ain-table__bar--filters) button[aria-haspopup="dialog"][aria-expanded="true"]';
+  for (const [width, height] of [[900, 420], [1000, 360], [1512, 950]] as const) {
+    await page.setViewportSize({ width, height });
+    await page.goto(DESIGN, { waitUntil: 'networkidle' });
+    await openSection(page, 'table');
+    await page.locator('#table').getByRole('button', { name: 'Columns' }).first().click();
+    await expect(page.locator('.ain-colpop')).toBeVisible();
 
-test('a popover with no room on either axis is clamped on both', async ({ page }) => {
-  // Narrow and short at once, with the chip out of the window above: neither
-  // axis may be given the distance to an off-screen anchor as if it were room.
-  await page.setViewportSize({ width: 460, height: 420 });
-  await page.goto(DESIGN, { waitUntil: 'networkidle' });
-  await openIssuedFilter(page);
-  for (const top of [80, -200]) {
-    await parkChip(page, top);
-    await expect.poll(() => popoverGeometry(page), { message: `460x420, chip at ${top}` }).toEqual(ON_SCREEN);
+    for (const top of [60, height - 50, -160]) {
+      const landed = await park(page, COLUMNS, top);
+      expect(landed, `the button could not be moved to ${top}`).toBe(top);
+      await expect.poll(() => popoverGeometry(page, COLUMNS), { message: `${width}x${height}, button asked to ${top}` })
+        .toEqual(ON_SCREEN);
+    }
   }
 });
 

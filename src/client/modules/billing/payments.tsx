@@ -79,8 +79,20 @@ const BANK_BEHAVIORS: { value: string; label: string }[] = [
   { value: 'debit_not_authorized', label: 'Fails — the mandate does not cover it' },
 ];
 
-export function PaymentMethodDialog({ customer, open, onClose, method }: {
+/**
+ * Attach an instrument to an account, or retune one already on it.
+ *
+ * `forPresentation` says the operator is choosing something to present one
+ * payment against, not setting up how this account gets charged from now on.
+ * It matters because the platform presents an account's un-reached open bills
+ * to a method the moment it arrives — right, when a card finally turns up for
+ * a bill nobody could charge, and wrong when the person attaching it is two
+ * fields away from typing what actually arrived: the bank account a €6 wire
+ * came from was charged the whole €13.09 balance before they had finished.
+ */
+export function PaymentMethodDialog({ customer, open, onClose, method, forPresentation }: {
   customer: Customer; open: boolean; onClose: () => void; method?: PaymentMethod | null;
+  forPresentation?: boolean;
 }) {
   const action = useAction();
   const editing = !!method;
@@ -134,10 +146,13 @@ export function PaymentMethodDialog({ customer, open, onClose, method }: {
           simulated_behavior: behavior,
           ...(declineCount !== null ? { simulated_decline_count: declineCount } : {}),
           set_default: setDefault,
+          ...(forPresentation ? { present_open_invoices: false } : {}),
         }, { idempotencyKey: idem() }),
         {
           success: 'Payment method attached',
-          description: setDefault ? `It is now the default for ${customer.name}.` : `It is on file for ${customer.name}.`,
+          description: forPresentation
+            ? `It is on file for ${customer.name} and nothing has been presented against it yet.`
+            : setDefault ? `It is now the default for ${customer.name}.` : `It is on file for ${customer.name}.`,
           failure: 'The payment method was refused',
         },
         INVALIDATE_PAYMENTS,
@@ -158,6 +173,9 @@ export function PaymentMethodDialog({ customer, open, onClose, method }: {
       description={
         'This platform runs a simulated processor and never holds a card number. Describe the instrument the '
         + 'customer sent through, and choose the outcome charges against it should produce.'
+        + (forPresentation
+          ? ' Nothing is charged when it is attached: the payment behind this is the one you are about to record.'
+          : '')
       }
       footer={
         <>
@@ -258,7 +276,12 @@ export function PaymentMethodDialog({ customer, open, onClose, method }: {
         )}
 
         {!editing && (
-          <Field label="Default for this account">
+          <Field
+            label="Default for this account"
+            hint={forPresentation
+              ? 'This decides what collects the account’s future bills. Neither answer presents anything now.'
+              : undefined}
+          >
             <Select
               value={setDefault ? 'yes' : 'no'}
               onChange={(value) => setSetDefault(value === 'yes')}

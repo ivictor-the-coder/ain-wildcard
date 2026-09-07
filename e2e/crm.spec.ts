@@ -159,8 +159,15 @@ test('the create form binds the server’s validation error to the field it name
 });
 
 test('a property edited inline on the record page is written, and lands on its own timeline', async ({ page }) => {
-  const company = (await (await page.request.get('/api/v1/records/company?limit=1')).json()).data[0];
-  await page.goto(`/companies/${company.id}`, { waitUntil: 'networkidle' });
+  // An empty property draws no row, so "the newest company" is not a fixture:
+  // any test that creates one without an About — this file has two — leaves
+  // this one looking for an Edit button that was never rendered. Take the
+  // newest company that actually has the property this test edits.
+  const companies = (await (await page.request.get('/api/v1/records/company?limit=50')).json()).data as
+    { id: string; properties: Record<string, unknown> }[];
+  const company = companies.find((c) => typeof c.properties.description === 'string' && c.properties.description.length > 0);
+  expect(company, 'no company in this workspace has an About to edit').toBeTruthy();
+  await page.goto(`/companies/${company!.id}`, { waitUntil: 'networkidle' });
 
   const next = `Rewritten by the CRM e2e run at ${Date.now()}`;
   await page.getByRole('button', { name: 'Edit About' }).click();
@@ -169,10 +176,10 @@ test('a property edited inline on the record page is written, and lands on its o
   await page.locator('.crm-prop--editing').getByRole('button', { name: 'Save' }).click();
   await expect(page.locator('.ain-toast')).toContainText('About updated');
 
-  const after = await recordOf(page.request, 'company', company.id);
+  const after = await recordOf(page.request, 'company', company!.id);
   expect(after.properties.description).toBe(next);
 
-  const timeline = await (await page.request.get(`/api/v1/records/company/${company.id}/timeline?kinds=property_change&limit=1`)).json();
+  const timeline = await (await page.request.get(`/api/v1/records/company/${company!.id}/timeline?kinds=property_change&limit=1`)).json();
   expect(timeline.data[0].title).toMatch(/About/i);
 });
 
@@ -553,9 +560,20 @@ test('moving the primary link to another record stands the first one down', asyn
   const contact = await (await page.request.post('/api/v1/records/contact', {
     data: { properties: { first_name: 'Wren', last_name: stamp, email: `wren.${stamp}@example.com` } },
   })).json() as { id: string; display_name: string };
+  // Fully described, like every other account in this workspace: a company
+  // with empty properties is a company whose record page draws fewer rows, and
+  // leaving two of those at the top of the list is how a fixture moves the book
+  // under the next test.
   const [first, second] = await Promise.all(['A', 'B'].map(async (suffix) =>
     (await (await page.request.post('/api/v1/records/company', {
-      data: { properties: { name: `${stamp} Holdings ${suffix}`, domain: `${stamp.toLowerCase()}-${suffix.toLowerCase()}.test` } },
+      data: {
+        properties: {
+          name: `${stamp} Holdings ${suffix}`,
+          domain: `${stamp.toLowerCase()}-${suffix.toLowerCase()}.test`,
+          description: `Holding company ${suffix}, stood up by the CRM e2e run.`,
+          industry: 'metals',
+        },
+      },
     })).json()) as { id: string; display_name: string }));
 
   await page.request.post('/api/v1/associations', { data: { from_id: contact.id, to_id: first.id, primary: true } });
