@@ -3450,15 +3450,16 @@ test('a complete question is answered for the workspace, not for the record two 
  * over the eight *open* stages and answered "0", and it looked for the surface
  * that fix shipped with: a `.cp-quarantine` disclosure holding the figure out
  * of the answer slot, under a danger banner. The engine no longer invents that
- * filter — it reads the question as a closing and answers 6 won, or 8 decided,
- * naming which — so the quarantine was removed with the defect, and from then
- * on the test skipped on its own guard in every run: a test nobody was running.
+ * filter — it reads "close" as a closing and answers the won count or the
+ * decided count, naming which — so the quarantine was removed with the defect,
+ * and from then on the test skipped on its own guard in every run: a test
+ * nobody was running.
  *
  * The invariant it existed for is checked, on live data and without a skip, by
- * "a question about deals we closed is never captioned \"open only\" in
- * silence" four hundred lines above: the figure has to be one of the two
- * readings of "close" the database holds, never the open count, and the answer
- * has to say which one it counted.
+ * "a question about deals we closed is never captioned open only in silence"
+ * four hundred lines above: the figure has to be one of the two readings of
+ * "close" the database holds, never the open count, and the answer has to say
+ * which one it counted.
  */
 
 /**

@@ -174,12 +174,12 @@ const formatValue = (value: number, unit: MetricUnit, workspace: WorkspaceProfil
  * stage grouping needs — the key it is handed is two values in one string, and
  * what leaves here has to be something a reader and a caller can both use.
  */
-export interface GroupNaming { key?: string; label: string; qualifier?: string | null }
+interface GroupNaming { key?: string; label: string; qualifier?: string | null }
 type GroupLabeller = (key: string) => string | GroupNaming;
 
 const named = (labeller: GroupLabeller | undefined, key: string): GroupNaming => {
-  const named = labeller ? labeller(key) : humanise(key);
-  return typeof named === 'string' ? { label: named } : named;
+  const read = labeller ? labeller(key) : humanise(key);
+  return typeof read === 'string' ? { label: read } : read;
 };
 
 function groupsFrom(result: AggregateResult, unit: MetricUnit, workspace: WorkspaceProfile, labeller?: GroupLabeller): MetricGroup[] {
