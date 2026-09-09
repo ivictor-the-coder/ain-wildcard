@@ -2,6 +2,8 @@ import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createApp, frozenClock, type App } from '../src/server/app';
 import revenue from '../src/server/modules/revenue/module';
+import { instantsOf, monthGrid } from '../src/server/modules/revenue/grid';
+import { movementSeries, type RevenueMatrix } from '../src/server/modules/revenue/movement';
 import type { Auth } from '../src/server/kernel/http';
 import { DAY } from '../src/shared/time';
 
@@ -517,9 +519,143 @@ describe('MRR movement', () => {
           + row.expansion_mrr + row.reactivation_mrr + row.resumed_mrr,
         'net retention is what the opening accounts close at: retained plus expansion, reactivation and resumed collection',
       );
-      assert.equal(row.logo_churn.denominator, row.accounts_at_open);
+      // The base is the logos the month could lose: those under contract at
+      // its open, plus any that signed and cancelled between the two reads and
+      // so never reached an opening figure at all.
+      assert.equal(row.logo_churn.denominator, row.accounts_exposed);
+      assert.ok(row.accounts_exposed >= row.accounts_at_open, `${row.month}: the base is never smaller than the open`);
+      assert.ok(
+        row.churned_accounts <= row.accounts_exposed,
+        `${row.month}: ${row.churned_accounts} churned logos out of a base of ${row.accounts_exposed}`,
+      );
     }
     assert.equal(churn.totals.exposed_mrr, churn.series.reduce((sum: number, row: any) => sum + row.opening_mrr, 0));
+  });
+});
+
+/* ========================================================================== *
+ * 2a. A life that fits between the two reads
+ * ========================================================================== */
+
+describe('an account that signs and cancels inside one month', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 7, 5)); });
+  after(() => ws.close());
+
+  test('is new business and churn, not nothing', async () => {
+    const customer = await ws.customer('Halverson Press Works');
+    const sub = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }],
+      billing_cycle_anchor: UTC(2026, 7, 5),
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+    await ws.travelTo(UTC(2026, 7, 20));
+    await ws.ok('POST', `/v1/subscriptions/${sub.id}/cancel`, {
+      cancellation_reason: 'other',
+      comment: 'Pilot line shut down before the first renewal.',
+    });
+    await ws.travelTo(UTC(2026, 8, 10));
+
+    // July opens before the fifth and closes after the twentieth, so both
+    // reads see this account at zero. It still signed, and it still cancelled.
+    const movement = await ws.ok('GET', '/v1/revenue/movement?months=6&top_movers=50&currency=usd');
+    for (const row of movement.series) assertRowReconciles(row, 'after a life inside one month');
+    assertSeriesChains(movement.series, 'after a life inside one month');
+
+    assert.deepEqual(
+      moversFor(movement, customer.id),
+      [
+        { month: '2026-07', kind: 'new', amount: GROWTH_MONTHLY },
+        { month: '2026-07', kind: 'churn', amount: -GROWTH_MONTHLY },
+      ],
+      'the month books what it gained and what it lost, at the same figure',
+    );
+
+    const july = movement.series.find((row: any) => row.month === '2026-07');
+    assert.equal(july.counts.same_month_churned_accounts, 1);
+    assert.ok(july.new_business >= GROWTH_MONTHLY, 'the signup is in new business');
+    assert.ok(july.churn >= GROWTH_MONTHLY, 'and the cancellation is in churn');
+
+    // The two halves of the module now say the same thing about July: as many
+    // accounts first carried revenue in it as were booked as new business.
+    assert.equal(july.reconciliation.signups, july.counts.new_accounts);
+    assert.equal(july.reconciliation.signup_difference, 0);
+    assert.equal(july.reconciliation.balanced, true);
+    assert.deepEqual(movement.unbalanced_months, []);
+
+    const cohorts = await ws.ok('GET', '/v1/revenue/cohorts?currency=usd');
+    const julyCohort = cohorts.series.find((row: any) => row.cohort === '2026-07');
+    assert.equal(
+      julyCohort.accounts, july.counts.new_accounts,
+      'the cohort matrix and the movement report count the same July signups',
+    );
+
+    const account = await ws.ok('GET', `/v1/revenue/accounts/${customer.id}`);
+    assert.equal(account.cohort, '2026-07', 'and this account is one of them');
+  });
+
+  test('is a churned logo, and the rate it lands in has it in the denominator too', async () => {
+    const churn = await ws.ok('GET', '/v1/revenue/churn?months=6&currency=usd');
+    const july = churn.series.find((row: any) => row.month === '2026-07');
+
+    assert.ok(july.churned_mrr >= GROWTH_MONTHLY, 'the cancellation is churned MRR');
+    assert.ok(july.churned_accounts >= 1, 'and a churned logo');
+    // An account that never reached the opening read cannot be in the
+    // numerator of a rate whose denominator it is missing from.
+    assert.equal(july.accounts_exposed, july.accounts_at_open + 1);
+    assert.equal(july.logo_churn.denominator, july.accounts_exposed);
+    assert.equal(july.logo_churn.numerator, july.churned_accounts);
+    assert.equal(
+      july.logo_churn.numerator + july.logo_retention.numerator, july.accounts_exposed,
+      'churned and retained logos partition the base exactly',
+    );
+    assert.equal(
+      churn.totals.exposed_accounts,
+      churn.series.reduce((sum: number, row: any) => sum + row.accounts_exposed, 0),
+    );
+  });
+
+  test('the signup check is one a month can fail', () => {
+    // Two whole months, read at the three instants the grid reads them at.
+    const { cells } = monthGrid(UTC(2026, 3, 1), UTC(2026, 4, 30), UTC(2026, 5, 15));
+    const instants = instantsOf(cells);
+    // One account whose first revenue is the twelfth of March and which is
+    // zero at every instant the grid samples — a whole life between two reads,
+    // with nothing kept from between them. That is the state the matrix used
+    // to be in, so a reconciliation that still calls this March balanced is a
+    // check that cannot fail.
+    const blind: RevenueMatrix = {
+      instants,
+      values: new Map([['cus_transient', instants.map(() => 0)]]),
+      paused: new Map([['cus_transient', instants.map(() => 0)]]),
+      within: new Map([['cus_transient', cells.map(() => 0)]]),
+      firstRevenue: new Map([['cus_transient', UTC(2026, 3, 12)]]),
+      totals: instants.map(() => 0),
+      customers: ['cus_transient'],
+    };
+    const blindSeries = movementSeries(blind, cells, 'usd');
+    assert.equal(blindSeries.rows[0].reconciliation.signups, 1, 'March signed one account');
+    assert.equal(blindSeries.rows[0].reconciliation.new_accounts, 0, 'and this matrix books none of it');
+    assert.equal(blindSeries.rows[0].reconciliation.signup_difference, 1);
+    assert.equal(blindSeries.rows[0].reconciliation.balanced, false, 'so March is not safe to read');
+    assert.deepEqual(blindSeries.unbalanced_months, ['2026-03']);
+    // The waterfall alone never notices: the two entries net to nothing.
+    assert.equal(blindSeries.rows[0].reconciliation.difference, 0);
+
+    // The same account with what it was worth between the reads kept.
+    const seeing: RevenueMatrix = {
+      ...blind,
+      within: new Map([['cus_transient', cells.map((_, i) => (i === 0 ? GROWTH_MONTHLY : 0))]]),
+    };
+    const march = movementSeries(seeing, cells, 'usd').rows[0];
+    assert.equal(march.new_business, GROWTH_MONTHLY);
+    assert.equal(march.churn, GROWTH_MONTHLY);
+    assert.equal(march.net, 0, 'a life inside one month moves the month by nothing');
+    assert.equal(march.counts.same_month_churned_accounts, 1);
+    assert.equal(march.counts.churned_accounts, 1);
+    assert.equal(march.reconciliation.balanced, true);
   });
 });
 
@@ -633,6 +769,44 @@ describe('cohorts', () => {
     assert.equal(
       assigned + report.totals.unassigned_accounts, mrr.sources.billing_customers,
       'every customer is either in a cohort or explicitly unassigned',
+    );
+  });
+
+  test('a trial that has not started paying is unassigned, not a cohort at 0%', async () => {
+    const before = await ws.ok('GET', '/v1/revenue/cohorts?currency=usd');
+
+    // A trial that runs to the twenty-eighth, started on the fifteenth. Its
+    // first revenue instant is inside this month and has not happened yet.
+    const customer = await ws.customer('Kestrel Forge');
+    await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }],
+      trial_end: UTC(2026, 6, 28),
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+
+    const account = await ws.ok('GET', `/v1/revenue/accounts/${customer.id}`);
+    assert.equal(account.mrr, 0, 'a trial that has not converted carries no MRR');
+    assert.ok(account.first_revenue_at > ws.now(), 'and its first revenue instant is still ahead of the read');
+    assert.equal(account.cohort, null, 'so it has not signed up into any cohort yet');
+
+    const after = await ws.ok('GET', '/v1/revenue/cohorts?currency=usd');
+    assert.equal(
+      after.totals.unassigned_accounts, before.totals.unassigned_accounts + 1,
+      'it is counted as unassigned, which is what this endpoint says it does with an account that has carried nothing',
+    );
+    assert.equal(after.totals.accounts, before.totals.accounts, 'and it joins no cohort');
+    assert.deepEqual(
+      after.totals.by_offset[0].logo_retention, before.totals.by_offset[0].logo_retention,
+      'so it cannot take month-0 logo retention down with it',
+    );
+
+    const mrr = await ws.ok('GET', '/v1/revenue/mrr?currency=usd');
+    const assigned = after.series.reduce((sum: number, row: any) => sum + row.accounts, 0);
+    assert.equal(
+      assigned + after.totals.unassigned_accounts, mrr.sources.billing_customers,
+      'and the account is still accounted for, on the other side of the line',
     );
   });
 });

@@ -85,7 +85,6 @@ export function AuditLogPage() {
   const session = useSession();
   const f = useFormat();
   const toast = useToast();
-  const actorName = useActorName();
   const [open, setOpen] = useState<AuditEntry | null>(null);
   const [range, setRange] = useState<DateRange>({ start: null, end: null });
   /**
@@ -121,6 +120,14 @@ export function AuditLogPage() {
     for (const [id, seat] of seats) if (seat.removed) map.set(id, 'removed');
     return map;
   }, [seats]);
+  /**
+   * The actor is named from the same two things the target is: the key list
+   * this screen is allowed to read, and the trail's own memory of a seat. A
+   * teammate the roster has dropped used to be a bare `usr_…` in the Actor
+   * column, the summary's second line and the export — while the Target column
+   * beside it named the very same person.
+   */
+  const actorName = useActorName({ known: names, seats });
   const now = session.now();
 
   /**

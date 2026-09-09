@@ -17,22 +17,23 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { api, invalidate, useMutation, useQuery, type ApiClientError, type ListEnvelope } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import { useSession } from '@/client/kernel/session';
+import { canWrite } from '@/client/kernel/shell-core';
 import {
   Badge, Banner, Button, Card, ConfirmDialog, EmptyState, ErrorState, Field, Icons, Input, MenuButton,
   MessageSquareIcon, Modal, Page, SearchInput, Select, Skeleton, SkeletonText, Switch, Textarea,
   humanize, useFormat, useHotkey, usePrefersReducedMotion, useToast, type MenuSection, type SelectOption,
 } from '@/client/design';
 import {
-  MODEL_KEY_VAR, answerCard, dealNamedIn, decidedBadge, dedupeCitations, editHref, filterTemplates,
+  MODEL_KEY_VAR, answerCard, currencyRefusal, dealNamedIn, decidedBadge, dedupeCitations, editHref, filterTemplates,
   groupTemplates, humanTool, nearestOf, parseBlocks, propertyAsked, rawRecordIds, recordAsk, recordLink,
-  splitRefusalOffer, splitToolEcho, starterTemplates, templatesAbout, threadErrorCopy, useAiStatus, useAllApprovals,
-  useRecordName, useRun, useTemplates, useThread, useThreads, useTools, useVocabulary, windowText,
-  withoutApiInstruction,
+  splitRefusalOffer, splitToolEcho, starterTemplates, subjectRecordIds, templatesAbout, threadErrorCopy, useAiStatus,
+  useAllApprovals, useRecordName, useRun, useTemplates, useThread, useThreads, useTools, useVocabulary, windowText,
+  withoutApiInstruction, withoutCurrencyClaim,
   type AiApproval, type AiCompletion, type AiMessage, type AiRun, type AiTemplate, type AiThread,
   type Remembered, type StepNote, type ThreadDetail, type ToolEcho, type Vocabulary,
 } from './api';
-import { ApprovalCard, ApprovalResolution, CitationChips, ReasoningList, TraceSteps } from './trace';
-import { CarriedMeasure, EngineIndicator, RefusalHelp, SlotChips } from './card';
+import { ApprovalCard, ApprovalResolution, CitationChips, PlanCitationChips, ReasoningList, TraceSteps } from './trace';
+import { CarriedMeasure, CurrencyRefusalNote, EngineIndicator, RefusalHelp, SlotChips, currencyRefusalTitle } from './card';
 import { TemplatePanel, TemplateStarters } from './templates';
 import { DraftDialog } from './draft';
 
@@ -201,6 +202,22 @@ function AssistantMessage({
   );
 
   /**
+   * The records this answer stands on when the engine named none of them.
+   *
+   * A quarter of the engine's answer shapes come back with no citations at
+   * all, under an empty state that promised it "cites every record it used".
+   * Where the plan itself was scoped to a record — every `account-…` shape
+   * passes `subject_id` or `associated_to` — that record is one it read, and
+   * it belongs under SOURCES. Where the plan named none, nothing is invented:
+   * the note below says the answer counted a set rather than a row, and points
+   * at the steps that show which set.
+   */
+  const planSources = useMemo(
+    () => (citations.length ? [] : subjectRecordIds(message.tool_calls ?? [])),
+    [citations.length, message.tool_calls],
+  );
+
+  /**
    * Everything the card draws, decided in one place.
    *
    * The engine that answered, the refusal with its nearest shapes, the slot
@@ -258,7 +275,14 @@ function AssistantMessage({
   // A refusal's closing "Try one of these" list is drawn as the chips below,
   // once; and an answer written for a caller with a request body is told to a
   // person with a switch.
-  const spoken = card.refusal ? splitRefusalOffer(prose).prose : card.switchOff ? withoutApiInstruction(prose) : prose;
+  // A refusal whose stated reason is a claim about the workspace's own books
+  // that its other answers contradict does not get read out as prose. What the
+  // surface can stand behind goes in the banner under it instead.
+  const currency = currencyRefusal(question, card.refusal);
+  const refused = card.refusal ? splitRefusalOffer(prose).prose : null;
+  const spoken = refused !== null
+    ? (currency ? withoutCurrencyClaim(refused, currency.claim) : refused)
+    : card.switchOff ? withoutApiInstruction(prose) : prose;
   const { shown, done } = useReveal(spoken, newest);
 
   // The prose was composed when the engine stopped: it says "Nothing has been
@@ -334,11 +358,20 @@ function AssistantMessage({
         )}
 
         {card.switchOff && (
-          <Banner tone="info" bar title="Asked with “Let it prepare writes” off">
+          <Banner
+            tone="info"
+            bar
+            // Without the switch on screen — a reader has none, because the ask
+            // routes refuse `allow_writes` below the member rung — a title
+            // naming it describes a control that is not there.
+            title={onAllowWrites ? 'Asked with “Let it prepare writes” off' : 'This was a write, and this run reads'}
+          >
             <p>
               The copilot read this as a write — {humanTool(card.switchOff.tool).toLowerCase()} — and stopped before
               preparing it. Nothing changed.
-              {onAllowWrites ? ' Turn the switch on and it prepares the write for your approval.' : ''}
+              {onAllowWrites
+                ? ' Turn the switch on and it prepares the write for your approval.'
+                : ' Preparing a write needs the member role or higher.'}
             </p>
             {onAllowWrites && (
               <p className="cp-chips" style={{ marginTop: 'var(--space-3)' }}>
@@ -366,9 +399,15 @@ function AssistantMessage({
         {/* The way out of a refusal sits directly under it: the refusal is the
             prose above, and the reason the engine recorded, when it recorded
             one apart from the prose, sits between the two. */}
+        {currency && done && (
+          <Banner tone="warning" bar title={currencyRefusalTitle(currency)}>
+            <CurrencyRefusalNote refusal={currency} onAsk={onAsk} />
+          </Banner>
+        )}
+
         {card.refusal && done && (
           <>
-            {card.refusal.message && !prose.includes(card.refusal.message) && (
+            {card.refusal.message && !prose.includes(card.refusal.message) && !currency && (
               <p className="cp-note">{card.refusal.message}</p>
             )}
             <RefusalHelp refusal={card.refusal} onAsk={onAsk} onSeeAll={onSeeAll} />
@@ -378,6 +417,17 @@ function AssistantMessage({
         {done && <ToolEchoes echoes={echoes} notes={notes} />}
 
         <CitationChips citations={citations} />
+        <PlanCitationChips ids={planSources} />
+
+        {/* Said, rather than left as an empty space under an answer that
+            promised sources. A count over every open invoice has no row to
+            cite, and the trace is where the set it counted is written down. */}
+        {done && !citations.length && !planSources.length && !card.refusal && (message.tool_calls?.length ?? 0) > 0 && (
+          <p className="cp-note">
+            No single record stands behind this — it is measured over a set. The steps below show the tool that
+            counted it and the arguments it was given.
+          </p>
+        )}
 
         {waiting.map((approval) => (
           <ApprovalCard key={approval.id} approval={approval} question={question} onDecided={onDecided} />
@@ -440,6 +490,12 @@ export function CopilotPage() {
   const f = useFormat();
   const toast = useToast();
   const { location, navigate, setQuery } = useRouter();
+  // `allow_writes` is refused below the member rung — the ask routes answer
+  // "have a teammate with the member role or higher run it from the approvals
+  // queue" — and the approvals route is gated there too. So for a reader the
+  // copilot is a reading surface, and the switch that only produces refusals
+  // is not drawn.
+  const writable = canWrite(session.me?.role);
 
   const [status, setStatus] = useState('open');
   const [filter, setFilter] = useState('');
@@ -663,7 +719,7 @@ export function CopilotPage() {
       thread_id: threadId,
       prompt: content,
       feature: 'copilot',
-      ...(allowWritesRef.current ? { allow_writes: true } : {}),
+      ...(writable && allowWritesRef.current ? { allow_writes: true } : {}),
     });
 
   const send = useMutation<{ content: string }, { threadId: string; completion: AiCompletion }>(
@@ -1141,8 +1197,8 @@ export function CopilotPage() {
                   title="Ask about this workspace"
                   body={
                     tools.data
-                      ? `The copilot reads Northwind’s own records through ${f.plural(tools.data.data.length, 'tool')} — CRM, billing, metering, credits and revenue — and cites every record it used. Writes stop for your approval.${hosted ? '' : ' Without a model key it answers the question shapes below and nothing else.'}`
-                      : 'The copilot reads this workspace’s own records and cites every one it used.'
+                      ? `The copilot reads Northwind’s own records through ${f.plural(tools.data.data.length, 'tool')} — CRM, billing, metering, credits and revenue. An answer about particular records links every one of them; an answer measured over a set names the tool that counted it. Writes stop for your approval.${hosted ? '' : ' Without a model key it answers the question shapes below and nothing else.'}`
+                      : 'The copilot reads this workspace’s own records: it links the ones an answer names, and shows the tool behind the ones it counts.'
                   }
                   illustration={<Icons.sparkles size={40} />}
                 />
@@ -1190,7 +1246,7 @@ export function CopilotPage() {
                   onSeeAll={() => setAsking(true)}
                   onOpenRecords={navigate}
                   onGrew={scrollToEnd}
-                  onAllowWrites={allowAndAsk}
+                  onAllowWrites={writable ? allowAndAsk : undefined}
                 />
               )
             ))}
@@ -1241,13 +1297,24 @@ export function CopilotPage() {
               disabled={send.loading}
             />
             <div className="cp-composer__foot">
-              <Switch
-                checked={allowWrites}
-                onChange={setAllowWrites}
-                size="sm"
-                label="Let it prepare writes"
-                hint="Nothing is written without your approval."
-              />
+              {/* `POST /v1/ai/complete` refuses `allow_writes` below the member
+                  rung — "have a teammate with the member role or higher run it
+                  from the approvals queue" — so a reader was offered a switch
+                  whose only effect was to turn every write question into a
+                  403. The reads are the whole surface for them. */}
+              {writable ? (
+                <Switch
+                  checked={allowWrites}
+                  onChange={setAllowWrites}
+                  size="sm"
+                  label="Let it prepare writes"
+                  hint="Nothing is written without your approval."
+                />
+              ) : (
+                <span className="cp-composer__hint">
+                  Reads only — preparing a write needs the member role or higher.
+                </span>
+              )}
               <span className="cp-composer__hint">Enter sends · Shift+Enter for a new line · C jumps back here</span>
               <Button
                 type="submit"

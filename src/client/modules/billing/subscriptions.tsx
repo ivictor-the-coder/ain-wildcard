@@ -30,7 +30,7 @@ import {
   subscriptionHref,
   csvAmount, csvDay, totalsByCurrency, useAction, useBillingFormat, useBookList, useBookTotal, useCurrencyChoices, useDebounced,
   useDialogForm,
-  useOpenOnQuery, usePricedPreview, useRecord, useRecordTab, useTableView, visibleRows,
+  useOpenOnQuery, usePricedPreview, useRecord, useRecordTab, useTableView, useUpcomingInvoice, visibleRows,
 } from './common';
 import {
   balanceDrawn, billedTotal, collectionSettled, describeAppliedChange, describeCreatedSubscription, firstInvoiceSettled,
@@ -2697,22 +2697,14 @@ function SubscriptionInvoices({ sub }: { sub: Subscription }) {
 
 function UpcomingTab({ sub }: { sub: Subscription }) {
   const f = useBillingFormat();
-  const [invoice, setInvoice] = useState<Invoice | null>(null);
-  const [error, setError] = useState<ApiClientError | null>(null);
-  const [nonce, setNonce] = useState(0);
-
-  useEffect(() => {
-    let live = true;
-    api.post<Invoice>('/v1/invoices/create_preview', { subscription: sub.id })
-      .then((result) => { if (live) { setInvoice(result); setError(null); } })
-      .catch((e: ApiClientError) => { if (live) { setError(e); setInvoice(null); } });
-    return () => { live = false; };
-  }, [sub.id, nonce]);
+  // Priced on the plan that will raise this bill, not on the one the
+  // subscription holds today — see `useUpcomingInvoice`.
+  const { data: invoice, error, loading, refetch, phase, caveat } = useUpcomingInvoice(sub);
 
   if (error) {
-    return <Card><SectionError error={error} path="POST /v1/invoices/create_preview" onRetry={() => setNonce((n) => n + 1)} /></Card>;
+    return <Card><SectionError error={error} path="POST /v1/invoices/create_preview" onRetry={refetch} /></Card>;
   }
-  if (!invoice) return <Card><Loading label="Drawing the next invoice…" /></Card>;
+  if (!invoice || loading) return <Card><Loading label="Drawing the next invoice…" /></Card>;
 
   // `status_detail` on a preview always reads as a held draft — the preview
   // endpoint can only return one — and on an actively billing subscription that
@@ -2730,6 +2722,14 @@ function UpcomingTab({ sub }: { sub: Subscription }) {
       title={`Upcoming invoice · ${f.day(invoice.period.start)}`}
       description={description}
     >
+      {phase && (
+        <Banner tone="info" compact title={`Priced on the change booked for ${f.day(phase.start_date)}`}>
+          {'This period is the first the schedule’s next phase covers, so the lines below are the plan it moves to '
+            + 'rather than the one running today. '}
+          {phase.description ?? ''}
+        </Banner>
+      )}
+      {caveat && <Banner tone="warning" compact title="A change is booked before this bill">{caveat}</Banner>}
       <div className="bl-tablewrap">
         <table className="bl-lines">
           <thead>

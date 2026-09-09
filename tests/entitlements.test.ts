@@ -1070,3 +1070,58 @@ describe('the entitlements overview', () => {
     assert.equal(counted.overrides_live, live(), 'and the overview counts the rows, not the page');
   });
 });
+
+/* ========================================================================== *
+ * What billing asks this module, and the only thing it asks
+ * ========================================================================== */
+
+describe('the included allowance a bill has to honour', () => {
+  const allowanceFor = (customer: string, meter: string) =>
+    app.ctx.svc.entitlements.allowanceFor(ORG, customer, meter);
+
+  const meterId = (key: string): string => {
+    const meter = app.ctx.svc.metering.meter(ORG, key);
+    assert.ok(meter, `the seeded workspace meters "${key}"`);
+    return meter.id;
+  };
+
+  test('a finite grant is an allowance, in the meter’s own units', async () => {
+    const { customer } = await growthAccount(4);
+    const granted = allowanceFor(customer, meterId('telemetry_events'));
+    assert.ok(granted, 'Growth includes telemetry events, so a bill has an allowance to take off');
+
+    // The figure is the one the plan grants, read back from the set the
+    // Features screen shows — never a number this test invented.
+    const set: EntitlementSet = await expectOk('GET', `/v1/customers/${customer}/entitlements`);
+    const events = set.entitlements.find((entry) => entry.feature === 'events_included');
+    assert.ok(events && !events.unlimited && events.value !== null);
+    assert.equal(granted.included, events.value);
+    assert.equal(granted.feature, 'events_included');
+    assert.equal(granted.meter, meterId('telemetry_events'));
+    assert.match(granted.granted_by, /^Included in /, 'a bill has to be able to name what grants it');
+  });
+
+  test('an unlimited grant is not an allowance — a ceiling removed is not a price waived', async () => {
+    const customer = await expectOk('POST', '/v1/customers', { name: nextName('Export House'), currency: 'usd' });
+    await expectOk('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      backdate_start_date: app.ctx.now() - DAY,
+      items: [{ price: priceOf('growth_monthly') }, { price: priceOf('data_export_monthly') }],
+    });
+    const set: EntitlementSet = await expectOk('GET', `/v1/customers/${customer.id}/entitlements`);
+    const exportEntry = set.entitlements.find((entry) => entry.feature === 'data_export');
+    assert.ok(exportEntry?.unlimited, 'the export add-on grants the thing it meters, without a cap');
+    assert.equal(allowanceFor(customer.id, meterId('data_export_gb')), null,
+      'so bulk export is uncapped and still billed by volume');
+  });
+
+  test('a meter nothing grants, and an account entitled to nothing, have no allowance', async () => {
+    const { customer } = await growthAccount(2);
+    assert.equal(allowanceFor(customer, meterId('connected_robots')), null,
+      'robots are a ceiling, not a quantity that comes off a bill');
+    assert.equal(allowanceFor(customer, 'mtr_not_a_meter_here'), null);
+
+    const bare = await expectOk('POST', '/v1/customers', { name: nextName('No Plan'), currency: 'usd' });
+    assert.equal(allowanceFor(bare.id, meterId('telemetry_events')), null);
+  });
+});

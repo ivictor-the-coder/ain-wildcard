@@ -42,6 +42,7 @@ import { formatMoney, money } from '../../../shared/money';
 import { DAY, formatDate } from '../../../shared/time';
 import { billingStore } from '../billing/module';
 import type { Invoice } from '../billing/types';
+import { isCurrency } from '../catalog/currencies';
 import { hydrateCharge, hydrateDispute, hydrateIntent, hydrateRefund, type Page, type WriteMeta } from './records';
 import {
   BANK_DEBIT_SETTLEMENT_DAYS, DECLINES, settleBankDebit, simulate,
@@ -302,6 +303,23 @@ export class Gateway {
         throw badRequest('amount_invalid', 'A payment intent has to be for a positive amount. There is nothing here to collect.', 'amount');
       }
       const currency = (input.currency ?? invoice?.currency ?? customer.currency).toLowerCase();
+      // The route refuses a code the ISO-4217 register does not know, and the
+      // request is not the only way one reaches here: `currency` is optional
+      // and falls back to the customer's, which is checked for *shape* one
+      // module along and not for existence. This is where the charge row is
+      // written, so this is where a currency nobody settles in has to stop —
+      // otherwise the Payments book carries a column denominated in "zzz",
+      // rendered as "ZZZ 125.00" because `Intl` has nothing better to say
+      // about it, and a refund goes back out of the same fiction.
+      if (!isCurrency(currency)) {
+        throw badRequest(
+          'currency_invalid',
+          `${currency.toUpperCase()} is not a currency this platform can settle in — it is not an ISO-4217 code.`
+          + `${input.currency ? '' : ` Nothing was sent on this request, so it came from ${customer.name}'s own currency; correct that first.`}`,
+          input.currency ? 'currency' : 'customer',
+          { currency },
+        );
+      }
       if (invoice && currency !== invoice.currency) {
         throw badRequest('currency_mismatch', `Invoice ${invoice.number} is in ${invoice.currency.toUpperCase()}, so it cannot be paid in ${currency.toUpperCase()}.`, 'currency');
       }

@@ -121,6 +121,39 @@ export const CITATION_ICON: Record<string, string> = {
 // today, not the note that lands on the timeline next week.
 const ID_PREFIX: Record<string, string> = { cmp: 'company', con: 'contact', deal: 'deal', tkt: 'ticket', task: 'task' };
 
+/**
+ * The records the plan itself named, for an answer the engine cited none of.
+ *
+ * The engine cites the rows it read, and 24 of its 100 answer shapes come back
+ * with an empty `citations` — while the surface's own empty state promised it
+ * "cites every record it used". Some of those are honest silences: a count of
+ * every open invoice reads a set no single row stands for. But "What does
+ * Kaskade Pharma Group owe?" reads the account, is scoped to `subject_id:
+ * cmp_nw_33`, and cited nothing at all — the one record behind the sentence
+ * was on the card as a slot chip and nowhere in its sources.
+ *
+ * The ids come from the arguments the engine passed, not from the question, so
+ * nothing here is inferred: it is the plan's own scope, read back.
+ */
+export function subjectRecordIds(
+  toolCalls: readonly { arguments?: Record<string, unknown> | null }[],
+): string[] {
+  const out: string[] = [];
+  const push = (value: unknown) => {
+    if (typeof value !== 'string' || !value) return;
+    if (!ID_PREFIX[value.split('_')[0]]) return;
+    if (!out.includes(value)) out.push(value);
+  };
+  for (const call of toolCalls) {
+    const args = call.arguments;
+    if (!args) continue;
+    for (const key of ['subject_id', 'associated_to', 'record_id', 'company_id', 'contact_id', 'deal_id', 'id']) {
+      push(args[key]);
+    }
+  }
+  return out;
+}
+
 /** The records a queued write names, so the conversation can link to them. */
 export function writeTargets(args: Record<string, unknown>): string[] {
   const out: string[] = [];

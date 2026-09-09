@@ -993,8 +993,16 @@ test('a voided credit note stops claiming the money came off the invoice', async
   const note = notes.data.find((row: { total: number; status: string }) => row.total === 700 && row.status === 'issued');
   const row = page.locator('.bl-row', { hasText: note.number });
   // Whatever the note did — came off the bill, or went onto the balance — the
-  // row says it in the server's own words while the note stands.
-  await expect(row).toContainText(note.routing_detail.slice(0, 30));
+  // row says so while the note stands, from the note's own amounts. Not from
+  // `routing_detail`: the server picks its wording from whether the bill is
+  // paid *in full*, so on a part-collected bill its last branch says nothing
+  // had been collected beside an `amount_paid` that says otherwise.
+  const destination = note.post_payment_amount > 0
+    ? [note.refund_amount_display, note.credit_amount_display, note.out_of_band_amount_display]
+      .filter((_, i) => [note.refund_amount, note.credit_amount, note.out_of_band_amount][i] > 0)
+    : [note.total_display];
+  for (const amount of destination) await expect(row).toContainText(amount);
+  await expect(row).toContainText(invoice.number);
 
   await page.getByRole('button', { name: `Void ${note.number}` }).click();
   await page.getByRole('button', { name: 'Void the credit note' }).click();
@@ -1093,6 +1101,19 @@ test('a failed list says so above the grid, and does not report zero rows', asyn
   await expect(page.locator('.bl-listfoot__count')).not.toContainText('No invoices on this page');
 });
 
+/**
+ * The prices a schedule phase names, so a spec can tell a metered line from a
+ * billed one. A metered line has no amount until the period closes — the screen
+ * says "(metered)" where a licensed line carries a figure — and a package price
+ * on a meter quotes one block at quantity 1, which is not what it will bill.
+ */
+const meteredPrices = async (page: Page): Promise<Set<string>> => {
+  const prices = await json(page, '/v1/prices?limit=200');
+  return new Set((prices.data as { id: string; recurring: { usage_type: string } | null }[])
+    .filter((price) => price.recurring?.usage_type === 'metered')
+    .map((price) => price.id));
+};
+
 /* =============================== schedules ================================ */
 
 test('a plan change can be booked for a future renewal, and released before it happens', async ({ page }) => {
@@ -1140,7 +1161,20 @@ test('a plan change can be booked for a future renewal, and released before it h
 
   /* ---- and it can be undone from the tab that shows it ---- */
   await page.getByRole('tab', { name: 'Schedule' }).click();
-  await expect(page.locator('.bl-phase__summary', { hasText: schedule.phases[1].summary })).toBeVisible();
+  // The phase is priced in the account's own currency by the engine that will
+  // bill it, so the row is checked against that answer rather than against
+  // `phases[].summary`, which the server writes in each price's home currency.
+  const phasePrice = await post(page, '/v1/catalog/estimate', {
+    currency: sub.currency,
+    lines: schedule.phases[1].items.map((item: { price: string; quantity: number }) => ({ price: item.price, quantity: item.quantity })),
+  });
+  const upcomingRow = page.locator('.bl-phase', { hasText: 'Upcoming' }).locator('.bl-phase__summary');
+  await expect(upcomingRow).toBeVisible();
+  const metered = await meteredPrices(page);
+  for (const line of phasePrice.lines) {
+    if (metered.has(line.price)) continue;
+    await expect(upcomingRow).toContainText(line.amount_display);
+  }
   await page.getByRole('button', { name: 'Release the subscription' }).click();
   await page.getByRole('dialog').getByRole('button', { name: 'Release it' }).click();
 
@@ -1158,7 +1192,17 @@ test('a subscription already under a schedule says so before anyone changes it',
   const upcoming = schedule.phases.find((phase: { state: string }) => phase.state === 'upcoming');
   if (upcoming) {
     await expect(page.getByText(`A change is already booked for`)).toBeVisible();
-    await expect(page.locator('.ain-banner__body')).toContainText(upcoming.summary);
+    // Priced here, in the subscription's currency — see the schedule tab test.
+    const sub = await json(page, `/v1/subscriptions/${schedule.subscription}`);
+    const priced = await post(page, '/v1/catalog/estimate', {
+      currency: sub.currency,
+      lines: upcoming.items.map((item: { price: string; quantity: number }) => ({ price: item.price, quantity: item.quantity })),
+    });
+    const metered = await meteredPrices(page);
+    for (const line of priced.lines) {
+      if (metered.has(line.price)) continue;
+      await expect(page.locator('.ain-banner__body').first()).toContainText(line.amount_display);
+    }
   }
 
   // The phases carry the server's own windows, not dates this screen computed.
@@ -2707,4 +2751,301 @@ test('bulk pause from the subscriptions list asks what happens to the invoices b
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();
   expect((await json(page, '/v1/subscriptions?status=paused&limit=100')).total_count).toBe(paused);
+});
+
+/* ===================== a change that is already booked ==================== */
+
+interface PhaseFixture {
+  subscription: string;
+  customer: string;
+  currency: string;
+  periodEnd: number;
+  /** What the new plan bills for one period, in the account's own currency. */
+  perPeriod: string;
+  /** Every line of the new plan, priced by the engine in that currency. */
+  lines: { price: string; amount_display: string }[];
+  /** The old plan's lines, which the booked period must no longer quote. */
+  leaving: string[];
+}
+
+const SCALE = [
+  { price: 'price_nw_scale_monthly', quantity: 1 },
+  { price: 'price_nw_scale_seat_monthly', quantity: 12 },
+  { price: 'price_nw_telemetry_events', quantity: 1 },
+];
+
+/**
+ * A subscription that does not bill in dollars, with a plan change booked for
+ * its very next renewal.
+ *
+ * Both defects this fixture exists for only show on an account whose currency
+ * is not the price's own: the phase summary the server writes prices every
+ * item in `price.currency`, and `currency_options` holds a different amount per
+ * currency rather than a conversion of one.
+ */
+const bookedChange = async (page: Page): Promise<PhaseFixture | null> => {
+  const subs = await json(page, '/v1/subscriptions?status=active&limit=200');
+  const rows = subs.data as (SubRow & { currency: string; items: { price: string; description: string }[] })[];
+  const monthly = rows.filter((row) => row.currency !== 'usd' && row.interval === 'month' && row.interval_count === 1);
+
+  // One already booked, if a previous test in this file left one: the fixture
+  // is a subscription whose *very next* period is governed by a phase, and
+  // making a second one is only worth the write when none exists.
+  for (const row of monthly.filter((candidate) => candidate.schedule)) {
+    const schedule = await json(page, `/v1/subscription-schedules/${row.schedule}`);
+    if (schedule.status !== 'active' && schedule.status !== 'not_started') continue;
+    const phase = schedule.phases.find((entry: { state: string; start_date: number }) =>
+      entry.state === 'upcoming' && entry.start_date === row.current_period_end);
+    if (!phase) continue;
+    const carried = new Set(phase.items.map((item: { price: string }) => item.price));
+    const dropped = row.items.filter((item) => !carried.has(item.price));
+    if (!dropped.length) continue;
+    return {
+      subscription: row.id,
+      customer: row.customer,
+      currency: row.currency,
+      periodEnd: row.current_period_end,
+      ...(await pricePhase(page, row.currency, phase.items)),
+      leaving: dropped.map((item) => item.description),
+    };
+  }
+
+  // Not one already on Scale — the phase has to name a different plan from the
+  // one the period is leaving. The metered line is shared by both plans and is
+  // not what makes them different, so it is not part of this test.
+  const target = monthly.find((row) => !row.schedule && !row.items.some((item) => item.price === SCALE[0].price));
+  if (!target) return null;
+
+  const sub = await json(page, `/v1/subscriptions/${target.id}`);
+  await post(page, '/v1/subscription-schedules', {
+    from_subscription: sub.id,
+    end_behavior: 'release',
+    phases: [
+      {
+        items: sub.items.map((item: { price: string; quantity: number; metered: boolean }) => ({
+          price: item.price, quantity: item.metered ? 1 : item.quantity,
+        })),
+        end_date: sub.current_period_end,
+        proration_behavior: 'none',
+        description: 'Stays on the current plan for the period now running.',
+      },
+      { items: SCALE, proration_behavior: 'create_prorations', description: 'Plant-wide rollout on Scale.' },
+    ],
+  });
+  const carried = new Set(SCALE.map((line) => line.price));
+  return {
+    subscription: sub.id,
+    customer: sub.customer,
+    currency: sub.currency,
+    periodEnd: sub.current_period_end,
+    ...(await pricePhase(page, sub.currency, SCALE)),
+    leaving: sub.items
+      .filter((item: { price: string }) => !carried.has(item.price))
+      .map((item: { description: string }) => item.description),
+  };
+};
+
+/** What a phase's items come to, priced by the engine in the account's currency. */
+const pricePhase = async (page: Page, currency: string, items: { price: string; quantity: number }[]) => {
+  const priced = await post(page, '/v1/catalog/estimate', {
+    currency,
+    lines: items.map((item) => ({ price: item.price, quantity: item.quantity })),
+  });
+  return {
+    perPeriod: priced.recurring.monthly_equivalent_display as string,
+    lines: priced.lines as { price: string; amount_display: string }[],
+  };
+};
+
+test('a booked change is quoted in the currency the subscription bills in', async ({ page }) => {
+  await signIn(page);
+  const fixture = await bookedChange(page);
+  test.skip(!fixture, 'no non-dollar monthly subscription free to put under a schedule');
+  const booked = fixture!;
+
+  await page.goto(`/billing/subscriptions/${booked.subscription}`, { waitUntil: 'networkidle' });
+  const banner = page.locator('.ain-banner', { hasText: 'A change is already booked' });
+  await expect(banner).toBeVisible();
+  // Every figure in the banner is the engine's answer for this account's
+  // currency. The server's own phase summary prices each item in the price's
+  // home currency, so it says $1,900.00 where the renewal charges €1,750.00.
+  const metered = await meteredPrices(page);
+  for (const line of booked.lines) {
+    if (metered.has(line.price)) continue;
+    await expect(banner).toContainText(line.amount_display);
+  }
+  await expect(banner.locator('.ain-banner__body')).not.toContainText('$');
+
+  await page.goto(`/billing/subscriptions/${booked.subscription}?tab=schedule`, { waitUntil: 'networkidle' });
+  const upcoming = page.locator('.bl-phase', { hasText: 'Upcoming' });
+  await expect(upcoming).toBeVisible();
+  await expect(upcoming.locator('.bl-phase__summary')).not.toContainText('$');
+  for (const line of booked.lines) {
+    if (metered.has(line.price)) continue;
+    await expect(upcoming.locator('.bl-phase__summary')).toContainText(line.amount_display);
+  }
+});
+
+test('the upcoming invoice quotes the plan the schedule books, not the one it replaces', async ({ page }) => {
+  await signIn(page);
+  const fixture = await bookedChange(page);
+  test.skip(!fixture, 'no non-dollar monthly subscription free to put under a schedule');
+  const booked = fixture!;
+
+  await page.goto(`/billing/subscriptions/${booked.subscription}?tab=upcoming`, { waitUntil: 'networkidle' });
+  const card = page.locator('.ain-card', { hasText: 'Upcoming invoice' });
+  await expect(card).toBeVisible();
+  // The period this preview covers is the first the booked phase governs, so
+  // the plan being left must not be quoted for it.
+  await expect(card.locator('.ain-banner', { hasText: 'Priced on the change booked' })).toBeVisible();
+  const metered = await meteredPrices(page);
+  for (const line of booked.lines) {
+    if (metered.has(line.price)) continue;
+    await expect(card.locator('table')).toContainText(line.amount_display);
+  }
+  await expect(card.locator('table')).not.toContainText(booked.leaving[0]);
+
+  // What the endpoint answers when nobody tells it about the schedule: the
+  // plan being left, for the period the phase replaces. That figure is the
+  // defect, so it must not be the one on screen.
+  const stale = await post(page, '/v1/invoices/create_preview', { subscription: booked.subscription });
+  const total = card.locator('.bl-total--grand').last().locator('.bl-total__value');
+  await expect(total).not.toHaveText(stale.amount_due_display);
+  const quoted = (await total.innerText()).trim();
+
+  // And the account header, which reads the same bill through the customer
+  // summary — a figure the summary builds from today's items. The two screens
+  // now agree, because both are priced on the phase that will bill.
+  await page.goto(`/billing/customers/${booked.customer}`, { waitUntil: 'networkidle' });
+  const tile = page.locator('.bl-headline__item', { has: page.locator('.bl-headline__label', { hasText: /^Next invoice$/ }) });
+  await expect(tile.locator('.bl-headline__caption')).toContainText(quoted);
+  await expect(tile.locator('.bl-headline__caption')).not.toContainText(stale.amount_due_display);
+});
+
+/* ===================== what a credit note says it did ===================== */
+
+test('a credit note does not claim nothing was collected on a bill that was part collected', async ({ page }) => {
+  await signIn(page);
+  const invoices = await json(page, '/v1/invoices?status=open&limit=200');
+  const open = (invoices.data as InvoiceRow[]).filter((row) => row.amount_due > 4_000);
+  // A bill that has taken money and is still owed the rest — the one state the
+  // server's routing sentence gets wrong, because it only asks whether the
+  // bill is paid in full.
+  let bill = open.find((row) => row.amount_paid > 0) ?? null;
+  for (const candidate of open) {
+    if (bill) break;
+    const methods = await json(page, `/v1/payment_methods?customer=${candidate.customer}&limit=10`);
+    if (!methods.data.length) continue;
+    // This workspace seeds cards that refuse, because the recovery story needs
+    // them. A refused charge collects nothing, so the fixture is only built
+    // once the money has actually moved — asserting on an unbuilt fixture
+    // reports the product broken for the test's own failure to set up.
+    const intent = await post(page, '/v1/payment_intents', {
+      customer: candidate.customer,
+      invoice: candidate.id,
+      amount: Math.floor(candidate.amount_due / 3),
+      payment_method: methods.data[0].id,
+      confirm: true,
+      off_session: false,
+    });
+    if (intent.status !== 'succeeded') continue;
+    bill = candidate;
+  }
+  test.skip(!bill, 'no open invoice could be part collected');
+  const after = await json(page, `/v1/invoices/${bill!.id}`);
+  expect(after.amount_paid).toBeGreaterThan(0);
+  expect(after.status).toBe('open');
+
+  await page.goto(`/billing/invoices/${bill!.id}?tab=credits`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Issue a credit note' }).first().click();
+  const dialog = page.getByRole('dialog', { name: new RegExp(`Credit ${after.number}`) });
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel('Amount to credit').fill(String(Math.floor(after.amount_due / 400)));
+
+  const routing = dialog.locator('.ain-banner').last();
+  await expect(routing).toBeVisible();
+  // The money is on the record beside this sentence; the sentence may not deny it.
+  await expect(routing).not.toContainText('nothing had been collected');
+  await expect(routing).toContainText(after.amount_paid_display ?? String(after.amount_paid));
+  await page.keyboard.press('Escape');
+});
+
+/* ============================== the price book ============================ */
+
+test('the price book is a screen, and it prices in every currency it sells in', async ({ page }) => {
+  await signIn(page);
+  const products = await json(page, '/v1/products?limit=200&active=true');
+  expect(products.data.length).toBeGreaterThan(0);
+
+  await page.goto('/catalog/products', { waitUntil: 'networkidle' });
+  await expect(page.getByRole('heading', { name: 'Price book' })).toBeVisible();
+  const rows = page.locator('tbody tr[data-index]');
+  await expect(rows.first()).toBeVisible();
+
+  // A product with more than one price, so the record has something to show.
+  const withPrices = await json(page, '/v1/products?limit=200&expand=prices&active=true');
+  const product = withPrices.data.find((row: { prices: unknown[] }) => row.prices.length > 1) ?? withPrices.data[0];
+  await page.goto(`/catalog/products/${product.id}`, { waitUntil: 'networkidle' });
+  await expect(page.getByRole('heading', { name: product.name })).toBeVisible();
+  const priced = product.prices[0];
+  await expect(page.locator('.bl-row', { hasText: priced.display.headline }).first()).toBeVisible();
+
+  // The calculator is the invoice engine, asked again per currency — never a
+  // conversion of the home amount.
+  await page.getByRole('button', { name: 'What would a quantity cost?' }).first().click();
+  const other = priced.currencies.find((code: string) => code !== priced.currency);
+  test.skip(!other, 'this price is sold in one currency only');
+  await page.getByLabel(`Currency for ${priced.nickname ?? priced.product_name}`).selectOption(other);
+  const answer = await post(page, `/v1/prices/${priced.id}/preview`, { quantity: 1, currency: other });
+  await expect(page.locator('.bl-phasepreview__total').first()).toHaveText(answer.amount_display);
+});
+
+test('a price-book hit in global search opens the product', async ({ page }) => {
+  await signIn(page);
+  const products = await json(page, '/v1/products?limit=5&active=true');
+  const product = products.data[0];
+  await page.goto('/', { waitUntil: 'networkidle' });
+  await page.keyboard.press('/');
+  const search = page.getByRole('combobox', { name: /Search/ }).or(page.locator('input[type=search]')).first();
+  await search.fill(product.name.split(' ').slice(-1)[0]);
+  const hit = page.getByRole('option', { name: new RegExp(product.name, 'i') }).first();
+  await expect(hit).toBeVisible();
+  await hit.click();
+  await expect(page).toHaveURL(new RegExp(`/catalog/products/${product.id}$`));
+});
+
+test('a product and its first price can be written from the price book, in every currency the book sells in', async ({ page }) => {
+  await signIn(page);
+  const currencies = await json(page, '/v1/catalog/currencies');
+  const home = (currencies.data as { code: string; default: boolean }[]).find((row) => row.default)!;
+  const other = (currencies.data as { code: string; default: boolean }[]).find((row) => !row.default);
+  const name = `Line Health Monitor ${Date.now()}`;
+
+  await page.goto('/catalog/products', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'New product' }).first().click();
+  const dialog = page.getByRole('dialog', { name: 'New product' });
+  await dialog.getByLabel('Product name').fill(name);
+  await dialog.getByLabel('Unit').fill('line');
+  await dialog.getByLabel(`Amount in ${home.code.toUpperCase()}`).fill('45.00');
+  if (other) await dialog.getByLabel(`Amount in ${other.code.toUpperCase()}`).fill('40.00');
+  await dialog.getByRole('button', { name: /Create the product/ }).click();
+
+  // The screen lands on the record it just wrote, and the workspace agrees.
+  await expect(page.getByRole('heading', { name })).toBeVisible();
+  const written = (await json(page, `/v1/products?query=${encodeURIComponent(name)}&limit=5&expand=prices`)).data[0];
+  expect(written.name).toBe(name);
+  expect(written.unit_label).toBe('line');
+  const price = written.prices[0];
+  expect(price.unit_amount).toBe(4500);
+  expect(written.default_price).toBe(price.id);
+  // A per-currency amount is its own figure on the price, not a conversion —
+  // and without one the price cannot go on an account that bills in it.
+  if (other) expect(price.currency_options[other.code].unit_amount).toBe(4000);
+
+  // Archiving is how a product is withdrawn: the prices it has already billed
+  // still have to explain themselves.
+  await page.getByRole('button', { name: 'More product actions' }).click();
+  await page.getByRole('menuitem', { name: 'Archive it' }).click();
+  await expect.poll(async () => (await json(page, `/v1/products/${written.id}`)).active).toBe(false);
+  await expect(page.getByText('This product is archived')).toBeVisible();
 });

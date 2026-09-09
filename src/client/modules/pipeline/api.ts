@@ -9,6 +9,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, useQuery, type ApiClientError, type ListEnvelope, type QueryResult } from '@/client/kernel/api';
 import { useSession } from '@/client/kernel/session';
+import { canWrite } from '@/client/kernel/shell-core';
 import { useFormat, type DateOptions, type Formatter } from '@/client/design';
 
 /* --------------------------- what the board is ---------------------------- */
@@ -195,6 +196,37 @@ export interface DealListEnvelope extends ListEnvelope<DealRecord> {
 
 export interface PropertyEnvelope extends ListEnvelope<PropertyDef> {
   groups: string[];
+}
+
+/* -------------------------------- authority ------------------------------- */
+
+/**
+ * Whether this session may write a deal at all.
+ *
+ * Every route this surface writes through — `POST /v1/records/deal`, `PATCH
+ * /v1/records/deal/:id`, the batch, the activity log, the associations — is
+ * gated at `member` on the server. The board offered all of it to an `analyst`
+ * and a `readonly` seat anyway: New deal opened, every card was draggable, the
+ * inline editors opened, and the refusal arrived only after the write had been
+ * attempted, as a red toast with a role name in it. A permission enforced only
+ * on the server is a screen that lies.
+ *
+ * The ladder is the kit's own `canWrite` — the same one the command palette
+ * reads to decide what to offer — so the board and the server can never
+ * disagree about who may write.
+ */
+export const useCanWriteDeals = (): boolean => canWrite(useSession().me?.role);
+
+/**
+ * Why the write affordances are missing, in the reader's own terms.
+ *
+ * Named for the rung, because "you do not have permission" is the sentence
+ * that sends someone to a support queue: a person who is told they are signed
+ * in as a read-only user knows exactly who to ask.
+ */
+export function readOnlyReason(role: string | null | undefined): string {
+  const named = role === 'readonly' ? 'a read-only user' : role === 'analyst' ? 'an analyst' : `a ${role ?? 'guest'}`;
+  return `You are signed in as ${named}, and writing a deal needs the member role or higher.`;
 }
 
 /* --------------------------------- reads --------------------------------- */
@@ -523,10 +555,17 @@ export function totalsOf(deals: DealRecord[]): ColumnTotals {
  * this deal has not filled in, and — when the destination stage closes the deal
  * — the writable properties in the object's outcome group, because a deal that
  * closes with no reason recorded is a forecast review nobody can hold.
+ *
+ * The deal and the stage are taken structurally because this rule has two
+ * callers now. The board's stage dialog is one; the copilot's approval card is
+ * the other, and it holds the destination as a stage from the shared
+ * vocabulary rather than as a `PipelineStage`. A rule that only one surface can
+ * call is a rule the other walks past — which is exactly what the copilot did,
+ * closing deals with no reason at all through an approved `update_record`.
  */
 export function stageRequirements(
-  deal: DealRecord | null,
-  stage: PipelineStage,
+  deal: { properties: Record<string, unknown> } | null,
+  stage: { is_closed: boolean },
   properties: PropertyDef[],
 ): { required: PropertyDef[]; optional: PropertyDef[] } {
   const writable = properties.filter((p) => !p.read_only && !p.calculated);

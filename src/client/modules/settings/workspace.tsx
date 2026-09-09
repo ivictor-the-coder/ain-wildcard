@@ -11,6 +11,15 @@
  * from the same formatter the rest of the product uses, before it is saved —
  * and once it is saved the session is re-read so the shell picks it up without
  * a reload.
+ *
+ * It is also the screen an operator arrives at when one of those three is
+ * *already* wrong, which is why it is the one screen that does not call
+ * `useFormat()`. `Intl` throws a `RangeError` on a zone it does not know and on
+ * a malformed language tag, so a workspace holding one renders nothing at all —
+ * and the repair lives here. Both formatters below are built through
+ * `previewSettings`, which substitutes the platform default for whatever cannot
+ * be formatted and reports what it substituted, so this screen still draws and
+ * still says what is wrong.
  */
 import { useEffect, useMemo, useState } from 'react';
 import { api, useQuery, type ListEnvelope } from '../../kernel/api';
@@ -19,11 +28,11 @@ import { describeOffset } from '../../kernel/shell-core';
 import {
   Badge, Banner, Button, Card, Divider, Field, Icons, Inline, Input, KeyValue,
   Select, Stack,
-  contrastGrade, contrastRatio, createFormatter, initials, parseColor, useFormat,
+  contrastGrade, contrastRatio, createFormatter, initials, parseColor,
   type SelectOption,
 } from '../../design';
 import { Loading, SettingsShell, useAction } from './common';
-import { HEX, problemWith, type WorkspaceDraft as Draft } from './workspace-core';
+import { FALLBACK_LOCALE, FALLBACK_ZONE, HEX, previewSettings, problemWith, type WorkspaceDraft as Draft } from './workspace-core';
 
 interface CatalogCurrency {
   object: 'catalog_currency';
@@ -116,8 +125,28 @@ export function WorkspacePage() {
   const session = useSession();
   const org = session.me?.org;
   const action = useAction();
-  const f = useFormat();
   const currencies = useQuery<ListEnvelope<CatalogCurrency>>('/v1/catalog/currencies');
+
+  /**
+   * This screen renders through the workspace's saved settings the way every
+   * other one does — except that it is the screen you open *because* they are
+   * wrong, so it may not take them on trust. `Intl` throws on a zone it does
+   * not know and on a malformed tag, and a throw here is a white page with no
+   * control on it: the workspace would be unrecoverable from inside the
+   * product. `previewSettings` substitutes the platform default for whichever
+   * of the two is unusable, and `savedProblem` below says so out loud.
+   */
+  const savedSettings = useMemo(
+    () => previewSettings({ timezone: org?.timezone ?? FALLBACK_ZONE, locale: org?.locale ?? FALLBACK_LOCALE }),
+    [org?.timezone, org?.locale],
+  );
+  const f = useMemo(
+    () => createFormatter(
+      { locale: savedSettings.locale, currency: org?.default_currency ?? 'usd', timeZone: savedSettings.timeZone },
+      session.now,
+    ),
+    [savedSettings, org?.default_currency, session.now],
+  );
 
   const [draft, setDraft] = useState<Draft | null>(org ? draftOf(org) : null);
   // The org arrives one paint after the first render, and a later refresh can
@@ -159,12 +188,16 @@ export function WorkspacePage() {
    * rather than the session — which is what makes the preview a preview and not
    * a repeat of what is already on screen.
    */
+  const draftSettings = useMemo(
+    () => previewSettings({ timezone: draft?.timezone ?? FALLBACK_ZONE, locale: draft?.locale ?? FALLBACK_LOCALE }),
+    [draft?.timezone, draft?.locale],
+  );
   const preview = useMemo(
     () => createFormatter(
-      { locale: draft?.locale ?? 'en-US', currency: draft?.default_currency ?? 'usd', timeZone: draft?.timezone ?? 'UTC' },
+      { locale: draftSettings.locale, currency: draft?.default_currency ?? 'usd', timeZone: draftSettings.timeZone },
       session.now,
     ),
-    [draft?.locale, draft?.default_currency, draft?.timezone, session.now],
+    [draftSettings, draft?.default_currency, session.now],
   );
 
   if (!org || !draft) {
@@ -276,6 +309,33 @@ export function WorkspacePage() {
           <Banner tone="info" compact title="You can read these, not change them">
             {`PATCH /v1/org is gated at admin and your role is ${session.me?.role}. The fields below are filled in from the `
               + 'workspace so you can see what is set; saving would be refused.'}
+          </Banner>
+        )}
+        {savedSettings.unusable.length > 0 && (
+          <Banner
+            tone="danger"
+            title={savedSettings.unusable.length === 2
+              ? 'The saved timezone and locale are not ones this browser can render'
+              : `The saved ${FIELD_LABEL[savedSettings.unusable[0]]} is not one this browser can render`}
+          >
+            <Stack gap={3}>
+              {savedSettings.unusable.map((key) => (
+                <div key={key}>
+                  <code className="st-mono">{key === 'timezone' ? org.timezone : org.locale}</code>
+                  {key === 'timezone'
+                    ? ' is not an IANA timezone. Intl answers a RangeError for it rather than falling back, and every date on every screen is rendered through it.'
+                    : ' is not a language tag Intl accepts. It answers a RangeError rather than falling back, and every number, date and amount is formatted through it.'}
+                  {' This screen is drawing in '}
+                  <code className="st-mono">{key === 'timezone' ? FALLBACK_ZONE : FALLBACK_LOCALE}</code>
+                  {' so that it still renders, and says so rather than passing that off as the workspace’s own.'}
+                </div>
+              ))}
+              <div>
+                {admin
+                  ? 'Choose a real one below and save — the session is re-read straight after, so the rest of the product recovers without a reload.'
+                  : 'PATCH /v1/org is gated at admin, so an owner or admin has to choose a real one below and save.'}
+              </div>
+            </Stack>
           </Banner>
         )}
         {action.error && !action.error.body.param && (
@@ -438,7 +498,10 @@ export function WorkspacePage() {
 
                 <Field
                   label="Timezone"
-                  error={action.errorFor('timezone')}
+                  // Shown whether or not the field has been touched: the value
+                  // that reaches this screen unusable is the *saved* one, and
+                  // the refusal belongs on the control that repairs it.
+                  error={action.errorFor('timezone') ?? problemWith('timezone', draft.timezone)}
                   hint="Timestamps — created, paid, last seen — are shown in this zone. Billing period boundaries stay UTC calendar dates, which is why an invoice never moves a day when this changes."
                 >
                   <Select
@@ -452,7 +515,7 @@ export function WorkspacePage() {
 
                 <Field
                   label="Locale"
-                  error={action.errorFor('locale')}
+                  error={action.errorFor('locale') ?? problemWith('locale', draft.locale)}
                   hint="Decides digit grouping, decimal separators, date order and how a currency symbol is placed."
                 >
                   <Select
@@ -478,6 +541,15 @@ export function WorkspacePage() {
                 <KeyValue label="Workspace time now" value={preview.dateTime(session.now())} />
                 <KeyValue label="Zone" value={preview.timeZone.replace(/_/g, ' ')} />
                 <KeyValue label="A large count" value={preview.number(1048576)} />
+                {draftSettings.unusable.length > 0 && (
+                  <div className="st-hint">
+                    {`Previewed in ${draftSettings.timeZone} and ${draftSettings.locale}: the `}
+                    {f.list(draftSettings.unusable.map((key) => FIELD_LABEL[key]))}
+                    {' selected above '}
+                    {draftSettings.unusable.length === 1 ? 'is not something' : 'are not something'}
+                    {' this browser can render, so there is nothing to preview it in.'}
+                  </div>
+                )}
                 {dirty && (
                   <>
                     <Divider label="saved right now" />

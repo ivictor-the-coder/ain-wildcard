@@ -15,7 +15,7 @@ import {
   type ActiveEntitlement, type CheckInput, type EntitlementCheck, type EntitlementOverride,
   type EntitlementSet, type EntitlementSummary, type EntitlementVersion, type Feature,
   type FeatureInput, type FeaturePatch,
-  type LimitPressure, type OverrideInput, type ProductFeature, type ProductFeatureInput,
+  type LimitPressure, type MeteredAllowance, type OverrideInput, type ProductFeature, type ProductFeatureInput,
   type RecomputeResult,
 } from './types';
 
@@ -50,6 +50,16 @@ export interface EntitlementsService {
 
   /** "Can this customer do this right now, and how much is left?" */
   check(orgId: string, input: CheckInput): EntitlementCheck;
+  /**
+   * What this account's plan includes of one meter, in that meter's units,
+   * before the metered price charges anything.
+   *
+   * Billing's one call into this module. It is by meter and not by feature
+   * because a bill knows what it is metering and nothing about feature keys,
+   * and it returns a quantity and not money because only the price knows what
+   * those units are worth on its own tier ladder.
+   */
+  allowanceFor(orgId: string, customerId: string, meter: string): MeteredAllowance | null;
   /** The same question when the caller only needs the gate, not the sentence. */
   allows(orgId: string, customerId: string, feature: string, requested?: number): boolean;
 
@@ -225,6 +235,7 @@ export default defineModule({
       activeById: (orgId, id, opts) => store.activeById(orgId, id, opts),
       summary: (orgId, customerId) => store.summary(orgId, customerId),
       check: (orgId, input) => store.check(orgId, input),
+      allowanceFor: (orgId, customerId, meter) => store.allowanceFor(orgId, customerId, meter),
       allows: (orgId, customerId, feature, requested) =>
         store.check(orgId, { customer: customerId, feature, requested }, { emit: false }).allowed,
       recompute: (orgId, customerId, opts) => store.recompute(orgId, customerId, opts),

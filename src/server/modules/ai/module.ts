@@ -16,11 +16,10 @@ import { accountUsage, describeUsage } from '../../ai/usage';
 import { entityIndex, workspaceProfile } from '../../ai/grounding';
 import { resolveEntities } from '../../ai/resolve';
 import { invalidateIndex } from '../../ai/grounding';
-import { accountProfile, recordTimeline, type AccountProfileResult } from '../../ai/functions';
+import { accountProfile, outstandingForDraft, recordTimeline, type AccountProfileResult } from '../../ai/functions';
 import { recordStanding, type RecordStanding } from '../../ai/query';
-import { composeDraft, detectDraftKind, detectTone, DRAFT_KINDS, TONES, type DraftKind, type DraftResult, type OutstandingInvoice, type Tone } from '../../ai/draft';
+import { composeDraft, detectDraftKind, detectTone, DRAFT_KINDS, TONES, type DraftKind, type DraftResult, type Tone } from '../../ai/draft';
 import { truncate } from '../../ai/text';
-import { money } from '../../ai/answer';
 import { normaliseResponseSchema, schemaNamesNoFields } from '../../ai/extract';
 import { vocabulary } from '../../ai/slots';
 import { publishTemplates, TEMPLATES } from '../../ai/templates';
@@ -183,30 +182,6 @@ export interface AiService {
 
 declare module '../../kernel/services' {
   interface ServiceRegistry { ai: AiService }
-}
-
-/**
- * The unpaid bills behind a dunning draft.
- *
- * A chase with no invoice number, no amount and no due date in it cannot be
- * acted on by the person who receives it, and the person who sends it has to
- * look all three up and retype them. They are on the ledger; this reads them.
- */
-function outstandingFor(ctx: Ctx, orgId: string, account: AccountProfileResult | null): OutstandingInvoice[] {
-  const billing = ctx.svc.billing;
-  if (!billing || !account) return [];
-  const customer = billing.customerByCrmRecord(orgId, account.id);
-  if (!customer) return [];
-  const workspace = workspaceProfile(ctx, orgId);
-  return billing.invoices(orgId, { customer: customer.id, status: 'open_like', limit: 10 })
-    .filter((invoice) => invoice.amount_due > 0)
-    .map((invoice) => ({
-      number: invoice.number,
-      amount_due_formatted: money(invoice.amount_due, invoice.currency, workspace),
-      due_at: invoice.due_date ?? null,
-      days_overdue: invoice.due_date && invoice.due_date < ctx.now() ? Math.floor((ctx.now() - invoice.due_date) / DAY) : null,
-      status: invoice.status,
-    }));
 }
 
 const SYSTEM_PROMPT = (ctx: Ctx, orgId: string): string => {
@@ -445,7 +420,7 @@ export default defineModule({
         const sender = workspace.people.find((p) => p.id === opts.actorId) ?? workspace.people[0] ?? null;
         return composeDraft({
           workspace,
-          outstanding: outstandingFor(ctx, orgId, account),
+          outstanding: outstandingForDraft(ctx, orgId, account?.id ?? null),
           kind: opts.kind ?? detectDraftKind(instruction),
           tone: opts.tone ?? detectTone(instruction),
           instruction,
@@ -707,7 +682,9 @@ export default defineModule({
         'Answers from the workspace\'s own records. Without an ANTHROPIC_API_KEY the built-in deterministic engine answers; with one, the hosted model takes over and uses the same tool runtime.\n\n'
         + '`response_schema` returns JSON of exactly that shape instead of prose. An object schema names its members as `fields` or as JSON Schema\'s `properties` — both spellings are accepted, and an object schema carrying neither is rejected with `response_schema_invalid` rather than answered with a silent `null`. '
         + 'Each member is `{"type": "string" | "number" | "integer" | "boolean" | "array" | "object", …}`; an array\'s element type is `of` or `items`. '
-        + 'A field nothing could fill honestly comes back `null` and is named in the run\'s reasoning rather than guessed at — including a money field on a workspace that bills in several currencies, where there is no single figure to give.',
+        + 'A field nothing could fill honestly comes back `null` and is named in the run\'s reasoning rather than guessed at — including a money field on a workspace that bills in several currencies, where there is no single figure to give. '
+        + 'A numeric field is filled only when it is the schema\'s bare figure (`value`, `amount`, `total`) or names the measure the run computed: a schema asking for `pipeline_value`, `average_deal_size` and `win_rate_percent` gets the pipeline and two nulls, not the same number three times. '
+        + 'Money is in minor units, exactly as `amount_due` on an invoice is — the run\'s reasoning names the currency and prints the formatted figure beside the raw one.',
       tags: ['ai'],
       body: v.object({
         prompt: v.optional(v.string({ min: 1, max: 20_000 })),

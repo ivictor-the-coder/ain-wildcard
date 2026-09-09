@@ -20,8 +20,8 @@ import {
 } from '@/client/design';
 import {
   accountOf, civilDay, closedVerb, contactsOf, dealAmount, dealCloseDate, dealEnteredStage, dealStage,
-  dealWeighted, emptyValue, needsYear, num, outcomeWord, recordHref, str, useDealFormat, useDealProperties,
-  usePipelines, useUserIndex, useUsers, useVelocity,
+  dealWeighted, emptyValue, needsYear, num, outcomeWord, readOnlyReason, recordHref, str, useCanWriteDeals,
+  useDealFormat, useDealProperties, usePipelines, useUserIndex, useUsers, useVelocity,
   type CalendarFormat, type DealRecord, type PipelineStage, type PropertyDef, type StageHistory,
   type TimelineItem,
 } from './api';
@@ -139,6 +139,10 @@ export function DealRecordPage({ id }: { id: string }) {
   const session = useSession();
   const toast = useToast();
   const { navigate, location, setQuery } = useRouter();
+  // The record's writes go through the same `member`-gated routes the board's
+  // do, so the same one answer decides what this page offers: the header
+  // buttons, the stage rail, the property editors and the archive.
+  const writable = useCanWriteDeals();
 
   const record = useQuery<DealDetail>(`/v1/records/deal/${encodeURIComponent(id)}`, { expand: 'timeline' });
   const history = useQuery<StageHistory>(`/v1/records/deal/${encodeURIComponent(id)}/stage-history`);
@@ -279,7 +283,11 @@ export function DealRecordPage({ id }: { id: string }) {
    */
   const landedOn = useRef<string | null>(null);
   /** Open the confirmation, remembering where the keyboard should come back to. */
-  const requestMove = (to: PipelineStage) => { landedOn.current = to.name; setMove(to); };
+  const requestMove = (to: PipelineStage) => {
+    if (!writable) return;
+    landedOn.current = to.name;
+    setMove(to);
+  };
   const currentStage = deal ? dealStage(deal) : null;
   useEffect(() => {
     const wanted = landedOn.current;
@@ -364,7 +372,9 @@ export function DealRecordPage({ id }: { id: string }) {
     icon: <GitBranchIcon size={12} />,
   }));
 
-  const actions: MenuSection[] = [
+  // Below `member` this menu holds the one thing a reader can do with a deal:
+  // ask about it. Everything else on it is a write the server would refuse.
+  const actions: MenuSection[] = writable ? [
     {
       id: 'move',
       label: 'Move to stage',
@@ -406,6 +416,18 @@ export function DealRecordPage({ id }: { id: string }) {
           icon: <Icons.trash size={14} />,
           danger: true,
           onSelect: () => setArchiving(true),
+        },
+      ],
+    },
+  ] : [
+    {
+      id: 'record',
+      items: [
+        {
+          id: 'ask',
+          label: 'Ask the copilot about this deal',
+          icon: <Icons.sparkles size={14} />,
+          onSelect: () => navigate(`/copilot?new=1&ask=${encodeURIComponent(`Where does ${deal.display_name} stand right now?`)}`),
         },
       ],
     },
@@ -487,24 +509,41 @@ export function DealRecordPage({ id }: { id: string }) {
       ].join(' · ')}
       actions={
         <>
-          <Button iconLeft={<Icons.note size={14} />} onClick={() => setLogging(true)}>Log activity</Button>
-          <Button iconLeft={<Icons.edit size={14} />} onClick={() => setEditing('')}>Edit</Button>
-          <MenuButton sections={actions} label="Deal actions" variant="secondary" icon={<GitBranchIcon size={14} />}>
-            Move stage
+          {writable && (
+            <>
+              <Button iconLeft={<Icons.note size={14} />} onClick={() => setLogging(true)}>Log activity</Button>
+              <Button iconLeft={<Icons.edit size={14} />} onClick={() => setEditing('')}>Edit</Button>
+            </>
+          )}
+          <MenuButton
+            sections={actions}
+            label="Deal actions"
+            variant="secondary"
+            icon={writable ? <GitBranchIcon size={14} /> : <Icons.more size={14} />}
+          >
+            {writable ? 'Move stage' : 'Actions'}
           </MenuButton>
         </>
       }
     >
+      {!writable && (
+        <Banner tone="info" title="This deal is read-only for you">
+          {readOnlyReason(session.me?.role)} The stage rail, the property editors and the timeline’s
+          “Log activity” are not offered rather than offered and refused.
+        </Banner>
+      )}
       {deal.archived && (
         <Banner
           tone="neutral"
           title="This deal is archived"
           bar
-          actions={
-            <Button size="sm" variant="primary" loading={restore.loading} onClick={() => { void restore.run().catch(() => undefined); }}>
-              Restore it
-            </Button>
-          }
+          actions={writable
+            ? (
+              <Button size="sm" variant="primary" loading={restore.loading} onClick={() => { void restore.run().catch(() => undefined); }}>
+                Restore it
+              </Button>
+            )
+            : undefined}
         >
           It is off the board and out of the forecast. Nothing has been deleted — restoring puts it back
           in {stage?.label ?? 'its stage'} at {num(deal.properties.probability)}%.
@@ -516,7 +555,7 @@ export function DealRecordPage({ id }: { id: string }) {
           tone="warning"
           title="This deal has stopped moving"
           bar
-          actions={<Button size="sm" onClick={() => setLogging(true)}>Log what happened</Button>}
+          actions={writable ? <Button size="sm" onClick={() => setLogging(true)}>Log what happened</Button> : undefined}
         >
           It has been in {stage?.label} for {f.plural(daysInStage ?? 0, 'day')}. Deals on {pipeline?.label} stall
           after {f.plural(stageVelocity.stalled_after_days, 'day')} — twice this stage’s own median.
@@ -524,7 +563,12 @@ export function DealRecordPage({ id }: { id: string }) {
       )}
 
       {pipeline && (
-        <Card title="Stage" description={`Clicking a stage moves the deal and restamps its probability, forecast category and close stamps.`}>
+        <Card
+          title="Stage"
+          description={writable
+            ? 'Clicking a stage moves the deal and restamps its probability, forecast category and close stamps.'
+            : 'Where this deal sits, and what each stage is worth at its own probability.'}
+        >
           <StageRail>
             {pipeline.stages.map((s) => {
               const current = s.name === stage?.name;
@@ -541,9 +585,11 @@ export function DealRecordPage({ id }: { id: string }) {
                   // drops focus the moment a move makes the step the caret is
                   // on the current one — which is how the keyboard ended up on
                   // `<body>` after every stage move made from this rail.
-                  aria-disabled={current || undefined}
-                  onClick={() => (current ? undefined : requestMove(s))}
-                  title={current ? `${s.label} — the stage this deal is in` : (s.description ?? s.label)}
+                  aria-disabled={current || !writable || undefined}
+                  onClick={() => (current || !writable ? undefined : requestMove(s))}
+                  title={current
+                    ? `${s.label} — the stage this deal is in`
+                    : writable ? (s.description ?? s.label) : `${s.label} — ${readOnlyReason(session.me?.role)}`}
                 >
                   <span className="pl-rail__label">{s.label}</span>
                   <span className="pl-rail__sub">{s.probability}% · {f.money(Math.round((amount * s.probability) / 100))}</span>
@@ -559,11 +605,11 @@ export function DealRecordPage({ id }: { id: string }) {
         gap={6}
         aside={
           <>
-            <AccountCard deal={deal} account={account} onChanged={refresh} />
+            <AccountCard deal={deal} account={account} writable={writable} onChanged={refresh} />
 
             <div style={{ height: 'var(--space-6)' }} />
 
-            <CommitteeCard deal={deal} contacts={committee} onChanged={refresh} />
+            <CommitteeCard deal={deal} contacts={committee} writable={writable} onChanged={refresh} />
 
             <div style={{ height: 'var(--space-6)' }} />
 
@@ -657,8 +703,12 @@ export function DealRecordPage({ id }: { id: string }) {
 
         <Card
           title="Properties"
-          description="Every field on this deal, in the workspace’s own display order. Click a value to change it."
-          actions={<Button size="sm" variant="secondary" iconLeft={<Icons.edit size={13} />} onClick={() => setEditing('')}>Edit them all</Button>}
+          description={writable
+            ? 'Every field on this deal, in the workspace’s own display order. Click a value to change it.'
+            : 'Every field on this deal, in the workspace’s own display order.'}
+          actions={writable
+            ? <Button size="sm" variant="secondary" iconLeft={<Icons.edit size={13} />} onClick={() => setEditing('')}>Edit them all</Button>
+            : undefined}
         >
           {properties.error && (
             <ErrorState
@@ -670,7 +720,7 @@ export function DealRecordPage({ id }: { id: string }) {
             />
           )}
           {!properties.error && properties.loading && <SkeletonText lines={10} />}
-          <InlineEditingScope>
+          <InlineEditingScope writable={writable}>
           <div className="pl-proplist">
             {groups.map(([group, rows]) => (
               <section key={group}>
@@ -685,7 +735,7 @@ export function DealRecordPage({ id }: { id: string }) {
                       <Badge size="sm" tone="neutral" className="pl-propgroup__flag">from an earlier close — this deal is open again</Badge>
                     )}
                   </span>
-                  {rows.some((property) => !property.read_only && !property.calculated) && (
+                  {writable && rows.some((property) => !property.read_only && !property.calculated) && (
                     <Button size="sm" variant="ghost" onClick={() => setEditing(group)}>Edit {group.toLowerCase()}</Button>
                   )}
                 </div>
@@ -718,7 +768,9 @@ export function DealRecordPage({ id }: { id: string }) {
         <Card
           title="Timeline"
           description="Calls, notes, emails, stage moves and links, newest first"
-          actions={<Button size="sm" variant="secondary" iconLeft={<Icons.plus size={13} />} onClick={() => setLogging(true)}>Log activity</Button>}
+          actions={writable
+            ? <Button size="sm" variant="secondary" iconLeft={<Icons.plus size={13} />} onClick={() => setLogging(true)}>Log activity</Button>
+            : undefined}
         >
           {timeline.length === 0 && (
             <EmptyState
@@ -726,8 +778,10 @@ export function DealRecordPage({ id }: { id: string }) {
               inline
               illustration={null}
               title="Nothing logged on this deal yet"
-              body="Notes, calls and meetings you log here show up on the account and in the copilot's answers."
-              action={<Button size="sm" variant="primary" onClick={() => setLogging(true)}>Log the first activity</Button>}
+              body="Notes, calls and meetings logged here show up on the account and in the copilot's answers."
+              action={writable
+                ? <Button size="sm" variant="primary" onClick={() => setLogging(true)}>Log the first activity</Button>
+                : undefined}
             />
           )}
           {timeline.length > 0 && <Timeline entries={timeline} />}
@@ -735,7 +789,7 @@ export function DealRecordPage({ id }: { id: string }) {
       </Split>
 
       <StageMoveDialog
-        open={!!move}
+        open={!!move && writable}
         deal={deal}
         from={stage}
         to={move}
@@ -744,7 +798,7 @@ export function DealRecordPage({ id }: { id: string }) {
         onMoved={refresh}
       />
       <EditDealDialog
-        open={editing !== null}
+        open={editing !== null && writable}
         deal={deal}
         properties={props}
         pipelines={pipelines.data?.data ?? []}
@@ -755,7 +809,7 @@ export function DealRecordPage({ id }: { id: string }) {
         onSaved={refresh}
       />
       <PipelineMoveDialog
-        open={repiping}
+        open={repiping && writable}
         deal={deal}
         pipelines={pipelines.data?.data ?? []}
         properties={props}
@@ -763,19 +817,19 @@ export function DealRecordPage({ id }: { id: string }) {
         onMoved={refresh}
       />
       <LogActivityDialog
-        open={logging}
+        open={logging && writable}
         deal={deal}
         onClose={() => setLogging(false)}
         onLogged={refresh}
       />
       <DraftDialog
-        open={drafting}
+        open={drafting && writable}
         subject={{ id: deal.id, objectType: 'deal', name: deal.display_name }}
         onClose={() => setDrafting(false)}
         onLogged={refresh}
       />
       <ConfirmDialog
-        open={archiving}
+        open={archiving && writable}
         onCancel={() => setArchiving(false)}
         onConfirm={() => archive.run().catch(() => undefined)}
         loading={archive.loading}

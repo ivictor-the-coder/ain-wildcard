@@ -23,7 +23,7 @@ import {
   csvInstant, moneyIn, useUrlTableState, visibleRows,
   type CsvColumn,
 } from './common';
-import { attemptsError, collectionHourError, policySavedLine, recoveryRateText } from './dunning-policy';
+import { attemptsError, canPresent, cannotPresentReason, collectionHourError, nextAttemptFact, nextAttemptLine, policySavedLine, recoveryRateText } from './dunning-policy';
 import type {
   CollectionAttempt, DunningCampaign, DunningPolicy, DunningSummary, OpenInvoice, PaymentSettings,
 } from './types';
@@ -254,10 +254,17 @@ export function DunningPage() {
     items: [
       { id: 'open', label: 'Open the campaign', icon: <ArrowRightIcon size={14} />, onSelect: () => setOpen(row) },
       {
+        // A campaign with no usable method on file has nothing to present. The
+        // row still offered the action, the dialog still named the attempt it
+        // was about to spend, and presenting did nothing at all: no intent, no
+        // attempt, a success toast over an unchanged campaign. An action the
+        // server cannot perform does not belong on the menu — the account needs
+        // a card first, which is what `recommended_action` already says.
         id: 'retry',
         label: 'Retry the charge now…',
         icon: <Icons.refresh size={14} />,
-        disabled: row.status === 'recovered' || row.status === 'canceled',
+        disabled: !canPresent(row),
+        description: cannotPresentReason(row),
         onSelect: () => setRetrying(row),
       },
       { id: 'invoice', label: 'Open the invoice', icon: <Icons.invoice size={14} />, onSelect: () => navigate(`/billing/invoices/${row.invoice}`) },
@@ -638,15 +645,36 @@ function CampaignDrawer({
     },
   );
 
-  const entries: TimelineEntry[] = row.attempts.map((attempt) => ({
-    id: attempt.id,
-    tone: attempt.outcome === 'succeeded' ? 'success' : attempt.outcome === 'failed' ? 'danger' : 'neutral',
-    icon: attempt.outcome === 'succeeded' ? <Icons.check size={12} /> : <Icons.x size={12} />,
-    title: `Attempt ${attempt.attempt_number} — ${humanize(attempt.outcome)}`,
-    time: f.dateTime(attempt.attempted_at ?? attempt.scheduled_for),
-    description: attempt.failure_message ?? `${moneyIn(f, attempt.amount, attempt.currency)} presented`,
-    children: <span className="rv-sub">{attempt.decision}</span>,
-  }));
+  /**
+   * Each attempt, and what the schedule decided after it.
+   *
+   * An attempt that scheduled another one has that instant on the row, so the
+   * timeline says it from `next_attempt_at` — the field the "Next attempt"
+   * tile above reads — rather than from the prose written beside it. The
+   * prose states the gap in words and goes stale as soon as the slot moves,
+   * which is how this drawer came to promise a retry "five days out" from
+   * Aug 31 under a tile reading Sep 11. Where there is no next attempt — a
+   * hold, an exhausted schedule, a charge that cleared — the prose carries
+   * the only explanation there is, so it is shown.
+   */
+  const entries: TimelineEntry[] = row.attempts.map((attempt, index) => {
+    const next = nextAttemptFact(attempt, row, index === row.attempts.length - 1);
+    return {
+      id: attempt.id,
+      tone: attempt.outcome === 'succeeded' ? 'success' : attempt.outcome === 'failed' ? 'danger' : 'neutral',
+      icon: attempt.outcome === 'succeeded' ? <Icons.check size={12} /> : <Icons.x size={12} />,
+      title: `Attempt ${attempt.attempt_number} — ${humanize(attempt.outcome)}`,
+      time: f.dateTime(attempt.attempted_at ?? attempt.scheduled_for),
+      description: attempt.failure_message ?? `${moneyIn(f, attempt.amount, attempt.currency)} presented`,
+      children: (
+        <span className="rv-sub">
+          {next
+            ? nextAttemptLine(next, (at) => f.dateTime(at), (count, noun) => f.plural(count, noun))
+            : attempt.decision}
+        </span>
+      ),
+    };
+  });
 
   return (
     <Drawer

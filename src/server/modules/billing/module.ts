@@ -134,6 +134,29 @@ const localeOf = (ctx: Ctx, orgId: string): string => {
 
 /* ------------------------------- validators ------------------------------- */
 
+/**
+ * An instant a caller can actually type.
+ *
+ * `v.timestamp()` publishes `format: 'unix-ms'` and means it — but a URL
+ * carries every value as text, so `Date.parse('1788825600000')` was asked to
+ * read epoch milliseconds as a date, failed, and the one spelling the schema
+ * names was the one spelling the route refused: `GET /v1/invoices?
+ * created_after=1788825600000` came back 400 while the ISO form went through.
+ * Every timestamp billing accepts goes through this, body and query alike, so
+ * an instant this API *emits* is an instant it takes back.
+ *
+ * The published schema node is unchanged — still an integer in unix-ms — so
+ * the OpenAPI document and the parser now agree instead of contradicting each
+ * other. `crm`, `metering` and `revenue` each carry their own copy of this;
+ * they all disappear the day `v.timestamp()` in the kernel coerces a numeric
+ * string itself.
+ */
+const instant = () => v.transform(
+  v.union(v.int({ min: -32_503_680_000_000, max: 32_503_680_000_000 }), v.timestamp()),
+  (value: number) => value,
+  { type: 'integer', format: 'unix-ms', fields: undefined, description: 'Unix epoch milliseconds, or an ISO-8601 timestamp.' },
+);
+
 const addressBody = v.object({
   line1: v.optional(v.string({ max: 200 })),
   line2: v.optional(v.string({ max: 200 })),
@@ -197,11 +220,11 @@ const subscriptionCreateBody = v.object({
   customer: v.id('cus'),
   items: v.array(itemBody, { min: 1, max: 30 }),
   currency: v.optional(v.currency()),
-  billing_cycle_anchor: v.optional(v.timestamp()),
+  billing_cycle_anchor: v.optional(instant()),
   billing_cycle_anchor_day: v.optional(v.int({ min: 1, max: 31, description: 'The billing day, when it is easier to say than an instant. The same cycle as billing_cycle_anchor, so send one or the other — a monthly or yearly cycle only.' })),
-  backdate_start_date: v.optional(v.timestamp()),
+  backdate_start_date: v.optional(instant()),
   trial_period_days: v.optional(v.int({ min: 0, max: 730 })),
-  trial_end: v.optional(v.timestamp()),
+  trial_end: v.optional(instant()),
   trial_from_plan: v.optional(v.boolean()),
   trial_settings: v.optional(v.object({
     end_behavior: v.optional(v.object({ missing_payment_method: v.enum(TRIAL_END_BEHAVIORS) }, { strict: true })),
@@ -212,7 +235,7 @@ const subscriptionCreateBody = v.object({
   proration_behavior: v.optional(v.enum(PRORATION_BEHAVIORS)),
   payment_behavior: v.optional(v.enum(PAYMENT_BEHAVIORS)),
   cancel_at_period_end: v.optional(v.boolean()),
-  cancel_at: v.optional(v.timestamp()),
+  cancel_at: v.optional(instant()),
   description: v.optional(v.string({ max: 500 })),
   metadata: v.metadata(),
 }, { strict: true });
@@ -220,15 +243,15 @@ const subscriptionCreateBody = v.object({
 const CHANGE_FIELDS = {
   items: v.optional(v.array(itemBody, { max: 30 })),
   proration_behavior: v.optional(v.enum(PRORATION_BEHAVIORS)),
-  proration_date: v.optional(v.timestamp()),
+  proration_date: v.optional(instant()),
   billing_cycle_anchor: v.optional(v.enum(['now', 'unchanged'] as const)),
-  trial_end: v.optional(v.union(v.literal('now'), v.timestamp())),
+  trial_end: v.optional(v.union(v.literal('now'), instant())),
 };
 
 const subscriptionUpdateBody = v.object({
   ...CHANGE_FIELDS,
   cancel_at_period_end: v.optional(v.boolean()),
-  cancel_at: v.optional(v.nullable(v.timestamp())),
+  cancel_at: v.optional(v.nullable(instant())),
   collection_method: v.optional(v.enum(COLLECTION_METHODS)),
   days_until_due: v.optional(v.int({ min: 0, max: 365 })),
   default_payment_method: v.optional(v.string({ max: 120 })),
@@ -240,7 +263,7 @@ const previewBody = v.object(CHANGE_FIELDS, { strict: true });
 
 const cancelBody = v.object({
   at_period_end: v.optional(v.boolean()),
-  cancel_at: v.optional(v.timestamp()),
+  cancel_at: v.optional(instant()),
   prorate: v.optional(v.boolean()),
   cancellation_reason: v.optional(v.enum(CANCELLATION_REASONS)),
   comment: v.optional(v.string({ max: 1000 })),
@@ -248,7 +271,7 @@ const cancelBody = v.object({
 
 const pauseBody = v.object({
   behavior: v.default(v.enum(PAUSE_BEHAVIORS), 'keep_as_draft'),
-  resumes_at: v.optional(v.timestamp()),
+  resumes_at: v.optional(instant()),
 }, { strict: true });
 
 const resumeBody = v.object({
@@ -264,11 +287,11 @@ const phaseBody = v.object({
     metadata: v.metadata(),
   }, { strict: true }), { min: 1, max: 30 }),
   iterations: v.optional(v.int({ min: 1, max: 120 })),
-  end_date: v.optional(v.timestamp()),
-  start_date: v.optional(v.timestamp()),
+  end_date: v.optional(instant()),
+  start_date: v.optional(instant()),
   proration_behavior: v.optional(v.enum(PRORATION_BEHAVIORS)),
   trial: v.optional(v.boolean()),
-  trial_end: v.optional(v.timestamp()),
+  trial_end: v.optional(instant()),
   collection_method: v.optional(v.enum(COLLECTION_METHODS)),
   days_until_due: v.optional(v.int({ min: 0, max: 365 })),
   description: v.optional(v.string({ max: 300 })),
@@ -278,7 +301,7 @@ const phaseBody = v.object({
 const scheduleCreateBody = v.object({
   customer: v.optional(v.id('cus')),
   from_subscription: v.optional(v.id('sub')),
-  start_date: v.optional(v.timestamp()),
+  start_date: v.optional(instant()),
   end_behavior: v.optional(v.enum(SCHEDULE_END_BEHAVIORS)),
   phases: v.array(phaseBody, { min: 1, max: 24 }),
   metadata: v.metadata(),
@@ -294,7 +317,7 @@ const invoicePreviewBody = v.object({
   subscription: v.id('sub'),
   items: v.optional(v.array(itemBody, { max: 30 })),
   proration_behavior: v.optional(v.enum(PRORATION_BEHAVIORS)),
-  proration_date: v.optional(v.timestamp()),
+  proration_date: v.optional(instant()),
   billing_cycle_anchor: v.optional(v.enum(['now', 'unchanged'] as const)),
 }, { strict: true });
 
@@ -335,7 +358,7 @@ const invoiceItemFields = {
   quantity: v.optional(v.int({ min: 1, max: 1_000_000 })),
   currency: v.optional(v.string({ min: 3, max: 3, description: 'Must be the customer\u2019s own currency; defaults to it.' })),
   tax_behavior: v.optional(v.enum(TAX_BEHAVIORS)),
-  period: v.optional(v.object({ start: v.timestamp(), end: v.timestamp() }, { strict: true })),
+  period: v.optional(v.object({ start: instant(), end: instant() }, { strict: true })),
   subscription: v.optional(v.id('sub')),
   metadata: v.metadata(),
 };
@@ -906,8 +929,8 @@ export default defineModule({
         collection_method: v.optional(v.enum(COLLECTION_METHODS)),
         schedule: v.optional(v.id('sub_sched')),
         query: v.optional(v.string({ max: 160 })),
-        created_after: v.optional(v.timestamp()),
-        created_before: v.optional(v.timestamp()),
+        created_after: v.optional(instant()),
+        created_before: v.optional(instant()),
         limit: v.optional(v.int({ min: 1, max: 200 })),
         cursor: v.optional(v.string({ max: 200 })),
         expand: v.optional(v.string({ max: 120 })),
@@ -1031,9 +1054,9 @@ export default defineModule({
         collection_method: v.optional(v.enum(COLLECTION_METHODS)),
         tax: v.optional(v.enum(INVOICE_TAX_FILTERS)),
         query: v.optional(v.string({ max: 160 })),
-        created_after: v.optional(v.timestamp()),
-        created_before: v.optional(v.timestamp()),
-        due_before: v.optional(v.timestamp()),
+        created_after: v.optional(instant()),
+        created_before: v.optional(instant()),
+        due_before: v.optional(instant()),
         limit: v.optional(v.int({ min: 1, max: 200 })),
         cursor: v.optional(v.string({ max: 200 })),
       }),
@@ -1445,7 +1468,7 @@ export default defineModule({
           customer: v.optional(v.string({ max: 80 })),
           subscription: v.optional(v.id('sub')),
           status: v.optional(v.enum([...INVOICE_STATUSES, 'open_like', 'all'] as const)),
-          due_before: v.optional(v.timestamp()),
+          due_before: v.optional(instant()),
           limit: v.optional(v.int({ min: 1, max: 50 })),
         }),
         run(args: { customer?: string; subscription?: string; status?: InvoiceStatus | 'open_like' | 'all'; due_before?: number; limit?: number }, c: Ctx, meta) {
@@ -1599,7 +1622,7 @@ export default defineModule({
             deleted: v.optional(v.boolean()),
           }), { max: 30 }),
           proration_behavior: v.optional(v.enum(PRORATION_BEHAVIORS)),
-          proration_date: v.optional(v.timestamp()),
+          proration_date: v.optional(instant()),
         }),
         run(args: { subscription: string; items: { id?: string; price?: string; quantity?: number; custom_unit_amount?: number; deleted?: boolean }[]; proration_behavior?: ProrationBehavior; proration_date?: number }, c: Ctx, meta) {
           const preview = billingStore(c).billing.previewSubscriptionChange(meta.orgId, args.subscription, {
@@ -1692,7 +1715,7 @@ export default defineModule({
         input: v.object({
           subscription: v.id('sub'),
           behavior: v.default(v.enum(PAUSE_BEHAVIORS), 'keep_as_draft'),
-          resumes_at: v.optional(v.timestamp()),
+          resumes_at: v.optional(instant()),
         }),
         run(args: { subscription: string; behavior: 'keep_as_draft' | 'mark_uncollectible' | 'void'; resumes_at?: number }, c: Ctx, meta) {
           const sub = billingStore(c).billing.pauseSubscription(meta.orgId, args.subscription, args, {
@@ -1815,19 +1838,31 @@ function creditNotePayload(ctx: Ctx, orgId: string, note: CreditNote) {
     refund_amount_display: display(note.refund_amount),
     credit_amount_display: display(note.credit_amount),
     out_of_band_amount_display: display(note.out_of_band_amount),
-    routing_detail: note.post_payment_amount > 0
-      ? describeRouting(note, display)
-      : `${display(note.pre_payment_amount)} came off what the invoice asks for; nothing had been collected yet.`,
+    routing_detail: describeRouting(note, display),
   };
 }
 
-/** Where a post-payment note's money went, one clause per destination that took any. */
+/**
+ * Where a note's money went, one clause per destination that took any.
+ *
+ * "Nothing had been collected yet" is true of a bill nobody has paid and false
+ * of one that was part collected — where this very note pushed the customer's
+ * own money onto their account, and telling them nothing had been collected is
+ * the platform contradicting the `amount_paid` printed beside it.
+ */
 function describeRouting(note: CreditNote, display: (amount: number) => string): string {
-  const parts: string[] = [];
-  if (note.refund_amount > 0) parts.push(`${display(note.refund_amount)} went back to the customer\u2019s card through the payments module`);
-  if (note.credit_amount > 0) parts.push(`${display(note.credit_amount)} was put onto the customer\u2019s balance and comes off the next invoice`);
-  if (note.out_of_band_amount > 0) parts.push(`${display(note.out_of_band_amount)} was returned outside the platform and is only recorded here`);
-  return `The invoice had already been paid, so the credit was handed back: ${parts.join('; ')}.`;
+  if (note.post_payment_amount > 0) {
+    const parts: string[] = [];
+    if (note.refund_amount > 0) parts.push(`${display(note.refund_amount)} went back to the customer’s card through the payments module`);
+    if (note.credit_amount > 0) parts.push(`${display(note.credit_amount)} was put onto the customer’s balance and comes off the next invoice`);
+    if (note.out_of_band_amount > 0) parts.push(`${display(note.out_of_band_amount)} was returned outside the platform and is only recorded here`);
+    return `The invoice had already been paid, so the credit was handed back: ${parts.join('; ')}.`;
+  }
+  if (note.displaced_to_balance > 0) {
+    return `${display(note.pre_payment_amount - note.displaced_to_balance)} came off what the invoice asks for, which is all it was still owed; `
+      + `the remaining ${display(note.displaced_to_balance)} had already been collected, so it went onto the customer’s balance and comes off the next invoice.`;
+  }
+  return `${display(note.pre_payment_amount)} came off what the invoice asks for; nothing had been collected yet.`;
 }
 
 function invoiceItemPayload(ctx: Ctx, orgId: string, item: InvoiceItem) {

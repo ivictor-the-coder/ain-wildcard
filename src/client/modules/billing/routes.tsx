@@ -22,6 +22,7 @@ import { CustomersPage, CustomerDetailPage } from './customers';
 import { SubscriptionsPage, SubscriptionDetailPage } from './subscriptions';
 import { InvoicesPage, InvoiceDetailPage } from './invoices';
 import { PaymentsPage } from './payments-book';
+import { PriceBookPage, ProductDetailPage } from './pricebook';
 import type { BillingOverview, Invoice, RevenueAccount, Subscription } from './types';
 
 /**
@@ -457,6 +458,13 @@ export const routes: RouteDef[] = [
   { path: '/billing/invoices/:id', element: InvoiceDetailPage, title: 'Invoice' },
   { path: '/billing/payments', element: PaymentsPage, title: 'Payments' },
   { path: '/billing/taxes', element: TaxRedirect, title: 'Tax' },
+  // `/catalog/products/:id` rather than `/billing/…`: the shell's search
+  // already looks for exactly this pattern when it decides whether a price-book
+  // hit can be opened (`firstRegistered(registered, ['/products/:id',
+  // '/catalog/products/:id'])` in src/client/kernel/search-core.ts), so
+  // registering it here is what turns those hits from dead rows into links.
+  { path: '/catalog/products', element: PriceBookPage, title: 'Price book' },
+  { path: '/catalog/products/:id', element: ProductDetailPage, title: 'Product' },
 ];
 
 export const nav: NavItem[] = [
@@ -465,6 +473,7 @@ export const nav: NavItem[] = [
   { id: 'billing.subscriptions.nav', label: 'Subscriptions', to: '/billing/subscriptions', group: 'revenue', order: 14, icon: 'repeat' },
   { id: 'billing.invoices.nav', label: 'Invoices', to: '/billing/invoices', group: 'revenue', order: 16, icon: 'invoice' },
   { id: 'billing.payments.nav', label: 'Payments', to: '/billing/payments', group: 'revenue', order: 18, icon: 'coins' },
+  { id: 'billing.pricebook.nav', label: 'Price book', to: '/catalog/products', group: 'revenue', order: 20, icon: 'tag' },
 ];
 
 /**
@@ -509,6 +518,25 @@ export const commands: CommandDef[] = [
     keywords: ['declined', 'failed payment', 'card declined', 'refused', 'refunds'],
     icon: 'coins',
     run: (nav) => nav('/billing/payments?status=requires_payment_method'),
+  },
+  {
+    id: 'billing.product.new',
+    title: 'New product',
+    subtitle: 'Add something to sell, with its first price in the same call',
+    group: 'Create',
+    keywords: ['product', 'price', 'plan', 'catalog', 'price book', 'sku'],
+    icon: 'tag',
+    roles: ['member'],
+    run: (nav) => nav('/catalog/products?new=1'),
+  },
+  {
+    id: 'billing.pricebook.archived',
+    title: 'Archived products',
+    subtitle: 'What is no longer sold, and still explains old invoices',
+    group: 'Go to',
+    keywords: ['archived', 'retired', 'price book', 'catalog', 'products'],
+    icon: 'tag',
+    run: (nav) => nav('/catalog/products?standing=archived'),
   },
   {
     id: 'billing.open.past_due',

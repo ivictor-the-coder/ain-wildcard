@@ -90,6 +90,18 @@ export interface NextInvoicePreview {
   /** The waiting prorations, on the same basis. */
   uninvoiced_total: number;
   /**
+   * Metered usage already settled and waiting for a bill, net of the plan's
+   * included allowance and of prepaid credit — on the same basis again.
+   *
+   * A usage period is priced the moment it closes and sits in the credits
+   * outbox until an invoice claims it, so on a metered account this is
+   * routinely the largest thing on the next bill: $7,824.27 of telemetry
+   * against a $99.00 plan fee. The upcoming-invoice preview carries it and the
+   * bill sweeps it up, so this panel — the third reader of "what is the next
+   * bill?" — carries it too rather than quoting a plan fee as the answer.
+   */
+  settled_usage_total: number;
+  /**
    * The tax the bill this predicts will actually charge, worked out by the same
    * call `issue()` makes. A next-invoice figure with the tax left out is short
    * by exactly the tax — 19% on a German account — and it is the number a
@@ -313,18 +325,28 @@ export function buildCustomerSummary(
     // line's `amount` is the base, its tax is beside it, and the two are never
     // read off different paths.
     const recurring = billing.invoices.recurringDrafts(orgId, upcoming.id, lines);
-    const prorated = billing.invoices.prorationDrafts(uninvoiced);
-    const taxed = billing.invoices.taxDrafts(orgId, customer, [...recurring, ...prorated]);
+    const prorated = billing.invoices.prorationDrafts(uninvoiced.filter((item) => item.currency === upcoming.currency));
+    // Everything the credits module is holding for this account: usage priced
+    // when a window closed, the allowance that comes off it, the credit that
+    // covered part of it, packs bought since the last bill. The next invoice
+    // sweeps all of it, so a panel that predicts that invoice has to carry it
+    // — a Starter account was told $99.00 over a bill of $7,879.95. Read
+    // through the store's one reader, so this panel and the upcoming invoice
+    // cannot come to name different lines.
+    const usage = billing.settledUsageDrafts(orgId, upcoming);
+    const taxed = billing.invoices.taxDrafts(orgId, customer, [...recurring, ...prorated, ...usage]);
     const subtotal = taxed.slice(0, recurring.length).reduce((total, line) => total + line.amount, 0);
     // What the waiting items will be worth *on the bill*. `uninvoiced_items`
     // below still reports what the ledger holds; this is the same money after
     // an inclusive price has had its tax taken out of it.
-    const uninvoicedOnBill = taxed.slice(recurring.length).reduce((total, line) => total + line.amount, 0);
+    const uninvoicedOnBill = taxed.slice(recurring.length, recurring.length + prorated.length)
+      .reduce((total, line) => total + line.amount, 0);
+    const settledUsage = taxed.slice(recurring.length + prorated.length).reduce((total, line) => total + line.amount, 0);
     const tax = taxed.reduce((total, line) => total + line.tax.amount, 0);
     // What the lines are worth with their tax on them. For an exclusive price
     // that is the amount plus the tax; for an inclusive one the tax came out of
     // the amount, so the two halves add back up to the listed price either way.
-    const gross = subtotal + uninvoicedOnBill + tax;
+    const gross = subtotal + uninvoicedOnBill + settledUsage + tax;
     // `Invoices.issue()`'s own formula, not a second one that agrees on the
     // easy cases. Both invariants fall out of it: the bill never goes below
     // zero, and whatever the lines and the balance cannot settle between them
@@ -348,6 +370,7 @@ export function buildCustomerSummary(
       lines,
       subtotal,
       uninvoiced_total: uninvoicedOnBill,
+      settled_usage_total: settledUsage,
       tax,
       automatic_tax: automaticTax,
       balance_applied: balanceApplied,
@@ -355,7 +378,7 @@ export function buildCustomerSummary(
       note: upcoming.cancel_at_period_end
         ? `This subscription ends on ${longDate(upcoming.current_period_end, locale)}, so there is no renewal charge — only anything still outstanding.`
         : metered.length
-          ? `Plus metered usage for ${longDate(upcoming.current_period_start, locale)} to ${longDate(upcoming.current_period_end, locale)}, which is not known until the period closes.`
+          ? `Includes ${formatMoney(money(settledUsage, upcoming.currency), { locale })} of metered usage already settled and waiting for a bill, plus whatever ${longDate(upcoming.current_period_start, locale)} to ${longDate(upcoming.current_period_end, locale)} comes to, which is not known until that period closes.`
           : `Covers ${longDate(period.start, locale)} to ${longDate(period.end, locale)}.`,
     };
   }

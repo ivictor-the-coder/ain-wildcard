@@ -606,6 +606,7 @@ export function hydrateCreditNote(row: any, lines: CreditNoteLine[]): CreditNote
     total: Number(row.total),
     pre_payment_amount: Number(row.pre_payment_amount ?? 0),
     post_payment_amount: Number(row.post_payment_amount ?? 0),
+    displaced_to_balance: Number(row.displaced_to_balance ?? 0),
     refund_amount: Number(row.refund_amount ?? 0),
     // Notes written before the split existed put the whole post-payment
     // amount on the balance, and a null here is that note saying so.

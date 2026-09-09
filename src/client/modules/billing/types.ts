@@ -322,8 +322,21 @@ export interface CreditNote {
   subtotal: number;
   tax: number;
   total: number;
+  /** Taken off `amount_due`, because that much of the bill was still owed. */
   pre_payment_amount: number;
+  /**
+   * How much of `pre_payment_amount` the bill could not absorb because it had
+   * already been collected, and which therefore went to the account balance.
+   * Zero on a note that fits inside what the bill still owed — including one
+   * raised against a bill that has been *part* collected, which is why it is
+   * not on its own enough to tell whether anything was collected.
+   */
+  displaced_to_balance: number;
+  /** Handed back because the bill was paid: the three below add up to it. */
   post_payment_amount: number;
+  refund_amount: number;
+  credit_amount: number;
+  out_of_band_amount: number;
   invoice_status_at_issue: InvoiceStatus;
   voided_at: number | null;
   created: number;
@@ -332,6 +345,9 @@ export interface CreditNote {
   subtotal_display: string;
   tax_display: string;
   total_display: string;
+  refund_amount_display: string;
+  credit_amount_display: string;
+  out_of_band_amount_display: string;
   remaining_creditable: number;
   routing_detail: string;
 }
@@ -495,6 +511,8 @@ export interface CustomerSummary {
       cancel_at: number | null;
       trial_end: number | null;
       collection_method: string;
+      /** The schedule managing it, when one is — the summary sends this. */
+      schedule: string | null;
     }[];
   };
   mrr: number;
@@ -590,6 +608,15 @@ export interface CustomUnitAmount {
   preset: number | null;
 }
 
+/** One band of a tiered price, as the catalog stores it. */
+export interface PriceTier {
+  up_to: number | null;
+  unit_amount: number | null;
+  unit_amount_decimal: string | null;
+  flat_amount: number | null;
+  flat_amount_decimal: string | null;
+}
+
 export interface Price {
   object: 'price';
   id: string;
@@ -601,15 +628,97 @@ export interface Price {
   model: string;
   currency: string;
   unit_amount: number | null;
-  recurring: { interval: string; interval_count: number; usage_type: string; meter: string | null } | null;
+  unit_amount_decimal: string | null;
+  billing_scheme: string;
+  tiers_mode: string | null;
+  tiers: PriceTier[] | null;
+  transform_quantity: { divide_by: number; round: string } | null;
+  recurring: {
+    interval: string; interval_count: number; usage_type: string; meter: string | null;
+    aggregate_usage?: string | null; trial_period_days?: number | null;
+  } | null;
+  tax_behavior: string;
+  proration_behavior: ProrationBehavior;
+  metadata: Record<string, string>;
+  created: number;
+  updated: number;
   currencies: string[];
-  display: { summary: string; headline: string; cadence: string | null } | null;
+  display: PriceDisplay | null;
   product_name: string;
   unit_label: string | null;
   /** Present on `model: 'custom'` prices — the negotiated amount's bounds. */
   custom_unit_amount: CustomUnitAmount | null;
   /** Per-currency overrides, including that currency's own negotiated bounds. */
-  currency_options: Record<string, { custom_unit_amount?: CustomUnitAmount | null }> | null;
+  currency_options: Record<string, {
+    unit_amount?: number | null;
+    unit_amount_decimal?: string | null;
+    tiers?: PriceTier[] | null;
+    custom_unit_amount?: CustomUnitAmount | null;
+  }> | null;
+}
+
+/** The price book's own copy, written once on the server so every screen agrees. */
+export interface PriceDisplay {
+  amount: string | null;
+  amount_detail: string | null;
+  headline: string | null;
+  cadence: string;
+  unit: string | null;
+  interval: string | null;
+  summary: string;
+  tiers: string[] | null;
+  from: string | null;
+  from_amount: number | null;
+  cheapest_unit: string | null;
+}
+
+/** `GET /v1/prices/:id` — the price plus what has already billed against it. */
+export interface PriceDetail extends Price {
+  usage: {
+    count: number;
+    by_type: { type: string; count: number }[];
+    summary: string;
+    references: { type: string; id: string }[];
+    in_use: boolean;
+  };
+  /** False once anything has billed: amounts and cadence are frozen from then on. */
+  editable: boolean;
+  boundaries: number[];
+}
+
+/** A feature a plan includes, and the key entitlements are granted against. */
+export interface ProductFeature {
+  name: string;
+  lookup_key: string;
+  description: string | null;
+}
+
+/**
+ * A thing this workspace sells. Prices hang off it: the plan is the product,
+ * the monthly and annual fees for it are two prices, and the seats and add-ons
+ * billed alongside it are more.
+ */
+export interface Product {
+  object: 'product';
+  id: string;
+  name: string;
+  description: string | null;
+  statement_descriptor: string | null;
+  unit_label: string | null;
+  active: boolean;
+  images: string[];
+  features: ProductFeature[];
+  metadata: Record<string, string>;
+  tax_code: string | null;
+  default_price: string | null;
+  category: string;
+  tagline: string | null;
+  url: string | null;
+  position: number;
+  created: number;
+  updated: number;
+  /** Only when the read asked for `expand=prices`. */
+  prices?: Price[];
 }
 
 /**
@@ -900,4 +1009,31 @@ export interface InvoicePayments {
   disputes: Dispute[];
   dunning: InvoiceDunning | null;
   summary: string;
+}
+
+/** `GET /v1/catalog/currencies` — a currency this price book already quotes in. */
+export interface CatalogCurrency {
+  object: 'catalog_currency';
+  code: string;
+  name: string;
+  symbol: string;
+  /** How many prices carry an amount in it. */
+  prices: number;
+  default: boolean;
+}
+
+/** `POST /v1/prices/:id/preview` — one quantity, priced with the arithmetic shown. */
+export interface PricePreview {
+  object: 'price_preview';
+  price: string;
+  currency: string;
+  quantity: number;
+  billable_quantity: number;
+  amount: number;
+  amount_display: string;
+  effective_unit_display: string;
+  marginal_unit_display: string;
+  product: { id: string; name: string; unit_label: string | null } | null;
+  warning: { code: string; param: string; message: string } | null;
+  breakdown: (BreakdownRow & { amount_display: string; unit_display: string | null })[];
 }

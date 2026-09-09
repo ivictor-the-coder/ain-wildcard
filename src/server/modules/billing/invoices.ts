@@ -56,9 +56,35 @@ import type {
   RecurringLine, Subscription,
 } from './types';
 
-/** The one call this file makes into another module, named so it is obvious. */
-interface CreditsOutbox {
+/** The calls this file makes into the credits module, named so they are obvious. */
+export interface CreditsOutbox {
   drainOutbox(orgId: string, customerId: string, invoiceId: string): BillableItem[];
+  /** The same lines, read without claiming them — what the upcoming-invoice preview sees. */
+  billableItems(orgId: string, filter: { customer?: string; status?: 'pending' | 'invoiced' | 'void'; limit?: number }): BillableItem[];
+  /**
+   * Where on the price's tier ladder a settled window sat. An allowance is
+   * handed out once over a billing period, so a period billed in two windows
+   * needs to know how much of it the first window already used up.
+   */
+  settlement(orgId: string, id: string): { billed_quantity: number; charged_quantity: number; tier_basis: { prior_quantity: number } } | null;
+}
+
+/**
+ * The one question an invoice asks the entitlement engine: how many units of
+ * this meter the customer's plan includes before anything is charged.
+ *
+ * Declared structurally rather than imported, because entitlements depends on
+ * billing and not the other way round — and because naming the four fields a
+ * bill actually uses is a better contract than a type with twenty.
+ */
+export interface AllowanceSource {
+  allowanceFor(orgId: string, customerId: string, meter: string): {
+    feature: string;
+    feature_name: string;
+    unit_label: string | null;
+    included: number;
+    granted_by: string;
+  } | null;
 }
 
 /** A line on its way onto an invoice, before it has an id. */
@@ -491,13 +517,14 @@ export class Invoices {
    */
   usageDrafts(orgId: string, items: BillableItem[], subscriptionId: string | null, fallback: Period): DraftLine[] {
     const locale = this.billing.locale(orgId);
-    return items.map((item) => {
+    const out: DraftLine[] = [];
+    for (const item of items) {
       const dated = item.period_start !== null && item.period_end !== null;
       const period = dated ? { start: item.period_start as number, end: item.period_end as number } : fallback;
       const kind: InvoiceLineKind = item.kind === 'charged' ? 'usage'
         : item.kind === 'credit_covered' ? 'credit_covered'
           : item.kind === 'topup' ? 'topup' : 'true_up';
-      return {
+      out.push({
         source: { type: 'billable_item' as InvoiceLineSource, id: item.id },
         subscription: subscriptionId,
         subscriptionItem: null,
@@ -514,8 +541,104 @@ export class Invoices {
         period,
         fraction: null,
         breakdown: [],
-      };
-    });
+      });
+      const included = this.includedAllowanceDraft(orgId, item, period, subscriptionId, locale);
+      if (included) out.push(included);
+    }
+    return out;
+  }
+
+  /**
+   * The allowance the plan sold, taken off the metered charge.
+   *
+   * "25,000,000 telemetry events included each month" is a promise the
+   * catalogue makes, the pricing page prints, the Features screen meters
+   * against and the entitlement engine enforces — and, until this line existed,
+   * the bill ignored completely. The metered price charged from event one on
+   * top of a plan fee that had already been paid for the first twenty-five
+   * million, which over-billed Northwind's largest account by $7,400.00 in a
+   * single period under a screen captioned "never out of step with the bill".
+   *
+   * The arithmetic, and why it is this and not something simpler:
+   *
+   *  - The allowance is a quantity, not a discount. Its worth is what the
+   *    price's own ladder charges for those units — `f(to) - f(from)` on the
+   *    graduated curve — so on Northwind's telemetry price 25,000,000 included
+   *    events are worth exactly $7,400.00 and never a flat percentage.
+   *  - It is handed out once per billing period, not once per settled window.
+   *    `prior_quantity` is where the period's tier ladder had already climbed
+   *    to, so a month billed in two pieces takes the two halves of one
+   *    allowance and the pieces add back up to the whole.
+   *  - It is applied to the ladder positions the *charged* units occupy, which
+   *    is what makes it self-clamping: usage entirely inside the allowance
+   *    zeroes the line, and the deduction can never make a charge negative.
+   *  - It is its own line rather than a smaller `usage` line, because the
+   *    settlement that priced the usage is a document too: line and settlement
+   *    still state the same charge, and the bill shows the customer the
+   *    subtraction instead of a number they cannot reconstruct.
+   *
+   * Only a `charged` line carries one. A `credit_covered` line already costs
+   * nothing, a `topup` is a purchase rather than usage, and a `true_up` — usage
+   * that arrived after its window was billed — is priced from a ladder position
+   * this cannot reconstruct once several of them have stacked, so it is left
+   * alone rather than guessed at. A late arrival inside an allowance the period
+   * had not spent is therefore still charged, which is the one case this line
+   * does not reach: the allowance belongs in the settlement itself, where the
+   * quantity is priced in the first place.
+   */
+  private includedAllowanceDraft(
+    orgId: string, item: BillableItem, period: Period, subscriptionId: string | null, locale: string,
+  ): DraftLine | null {
+    if (item.kind !== 'charged' || item.billed_amount <= 0 || !item.price || !item.meter) return null;
+    const allowance = this.allowances()?.allowanceFor(orgId, item.customer, item.meter);
+    if (!allowance || allowance.included <= 0) return null;
+    const price = this.ctx.svc.catalog.price(orgId, item.price);
+    if (!price) return null;
+
+    // Where this window sat on the period's ladder. Read from the settlement
+    // rather than guessed, because a window that started at 20,000,000 has
+    // already spent that much of the allowance.
+    const settlement = item.settlement ? this.credits()?.settlement(orgId, item.settlement) ?? null : null;
+    const prior = Math.max(0, settlement?.tier_basis.prior_quantity ?? 0);
+    const charged = Math.max(0, settlement?.charged_quantity ?? Math.round(item.quantity));
+    const from = Math.min(prior, allowance.included);
+    const to = Math.min(prior + charged, allowance.included);
+    const units = to - from;
+    if (units <= 0) return null;
+
+    const upTo = (quantity: number): number => (quantity <= 0 ? 0
+      : this.ctx.svc.catalog.compute(price, quantity, item.currency, { unitLabel: item.unit_label }).amount);
+    const listed = upTo(to) - upTo(from);
+    // Capped at what the line actually charges: prepaid credit may already have
+    // taken money off it, and an allowance cannot give back more than is there.
+    const worth = Math.min(listed, item.billed_amount);
+    if (worth <= 0) return null;
+
+    const noun = allowance.unit_label ?? item.unit_label ?? 'unit';
+    const count = (value: number) => `${value.toLocaleString('en-US')} ${noun}${value === 1 ? '' : 's'}`;
+    const show = (value: number) => formatMoney(money(value, item.currency), { locale });
+    return {
+      source: { type: 'subscription_item' as InvoiceLineSource, id: null },
+      subscription: subscriptionId,
+      subscriptionItem: null,
+      // The metered price, so the allowance is taxed exactly the way the charge
+      // it reduces is taxed and the two net to the tax on what is really owed.
+      price: item.price,
+      kind: 'included_allowance',
+      proration: false,
+      description: `${allowance.feature_name} — ${count(allowance.included)}`,
+      explanation: `${allowance.granted_by}: ${count(allowance.included)} each period before the metered price charges anything.${
+        prior > 0 ? ` ${count(prior)} of the allowance went on an earlier window of this period, so ${count(units)} of it lands here.` : ''
+      } On this price's own tiers those ${count(units)} are worth ${show(listed)}${
+        worth !== listed ? `, of which ${show(worth)} is all that is left to give back once prepaid credit had taken its share` : ''
+      }, which comes off the ${show(item.billed_amount)} charged for ${describeWindow(period, locale)}.`,
+      quantity: units,
+      amount: -worth,
+      currency: item.currency,
+      period,
+      fraction: null,
+      breakdown: [],
+    };
   }
 
   /* ----------------------------------- tax --------------------------------- */
@@ -668,15 +791,8 @@ export class Invoices {
 
     const lines = this.taxDrafts(orgId, customer, drafts);
     const taxStatus = this.taxStatusFor(orgId, customer);
-    const subtotal = lines.reduce((total, line) => total + line.amount, 0);
-    const tax = lines.reduce((total, line) => total + line.tax.amount, 0);
+    const { subtotal, tax, total, balanceApplied, ending } = billTotals(lines, customer.balance);
     const starting = customer.balance;
-    // One formula, and both invariants fall out of it: the invoice never goes
-    // below zero, and whatever the bill, its tax and the balance cannot settle
-    // between them stays on the account.
-    const total = Math.max(0, subtotal + tax + starting);
-    const balanceApplied = total - subtotal - tax;
-    const ending = starting - balanceApplied;
 
     const dueDate = input.collectionMethod === 'send_invoice'
       ? createdAt + (input.daysUntilDue ?? customer.invoice_settings.days_until_due ?? 30) * DAY
@@ -838,6 +954,17 @@ export class Invoices {
    * the draft was drawn: an address put on the account since is exactly what
    * unblocks a held bill, and re-asking is what makes "add the country, then
    * finalise" work without re-raising the invoice.
+   *
+   * The *rate* is asked again for the same reason, and that is a wider door
+   * than the one this used to open. Finalisation is where tax resolves —
+   * Stripe Tax works this way, and a draft is not a document yet — so a draft
+   * is priced against the jurisdiction the account is in **now**, not the one
+   * it was in when the draft was drawn. Only the missing-location case was
+   * re-priced before, which left the ordinary correction wrong in exactly the
+   * way nobody looks for: move an account from Texas to Ireland between
+   * raising the draft and finalising it and the bill went out charging 6.25%
+   * Texas sales tax on a document that prints a Dublin address, with a
+   * `tax_jurisdiction` naming a state the customer does not trade in.
    */
   finalize(orgId: string, id: string, meta: WriteMeta | undefined, at?: number): Invoice {
     const invoice = this.require(orgId, id);
@@ -860,10 +987,15 @@ export class Invoices {
     // A draft raised before the country was known was taxed at nothing, because
     // there was nothing to tax it at. Letting it through now would turn "we did
     // not know" into a bill that says 0% and means it — the same under-charge,
-    // one step further along and harder to see. So it is priced again.
-    if (taxStatus === 'complete' && invoice.automatic_tax.status === 'requires_location_inputs') {
-      this.retax(orgId, invoice, customer, now);
-    }
+    // one step further along and harder to see. And a draft raised against an
+    // address that has since been corrected is the same mistake wearing a
+    // number: the document prints the new address and charges the old
+    // jurisdiction. Both are the one question "what is this supply taxed at,
+    // here, now?", so both are answered here, every time.
+    //
+    // `retax` writes nothing when the answer has not moved, so the bill this
+    // call finalises a millisecond after `issue()` drew it is untouched.
+    if (taxStatus === 'complete') this.retax(orgId, invoice, customer, now);
     if (taxStatus !== invoice.automatic_tax.status) {
       this.ctx.db.patch('billing_invoices', 'id', id, { automatic_tax_status: taxStatus, updated: now });
     }
@@ -886,24 +1018,22 @@ export class Invoices {
   }
 
   /**
-   * Price a held draft again, against the jurisdiction the account now has.
+   * Price a draft again, against the jurisdiction the account is in now.
    *
    * Only ever a draft, and only one nobody has paid or credited: a draft is not
    * a document yet, so redrawing it is honest, while re-pricing anything that
    * money has moved against is not. Everything the invoice recorded moves with
    * it — the base, every jurisdiction's tax, the total and the account balance
    * it draws on — so the five identities still hold when it opens.
+   *
+   * Nothing is written when nothing moved. That is what lets `finalize()` ask
+   * this question of *every* draft rather than only of the ones held for want
+   * of an address: a bill whose rate has not changed since it was drawn is
+   * left exactly as it is, with no `invoice.updated` event announcing a change
+   * that did not happen, and the money-has-moved refusal below is reached only
+   * by a bill whose numbers really are about to change.
    */
   private retax(orgId: string, invoice: Invoice, customer: Customer, at: number): void {
-    if (invoice.amount_paid !== 0
-      || invoice.pre_payment_credit_notes_amount !== 0
-      || invoice.post_payment_credit_notes_amount !== 0) {
-      throw conflict(
-        'invoice_tax_stale',
-        `Invoice ${invoice.number} was drawn before ${customer.name} had a country on file, so its lines carry no tax — but money has already moved against it, so it cannot be priced again. Credit it and raise a new bill.`,
-        { invoice: invoice.id, customer: customer.id },
-      );
-    }
     const rates = new TaxRates(this.ctx, orgId);
     const resolved = rates.forCustomer(customer);
     const book = this.billing.book(orgId);
@@ -912,8 +1042,18 @@ export class Invoices {
 
     let subtotal = 0;
     let tax = 0;
-    for (const line of invoice.lines) {
-      const behavior: TaxBehavior = line.price ? book.find(line.price)?.tax_behavior ?? 'unspecified' : 'unspecified';
+    const repriced = invoice.lines.map((line) => {
+      // A line with a price behind it is taxed the way that price says, and a
+      // line with none — a hand-written invoice item — carries its own
+      // behaviour, which is the one it was drawn under. Reading the second as
+      // `unspecified` re-split an inclusive $1,062.50 item as though it were
+      // exclusive: the base went back up to the gross, tax was charged on top
+      // of tax the customer had already paid, and the "amount is what the
+      // customer pays, tax included" sentence on the line became false. It only
+      // bit a held draft before this ran on every finalisation.
+      const behavior: TaxBehavior = line.price
+        ? book.find(line.price)?.tax_behavior ?? 'unspecified'
+        : line.tax.behavior ?? 'unspecified';
       // The number `issue()` started from, rebuilt — not the number the held
       // line happens to carry.
       //
@@ -932,11 +1072,40 @@ export class Invoices {
       const split = rates.split(priced, behavior, line.currency, resolved);
       const taxes = snapshotTax(rates, split, where);
       const rolled = rollUpLineTax(taxes);
-      this.ctx.db.patch('billing_invoice_lines', 'id', line.id, {
-        amount: split.base, ...this.taxColumns(rolled, taxes),
-      });
       subtotal += split.base;
       tax += rolled.amount;
+      return { line, base: split.base, taxes, rolled };
+    });
+
+    // The rate the draft already carries is the rate it should go out at, so
+    // the draft goes out untouched. Compared line by line rather than on the
+    // totals: two jurisdictions can swap a bill's tax between them and leave
+    // the total identical, and an invoice that names the wrong authority is
+    // wrong however well it adds up.
+    const unchanged = repriced.every(({ line, base, rolled, taxes }) =>
+      base === line.amount
+      && rolled.amount === line.tax.amount
+      && rolled.rate === line.tax.rate
+      && rolled.jurisdiction === line.tax.jurisdiction
+      && rolled.percentage === line.tax.percentage
+      && taxes.length === line.taxes.length
+      && taxes.every((entry, i) => entry.rate === line.taxes[i].rate && entry.amount === line.taxes[i].amount));
+    if (unchanged) return;
+
+    if (invoice.amount_paid !== 0
+      || invoice.pre_payment_credit_notes_amount !== 0
+      || invoice.post_payment_credit_notes_amount !== 0) {
+      throw conflict(
+        'invoice_tax_stale',
+        `Invoice ${invoice.number} was drawn against a different tax position than ${customer.name} holds now, so finalising it would send a bill charging a jurisdiction the document does not name — but money has already moved against it, so it cannot be priced again. Credit it and raise a new bill.`,
+        { invoice: invoice.id, customer: customer.id },
+      );
+    }
+
+    for (const { line, base, taxes, rolled } of repriced) {
+      this.ctx.db.patch('billing_invoice_lines', 'id', line.id, {
+        amount: base, ...this.taxColumns(rolled, taxes),
+      });
     }
 
     // The credit this bill may draw is the credit the account holds *now*, not
@@ -958,7 +1127,7 @@ export class Invoices {
     if (moved !== 0) {
       this.billing.adjustBalance(orgId, customer.id, -moved, {
         type: 'applied_to_invoice',
-        description: `Invoice ${invoice.number} was priced again once ${customer.name} had a country on file, so what it draws from the account moved by ${formatMoney(money(Math.abs(moved), invoice.currency), { locale })}`,
+        description: `Invoice ${invoice.number} was priced again against ${customer.name}'s tax position at finalisation, so what it draws from the account moved by ${formatMoney(money(Math.abs(moved), invoice.currency), { locale })}`,
         subscription: invoice.subscription,
         invoice: invoice.id,
         createdAt: at,
@@ -1343,6 +1512,24 @@ export class Invoices {
     return registry.credits ?? null;
   }
 
+  /** The same, read-only, for the two places that price usage without claiming it. */
+  credits(): CreditsOutbox | null {
+    return this.creditsOutbox();
+  }
+
+  /**
+   * The entitlement engine, if this workspace runs one.
+   *
+   * Reached the way credits and payments are, and for the same reason: billing
+   * has to draw a bill in a deployment where the module is not installed. What
+   * is lost when it is absent is the allowance line, and a workspace with no
+   * entitlement engine has no allowance to lose.
+   */
+  private allowances(): AllowanceSource | null {
+    const registry = this.ctx.svc as { entitlements?: AllowanceSource };
+    return registry.entitlements ?? null;
+  }
+
   /**
    * `NR-000042`. The prefix is the workspace's initials so a human reading a
    * remittance advice knows whose invoice it is; the sequence is per workspace
@@ -1359,6 +1546,27 @@ export class Invoices {
 }
 
 /* --------------------------------- helpers -------------------------------- */
+
+/**
+ * What a taxed set of lines is worth as a bill, once the account balance has
+ * been drawn against it.
+ *
+ * One formula, and both invariants fall out of it: the invoice never goes below
+ * zero, and whatever the bill, its tax and the balance cannot settle between
+ * them stays on the account. It is a function, exported and called from both
+ * `issue()` and the upcoming-invoice preview, for the same reason proration and
+ * its preview are one function — a projection that recomputes the arithmetic
+ * agrees with the charge only until one of the two copies is edited.
+ */
+export function billTotals(
+  lines: TaxedLine[], startingBalance: number,
+): { subtotal: number; tax: number; total: number; balanceApplied: number; ending: number } {
+  const subtotal = lines.reduce((sum, line) => sum + line.amount, 0);
+  const tax = lines.reduce((sum, line) => sum + line.tax.amount, 0);
+  const total = Math.max(0, subtotal + tax + startingBalance);
+  const balanceApplied = total - subtotal - tax;
+  return { subtotal, tax, total, balanceApplied, ending: startingBalance - balanceApplied };
+}
 
 export function orgPrefix(name: string): string {
   const initials = name.split(/[^A-Za-z0-9]+/).filter(Boolean).map((word) => word[0].toUpperCase()).join('');

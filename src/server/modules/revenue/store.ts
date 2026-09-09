@@ -30,7 +30,7 @@ import {
 } from './grid';
 import { ratio } from './ratio';
 import {
-  buildMatrix, churnSeries, cohortMatrix, movementSeries,
+  buildMatrix, churnSeries, cohortKey, cohortMatrix, movementSeries,
   type MovementSeries, type RevenueMatrix,
 } from './movement';
 import { recognise, scheduleFor, type ArrearsItem, type RecognitionLine, type RecognitionReport } from './recognition';
@@ -620,6 +620,10 @@ export class Revenue {
           computed_closing: only(scope, row.reconciliation.computed_closing),
           reported_closing: only(scope, row.reconciliation.reported_closing),
           difference: only(scope, row.reconciliation.difference),
+          // Logos, not money: the same figure in every currency the book holds.
+          signups: row.reconciliation.signups,
+          new_accounts: row.reconciliation.new_accounts,
+          signup_difference: row.reconciliation.signup_difference,
           balanced,
           note: balanced
             ? null
@@ -647,9 +651,11 @@ export class Revenue {
           'A month opens at the last millisecond before it starts and closes at the last millisecond of the month, or at now if it has not finished. Closing March and opening April are the same instant, so the chain across months is an identity, not an approximation.',
           'Movement is classified per customer, not per subscription: an account that cancels a monthly plan and signs an annual one on the same day has expanded or contracted, it has not churned and re-joined.',
           'new is an account that had no MRR at the open and never had any before this month. reactivation is one that had none at the open but did once. churn is an account that had MRR at the open, none at the close, and no contract left: a cancellation, never a pause.',
+          'An account whose whole contract fits between the two reads — signed and cancelled inside the month — is zero at both of them and is still booked: new business at the largest it was worth while it ran, and churn at the same figure, so it appears in both bars and moves the month by nothing. counts.same_month_churned_accounts is how many, and the churn report adds them to the base logo churn is divided by rather than leaving them in a numerator with no denominator.',
           'expansion and contraction are the signed difference for accounts that had MRR at both ends; both are reported as positive magnitudes and applied with their sign in the reconciliation.',
           'A collection pause takes a subscription out of recognised MRR from the instant the subscription.paused event was written, and puts it back at subscription.resumed. The contract is intact, so the account is not churn: what left recognised MRR is booked as paused and what came back as resumed, each in the month it happened, and both are in the identity. An account that cancels while paused is churn for logo purposes and moves nothing, because its recognised MRR was already zero. A plan change landing in the same month as the pause is inside the paused figure, and shows as the difference between what was paused and what is later resumed.',
           'reconciliation.computed_closing is opening plus movements; reconciliation.reported_closing is the closing MRR summed straight from the subscription timelines. They are two different aggregations of the same reads, and unbalanced_months names any month where they differ.',
+          'reconciliation.signups is the second check, and it is about logos rather than money: how many accounts first carried recurring revenue inside the month, read from the first instant of revenue the way the cohort matrix reads it, against how many the movement booked as new business. A month where the two disagree is unbalanced, because the new-business bar and the signup cohort for that month are then two different answers to one question.',
           'The identity is proved once per currency and once across the book, so a mixed month is reconciled in each of its currencies rather than in a sum of them.',
         ],
         {
@@ -683,6 +689,9 @@ export class Revenue {
         computed_closing: only(scope, whole.reconciliation.computed_closing),
         reported_closing: only(scope, whole.reconciliation.reported_closing),
         difference: only(scope, whole.reconciliation.difference),
+        signups: whole.reconciliation.signups,
+        new_accounts: whole.reconciliation.new_accounts,
+        signup_difference: whole.reconciliation.signup_difference,
         balanced,
         note: whole.reconciliation.note
           ?? parts.find((part) => !part.series.reconciliation.balanced)?.series.reconciliation.note
@@ -708,12 +717,17 @@ export class Revenue {
     if (offset === 0) return matrix;
     const values = new Map<string, number[]>();
     const paused = new Map<string, number[]>();
+    const within = new Map<string, number[]>();
     for (const [customer, row] of matrix.values) values.set(customer, row.slice(offset));
     for (const [customer, row] of matrix.paused) paused.set(customer, row.slice(offset));
+    // One entry per interval rather than per instant, so it drops the same
+    // number of leading months the instants do.
+    for (const [customer, row] of matrix.within) within.set(customer, row.slice(offset));
     return {
       instants: matrix.instants.slice(offset),
       values,
       paused,
+      within,
       firstRevenue: matrix.firstRevenue,
       totals: matrix.totals.slice(offset),
       customers: matrix.customers,
@@ -762,6 +776,7 @@ export class Revenue {
       paused_mrr: only(scope, row.paused_mrr),
       resumed_mrr: only(scope, row.resumed_mrr),
       accounts_at_open: row.accounts_at_open,
+      accounts_exposed: row.accounts_exposed,
       churned_accounts: row.churned_accounts,
       paused_accounts: row.paused_accounts,
       logo_churn: row.logo_churn,
@@ -779,10 +794,10 @@ export class Revenue {
         book,
         'Logo and revenue churn, gross and net retention, by month and by signup cohort.',
         [
-          'Logo churn is accounts whose contract ended in the month over accounts that held one at its open, paused or not. An account with several subscriptions churns only when the last of them stops, and a collection pause is not churn: the contract is intact.',
+          'Logo churn is accounts whose contract ended in the month over accounts_exposed: those that held a contract at its open, paused or not, plus any that signed and cancelled between the two reads and so never reached an opening figure. An account with several subscriptions churns only when the last of them stops, and a collection pause is not churn: the contract is intact.',
           'Gross revenue churn is churned MRR plus contraction over opening MRR; paused MRR is in neither. Gross revenue retention is the opening base less churn, contraction and pauses — paused revenue is not lost, but it is not being collected either — so churn, retention and paused_share always add to 100%.',
           'Net revenue retention is what the accounts open at the start of the month close at, over what they opened at: the retained base plus expansion, reactivation and resumed collection. New business is never in it — that is the point of the measure.',
-          'Range rates use the sum of every month\'s opening as the denominator, so a month with a large book weighs more than a small one. The monthly rates are unweighted and shown beside them.',
+          'Range rates use the sum of every month\'s opening as the denominator — every month\'s exposed logo count for logo churn — so a month with a large book weighs more than a small one. The monthly rates are unweighted and shown beside them.',
           'A cohort is the month an account first carried recurring revenue, not the month its customer record was created — a record created during a sales cycle is not a cohort.',
           'Logo churn is a ratio of account counts and holds across currencies. Every revenue-weighted rate is a money figure in disguise and is reported per currency only.',
         ],
@@ -825,6 +840,12 @@ export class Revenue {
         computed_closing: only(scope, movement.reconciliation.computed_closing),
         reported_closing: only(scope, movement.reconciliation.reported_closing),
         difference: only(scope, movement.reconciliation.difference),
+        // The logo half of the same reconciliation: churn is read off these
+        // months, so a month whose signups and new logos disagree is a month
+        // whose retention rates are not safe to read either.
+        signups: movement.reconciliation.signups,
+        new_accounts: movement.reconciliation.new_accounts,
+        signup_difference: movement.reconciliation.signup_difference,
         balanced: unbalanced.length === 0
           && movement.reconciliation.balanced
           && parts.every((part) => part.movement.reconciliation.balanced),
@@ -848,8 +869,11 @@ export class Revenue {
     const parts = scope.currencies.map((currency) => ({
       currency, matrix: cohortMatrix(this.matrixOf(book, currency), book.cells, currency),
     }));
+    // Unassigned is read through the same rule the matrix keys with, so the
+    // two can never disagree about who is in a cohort: an account whose first
+    // revenue has not arrived yet is not a 0% cohort, it is unassigned.
     const unassigned = [...book.matrix.customers]
-      .filter((customer) => book.matrix.firstRevenue.get(customer) === undefined).length;
+      .filter((customer) => cohortKey(book.matrix.firstRevenue.get(customer) ?? null, book.cells) === null).length;
 
     const rows = parts
       .flatMap((part) => part.matrix.rows)
@@ -871,7 +895,7 @@ export class Revenue {
         book,
         'A retention matrix by signup month and currency: how many accounts, and how much MRR, each cohort still has n months later.',
         [
-          'A cohort is the month an account first carried recurring revenue, paired with the currency it bills in. Accounts that have never carried any are counted in totals.unassigned_accounts rather than dropped silently.',
+          'A cohort is the month an account first carried recurring revenue, paired with the currency it bills in. Accounts that have never carried any are counted in totals.unassigned_accounts rather than dropped silently, and an account whose first revenue instant has not arrived yet — a trial still running — has carried none: it is unassigned, not a cohort at 0%.',
           'Offset 0 is the signup month itself, read at the close of that month — so an account that signed and cancelled inside its first month shows as offset-0 attrition rather than as a full retained logo.',
           'logo_retention is retained accounts over the cohort size. net_revenue_retention is the cohort\'s MRR at that offset over its MRR at offset 0, so it goes above 100% when the cohort expands.',
           'Every cell names the month it was read at, and the grid runs to the current month only — a cohort is never padded with months that have not happened.',
@@ -1676,7 +1700,7 @@ export class Revenue {
       warnings: mixedWarning(scope, `${customer?.name ?? customerId}'s book`),
       as_of: book.now,
       first_revenue_at: first,
-      cohort: first === null ? null : book.cells.find((cell) => first >= cell.start && first < cell.end)?.key ?? null,
+      cohort: cohortKey(first, book.cells),
       mrr: only(scope, mrrNow),
       arr: only(scope, annualise(mrrNow)),
       by_currency: scope.currencies.map((currency) => ({

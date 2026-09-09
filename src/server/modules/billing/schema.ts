@@ -507,4 +507,17 @@ ALTER TABLE billing_credit_notes ADD COLUMN out_of_band_amount INTEGER NOT NULL 
 ALTER TABLE billing_credit_notes ADD COLUMN refund_id TEXT;
 `,
   },
+  {
+    id: 'billing.0009_credit_note_displaced_balance',
+    sql: `
+-- How much of a pre-payment note the bill could not absorb because that much
+-- had already been collected against it, and which therefore left the bill for
+-- the customer's balance. The note used to record its whole value as coming off
+-- amount_due on a bill that could only take part of it, while the payments
+-- module quietly carried the rest onto the account — a document that did not
+-- account for its own money. Notes written before this column displaced nothing
+-- or displaced it unrecorded, and zero is the honest default for both.
+ALTER TABLE billing_credit_notes ADD COLUMN displaced_to_balance INTEGER NOT NULL DEFAULT 0;
+`,
+  },
 ];

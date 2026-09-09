@@ -32,8 +32,8 @@ import { listHref, recordHref } from './links';
 import { slug } from './naming';
 import { describeMergeResult, duplicateReason, isEmptyValue as isEmpty, planMerge, primaryCompany, type MergeOutcome } from './merge';
 import {
-  ACTIVITY_LINK, canMarkPrimary, directActivityIds, groupAssociations, isActivityDef, loggedOnTargets, mergeCellCompact,
-  reachedThrough, showsAssociationLabel, timeInStage, viaFor,
+  ACTIVITY_LINK, canMarkPrimary, directActivityIds, groupAssociations, isActivityDef, linkableObjectTypes,
+  loggedOnTargets, mergeCellCompact, reachedThrough, showsAssociationLabel, timeInStage, viaFor,
 } from './record-model';
 
 /* --------------------------------- helpers -------------------------------- */
@@ -307,10 +307,23 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
   const secondaryProp = secondary ? properties.find((p) => p.name === secondary) : undefined;
   const primaryLabel = properties.find((p) => p.name === primary)?.label ?? 'Name';
   const associations = data.associations ?? [];
-  const byType = groupAssociations(associations, isActivity);
+  const activityTypes = new Set((schema.data?.object_types ?? []).filter((t) => t.category === 'activity').map((t) => t.name));
+  const byType = groupAssociations(associations, isActivity, (type) => activityTypes.has(type));
   const duplicates = similar.data?.data ?? [];
-  const linkTargets = (schema.data?.object_types ?? []).filter((t) => t.category === 'record');
+  // Only the types an association type actually connects to this one. Offering
+  // the rest reported a link the platform then filed under the wildcard label,
+  // where it showed on neither record and could not be taken back.
+  const linkTargets = linkableObjectTypes(
+    objectType,
+    isActivity,
+    (schema.data?.object_types ?? []).filter((t) => t.category === 'record'),
+    schema.data?.association_types ?? [],
+  );
   const newLinkTarget = linkTargets.find((t) => t.name === linkingNew) ?? null;
+  // The type the plus button opens on: another type where one exists, this one
+  // where it links to itself. Empty when the data model connects this object to
+  // nothing at all, and then there is nothing to open.
+  const firstLinkTarget = (linkTargets.find((t) => t.name !== objectType) ?? linkTargets[0])?.name ?? '';
   const typeLabel = (name: string): string =>
     (schema.data?.object_types.find((t) => t.name === name)?.label ?? humanize(name)).toLowerCase();
   const ownLabel = (objectDef?.label ?? humanize(objectType)).toLowerCase();
@@ -692,12 +705,18 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
               ? `The records this ${ownLabel} is attached to — it shows on each of their timelines`
               : 'Labelled both ways, with the primary link marked'}
             actions={
-              <IconButton
-                size="sm"
-                label={isActivity ? 'Attach to another record' : 'Link another record'}
-                icon={<Icons.plus size={14} />}
-                onClick={() => setLinking(linkTargets.find((t) => t.name !== objectType)?.name ?? 'company')}
-              />
+              <Tooltip
+                content={`No association type connects ${objectDef?.plural_label.toLowerCase() ?? 'this object'} to anything yet — define one in the data model`}
+                disabled={!!firstLinkTarget}
+              >
+                <IconButton
+                  size="sm"
+                  label={isActivity ? 'Attach to another record' : 'Link another record'}
+                  icon={<Icons.plus size={14} />}
+                  disabled={!firstLinkTarget}
+                  onClick={() => setLinking(firstLinkTarget)}
+                />
+              </Tooltip>
             }
           >
             {byType.size === 0 && (
@@ -709,11 +728,17 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
                 body={isActivity
                   ? `A ${ownLabel} that is not logged on a contact, company, deal or ticket shows on no timeline at all.`
                   : 'Associations are what make a company page show its contacts and its deals.'}
-                action={
-                  <Button size="sm" variant="secondary" onClick={() => setLinking(linkTargets.find((t) => t.name !== objectType)?.name ?? 'company')}>
-                    {isActivity ? 'Attach to a record' : 'Link a record'}
-                  </Button>
-                }
+                action={firstLinkTarget
+                  ? (
+                    <Button size="sm" variant="secondary" onClick={() => setLinking(firstLinkTarget)}>
+                      {isActivity ? 'Attach to a record' : 'Link a record'}
+                    </Button>
+                  )
+                  : (
+                    <Button size="sm" variant="secondary" onClick={() => navigate('/records')}>
+                      Define an association type
+                    </Button>
+                  )}
               />
             )}
             {[...byType.entries()].map(([type, edges]) => {
@@ -725,7 +750,12 @@ export function RecordPage({ objectType, id }: { objectType: string; id: string 
                     <span>{sectionLabel}</span>
                     <Badge tone="neutral" size="sm">{edges.length}</Badge>
                     <span className="u-spacer" />
-                    <IconButton size="sm" label={`Link a ${type}`} icon={<Icons.plus size={13} />} onClick={() => setLinking(type)} />
+                    {/* A section can exist for a type that is not linkable — a
+                        stranded wildcard link surfaced so it can be removed.
+                        Offering "+" there would only make another one. */}
+                    {linkTargets.some((t) => t.name === type) && (
+                      <IconButton size="sm" label={`Link a ${type}`} icon={<Icons.plus size={13} />} onClick={() => setLinking(type)} />
+                    )}
                   </div>
                   {edges.map((edge) => (
                     <div className="crm-assoc__row" key={edge.id}>

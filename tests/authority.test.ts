@@ -22,6 +22,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createApp, type App } from '../src/server/app';
+import { hashPassword } from '../src/server/modules/core/module';
 import type { Auth } from '../src/server/kernel/http';
 
 const ORG = 'org_demo';
@@ -94,16 +95,23 @@ describe('a key minted by a key still belongs to a person', () => {
     const dana = await signIn(app, 'dana@northwind.io');
     const reporting = await mint(app, dana, 'Reporting key', ['crm:read']);
 
+    // Minting is a `core` write, so the forged credential carries the scope
+    // that reaches the route — otherwise the domain gate answers first and
+    // this asserts nothing about the bound. The bound reads the key's
+    // *stored* scopes (`["crm:read"]`), which is the thing under test.
+    const asReporting = (scopes: string[]) =>
+      ({ kind: 'api_key', orgId: ORG, keyId: reporting.id, role: 'admin', scopes, livemode: false }) as const;
+
     const wider = await app.handle({
       method: 'POST', path: '/v1/api-keys', body: { name: 'Wider child', scopes: ['crm:write'] },
-      auth: { kind: 'api_key', orgId: ORG, keyId: reporting.id, role: 'admin', scopes: ['crm:read'], livemode: false },
+      auth: asReporting(['crm:read', 'core:write']),
     });
     assert.equal(wider.status, 403, `a ["crm:read"] key minted a ["crm:write"] child (${wider.status})`);
     assert.match(String(wider.body.error.message), /never issue more reach/);
 
     const same = await app.handle({
       method: 'POST', path: '/v1/api-keys', body: { name: 'Narrower child', scopes: ['crm:read'] },
-      auth: { kind: 'api_key', orgId: ORG, keyId: reporting.id, role: 'admin', scopes: ['crm:read'], livemode: false },
+      auth: asReporting(['crm:read', 'core:write']),
     });
     assert.equal(same.status, 201, 'the bound refused a child no wider than its parent');
     app.close();
@@ -423,11 +431,14 @@ describe('an invited teammate cannot sign in until they accept', () => {
     assert.equal(login.status, 403, `a merely invited seat signed in (${login.status})`);
     assert.match(String(login.body.error.message), /invitation to Northwind Robotics has not been accepted/);
 
-    // Accepting resets the password to the one he chooses now.
-    const accepted = await app.handle({ method: 'POST', path: '/v1/auth/accept', body: { token: back.body.invitation.token, password: 'welcome-back-2026' } });
-    assert.equal(accepted.status, 200);
-    assert.equal((await app.handle({ method: 'POST', path: '/v1/auth/login', body: { email: 'marcus@northwind.io', password: 'demo1234' } })).status, 401);
-    assert.equal((await app.handle({ method: 'POST', path: '/v1/auth/login', body: { email: 'marcus@northwind.io', password: 'welcome-back-2026' } })).status, 200);
+    // He accepts with the password his account already has — the workspace
+    // does not get to choose one for him, here or anywhere (section 9).
+    const chosenForHim = await app.handle({ method: 'POST', path: '/v1/auth/accept', body: { token: back.body.invitation.token, password: 'welcome-back-2026' } });
+    assert.equal(chosenForHim.status, 401, `the workspace set the password on an account that already had one (${chosenForHim.status})`);
+    const accepted = await app.handle({ method: 'POST', path: '/v1/auth/accept', body: { token: back.body.invitation.token, password: 'demo1234' } });
+    assert.equal(accepted.status, 200, `Marcus could not join with his own password: ${JSON.stringify(accepted.body)}`);
+    assert.equal((await app.handle({ method: 'POST', path: '/v1/auth/login', body: { email: 'marcus@northwind.io', password: 'welcome-back-2026' } })).status, 401);
+    assert.equal((await app.handle({ method: 'POST', path: '/v1/auth/login', body: { email: 'marcus@northwind.io', password: 'demo1234' } })).status, 200);
     app.close();
   });
 });
@@ -702,6 +713,370 @@ describe('every settings-class write reaches the audit trail', () => {
     assert.ok(expired, 'the override expiring under the time machine left no audit row');
     assert.equal(expired.actor_type, 'system', `an expiry run by a job was attributed to ${expired.actor_type} ${expired.actor_id}`);
     assert.equal(expired.actor_id, null);
+    app.close();
+  });
+});
+
+/* ============================================================================
+ * 9. one identity, many workspaces — and no workspace may act on the identity
+ *
+ * A person is a single global `users` row: one email, one `password_hash`,
+ * shared by every workspace they belong to. Joining one of those workspaces
+ * therefore has to be an act *on the membership*, never on the account — the
+ * moment a workspace can write the account, every other workspace that account
+ * belongs to has been handed to that workspace's admin.
+ *
+ * All three of these were live at once:
+ *   (a) `POST /v1/auth/accept` set `password_hash` unconditionally, so an
+ *       admin anywhere could invite a known address, redeem their own
+ *       invitation with a password of their choosing, and sign in to the
+ *       victim's other workspaces as the victim;
+ *   (b) the same flow answered with the account's name, title, avatar,
+ *       sign-up date and last-seen time, so it confirmed which addresses are
+ *       on the platform and read their profiles back to the inviter;
+ *   (c) `PATCH /v1/users/:id` wrote `users.name`, renaming the person in every
+ *       workspace they work in.
+ * ========================================================================= */
+
+const RIVAL = 'org_rival';
+const RIVAL_ADMIN = 'usr_rival_admin';
+
+/**
+ * A second workspace with an owner of its own, signed in. Nothing here is
+ * privileged: it is what anybody who signs up for Ain gets.
+ */
+async function rivalWorkspace(app: App): Promise<Record<string, string>> {
+  const at = app.ctx.now();
+  app.db.insert('orgs', { id: RIVAL, name: 'Vantage Automation', slug: 'vantage', created: at, updated: at });
+  app.db.insert('users', {
+    id: RIVAL_ADMIN, email: 'chen@vantage.test', name: 'Chen Ito', title: 'Founder', avatar_url: null,
+    password_hash: hashPassword('vantage-owner-42'), created: at, updated: at, last_seen: null,
+  });
+  app.db.insert('memberships', { id: 'mem_rival_admin', org_id: RIVAL, user_id: RIVAL_ADMIN, role: 'owner', status: 'active', teams: '[]', created: at });
+  const login = await app.handle({ method: 'POST', path: '/v1/auth/login', body: { email: 'chen@vantage.test', password: 'vantage-owner-42' } });
+  assert.equal(login.status, 200, `precondition: the second workspace's owner could not sign in: ${JSON.stringify(login.body)}`);
+  assert.equal(login.body.org_id, RIVAL);
+  return { cookie: String(login.headers['set-cookie']).split(';')[0] };
+}
+
+const credentialOf = (app: App, userId: string) => app.db.pluck<string>(`SELECT password_hash FROM users WHERE id = ?`, userId);
+
+describe('a workspace cannot set the credential of an account it invited', () => {
+  test('a rival admin cannot invite the owner of another workspace and choose her password', async () => {
+    const app = await boot();
+    const chen = await rivalWorkspace(app);
+    const before = credentialOf(app, DANA);
+    assert.ok(before, 'precondition: Dana has a password');
+
+    // Step one of the takeover: invite an address you know is on the platform.
+    const invited = await app.handle({
+      method: 'POST', path: '/v1/users', body: { email: 'dana@northwind.io', name: 'Contractor', role: 'member' }, headers: chen,
+    });
+    assert.equal(invited.status, 201, JSON.stringify(invited.body));
+    const token = invited.body.invitation.token as string;
+
+    // Step two, which used to answer 200 and hand back a session: redeem your
+    // own invitation with a password you choose. That password was hers.
+    const takeover = await app.handle({ method: 'POST', path: '/v1/auth/accept', body: { token, password: 'chosen-by-the-inviter' } });
+    assert.equal(takeover.status, 401, `a second workspace set the password on Northwind's owner (${takeover.status})`);
+    assert.equal(credentialOf(app, DANA), before, 'the shared credential was rewritten by a workspace that does not own it');
+
+    // Step three, the payload: signing in to *Northwind* as its owner.
+    const asDana = await app.handle({ method: 'POST', path: '/v1/auth/login', body: { email: 'dana@northwind.io', password: 'chosen-by-the-inviter' } });
+    assert.equal(asDana.status, 401, `the password a rival workspace chose signed in as Northwind's owner (${asDana.status})`);
+    const hers = await app.handle({ method: 'POST', path: '/v1/auth/login', body: { email: 'dana@northwind.io', password: 'demo1234' } });
+    assert.equal(hers.status, 200, 'her own password stopped working');
+    assert.equal(hers.body.org_id, ORG, 'sign-in left her home workspace');
+
+    // A refused attempt is not a used invitation: the person it was actually
+    // meant for can still accept it.
+    assert.equal(app.db.pluck(`SELECT accepted_at FROM invitations WHERE token_hash = ?`, sha256(token)), null);
+    assert.equal(app.db.pluck(`SELECT status FROM memberships WHERE org_id = ? AND user_id = ?`, RIVAL, DANA), 'invited');
+    app.close();
+  });
+
+  test('the person the invitation names joins with the credential they already have, and it is not touched', async () => {
+    const app = await boot();
+    const chen = await rivalWorkspace(app);
+    const before = credentialOf(app, DANA);
+
+    const invited = await app.handle({
+      method: 'POST', path: '/v1/users', body: { email: 'dana@northwind.io', name: 'Dana (contract)', role: 'analyst' }, headers: chen,
+    });
+    const token = invited.body.invitation.token as string;
+
+    const joined = await app.handle({ method: 'POST', path: '/v1/auth/accept', body: { token, password: 'demo1234' } });
+    assert.equal(joined.status, 200, `an invited person could not join with their own password: ${JSON.stringify(joined.body)}`);
+    assert.equal(credentialOf(app, DANA), before, 'joining a workspace re-hashed the account\'s credential');
+    assert.equal(joined.body.org_id, RIVAL);
+    assert.equal(app.db.pluck(`SELECT status FROM memberships WHERE org_id = ? AND user_id = ?`, RIVAL, DANA), 'active');
+
+    // The session she got is a session in *that* workspace, at the rung that
+    // workspace seated her at — not the authority she holds at Northwind.
+    const me = await app.handle({ method: 'GET', path: '/v1/me', headers: { cookie: String(joined.headers['set-cookie']).split(';')[0] } });
+    assert.equal(me.status, 200);
+    assert.equal(me.body.org.id, RIVAL);
+    assert.equal(me.body.role, 'analyst', `joining as an analyst answered ${me.body.role}`);
+    assert.equal(app.db.pluck(`SELECT role FROM memberships WHERE org_id = ? AND user_id = ?`, ORG, DANA), 'owner');
+    app.close();
+  });
+
+  test('an address with no account still enrols: the first password is set by accepting', async () => {
+    // The mirror image of the fix, and the thing it must not break — for a
+    // brand new address there is no credential to protect, so the invitation
+    // is how one comes into existence.
+    const app = await boot();
+    const dana = await signIn(app, 'dana@northwind.io');
+    const invited = await invite(app, dana, 'zoe@northwind.io', 'Zoe Brandt');
+    assert.equal(app.db.pluck(`SELECT password_hash FROM users WHERE id = ?`, invited.body.id), null);
+
+    const accepted = await app.handle({ method: 'POST', path: '/v1/auth/accept', body: { token: invited.body.invitation.token, password: 'orchid-9-lantern' } });
+    assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+    assert.ok(credentialOf(app, invited.body.id as string), 'enrolment left the account with no password');
+    assert.equal((await app.handle({ method: 'POST', path: '/v1/auth/login', body: { email: 'zoe@northwind.io', password: 'orchid-9-lantern' } })).status, 200);
+    app.close();
+  });
+});
+
+describe('an invitation does not tell the inviter whether the address is already on Ain', () => {
+  test('inviting a known address and an unknown one answer the same shape, and neither reads a profile back', async () => {
+    const app = await boot();
+    const chen = await rivalWorkspace(app);
+    const profile = app.db.get<Record<string, unknown>>(
+      `SELECT name, title, avatar_url, created, last_seen FROM users WHERE id = ?`, DANA)!;
+    assert.ok(profile.name && profile.title && profile.avatar_url && profile.last_seen,
+      'precondition: the seeded owner has a profile there would be something to leak from');
+
+    // No `title` on purpose: a field the inviter left blank must come back
+    // blank, not filled in from the account behind the address.
+    const known = await app.handle({
+      method: 'POST', path: '/v1/users', body: { email: 'dana@northwind.io', name: 'Contractor', role: 'member' }, headers: chen,
+    });
+    const unknown = await app.handle({
+      method: 'POST', path: '/v1/users', body: { email: 'nobody@vantage.test', name: 'Contractor', role: 'member' }, headers: chen,
+    });
+    assert.equal(known.status, unknown.status, 'the status code answered the question');
+    assert.deepEqual(Object.keys(known.body).sort(), Object.keys(unknown.body).sort(), 'one answer carried fields the other did not');
+
+    for (const [field, value] of Object.entries(profile)) {
+      assert.ok(!JSON.stringify(known.body).includes(String(value)),
+        `inviting a known address read back the account's ${field} (${String(value)})`);
+    }
+    // What comes back is what the caller sent, for both.
+    for (const res of [known, unknown]) {
+      assert.equal(res.body.name, 'Contractor');
+      assert.equal(res.body.title, null, `a title nobody typed came back as "${res.body.title}"`);
+      assert.equal(res.body.avatar_url, null);
+      assert.equal(res.body.last_seen, null);
+    }
+    assert.equal(
+      known.body.created,
+      app.db.pluck(`SELECT created FROM memberships WHERE org_id = ? AND user_id = ?`, RIVAL, DANA),
+      'the date on the seat is the account\'s sign-up date, not the day this workspace invited it',
+    );
+
+    // The roster and the accept screen say the same thing the 201 did.
+    const roster = await app.handle({ method: 'GET', path: '/v1/users', headers: chen });
+    const seat = roster.body.data.find((u: { email: string }) => u.email === 'dana@northwind.io');
+    assert.equal(seat.name, 'Contractor', `the roster named the invited seat "${seat.name}"`);
+    assert.equal(seat.avatar_url, null);
+    assert.equal(seat.last_seen, null);
+
+    const preview = await app.handle({ method: 'GET', path: `/v1/auth/invitations/${known.body.invitation.token}` });
+    assert.equal(preview.status, 200, JSON.stringify(preview.body));
+    assert.equal(preview.body.name, 'Contractor', `the accept screen named her "${preview.body.name}"`);
+    assert.equal(preview.body.email, 'dana@northwind.io');
+    app.close();
+  });
+
+  test('accepting leaves the same trail whether the address enrolled or joined', async () => {
+    // A summary that said "set a password" for one and something else for the
+    // other would answer the question in the audit log instead.
+    const app = await boot();
+    const chen = await rivalWorkspace(app);
+    const summaries: string[] = [];
+
+    for (const [email, name, password] of [
+      ['dana@northwind.io', 'Contractor', 'demo1234'],
+      ['nobody@vantage.test', 'Contractor', 'orchid-9-lantern'],
+    ] as const) {
+      const invited = await app.handle({ method: 'POST', path: '/v1/users', body: { email, name, role: 'member' }, headers: chen });
+      const accepted = await app.handle({ method: 'POST', path: '/v1/auth/accept', body: { token: invited.body.invitation.token, password } });
+      assert.equal(accepted.status, 200, `${email} could not accept: ${JSON.stringify(accepted.body)}`);
+      summaries.push(app.db.pluck<string>(
+        `SELECT summary FROM audit_log WHERE org_id = ? AND action = 'user.invitation_accepted' ORDER BY created DESC, rowid DESC LIMIT 1`, RIVAL)!);
+    }
+    assert.equal(summaries.length, 2);
+    assert.equal(summaries[0], summaries[1], `the trail distinguished the two: ${JSON.stringify(summaries)}`);
+    app.close();
+  });
+});
+
+describe('a workspace names its own seat, not the person', () => {
+  test('renaming a teammate who works elsewhere does not rename them there', async () => {
+    const app = await boot();
+    const chen = await rivalWorkspace(app);
+    const dana = await signIn(app, 'dana@northwind.io');
+    const atHome = (await app.handle({ method: 'GET', path: '/v1/users', headers: dana }))
+      .body.data.find((u: { id: string }) => u.id === DANA);
+
+    const invited = await app.handle({
+      method: 'POST', path: '/v1/users', body: { email: 'dana@northwind.io', name: 'Contractor', role: 'member' }, headers: chen,
+    });
+    assert.equal((await app.handle({ method: 'POST', path: '/v1/auth/accept', body: { token: invited.body.invitation.token, password: 'demo1234' } })).status, 200);
+
+    const renamed = await app.handle({ method: 'PATCH', path: `/v1/users/${DANA}`, body: { name: 'D. W.', title: 'Vendor' }, headers: chen });
+    assert.equal(renamed.status, 200, JSON.stringify(renamed.body));
+
+    // Northwind first: the thing that must not have happened.
+    const stillHome = (await app.handle({ method: 'GET', path: '/v1/users', headers: dana }))
+      .body.data.find((u: { id: string }) => u.id === DANA);
+    assert.equal(stillHome.name, atHome.name, `another workspace renamed Northwind's owner to "${stillHome.name}"`);
+    assert.equal(stillHome.title, atHome.title, `another workspace rewrote her title on her own team list ("${stillHome.title}")`);
+
+    // …and the rename did land where it was made.
+    assert.equal(renamed.body.name, 'D. W.', 'the workspace could not name its own seat');
+    app.close();
+  });
+
+  test('a workspace that is the only one an account belongs to still names it outright', async () => {
+    // The mirror image: the isolation must not turn every rename into a seat
+    // nickname the rest of the platform disagrees with.
+    const app = await boot();
+    const dana = await signIn(app, 'dana@northwind.io');
+    const renamed = await app.handle({ method: 'PATCH', path: `/v1/users/${PRIYA}`, body: { name: 'Priya Raman-Okafor' }, headers: dana });
+    assert.equal(renamed.status, 200, JSON.stringify(renamed.body));
+    assert.equal(renamed.body.name, 'Priya Raman-Okafor');
+    assert.equal(app.db.pluck(`SELECT name FROM users WHERE id = ?`, PRIYA), 'Priya Raman-Okafor',
+      'the profile the rest of the platform reads still carries the old name');
+    app.close();
+  });
+});
+
+/* ============================================================================
+ * 10. a restricted API key is restricted to what it names
+ *
+ * `route.meta.scopes` was the only reader of `auth.scopes` and no route
+ * declared it, so the domain half of every scope was decoration: a
+ * `["crm:read"]` key sold as a reporting credential read the invoice ledger
+ * and the audit trail, and `["metering:write"]` — the ingest scope every
+ * customer's telemetry agent holds — wrote CRM records, credit grants and
+ * refunds, because every mutating route is gated at `member` and that is the
+ * rung any write scope reaches.
+ * ========================================================================= */
+
+describe('the scopes on a key gate the routes they name', () => {
+  async function keyed(app: App, headers: Record<string, string>, scopes: string[]) {
+    const minted = await app.handle({ method: 'POST', path: '/v1/api-keys', body: { name: `Key ${scopes.join()}`, scopes }, headers });
+    assert.equal(minted.status, 201, `precondition: minting ${scopes.join()} answered ${minted.status}`);
+    return { authorization: `Bearer ${minted.body.secret}` };
+  }
+
+  test('a reporting key issued for CRM reads reaches CRM, and nothing else', async () => {
+    const app = await boot();
+    const dana = await signIn(app, 'dana@northwind.io');
+    const headers = await keyed(app, dana, ['crm:read']);
+
+    const crm = await app.handle({ method: 'GET', path: '/v1/records/company', headers });
+    assert.equal(crm.status, 200, 'the key was refused the surface it was issued for');
+
+    for (const [path, needs] of [['/v1/invoices', 'billing:read'], ['/v1/credit-grants', 'credits:read'], ['/v1/events', 'core:read']] as const) {
+      const res = await app.handle({ method: 'GET', path, headers });
+      assert.equal(res.status, 403, `a ["crm:read"] key read ${path} (${res.status})`);
+      assert.match(String(res.body.error.message), new RegExp(needs), `the refusal does not say what is missing: ${res.body.error.message}`);
+    }
+    // The audit trail is gated at `admin` as well, so the ladder answers first
+    // — the two guards agree on the answer and only disagree on the reason.
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/audit-log', headers })).status, 403);
+
+    // A search is a read that happens to be a POST, and a reporting key that
+    // cannot search is not a reporting key.
+    const search = await app.handle({
+      method: 'POST', path: '/v1/records/company/search', body: { query: 'a' }, headers,
+    });
+    assert.equal(search.status, 200, `a ["crm:read"] key could not search records: ${JSON.stringify(search.body).slice(0, 200)}`);
+    const preview = await app.handle({ method: 'POST', path: '/v1/invoices/create_preview', body: {}, headers });
+    assert.equal(preview.status, 403, 'a CRM key previewed an invoice');
+    assert.match(String(preview.body.error.message), /billing:read/);
+
+    // The one thing every credential may always ask: what am I?
+    const me = await app.handle({ method: 'GET', path: '/v1/me', headers });
+    assert.equal(me.status, 200, 'a restricted key could not discover it is restricted');
+    assert.equal(me.body.role, 'readonly');
+    app.close();
+  });
+
+  test('a write scope writes its own domain, reads it, and writes nowhere else', async () => {
+    const app = await boot();
+    const dana = await signIn(app, 'dana@northwind.io');
+    const headers = await keyed(app, dana, ['crm:write']);
+
+    const wrote = await app.handle({
+      method: 'POST', path: '/v1/records/company', body: { properties: { name: 'Halden Steelworks' } }, headers,
+    });
+    assert.equal(wrote.status, 201, `an integration key issued for CRM writes was refused: ${JSON.stringify(wrote.body)}`);
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/records/company', headers })).status, 200,
+      'a key that may write records could not read the record it just wrote');
+
+    // Every mutating route in the platform is gated at `member`, which this
+    // key reaches — the domain is the only thing standing in front of them.
+    const grant = await app.handle({
+      method: 'POST', path: '/v1/credit-grants',
+      body: { customer: 'cus_whatever', amount: 500_00, currency: 'usd', reason: 'goodwill' }, headers,
+    });
+    assert.equal(grant.status, 403, `a CRM key issued credit (${grant.status} ${JSON.stringify(grant.body).slice(0, 200)})`);
+    assert.match(String(grant.body.error.message), /credits:write/);
+    app.close();
+  });
+
+  test('the telemetry ingest scope reaches the meter and stops there', async () => {
+    const app = await boot();
+    const dana = await signIn(app, 'dana@northwind.io');
+    const headers = await keyed(app, dana, ['metering:write']);
+
+    const posted = await app.handle({
+      method: 'POST', path: '/v1/meter-events',
+      body: { event_name: 'telemetry_events', payload: { customer_id: 'cus_missing', value: 1 } }, headers,
+    });
+    assert.notEqual(posted.status, 403, 'the ingest path this product is priced on was closed to its own scope');
+    assert.notEqual(posted.status, 401);
+
+    const record = await app.handle({
+      method: 'POST', path: '/v1/records/company', body: { properties: { name: 'Ingest Overreach GmbH' } }, headers,
+    });
+    assert.equal(record.status, 403, `a telemetry key wrote a CRM record (${record.status})`);
+    assert.match(String(record.body.error.message), /crm:write/);
+    app.close();
+  });
+
+  test('the reach a key was minted with is the reach it keeps: `read`, `write` and `*` are workspace-wide', async () => {
+    // The mirror image of the narrowing: the presets the key dialog issues are
+    // domain-less on purpose, and a customer holding one must not wake up to
+    // 403s on the surface they bought.
+    const app = await boot();
+    const dana = await signIn(app, 'dana@northwind.io');
+
+    const readWrite = await keyed(app, dana, ['read', 'write']);
+    for (const path of ['/v1/records/company', '/v1/invoices', '/v1/credit-grants', '/v1/meters']) {
+      assert.equal((await app.handle({ method: 'GET', path, headers: readWrite })).status, 200, `the "Read and write" preset was refused ${path}`);
+    }
+    assert.equal((await app.handle({
+      method: 'POST', path: '/v1/records/company', body: { properties: { name: 'Preset Works' } }, headers: readWrite,
+    })).status, 201, 'the "Read and write" preset could not write');
+
+    const readOnly = await keyed(app, dana, ['read']);
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/invoices', headers: readOnly })).status, 200);
+    assert.equal((await app.handle({
+      method: 'POST', path: '/v1/records/company', body: { properties: { name: 'Read Only Works' } }, headers: readOnly,
+    })).status, 403, 'a read-only preset wrote a record');
+
+    const full = await keyed(app, dana, ['*']);
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/events', headers: full })).status, 200);
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/audit-log', headers: full })).status, 200);
+
+    // And a session is not an API key: its authority is its membership.
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/events', headers: dana })).status, 200);
+    assert.equal((await app.handle({ method: 'GET', path: '/v1/health' })).status, 200, 'a public route now needs a scope');
     app.close();
   });
 });

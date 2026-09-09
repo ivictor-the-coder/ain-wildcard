@@ -25,15 +25,18 @@ import {
   useUrlTableState, visibleRows,
   type CsvColumn, type Formatter,
 } from './common';
+import {
+  PACK_ANY_CHARGE, packGrantLine, packGrantPlan, packMeterHint, packRedemptionError, packSize, packTopUpBody,
+} from './credit-pack';
 import { unitPotValue, type UnitPotValue } from './credit-value';
 import {
-  CREDIT_WRITE_INVALIDATES, burnDownChart, burnDownFigures, checkPhrases, formatReasonDates, movementLabel,
-  shareText, splitReconciles,
+  CREDIT_WRITE_INVALIDATES, burnDownChart, burnDownFigures, checkPhrases, formatReasonDates, grantStatusWord,
+  movementLabel, shareText, splitReconciles,
 } from './credits-math';
 import type {
   CreditBalance, CreditGrant, CreditLedgerEntry, CreditLedgerResponse, CreditRefund, CreditSettlement,
   CreditBillableItem, CreditsOverview, CreditTopUp, Meter, MeterUsage, OpenInvoice, PriceLite,
-  PricePreview, RevenueMrr, RevenueUsage, SettlementClashDetail,
+  PricePreview, ProductLite, RevenueMrr, RevenueUsage, SettlementClashDetail,
 } from './types';
 
 const DAY_MS = 86_400_000;
@@ -66,8 +69,10 @@ function grantBreakdown(grants: CreditGrant[], total: number): string {
   const parts = GRANT_STATES
     .filter((state) => (counts.get(state) ?? 0) > 0)
     // The wire word, not the reader's: the tile counted "1 exhausted" over a
-    // table whose pill for that same grant reads "Given up". One vocabulary.
-    .map((state) => `${counts.get(state)} ${statusLabel(state).toLowerCase()}`);
+    // table whose pill for that same grant reads "Given up". One vocabulary —
+    // and `grantStatusWord` is the one the credits screen means, so a spent
+    // pack is counted as spent here and painted as spent in the table.
+    .map((state) => `${counts.get(state)} ${statusLabel(grantStatusWord(state)).toLowerCase()}`);
   if (!parts.length) return 'none issued yet';
   const counted = [...counts.values()].reduce((sum, n) => sum + n, 0);
   // The list read is capped; say so rather than print a breakdown of a subset
@@ -147,7 +152,14 @@ export function CreditsPage() {
       ),
       width: 260,
     },
-    { id: 'status', header: 'Status', accessor: (row) => row.status, filter: 'set', cell: (row) => <StatusPill status={row.status} />, width: 130 },
+    {
+      id: 'status', header: 'Status', filter: 'set', width: 130,
+      // Filtered, sorted, searched and painted on the same word, so "spent"
+      // in the filter list cannot select a pill that reads something else.
+      accessor: (row) => grantStatusWord(row.status),
+      cell: (row) => <StatusPill status={grantStatusWord(row.status)} />,
+      filterOptionLabel: statusLabel,
+    },
     { id: 'category', header: 'Category', accessor: (row) => row.category, filter: 'set', cell: (row) => <Badge tone={row.category === 'paid' ? 'brand' : 'neutral'} size="sm">{humanize(row.category)}</Badge>, width: 130 },
     { id: 'currency', header: 'Currency', accessor: (row) => row.currency.toUpperCase(), filter: 'set', width: 110, defaultHidden: true },
     {
@@ -629,7 +641,7 @@ function GrantLedgerDrawer({
       <Stack gap={6}>
         <Grid minColumnWidth={150} gap={5}>
           <Stat size="sm" label="Granted" value={grantAmount(f, grant, grant.amount)} caption={humanize(grant.category)} />
-          <Stat size="sm" label="Balance" value={grantAmount(f, grant, grant.balance)} caption={grant.status === 'active' ? 'spendable now' : humanize(grant.status)} />
+          <Stat size="sm" label="Balance" value={grantAmount(f, grant, grant.balance)} caption={grant.status === 'active' ? 'spendable now' : statusLabel(grantStatusWord(grant.status)).toLowerCase()} />
           <Stat size="sm" label="Effective" value={boundaryDate(f, grant.effective_at)} caption={grant.expires_at ? `expires ${boundaryDate(f, grant.expires_at)}` : 'never expires'} />
           <Stat size="sm" label="Priority" value={formatNumber(grant.priority)} caption={`rollover: ${humanize(grant.rollover)}`} />
         </Grid>
@@ -1380,29 +1392,66 @@ function ChargePreview({
   );
 }
 
+/**
+ * Sell a credit pack.
+ *
+ * The dialog states the charge *and* what the charge buys, because those are
+ * two different quantities: five packs of the telemetry pack cost $2,300 and
+ * grant 5,000,000 prepaid events. It used to send only the customer, the
+ * price and the quantity, which left the denomination to be inferred from a
+ * catalogue that does not link the pack product to a meter — so every pack
+ * this workspace sold became unrestricted money against any charge in the
+ * account's currency, and the pack it actually sells could not be sold at all.
+ */
 function TopUpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const f = useFormat();
   const toast = useToast();
   const names = useCustomerNames();
   const prices = useQuery<ListEnvelope<PriceLite>>('/v1/prices', { limit: 100 });
+  const products = useQuery<ListEnvelope<ProductLite>>('/v1/products', { limit: 100 });
+  const meters = useQuery<ListEnvelope<Meter>>('/v1/meters');
   const [customer, setCustomer] = useState('');
   const [price, setPrice] = useState('');
   const [quantity, setQuantity] = useState<number | null>(1);
   const [expires, setExpires] = useState<number | null>(null);
+  // Empty until the price is known: a pack sold in units has to be told which
+  // meter's units it holds, and the catalogue may not say.
+  const [redeemAgainst, setRedeemAgainst] = useState('');
 
   const options = (prices.data?.data ?? []);
   const chosen = options.find((p) => p.id === price);
+  const product = (products.data?.data ?? []).find((p) => p.id === chosen?.product) ?? null;
+  const meterRows = meters.data?.data ?? [];
   const account = names.customers.find((c) => c.id === customer);
   // A price may be sold in more than one currency; the account's own is the
   // one the charge will be raised in, so it is the one previewed.
   const currency = account && chosen?.currencies.includes(account.currency) ? account.currency : (chosen?.currency ?? null);
   const charge = useChargePreview(price, quantity, currency);
 
+  const unitsPerPack = packSize(chosen, product);
+  const hinted = packMeterHint(chosen, product);
+
+  // The catalogue's own answer, when it has one, is the default — resolved
+  // against the meter list because a price may name a meter by its event name
+  // rather than its id, and the request has to carry something metering can
+  // resolve. Everything else waits for the operator.
+  useEffect(() => {
+    if (!chosen) { setRedeemAgainst(''); return; }
+    const named = hinted
+      ? meterRows.find((m) => m.id === hinted || m.event_name === hinted)
+      : undefined;
+    setRedeemAgainst(named ? named.id : (unitsPerPack > 0 ? '' : PACK_ANY_CHARGE));
+  }, [price, hinted, unitsPerPack, meterRows.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const meter = meterRows.find((m) => m.id === redeemAgainst) ?? null;
+  const plan = packGrantPlan(redeemAgainst, unitsPerPack, quantity ?? 1);
+
   const run = useMutation<{ quoted: number }, CreditTopUp>(
     async () => api.post<CreditTopUp>('/v1/credit-topups', {
       customer,
       price,
       quantity: quantity ?? 1,
+      ...packTopUpBody(plan),
       ...(expires ? { expires_at: expires } : {}),
     }),
     {
@@ -1416,20 +1465,23 @@ function TopUpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
           : '';
         toast.success(
           `${charged} charged to ${names.name(customer)}`,
-          `${result.grant.name} — the credit is ${result.grant.status === 'active' ? 'spendable now' : 'held until the charge is invoiced'}.${surprise}`,
+          `${grantAmount(f, result.grant, result.grant.amount)} — ${result.grant.applies_to}. The credit is ${result.grant.status === 'active' ? 'spendable now' : 'held until the charge is invoiced'}.${surprise}`,
         );
         onClose();
       },
     },
   );
 
-  const params = ['customer', 'price', 'quantity', 'expires_at'];
+  const params = ['customer', 'price', 'quantity', 'expires_at', 'applicability', 'kind'];
   const general = generalError(run.error, params);
-  const unit = chosen?.unit_label ?? 'pack';
+  const unit = chosen?.unit_label ?? product?.unit_label ?? 'pack';
+  const packContents = units(f, unitsPerPack, meter?.unit_label ?? 'unit');
+  const redemptionError = errorFor(run.error, 'applicability')
+    ?? (price ? packRedemptionError(redeemAgainst, unitsPerPack, packContents) : undefined);
   // Nothing may be charged from a figure that is not on screen: the sale is
   // only armed while a quote for *this* quantity has landed.
   const quote = charge.preview;
-  const ready = !!customer && !!price && !!quantity && !!quote && !charge.error;
+  const ready = !!customer && !!price && !!quantity && !!redeemAgainst && !!quote && !charge.error;
   const sell = () => {
     if (!ready || !quote) return;
     void run.run({ quoted: quote.amount }).catch(() => undefined);
@@ -1480,6 +1532,26 @@ function TopUpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
             options={options.map((p) => ({ value: p.id, label: priceLabel(p) }))}
           />
         </Field>
+        <Field
+          label="Redeemable against"
+          required
+          hint={unitsPerPack > 0
+            ? `This price sells ${packContents} a ${unit}. Prepaid units are held in a meter's own denomination, so the pack has to name the meter it draws from.`
+            : 'Money credit pays for anything in its currency; pointed at one meter it pays for that meter alone.'}
+          error={redemptionError}
+        >
+          <Select
+            value={redeemAgainst}
+            onChange={setRedeemAgainst}
+            placeholder={price ? 'Pick what the pack pays for' : 'Pick a price first'}
+            options={[
+              ...meterRows.map((m) => ({ value: m.id, label: `${m.name} · ${m.unit_label ?? 'units'}` })),
+              // Last, not first: on a pack sold in units the meter is the
+              // answer, and money is the exception a goodwill pack needs.
+              { value: PACK_ANY_CHARGE, label: 'Any charge in this currency — money, not units' },
+            ]}
+          />
+        </Field>
         <div className="rv-form__pair">
           <Field
             label="Packs"
@@ -1507,6 +1579,21 @@ function TopUpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
           />
         ) : (
           <div className="rv-hint">Pick a price and a quantity and the exact charge is stated here before anything is raised.</div>
+        )}
+        {price && quantity && redeemAgainst && (
+          /* What the money buys, beside what it costs — the two are different
+             quantities, and only one of them used to be on screen. */
+          <div className="rv-hint">
+            {`The customer receives: ${packGrantLine(plan, {
+              quantity,
+              packLabel: unit,
+              meterName: meter?.name ?? null,
+              units: (count) => units(f, count, meter?.unit_label ?? 'unit'),
+              money: (minor) => moneyIn(f, minor, quote?.currency ?? currency ?? f.currency),
+              amount: quote?.amount ?? null,
+              plural: (count, noun) => f.plural(count, noun),
+            })}`}
+          </div>
         )}
       </form>
     </Modal>

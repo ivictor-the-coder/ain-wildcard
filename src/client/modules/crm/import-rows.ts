@@ -151,17 +151,55 @@ export function resolveUser(raw: string, users: WorkspaceUser[]): string | null 
   return hit?.id ?? null;
 }
 
+/**
+ * Properties the API refuses to create a record without.
+ *
+ * `POST /v1/records/:type/batch` fills a missing property from its default and
+ * throws `property_required` when there is none — so a contacts file with no
+ * name column is a certain refusal on every row it creates, and the Check step
+ * used to answer "3 ready" to exactly that.
+ */
+export const requiredForCreate = (properties: PropertyDef[]): PropertyDef[] =>
+  properties.filter((p) => (
+    p.required && !p.calculated && !p.rollup
+    && (p.default_value === null || p.default_value === undefined || p.default_value === '')
+  ));
+
+/** How the run will treat each row — which decides what the API will refuse. */
+export interface ImportPlan {
+  operation: 'create' | 'upsert';
+  /** The unique property rows are matched on, when the import is keyed on one. */
+  keyProperty?: string | null;
+}
+
 export interface BuiltImport {
   records: ImportRecord[];
   problems: ImportProblem[];
   /** Rows dropped before the request: every cell in them failed to map. */
   skipped: number;
+  /**
+   * Required properties nothing in the file fills. Any row that creates a
+   * record is refused for each of them, so they are named before the send.
+   */
+  missingRequired: PropertyDef[];
+  /**
+   * Rows still worth sending that only land if they match a record that is
+   * already there. A keyed upsert cannot know that from the file alone — the
+   * match is the server's to make — so the row goes, and the count says so
+   * instead of the Check step calling it ready.
+   */
+  conditional: number;
 }
 
 /**
  * File rows → API records. A row with a problem in any mapped cell is held
  * back and reported, so a batch never half-writes a record whose email was
  * unreadable but whose name was fine.
+ *
+ * `plan` is what makes the count honest. A row the run will certainly create —
+ * every row under "create every row", and under a keyed upsert any row with
+ * neither an id nor a key value — is checked against the object's required
+ * properties here rather than sent to be refused one at a time.
  */
 export function buildImportRows(
   rows: string[][],
@@ -169,11 +207,17 @@ export function buildImportRows(
   mapping: ImportTarget[],
   properties: PropertyDef[],
   ctx: ImportContext,
+  plan: ImportPlan = { operation: 'create' },
 ): BuiltImport {
   const index = new Map(properties.map((p) => [p.name, p]));
+  const required = requiredForCreate(properties);
+  const filled = new Set(mapping.filter((t): t is string => !!t && t !== 'id' && t !== 'owner_id'));
+  const missingRequired = required.filter((p) => !filled.has(p.name));
+  const idColumn = mapping.indexOf('id');
   const records: ImportRecord[] = [];
   const problems: ImportProblem[] = [];
   let skipped = 0;
+  let conditional = 0;
   rows.forEach((cells, i) => {
     const row = i + 1;
     const record: ImportRecord = { row, properties: {} };
@@ -198,9 +242,39 @@ export function buildImportRows(
       if (coerced.value !== undefined) record.properties[property.name] = coerced.value;
     });
     if (!any) { skipped++; return; }
+
+    // Ain assigns ids, so `create` refuses any row carrying one outright.
+    if (record.id !== undefined && plan.operation === 'create') {
+      problems.push({
+        row,
+        column: idColumn >= 0 ? headers[idColumn] : 'Record id',
+        message: 'Ain assigns record ids, so a row cannot bring one to a create. Skip this column, or switch to “Update the ones that already exist”.',
+      });
+      bad = true;
+    }
+
+    const matchable = record.id !== undefined
+      || (plan.operation === 'upsert' && !!plan.keyProperty && record.properties[plan.keyProperty] !== undefined);
+    const creating = plan.operation === 'create' || !matchable;
+    const absent = required.filter((p) => record.properties[p.name] === undefined);
+    if (absent.length && creating) {
+      for (const property of absent) {
+        problems.push({
+          row,
+          column: property.label,
+          message: filled.has(property.name)
+            ? `${property.label} is empty on this row, and a new record cannot be created without it.`
+            : `Nothing in this file fills ${property.label}, and a new record cannot be created without it.`,
+        });
+      }
+      bad = true;
+    } else if (absent.length) {
+      conditional++;
+    }
+
     if (!bad) records.push(record);
   });
-  return { records, problems, skipped };
+  return { records, problems, skipped, missingRequired, conditional };
 }
 
 /** `records[3].properties.email` → the property's label, for the result table. */

@@ -97,6 +97,20 @@ export interface InvoiceSource {
    * answered with the first pair of figures.
    */
   dueDateColumn: string | null;
+  /**
+   * What is *still* owed on the bill, which is not its face value: a credit
+   * note or an absorbed account credit reduces this and leaves `total` alone.
+   * Ageing a receivable at face value invents money nobody owes, which is why
+   * the collections report has never used `total` and neither may we.
+   */
+  dueAmountColumn: string | null;
+  /** The bill becomes a receivable when it is finalised, never before. */
+  finalizedDateColumn: string | null;
+  /** The two other ways a bill stops being a receivable, beside being paid. */
+  voidedDateColumn: string | null;
+  uncollectibleDateColumn: string | null;
+  /** Last resort for ageing a bill that carries neither due date nor issue date. */
+  createdDateColumn: string | null;
   statusColumn: string | null;
   customerColumn: string | null;
   currencyColumn: string | null;
@@ -164,6 +178,11 @@ export function billingSources(db: Db): BillingSources {
           // between outstanding and overdue: an open invoice inside its terms
           // is money owed, not money late.
           dueDateColumn: firstColumn(db, invoiceTable, ['due_date', 'due_at', 'payment_due_at']),
+          dueAmountColumn: firstColumn(db, invoiceTable, ['amount_due', 'amount_remaining', 'balance_due', 'outstanding_amount']),
+          finalizedDateColumn: firstColumn(db, invoiceTable, ['finalized_at', 'issued_at']),
+          voidedDateColumn: firstColumn(db, invoiceTable, ['voided_at', 'void_at', 'canceled_at']),
+          uncollectibleDateColumn: firstColumn(db, invoiceTable, ['marked_uncollectible_at', 'written_off_at']),
+          createdDateColumn: firstColumn(db, invoiceTable, ['created', 'created_at']),
           statusColumn: firstColumn(db, invoiceTable, ['status', 'state']),
           customerColumn: firstColumn(db, invoiceTable, ['customer_id', 'account_id', 'company_id', 'customer']),
           currencyColumn: firstColumn(db, invoiceTable, ['currency']),

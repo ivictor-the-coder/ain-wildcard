@@ -50,7 +50,53 @@ export function schemaNamesNoFields(node: unknown): boolean {
   return !members || typeof members !== 'object' || !Object.keys(members).length;
 }
 
+/**
+ * A number is filled only when the run can account for it.
+ *
+ * Every numeric field that was not literally named "count" used to be handed
+ * the run's one figure, whatever the field was called. Asking for the open
+ * pipeline under a schema of `pipeline_value`, `average_deal_size`,
+ * `biggest_deal_amount` and `win_rate_percent` answered 901096000 to all four:
+ * a win rate of nine hundred million percent, an average deal the size of the
+ * whole book, and a biggest deal that is every deal. One of those four numbers
+ * was the answer and the schema gave the caller no way to tell which.
+ *
+ * A field is refused when its own name claims a figure this run did not
+ * compute — an average, an extreme, a per-something, a rate, a duration, a
+ * score — and the measure does not claim the same thing. "Average deal size"
+ * asked of the average-deal-size metric is that metric and is filled; asked of
+ * the pipeline total it is a different number and comes back null, named in
+ * the run's reasoning beside the fields that were filled.
+ *
+ * Money stays in minor units, as it is everywhere else in this platform and on
+ * every other field of this API: `amount_due` on an invoice and `amount` here
+ * are the same money in the same unit, and the run's reasoning names the unit
+ * and prints the formatted figure beside it so the raw number cannot be read
+ * as major units by mistake.
+ */
 const COUNT_FIELD = /(^|_)(count|number|total_records|rows|records|how_many|n)($|_)/i;
+
+/** An aggregation over the rows, rather than the aggregation the run performed. */
+const OTHER_AGGREGATION = ['average', 'avg', 'mean', 'median', 'typical', 'biggest', 'largest', 'smallest', 'highest', 'lowest', 'min', 'minimum', 'max', 'maximum', 'per', 'each', 'best', 'worst'];
+const RATE_WORDS = ['percent', 'pct', 'rate', 'ratio', 'share', 'bps', 'margin', 'conversion'];
+const DURATION_WORDS = ['days', 'day', 'weeks', 'months', 'years', 'hours', 'minutes', 'age', 'ageing', 'aging', 'duration'];
+const SCORE_WORDS = ['score', 'health', 'nps', 'csat'];
+
+const wordsOf = (text: string | null): Set<string> => new Set(text?.toLowerCase().match(/[a-z0-9]+/g) ?? []);
+
+/** True when the run's one figure is an honest answer to a field of this name. */
+function accountedFor(name: string, facts: Facts): boolean {
+  const field = wordsOf(name);
+  const measure = wordsOf(facts.label);
+  const claims = (words: string[], units: Facts['unit'][]): boolean =>
+    words.some((w) => field.has(w)) && !words.some((w) => measure.has(w)) && !units.includes(facts.unit);
+  if (claims(OTHER_AGGREGATION, [])) return false;
+  if (claims(RATE_WORDS, ['percent'])) return false;
+  if (claims(DURATION_WORDS, ['days', 'hours'])) return false;
+  if (claims(SCORE_WORDS, ['score'])) return false;
+  return true;
+}
+
 const PERIOD_FIELD = /(period|window|quarter|month|year|date_range|timeframe)/i;
 const CURRENCY_FIELD = /currency/i;
 const SUBJECT_ID_FIELD = /(company|account|customer|subject|record|contact|deal)_id$/i;
@@ -70,8 +116,8 @@ function fillField(name: string, node: SchemaNode, facts: Facts, refused: boolea
     case 'number':
     case 'integer': {
       if (COUNT_FIELD.test(name) && facts.count !== null) return facts.count;
-      if (facts.value !== null && !facts.mixed) return node.type === 'integer' ? Math.round(facts.value) : facts.value;
-      return null;
+      if (facts.value === null || facts.mixed || !accountedFor(name, facts)) return null;
+      return node.type === 'integer' ? Math.round(facts.value) : facts.value;
     }
     case 'string': {
       if (SUBJECT_ID_FIELD.test(name)) return facts.subjectId ?? null;

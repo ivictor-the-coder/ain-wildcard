@@ -14,8 +14,8 @@ import { DAY, formatDate } from '../../../shared/time';
 import { subjectOf } from '../../ai/text';
 import { recordStanding } from '../../ai/query';
 import {
-  accountProfile, businessMetric, delinquentCustomers, meteredUsage, recordAggregate, recordSearch, recordTimeline,
-  staleAccounts, subscriptionsOnProduct, workspaceSearch,
+  accountProfile, businessMetric, delinquentCustomers, meteredUsage, outstandingForDraft, outstandingInvoices,
+  recordAggregate, recordSearch, recordTimeline, staleAccounts, subscriptionsOnProduct, workspaceSearch,
 } from '../../ai/functions';
 import { metricById, metricIds } from '../../ai/metrics';
 import { composeDraft, DRAFT_KINDS, TONES, detectDraftKind, detectTone, type DraftKind, type Tone } from '../../ai/draft';
@@ -151,12 +151,27 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
     {
       name: 'delinquent_customers',
       description:
-        'The customers who owe money, from the customer ledger: what each one has outstanding, across how many open invoices, how far past due the oldest is, and whether a subscription of theirs is in payment recovery. '
+        'The customers who are late paying, from the receivables book: what each one owes past its due date, across how many bills, how old the oldest is, and whether a subscription of theirs is in payment recovery. '
         + 'This is the capability behind "which customers are past due", "who owes us money" and "who is in arrears" — a question about customers, which subscription status cannot answer.',
       readOnly: true,
       tags: ['ai', 'billing', 'collections'],
       input: v.object({ limit: v.optional(v.int({ min: 1, max: 50 })) }),
       run: (args: { limit?: number }, _c, meta) => delinquentCustomers(ctx, meta.orgId, args),
+    },
+    {
+      name: 'outstanding_invoices',
+      description:
+        'The receivables book: every finalised bill that has not been paid, voided or written off, with what is still due on it and how late it is. '
+        + 'Pass overdue=true for only the ones past their due date — a bill with no due date is due on receipt and counts as late from the day it was finalised, which is why the ledger\'s own due_before filter cannot answer this. '
+        + 'Written-off bills are never in it: uncollectible is a loss, not a receivable.',
+      readOnly: true,
+      tags: ['ai', 'billing', 'collections'],
+      input: v.object({
+        overdue: v.optional(v.boolean()),
+        record_id: v.optional(v.string({ max: 80, description: 'Company, contact or billing customer to scope to.' })),
+        limit: v.optional(v.int({ min: 1, max: 50 })),
+      }),
+      run: (args: { overdue?: boolean; record_id?: string; limit?: number }, _c, meta) => outstandingInvoices(ctx, meta.orgId, args),
     },
     {
       name: 'subscriptions_on_plan',
@@ -200,6 +215,7 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
       name: 'compose_message',
       description:
         'Write an email, call summary, meeting notes, dunning notice, renewal note or deal summary personalised from the account\'s real records, in a chosen tone. ' +
+        'A dunning notice is written around the account\'s own unpaid bills — their numbers, what is still due on each and how late it is — and refuses to be written at all when the ledger holds none. ' +
         'Returns a subject and body plus the list of facts it used; it never sends anything.',
       readOnly: true,
       tags: ['ai', 'content'],
@@ -216,14 +232,22 @@ export function aiTools(ctx: Ctx): AiToolDef[] {
         const account = profile && !('error' in profile) ? profile : null;
         const timeline = account ? recordTimeline(ctx, meta.orgId, { record_id: account.id, limit: 8 }).items : [];
         const sender = workspace.people.find((p) => p.id === meta.actorId) ?? workspace.people[0] ?? null;
+        const kind = args.kind ?? detectDraftKind(args.instruction);
+        // A chase is an assertion about specific bills, and the draft refuses to
+        // make one it has not read. Not passing them meant it read none — so
+        // every payment reminder this tool has ever produced told the debtor
+        // their account was clear, over the sender's own name, while the ledger
+        // held the invoice and the number of days it was late.
+        const outstanding = kind === 'dunning' ? outstandingForDraft(ctx, meta.orgId, account?.id ?? null) : undefined;
         return composeDraft({
           workspace,
-          kind: args.kind ?? detectDraftKind(args.instruction),
+          kind,
           tone: args.tone ?? detectTone(args.instruction),
           instruction: args.instruction,
           account,
           contactId: args.contact_id ?? null,
           timeline,
+          outstanding,
           sender: sender ? { name: sender.name, title: sender.title, email: sender.email } : null,
         });
       },

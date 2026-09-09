@@ -453,3 +453,264 @@ export function annualRecurring(
   }
   return Math.round(total);
 }
+
+/* ---------------------------- schedule phases ----------------------------- */
+
+/**
+ * One item of a schedule phase, priced in the currency that will bill it.
+ *
+ * `subscription_schedule.phases[].summary` is written on the server by
+ * `schedulePayload`, which prices every item with `book.compute(price,
+ * quantity, price.currency)` — the *price's* home currency, never the
+ * subscription's. Every price in the demo book is priced in dollars first and
+ * carries `currency_options` for the rest, so a EUR account with a change
+ * booked onto Scale reads "$1,900.00" for a phase that will bill €1,750.00:
+ * the wrong symbol, and — because a currency option is a separate amount, not
+ * a conversion — the wrong number beside it.
+ *
+ * The client cannot rewrite that field. What it can do is what the create
+ * dialog already does: price the phase through `POST /v1/catalog/estimate` in
+ * the subscription's own currency, which is the same `computeLineAmount` the
+ * renewal will run.
+ */
+export interface PhaseLine {
+  price: string;
+  quantity: number;
+  /** The name a human uses for the line — product, then nickname. */
+  label: string;
+  /** Priced in the subscription's currency; null while nothing has priced it. */
+  amountDisplay: string | null;
+  /** A metered line has no amount until the period closes, and says so. */
+  metered: boolean;
+}
+
+export interface PhaseItem {
+  price: string;
+  quantity: number;
+  custom_unit_amount: number | null;
+}
+
+/** What the price book knows about one price, as a phase line needs it. */
+export interface PhasePrice {
+  product_name: string;
+  nickname: string | null;
+  /** True when this price is its product's default, and so speaks for it. */
+  is_default: boolean;
+  metered: boolean;
+}
+
+/**
+ * The name a human uses for a line, the way `Pricebook.label` on the server
+ * picks it: the product's own name is right for the plan it sells, and wrong
+ * for the seats and add-ons that hang off the same product — which is exactly
+ * what a nickname is for. Keeping the same rule is what stops a phase summary
+ * naming a line differently from the invoice that bills it.
+ */
+export function priceLabel(price: PhasePrice): string {
+  if (price.is_default && price.product_name) return price.product_name;
+  return price.nickname || price.product_name;
+}
+
+/** What a phase's items are worth, as a sentence: the one the phase card prints. */
+export function phaseSummary(lines: PhaseLine[]): string {
+  return lines
+    .map((line) => {
+      const count = line.quantity > 1 ? `${line.quantity} × ` : '';
+      if (line.metered) return `${count}${line.label} (metered)`;
+      return line.amountDisplay ? `${count}${line.label} — ${line.amountDisplay}` : `${count}${line.label}`;
+    })
+    .join(', ');
+}
+
+/**
+ * Join a phase's items to the price book and to the engine's answer.
+ *
+ * The estimate returns one line per line sent, in order, so items are paired
+ * by position — a phase may legitimately carry the same price twice, and
+ * pairing by id would then read one of them twice. Anything the book has not
+ * answered for yet falls back to the estimate's own product name, and then to
+ * the price id, so a row is never blank while a read is in flight.
+ */
+export function phaseLines(
+  items: PhaseItem[],
+  priced: { price: string; quantity: number; amount_display: string; product: { name: string } | null; nickname: string | null }[] | null,
+  priceOf: (id: string) => PhasePrice | null,
+): PhaseLine[] {
+  return items.map((item, index) => {
+    const price = priceOf(item.price);
+    const line = priced?.[index] ?? null;
+    const fallback = line?.nickname || line?.product?.name || item.price;
+    return {
+      price: item.price,
+      quantity: item.quantity,
+      label: price ? priceLabel(price) : fallback,
+      amountDisplay: line ? line.amount_display : null,
+      metered: price?.metered ?? false,
+    };
+  });
+}
+
+/* ------------------------ the next invoice, as booked --------------------- */
+
+export interface PhaseWindow {
+  id: string;
+  state: 'complete' | 'current' | 'upcoming';
+  start_date: number;
+  end_date: number;
+  items: PhaseItem[];
+  description: string | null;
+}
+
+/**
+ * The phase that governs the period beginning `periodStart`, when it is not
+ * the one already running.
+ *
+ * A released, canceled or completed schedule governs nothing — the
+ * subscription has been handed back to whatever it holds today.
+ */
+export function phaseGoverning(
+  schedule: { status: string; phases: PhaseWindow[] } | null,
+  periodStart: number,
+): PhaseWindow | null {
+  if (!schedule || (schedule.status !== 'active' && schedule.status !== 'not_started')) return null;
+  const phase = schedule.phases.find((p) => p.start_date <= periodStart && p.end_date > periodStart) ?? null;
+  return phase && phase.state === 'upcoming' ? phase : null;
+}
+
+/** An item as `POST /v1/invoices/create_preview` takes it. */
+export interface PreviewItem {
+  id?: string;
+  price?: string;
+  quantity?: number;
+  custom_unit_amount?: number;
+  deleted?: boolean;
+}
+
+/**
+ * The phase, written as the change the engine will actually make.
+ *
+ * `items` on the preview is a patch, not a replacement: sending only the new
+ * plan's prices leaves the old ones standing and quotes both — a EUR account
+ * moving from Growth to Scale priced at €3,091.00, which is the two plans
+ * added together. So this mirrors `Billing.applyPhase` exactly: an item whose
+ * price the phase also carries keeps its identity, and only what the phase
+ * drops is removed.
+ */
+export function phasePreviewItems(
+  current: { id: string; price: string }[],
+  phase: Pick<PhaseWindow, 'items'>,
+): PreviewItem[] {
+  const carried = new Set(phase.items.map((item) => item.price));
+  return [
+    ...current.filter((item) => !carried.has(item.price)).map((item) => ({ id: item.id, deleted: true })),
+    ...phase.items.map((item) => ({
+      price: item.price,
+      quantity: item.quantity,
+      ...(item.custom_unit_amount !== null ? { custom_unit_amount: item.custom_unit_amount } : {}),
+    })),
+  ];
+}
+
+export interface ScheduledUpcoming {
+  /** The phase that takes over at the boundary this bill covers, if any. */
+  phase: PhaseWindow | null;
+  /** The item patch to price the bill with, or null when it must not be re-priced. */
+  items: PreviewItem[] | null;
+  /** Why the booked change could not be priced here, in the words to show. */
+  caveat: string | null;
+}
+
+/**
+ * How the upcoming-invoice preview must be asked for on a subscription that
+ * has a change already booked.
+ *
+ * `POST /v1/invoices/create_preview` prices the next period from the items the
+ * subscription holds *today*, and the customer summary's `next_invoice` does
+ * the same. Neither reads the schedule, so on the one period a phase replaces
+ * they quote the plan being left — directly under a banner that says the
+ * account moves. Re-pricing through the phase's own items is what makes the
+ * two agree.
+ *
+ * A phase that bills on a different cadence is the one case the client leaves
+ * alone: changing cadence re-anchors the cycle, so the preview would come back
+ * describing a period starting today rather than the one on screen. That is
+ * said in words instead of quoted wrongly.
+ */
+export function scheduledUpcoming(
+  sub: { current_period_end: number; interval: string; interval_count: number; items: { id: string; price: string }[] },
+  schedule: { status: string; phases: PhaseWindow[] } | null,
+  f: CopyFormat,
+  cadenceOf: (priceId: string) => { interval: string; interval_count: number } | null,
+): ScheduledUpcoming {
+  const phase = phaseGoverning(schedule, sub.current_period_end);
+  if (!phase) return { phase: null, items: null, caveat: null };
+
+  const cadences = phase.items.map((item) => cadenceOf(item.price));
+  const unknown = cadences.some((cadence) => cadence === null);
+  if (unknown) {
+    return {
+      phase,
+      items: null,
+      caveat: 'The prices this change moves on to could not be read, so the bill below is still priced on the plan running today.',
+    };
+  }
+  const moves = cadences.some((cadence) => cadence && (cadence.interval !== sub.interval || cadence.interval_count !== sub.interval_count));
+  if (moves) {
+    return {
+      phase,
+      items: null,
+      caveat:
+        `The change booked for ${f.day(phase.start_date)} also moves the billing cadence, which restarts the cycle — `
+        + 'so the period below is not the one it will bill. Open the schedule for what the new plan costs.',
+    };
+  }
+  return { phase, items: phasePreviewItems(sub.items, phase), caveat: null };
+}
+
+/* ------------------------------ credit notes ------------------------------ */
+
+/**
+ * Where a credit note's money went, said from the note and the bill together.
+ *
+ * The server writes this sentence too, and its last branch is false on a bill
+ * that was part collected. Routing is chosen as `invoice.status === 'paid' ?
+ * post_payment : pre_payment`, and `displaced_to_balance` only becomes
+ * non-zero once a note outruns what the bill is *still owed* — so a $500.00
+ * invoice with $166.66 collected, credited $83.33, takes the last branch and
+ * reads "nothing had been collected yet" beside an `amount_paid` of $166.66.
+ * The screen has the invoice in hand, so it says what the invoice says.
+ */
+export function creditNoteRouting(
+  note: {
+    total: number; currency: string;
+    pre_payment_amount: number; post_payment_amount: number; displaced_to_balance: number;
+    refund_amount: number; credit_amount: number; out_of_band_amount: number;
+  },
+  invoice: { number: string | null; amount_paid: number },
+  f: CopyFormat,
+): string {
+  const money = (amount: number) => f.money(amount, note.currency);
+  const bill = invoice.number ?? 'the invoice';
+
+  if (note.post_payment_amount > 0) {
+    const parts: string[] = [];
+    if (note.refund_amount > 0) parts.push(`${money(note.refund_amount)} went back to the customer’s card through the payments module`);
+    if (note.credit_amount > 0) parts.push(`${money(note.credit_amount)} was put onto the customer’s balance and comes off the next invoice`);
+    if (note.out_of_band_amount > 0) parts.push(`${money(note.out_of_band_amount)} was returned outside the platform and is only recorded here`);
+    return `${bill} had already been paid, so the credit was handed back: ${parts.join('; ')}.`;
+  }
+
+  if (note.displaced_to_balance > 0) {
+    const absorbed = note.pre_payment_amount - note.displaced_to_balance;
+    return `${money(absorbed)} came off what ${bill} asks for, which is all it was still owed; `
+      + `the remaining ${money(note.displaced_to_balance)} had already been collected, so it went onto the customer’s `
+      + 'balance and comes off the next invoice.';
+  }
+
+  if (invoice.amount_paid > 0) {
+    return `${money(note.pre_payment_amount)} came off what ${bill} asks for. `
+      + `The ${money(invoice.amount_paid)} already collected against it stays collected — this note reduces the balance still owed, not the money in.`;
+  }
+
+  return `${money(note.pre_payment_amount)} came off what ${bill} asks for; nothing had been collected yet.`;
+}

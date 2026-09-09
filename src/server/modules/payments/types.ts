@@ -430,12 +430,22 @@ export interface DunningAttempt {
  * off": the first is a fact about the card, the second is a decision the
  * workspace's policy makes after a set number of days, not a millisecond.
  *
+ * `not_card_collected`: the bill is on net terms. Nothing presents it
+ * automatically and nothing ever will, so there is no schedule to hold — but
+ * there is a bill somebody has to collect, and this is what puts it in front
+ * of them. A card offered against such a bill and refused used to be dropped
+ * here in silence: billing still moved the subscription to `past_due` off the
+ * same decline, and the recovery queue — the one screen that answers "who is
+ * behind and what do I do" — had no row for it, while the summary went on
+ * reporting the workspace recovering 100% of its failed payments. Held with no
+ * deadline, because no window is running: only the bill being settled ends it.
+ *
  * There was a second reason here, `reopened_by_refund`, for a bill a refund
  * had put back on the books. A refund no longer puts one back: the cash going
  * out is recorded on the invoice and the bill stays paid, so nothing is owed
  * again and there is nothing to hold.
  */
-export const DUNNING_HOLD_REASONS = ['card_needs_person'] as const;
+export const DUNNING_HOLD_REASONS = ['card_needs_person', 'not_card_collected'] as const;
 export type DunningHoldReason = (typeof DUNNING_HOLD_REASONS)[number];
 
 export interface DunningHold {

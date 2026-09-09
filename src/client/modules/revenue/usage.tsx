@@ -27,6 +27,10 @@ import {
   type CsvColumn,
 } from './common';
 import { NEVER_COPY, OVERVIEW_WINDOW_DAYS, QUIET_COPY, lastSeen, lastSeenAt, type LastSeen } from './meter-copy';
+import {
+  RESOLUTION_COPY, allowedResolutions, defaultResolution, resolutionBlockedBecause, trueUpDirection,
+  trueUpRefusalText, trueUpWorthText, type TrueUpResolution,
+} from './true-up';
 import type {
   CreditSettlement, Meter, MeterDetail, MeterEvent, MeterEventAdjustment, MeterEventResult, MeterLateArrival,
   MeterPeriodClosure, MeterPeriodClosureDetail, MeterUsage, MeteringOverview, PriceLite, RevenueUsage, SummaryBucket,
@@ -1129,21 +1133,68 @@ function LateArrivalsTable({ meter, limit, names }: { meter: string; limit: numb
   );
 }
 
+/**
+ * Settle one billed period's drift.
+ *
+ * The worth comes from the closure, not from the entry: an open late arrival
+ * has `amount: null` because pricing it is what settling it does, and reading
+ * that null as "not priced" told the operator the period had been billed
+ * without a price when it names one. `GET /v1/meter-period-closures/:id`
+ * re-prices the window on read and returns the signed money the invoice has
+ * to move by — the same figure the server's refusal is computed from — so the
+ * dialog states the worth, offers only the direction the drift allows, and
+ * says why in this workspace's money instead of forwarding a message about
+ * minor units and a wire enum.
+ */
 function ResolveLateArrivalModal({ entry, onClose }: { entry: MeterLateArrival; onClose: () => void }) {
   const f = useFormat();
   const toast = useToast();
-  const [resolution, setResolution] = useState('credited');
+  const closure = useQuery<MeterPeriodClosureDetail>(`/v1/meter-period-closures/${entry.closure}`);
+  const meter = useQuery<MeterDetail>(`/v1/meters/${entry.meter}`);
+  const basis = closure.data ?? null;
+  const direction = trueUpDirection(basis);
+  const allowed = allowedResolutions(direction);
+  const unit = meter.data?.unit_label ?? null;
+  const currency = basis?.currency ?? entry.currency ?? f.currency;
+  const money = (minor: number) => moneyIn(f, minor, currency);
+  const worth = money(Math.abs(basis?.outstanding_amount ?? 0));
+
+  const [resolution, setResolution] = useState<TrueUpResolution | null>(null);
   const [note, setNote] = useState('');
+  // The default is the drift's own direction, and it cannot be chosen until
+  // the window has been re-priced — opening on `credited` is how the dialog
+  // came to refuse the commonest case, usage that arrived late and is owed.
+  const chosen = resolution ?? defaultResolution(direction);
   const run = useMutation<void, MeterLateArrival>(
     async () => api.post<MeterLateArrival>(`/v1/meter-late-arrivals/${entry.id}/resolve`, {
-      resolution,
+      resolution: chosen,
       note: note || undefined,
     }),
     {
-      invalidates: ['/v1/meter-late-arrivals', '/v1/metering/overview', '/v1/credit-billable-items', '/v1/credit-settlements'],
-      onSuccess: (row) => { toast.success(`True-up ${humanize(row.resolution)}${row.amount !== null ? ` — ${moneyIn(f, row.amount, row.currency)}` : ''}`); onClose(); },
+      invalidates: [
+        '/v1/meter-late-arrivals', '/v1/meter-period-closures', '/v1/metering/overview',
+        '/v1/credit-billable-items', '/v1/credit-settlements',
+      ],
+      onSuccess: (row) => {
+        toast.success(
+          `${RESOLUTION_COPY[row.resolution as TrueUpResolution] ?? humanize(row.resolution)} — ${boundaryRange(f, row.period_start, row.period_end)}`,
+          row.amount === null || row.amount === 0
+            ? 'The drift is on the record; no money moved.'
+            : `${moneyIn(f, Math.abs(row.amount), row.currency)} ${row.amount > 0 ? 'billed for the difference' : 'credited back'}${row.credit_restored ? `, and ${units(f, row.credit_restored, unit)} returned to the grants that paid for it` : ''}.`,
+        );
+        onClose();
+      },
+      // The drift can move under an open dialog; re-read it so the refusal is
+      // explained from what the period says now, not from a stale figure.
+      onError: () => { void closure.refetch(); },
     },
   );
+  const refusal = run.error
+    ? trueUpRefusalText(
+      { code: run.error.body.code ?? '', param: run.error.param ?? null, message: run.error.body.message },
+      direction, worth,
+    )
+    : null;
 
   return (
     <Modal
@@ -1154,29 +1205,67 @@ function ResolveLateArrivalModal({ entry, onClose }: { entry: MeterLateArrival; 
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
-          <Button variant="primary" loading={run.loading} onClick={() => { void run.run().catch(() => undefined); }}>Settle</Button>
+          <Button
+            variant="primary"
+            loading={run.loading || closure.loading}
+            disabled={!basis && !closure.error}
+            onClick={() => { void run.run().catch(() => undefined); }}
+          >
+            {chosen === 'ignored' || direction === 'agrees' || direction === 'unpriced' || !basis
+              ? 'Settle'
+              : chosen === 'credited' ? `Credit ${worth}` : `Bill ${worth}`}
+          </Button>
         </>
       }
     >
       <Stack gap={5}>
-        {run.error && <Banner tone="danger" compact>{run.error.body.message}</Banner>}
+        {refusal && <Banner tone="danger" compact>{refusal}</Banner>}
+        {closure.error && (
+          <SectionError error={closure.error} path={`GET /v1/meter-period-closures/${entry.closure}`} onRetry={closure.refetch} />
+        )}
         <DescriptionList
           items={[
             { term: 'Period', value: boundaryRange(f, entry.period_start, entry.period_end) },
-            { term: 'Drift', value: formatNumber(entry.value) },
-            { term: 'Worth', value: entry.amount === null ? 'Not priced — the period was billed without naming a price' : moneyIn(f, entry.amount, entry.currency) },
+            {
+              term: 'This reading',
+              value: `${entry.value >= 0 ? '+' : '−'}${units(f, Math.abs(entry.value), unit)}, dated ${f.dateTime(entry.timestamp)}`,
+            },
+            {
+              term: 'The window still owes',
+              value: trueUpWorthText(direction, { money, units: (n) => units(f, n, unit), basis, loading: closure.loading }),
+            },
           ]}
         />
         <Field label="Resolution" required error={errorFor(run.error, 'resolution')}>
           <RadioGroup
             label="Resolution"
             name="late-resolution"
-            value={resolution}
-            onChange={setResolution}
+            value={chosen}
+            onChange={(value) => setResolution(value as TrueUpResolution)}
             options={[
-              { value: 'credited', label: 'Credit the difference', hint: 'The period was over-billed. Money goes back, and unit credit returns to the grants that paid for it.' },
-              { value: 'rebilled', label: 'Bill the difference', hint: 'The period was under-billed. A new invoice line is raised for exactly the drift.' },
-              { value: 'ignored', label: 'Leave it', hint: 'Record the drift and move on. The only resolution that writes a word rather than money.' },
+              {
+                value: 'credited',
+                label: RESOLUTION_COPY.credited,
+                disabled: !allowed.includes('credited'),
+                hint: resolutionBlockedBecause('credited', direction, worth)
+                  ?? (direction === 'over_billed'
+                    ? `${worth} goes back, and the units it paid for return to the grants they were drawn from.`
+                    : 'The period was over-billed. Money goes back, and unit credit returns to the grants that paid for it.'),
+              },
+              {
+                value: 'rebilled',
+                label: RESOLUTION_COPY.rebilled,
+                disabled: !allowed.includes('rebilled'),
+                hint: resolutionBlockedBecause('rebilled', direction, worth)
+                  ?? (direction === 'under_billed'
+                    ? `A new invoice line is raised for ${worth} — exactly the drift, priced on the rung this period had already reached.`
+                    : 'The period was under-billed. A new invoice line is raised for exactly the drift.'),
+              },
+              {
+                value: 'ignored',
+                label: RESOLUTION_COPY.ignored,
+                hint: 'Record the drift and move on. The only resolution that writes a word rather than money.',
+              },
             ]}
           />
         </Field>

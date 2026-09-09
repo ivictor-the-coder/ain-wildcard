@@ -11,7 +11,7 @@ import {
   type ActiveEntitlement, type AllowanceInterval, type ChangeKind, type CheckInput, type EntitlementChange,
   type EntitlementCheck, type EntitlementOverride, type EntitlementSet, type EntitlementSource,
   type EntitlementSourceType, type EntitlementSummary, type EntitlementSummaryRow,
-  type EntitlementUsage, type EntitlementVersion, type Feature,
+  type EntitlementUsage, type EntitlementVersion, type Feature, type MeteredAllowance,
   type FeatureInput, type FeaturePatch, type FeatureType, type LimitPressure, type OverrideInput,
   type ProductFeature, type ProductFeatureInput, type RecomputeResult, type UsageWindow,
   type VersionSnapshotRow,
@@ -860,6 +860,58 @@ export class Entitlements {
       description,
       expires_at: row.source_expires_at,
     };
+  }
+
+  /**
+   * What this account's plan includes of one meter, before anything is charged
+   * for it — the figure the catalogue sells, the Features screen shows, and,
+   * until this existed, the invoice ignored.
+   *
+   * Billing asks by meter rather than by feature key because a bill knows what
+   * it is metering and nothing about this module's vocabulary. A meter with no
+   * feature over it, a feature granting nothing, and an unlimited grant all
+   * come back null: the first two have no allowance, and the third is a
+   * ceiling removed rather than a quantity given away (see `MeteredAllowance`).
+   *
+   * The value returned is the one in force now, which is the only one this
+   * module stores — a window that closed last week is billed against today's
+   * grant. That is right for the case this exists for (a period settled the
+   * moment it closes) and is the reason a plan change is applied from the
+   * boundary rather than backdated.
+   */
+  allowanceFor(orgId: string, customerId: string, meter: string): MeteredAllowance | null {
+    // `metered` only. This module's own vocabulary draws the line: a `metered`
+    // feature is "a per-period allowance drawn down by real events", which is
+    // exactly what comes off a metered charge, while a `limit` is "a ceiling on
+    // a standing quantity" — 75 connected robots is how many may be plugged in
+    // at once, not 75 of anything given away.
+    const features = this.featureIndex(orgId).list
+      .filter((feature) => feature.active && feature.meter && feature.type === 'metered');
+    if (!features.length) return null;
+    const rows = this.ctx.db.all<ActiveRow>(
+      `SELECT * FROM entitlement_active WHERE org_id = ? AND customer_id = ? AND unlimited = 0`,
+      orgId, customerId,
+    );
+    if (!rows.length) return null;
+    const byKey = new Map(rows.map((row) => [row.feature_key, row]));
+    for (const feature of features) {
+      const row = byKey.get(feature.key);
+      if (!row || row.value === null || row.value <= 0) continue;
+      // Resolved rather than compared: a feature names its meter by id or by
+      // the event name it listens for, and billing only ever has the id.
+      const resolved = this.usage.meterFor(orgId, feature);
+      if (!resolved || resolved.id !== meter) continue;
+      return {
+        feature: feature.key,
+        feature_name: feature.name,
+        unit_label: feature.unit_label ?? resolved.unit_label,
+        meter: resolved.id,
+        included: row.value,
+        granted_by: this.sourceOf(orgId, row).description,
+        source: row.source_type,
+      };
+    }
+    return null;
   }
 
   private activeRow(orgId: string, customerId: string, featureKey: string): ActiveRow | undefined {

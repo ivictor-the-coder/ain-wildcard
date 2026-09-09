@@ -12,9 +12,11 @@ import { describe, it } from 'node:test';
 import { readFileSync } from 'node:fs';
 
 import {
-  balanceDrawn, collectionSettled, coversNoPeriod, describeAppliedChange, describeCreatedSubscription, describeDelete,
-  firstInvoiceSettled, humaniseNote, pluraliseBrackets,
+  balanceDrawn, collectionSettled, coversNoPeriod, creditNoteRouting, describeAppliedChange, describeCreatedSubscription,
+  describeDelete, firstInvoiceSettled, humaniseNote, phaseGoverning, phaseLines, phasePreviewItems, phaseSummary,
+  pluraliseBrackets, scheduledUpcoming, type PhaseWindow,
 } from '../src/client/modules/billing/copy';
+import { buildSources, hitsFrom } from '../src/client/kernel/search-core';
 import type { ChangePreview, Invoice, Subscription } from '../src/client/modules/billing/types';
 
 const f = {
@@ -394,5 +396,269 @@ describe('no screen promises a refund reopens the bill', () => {
     assert.match(description, /status all stand|is untouched/, 'it does not say the bill is untouched');
     assert.doesNotMatch(description, /leaves the bill owed again/,
       'the refund route still claims it reopens the bill');
+  });
+});
+
+/* ===================== a change already in the book ======================= */
+
+/**
+ * A subscription schedule is the one place on these screens where the *future*
+ * plan is quoted, and all three of the defects below are the same mistake in
+ * different clothes: a figure taken from a source that does not know about the
+ * schedule, or does not know what currency the account bills in.
+ */
+
+const PHASE_PRICES: Record<string, { product_name: string; nickname: string | null; is_default: boolean; metered: boolean }> = {
+  price_scale: { product_name: 'Telemetry Cloud Scale', nickname: 'Scale platform fee — monthly', is_default: true, metered: false },
+  price_scale_seat: { product_name: 'Telemetry Cloud Scale', nickname: 'Scale operator seat — monthly', is_default: false, metered: false },
+  price_events: { product_name: 'Telemetry events', nickname: 'Telemetry events — graduated', is_default: true, metered: true },
+};
+const priceOf = (id: string) => PHASE_PRICES[id] ?? null;
+
+const PHASE_ITEMS = [
+  { price: 'price_scale', quantity: 1, custom_unit_amount: null },
+  { price: 'price_scale_seat', quantity: 18, custom_unit_amount: null },
+  { price: 'price_events', quantity: 1, custom_unit_amount: null },
+];
+
+/** What `POST /v1/catalog/estimate` answers for those items in euros. */
+const EUR_ESTIMATE = [
+  { price: 'price_scale', quantity: 1, amount_display: '€1,750.00', product: { name: 'Telemetry Cloud Scale' }, nickname: 'Scale platform fee — monthly' },
+  { price: 'price_scale_seat', quantity: 18, amount_display: '€396.00', product: { name: 'Telemetry Cloud Scale' }, nickname: 'Scale operator seat — monthly' },
+  { price: 'price_events', quantity: 1, amount_display: '€0.00', product: { name: 'Telemetry events' }, nickname: 'Telemetry events — graduated' },
+];
+
+describe('a schedule phase is quoted in the currency that will bill it', () => {
+  it('prices every line from the engine’s answer in the subscription’s own currency', () => {
+    const summary = phaseSummary(phaseLines(PHASE_ITEMS, EUR_ESTIMATE, priceOf));
+    // Every amount on the line came out of the estimate, so the currency on
+    // screen is the currency the renewal charges.
+    for (const line of EUR_ESTIMATE) {
+      if (line.price === 'price_events') continue;
+      assert.ok(summary.includes(line.amount_display), `${line.amount_display} is missing from: ${summary}`);
+    }
+    assert.doesNotMatch(summary, /\$/, `a EUR phase quoted a dollar figure: ${summary}`);
+    assert.match(summary, /18 × /, 'the quantity is dropped from the line');
+  });
+
+  it('names a metered line rather than pricing it at nothing', () => {
+    const summary = phaseSummary(phaseLines(PHASE_ITEMS, EUR_ESTIMATE, priceOf));
+    assert.match(summary, /Telemetry events \(metered\)/);
+    // €0.00 is what the engine answers for one unit of a graduated meter, and
+    // printing it would say the account is billed nothing for its usage.
+    assert.doesNotMatch(summary, /Telemetry events — €0\.00/);
+  });
+
+  it('names a line the way the invoice will name it', () => {
+    const [base, seat] = phaseLines(PHASE_ITEMS, EUR_ESTIMATE, priceOf);
+    // The product speaks for its own default price; a seat that hangs off the
+    // same product speaks for itself, or two lines read identically.
+    assert.equal(base.label, 'Telemetry Cloud Scale');
+    assert.equal(seat.label, 'Scale operator seat — monthly');
+  });
+
+  it('says what it can while the estimate has not answered, and quotes nothing', () => {
+    const summary = phaseSummary(phaseLines(PHASE_ITEMS, null, priceOf));
+    assert.match(summary, /Telemetry Cloud Scale/);
+    assert.doesNotMatch(summary, /[$€£]/, 'a figure was printed before anything priced it');
+  });
+
+  it('is never read off the server’s own phase summary, which is priced in the price’s home currency', () => {
+    // `schedulePayload` in src/server/modules/billing/module.ts computes each
+    // phase item with `book.compute(price, quantity, price.currency)` — the
+    // price's home currency, not the subscription's. Printing that field is
+    // the defect; a screen that reads it is the defect on screen.
+    const source = readFileSync(new URL('../src/client/modules/billing/schedules.tsx', import.meta.url), 'utf8');
+    for (const line of source.split('\n')) {
+      if (!/\bphase\.summary\b|\bnext\.summary\b/.test(line)) continue;
+      assert.fail(`schedules.tsx still prints the server's phase summary: ${line.trim()}`);
+    }
+  });
+});
+
+describe('which phase governs the period a preview covers', () => {
+  const phase = (over: Partial<PhaseWindow> = {}): PhaseWindow => ({
+    id: 'phase_1', state: 'upcoming', start_date: NOW, end_date: NOW + 30 * DAY, items: PHASE_ITEMS, description: null, ...over,
+  });
+  const schedule = (phases: PhaseWindow[], status = 'active') => ({ status, phases });
+
+  it('is the phase that takes over at the boundary, not the one running now', () => {
+    const current = phase({ id: 'phase_0', state: 'current', start_date: NOW - 30 * DAY, end_date: NOW });
+    const next = phase();
+    assert.equal(phaseGoverning(schedule([current, next]), NOW)?.id, 'phase_1');
+    // The period now running is the current phase's own; nothing changes in it.
+    assert.equal(phaseGoverning(schedule([current, next]), NOW - DAY), null);
+  });
+
+  it('is nothing when the next phase starts after the period being previewed', () => {
+    const current = phase({ id: 'phase_0', state: 'current', start_date: NOW - 30 * DAY, end_date: NOW + 60 * DAY });
+    const later = phase({ start_date: NOW + 60 * DAY, end_date: NOW + 90 * DAY });
+    assert.equal(phaseGoverning(schedule([current, later]), NOW + 30 * DAY), null);
+  });
+
+  it('is nothing once the schedule has been released, canceled or completed', () => {
+    const current = phase({ id: 'phase_0', state: 'current', start_date: NOW - 30 * DAY, end_date: NOW });
+    for (const status of ['released', 'canceled', 'completed']) {
+      assert.equal(phaseGoverning(schedule([current, phase()], status), NOW), null, `a ${status} schedule still governed a bill`);
+    }
+    assert.equal(phaseGoverning(null, NOW), null);
+  });
+});
+
+describe('previewing the bill a booked change will actually raise', () => {
+  const items = [
+    { id: 'si_base', price: 'price_growth' },
+    { id: 'si_seat', price: 'price_growth_seat' },
+    { id: 'si_events', price: 'price_events' },
+  ];
+  const sub = { current_period_end: NOW, interval: 'month', interval_count: 1, items };
+  const upcoming: PhaseWindow = {
+    id: 'phase_1', state: 'upcoming', start_date: NOW, end_date: NOW + 30 * DAY, items: PHASE_ITEMS, description: 'Rollout on Scale.',
+  };
+  const current: PhaseWindow = {
+    id: 'phase_0', state: 'current', start_date: NOW - 30 * DAY, end_date: NOW, items: [], description: null,
+  };
+  const monthly = () => ({ interval: 'month', interval_count: 1 });
+
+  it('removes what the phase drops instead of adding the new plan beside the old', () => {
+    const patch = phasePreviewItems(items, upcoming);
+    // The preview's `items` is a patch, not a replacement: sending only the new
+    // prices leaves Growth standing and quotes both plans on one bill.
+    const deleted = patch.filter((row) => row.deleted).map((row) => row.id);
+    assert.deepEqual(deleted, ['si_base', 'si_seat']);
+    // The metered line survives the change, so it is neither deleted nor
+    // credited — it is the same item, still running.
+    assert.ok(!deleted.includes('si_events'));
+    assert.deepEqual(
+      patch.filter((row) => !row.deleted).map((row) => row.price),
+      ['price_scale', 'price_scale_seat', 'price_events'],
+    );
+  });
+
+  it('carries a negotiated amount through, and leaves it off every other line', () => {
+    const negotiated: PhaseWindow = {
+      ...upcoming,
+      items: [{ price: 'price_enterprise', quantity: 1, custom_unit_amount: 12_000_000 }, PHASE_ITEMS[2]],
+    };
+    const patch = phasePreviewItems(items, negotiated).filter((row) => !row.deleted);
+    assert.equal(patch[0].custom_unit_amount, 12_000_000);
+    assert.ok(!('custom_unit_amount' in patch[1]), 'a null negotiated amount was sent as a field');
+  });
+
+  it('prices the next bill on the phase when the cadence is unchanged', () => {
+    const plan = scheduledUpcoming(sub, { status: 'active', phases: [current, upcoming] }, f, monthly);
+    assert.equal(plan.phase?.id, 'phase_1');
+    assert.equal(plan.caveat, null);
+    assert.deepEqual(plan.items, phasePreviewItems(items, upcoming));
+  });
+
+  it('quotes nothing at all when there is no schedule', () => {
+    assert.deepEqual(scheduledUpcoming(sub, null, f, monthly), { phase: null, items: null, caveat: null });
+  });
+
+  it('refuses to re-price a phase that moves the cadence, and says why', () => {
+    // A cadence change re-anchors the cycle, so the preview would come back
+    // describing a period starting today rather than the one on screen.
+    const yearly = () => ({ interval: 'year', interval_count: 1 });
+    const plan = scheduledUpcoming(sub, { status: 'active', phases: [current, upcoming] }, f, yearly);
+    assert.equal(plan.items, null);
+    assert.match(plan.caveat ?? '', /cadence/);
+  });
+
+  it('refuses to re-price a phase whose prices it could not read', () => {
+    const plan = scheduledUpcoming(sub, { status: 'active', phases: [current, upcoming] }, f, () => null);
+    assert.equal(plan.items, null);
+    assert.match(plan.caveat ?? '', /could not be read/);
+  });
+});
+
+/* ======================= what a credit note collected ===================== */
+
+describe('a credit note never denies money the bill has taken', () => {
+  const note = (over: Partial<Parameters<typeof creditNoteRouting>[0]> = {}) => ({
+    total: 8333, currency: 'usd', pre_payment_amount: 8333, post_payment_amount: 0, displaced_to_balance: 0,
+    refund_amount: 0, credit_amount: 0, out_of_band_amount: 0, ...over,
+  });
+
+  it('says nothing was collected only when nothing was', () => {
+    const said = creditNoteRouting(note(), { number: 'NR-000350', amount_paid: 0 }, f);
+    assert.match(said, /nothing had been collected yet/);
+    assert.match(said, /USD 83\.33/);
+  });
+
+  it('does not claim nothing was collected on a bill that was part collected', () => {
+    // $500.00 raised, $166.66 taken, $83.33 credited: the note fits inside what
+    // is still owed, so `displaced_to_balance` is zero and the server's own
+    // sentence falls through to "nothing had been collected yet" — beside an
+    // `amount_paid` of $166.66 printed on the same screen.
+    const said = creditNoteRouting(note(), { number: 'NR-000350', amount_paid: 16_666 }, f);
+    assert.doesNotMatch(said, /nothing had been collected/);
+    assert.match(said, /USD 166\.66/);
+    assert.match(said, /stays collected/);
+  });
+
+  it('says where the money went when the bill was already paid in full', () => {
+    const said = creditNoteRouting(
+      note({ pre_payment_amount: 0, post_payment_amount: 8333, refund_amount: 5000, credit_amount: 3333 }),
+      { number: 'NR-000350', amount_paid: 50_000 },
+      f,
+    );
+    assert.match(said, /already been paid/);
+    assert.match(said, /USD 50\.00 went back to the customer’s card/);
+    assert.match(said, /USD 33\.33 was put onto the customer’s balance/);
+  });
+
+  it('splits a note that outruns what the bill still owed', () => {
+    const said = creditNoteRouting(
+      note({ total: 40_000, pre_payment_amount: 40_000, displaced_to_balance: 6_666 }),
+      { number: 'NR-000350', amount_paid: 16_666 },
+      f,
+    );
+    assert.match(said, /USD 333\.34 came off what NR-000350 asks for/);
+    assert.match(said, /remaining USD 66\.66 had already been collected/);
+  });
+
+  it('is what the screens print, rather than the server’s own sentence', () => {
+    const source = readFileSync(new URL('../src/client/modules/billing/invoices.tsx', import.meta.url), 'utf8');
+    for (const line of source.split('\n')) {
+      if (!/routing_detail/.test(line) || /^\s*(\/\/|\*|\{\/\*)/.test(line.trim())) continue;
+      assert.fail(`invoices.tsx still prints the server's routing sentence: ${line.trim()}`);
+    }
+  });
+});
+
+/* ============================= the price book ============================= */
+
+describe('the price book has a screen', () => {
+  // Read as text, the way the shell's own registration tests do: importing
+  // `routes.tsx` pulls the whole client in, stylesheet and all.
+  const routesSource = readFileSync(new URL('../src/client/modules/billing/routes.tsx', import.meta.url), 'utf8');
+  const block = (name: string): string =>
+    new RegExp(`export const ${name}[\\s\\S]*?\\n\\];`).exec(routesSource)?.[0] ?? '';
+  const registered = [...block('routes').matchAll(/path: '([^']+)'/g)].map((match) => match[1]);
+
+  it('registers the list and the record', () => {
+    assert.ok(registered.includes('/billing/invoices'), 'the route table was not read');
+    assert.ok(registered.includes('/catalog/products'), 'no price-book list is registered');
+    assert.ok(registered.includes('/catalog/products/:id'), 'no product record is registered');
+  });
+
+  it('gives the nav a way in', () => {
+    const destinations = [...block('nav').matchAll(/ to: '([^']+)'/g)].map((match) => match[1]);
+    assert.ok(destinations.includes('/catalog/products'), 'nothing in the nav reaches the price book');
+  });
+
+  it('turns the shell’s price-book search hits into links', () => {
+    // The shell has always offered a Price book source; with no screen for a
+    // product, `detailPattern` resolved to null and every hit was a dead row.
+    const [source] = buildSources({
+      objectTypes: [],
+      routes: new Set(['GET /v1/products']),
+      registered,
+    }).filter((candidate) => candidate.id === 'product');
+    assert.ok(source, 'the shell does not offer a price-book source');
+    assert.equal(source.detailPattern, '/catalog/products/:id');
+    const [hit] = hitsFrom(source, [{ id: 'prod_nw_scale', name: 'Telemetry Cloud Scale' }], 'scale');
+    assert.equal(hit.href, '/catalog/products/prod_nw_scale');
   });
 });

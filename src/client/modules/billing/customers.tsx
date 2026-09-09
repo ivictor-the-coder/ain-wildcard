@@ -25,14 +25,16 @@ import {
   MoneyRangeFilter, MoneyTotals, RecordLink, RecordMissing, SectionError, StatusPill, TableSearch, customerHref,
   decodeRange, encodeRange, idem, invoiceHref, matchesRange, moneyRank, prorationCopy, rangeActive, subscriptionHref,
   totalsByCurrency, useAction, useBillingFormat, useBookList, useCurrencyChoices, useDebounced, useDialogForm,
-  useOpenOnQuery, useRecord, useRecordTab, useTableView, visibleRows,
+  useOpenOnQuery, useRecord, useRecordTab, useTableView, useUpcomingInvoice, visibleRows,
 } from './common';
 import { ActionMenu, CreditDialog, Headline, SubscriptionCreateDialog } from './subscriptions';
 import { BillNowDialog, BulkBillDialog, CustomerInvoices } from './invoices';
 import { PaymentsTab, TaxRegistrationsCard } from './payments';
-import { annualRecurring, describeDelete, pluraliseBrackets } from './copy';
+import { annualRecurring, describeDelete, pluraliseBrackets, type PhaseWindow } from './copy';
 import type { BillingFormatter, CsvColumn } from './common';
-import type { BalanceTransaction, Customer, CustomerSummary, Invoice, RevenueAccount } from './types';
+import type {
+  BalanceTransaction, Customer, CustomerSummary, Invoice, RevenueAccount, Subscription,
+} from './types';
 
 /* ================================== list ================================== */
 
@@ -638,6 +640,44 @@ function CustomerCreateDialog({ open, onClose }: { open: boolean; onClose: () =>
 
 const CUSTOMER_TABS = ['overview', 'invoices', 'payments', 'ledger', 'details'] as const;
 
+export interface BookedNextInvoice {
+  /** The bill re-priced on the phase that takes over; null when none does. */
+  invoice: Invoice | null;
+  phase: PhaseWindow | null;
+  caveat: string | null;
+  /** True while the correction is still being priced, so nothing is quoted yet. */
+  pending: boolean;
+}
+
+const NO_CORRECTION: BookedNextInvoice = { invoice: null, phase: null, caveat: null, pending: false };
+
+/**
+ * The account's next bill, corrected for a change already booked against it.
+ *
+ * `summary.next_invoice` is built by `buildCustomerSummary` from
+ * `upcoming.items` — the items the subscription holds today — and never reads
+ * that subscription's schedule. So an account whose plan changes at its very
+ * next renewal is quoted the plan it is leaving, on the date it leaves it, in
+ * the same panel as the subscription page's banner that says otherwise.
+ *
+ * Nothing is fetched unless the summary's own row says that subscription is
+ * under a schedule, so the ordinary account pays for none of this.
+ */
+function useBookedNextInvoice(summary: CustomerSummary | null): BookedNextInvoice {
+  const next = summary?.next_invoice ?? null;
+  const row = next ? summary?.subscriptions.data.find((s) => s.id === next.subscription) ?? null : null;
+  const scheduled = !!row?.schedule;
+  const sub = useQuery<Subscription>(scheduled && row ? `/v1/subscriptions/${row.id}` : null);
+  const upcoming = useUpcomingInvoice(sub.data ?? null);
+  if (!scheduled) return NO_CORRECTION;
+  return {
+    invoice: upcoming.phase ? upcoming.data : null,
+    phase: upcoming.phase,
+    caveat: upcoming.caveat,
+    pending: sub.loading || upcoming.loading,
+  };
+}
+
 export function CustomerDetailPage() {
   const { id } = useParams();
   const f = useBillingFormat();
@@ -648,6 +688,7 @@ export function CustomerDetailPage() {
 
   const { data, error, loading, refetch } = useRecord<CustomerSummary>(`/v1/customers/${id}/summary`);
   useCurrentCrumb(data?.customer.name);
+  const booked = useBookedNextInvoice(data ?? null);
 
   if (loading) return <Page title="Customer"><Loading label="Loading this account…" /></Page>;
   if (error || !data) {
@@ -747,12 +788,20 @@ export function CustomerDetailPage() {
               value={data.balance.amount === 0 ? '—' : f.money(Math.abs(data.balance.amount), { currency: data.balance.currency })}
               caption={data.balance.description}
             />
+            {/* The summary's own figure prices the plan the account holds
+                today. On the one period a booked schedule phase replaces, that
+                is the plan being left — so the corrected bill is quoted here
+                instead, and nothing is quoted at all until it has answered. */}
             <Headline
               label="Next invoice"
               value={data.next_invoice ? f.day(data.next_invoice.date) : '—'}
-              caption={data.next_invoice
-                ? `${f.money(data.next_invoice.estimated_total, { currency: data.next_invoice.currency })} estimated`
-                : 'No subscription is due to renew'}
+              caption={!data.next_invoice
+                ? 'No subscription is due to renew'
+                : booked.pending
+                  ? 'Pricing the change booked for that date…'
+                  : booked.invoice
+                    ? `${f.money(booked.invoice.amount_due, { currency: booked.invoice.currency })} estimated on the plan booked for that date`
+                    : `${f.money(data.next_invoice.estimated_total, { currency: data.next_invoice.currency })} estimated`}
             />
           </div>
         </Card>
@@ -765,7 +814,7 @@ export function CustomerDetailPage() {
           </div>
         )}
 
-        {tab === 'overview' && <OverviewTab summary={data} onNewSubscription={() => setDialog('subscription')} />}
+        {tab === 'overview' && <OverviewTab summary={data} booked={booked} onNewSubscription={() => setDialog('subscription')} />}
         {tab === 'invoices' && <CustomerInvoices customerId={customer.id} />}
         {tab === 'payments' && <PaymentsTab customer={customer} />}
         {tab === 'ledger' && <LedgerTab summary={data} onGrant={() => setDialog('credit')} />}
@@ -876,7 +925,9 @@ function subscriptionCountShort(summary: CustomerSummary, f: BillingFormatter): 
     : `${f.number(billing)} live`;
 }
 
-function OverviewTab({ summary, onNewSubscription }: { summary: CustomerSummary; onNewSubscription: () => void }) {
+function OverviewTab({ summary, booked, onNewSubscription }: {
+  summary: CustomerSummary; booked: BookedNextInvoice; onNewSubscription: () => void;
+}) {
   const f = useBillingFormat();
   const next = summary.next_invoice;
   // Lifetime value is what this account has actually been billed, so a zero
@@ -975,8 +1026,17 @@ function OverviewTab({ summary, onNewSubscription }: { summary: CustomerSummary;
       </Stack>
 
       <Stack gap={6}>
-        {next && (
+        {next && booked.invoice && booked.phase && (
+          <BookedNextInvoiceCard invoice={booked.invoice} phase={booked.phase} date={next.date} />
+        )}
+        {next && !booked.invoice && (
           <Card title={`Next invoice · ${f.day(next.date)}`} description={next.note}>
+            {booked.pending && (
+              <Banner tone="info" compact>
+                A change is booked against this subscription; the bill below is being re-priced on it.
+              </Banner>
+            )}
+            {booked.caveat && <Banner tone="warning" compact title="A change is booked before this bill">{booked.caveat}</Banner>}
             <div className="bl-tablewrap">
               <table className="bl-lines">
                 <thead><tr><th>Line</th><th className="bl-num">Amount</th></tr></thead>
@@ -1010,6 +1070,50 @@ function OverviewTab({ summary, onNewSubscription }: { summary: CustomerSummary;
 
       </Stack>
     </div>
+  );
+}
+
+/**
+ * The next bill when a schedule phase takes over on the very date it falls.
+ *
+ * The summary's own `next_invoice` prices the plan being left, so this card
+ * reads the corrected preview instead — the same document the subscription's
+ * Upcoming invoice tab draws, so the two screens cannot disagree about what
+ * the account will be asked for.
+ */
+function BookedNextInvoiceCard({ invoice, phase, date }: { invoice: Invoice; phase: PhaseWindow; date: number }) {
+  const f = useBillingFormat();
+  return (
+    <Card
+      title={`Next invoice \u00b7 ${f.day(date)}`}
+      description={`Priced on the change booked for ${f.day(phase.start_date)}, which takes over for exactly this period.`}
+    >
+      {phase.description && <Banner tone="info" compact>{phase.description}</Banner>}
+      <div className="bl-tablewrap">
+        <table className="bl-lines">
+          <thead><tr><th>Line</th><th className="bl-num">Amount</th></tr></thead>
+          <tbody>
+            {invoice.lines.map((line) => (
+              <tr key={line.id}>
+                <td>
+                  <div>{line.description}</div>
+                  <div className="bl-lines__why">{f.dayRange(line.period.start, line.period.end)}</div>
+                </td>
+                <td className="bl-num">{f.money(line.amount, { currency: line.currency })}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="bl-totals" style={{ marginTop: 'var(--space-5)' }}>
+        <div className="bl-total"><span className="bl-total__label">Subtotal</span><span className="bl-total__value">{invoice.subtotal_display}</span></div>
+        <div className="bl-total"><span className="bl-total__label">Tax</span><span className="bl-total__value">{invoice.tax_display}</span></div>
+        {invoice.balance_applied !== 0 && (
+          <div className="bl-total"><span className="bl-total__label">Balance applied</span><span className="bl-total__value">{invoice.balance_applied_display}</span></div>
+        )}
+        <div className="bl-total bl-total--grand"><span className="bl-total__label">Estimated total</span><span className="bl-total__value">{invoice.amount_due_display}</span></div>
+      </div>
+    </Card>
   );
 }
 

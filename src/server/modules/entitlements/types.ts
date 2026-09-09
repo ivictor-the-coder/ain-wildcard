@@ -321,6 +321,40 @@ export interface CheckInput {
   requested?: number;
 }
 
+/* -------------------------- the allowance on a bill ------------------------ */
+
+/**
+ * What a customer's plan includes of one meter, in that meter's own units,
+ * over one allowance window.
+ *
+ * The one thing billing needs from this module, and deliberately the smallest
+ * thing that answers it: how many units come free before the metered price
+ * starts charging. Billing turns that quantity into money on the price's own
+ * ladder, because only the price knows what the first 25,000,000 events are
+ * worth — this module knows only that there are 25,000,000 of them.
+ *
+ * Two grants deliberately do not come back from here. An *unlimited* one is a
+ * ceiling removed — permission to use something without a cap, not a promise
+ * that its meter is free: `data_export` is granted `unlimited` by the very
+ * add-on that meters and bills it, and reading that as "included" would bill
+ * nobody for bulk export ever again. And a `limit` feature is a ceiling on a
+ * standing quantity, so "up to 400 connected robots" says how many may be
+ * plugged in at once and nothing at all about what a bill should give away.
+ */
+export interface MeteredAllowance {
+  feature: string;
+  feature_name: string;
+  unit_label: string | null;
+  /** The meter this allowance is measured against, as its own id. */
+  meter: string;
+  /** Units included per allowance window. Always finite and greater than zero. */
+  included: number;
+  /** One sentence naming what grants it — the plan, or the override that raised it. */
+  granted_by: string;
+  /** Where the value came from, so a bill can say "your plan" or "a support grant". */
+  source: EntitlementSourceType;
+}
+
 /* ------------------------------- versioning -------------------------------- */
 
 export const CHANGE_KINDS = ['granted', 'revoked', 'changed'] as const;

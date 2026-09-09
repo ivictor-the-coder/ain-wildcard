@@ -20,6 +20,8 @@ import {
   AlertTriangleIcon, ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon, ChevronUpIcon,
 } from '../../design';
 import { exponentOf, type Currency } from '../../../shared/money';
+import { scheduledUpcoming, type PhaseWindow, type ScheduledUpcoming } from './copy';
+import type { Invoice, Price, Subscription, SubscriptionSchedule } from './types';
 import './billing.css';
 
 /* --------------------------- dates that bill ----------------------------- */
@@ -1598,3 +1600,65 @@ export function RecordMissing({ error, path, backTo, backLabel, noun, onRetry }:
   }
   return <SectionError error={error} path={path} onRetry={onRetry} />;
 }
+
+/* ------------------------ the bill that comes next ------------------------ */
+
+export interface UpcomingInvoice extends PreviewResult<Invoice> {
+  /** The booked phase this bill was priced on, when one governs it. */
+  phase: PhaseWindow | null;
+  /** Why a booked change could not be priced into the figures, in words. */
+  caveat: string | null;
+}
+
+/**
+ * The next bill for a subscription, priced on the plan that will actually
+ * raise it.
+ *
+ * `POST /v1/invoices/create_preview` and the customer summary's `next_invoice`
+ * both build the period from the items the subscription holds *today*. Neither
+ * reads the subscription schedule, so on exactly the period a booked phase
+ * replaces they quote the plan being left — €945.00 under a banner that says
+ * the account moves to Scale on that very date, which bills €2,146.00. The
+ * preview does take an item patch, so the phase is handed to it: the same
+ * patch `Billing.applyPhase` will make when the phase fires, with proration
+ * off because a phase that lands on a period boundary has no part-period to
+ * settle. Everything else on the bill — the prorations already waiting, the
+ * settled usage, the balance drawn down, the tax — is still the server's.
+ *
+ * Nothing is asked until the schedule and the price book have answered, so the
+ * panel shows one figure rather than correcting itself a moment later.
+ */
+export function useUpcomingInvoice(sub: Subscription | null): UpcomingInvoice {
+  const f = useBillingFormat();
+  const scheduled = !!sub?.schedule;
+  const schedule = useQuery<SubscriptionSchedule>(sub?.schedule ? `/v1/subscription-schedules/${sub.schedule}` : null);
+  // A phase can name a price that is no longer sold, so the book is read whole
+  // rather than through the active filter the pickers use.
+  const book = useQuery<ListEnvelope<Price>>('/v1/prices', { limit: 200 }, { enabled: scheduled });
+
+  const cadenceOf = useCallback((id: string) => {
+    const price = (book.data?.data ?? []).find((row) => row.id === id);
+    return price?.recurring ? { interval: price.recurring.interval, interval_count: price.recurring.interval_count } : null;
+  }, [book.data]);
+
+  const settled = !scheduled || ((!!schedule.data || !!schedule.error) && (!!book.data || !!book.error));
+  const plan = useMemo<ScheduledUpcoming>(
+    () => (sub && settled ? scheduledUpcoming(sub, schedule.data ?? null, copyFormat(f), cadenceOf) : EMPTY_PLAN),
+    [sub, settled, schedule.data, f, cadenceOf],
+  );
+
+  const body = useMemo(() => (sub ? {
+    subscription: sub.id,
+    ...(plan.items ? { items: plan.items, proration_behavior: 'none' as const } : {}),
+  } : null), [sub, plan.items]);
+
+  const preview = usePricedPreview<Invoice>('/v1/invoices/create_preview', body, !!sub && settled);
+  return {
+    ...preview,
+    loading: preview.loading || (!!sub && !settled),
+    phase: plan.items ? plan.phase : null,
+    caveat: plan.caveat,
+  };
+}
+
+const EMPTY_PLAN: ScheduledUpcoming = { phase: null, items: null, caveat: null };

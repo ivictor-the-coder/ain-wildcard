@@ -1,10 +1,14 @@
 /**
  * The settings screens' own logic, run without a browser.
  *
- * Two things here have to be right or the surface lies: what the time machine
- * says each move ran, and where an object id on the audit trail or the event
- * stream leads. Both are pure, so each case hands the function exactly what the
- * API serves and checks the answer against the API's own numbers.
+ * Four things here have to be right or the surface lies: what the time machine
+ * says each move ran and what it will run, how far past its allowance an
+ * account under pressure is, where an object id on the audit trail leads and
+ * what it is called once the roster has forgotten it, and which of the
+ * workspace's own format settings this runtime can actually render — the one
+ * screen that can repair those is rendered through them. All of it is pure, so
+ * each case hands the function exactly what the API serves and checks the
+ * answer against the API's own numbers.
  */
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
@@ -15,8 +19,9 @@ import {
 } from '../src/client/modules/settings/moves';
 import { targetLabel, targetRoute } from '../src/client/modules/settings/targets';
 import { TILE_DASH, tileOf } from '../src/client/modules/settings/tiles';
-import { isHostname, problemWith } from '../src/client/modules/settings/workspace-core';
+import { FALLBACK_LOCALE, FALLBACK_ZONE, isHostname, isLocale, isTimeZone, previewSettings, problemWith } from '../src/client/modules/settings/workspace-core';
 import { actorLabel, seatsFromTrail, unattributedBecause } from '../src/client/modules/settings/audit-core';
+import { byPressure, describePressure, readPressure } from '../src/client/modules/settings/features-core';
 
 const DAY = 86_400_000;
 const T0 = Date.UTC(2026, 8, 5, 3, 33, 0);
@@ -224,6 +229,60 @@ describe('what the workspace form refuses before the server sees it', () => {
     }
   });
 
+  /**
+   * One PATCH used to take the whole product down. `timezone` is validated as
+   * `v.string({ max: 60 })` and `locale` as `v.string({ max: 20 })`, `/v1/me`
+   * serves whatever was stored, and every screen renders dates through
+   * `Intl.DateTimeFormat(locale, { timeZone })` — which throws a RangeError on
+   * an unknown zone rather than falling back. The shell's own clock chip threw
+   * while drawing and React unmounted the tree: every screen went white, with
+   * no way back to this form.
+   */
+  it('refuses a timezone Intl cannot format in, and accepts every real one', () => {
+    for (const zone of ['UTC', 'Europe/Berlin', 'America/New_York', 'Australia/Sydney']) {
+      assert.equal(isTimeZone(zone), true, `${zone} is a zone`);
+      assert.equal(problemWith('timezone', zone), undefined);
+    }
+    for (const bad of ['Mars/Phobos', 'Europe/Berlin ', 'not a zone', 'UTC+2', '']) {
+      assert.equal(isTimeZone(bad), false, `${bad} is not a zone`);
+      assert.match(problemWith('timezone', bad) ?? '', /IANA timezone/);
+    }
+    // The value is quoted back so the refusal names what was rejected.
+    assert.match(problemWith('timezone', 'Mars/Phobos') ?? '', /Mars\/Phobos/);
+  });
+
+  it('refuses a malformed language tag, and leaves a well-formed one Intl resolves alone', () => {
+    for (const tag of ['en-US', 'de-DE', 'pt-BR', 'zh-Hans-CN']) {
+      assert.equal(isLocale(tag), true, `${tag} is a tag`);
+      assert.equal(problemWith('locale', tag), undefined);
+    }
+    for (const bad of ['en_US', 'de--DE', 'en-US-', 'en@US', '']) {
+      assert.equal(isLocale(bad), false, `${bad} is not a tag`);
+      assert.match(problemWith('locale', bad) ?? '', /BCP 47/);
+    }
+    // A well-formed tag with no data behind it renders through the runtime's
+    // fallback rather than throwing, so it is not this function's business —
+    // and neither is a registered-shape tag nobody uses.
+    assert.equal(isLocale('xx-YY'), true);
+    assert.equal(isLocale('english'), true);
+  });
+
+  it('renders the workspace screen through settings it can actually format, and says what it substituted', () => {
+    assert.deepEqual(previewSettings({ timezone: 'Europe/Berlin', locale: 'de-DE' }), {
+      timeZone: 'Europe/Berlin', locale: 'de-DE', unusable: [],
+    });
+    assert.deepEqual(previewSettings({ timezone: 'Mars/Phobos', locale: 'de-DE' }), {
+      timeZone: FALLBACK_ZONE, locale: 'de-DE', unusable: ['timezone'],
+    });
+    assert.deepEqual(previewSettings({ timezone: 'Mars/Phobos', locale: 'en_US' }), {
+      timeZone: FALLBACK_ZONE, locale: FALLBACK_LOCALE, unusable: ['timezone', 'locale'],
+    });
+    // The point of the substitution: formatting through the answer never throws.
+    const bad = previewSettings({ timezone: 'Mars/Phobos', locale: 'en_US' });
+    assert.doesNotThrow(() => new Intl.DateTimeFormat(bad.locale, { timeZone: bad.timeZone }).format(T0));
+    assert.throws(() => new Intl.DateTimeFormat('en_US', { timeZone: 'Mars/Phobos' }).format(T0), RangeError);
+  });
+
   it('pins the refusal to the domain field and leaves an empty domain to the dropped-value hint', () => {
     // PATCH /v1/org stored "not a domain!!" and the shell header read it back
     // under the workspace name on every screen.
@@ -253,6 +312,18 @@ describe('what the trail can say about the teammates it names', () => {
     assert.deepEqual(seats.get('usr_gone'), { email: 'critic@northwind.io', removed: true });
   });
 
+  it('names a seat off the cancellation of its invitation, and counts that as removed', () => {
+    // The same route removes an invited seat and an active one, and this is the
+    // only entry that carries the address of a seat that never accepted.
+    const seats = seatsFromTrail([{
+      action: 'user.invitation_cancelled',
+      target_type: 'user',
+      target_id: 'usr_never',
+      summary: 'Cancelled the invitation to sam@northwind.io — the link no longer works',
+    }]);
+    assert.deepEqual(seats.get('usr_never'), { email: 'sam@northwind.io', removed: true });
+  });
+
   it('knows a seat it never saw invited, and does not call it removed', () => {
     const seats = seatsFromTrail(entries);
     assert.deepEqual(seats.get('usr_seed06'), { email: null, removed: false });
@@ -267,6 +338,43 @@ describe('what an entry or an event calls its actor', () => {
   it('names a teammate the session knows and falls back to the id for one it does not', () => {
     assert.equal(actorLabel('usr_seed01', 'user', name), 'Dana Whitfield');
     assert.equal(actorLabel('usr_other', 'user', name), 'usr_other');
+  });
+
+  /**
+   * The roster on `/v1/me` holds the people who are still here, so the moment
+   * a teammate was removed every change they had ever made read `usr_…` — on
+   * the one screen whose entire purpose is accountability, and for exactly the
+   * person an auditor is most likely to be asking about. The trail recorded
+   * their address when they were invited; it is read back out of it.
+   */
+  it('names a removed teammate off the trail rather than showing the row id nobody can resolve', () => {
+    const trail = [
+      { action: 'user.invited', target_type: 'user', target_id: 'usr_gone', summary: 'Invited critic@northwind.io as admin' },
+      { action: 'api_key.created', target_type: 'api_key', target_id: 'ak_9', summary: 'Created API key "CI"' },
+      { action: 'user.removed', target_type: 'user', target_id: 'usr_gone', summary: 'Removed from workspace — 1 session ended, 1 API key revoked' },
+    ];
+    const seats = seatsFromTrail(trail);
+    // The key revocation this person made, still on the trail after they left.
+    assert.equal(actorLabel('usr_gone', 'user', name, seats), 'critic@northwind.io · removed');
+    assert.notEqual(actorLabel('usr_gone', 'user', name, seats), 'usr_gone');
+    // A seat the trail knows and has not seen removed is simply named.
+    const invited = seatsFromTrail([trail[0]]);
+    assert.equal(actorLabel('usr_gone', 'user', name, invited), 'critic@northwind.io');
+    // The roster still wins where it has an answer — the name beats the address.
+    assert.equal(actorLabel('usr_seed01', 'user', name, seats), 'Dana Whitfield');
+    // And a seat the trail saw removed but never saw invited is at least
+    // marked as gone, rather than reading as though the person were still here.
+    const anonymous = seatsFromTrail([trail[2]]);
+    assert.equal(actorLabel('usr_gone', 'user', name, anonymous), 'usr_gone · removed');
+    // An id nothing knows anything about is still the id, not an invention.
+    assert.equal(actorLabel('ak_9', 'api_key', name, seats), 'ak_9');
+  });
+
+  it('names an id the caller can name from a list of its own', () => {
+    // The audit screen reads the API keys it is allowed to; an actor that is a
+    // key was showing `ak_…` beside a target column naming that very key.
+    const withKeys = (id: string) => names.get(id) ?? new Map([['ak_9', 'CI']]).get(id);
+    assert.equal(actorLabel('ak_9', 'api_key', withKeys), 'CI');
   });
 
   it('never credits "the platform" with a change the record does not attribute', () => {
@@ -288,13 +396,95 @@ describe('what a preset will run, before it is pressed', () => {
   const pending = [{ run_at: T0 + 2 * DAY }, { run_at: T0 + 5 * DAY }, { run_at: T0 + 40 * DAY }];
 
   it('counts the pending jobs a jump would reach', () => {
-    assert.deepEqual(dueBy(pending, T0 + DAY, false), { count: 0, atLeast: false });
-    assert.deepEqual(dueBy(pending, T0 + 7 * DAY, false), { count: 2, atLeast: false });
-    assert.deepEqual(dueBy(pending, T0 + 90 * DAY, false), { count: 3, atLeast: false });
+    assert.equal(dueBy(pending, T0 + DAY, false).count, 0);
+    assert.equal(dueBy(pending, T0 + 7 * DAY, false).count, 2);
+    assert.equal(dueBy(pending, T0 + 90 * DAY, false).count, 3);
+  });
+
+  /**
+   * The contradiction this screen shipped: "A day" promised 18 jobs from the
+   * queue as it stood, the move it made recorded 42, and both numbers were on
+   * screen at once. A jump drains the queue, asks it again, and drains what the
+   * last batch queued — so any job that books its own next run comes due again
+   * inside the same jump. A count of rows is a floor and never the answer.
+   */
+  it('states a positive count as a floor, because a job that runs may queue its next run inside the jump', () => {
+    const forecast = dueBy(pending, T0 + 7 * DAY, false);
+    assert.equal(forecast.count, 2);
+    assert.equal(forecast.atLeast, true, 'two rows now is not a promise of two jobs run');
+    assert.equal(forecast.floor, 'requeues');
+  });
+
+  it('keeps zero exact: a job that does not run cannot queue anything', () => {
+    const forecast = dueBy(pending, T0 + DAY, false);
+    assert.deepEqual(forecast, { count: 0, atLeast: false, floor: 'exact' });
   });
 
   it('calls the count a floor when the read was capped, because the cap drops the soonest rows', () => {
-    assert.deepEqual(dueBy(pending, T0 + 7 * DAY, true), { count: 2, atLeast: true });
+    assert.deepEqual(dueBy(pending, T0 + 7 * DAY, true), { count: 2, atLeast: true, floor: 'capped' });
+    // Even nothing-due is a floor then: the rows the cap dropped are the
+    // soonest ones, which are exactly the ones a jump reaches first.
+    assert.deepEqual(dueBy(pending, T0 + DAY, true), { count: 0, atLeast: true, floor: 'capped' });
+  });
+});
+
+/* --------------------------- accounts under pressure ---------------------- */
+
+/**
+ * The overview divides by the allowance *plus* prepaid credit and caps the
+ * result at 100, while the sentence beside it prints the allowance alone. An
+ * account 15% past its plan therefore read "115 of 100 — 92% used" — the one
+ * number on the screen an operator acts on, saying the opposite of the truth.
+ */
+describe('what an account under pressure is measured against', () => {
+  // 115 events used against a 100-event allowance topped up by 25 of prepaid
+  // credit: `remaining` is 125 − 115, which is what the server sends.
+  const over = { value: 100, used: 115, remaining: 10 };
+  const f = {
+    number: (value: number) => value.toLocaleString('en-US'),
+    plural: (count: number, word: string) => `${count.toLocaleString('en-US')} ${word}${count === 1 ? '' : 's'}`,
+  };
+
+  it('divides by the allowance it prints, so 115 of 100 is not 92%', () => {
+    const reading = readPressure(over);
+    assert.equal(reading.percentOfAllowance, 115);
+    assert.equal(reading.over, true);
+    const sentence = describePressure(over, 'event', f);
+    assert.match(sentence, /115% of the included allowance/);
+    assert.ok(!/^92%|— 92%/.test(sentence), 'the ceiling percentage is never the headline');
+  });
+
+  it('names the prepaid credit rather than hiding it in the denominator', () => {
+    const reading = readPressure(over);
+    assert.equal(reading.ceiling, 125, 'used + remaining is the topped-up ceiling');
+    assert.equal(reading.credit, 25);
+    assert.equal(reading.percentOfCeiling, 92, 'the server’s number, said against the number it belongs to');
+    assert.match(describePressure(over, 'event', f), /25 events of prepaid credit raise the ceiling to 125, so 92% of that/);
+  });
+
+  it('says nothing about a ceiling it cannot prove', () => {
+    // `remaining` is floored at zero, so an account past the topped-up ceiling
+    // carries no evidence of how much credit was behind it.
+    const spent = readPressure({ value: 100, used: 150, remaining: 0 });
+    assert.equal(spent.percentOfAllowance, 150);
+    assert.equal(spent.ceiling, null);
+    assert.equal(spent.credit, null);
+    assert.equal(describePressure({ value: 100, used: 150, remaining: 0 }, 'event', f), '150% of the included allowance');
+    // And an account with no credit behind it is not told about credit.
+    assert.equal(describePressure({ value: 100, used: 90, remaining: 10 }, 'event', f), '90% of the included allowance');
+  });
+
+  it('leaves a row with no allowance to divide by unmeasured rather than guessing', () => {
+    assert.equal(readPressure({ value: null, used: 40, remaining: null }).percentOfAllowance, null);
+    assert.equal(readPressure({ value: 0, used: 40, remaining: null }).percentOfAllowance, null);
+    assert.equal(describePressure({ value: null, used: 40, remaining: null }, 'event', f), '');
+  });
+
+  it('orders the worst account first, which the capped percentage could not', () => {
+    // Both are at 100% by the server's reckoning — one of them because the cap
+    // hid that it is at 190%.
+    const rows = [{ value: 100, used: 100, remaining: 0 }, { value: 100, used: 190, remaining: 0 }];
+    assert.deepEqual([...rows].sort(byPressure).map((row) => row.used), [190, 100]);
   });
 });
 
@@ -452,6 +642,42 @@ describe('what the settings screens say', () => {
       assert.ok(read(file).includes('<DialogForm onSubmit='), `${file} wraps its dialog fields in a form`);
     }
     assert.ok(!/onKeyDown=\{\(e\) => \{ if \(e\.key === 'Enter'/.test(read('team.tsx')), 'no per-field Enter handler is left to disagree with the form');
+  });
+
+  it('names the actor from everything the screen knows, not the roster alone', () => {
+    // The roster on /v1/me holds the people who are still here. Both screens
+    // that show an actor read the trail as well, and the trail remembers a
+    // seat the roster has dropped — so both hand it over.
+    const audit = read('audit.tsx');
+    assert.match(audit, /useActorName\(\{ known: names, seats \}\)/, 'the trail screen names actors off the keys and the seats it read');
+    const clock = read('clock.tsx');
+    assert.match(clock, /seatsFromTrail\(/, 'the move history reads the same trail');
+    assert.match(clock, /useActorName\(\{ seats \}\)/);
+  });
+
+  it('measures an account against the allowance it prints beside it', () => {
+    const features = read('features.tsx');
+    assert.match(features, /describePressure\(/, 'the at-risk sentence is composed from the numbers, not from percent_used');
+    // The comments quote the defect, so the scan reads the code alone.
+    const code = features.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    assert.ok(!/percent_used/.test(code), 'the overview’s capped percentage is never printed beside the included allowance');
+    assert.ok(!/% used/.test(code), 'and "92% used" cannot come back beside "115 of 100"');
+  });
+
+  it('says what a jump will run as a floor, because a jump queues its own work', () => {
+    const clock = read('clock.tsx');
+    assert.match(clock, /At least \$\{jobs\} \$\{due\.count === 1 \? 'runs' : 'run'\} on the way/, 'the preset promises a floor');
+    assert.ok(!/\$\{due\.atLeast \? '\+' : ''\}/.test(clock), 'the old "17 jobs run on the way" promise is gone');
+  });
+
+  it('the workspace screen renders through settings it can format, so a bad one leaves a way back', () => {
+    // Every other screen renders through useFormat(); this is the one an
+    // operator opens because the workspace's own locale or zone is unusable,
+    // and Intl throws on those rather than falling back.
+    const workspace = read('workspace.tsx');
+    assert.match(workspace, /previewSettings\(/);
+    assert.ok(!/const f = useFormat\(\)/.test(workspace), 'it does not bind itself to the settings it exists to repair');
+    assert.match(workspace, /savedSettings\.unusable\.length > 0/, 'and it says which saved value cannot be rendered');
   });
 
   it('the workspace shows Save only to a role that can save', () => {

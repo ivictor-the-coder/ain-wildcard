@@ -32,7 +32,7 @@ import {
 } from './cycle';
 import { InvoiceHolds, type InvoiceHold } from './holds';
 import { InvoiceItems, type InvoiceItemInput } from './invoice-items';
-import { Invoices, describeWindow, type DraftLine } from './invoices';
+import { Invoices, billTotals, describeWindow, type DraftLine } from './invoices';
 import { previewChange, prorate, type ItemState, type ProrationSet } from './proration';
 import { assertTransition, countsAsRevenue, isTerminal, transitionEvent } from './status';
 import {
@@ -916,7 +916,11 @@ export class Billing {
       automaticTax: this.automaticTaxFor(orgId, customer),
       // What an `always_invoice` bill sweeps up besides its own lines: the
       // items already waiting for this customer, in the currency the bill can
-      // carry — exactly the claim `issue()` will make.
+      // carry — exactly the claim `issue()` will make. All three sources, for
+      // the same reason: the settled metered usage sitting in the credits
+      // outbox is on that bill too, and on a metered account it is routinely
+      // the largest thing on it, so leaving it out understates the figure a
+      // screen prints on the button that takes the money.
       waitingLines: [
         ...this.pendingItems(orgId, { customer: customer.id, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE })
           .filter((item) => item.currency === sub.currency)
@@ -924,6 +928,8 @@ export class Billing {
         ...this.invoiceItems.pending(orgId, customer.id)
           .filter((item) => item.currency === sub.currency)
           .map((item) => ({ price: null, amount: item.amount, currency: item.currency, taxBehavior: item.tax_behavior })),
+        ...this.settledUsageDrafts(orgId, sub)
+          .map((line) => ({ price: line.price, amount: line.amount, currency: line.currency, taxBehavior: line.taxBehavior })),
       ],
     });
 
@@ -1859,6 +1865,30 @@ export class Billing {
   }
 
   /**
+   * Everything the credits module is holding for this subscription's account,
+   * as the lines a bill would carry — read, never claimed.
+   *
+   * `issue()` gets these by draining the outbox, which writes; every reader
+   * that *predicts* a bill needs the same lines without the write, and there
+   * are three of them (the upcoming invoice, the change preview's
+   * `amount_due_now`, the customer summary's next-invoice panel). One reader,
+   * so they cannot come to disagree — including about the allowance line
+   * `usageDrafts` puts beside a metered charge.
+   *
+   * The currency filter is `issue()`'s own refusal turned into a filter: a line
+   * the bill could not carry is not a line to predict.
+   */
+  settledUsageDrafts(orgId: string, sub: Subscription): DraftLine[] {
+    const waiting = (this.invoices.credits()?.billableItems(orgId, {
+      customer: sub.customer, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE,
+    }) ?? []).filter((item) => item.currency === sub.currency);
+    if (!waiting.length) return [];
+    return this.invoices.usageDrafts(orgId, waiting, sub.id, {
+      start: sub.current_period_start, end: sub.current_period_end,
+    });
+  }
+
+  /**
    * Write the invoice for something that has already happened.
    *
    * The difference from `requestInvoice` is the silence: no
@@ -1970,11 +2000,26 @@ export class Billing {
    * arithmetic as the change preview, arranged as the bill the customer will
    * actually receive. Nothing is written.
    *
-   * The lines are what the next invoice will really carry: the prorations this
-   * change would leave waiting, anything already waiting, and the recurring fee
-   * for the period that begins when the current one ends. Because a cadence
-   * change re-anchors the cycle, "the period after next" is derived from the
-   * subscription as it would be, not as it is.
+   * The lines are what the next invoice will really carry, and they are built
+   * from the four sources `Invoices.issue()` builds from, through the same four
+   * calls: the recurring fee for the period that begins when the current one
+   * ends, every proration waiting (plus the ones this change would add), every
+   * hand-written invoice item waiting, and everything the credits module is
+   * holding for this account — usage it has already settled, the part of it
+   * prepaid credit covered, the credit packs bought since the last bill, and
+   * the allowance the plan includes. Because a cadence change re-anchors the
+   * cycle, "the period after next" is derived from the subscription as it would
+   * be, not as it is.
+   *
+   * The credits outbox was the source this preview did not have, and it is the
+   * one that made the number wrong rather than merely incomplete: a Starter
+   * account with a settled telemetry period waiting was shown $99.00 against a
+   * bill that went out at $7,879.95, because the preview listed the plan fee
+   * and the charge swept up the usage as well. Everything else in this module
+   * is fanatical that a preview is the charge's own arithmetic; this is now
+   * literally that — the same `usageDrafts`, the same `taxDrafts`, the same
+   * `billTotals` — with the outbox read rather than claimed, because a preview
+   * writes nothing.
    */
   previewInvoice(orgId: string, subscriptionId: string, input: SubscriptionUpdateInput): Invoice {
     const sub = this.requireSubscription(orgId, subscriptionId);
@@ -2004,12 +2049,18 @@ export class Billing {
     // Lines already waiting, plus the ones this change would add — including a
     // set that nets negative, which reaches the bill as credit lines and is
     // taxed there rather than being netted off in the balance.
-    const waiting = this.pendingItems(orgId, { customer: customer.id, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE });
+    const waiting = this.pendingItems(orgId, { customer: customer.id, status: 'pending', limit: PENDING_ITEMS_PER_INVOICE })
+      .filter((item) => item.currency === sub.currency);
     const written = this.invoiceItems.pending(orgId, customer.id).filter((item) => item.currency === sub.currency);
+    // Exactly what `issue()`'s `drainOutbox` would claim, read instead of
+    // claimed, through the one reader every prediction of this bill shares.
+    const settled = this.settledUsageDrafts(orgId, sub);
+    const arrears: Period = { start: sub.current_period_start, end: sub.current_period_end };
     const proposed = preview.lines;
     const drafts: DraftLine[] = [
       ...this.invoices.recurringDrafts(orgId, sub.id, upcoming),
       ...this.invoices.prorationDrafts(waiting),
+      ...settled,
       ...this.invoices.invoiceItemDrafts(orgId, written, period),
       ...proposed.map((line) => ({
         source: { type: 'pending_item' as const, id: null },
@@ -2034,11 +2085,9 @@ export class Billing {
     // preview of anything.
     const taxed = this.invoices.taxDrafts(orgId, customer, drafts);
     const automaticTax = this.automaticTaxFor(orgId, customer);
-    const subtotal = taxed.reduce((total, line) => total + line.amount, 0);
-    const tax = taxed.reduce((total, line) => total + line.tax.amount, 0);
+    // `issue()`'s own formula, called rather than restated.
     const starting = customer.balance;
-    const total = Math.max(0, subtotal + tax + starting);
-    const balanceApplied = total - subtotal - tax;
+    const { subtotal, tax, total, balanceApplied } = billTotals(taxed, starting);
 
     const lines = taxed.map((line, index) => ({
       object: 'invoice_line_item' as const,
@@ -2102,7 +2151,14 @@ export class Billing {
       marked_uncollectible_at: null,
       payment_note: null,
       footer: customer.invoice_settings.footer,
-      description: `Upcoming invoice for ${customer.name}, covering ${describeWindow(period, locale)}.`,
+      description: `Upcoming invoice for ${customer.name}, covering ${describeWindow(period, locale)}${
+        // A metered account's bill has one part nobody can predict: the window
+        // still open. Saying so is the difference between a preview that is
+        // incomplete and one that is wrong.
+        settled.length || sub.items.some((item) => isMetered(book.price(item.price)))
+          ? `, plus the metered usage already settled and waiting for it. Usage still accruing ${describeWindow(arrears, locale)} lands on this bill too, and is not known until that window closes`
+          : ''
+      }.`,
       metadata: {},
       created: now,
       updated: now,

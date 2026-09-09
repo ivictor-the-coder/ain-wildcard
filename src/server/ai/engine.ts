@@ -123,8 +123,17 @@ function carriedTurn(
   const follow = FOLLOW_UP.exec(question.trim());
   if (!follow) return null;
   const asked = messages.filter((m) => m.role === 'user').map((m) => m.content.trim()).filter(Boolean);
-  // The last one is this question; the one before it is what it follows.
-  const previous = asked[asked.length - 2];
+  // The last one is this question. Walk back past any follow-ups before it: a
+  // follow-up carries no measure either, so re-asking the one immediately
+  // before produced "And by owner by stage?" — a sentence with no subject in
+  // it, refused three words after the engine had answered the same measure
+  // grouped the other way, and refused by quoting the word "And" back at the
+  // person. The measure belongs to the last question that stood on its own
+  // words, however many groupings have been asked of it since.
+  let previous: string | undefined;
+  for (let i = asked.length - 2; i >= 0; i -= 1) {
+    if (!FOLLOW_UP.test(asked[i])) { previous = asked[i]; break; }
+  }
   if (!previous) return null;
   const outcome = matchTemplates(`${previous.replace(/[?\s]+$/, '')} ${follow[1].trim()}?`, vocab, catalogue);
   if (!outcome.match) return null;
@@ -283,6 +292,12 @@ export function builtinEngine(): AiProvider {
         const extraction = fillSchema(normaliseResponseSchema(req.responseSchema as SchemaNode), facts, refusal !== null);
         content = JSON.stringify(extraction.value, null, 2);
         reasoning.push(`Filled ${extraction.filled.length} schema ${extraction.filled.length === 1 ? 'field' : 'fields'}${extraction.missing.length ? `, left ${extraction.missing.join(', ')} null rather than guessing` : ''}.`);
+        // A JSON number carries no unit, and this one is a hundred times the
+        // figure the same run states in prose. Say which it is, beside the
+        // formatted figure, so nothing has to be inferred from the field name.
+        if (extraction.filled.length && facts.unit === 'money' && facts.value !== null && facts.currency && !facts.mixed) {
+          reasoning.push(`Money is in ${facts.currency.toUpperCase()} minor units, as on every other field of this API: ${facts.value} is ${facts.formatted}.`);
+        }
       }
 
       const inputTokens = messageTokens(req.messages) + toolTokens(req.tools) + estimateTokens(reasoning.join(' '));

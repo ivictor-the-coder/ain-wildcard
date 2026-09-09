@@ -4335,3 +4335,93 @@ test('the board holds its shape at 1024 wide, and every column header is the sam
   expect(heights.length).toBe(def.stages.length);
   expect(Math.max(...heights) - Math.min(...heights), `header heights: ${heights.join(', ')}`).toBeLessThan(1);
 });
+
+/* ==================== the board a reader is shown ========================= */
+
+/**
+ * A `readonly` seat, made through the product's own invitation flow.
+ *
+ * The seed's six teammates are owner, admin, member and analyst, and a rung
+ * that nobody in the workspace holds is a rung nobody drives. The seat is
+ * created and redeemed here so this file tests the screen a real read-only
+ * person sees, and a fresh address each run keeps it independent of whatever
+ * ran before.
+ */
+const readerSeat = async (request: APIRequestContext): Promise<string> => {
+  await request.post('/api/v1/auth/demo');
+  const email = `reid.onley+${Date.now()}@northwind.io`;
+  const seat = await postJson<{ invitation: { token: string } }>(
+    request, '/api/v1/users', { email, name: 'Reid Onley', role: 'readonly' },
+  );
+  await postJson(request, '/api/v1/auth/accept', { token: seat.invitation.token, password: 'demo1234' });
+  // Redeeming an invitation signs that request context in as the new seat, and
+  // every assertion below asks the API as the owner. Put it back.
+  await request.post('/api/v1/auth/demo');
+  return email;
+};
+
+/** The browser signed in as that seat; the `request` fixture stays the owner. */
+const signInAs = async (page: Page, email: string) => {
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  const response = await page.request.post('/api/v1/auth/login', { data: { email, password: 'demo1234' } });
+  expect(response.ok(), `sign-in as ${email}: ${response.status()}`).toBeTruthy();
+};
+
+test.describe('a read-only seat on the deal board', () => {
+  test('is offered no write it would be refused, and is told why', async ({ page, request }) => {
+    const email = await readerSeat(request);
+    const target = (await getJson<DealList>(request, '/api/v1/records/deal?limit=1')).data[0];
+
+    // The claim under test is that the server would refuse. Made against the
+    // reader's own session rather than assumed from the role name.
+    await signInAs(page, email);
+    const refused = await page.request.patch(`/api/v1/records/deal/${target.id}`, {
+      data: { properties: { deal_stage: 'negotiation' } },
+    });
+    expect(refused.status(), await refused.text()).toBe(403);
+
+    await board(page);
+    await expect(page.getByRole('button', { name: 'New deal' })).toHaveCount(0);
+    await expect(page.locator('.pl-card')).not.toHaveCount(0);
+    // Not one card lifts. A card that animates out of its column and snaps
+    // back on a 403 is the failure this replaces.
+    await expect(page.locator('.pl-card[draggable="true"]')).toHaveCount(0);
+    await expect(page.getByText('This board is read-only for you')).toBeVisible();
+    await expect(page.getByText('needs the member role or higher').first()).toBeVisible();
+
+    // The card menu keeps what a reader can do and drops what it cannot.
+    await page.locator('.pl-card__menu').first().click();
+    await expect(page.getByRole('menuitem', { name: 'Open deal' })).toBeVisible();
+    await expect(page.getByRole('menu').getByText('Move to stage')).toHaveCount(0);
+    await page.keyboard.press('Escape');
+
+    // Nor through the address: `?new=1` is how the dashboard opens the form.
+    await visit(page, '/deals?new=1', '.pl-col');
+    await expect(page.locator('[role="dialog"]')).toHaveCount(0);
+  });
+
+  test('reads the deal record with no editor on it, and the owner still has every one', async ({ page, request }) => {
+    const email = await readerSeat(request);
+    const target = (await getJson<DealList>(request, '/api/v1/records/deal?limit=1')).data[0];
+
+    await signInAs(page, email);
+    await visit(page, `/deals/${target.id}`, '.pl-proplist');
+    await expect(page.getByText('This deal is read-only for you')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Log activity' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Edit', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Edit them all' })).toHaveCount(0);
+    // Every property row is a value, not a button that opens a PATCH.
+    await expect(page.locator('.pl-inline__read')).toHaveCount(0);
+    // And the stage rail is inert rather than a row of live moves.
+    const rail = page.locator('.pl-rail__step');
+    await expect(rail.first()).toBeVisible();
+    expect(await rail.evaluateAll((els) => els.every((el) => el.getAttribute('aria-disabled') === 'true'))).toBe(true);
+
+    // The same screen for the owner, so this is a gate and not a removal.
+    await signIn(page, request);
+    await visit(page, `/deals/${target.id}`, '.pl-proplist');
+    await expect(page.getByText('This deal is read-only for you')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Edit', exact: true })).toBeVisible();
+    await expect(page.locator('.pl-inline__read').first()).toBeVisible();
+  });
+});

@@ -464,7 +464,7 @@ export function renderDraft(draft: DraftResult): Rendered {
 export function renderDelinquent(result: DelinquentCustomersResult, workspace: WorkspaceProfile): Rendered {
   void workspace;
   if (!result.total) return { content: 'No customer is past due: every open invoice is inside its terms.', citations: [], facts: { ...NO_FACTS, unit: 'count', value: 0, formatted: '0', count: 0, label: 'past-due customers' } };
-  const lines = result.customers.map((c) => `• ${c.name} — ${c.outstanding_formatted} across ${c.open_invoices} open ${plural(c.open_invoices, 'invoice')}${c.days_overdue ? `, oldest ${c.days_overdue} ${plural(c.days_overdue, 'day')} overdue` : ''}`);
+  const lines = result.customers.map((c) => `• ${c.name} — ${c.past_due_formatted} across ${c.past_due_invoices} past-due ${plural(c.past_due_invoices, 'invoice')}${c.days_overdue ? `, oldest ${c.days_overdue} ${plural(c.days_overdue, 'day')} overdue` : ''}`);
   return {
     content: `${result.total} ${plural(result.total, 'customer is', 'customers are')} past due:\n\n${lines.join('\n')}`,
     citations: result.customers.map((c) => ({ id: c.id, label: c.name, type: 'customer' })),

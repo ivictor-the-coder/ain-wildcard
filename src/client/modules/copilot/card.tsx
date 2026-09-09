@@ -5,7 +5,7 @@
  * template was bound to. Each takes what `answerCard` decided and draws it —
  * nothing here reads a question or a sentence of prose.
  */
-import { Icons } from '@/client/design';
+import { Button, Icons } from '@/client/design';
 import type { Refusal } from './card-core';
 import type { SlotChip } from './slots-core';
 import type { EngineLine } from './templates-core';
@@ -33,6 +33,48 @@ export function EngineIndicator({ line }: { line: EngineLine }) {
     </span>
   );
 }
+
+/**
+ * A money measure the engine would not narrow to the currency that was named.
+ *
+ * The engine's own reason for this is a statement about the whole measure —
+ * "Overdue balance is measured from records that carry no currency book in
+ * this workspace … the figure I hold is the whole of it, in USD" — written
+ * from a read that had already been narrowed to the currency. The same measure
+ * asked without one answers "held in 2 currencies … $127,840.00 in USD and
+ * €1,007.00 in EUR", so the sentence is not true of this workspace and the
+ * surface does not repeat it. What is said instead is what this screen can
+ * stand behind, and the question that gets a real answer is a press away.
+ *
+ * Drawn the same on the conversation and on the run's own page: a refusal that
+ * reads as fact in one place and as a caveat in the other is two answers.
+ */
+export function CurrencyRefusalNote({ refusal, onAsk }: {
+  refusal: { measure: string; currency: string; unscoped: string | null };
+  onAsk?: (question: string) => void;
+}) {
+  const { currency, unscoped } = refusal;
+  return (
+    <>
+      <p>
+        Its reason is a claim about the whole measure, not about the {currency} book — and the same measure asked
+        without a currency comes back as one figure per book, because this platform holds no exchange rates and never
+        adds them together. That answer is what says whether {currency} is missing here or simply empty.
+      </p>
+      {unscoped && (
+        <p className="cp-chips" style={{ marginTop: 'var(--space-3)' }}>
+          <Button size="sm" variant="secondary" iconLeft={<Icons.sparkles size={13} />} onClick={() => onAsk?.(unscoped)}>
+            {unscoped}
+          </Button>
+        </p>
+      )}
+    </>
+  );
+}
+
+/** The banner title both surfaces put that note under. */
+export const currencyRefusalTitle = (refusal: { measure: string; currency: string }): string =>
+  `The copilot will not narrow ${refusal.measure} to ${refusal.currency}`;
 
 /**
  * What a bare follow-up inherited from the question before it.

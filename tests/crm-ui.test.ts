@@ -17,14 +17,18 @@ import { join } from 'node:path';
 import type { AssociationSummary, CrmRecord, CrmSchema, PropertyDef, ViewDef, WorkspaceUser } from '../src/client/modules/crm/api';
 import { changedProperties, describeMergeResult, duplicateReason, planMerge, primaryCompany } from '../src/client/modules/crm/merge';
 import { parseCsv } from '../src/client/modules/crm/csv';
-import { autoMapColumns, buildImportRows, coerceImportValue, blamedLabel, outcomesFrom } from '../src/client/modules/crm/import-rows';
+import {
+  autoMapColumns, blamedLabel, buildImportRows, coerceImportValue, outcomesFrom, requiredForCreate,
+} from '../src/client/modules/crm/import-rows';
 import { associationTypeName } from '../src/client/modules/crm/naming';
-import { slaState } from '../src/client/modules/crm/time';
+import { onCivilDay, slaState, wallClockIn, zonedDay, zonedDayStart } from '../src/client/modules/crm/time';
+import { civilDay } from '../src/shared/time';
 import { describeAssociationCondition, farObjectType, identityWhere, referencedRecordIds } from '../src/client/modules/crm/filter-words';
 import { ACTIVITY_PATHS, hasDedicatedAddress, listHref, recordHref } from '../src/client/modules/crm/links';
 import {
-  canMarkPrimary, directActivityIds, groupAssociations, listBootPhase, loggedOnTargets, mergeCellCompact, reachedThrough,
-  showsAssociationLabel, staleViewParam, timeInStage, viaFor, visibleViews,
+  canMarkPrimary, directActivityIds, groupAssociations, linkableObjectTypes, listBootPhase, loggedOnTargets,
+  mergeCellCompact, reachedThrough, showsAssociationLabel, staleViewParam, timeInStage, viaFor, visibleViews,
+  withFreshView,
 } from '../src/client/modules/crm/record-model';
 
 const property = (over: Partial<PropertyDef> & { name: string; type: PropertyDef['type'] }): PropertyDef => ({
@@ -430,5 +434,229 @@ describe('the filter chip', () => {
     assert.equal(farObjectType('contact_to_company', 'company', schema), 'contact');
     assert.equal(farObjectType('activity_to_record', 'contact', schema), null);
     assert.equal(farObjectType('company', 'contact', undefined), null);
+  });
+});
+
+/* ------------------------- the four defects of this pass ------------------ */
+
+describe('a view the moment it is saved', () => {
+  const me = 'usr_seed01';
+  const cached = [
+    view({ id: 'v_all', name: 'All contacts', system: true, position: 0 }),
+    view({ id: 'v_sql', name: 'Sales qualified leads', position: 10 }),
+  ];
+
+  it('is in the bar before its refetch lands, so nothing calls it unavailable', () => {
+    // What `POST /v1/views` hands back. The cached list behind the bar still
+    // predates it — invalidation keeps the stale answer on screen — and the
+    // list used to agree with the cache: no tab, "That view is not available",
+    // `?view=` stripped, and the filter that had just been saved discarded.
+    const saved = view({ id: 'v_new', name: 'Carmen only', position: 20, owner_id: me, shared: false });
+    const bar = visibleViews(withFreshView(cached, saved), me);
+    assert.deepEqual(bar.map((v) => v.id), ['v_all', 'v_sql', 'v_new']);
+    assert.equal(staleViewParam('v_new', bar, true), false);
+    // Without the fresh copy the guard fires, which is the defect.
+    assert.equal(staleViewParam('v_new', visibleViews(cached, me), true), true);
+  });
+
+  it('replaces the cached copy of a view it updated rather than listing it twice', () => {
+    const resorted = view({ id: 'v_sql', name: 'Sales qualified leads', position: 10, sort: [{ property: 'created', direction: 'asc' }] });
+    const bar = withFreshView(cached, resorted);
+    assert.equal(bar.length, cached.length);
+    assert.deepEqual(bar.find((v) => v.id === 'v_sql')?.sort, resorted.sort);
+  });
+
+  it('leaves the bar exactly as it is when there is no fresh view', () => {
+    assert.equal(withFreshView(cached, null), cached);
+    // A teammate's private view is still not mine to see, freshly saved or not.
+    const theirs = view({ id: 'v_theirs', shared: false, owner_id: 'usr_seed04' });
+    assert.deepEqual(visibleViews(withFreshView(cached, theirs), me).map((v) => v.id), ['v_all', 'v_sql']);
+  });
+});
+
+describe('the day a datetime picker means', () => {
+  // The workspace is on New York time, so UTC midnight is 8pm the day before.
+  const zone = 'America/New_York';
+  const sep18 = Date.UTC(2026, 8, 18);
+
+  it('turns the calendar’s day stamp into an instant on that day where the business is', () => {
+    const start = zonedDayStart(sep18, zone);
+    assert.equal(zonedDay(start, zone), '2026-09-18');
+    // The defect: the stamp itself is the 17th in New York.
+    assert.equal(zonedDay(sep18, zone), '2026-09-17');
+    // And it round-trips: what the picker is handed back is the day picked.
+    assert.equal(civilDay(start, zone), sep18);
+  });
+
+  it('keeps the time of day a stamp already had when it is re-dated', () => {
+    const dueAt5pm = zonedDayStart(Date.UTC(2026, 8, 14), zone) + 17 * 3_600_000;
+    const moved = onCivilDay(sep18, zone, dueAt5pm);
+    assert.equal(zonedDay(moved, zone), '2026-09-18');
+    assert.deepEqual(wallClockIn(moved, zone), { year: 2026, month: 9, day: 18, hour: 17, minute: 0, second: 0 });
+    // Nothing behind it lands at the start of the day, not at UTC midnight.
+    assert.equal(onCivilDay(sep18, zone, null), zonedDayStart(sep18, zone));
+  });
+
+  it('crosses a daylight-saving boundary without moving the wall clock', () => {
+    // 1 Nov 2026 is the fall-back Sunday in New York.
+    const before = zonedDayStart(Date.UTC(2026, 9, 30), zone) + 9 * 3_600_000;
+    const after = onCivilDay(Date.UTC(2026, 10, 2), zone, before);
+    assert.deepEqual(wallClockIn(after, zone), { year: 2026, month: 11, day: 2, hour: 9, minute: 0, second: 0 });
+  });
+
+  it('answers about Greenwich for a zone it does not know rather than throwing', () => {
+    assert.equal(zonedDayStart(sep18, 'Mars/Olympus_Mons'), sep18);
+  });
+});
+
+describe('what the link dialog may offer', () => {
+  const types = [
+    { name: 'contact', category: 'record' as const },
+    { name: 'company', category: 'record' as const },
+    { name: 'deal', category: 'record' as const },
+    { name: 'ticket', category: 'record' as const },
+    { name: 'note', category: 'activity' as const },
+  ];
+  // The workspace's own association types, as `/v1/crm/schema` lists them.
+  const assoc = [
+    { from_object: 'contact', to_object: 'company' },
+    { from_object: 'contact', to_object: 'contact' },
+    { from_object: 'deal', to_object: 'company' },
+    { from_object: 'deal', to_object: 'contact' },
+    { from_object: 'ticket', to_object: 'company' },
+    { from_object: 'ticket', to_object: 'contact' },
+    { from_object: 'ticket', to_object: 'deal' },
+    { from_object: 'company', to_object: 'company' },
+    { from_object: '*', to_object: '*' },
+  ];
+  const records = types.filter((t) => t.category === 'record');
+
+  it('leaves out a type no association type reaches, in either direction', () => {
+    // Nothing connects a ticket to a ticket, or a deal to a deal. Offered, the
+    // link was filed under the wildcard label — 201, "shows on both sides",
+    // visible on neither, removable from nowhere.
+    assert.deepEqual(linkableObjectTypes('ticket', false, records, assoc).map((t) => t.name), ['contact', 'company', 'deal']);
+    assert.deepEqual(linkableObjectTypes('deal', false, records, assoc).map((t) => t.name), ['contact', 'company', 'ticket']);
+    // A type that does connect to itself stays: company↔company is a real one.
+    assert.deepEqual(linkableObjectTypes('company', false, records, assoc).map((t) => t.name), ['contact', 'company', 'deal', 'ticket']);
+    assert.deepEqual(linkableObjectTypes('contact', false, records, assoc).map((t) => t.name), ['contact', 'company', 'deal', 'ticket']);
+  });
+
+  it('still offers every record type from an activity, which is what the wildcard is for', () => {
+    assert.deepEqual(linkableObjectTypes('note', true, records, assoc).map((t) => t.name), ['contact', 'company', 'deal', 'ticket']);
+    // And an activity is a legitimate target from a record for the same reason.
+    assert.deepEqual(linkableObjectTypes('ticket', false, types, assoc).map((t) => t.name), ['contact', 'company', 'deal', 'note']);
+  });
+
+  it('offers nothing at all for an object the data model connects to nothing', () => {
+    const site = { name: 'site', category: 'record' as const };
+    assert.deepEqual(linkableObjectTypes('site', false, [...records, site], assoc), []);
+  });
+
+  it('shows a stranded wildcard link between two records so it can be undone', () => {
+    const stray = edge({
+      record_id: 'tkt_nw_29', object_type: 'ticket', display_name: 'Onboarding',
+      label: 'Logged on', association_type: 'activity_to_record',
+    });
+    const logged = edge({
+      record_id: 'note_9', object_type: 'note', display_name: 'Site survey',
+      label: 'Logged on', association_type: 'activity_to_record',
+    });
+    const isActivityType = (name: string) => name === 'note';
+    // On a ticket page: the note stays in the timeline where it belongs, the
+    // stranded ticket link surfaces in the rail where it can be removed.
+    const rail = groupAssociations([stray, logged], false, isActivityType);
+    assert.deepEqual([...rail.keys()], ['ticket']);
+    // Without the predicate the old behaviour stands: both are hidden.
+    assert.equal(groupAssociations([stray, logged], false).size, 0);
+  });
+});
+
+describe('the import’s Check step', () => {
+  const users: WorkspaceUser[] = [
+    { id: 'usr_dana', name: 'Dana Whitfield', email: 'dana@northwind.io', title: null, role: 'owner', avatar_url: null, status: 'active' },
+  ];
+  const ctx = { users, currency: 'usd' };
+  // Contacts as Ain ships them: a first and last name are required, email unique.
+  const properties = [
+    property({ name: 'first_name', type: 'string', label: 'First name', object_type: 'contact', required: true }),
+    property({ name: 'last_name', type: 'string', label: 'Last name', object_type: 'contact', required: true }),
+    property({ name: 'email', type: 'email', label: 'Email', unique: true, object_type: 'contact' }),
+    property({ name: 'job_title', type: 'string', label: 'Job title', object_type: 'contact' }),
+    property({ name: 'lifecycle_stage', type: 'enum', label: 'Lifecycle stage', object_type: 'contact', required: true, default_value: 'lead', options: [{ value: 'lead', label: 'Lead' }] }),
+  ];
+  const headers = ['Email', 'Job title'];
+  const rows = [
+    ['ingrid@nordhavn.example', 'Plant manager'],
+    ['piet@example.com', 'QA lead'],
+  ];
+  const mapping = autoMapColumns(headers, properties);
+
+  it('counts only the properties the API will actually insist on', () => {
+    // A required property with a default is filled by the server, not by the file.
+    assert.deepEqual(requiredForCreate(properties).map((p) => p.name), ['first_name', 'last_name']);
+  });
+
+  it('holds back a row that certainly cannot be created, instead of promising it', () => {
+    const built = buildImportRows(rows, headers, mapping, properties, ctx, { operation: 'create' });
+    // The defect: two rows counted as ready, then refused one at a time.
+    assert.equal(built.records.length, 0);
+    assert.deepEqual(built.missingRequired.map((p) => p.label), ['First name', 'Last name']);
+    assert.deepEqual(
+      built.problems.filter((p) => p.row === 1).map((p) => p.column),
+      ['First name', 'Last name'],
+    );
+    assert.match(built.problems[0].message, /cannot be created without it/);
+  });
+
+  it('still sends a keyed upsert, and says out loud that it can only update', () => {
+    const built = buildImportRows(rows, headers, mapping, properties, ctx, { operation: 'upsert', keyProperty: 'email' });
+    // A job-title sync keyed on email is a legitimate import; it just cannot
+    // create the contacts it does not find, and the count says so.
+    assert.equal(built.records.length, 2);
+    assert.equal(built.conditional, 2);
+    assert.equal(built.problems.length, 0);
+  });
+
+  it('names the empty cell when the column is there but the row is blank', () => {
+    const full = ['First name', 'Last name', 'Email'];
+    const built = buildImportRows(
+      [['Ingrid', 'Halvorsen', 'ingrid@nordhavn.example'], ['', 'de Vries', 'piet@example.com']],
+      full, autoMapColumns(full, properties), properties, ctx, { operation: 'create' },
+    );
+    assert.deepEqual(built.records.map((r) => r.row), [1]);
+    assert.deepEqual(built.missingRequired, []);
+    assert.deepEqual(built.problems.map((p) => [p.row, p.column]), [[2, 'First name']]);
+    assert.match(built.problems[0].message, /is empty on this row/);
+  });
+
+  it('refuses a row that brings an id to a create, which Ain never accepts', () => {
+    const withId = ['id', 'First name', 'Last name'];
+    const built = buildImportRows(
+      [['con_nw_01', 'Ingrid', 'Halvorsen']],
+      withId, autoMapColumns(withId, properties), properties, ctx, { operation: 'create' },
+    );
+    assert.equal(built.records.length, 0);
+    assert.deepEqual(built.problems.map((p) => p.column), ['id']);
+    assert.match(built.problems[0].message, /Ain assigns record ids/);
+    // The same row under upsert is the re-import it looks like.
+    const upsert = buildImportRows(
+      [['con_nw_01', 'Ingrid', 'Halvorsen']],
+      withId, autoMapColumns(withId, properties), properties, ctx, { operation: 'upsert' },
+    );
+    assert.equal(upsert.records.length, 1);
+    assert.equal(upsert.problems.length, 0);
+  });
+});
+
+describe('re-dating an instant across a daylight-saving jump', () => {
+  const zone = 'America/New_York';
+  it('keeps the wall clock, not a count of milliseconds since midnight', () => {
+    // 8 March 2026 is the spring-forward Sunday in New York: that civil day is
+    // 23 hours long, so 09:00 on it is only eight hours after its midnight.
+    const onShortDay = zonedDayStart(Date.UTC(2026, 2, 8), zone) + 8 * 3_600_000;
+    assert.deepEqual(wallClockIn(onShortDay, zone), { year: 2026, month: 3, day: 8, hour: 9, minute: 0, second: 0 });
+    const moved = onCivilDay(Date.UTC(2026, 2, 12), zone, onShortDay);
+    assert.deepEqual(wallClockIn(moved, zone), { year: 2026, month: 3, day: 12, hour: 9, minute: 0, second: 0 });
   });
 });

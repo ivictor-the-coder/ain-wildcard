@@ -23,6 +23,15 @@ export interface StageWrite {
   recordId: string;
   objectType: string;
   stage: string;
+  /**
+   * Every property the write sets, stage included.
+   *
+   * The card has to know what the write *does not* say as well as what it
+   * does: a move into a closing stage that carries no close reason is the
+   * write the board refuses to make, and the only way to tell is to look at
+   * the whole property bag rather than at the stage alone.
+   */
+  properties: Record<string, unknown>;
 }
 
 const str = (value: unknown): string | null =>
@@ -43,7 +52,7 @@ export function stageWriteOf(tool: string, args: Record<string, unknown>): Stage
   const recordId = str(args.id) ?? str(args.record_id);
   const objectType = str(args.object_type) ?? 'deal';
   if (!stage || !recordId || objectType !== 'deal') return null;
-  return { recordId, objectType, stage };
+  return { recordId, objectType, stage, properties: properties as Record<string, unknown> };
 }
 
 /** The deal a stage write would land on, as the record API returns it. */

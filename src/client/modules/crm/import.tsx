@@ -71,9 +71,14 @@ export function ImportDialog({ open, onClose, objectType, properties, users, onI
   const ctx = useMemo(() => ({ users, currency: session.currency }), [users, session.currency]);
   const propertyIndex = useMemo(() => new Map(properties.map((p) => [p.name, p])), [properties]);
 
+  // The plan is part of the build: what the API will refuse depends on whether
+  // a row is a create or a match, and the Check step has to know before it
+  // promises anything.
   const built = useMemo(
-    () => (rows.length && mapping.length ? buildImportRows(rows, headers, mapping, properties, ctx) : null),
-    [rows, headers, mapping, properties, ctx],
+    () => (rows.length && mapping.length
+      ? buildImportRows(rows, headers, mapping, properties, ctx, { operation, keyProperty })
+      : null),
+    [rows, headers, mapping, properties, ctx, operation, keyProperty],
   );
 
   const load = (text: string, name: string) => {
@@ -153,6 +158,13 @@ export function ImportDialog({ open, onClose, objectType, properties, users, onI
   };
 
   const stepIndex = STEPS.findIndex((s) => s.id === step);
+  const heldBack = built ? new Set(built.problems.map((p) => p.row)).size : 0;
+  const matchLabel = idMapped ? 'record id' : propertyIndex.get(keyProperty)?.label.toLowerCase() ?? 'key';
+  // A file with no name column puts the same sentence on all 400 rows. One
+  // line per row is the list of what to fix; the banner above says it once.
+  const problemLines = built
+    ? built.problems.filter((p) => !built.missingRequired.some((m) => m.label === p.column))
+    : [];
   const created = outcomes.filter((o) => o.status === 'created').length;
   const updated = outcomes.filter((o) => o.status === 'updated').length;
   const refused = outcomes.filter((o) => o.status === 'refused');
@@ -189,7 +201,9 @@ export function ImportDialog({ open, onClose, objectType, properties, users, onI
           )}
           {step === 'preview' && (
             <Button variant="primary" disabled={!canRun} onClick={() => { void run(); }}>
-              Import {f.number(built?.records.length ?? 0)} {f.plural(built?.records.length ?? 0, objectType.label.toLowerCase(), { hideCount: true })}
+              {built && built.conditional === built.records.length && built.conditional > 0
+                ? `Try ${f.number(built.records.length)} ${f.plural(built.records.length, 'row', { hideCount: true })}`
+                : `Import ${f.number(built?.records.length ?? 0)} ${f.plural(built?.records.length ?? 0, objectType.label.toLowerCase(), { hideCount: true })}`}
             </Button>
           )}
           {step === 'result' && <Button variant="primary" loading={busy} onClick={onClose}>Done</Button>}
@@ -243,6 +257,13 @@ export function ImportDialog({ open, onClose, objectType, properties, users, onI
             <div className="crm-import__filemeta">
               <Badge tone="neutral" size="sm">{fileName}</Badge>
               <span>{f.number(rows.length)} {f.plural(rows.length, 'row', { hideCount: true })} · {headers.length} columns · {mappedCount} mapped</span>
+              {/* Said here, where the mapping can still be changed, rather than
+                  only on the step after it. */}
+              {built && built.missingRequired.length > 0 && (
+                <Badge tone="danger" size="sm">
+                  no column fills {f.list(built.missingRequired.map((p) => p.label))}
+                </Badge>
+              )}
             </div>
             <div className="crm-import__tablewrap">
               <table className="crm-import__table">
@@ -309,22 +330,44 @@ export function ImportDialog({ open, onClose, objectType, properties, users, onI
         {step === 'preview' && built && (
           <div className="crm-import__preview">
             <div className="crm-import__filemeta">
-              <Badge tone="success" size="sm">{f.number(built.records.length)} ready</Badge>
-              {built.problems.length > 0 && <Badge tone="danger" size="sm">{f.number(new Set(built.problems.map((p) => p.row)).size)} held back</Badge>}
+              <Badge tone={built.records.length - built.conditional > 0 ? 'success' : 'neutral'} size="sm">{f.number(built.records.length - built.conditional)} ready</Badge>
+              {built.conditional > 0 && <Badge tone="warning" size="sm">{f.number(built.conditional)} only if they already exist</Badge>}
+              {heldBack > 0 && <Badge tone="danger" size="sm">{f.number(heldBack)} held back</Badge>}
               {built.skipped > 0 && <Badge tone="neutral" size="sm">{f.number(built.skipped)} empty</Badge>}
-              <span>Showing the first {Math.min(PREVIEW_ROWS, built.records.length)} as they will land.</span>
+              <span>
+                {built.records.length
+                  ? `Showing the first ${Math.min(PREVIEW_ROWS, built.records.length)} as they will land.`
+                  : 'Nothing here can be written yet.'}
+              </span>
             </div>
-            {built.problems.length > 0 && (
+            {/* The API fills a missing property from its default and refuses the
+                row when there is none, so a file with no name column is a
+                certain refusal on every row it creates. This step used to
+                answer "3 ready" to exactly that and let the result explain. */}
+            {built.missingRequired.length > 0 && (
+              <Banner
+                tone={built.conditional > 0 ? 'warning' : 'danger'}
+                compact
+                title={built.conditional > 0
+                  ? `${f.number(built.conditional)} ${f.plural(built.conditional, 'row', { hideCount: true })} can only update, never create`
+                  : `Nothing in this file fills ${f.list(built.missingRequired.map((p) => p.label))}`}
+              >
+                {built.conditional > 0
+                  ? `Every ${objectType.label.toLowerCase()} needs ${f.list(built.missingRequired.map((p) => p.label))}, and no column supplies ${built.missingRequired.length === 1 ? 'it' : 'them'}. A row whose ${matchLabel} matches an existing ${objectType.label.toLowerCase()} updates it; any row that does not match is refused.`
+                  : `Every ${objectType.label.toLowerCase()} needs ${f.list(built.missingRequired.map((p) => p.label))}. Map a column to ${built.missingRequired.length === 1 ? 'it' : 'each of them'} on the previous step — nothing in this file can be created without ${built.missingRequired.length === 1 ? 'it' : 'them'}.`}
+              </Banner>
+            )}
+            {problemLines.length > 0 && (
               <Banner tone="warning" compact title="Some rows cannot be written as they are">
                 <ul className="crm-import__problems">
-                  {built.problems.slice(0, 6).map((p, i) => (
+                  {problemLines.slice(0, 6).map((p, i) => (
                     <li key={i}>Row {p.row}, {p.column}: {p.message}</li>
                   ))}
-                  {built.problems.length > 6 && <li>…and {built.problems.length - 6} more. They are listed in the result.</li>}
+                  {problemLines.length > 6 && <li>…and {problemLines.length - 6} more. They are listed in the result.</li>}
                 </ul>
               </Banner>
             )}
-            <div className="crm-import__tablewrap">
+            <div className="crm-import__tablewrap" hidden={built.records.length === 0}>
               <table className="crm-import__table">
                 <thead>
                   <tr>

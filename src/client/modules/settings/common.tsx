@@ -20,7 +20,7 @@ import {
 } from '../../design';
 import type { Role } from './types';
 import { targetLabel, targetRoute } from './targets';
-import { actorLabel } from './audit-core';
+import { actorLabel, type TrailSeat } from './audit-core';
 import './settings.css';
 
 /* ============================== the sub-nav =============================== */
@@ -498,21 +498,38 @@ export function JsonBlock({ value, label, maxHeight = 340 }: { value: unknown; l
   );
 }
 
+/** What a caller knows about ids the session's roster does not hold. */
+export interface ActorNaming {
+  /** Ids the caller can name from a list of its own — the API keys, say. */
+  known?: ReadonlyMap<string, string>;
+  /** What the trail says about teammate ids, from `seatsFromTrail`. */
+  seats?: ReadonlyMap<string, TrailSeat>;
+}
+
 /**
  * Actor ids are opaque (`usr_seed01`, `null` for the system). Every screen that
  * shows one resolves it against the teammates the session already carries, so
  * the audit trail and the event stream name people rather than row ids — and
  * an entry with no actor says so rather than crediting "the platform" with a
  * change the record cannot attribute (see `actorLabel`).
+ *
+ * The roster holds the people who are still here, which is why a screen that
+ * has read the trail hands over what the trail knows as well: a teammate who
+ * has been removed is named off the invitation the trail recorded rather than
+ * shown as the bare id an auditor cannot resolve.
  */
-export function useActorName(): (id: string | null, kind?: string) => string {
+export function useActorName(naming: ActorNaming = {}): (id: string | null, kind?: string) => string {
   const { me } = useSession();
+  const { known, seats } = naming;
   const byId = useMemo(() => {
     const map = new Map<string, string>();
     for (const mate of me?.teammates ?? []) map.set(mate.id, mate.name);
     return map;
   }, [me?.teammates]);
-  return useCallback((id: string | null, kind?: string) => actorLabel(id, kind, (key) => byId.get(key)), [byId]);
+  return useCallback(
+    (id: string | null, kind?: string) => actorLabel(id, kind, (key) => byId.get(key) ?? known?.get(key), seats),
+    [byId, known, seats],
+  );
 }
 
 /**

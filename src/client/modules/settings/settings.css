@@ -335,3 +335,10 @@
  * a column four lines tall beside the title; the header text yields instead.
  */
 .st-body .ain-card__actions { flex: none; white-space: nowrap; }
+
+/*
+ * An account past the allowance its plan includes, in the at-risk banner. The
+ * banner's own tone is "close to a ceiling"; the accounts that are already
+ * through one have to be legible as that at a glance, not read for it.
+ */
+.st-over { color: var(--text-danger); font-weight: var(--weight-medium); }

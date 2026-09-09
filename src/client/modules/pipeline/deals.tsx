@@ -37,7 +37,7 @@ import {
   snapshotMove, sortKeyOf, stageKey, viewToState,
   accountOf, civilDay, dealAmount, dealCloseDate, dealEnteredStage, dealPipeline, dealStage,
   dealWeighted, num, recordHref, str, totalsOf, useDealFormat, useDealProperties, usePipelines,
-  useUserIndex, useUsers, useVelocities,
+  readOnlyReason, useCanWriteDeals, useUserIndex, useUsers, useVelocities,
   type BoardGrid, type BoardState, type CalendarFormat, type DealListEnvelope, type DealRecord, type DealView,
   type Horizon, type OutcomeFilter, type Pipeline, type PipelineStage, type StageVelocity,
 } from './api';
@@ -75,8 +75,8 @@ function StatLabel({ filtered, children }: { filtered: boolean; children: React.
 /* --------------------------------- card ---------------------------------- */
 
 function DealCard({
-  deal, stages, currentStage, velocity, ownerName, reasonLabel, busy, dragging, tabStop, onOpen, onMove, onDragStart,
-  onDragEnd, onFocus, onKeyDown,
+  deal, stages, currentStage, velocity, ownerName, reasonLabel, busy, dragging, tabStop, writable, onOpen, onMove,
+  onDragStart, onDragEnd, onFocus, onKeyDown,
 }: {
   deal: DealRecord;
   stages: PipelineStage[];
@@ -89,6 +89,8 @@ function DealCard({
   dragging: boolean;
   /** This is the one card on the board that Tab reaches; the rest are arrowed to. */
   tabStop: boolean;
+  /** Whether this session may move the deal: below `member` the card is a link and nothing else. */
+  writable: boolean;
   onOpen: () => void;
   onMove: (stage: PipelineStage) => void;
   onDragStart: () => void;
@@ -137,7 +139,9 @@ function DealCard({
         { id: 'open', label: 'Open deal', icon: <Icons.external size={14} />, onSelect: onOpen },
       ],
     },
-    {
+    // A reader gets the menu with one item in it rather than a stage list that
+    // ends in "Your role (readonly) cannot perform this action" on every pick.
+    ...(writable ? [{
       id: 'move',
       label: 'Move to stage',
       items: stages
@@ -149,16 +153,20 @@ function DealCard({
           icon: stage.is_won ? <CheckCircleIcon size={14} /> : stage.is_closed ? <XCircleIcon size={14} /> : <ArrowRightIcon size={14} />,
           onSelect: () => onMove(stage),
         })),
-    },
+    }] : []),
   ];
 
   return (
     <li
       ref={card}
       className={`pl-card${dragging ? ' is-dragging' : ''}${busy ? ' is-busy' : ''}`}
-      draggable
-      onDragStart={(e) => { e.dataTransfer.setData('text/plain', deal.id); e.dataTransfer.effectAllowed = 'move'; onDragStart(); }}
-      onDragEnd={onDragEnd}
+      // A card a reader can pick up is a card that animates out of its column
+      // and snaps back on a 403. Below `member` it does not lift at all.
+      draggable={writable}
+      onDragStart={writable
+        ? (e) => { e.dataTransfer.setData('text/plain', deal.id); e.dataTransfer.effectAllowed = 'move'; onDragStart(); }
+        : undefined}
+      onDragEnd={writable ? onDragEnd : undefined}
       onFocus={onFocus}
       onKeyDown={onKeyDown}
       data-deal={deal.id}
@@ -236,7 +244,7 @@ function DealCard({
 /* -------------------------------- column --------------------------------- */
 
 function StageColumn({
-  stage, pipeline, pipelineLabel, deals, stalled, velocity, ceiling, children, over, blocked, onDragOver,
+  stage, pipeline, pipelineLabel, deals, stalled, velocity, ceiling, children, over, blocked, writable, onDragOver,
   onDragLeave, onDrop, onAdd,
 }: {
   stage: PipelineStage;
@@ -251,6 +259,8 @@ function StageColumn({
   over: boolean;
   /** A card from another pipeline is being held over this column, and cannot land. */
   blocked: boolean;
+  /** Whether this session may land a card here, or open a deal into it. */
+  writable: boolean;
   onDragOver: (e: React.DragEvent) => void;
   onDragLeave: () => void;
   onDrop: (e: React.DragEvent) => void;
@@ -276,9 +286,9 @@ function StageColumn({
     // keyboard can be *put* when the card it was following has left the board.
     <section
       className={`pl-col${over && !blocked ? ' is-over' : ''}${over && blocked ? ' is-blocked' : ''}${stage.is_closed ? ' is-closed' : ''}`}
-      onDragOver={onDragOver}
-      onDragLeave={onDragLeave}
-      onDrop={onDrop}
+      onDragOver={writable ? onDragOver : undefined}
+      onDragLeave={writable ? onDragLeave : undefined}
+      onDrop={writable ? onDrop : undefined}
       aria-label={`${stage.label} — ${f.plural(totals.deals, 'deal')}, ${f.money(totals.amount)}`}
       data-stage={stage.name}
       data-pipeline={pipeline}
@@ -322,7 +332,7 @@ function StageColumn({
         {deals.length === 0 && (
           <li className="pl-col__empty">
             Nothing in {stage.label.toLowerCase()}.
-            {!stage.is_closed && (
+            {!stage.is_closed && writable && (
               <>
                 {' '}
                 <Button size="sm" variant="link" onClick={onAdd}>Add a deal here</Button>
@@ -342,6 +352,11 @@ export function DealsPage() {
   const f = useDealFormat();
   const toast = useToast();
   const { location, navigate, setQuery } = useRouter();
+  // Read once, here: every write affordance on this screen — the header button,
+  // the empty states, the drag, the card menus, the row actions and the bulk
+  // bar — is drawn from this one answer, so none of them can drift out of step
+  // with the rung the server gates the record routes at.
+  const writable = useCanWriteDeals();
 
   const pipelines = usePipelines();
   const properties = useDealProperties();
@@ -597,7 +612,7 @@ export function DealsPage() {
   }, [bulkDone]);
 
   const requestMove = useCallback((deal: DealRecord, stage: PipelineStage) => {
-    if (dealStage(deal) === stage.name) return;
+    if (!writable || dealStage(deal) === stage.name) return;
     const props = properties.data?.data ?? [];
     const needs = stage.is_closed
       || props.some((p) => p.required && !p.read_only && !p.calculated
@@ -608,7 +623,7 @@ export function DealsPage() {
     void moveNow.run({ deal, stage }).catch(() => {
       setPending((prev) => { const next = { ...prev }; delete next[deal.id]; return next; });
     });
-  }, [moveNow, properties.data]);
+  }, [moveNow, properties.data, writable]);
 
   /* -------------------------------- grouping ------------------------------ */
 
@@ -1121,7 +1136,7 @@ export function DealsPage() {
 
   const rowActions = useCallback((row: DealRecord): MenuSection[] => [
     { id: 'open', items: [{ id: 'open', label: 'Open deal', icon: <Icons.external size={14} />, onSelect: () => openDeal(row) }] },
-    {
+    ...(writable ? [{
       // A deal's stages are its own pipeline's stages. Offering the selected
       // pipeline's list would put "Move to Renewal outreach" on a new-business
       // deal, which is a pipeline change the record page does properly.
@@ -1135,8 +1150,8 @@ export function DealsPage() {
           description: `${stage.probability}%`,
           onSelect: () => requestMove(row, stage),
         })),
-    },
-  ], [pipelineByName, openDeal, requestMove, stageOf]);
+    }] : []),
+  ], [pipelineByName, openDeal, requestMove, stageOf, writable]);
 
   /* -------------------------------- render -------------------------------- */
 
@@ -1192,9 +1207,11 @@ export function DealsPage() {
               navigate(`/deals/forecast?${params.toString()}`);
             }}
           />
-          <Button ref={newDealButton} variant="primary" iconLeft={<Icons.plus size={14} />} onClick={() => setNewOpen(true)}>
-            New deal
-          </Button>
+          {writable && (
+            <Button ref={newDealButton} variant="primary" iconLeft={<Icons.plus size={14} />} onClick={() => setNewOpen(true)}>
+              New deal
+            </Button>
+          )}
         </>
       }
     >
@@ -1214,6 +1231,16 @@ export function DealsPage() {
       >
         Skip to the board
       </a>
+
+      {/* Said once, at the top, rather than as a tooltip on each of the twenty
+          controls that are missing. The rung is named because "you do not have
+          permission" is what sends a person to a support queue. */}
+      {!writable && !loading && (
+        <Banner tone="info" title="This board is read-only for you">
+          {readOnlyReason(session.me?.role)} Every figure here is live; New deal, the drag, the stage menus and the
+          bulk actions are not offered rather than offered and refused.
+        </Banner>
+      )}
 
       {board && (
         <div className="pl-summary">
@@ -1418,11 +1445,15 @@ export function DealsPage() {
           title={filtered ? 'No deal matches these filters' : `${allMode ? 'No pipeline' : board.label} has ${allMode ? 'any' : 'no'} deals yet`}
           body={filtered
             ? `Nothing on ${allMode ? 'any pipeline' : board.label} matches ${filterSummary}.`
-            : `Open the first opportunity and it lands in ${board.stages[0]?.label ?? 'the first stage'} at ${board.stages[0]?.probability ?? 0}% — or add it straight into a stage below.`}
+            : writable
+              ? `Open the first opportunity and it lands in ${board.stages[0]?.label ?? 'the first stage'} at ${board.stages[0]?.probability ?? 0}% — or add it straight into a stage below.`
+              : `The first opportunity lands in ${board.stages[0]?.label ?? 'the first stage'} at ${board.stages[0]?.probability ?? 0}%. ${readOnlyReason(session.me?.role)}`}
           action={filtered
             ? <Button variant="primary" onClick={clearFilters}>Clear filters</Button>
-            : <Button variant="primary" iconLeft={<Icons.plus size={14} />} onClick={() => setNewOpen(true)}>New deal</Button>}
-          secondaryAction={filtered ? <Button onClick={() => setNewOpen(true)}>New deal</Button> : undefined}
+            : writable
+              ? <Button variant="primary" iconLeft={<Icons.plus size={14} />} onClick={() => setNewOpen(true)}>New deal</Button>
+              : undefined}
+          secondaryAction={filtered && writable ? <Button onClick={() => setNewOpen(true)}>New deal</Button> : undefined}
         />
       )}
 
@@ -1497,6 +1528,7 @@ export function DealsPage() {
                     ceiling={ceilings.get(pipeline.name) ?? 0}
                     over={over === key}
                     blocked={blocked}
+                    writable={writable}
                     onDragOver={(e) => {
                       // A foreign card is still accepted as a hover, so the
                       // column can say why it will not take it; the effect
@@ -1545,6 +1577,7 @@ export function DealsPage() {
                         busy={!!pending[deal.id]}
                         dragging={dragging === deal.id}
                         tabStop={deal.id === tabStop}
+                        writable={writable}
                         onFocus={() => setRoving(deal.id)}
                         onKeyDown={(e) => onCardKey(deal.id, e)}
                         onOpen={() => openDeal(deal)}
@@ -1603,12 +1636,12 @@ export function DealsPage() {
                 <span className="ain-table__bulknote">
                   {f.money(totals.amount)} · {f.money(totals.weighted)} weighted
                 </span>
-                {!one && (
+                {!one && writable && (
                   <span className="ain-table__bulknote">
                     On {spans.map(pipelineLabel).join(' and ')} — pick one pipeline to move stage.
                   </span>
                 )}
-                {one && (
+                {one && writable && (
                 <MenuButton
                   size="sm"
                   variant="secondary"
@@ -1641,9 +1674,11 @@ export function DealsPage() {
                   Move stage
                 </MenuButton>
                 )}
-                <Button size="sm" variant="secondary" iconLeft={<Icons.user size={13} />} onClick={() => setBulkOwner(true)}>
-                  Reassign
-                </Button>
+                {writable && (
+                  <Button size="sm" variant="secondary" iconLeft={<Icons.user size={13} />} onClick={() => setBulkOwner(true)}>
+                    Reassign
+                  </Button>
+                )}
               </>
             );
           }}
@@ -1675,7 +1710,7 @@ export function DealsPage() {
       )}
 
       <NewDealDialog
-        open={newOpen}
+        open={newOpen && writable}
         onClose={closeNew}
         pipelines={pipelines.data?.data ?? []}
         properties={properties.data?.data ?? []}
@@ -1686,7 +1721,7 @@ export function DealsPage() {
       />
 
       <BulkStageDialog
-        open={!!bulkStage}
+        open={!!bulkStage && writable}
         deals={inView.filter((row) => selection.includes(row.id))}
         stage={bulkStage}
         stages={bulkStage
@@ -1698,7 +1733,7 @@ export function DealsPage() {
       />
 
       <BulkOwnerDialog
-        open={bulkOwner}
+        open={bulkOwner && writable}
         deals={inView.filter((row) => selection.includes(row.id))}
         users={users.data?.data ?? []}
         onClose={() => setBulkOwner(false)}
@@ -1706,7 +1741,7 @@ export function DealsPage() {
       />
 
       <StageMoveDialog
-        open={!!move}
+        open={!!move && writable}
         deal={move?.deal ?? null}
         from={move ? board?.stages.find((s) => s.name === dealStage(move.deal)) : undefined}
         to={move?.stage ?? null}

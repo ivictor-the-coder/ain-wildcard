@@ -241,7 +241,7 @@ const customerName = (id: string): string => app.db.pluck<string>(`SELECT name F
 const sortBooks = (books: Book[]): Book[] =>
   books.filter((b) => b.count > 0).sort((a, b) => Number(b.currency === 'usd') - Number(a.currency === 'usd') || a.currency.localeCompare(b.currency));
 
-function invoiceBooks(where: string, params: unknown[], column: 'total' | 'amount_paid', ids?: string[], currency?: string): Book[] {
+function invoiceBooks(where: string, params: unknown[], column: 'total' | 'amount_paid' | 'amount_due', ids?: string[], currency?: string): Book[] {
   if (ids && !ids.length) return [];
   const scoped = `${where}${ids ? ` AND customer_id IN (${ids.map(() => '?').join(', ')})` : ''}${currency ? ' AND currency = ?' : ''}`;
   const rows = app.db.all<{ c: string; v: number | null; nn: number }>(
@@ -253,8 +253,10 @@ const revenueBooks = (w: Window, ids?: string[], currency?: string): Book[] =>
   invoiceBooks(`status = 'paid' AND paid_at >= ? AND paid_at < ?`, [w.start, w.end], 'amount_paid', ids, currency);
 const invoicedBooks = (w: Window, ids?: string[], currency?: string): Book[] =>
   invoiceBooks(`status NOT IN ('draft', 'void', 'deleted') AND finalized_at >= ? AND finalized_at < ?`, [w.start, w.end], 'total', ids, currency);
+// What is owed is what is still due on a finalised, unsettled bill — never the
+// face value, and never a written-off one: uncollectible is a loss.
 const outstandingBooks = (ids?: string[], currency?: string): Book[] =>
-  invoiceBooks(`status IN ('open', 'past_due', 'unpaid', 'uncollectible')`, [], 'total', ids, currency);
+  invoiceBooks(`status = 'open' AND paid_at IS NULL AND voided_at IS NULL AND marked_uncollectible_at IS NULL AND amount_due > 0`, [], 'amount_due', ids, currency);
 
 /** Recurring revenue from the ledger's own normalisation, one book per currency. */
 function recurringBooks(months: 1 | 12, opts: { customerIds?: string[]; currency?: string } = {}): Book[] {
@@ -699,17 +701,75 @@ function invoicesWith(where: string, params: unknown[]): Expectation {
     also: (body) => assert.equal(body.citations.length, shown),
   };
 }
-function delinquents(now: number): Expectation {
-  const customers = app.db.all<{ id: string; name: string }>(`SELECT id, name FROM billing_customers WHERE org_id = ? AND delinquent = 1`, ORG);
-  const numbers = allow(customers.length);
-  for (const c of customers) {
-    const open = app.db.all<{ amount_due: number; currency: string; due_date: number | null }>(
-      `SELECT amount_due, currency, due_date FROM billing_invoices WHERE org_id = ? AND customer_id = ? AND status IN ('draft', 'open') AND amount_due > 0`, ORG, c.id);
-    const owed = open.reduce((sum, i) => sum + i.amount_due, 0);
-    const oldest = open.map((i) => i.due_date).filter((d): d is number => typeof d === 'number').sort((a, b) => a - b)[0];
-    for (const value of allow(c.name, money2(owed, open[0]?.currency ?? 'usd'), open.length, oldest && oldest < now ? Math.floor((now - oldest) / DAY) : '')) numbers.add(value);
+interface LateBill { id: string; number: string; customer: string; name: string; amount_due: number; currency: string; due_at: number; on_receipt: boolean }
+
+/**
+ * The bills the business is late on, by the product's own rule.
+ *
+ * Read off the raw columns rather than out of any query the engine writes: a
+ * receivable is a finalised bill that has not been paid, voided or written off,
+ * and it is late once the day it falls due has passed — its own due date, or
+ * the day it was finalised when it carries none, because a bill with no terms
+ * is due on receipt. That is the rule `/v1/revenue/collections` publishes and
+ * the rule dunning chases on, and `pastDueAgrees` below holds this list to it.
+ */
+function lateBills(now: number): LateBill[] {
+  const rows = app.db.all<{
+    id: string; number: string; customer_id: string; nm: string | null; amount_due: number; currency: string;
+    due_date: number | null; finalized_at: number | null; created: number; paid_at: number | null; voided_at: number | null; uncollectible_at: number | null;
+  }>(
+    `SELECT i.id, i.number, i.customer_id, i.amount_due, i.currency, i.due_date, i.finalized_at, i.created,
+            i.paid_at, i.voided_at, i.marked_uncollectible_at AS uncollectible_at,
+            (SELECT name FROM billing_customers c WHERE c.id = i.customer_id) AS nm
+     FROM billing_invoices i WHERE i.org_id = ?`, ORG);
+  return rows
+    .filter((r) => r.finalized_at !== null && r.finalized_at <= now)
+    .filter((r) => r.paid_at === null && r.voided_at === null && r.uncollectible_at === null && r.amount_due > 0)
+    .map((r) => ({
+      id: r.id, number: r.number, customer: r.customer_id, name: r.nm ?? r.customer_id,
+      amount_due: r.amount_due, currency: r.currency,
+      due_at: r.due_date ?? r.finalized_at ?? r.created,
+      on_receipt: r.due_date === null,
+    }))
+    .filter((r) => r.due_at <= now)
+    .sort((a, b) => a.due_at - b.due_at || a.id.localeCompare(b.id));
+}
+
+/** The collections report's own past-due count, so this file cannot drift from the product. */
+async function pastDueAgrees(bills: LateBill[]): Promise<void> {
+  const books = (await revenueReport('/v1/revenue/collections', TRAILING)).by_currency as AgeingBook[];
+  const aged = books.reduce((total, b) => total + b.ageing.buckets.filter((x) => x.label !== 'Not yet due').reduce((n2, x) => n2 + x.invoices, 0), 0);
+  assert.equal(bills.length, aged, 'this file and /v1/revenue/collections disagree about what is past due');
+}
+
+/** Every invoice past its due date, as the collections report ages them. */
+async function overdueInvoices(now: number): Promise<Expectation> {
+  const bills = lateBills(now);
+  await pastDueAgrees(bills);
+  const shown = Math.min(bills.length, 25);
+  return {
+    figures: [bills.length ? countRe(bills.length) : NONE],
+    numbers: allow(bills.length, bills.length - shown,
+      ...bills.flatMap((b) => [b.number, b.name, money2(b.amount_due, b.currency), b.on_receipt ? '' : day(b.due_at)])),
+    ids: new Set(bills.map((b) => b.id)),
+    also: (body) => assert.equal(body.citations.length, shown),
+  };
+}
+
+async function delinquents(now: number): Promise<Expectation> {
+  const bills = lateBills(now);
+  await pastDueAgrees(bills);
+  const byCustomer = new Map<string, LateBill[]>();
+  for (const bill of bills) byCustomer.set(bill.customer, [...(byCustomer.get(bill.customer) ?? []), bill]);
+  const numbers = allow(byCustomer.size);
+  for (const [, owed] of byCustomer) {
+    const perCurrency = new Map<string, number>();
+    for (const bill of owed) perCurrency.set(bill.currency, (perCurrency.get(bill.currency) ?? 0) + bill.amount_due);
+    const oldest = Math.min(...owed.map((b) => b.due_at));
+    for (const value of allow(owed[0].name, owed.length, Math.floor((now - oldest) / DAY),
+      ...[...perCurrency].map(([currency, amount]) => money2(amount, currency)))) numbers.add(value);
   }
-  return { figures: [customers.length ? countRe(customers.length) : NONE], numbers, ids: new Set(customers.map((c) => c.id)) };
+  return { figures: [byCustomer.size ? countRe(byCustomer.size) : NONE], numbers, ids: new Set(byCustomer.keys()) };
 }
 /** Every number a product's own price rows carry, in minor and major units. */
 function priceUniverse(productId: string): Expectation {
@@ -1035,11 +1095,11 @@ const CORPUS: CorpusRow[] = [
   { template: 'count-subscriptions-status', q: 'How many trialing subscriptions do we have?', expect: () => countOf(app.db.count(`SELECT COUNT(*) FROM billing_subscriptions WHERE org_id = ? AND status = 'trialing'`, ORG)) },
   { template: 'customers-past-due', q: 'Which customers are past due?', expect: (now) => delinquents(now) },
   { template: 'customers-past-due', q: 'Who owes us money?', expect: (now) => delinquents(now) },
-  { template: 'invoices-status', q: 'Which invoices are overdue?', expect: (now) => invoicesWith(`i.status IN ('draft', 'open') AND i.due_date IS NOT NULL AND i.due_date <= ?`, [now]) },
+  { template: 'invoices-status', q: 'Which invoices are overdue?', expect: (now) => overdueInvoices(now) },
   // A settled bill shows how it was settled — what was paid and when — and no due language.
   { template: 'invoices-status', q: 'List the paid invoices', expect: () => paidInvoices() },
   { template: 'count-invoices-status', q: 'How many invoices are open?', expect: () => countOf(app.db.count(`SELECT COUNT(*) FROM billing_invoices WHERE org_id = ? AND status = 'open'`, ORG)) },
-  { template: 'count-invoices-status', q: 'How many overdue invoices are there?', expect: (now) => countOf(app.db.count(`SELECT COUNT(*) FROM billing_invoices WHERE org_id = ? AND status IN ('draft', 'open') AND due_date IS NOT NULL AND due_date <= ?`, ORG, now)) },
+  { template: 'count-invoices-status', q: 'How many overdue invoices are there?', expect: async (now) => countOf((await overdueInvoices(now)).ids!.size) },
   { template: 'count-invoices-period', q: 'How many invoices did we issue in 2025?', expect: () => countOf(invoicedBooks(YEAR(2025)).reduce((s, b) => s + b.count, 0), [2025]) },
   { template: 'count-invoices-period', q: 'How many invoices were paid in Q2 2026?', expect: () => countOf(revenueBooks(QUARTER(2, 2026)).reduce((s, b) => s + b.count, 0), ['Q2 2026']) },
   { template: 'plan-prices', q: 'What does the Telemetry Cloud Scale plan cost?', expect: () => priceUniverse('prod_nw_scale') },

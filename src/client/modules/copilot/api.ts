@@ -13,7 +13,8 @@ import { recordLink, writeTargetLabel, type Citation } from './citations';
 import type { AiTemplate, Engine, NearestOnWire } from './templates-core';
 
 export {
-  CITATION_ICON, citationHref, citationResolution, dedupeCitations, needsProbe, recordLink, writeTargetLabel, writeTargets,
+  CITATION_ICON, citationHref, citationResolution, dedupeCitations, needsProbe, recordLink, subjectRecordIds,
+  writeTargetLabel, writeTargets,
 } from './citations';
 export type { Citation, CitationProbe, CitationResolution } from './citations';
 
@@ -692,10 +693,10 @@ export function useVocabulary(): VocabularyRead {
 
 
 export {
-  confidenceBand, nearestFromReasoning, noWritePrepared, parseBlocks, propertyAsked, refusalOf, splitRefusalOffer,
-  splitToolEcho, withoutApiInstruction, writeNeedsSwitch,
+  confidenceBand, currencyRefusal, nearestFromReasoning, noWritePrepared, parseBlocks, propertyAsked, refusalOf,
+  splitRefusalOffer, splitToolEcho, withoutApiInstruction, withoutCurrencyClaim, writeNeedsSwitch,
 } from './answer-core';
-export type { Block, ConfidenceBand, StepNote, ToolEcho } from './answer-core';
+export type { Block, ConfidenceBand, CurrencyRefusal, StepNote, ToolEcho } from './answer-core';
 
 export {
   consequenceLines, dealNamedIn, editHref, linkedTargetOf, needsAcknowledgement, spokenPreview, stageConsequences,

@@ -34,6 +34,7 @@ import {
   attributeJobs, covers, dueBy, readRecordedMoves, recordMove, recordedFor, tallyMove,
   type MoveTally, type RecordedMove,
 } from './moves';
+import { seatsFromTrail } from './audit-core';
 import { tileOf } from './tiles';
 import type { AuditEntry, ClockResult, JobRow } from './types';
 
@@ -131,7 +132,6 @@ export function TimeMachinePage() {
   const session = useSession();
   const f = useFormat();
   const toast = useToast();
-  const actorName = useActorName();
   /**
    * `null` means "nothing picked yet", and it is never handed to the picker.
    *
@@ -169,6 +169,14 @@ export function TimeMachinePage() {
   // The move history is read off the audit trail, which is the one read on this
   // screen the server gates at admin. Everything else here is served to anyone.
   const log = useQuery<ListEnvelope<AuditEntry>>('/v1/audit-log', { limit: 500 }, { enabled: admin });
+  /**
+   * Who moved the clock, named off the same read. An admin who has since been
+   * removed is no longer on the session's roster, and every jump they made
+   * read `usr_…` here — so the trail's own memory of that seat is handed over
+   * with it, exactly as the audit screen does.
+   */
+  const seats = useMemo(() => seatsFromTrail(log.data?.data ?? []), [log.data]);
+  const actorName = useActorName({ seats });
   const doneJobs = useQuery<ListEnvelope<JobRow>>('/v1/jobs', { status: 'done', limit: PAGE });
   const failedJobs = useQuery<ListEnvelope<JobRow>>('/v1/jobs', { status: 'failed', limit: PAGE });
   const pendingJobs = useQuery<ListEnvelope<JobRow>>('/v1/jobs', { status: 'pending', limit: PAGE });
@@ -265,11 +273,36 @@ export function TimeMachinePage() {
     }
   };
 
-  /** "12 jobs due", "Nothing due", "12+ jobs due" — what a jump to `to` will run. */
-  const dueLabel = (to: number): { text: string; tone: 'brand' | 'neutral' } => {
+  /**
+   * What a jump to `to` will run, as much as the queue can be asked to say.
+   *
+   * A count of pending rows is not a forecast: every job that runs on the way
+   * may book its own next run inside the same span, and the replay drains the
+   * queue again after each batch. This screen used to promise "18 jobs run on
+   * the way" and then record 42 for that very move, three lines below. The
+   * number is the queue as it stands, said as the floor it is, and `why`
+   * explains it on the control itself.
+   */
+  const dueLabel = (to: number): { text: string; tone: 'brand' | 'neutral'; why: string } => {
     const due = dueBy(pending, to, pendingCapped);
-    if (due.count === 0 && !due.atLeast) return { text: 'Nothing is due — the clock moves, no job runs', tone: 'neutral' };
-    return { text: `${f.number(due.count)}${due.atLeast ? '+' : ''} ${due.count === 1 && !due.atLeast ? 'job runs' : 'jobs run'} on the way`, tone: 'brand' };
+    if (due.floor === 'exact') {
+      return {
+        text: 'Nothing is due — the clock moves, no job runs',
+        tone: 'neutral',
+        why: 'No pending job comes due before that instant, and a job that does not run cannot queue another.',
+      };
+    }
+    const jobs = `${f.number(due.count)} ${due.count === 1 ? 'job' : 'jobs'}`;
+    return {
+      text: `At least ${jobs} ${due.count === 1 ? 'runs' : 'run'} on the way`,
+      tone: 'brand',
+      why: due.floor === 'capped'
+        ? `The queue read is capped at ${PAGE} rows and orders by run_at descending, so the soonest work is exactly what it dropped. `
+          + `${jobs} of what it can see come due before that instant, and each job that runs may queue its next run inside the same jump.`
+        : `${jobs} in the queue come due before that instant. Each one that runs may queue its next run inside the same jump — `
+          + 'a meter that shifts every hour, a dunning retry, a digest that re-enqueues itself — so a jump routinely runs more '
+          + 'than the queue holds right now.',
+    };
   };
 
   const describeTally = (tally: MoveTally): { badge: string; tone: 'success' | 'neutral' | 'warning'; why: string } => {
@@ -381,7 +414,7 @@ export function TimeMachinePage() {
 
         <Card
           title="Jump forward"
-          description="Every job that comes due on the way is executed for real, at its own run_at — not at the far end of the jump."
+          description="Every job that comes due on the way is executed for real, at its own run_at — not at the far end of the jump — and a job that books its own next run comes due again inside the same jump, which is why what each of these will run is a floor rather than a count."
         >
           <Stack gap={6}>
             <div className="st-jumps">
@@ -394,6 +427,10 @@ export function TimeMachinePage() {
                     type="button"
                     className="st-jump"
                     disabled={!admin || !virtual || busy}
+                    // The forecast is a floor, and the reason is the interesting
+                    // part: it is why the history under this control reports a
+                    // bigger number than the button promised.
+                    title={pendingJobs.loading ? undefined : due.why}
                     onClick={() => void jump(to, `Jumped forward ${preset.label.toLowerCase()}`)}
                   >
                     <span className="st-jump__title">{preset.label}</span>

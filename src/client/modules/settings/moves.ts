@@ -177,16 +177,35 @@ export function tallyMove(input: {
 /* ------------------------------ what is due ------------------------------- */
 
 export interface DuePreview {
+  /** Pending rows this read can see coming due at or before the target. */
   count: number;
-  /** The pending read was capped, and its cap drops the *earliest* rows — so the count is a floor. */
+  /** The count is a floor, not the number of jobs the jump will run. */
   atLeast: boolean;
+  /** Why it is a floor, so the sentence under the button can say. */
+  floor: 'exact' | 'requeues' | 'capped';
 }
 
 /**
- * How many pending jobs a jump to `target` would run. `GET /v1/jobs` orders by
- * `run_at DESC`, so a capped page is missing exactly the soonest work; the
- * count is then a lower bound and says so.
+ * How many pending jobs a jump to `target` would run — a floor, whenever it is
+ * not zero.
+ *
+ * The queue is not a fixed list that a jump works through. `drainUntil` steps
+ * the clock to each due batch and drains it, then asks the queue again, so a
+ * job that books its own next run — the fleet-shift meter, a dunning retry, a
+ * re-enqueuing digest — comes due again inside the same jump and runs again.
+ * The pending page holds one row for each of those, and the jump runs it as
+ * many times as the span allows: "A day" forecast 18 jobs on the demo
+ * workspace and the move it made recorded 42, on the same screen, minutes
+ * apart. So a positive count is stated as a floor and never as the answer.
+ *
+ * Zero is exact, though, and worth keeping exact: if nothing is due before the
+ * target then nothing runs, and nothing that did not run can queue anything.
+ * Unless the read itself was cut — `GET /v1/jobs` orders by `run_at DESC`, so
+ * a capped page is missing exactly the soonest work, which is the work a jump
+ * reaches first.
  */
 export function dueBy(pending: readonly { run_at: number }[], target: number, capped: boolean): DuePreview {
-  return { count: pending.filter((job) => job.run_at <= target).length, atLeast: capped };
+  const count = pending.filter((job) => job.run_at <= target).length;
+  const floor = capped ? 'capped' : count === 0 ? 'exact' : 'requeues';
+  return { count, atLeast: floor !== 'exact', floor };
 }

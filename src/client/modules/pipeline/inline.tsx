@@ -35,6 +35,16 @@ interface InlineScope {
   active: string | null;
   open: (name: string) => void;
   close: (name: string) => void;
+  /**
+   * Whether this session may write the record at all.
+   *
+   * `PATCH /v1/records/deal/:id` is gated at `member`, and every row here used
+   * to open its editor for an analyst and a read-only seat — the refusal came
+   * after the typing, as a toast, with the value thrown away. It rides the
+   * scope rather than each row's props because the answer is a property of the
+   * record being edited, not of the field.
+   */
+  writable: boolean;
 }
 
 const InlineScopeContext = createContext<InlineScope | null>(null);
@@ -46,13 +56,14 @@ const InlineScopeContext = createContext<InlineScope | null>(null);
  * "Enter saves" hints, and no way to know which one a keystroke would land in.
  * A row that opens outside a scope still works; it just cannot close anyone.
  */
-export function InlineEditingScope({ children }: { children: ReactNode }) {
+export function InlineEditingScope({ writable = true, children }: { writable?: boolean; children: ReactNode }) {
   const [active, setActive] = useState<string | null>(null);
   const value = useMemo<InlineScope>(() => ({
     active,
     open: (name) => setActive(name),
     close: (name) => setActive((current) => (current === name ? null : current)),
-  }), [active]);
+    writable,
+  }), [active, writable]);
   return <InlineScopeContext.Provider value={value}>{children}</InlineScopeContext.Provider>;
 }
 
@@ -73,8 +84,11 @@ export function InlineProperty({
 }: InlinePropertyProps) {
   const toast = useToast();
   const scope = useContext(InlineScopeContext);
+  // A row outside a scope is its own scope, and every one of those is on a
+  // screen that has already decided the record is writable.
+  const writable = scope?.writable ?? true;
   const [editingAlone, setEditingAlone] = useState(false);
-  const editing = scope ? scope.active === property.name : editingAlone;
+  const editing = writable && (scope ? scope.active === property.name : editingAlone);
   const setEditing = (next: boolean) => {
     if (scope) { if (next) scope.open(property.name); else scope.close(property.name); }
     else setEditingAlone(next);
@@ -175,6 +189,15 @@ export function InlineProperty({
   /* --------------------------- the two exceptions -------------------------- */
 
   if (STAGE_OWNED.has(property.name)) {
+    // The two confirmations behind these links are writes, so a reader gets the
+    // value and nothing to press.
+    if (!writable) {
+      return (
+        <span className="pl-inline pl-inline--derived">
+          <span className="pl-inline__text">{display}</span>
+        </span>
+      );
+    }
     return (
       <span className="pl-inline pl-inline--linked">
         <span className="pl-inline__text">{display}</span>
@@ -199,6 +222,16 @@ export function InlineProperty({
       <span className="pl-inline pl-inline--derived">
         <span className="pl-inline__text">{display}</span>
         <Badge size="sm" tone="neutral">derived</Badge>
+      </span>
+    );
+  }
+
+  // Below `member` the value is the whole row: no pencil, no button, and an
+  // empty property reads as empty rather than as "Add close reason".
+  if (!writable) {
+    return (
+      <span className="pl-inline pl-inline--derived">
+        <span className="pl-inline__text">{emptyValue(deal.properties[property.name]) ? '—' : display}</span>
       </span>
     );
   }

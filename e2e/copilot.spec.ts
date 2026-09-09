@@ -491,3 +491,149 @@ test.describe('the run log and the tools tab', () => {
     await expect(page.getByLabel('Filter the tools')).toHaveAttribute('placeholder', 'Filter the tools');
   });
 });
+
+/* ------------------------------------------------------------------------- */
+/* A client-only rule, a refusal that stated a falsehood, and a promise about  */
+/* citations the surface kept three times in four.                            */
+/* ------------------------------------------------------------------------- */
+
+interface CompanyRecord { id: string; display_name: string }
+
+test.describe('a copilot write that would close a deal with no reason', () => {
+  test('is refused on the card, because the board refuses the same move', async ({ page, request }) => {
+    await signIn(page, request);
+    // An open deal on the default pipeline, and the closing stage that pipeline
+    // calls won — both read from the workspace rather than written down.
+    interface StageRow { name: string; label: string; is_closed: boolean; is_won: boolean }
+    interface PipelineRow { name: string; label: string; is_default: boolean; stages: StageRow[] }
+    const pipelines = await getJson<{ data: PipelineRow[] }>(request, '/api/v1/pipelines/deal');
+    const board = pipelines.data.find((row) => row.is_default) ?? pipelines.data[0];
+    const won = board.stages.find((stage) => stage.is_won)!;
+    const open = (await getJson<{ data: DealRecord[] }>(
+      request, '/api/v1/records/deal?limit=50&sort=amount&order=desc',
+    )).data.find((row) => row.properties.pipeline === board.name
+      && row.properties.deal_status === 'open'
+      && !row.properties.close_reason)!;
+    expect(open, 'the workspace has no open deal without a close reason').toBeTruthy();
+
+    const { thread } = await threadWith(request, [`Move ${open.display_name} to the ${won.label} stage`], true);
+    await visit(page, `/copilot?thread=${thread.id}`, '.cp-approval__actions');
+
+    // The write carries the stage and nothing else — which is exactly the move
+    // the stage dialog will not let through until the reason is filled in.
+    await expect(page.getByText('This close records no close reason')).toBeVisible();
+    const approve = page.getByRole('button', { name: /^Approve/ });
+    await expect(approve).toBeDisabled();
+    await expect(approve).toHaveAttribute('title', /close reason, which this workspace requires/);
+    // No tick that would promise the write can be let through anyway.
+    await expect(page.getByText('Yes — close this deal and take it out of the forecast')).toHaveCount(0);
+    // And the way that does work is on the card.
+    await expect(page.getByRole('link', { name: new RegExp(`Close ${open.display_name}`.slice(0, 30)) })).toBeVisible();
+
+    // Nothing was written by looking at it.
+    const after = await getJson<DealRecord>(request, `/api/v1/records/deal/${open.id}`);
+    expect(after.properties.deal_stage).toBe(open.properties.deal_stage);
+    expect(after.properties.deal_status).toBe('open');
+  });
+
+  test('still approves the open-to-open move, which the board also allows', async ({ page, request }) => {
+    await signIn(page, request);
+    interface StageRow { name: string; label: string; is_closed: boolean }
+    interface PipelineRow { name: string; is_default: boolean; stages: StageRow[] }
+    const pipelines = await getJson<{ data: PipelineRow[] }>(request, '/api/v1/pipelines/deal');
+    const board = pipelines.data.find((row) => row.is_default) ?? pipelines.data[0];
+    const open = (await getJson<{ data: DealRecord[] }>(request, '/api/v1/records/deal?limit=50')).data
+      .find((row) => row.properties.pipeline === board.name && row.properties.deal_status === 'open')!;
+    const to = board.stages.find((stage) => !stage.is_closed && stage.name !== open.properties.deal_stage)!;
+
+    const { thread } = await threadWith(request, [`Move ${open.display_name} to the ${to.label} stage`], true);
+    await visit(page, `/copilot?thread=${thread.id}`, '.cp-approval__actions');
+    await expect(page.getByText('This close records no close reason')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Approve/ })).toBeEnabled();
+  });
+});
+
+test.describe('a money measure asked for in a currency it does not hold', () => {
+  test('does not state the engine’s claim about the books, and offers the question that answers it', async ({ page, request }) => {
+    await signIn(page, request);
+    const asked = 'What is our overdue balance in GBP?';
+    const { thread, answers } = await threadWith(request, [asked]);
+    // The premise: the engine refuses with a sentence about the whole measure.
+    expect(answers[0].content).toMatch(/carry no currency book|there is no GBP book/);
+
+    await visit(page, `/copilot?thread=${thread.id}`, '.cp-answer');
+    const answer = page.locator('.cp-answer').last();
+    await expect(answer.locator('.cp-answer__body')).toContainText("I can't answer that as asked", { timeout: 15_000 });
+    // The claim itself is nowhere on the card as prose.
+    await expect(answer.locator('.cp-answer__body')).not.toContainText('carry no currency book');
+    await expect(answer.locator('.cp-answer__body')).not.toContainText('the whole of it');
+    await expect(answer.getByText('The copilot will not narrow Overdue balance to GBP')).toBeVisible();
+    // And the question that does come back with the books is one press away.
+    await answer.getByRole('button', { name: 'What is our overdue balance?' }).click();
+    const settled = page.locator('.cp-answer').last();
+    await expect(settled).toContainText(/Overdue balance is|nothing is overdue|Overdue balance in/i, { timeout: 20_000 });
+  });
+});
+
+test.describe('the promise that every record an answer used is cited', () => {
+  test('names the account an uncited answer was scoped to, and says so when there is no row to name', async ({ page, request }) => {
+    await signIn(page, request);
+    // A company with nothing on it: the engine reads it, answers "none", and
+    // cites nothing — which is the shape the empty state used to over-promise.
+    const name = `Halvorsen Kraftteknikk ${Date.now()}`;
+    const company = await postJson<CompanyRecord>(request, '/api/v1/records/company', { properties: { name } });
+    const asked = `How many open tickets does ${name} have?`;
+    const { thread, answers } = await threadWith(request, [asked, 'How many invoices are open?']);
+    expect(answers[0].citations, 'the engine cited something after all').toHaveLength(0);
+    expect(answers[1].citations).toHaveLength(0);
+
+    await visit(page, `/copilot?thread=${thread.id}`, '.cp-answer');
+    const scoped = page.locator('.cp-answer').first();
+    const sources = scoped.locator('[data-plan-sources] a.cp-chip').first();
+    await expect(sources).toContainText(name, { timeout: 15_000 });
+    await expect(sources).toHaveAttribute('href', `/companies/${company.id}`);
+
+    // Where the plan named no record, the card says what it measured instead of
+    // leaving the promise silently unkept.
+    const counted = page.locator('.cp-answer').last();
+    await expect(counted).toContainText('it is measured over a set', { timeout: 15_000 });
+    await expect(counted.locator('[data-plan-sources]')).toHaveCount(0);
+
+    // The empty state no longer promises what a quarter of the shapes cannot do.
+    await visit(page, '/copilot?new=1', '.ain-empty');
+    await expect(page.locator('.ain-empty').first()).not.toContainText('cites every record it used');
+    await expect(page.locator('.ain-empty').first()).toContainText('links every one of them');
+  });
+});
+
+test.describe('the copilot a read-only seat is given', () => {
+  test('offers no writes switch and no decision, because both are refused at the member rung', async ({ page, request }) => {
+    await request.post('/api/v1/auth/demo');
+    const email = `reid.onley+${Date.now()}@northwind.io`;
+    const seat = await postJson<{ invitation: { token: string } }>(
+      request, '/api/v1/users', { email, name: 'Reid Onley', role: 'readonly' },
+    );
+    await postJson(request, '/api/v1/auth/accept', { token: seat.invitation.token, password: 'demo1234' });
+    // Redeeming an invitation signs this request context in as the new seat.
+    await request.post('/api/v1/auth/demo');
+
+    // A pending write, prepared by the owner, that the reader will be shown.
+    const { thread } = await threadWith(request, ['Add a note on Aconcagua Alimentos: the pilot slipped to October.'], true);
+
+    await page.goto('/', { waitUntil: 'domcontentloaded' });
+    const login = await page.request.post('/api/v1/auth/login', { data: { email, password: 'demo1234' } });
+    expect(login.ok(), `sign-in as ${email}: ${login.status()}`).toBeTruthy();
+
+    await visit(page, '/copilot?new=1', 'textarea[aria-label="Ask the copilot"]');
+    await expect(page.getByRole('switch', { name: 'Let it prepare writes' })).toHaveCount(0);
+    await expect(page.getByText('Reads only — preparing a write needs the member role or higher.')).toBeVisible();
+    // Even asked for by the address the "turn it on" affordance uses.
+    await visit(page, '/copilot?new=1&writes=1', 'textarea[aria-label="Ask the copilot"]');
+    await expect(page.getByRole('switch', { name: 'Let it prepare writes' })).toHaveCount(0);
+
+    await visit(page, `/copilot?thread=${thread.id}`, '.cp-approval__actions');
+    await expect(page.getByRole('button', { name: /^Approve/ })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Decline' })).toHaveCount(0);
+    await expect(page.getByText('Deciding a write needs the member role or higher')).toBeVisible();
+  });
+});

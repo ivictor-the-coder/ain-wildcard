@@ -460,12 +460,14 @@ export type InvoiceBillingReason = (typeof INVOICE_BILLING_REASONS)[number];
 
 /**
  * Where a line came from. `recurring` is the subscription's own fee for the
- * period; the three proration kinds come from `billing_pending_items`; the last
- * four are what the credits module hands over for usage already consumed.
+ * period; the three proration kinds come from `billing_pending_items`; four of
+ * the rest are what the credits module hands over for usage already consumed;
+ * and `included_allowance` is the negative line that takes the plan's own
+ * included quantity back off a metered charge, priced on that price's tiers.
  */
 export const INVOICE_LINE_KINDS = [
   'recurring', 'unused_time', 'remaining_time', 'immediate',
-  'usage', 'credit_covered', 'topup', 'true_up', 'invoice_item',
+  'usage', 'credit_covered', 'topup', 'true_up', 'included_allowance', 'invoice_item',
 ] as const;
 export type InvoiceLineKind = (typeof INVOICE_LINE_KINDS)[number];
 
@@ -776,8 +778,21 @@ export interface CreditNote {
   tax: number;
   /** `subtotal + tax`. What the invoice is reduced by. */
   total: number;
-  /** Taken off `amount_due` because nothing had been collected yet. */
+  /** Taken off `amount_due`, because that much of the bill was still owed. */
   pre_payment_amount: number;
+  /**
+   * How much of `pre_payment_amount` the bill could not absorb, because that
+   * much had already been collected against it, and which therefore left the
+   * bill for the customer's balance.
+   *
+   * Not a fourth destination beside the three below: those describe a note
+   * raised against a bill that was already paid in full. This is the same thing
+   * happening to a note raised against one that was *part* paid — the note
+   * still reduces what is owed, because that is what withdrawing it has to put
+   * back, and this says how much of it could not stay there. Zero on every note
+   * against a bill that had collected nothing, which is nearly all of them.
+   */
+  displaced_to_balance: number;
   /** Put back to the customer because the bill had been paid: the three amounts below add up to it. */
   post_payment_amount: number;
   /** Sent back to the card through the payments module. */

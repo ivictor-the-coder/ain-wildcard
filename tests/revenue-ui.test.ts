@@ -507,9 +507,7 @@ describe('what a credit write invalidates', () => {
 
 /* ------------------------------- the retry policy ------------------------- */
 
-import {
-  MAX_ATTEMPTS, MIN_ATTEMPTS, attemptsError, collectionHourError, policySavedLine, recoveryRateText,
-} from '../src/client/modules/revenue/dunning-policy';
+import { MAX_ATTEMPTS, MIN_ATTEMPTS, attemptsError, canPresent, cannotPresentReason, collectionHourError, policySavedLine, recoveryRateText } from '../src/client/modules/revenue/dunning-policy';
 
 describe('the retry policy form', () => {
   it('refuses 0 and 13 attempts in words, and accepts the server’s 1–12', () => {
@@ -598,5 +596,351 @@ describe('addresses the brief names', () => {
     assert.match(board, /id="movement"/, 'the board has a section to land on');
     assert.match(board, /id="collections"/);
     assert.match(board, /useScrollToHash\(\)/);
+  });
+});
+
+/* ------------------------------ the pack picker --------------------------- */
+
+import {
+  PACK_ANY_CHARGE, packGrantLine, packGrantPlan, packMeterHint, packRedemptionError, packSize, packTopUpBody,
+} from '../src/client/modules/revenue/credit-pack';
+import type { PackPrice, PackProduct } from '../src/client/modules/revenue/credit-pack';
+
+/** `price_nw_credit_pack` and `prod_nw_credits`, exactly as the catalogue returns them. */
+const PACK_PRICE: PackPrice = {
+  id: 'price_nw_credit_pack',
+  product: 'prod_nw_credits',
+  recurring: null,
+  metadata: { component: 'credits', events_per_pack: '1000000' },
+};
+const PACK_PRODUCT: PackProduct = {
+  id: 'prod_nw_credits',
+  unit_label: 'pack',
+  metadata: { events_per_pack: '1000000', drawdown_order: 'before_overage' },
+};
+const SEAT_PRICE: PackPrice = {
+  id: 'price_nw_scale_seat_monthly',
+  product: 'prod_nw_scale',
+  recurring: { meter: null },
+  metadata: { component: 'seat', term: 'monthly', included_with_plan: '25' },
+};
+
+describe('what the pack picker sells', () => {
+  it('reads the pack size off the price, and off its product when the price is silent', () => {
+    assert.equal(packSize(PACK_PRICE, PACK_PRODUCT), 1_000_000);
+    // The price wins, so a repriced pack can change size without editing the
+    // product every other price hangs off.
+    assert.equal(packSize({ ...PACK_PRICE, metadata: { units_per_pack: '250000' } }, PACK_PRODUCT), 250_000);
+    assert.equal(packSize({ ...PACK_PRICE, metadata: { component: 'credits' } }, PACK_PRODUCT), 1_000_000);
+    assert.equal(packSize(SEAT_PRICE, { id: 'prod_nw_scale', unit_label: 'seat', metadata: { rung: '3' } }), 0);
+  });
+
+  it('sells the metered pack as prepaid units, naming the meter and the size', () => {
+    const plan = packGrantPlan('mtr_nw_telemetry', packSize(PACK_PRICE, PACK_PRODUCT), 5);
+    assert.deepEqual(plan, { kind: 'unit', meter: 'mtr_nw_telemetry', unitsPerPack: 1_000_000, units: 5_000_000 });
+    // Both halves are sent: the catalogue never links `prod_nw_credits` to a
+    // meter, so a request that leaves the denomination to be inferred is the
+    // request that made five packs of events into $2,300 of spendable money.
+    assert.deepEqual(packTopUpBody(plan), {
+      kind: 'unit',
+      applicability: { scope: 'targeted', meters: ['mtr_nw_telemetry'] },
+    });
+  });
+
+  it('still sells unrestricted money when that is what was asked for', () => {
+    const plan = packGrantPlan(PACK_ANY_CHARGE, 1_000_000, 5);
+    assert.deepEqual(plan, { kind: 'monetary', meter: null });
+    assert.deepEqual(packTopUpBody(plan), { kind: 'monetary', applicability: { scope: 'all' } });
+  });
+
+  it('a pack whose price states no size, pointed at a meter, is money for that meter alone', () => {
+    const plan = packGrantPlan('mtr_nw_export', 0, 2);
+    assert.deepEqual(plan, { kind: 'monetary', meter: 'mtr_nw_export' });
+    assert.deepEqual(packTopUpBody(plan), {
+      kind: 'monetary',
+      applicability: { scope: 'targeted', meters: ['mtr_nw_export'] },
+    });
+  });
+
+  it('withholds the sale of a unit pack until it names a meter, and says why', () => {
+    const refused = packRedemptionError('', packSize(PACK_PRICE, PACK_PRODUCT), '1,000,000 events');
+    assert.match(String(refused), /1,000,000 events a pack/);
+    assert.match(String(refused), /cannot pay for exported gigabytes/);
+    assert.equal(packRedemptionError('mtr_nw_telemetry', 1_000_000, '1,000,000 events'), null);
+    assert.equal(packRedemptionError(PACK_ANY_CHARGE, 1_000_000, '1,000,000 events'), null);
+  });
+
+  it('states what the customer receives in the denomination they receive it in', () => {
+    const opts = {
+      quantity: 5,
+      packLabel: 'pack',
+      meterName: 'Telemetry events',
+      units: (n: number) => `${n.toLocaleString('en-US')} events`,
+      money: (minor: number) => `$${(minor / 100).toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+      amount: 230_000,
+      plural: (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`,
+    };
+    const unit = packGrantLine(packGrantPlan('mtr_nw_telemetry', 1_000_000, 5), opts);
+    assert.match(unit, /5,000,000 events/, 'the total units the packs grant');
+    assert.match(unit, /Telemetry events/);
+    // A unit pack grants events, not the money it cost — printing the charge
+    // here is the confusion the dialog exists to remove.
+    assert.doesNotMatch(unit, /\$2,300/);
+
+    const money = packGrantLine(packGrantPlan(PACK_ANY_CHARGE, 1_000_000, 5), opts);
+    assert.match(money, /\$2,300\.00/);
+    assert.match(money, /any charge in this currency/);
+  });
+
+  it('defaults from the meter the catalogue names, and to nothing when it names none', () => {
+    assert.equal(packMeterHint(PACK_PRICE, PACK_PRODUCT), null, 'the seeded pack names no meter, so the dialog must ask');
+    assert.equal(packMeterHint({ ...PACK_PRICE, metadata: { ...PACK_PRICE.metadata, meter: 'telemetry_events' } }, PACK_PRODUCT), 'telemetry_events');
+    assert.equal(packMeterHint({ ...PACK_PRICE, recurring: { meter: 'telemetry_events' } }, PACK_PRODUCT), 'telemetry_events');
+    assert.equal(packMeterHint(PACK_PRICE, { ...PACK_PRODUCT, metadata: { meter: 'mtr_nw_telemetry' } }), 'mtr_nw_telemetry');
+  });
+
+  it('the dialog sends the denomination rather than letting it be inferred', () => {
+    const credits = readFileSync(new URL('../src/client/modules/revenue/credits.tsx', import.meta.url), 'utf8');
+    assert.match(credits, /\.\.\.packTopUpBody\(plan\)/);
+    assert.match(credits, /label="Redeemable against"/);
+  });
+});
+
+/* --------------------------- settling a true-up --------------------------- */
+
+import {
+  RESOLUTION_COPY, allowedResolutions, defaultResolution, resolutionBlockedBecause, trueUpDirection,
+  trueUpRefusalText, trueUpWorthText,
+} from '../src/client/modules/revenue/true-up';
+import type { TrueUpBasis } from '../src/client/modules/revenue/true-up';
+
+const usd = (minor: number) => `$${(Math.abs(minor) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const events = (count: number) => `${count.toLocaleString('en-US')} events`;
+
+/**
+ * `GET /v1/meter-period-closures/:id` for Meridian Forge's Aug 9 – Sep 8
+ * window: billed at 31,845,798 events, reads 32,022,241 today, and the
+ * 250,000 that arrived late are worth $47.50 on the price it was billed on.
+ */
+const UNDER_BILLED: TrueUpBasis = {
+  outstanding_amount: 4_750, outstanding_quantity: 250_000, price: 'price_nw_telemetry_events', currency: 'usd',
+};
+const OVER_BILLED: TrueUpBasis = {
+  outstanding_amount: -1_397, outstanding_quantity: -73_557, price: 'price_nw_telemetry_events', currency: 'usd',
+};
+const FREE_DRIFT: TrueUpBasis = {
+  outstanding_amount: 0, outstanding_quantity: 4_000, price: 'price_nw_telemetry_events', currency: 'usd',
+};
+const NO_PRICE: TrueUpBasis = { outstanding_amount: null, outstanding_quantity: 9_000, price: null, currency: 'usd' };
+const AGREES: TrueUpBasis = {
+  outstanding_amount: 0, outstanding_quantity: 0, price: 'price_nw_telemetry_events', currency: 'usd',
+};
+
+describe('what a true-up is worth before it is settled', () => {
+  it('reads the direction off the re-priced closure, so the money is known before anything is chosen', () => {
+    assert.equal(trueUpDirection(UNDER_BILLED), 'under_billed');
+    assert.equal(trueUpDirection(OVER_BILLED), 'over_billed');
+    assert.equal(trueUpDirection(FREE_DRIFT), 'free');
+    assert.equal(trueUpDirection(NO_PRICE), 'unpriced');
+    assert.equal(trueUpDirection(AGREES), 'agrees');
+    assert.equal(trueUpDirection(null), null, 'nothing is claimed until the window has been read');
+  });
+
+  it('offers only the resolution the drift allows, and opens on it', () => {
+    assert.deepEqual(allowedResolutions('under_billed'), ['rebilled', 'ignored']);
+    assert.deepEqual(allowedResolutions('over_billed'), ['credited', 'ignored']);
+    assert.deepEqual(allowedResolutions('agrees'), ['ignored']);
+    assert.deepEqual(allowedResolutions('unpriced'), ['ignored']);
+    // Usage that arrives late is owed, which is the commonest drift there is —
+    // and the dialog used to open on `credited`, the one answer the server
+    // refuses for it.
+    assert.equal(defaultResolution(trueUpDirection(UNDER_BILLED)), 'rebilled');
+    assert.equal(defaultResolution(trueUpDirection(OVER_BILLED)), 'credited');
+    assert.equal(defaultResolution(trueUpDirection(NO_PRICE)), 'ignored');
+  });
+
+  it('states the worth and which way it points, in money rather than minor units', () => {
+    const owed = trueUpWorthText('under_billed', { money: usd, units: events, basis: UNDER_BILLED, loading: false });
+    assert.match(owed, /\$47\.50/);
+    assert.match(owed, /250,000 events/);
+    assert.match(owed, /still owes/);
+    assert.doesNotMatch(owed, /4750|4,750/, 'the raw minor units never reach a screen');
+    assert.doesNotMatch(owed, /Not priced/, 'the closure names a price, so it is priced');
+
+    const back = trueUpWorthText('over_billed', { money: usd, units: events, basis: OVER_BILLED, loading: false });
+    assert.match(back, /\$13\.97/);
+    assert.match(back, /owed back to the customer/);
+
+    // The one case where "not priced" is true is the one that says it.
+    const none = trueUpWorthText('unpriced', { money: usd, units: events, basis: NO_PRICE, loading: false });
+    assert.match(none, /Not priced/);
+  });
+
+  it('explains a refusal in the workspace’s money and the radio’s own label', () => {
+    const raw = {
+      code: 'parameter_invalid',
+      param: 'resolution',
+      message: 'This period is under-billed by 4750 minor units, not over-billed. Resolve it as `rebilled`.',
+    };
+    const said = trueUpRefusalText(raw, 'under_billed', usd(4_750));
+    assert.match(said, /\$47\.50/);
+    assert.match(said, new RegExp(RESOLUTION_COPY.rebilled));
+    assert.doesNotMatch(said, /minor units/);
+    assert.doesNotMatch(said, /`/, 'no wire enum in backticks');
+
+    const other = trueUpRefusalText({ ...raw, message: 'This period is over-billed by 1397 minor units, not under-billed. Resolve it as `credited`.' }, 'over_billed', usd(1_397));
+    assert.match(other, new RegExp(RESOLUTION_COPY.credited));
+    assert.doesNotMatch(other, /minor units/);
+
+    // Anything the dialog cannot say better is the server's to explain.
+    assert.equal(trueUpRefusalText({ code: 'rate_limited', param: null, message: 'Slow down.' }, 'under_billed', '$47.50'), 'Slow down.');
+  });
+
+  it('says on the option itself why the other direction is not on offer', () => {
+    assert.equal(resolutionBlockedBecause('rebilled', 'under_billed', usd(4_750)), null);
+    assert.match(String(resolutionBlockedBecause('credited', 'under_billed', usd(4_750))), /nothing to credit/);
+    assert.match(String(resolutionBlockedBecause('rebilled', 'over_billed', usd(1_397))), /nothing more to bill/);
+    assert.equal(resolutionBlockedBecause('ignored', 'agrees', '—'), null);
+  });
+
+  it('the dialog reads the closure rather than the entry’s empty amount', () => {
+    const usage = readFileSync(new URL('../src/client/modules/revenue/usage.tsx', import.meta.url), 'utf8');
+    assert.match(usage, /\/v1\/meter-period-closures\/\$\{entry\.closure\}/);
+    assert.match(usage, /trueUpRefusalText/);
+    // The sentence an open entry's null `amount` used to produce.
+    assert.doesNotMatch(usage, /the period was billed without naming a price/);
+  });
+});
+
+/* --------------------- what the schedule decided next --------------------- */
+
+import { nextAttemptFact, nextAttemptLine } from '../src/client/modules/revenue/dunning-policy';
+
+/**
+ * Van Doorn Verpakking's campaign as `GET /v1/dunning/:id` returns it: two
+ * refusals three days apart, and a queue holding Sep 11 — eleven days after
+ * the second, because the five-day slot had already gone past.
+ */
+const ATTEMPT_2 = {
+  attempt_number: 2,
+  scheduled_for: Date.UTC(2026, 7, 31, 6, 25),
+  attempted_at: Date.UTC(2026, 7, 31, 6, 25),
+  next_attempt_at: Date.UTC(2026, 8, 11, 9, 52),
+  outcome: 'failed',
+  decision: 'Attempt 2 was refused with insufficient_funds again. Attempt 3 of 4 is scheduled five days out — €89.00 is still at risk.',
+};
+const VAN_DOORN = { max_attempts: 4, next_attempt_at: Date.UTC(2026, 8, 11, 9, 52) };
+const asDate = (at: number) => new Date(at).toISOString().slice(0, 10);
+const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+
+describe('what the recovery timeline says the schedule decided', () => {
+  it('reads the instant off the attempt, so the timeline and the Next attempt tile cannot disagree', () => {
+    const fact = nextAttemptFact(ATTEMPT_2, VAN_DOORN, true);
+    assert.ok(fact);
+    assert.equal(fact.at, VAN_DOORN.next_attempt_at, 'the same field the tile above reads');
+    assert.equal(fact.attempt, 3);
+    assert.equal(fact.of, 4);
+    assert.equal(fact.gapDays, 11);
+    assert.equal(fact.movedTo, null);
+  });
+
+  it('states the date, and a gap that agrees with it', () => {
+    const fact = nextAttemptFact(ATTEMPT_2, VAN_DOORN, true);
+    assert.ok(fact);
+    const line = nextAttemptLine(fact, asDate, plural);
+    assert.match(line, /2026-09-11/);
+    assert.match(line, /11 days after this one/);
+    // The claim the recorded prose made, and the tile contradicted.
+    assert.doesNotMatch(line, /five days/);
+    assert.doesNotMatch(line, /5 days/);
+  });
+
+  it('says so when the campaign has moved the slot since the attempt recorded one', () => {
+    const moved = nextAttemptFact(ATTEMPT_2, { ...VAN_DOORN, next_attempt_at: Date.UTC(2026, 8, 14, 9, 52) }, true);
+    assert.ok(moved);
+    assert.equal(moved.movedTo, Date.UTC(2026, 8, 14, 9, 52));
+    assert.match(nextAttemptLine(moved, asDate, plural), /moved it since, to 2026-09-14/);
+    // Only the newest attempt is compared: an older one recorded a slot the
+    // campaign has legitimately left behind.
+    assert.equal(nextAttemptFact(ATTEMPT_2, { ...VAN_DOORN, next_attempt_at: Date.UTC(2026, 8, 14) }, false)?.movedTo, null);
+  });
+
+  it('leaves the server’s explanation in place where there is no next attempt', () => {
+    assert.equal(nextAttemptFact({ ...ATTEMPT_2, next_attempt_at: null }, VAN_DOORN, true), null);
+    assert.equal(nextAttemptFact({ ...ATTEMPT_2, outcome: 'succeeded', next_attempt_at: null }, VAN_DOORN, true), null);
+  });
+
+  it('the drawer draws the timeline from the instant, not from the prose', () => {
+    const source = readFileSync(new URL('../src/client/modules/revenue/dunning.tsx', import.meta.url), 'utf8');
+    assert.match(source, /nextAttemptFact\(attempt, row/);
+    assert.match(source, /nextAttemptLine\(next/);
+  });
+});
+
+/* ----------------------------- a spent grant ------------------------------ */
+
+import { grantStatusWord } from '../src/client/modules/revenue/credits-math';
+import { statusLabel, statusTone } from '../src/client/design/status-core';
+
+describe('a credit grant drawn down to nothing', () => {
+  it('is not called what dunning calls a bill it stopped chasing', () => {
+    // The kit's lifecycle word for `exhausted`, which is right for a campaign.
+    assert.equal(statusLabel('exhausted'), 'Given up');
+    assert.equal(statusLabel(grantStatusWord('exhausted')), 'Spent');
+    // And finished, not failed: a customer who used their prepaid events did
+    // nothing wrong, so the pill is not painted as a problem.
+    assert.equal(statusTone('exhausted'), 'danger');
+    assert.equal(statusTone(grantStatusWord('exhausted')), 'neutral');
+  });
+
+  it('leaves every other grant state to the kit', () => {
+    for (const state of ['active', 'scheduled', 'expired', 'voided']) {
+      assert.equal(grantStatusWord(state), state, state);
+      assert.equal(statusLabel(grantStatusWord(state)), statusLabel(state));
+    }
+  });
+
+  it('the pill, the filter, the tile caption and the drawer ask about the same word', () => {
+    const credits = readFileSync(new URL('../src/client/modules/revenue/credits.tsx', import.meta.url), 'utf8');
+    assert.match(credits, /<StatusPill status=\{grantStatusWord\(row\.status\)\} \/>/);
+    assert.match(credits, /accessor: \(row\) => grantStatusWord\(row\.status\)/);
+    assert.match(credits, /statusLabel\(grantStatusWord\(state\)\)\.toLowerCase\(\)/);
+    // A third word for the same state: the drawer's stat read "Exhausted".
+    assert.doesNotMatch(credits, /humanize\(grant\.status\)/);
+  });
+});
+
+/* --------------- an action the server cannot perform is not offered -------- */
+
+/**
+ * A campaign with no usable method on file has nothing to present.
+ *
+ * The row offered "Retry the charge now…" regardless, the dialog named the
+ * attempt it was about to spend, and presenting recorded no attempt at all:
+ * a success toast over a campaign that had not moved. It surfaced as a browser
+ * test whose retry never incremented the count, which is the only way anyone
+ * was ever going to notice — the screen looked like it had worked.
+ */
+describe('the retry that has nothing to present', () => {
+  const campaign = (status: string, method: unknown) => ({ status, payment_method: method });
+  const CARD = { id: 'pm_1', display_name: 'Visa 4242', type: 'card' };
+
+  it('is not offered when no card is on file, and says why', () => {
+    assert.equal(canPresent(campaign('recovering', null)), false);
+    assert.equal(cannotPresentReason(campaign('recovering', null)), 'No usable card on file — attach one first');
+  });
+
+  it('is offered while the campaign is being chased and a card is on file', () => {
+    assert.equal(canPresent(campaign('recovering', CARD)), true);
+    assert.equal(cannotPresentReason(campaign('recovering', CARD)), undefined);
+    assert.equal(canPresent(campaign('open', CARD)), true);
+  });
+
+  it('is not offered on a campaign that is already settled — and does not blame a missing card for it', () => {
+    for (const status of ['recovered', 'canceled']) {
+      assert.equal(canPresent(campaign(status, CARD)), false, status);
+      // The row is disabled because the chase is over, not because of the card.
+      assert.equal(cannotPresentReason(campaign(status, null)), undefined, status);
+    }
   });
 });

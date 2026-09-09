@@ -30,7 +30,9 @@ import { downloadCsv, exportFilename, toCsv } from './csv';
 import {
   NONE, decodeFilterParam, decodeSortParam, encodeFilterParam, encodeSortParam, listHref, recordHref,
 } from './links';
-import { isActivityDef, listBootPhase, staleViewParam, visibleViews } from './record-model';
+import {
+  isActivityDef, linkableObjectTypes, listBootPhase, staleViewParam, visibleViews, withFreshView,
+} from './record-model';
 
 export { NONE, decodeFilterParam, decodeSortParam, encodeFilterParam, encodeSortParam, listHref, recordHref };
 
@@ -180,27 +182,29 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
 
   const properties = useMemo(() => objects.data?.data ?? [], [objects.data]);
   const propertyIndex = useMemo(() => new Map(properties.map((p) => [p.name, p])), [properties]);
-  // A view saved without "Share with the workspace" is its author's own. The
-  // API lists it for everyone; the bar shows what the checkbox promised.
-  const viewList = useMemo(() => visibleViews(views.data?.data ?? [], session.me?.user?.id), [views.data, session.me?.user?.id]);
 
   /* -------- view + query state, seeded from the saved view in the URL ------- */
 
   const viewId = location.query.view ?? '';
   // The view as the server just returned it from a save. The cached list is
-  // one write behind until its refetch lands, and seeding the grid from that
-  // stale copy is how "Save changes" re-sorted the grid by the *old* sort and
-  // then marked the view Modified against the new one. The fresh copy stands
-  // in until the list catches up.
+  // one write behind until its refetch lands, and reading the bar off that
+  // stale copy is how "Save changes" re-sorted the grid by the *old* sort, and
+  // how saving a *new* view was followed a beat later by "That view is not
+  // available". The fresh copy stands in the list until the refetch lands.
   const [freshView, setFreshView] = useState<ViewDef | null>(null);
   useEffect(() => { setFreshView(null); }, [views.data]);
+  // A view saved without "Share with the workspace" is its author's own. The
+  // API lists it for everyone; the bar shows what the checkbox promised.
+  const viewList = useMemo(
+    () => visibleViews(withFreshView(views.data?.data ?? [], freshView), session.me?.user?.id),
+    [views.data, freshView, session.me?.user?.id],
+  );
   const activeView = useMemo(
-    () => (freshView && freshView.id === viewId ? freshView : null)
-      ?? viewList.find((v) => v.id === viewId)
+    () => viewList.find((v) => v.id === viewId)
       ?? viewList.find((v) => v.is_default)
       ?? viewList[0]
       ?? null,
-    [viewList, viewId, freshView],
+    [viewList, viewId],
   );
 
   // `?view=` names a view that is not in the bar — deleted since the link was
@@ -605,6 +609,16 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
 
   const conditions = countConditions(pruned);
   const selectedRows = result.rows.filter((r) => selected.includes(r.id));
+  // The same rule as the record page's link dialog: a type nothing connects to
+  // this one gets filed under the wildcard label, where the link shows on
+  // neither record and cannot be removed. Bulk-linking 40 records that way is
+  // 40 stranded edges, so the action is only offered where it can land.
+  const bulkLinkTypes = linkableObjectTypes(
+    objectType,
+    isActivityDef(objectDef),
+    (schema.data?.object_types ?? []).filter((t) => t.category === 'record' && t.name !== objectType),
+    schema.data?.association_types ?? [],
+  ).map((t) => ({ name: t.name, label: t.label }));
 
   // A shared view is a team asset, not a personal scratchpad: the three views
   // a sales team lives in have to be fixable in place. The server is the
@@ -879,7 +893,9 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
           <Inline gap={2} wrap>
             <Button size="sm" variant="secondary" iconLeft={<Icons.user size={13} />} onClick={() => { setSelected(ids); setBulk('owner'); }}>Change owner</Button>
             <Button size="sm" variant="secondary" iconLeft={<Icons.edit size={13} />} onClick={() => { setSelected(ids); setBulk('property'); }}>Set a property</Button>
-            <Button size="sm" variant="secondary" iconLeft={<Icons.link size={13} />} onClick={() => { setSelected(ids); setBulk('link'); }}>Link to a record</Button>
+            {bulkLinkTypes.length > 0 && (
+              <Button size="sm" variant="secondary" iconLeft={<Icons.link size={13} />} onClick={() => { setSelected(ids); setBulk('link'); }}>Link to a record</Button>
+            )}
             <Button size="sm" variant="ghost" iconLeft={<Icons.download size={13} />} onClick={() => { void exportCsv(ids); }}>Export</Button>
             <Button size="sm" variant="danger-ghost" iconLeft={<Icons.trash size={13} />} onClick={() => setConfirmArchive(ids)}>Archive</Button>
           </Inline>
@@ -1015,9 +1031,7 @@ export function ObjectListPage({ objectType }: ObjectListPageProps) {
         onClose={() => setBulk(null)}
         ids={selected}
         objectTypeLabel={objectDef.plural_label}
-        targetTypes={(schema.data?.object_types ?? [])
-          .filter((t) => t.category === 'record' && t.name !== objectType)
-          .map((t) => ({ name: t.name, label: t.label }))}
+        targetTypes={bulkLinkTypes}
         onDone={() => setSelected([])}
       />
 

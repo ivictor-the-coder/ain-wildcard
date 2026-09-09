@@ -27,6 +27,7 @@ import {
   XCircleIcon,
 } from '../../design';
 import { DialogForm, ListFailure, Loading, SettingsShell, useAction, useConsumeQuery } from './common';
+import { byPressure, describePressure, readPressure } from './features-core';
 import { tileOf } from './tiles';
 import type {
   ActiveEntitlement, CustomerLite, EntitlementOverride, EntitlementSet, EntitlementsOverview, Feature,
@@ -117,7 +118,20 @@ function Catalogue() {
     () => new Map((overview.data?.features ?? []).map((row) => [row.feature, row])),
     [overview.data],
   );
-  const atRisk = (overview.data?.features ?? []).flatMap((row) => row.at_risk);
+  /**
+   * Every account pressing against a ceiling, worst first, each carrying the
+   * unit its feature is counted in — the overview hangs `unit_label` off the
+   * feature and the pressure rows off that, and a list flattened without it
+   * could only say "115 of 100" with no idea what 100 of anything was.
+   */
+  const atRisk = useMemo(
+    () => (overview.data?.features ?? [])
+      .flatMap((row) => row.at_risk.map((pressure) => ({ ...pressure, unit_label: row.unit_label })))
+      .sort(byPressure),
+    [overview.data],
+  );
+
+  const over = atRisk.filter((row) => readPressure(row).over).length;
 
   // A catalogue whose read failed is not a catalogue of zero features.
   const tiles = {
@@ -135,7 +149,9 @@ function Catalogue() {
     })),
     pressure: tileOf([overview], 'GET /v1/entitlements/overview', () => ({
       value: f.number(atRisk.length),
-      caption: atRisk.length ? 'Past their approaching threshold' : 'Nobody is near a ceiling',
+      caption: over > 0
+        ? `${f.number(over)} of them past the allowance the plan includes`
+        : atRisk.length ? 'Past their approaching threshold' : 'Nobody is near a ceiling',
     })),
   };
 
@@ -259,23 +275,39 @@ function Catalogue() {
 
       {atRisk.length > 0 && (
         <Banner
-          tone="warning"
-          title={`${f.plural(atRisk.length, 'account')} ${atRisk.length === 1 ? 'is' : 'are'} close to a ceiling`}
+          tone={over > 0 ? 'danger' : 'warning'}
+          // "Close to a ceiling" is the wrong headline for an account already
+          // through one, and the threshold that puts a row in this list is
+          // reached well before the allowance is.
+          title={over > 0
+            ? `${f.plural(over, 'account')} ${over === 1 ? 'is' : 'are'} past an included allowance`
+              + (atRisk.length > over ? `, and ${f.plural(atRisk.length - over, 'other')} ${atRisk.length - over === 1 ? 'is' : 'are'} close to one` : '')
+            : `${f.plural(atRisk.length, 'account')} ${atRisk.length === 1 ? 'is' : 'are'} close to a ceiling`}
         >
           <Stack gap={2}>
-            {atRisk.slice(0, 4).map((row) => (
-              <div key={`${row.customer}:${row.feature}`}>
-                <Button
-                  size="sm"
-                  variant="link"
-                  onClick={() => navigate(`/settings/features?customer=${row.customer}`)}
-                >
-                  {accountName(row.customer)}
-                </Button>
-                {` · ${row.feature}: ${f.number(row.used)} of ${row.value === null ? 'unlimited' : f.number(row.value)}`}
-                {row.percent_used !== null ? ` — ${f.number(row.percent_used)}% used` : ''}
-              </div>
-            ))}
+            {atRisk.slice(0, 4).map((row) => {
+              /*
+               * The percentage is taken against the number printed next to it.
+               * `percent_used` from the overview divides by the allowance plus
+               * prepaid credit and caps at 100, so an account 15% past the 100
+               * events its plan includes read "115 of 100 — 92% used" and
+               * looked comfortable on the one line an operator acts on.
+               */
+              const measured = describePressure(row, row.unit_label ?? 'unit', f);
+              return (
+                <div key={`${row.customer}:${row.feature}`}>
+                  <Button
+                    size="sm"
+                    variant="link"
+                    onClick={() => navigate(`/settings/features?customer=${row.customer}`)}
+                  >
+                    {accountName(row.customer)}
+                  </Button>
+                  {` · ${row.feature}: ${f.number(row.used)} ${row.value === null ? 'against no ceiling' : `of ${f.number(row.value)} included`}`}
+                  {measured && <span className={readPressure(row).over ? 'st-over' : undefined}>{` — ${measured}`}</span>}
+                </div>
+              );
+            })}
             {atRisk.length > 4 && <div>{`…and ${f.plural(atRisk.length - 4, 'more')}.`}</div>}
           </Stack>
         </Banner>

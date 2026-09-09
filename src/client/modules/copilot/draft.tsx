@@ -19,6 +19,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, invalidate, useMutation, useQuery, type ApiClientError, type ListEnvelope } from '@/client/kernel/api';
 import { useSession } from '@/client/kernel/session';
+import { canWrite as roleCanWrite } from '@/client/kernel/shell-core';
 import {
   Badge, Banner, Button, Combobox, Field, Icons, Input, Modal, Select, SkeletonText, Textarea,
   humanize, useFormat, useToast, type ComboOption, type SelectOption,
@@ -264,6 +265,13 @@ export function DraftDialog({
    */
   const gate = canLog(kind, draft, outgoing, ledger, money);
 
+  // Drafting reads; logging the draft onto a timeline is
+  // `POST /v1/records/:type/:id/activities`, which is gated at `member`. A
+  // reader may still compose one and copy it out — what they may not do is
+  // press a button that ends in "Your role (readonly) cannot perform this
+  // action" with the letter still on screen.
+  const mayLog = roleCanWrite(session.me?.role);
+
   const searchDeals = useMemo(() => async (query: string): Promise<ComboOption[]> => {
     const page = await api.get<ListEnvelope<RecordRow>>('/v1/records/deal', { q: query, limit: 8 });
     for (const row of page.data) names.current.set(row.id, row.display_name);
@@ -353,8 +361,10 @@ export function DraftDialog({
             <Button
               variant="primary"
               loading={log.loading}
-              disabled={!gate.ok}
-              title={gate.ok ? undefined : gate.why}
+              disabled={!gate.ok || !mayLog}
+              title={!mayLog
+                ? `Logging an activity needs the member role or higher; you are signed in as ${session.me?.role ?? 'a guest'}.`
+                : gate.ok ? undefined : gate.why}
               iconLeft={<Icons.note size={14} />}
               onClick={() => { void log.run().catch(() => undefined); }}
             >

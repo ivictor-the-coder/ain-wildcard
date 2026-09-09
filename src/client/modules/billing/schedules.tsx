@@ -23,7 +23,7 @@
  * so what the phase card says the new plan costs is what the renewal charges.
  */
 import { useEffect, useMemo, useState } from 'react';
-import { api, useQuery } from '../../kernel/api';
+import { api, useQuery, type ListEnvelope } from '../../kernel/api';
 import {
   Badge, Banner, Button, Card, ConfirmDialog, Divider, Field, Grid, GridItem, Icons, Inline, Modal,
   NumberInput, Select, Stack, StatusPill, Textarea, humanize,
@@ -32,9 +32,10 @@ import {
   DialogFields, FieldRow, Loading, PreviewFailure, SectionError, idem, useAction, useBillingFormat, useDialogForm,
   usePricedPreview, useRecord,
 } from './common';
+import { phaseLines, phaseSummary } from './copy';
 import { useActivePrices } from './subscriptions';
 import type {
-  CatalogEstimate, Price, SchedulePhase, Subscription, SubscriptionSchedule,
+  CatalogEstimate, Price, Product, SchedulePhase, Subscription, SubscriptionSchedule,
 } from './types';
 
 /* ------------------------------- shared bits ------------------------------ */
@@ -54,6 +55,69 @@ const priceName = (price: Price): string =>
 const cadenceOf = (price: Price): string | null =>
   (price.recurring ? `${price.recurring.interval_count === 1 ? '' : `${price.recurring.interval_count} `}${price.recurring.interval}` : null);
 
+/* ---------------------------- pricing the phases -------------------------- */
+
+/** A stable empty list, so the estimate is not re-keyed on every render. */
+const NO_PHASES: SchedulePhase[] = [];
+
+/**
+ * What every phase of a schedule costs, in the currency the subscription bills
+ * in — see `phaseSummary` in ./copy for why the server's own `summary` cannot
+ * be printed on a account that does not bill in the price's home currency.
+ *
+ * One estimate covers the whole schedule: the engine prices the lines it is
+ * sent, in order, so the phases are laid end to end and sliced apart again.
+ * The book is read unfiltered because a phase already in the past can name a
+ * price that has since been archived.
+ */
+function usePhasePricing(phases: SchedulePhase[], currency: string) {
+  const book = useQuery<ListEnvelope<Price>>('/v1/prices', { limit: 200 });
+  // The products, only so a line is named the way the invoice will name it:
+  // the product speaks for its default price, every other price for itself.
+  const products = useQuery<ListEnvelope<Product>>('/v1/products', { limit: 200 });
+  const priceOf = useMemo(() => {
+    const defaults = new Set(
+      (products.data?.data ?? []).map((product) => product.default_price).filter((id): id is string => !!id),
+    );
+    const map = new Map((book.data?.data ?? []).map((price) => [price.id, {
+      product_name: price.product_name,
+      nickname: price.nickname,
+      is_default: defaults.has(price.id),
+      metered: price.recurring?.usage_type === 'metered',
+    }]));
+    return (id: string) => map.get(id) ?? null;
+  }, [book.data, products.data]);
+
+  const basket = useMemo(() => phases.flatMap((phase) => phase.items.map((item) => ({
+    price: item.price,
+    quantity: item.quantity,
+    ...(item.custom_unit_amount !== null ? { custom_unit_amount: item.custom_unit_amount } : {}),
+  }))), [phases]);
+
+  const estimate = usePricedPreview<CatalogEstimate>(
+    '/v1/catalog/estimate',
+    useMemo(() => ({ currency, lines: basket }), [currency, basket]),
+    basket.length > 0,
+  );
+
+  const known = !!book.data || !!estimate.data;
+  return useMemo(() => {
+    const offsets: number[] = [];
+    let cursor = 0;
+    for (const phase of phases) { offsets.push(cursor); cursor += phase.items.length; }
+    // Null, not the server's sentence, while nothing has answered: that
+    // sentence is the defect, and showing it for a frame prints the wrong
+    // currency on the screen this hook exists to correct.
+    return (index: number): string | null => {
+      const phase = phases[index];
+      if (!phase || !known) return null;
+      const from = offsets[index];
+      const priced = estimate.data ? estimate.data.lines.slice(from, from + phase.items.length) : null;
+      return phaseSummary(phaseLines(phase.items, priced, priceOf));
+    };
+  }, [phases, estimate.data, priceOf, known]);
+}
+
 /* ================================ the tab ================================= */
 
 export function ScheduleTab({ scheduleId, subscription }: { scheduleId: string; subscription: Subscription }) {
@@ -63,6 +127,7 @@ export function ScheduleTab({ scheduleId, subscription }: { scheduleId: string; 
   // panel that holds the button away before the new state arrives.
   const { data, loading, error, refetch } = useRecord<SubscriptionSchedule>(`/v1/subscription-schedules/${scheduleId}`);
   const [confirm, setConfirm] = useState<'release' | 'cancel' | null>(null);
+  const summaryOf = usePhasePricing(data?.phases ?? NO_PHASES, subscription.currency);
 
   if (error) {
     return <Card><SectionError error={error} path={`GET /v1/subscription-schedules/${scheduleId}`} onRetry={refetch} /></Card>;
@@ -141,7 +206,7 @@ export function ScheduleTab({ scheduleId, subscription }: { scheduleId: string; 
 
         <Divider />
 
-        {data.phases.map((phase) => <PhaseRow key={phase.id} phase={phase} />)}
+        {data.phases.map((phase, index) => <PhaseRow key={phase.id} phase={phase} summary={summaryOf(index)} />)}
       </Card>
 
       <ConfirmDialog
@@ -174,7 +239,7 @@ export function ScheduleTab({ scheduleId, subscription }: { scheduleId: string; 
   );
 }
 
-function PhaseRow({ phase }: { phase: SchedulePhase }) {
+function PhaseRow({ phase, summary }: { phase: SchedulePhase; summary: string | null }) {
   const f = useBillingFormat();
   return (
     <div className="bl-phase">
@@ -185,7 +250,9 @@ function PhaseRow({ phase }: { phase: SchedulePhase }) {
         <div className="bl-phase__when" style={{ marginTop: 'var(--space-3)' }}>{f.day(phase.start_date)}</div>
       </div>
       <div>
-        <div className="bl-phase__summary">{phase.summary}</div>
+        <div className="bl-phase__summary">
+          {summary ?? <span className="bl-muted">Pricing this phase…</span>}
+        </div>
         <div className="bl-phase__desc">{phase.window}{phase.description ? ` — ${phase.description}` : ''}</div>
       </div>
     </div>
@@ -514,8 +581,18 @@ const currentItems = (sub: Subscription) => sub.items.map((item) => ({
 export function ScheduleBanner({ sub, onOpen }: { sub: Subscription; onOpen: () => void }) {
   const f = useBillingFormat();
   const { data } = useQuery<SubscriptionSchedule>(sub.schedule ? `/v1/subscription-schedules/${sub.schedule}` : null);
-  if (!data || !isLive(data)) return null;
-  const next = data.phases.find((phase) => phase.state === 'upcoming');
+  const live = !!data && isLive(data);
+  const phases = useMemo(
+    () => (data && isLive(data) ? data.phases.filter((phase) => phase.state === 'upcoming').slice(0, 1) : NO_PHASES),
+    [data],
+  );
+  // The banner quotes one phase, so only that phase is priced — and it is
+  // priced in this subscription's currency rather than read off the field the
+  // server wrote in the price's own.
+  const summaryOf = usePhasePricing(phases, sub.currency);
+  if (!data || !live) return null;
+  const next = phases[0];
+  const summary = next ? summaryOf(0) : null;
   return (
     <Banner
       tone="info"
@@ -523,7 +600,7 @@ export function ScheduleBanner({ sub, onOpen }: { sub: Subscription; onOpen: () 
       actions={<Button size="sm" variant="secondary" onClick={onOpen}>Open the schedule</Button>}
     >
       {next
-        ? `${next.summary}${next.description ? ` — ${next.description}` : ''}`
+        ? `${summary ?? 'Pricing the booked change…'}${next.description ? ` — ${next.description}` : ''}`
         : endBehaviorCopy(data)}
     </Banner>
   );

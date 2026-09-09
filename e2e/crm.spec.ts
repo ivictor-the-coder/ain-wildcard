@@ -1641,3 +1641,141 @@ test('the company rail does not badge every deal “Deals”, and the data model
   await expect(page.locator('.crm-objcard__stats', { hasText: /\b1 (records|properties)\b/ })).toHaveCount(0);
   await page.request.delete(`/api/v1/objects/${created.name}`);
 });
+
+/* ======================= four defects of normal use ====================== */
+
+/**
+ * Each of these four was a gesture an operator makes every day, answered with
+ * a lie: a view saved and then declared missing, a date stored a day before
+ * the one clicked, a link reported as saved that appeared nowhere, and a
+ * preview promising rows the import went on to refuse.
+ */
+
+test('a view saved from the View menu is the view the list is left on, filter and all', async ({ page }) => {
+  const name = `Customers only ${Date.now()}`;
+  const filter = { op: 'and', filters: [{ property: 'lifecycle_stage', operator: 'eq', value: 'customer' }] };
+  const encoded = Buffer.from(JSON.stringify(filter)).toString('base64url');
+  const expected = (await (await page.request.post('/api/v1/records/contact/search', { data: { filter, limit: 1 } })).json()) as { total_count: number };
+
+  await openList(page, `/contacts?f=${encoded}`);
+  await expect(page.locator('.ain-page__subtitle')).toContainText(`${expected.total_count} contacts`);
+
+  await openViewMenu(page);
+  await page.getByRole('menuitem', { name: 'Save as a new view' }).click();
+  const save = page.getByRole('dialog');
+  await save.getByLabel('Name').fill(name);
+  await save.getByRole('button', { name: 'Save view' }).click();
+  await expect(page.getByRole('status', { name: 'View saved' })).toBeVisible();
+
+  // The server has it, so nothing on the screen may claim otherwise. The list
+  // used to be told the view did not exist one beat after saving it, strip
+  // `?view=` and re-seed from the default — discarding the filter with it.
+  const saved = (await viewsOf(page, 'contact')).find((v) => v.name === name)!;
+  expect(saved).toBeTruthy();
+  await expect(page.getByRole('status', { name: 'That view is not available' })).toHaveCount(0);
+  expect(new URL(page.url()).searchParams.get('view')).toBe(saved.id);
+  await expect(page.locator('.ain-page__subtitle')).toContainText(`in “${name}”`);
+  await expect(page.locator('.ain-page__subtitle')).toContainText(`${expected.total_count} contacts`);
+  await expect(page.locator('.crm-activefilter')).toBeVisible();
+  // And the new tab is the selected one, not a tab beside a different view.
+  await expect(page.getByRole('button', { name, exact: true })).toHaveAttribute('aria-selected', 'true');
+
+  await page.request.delete(`/api/v1/views/${saved.id}`);
+});
+
+test('a due date is stored on the day that was clicked, in the workspace’s zone', async ({ page }) => {
+  const me = (await (await page.request.get('/api/v1/me')).json()) as { org: { timezone: string }; clock: { now: number } };
+  const zone = me.org.timezone;
+  // A day far enough out that it is unambiguous, named the way the calendar
+  // labels its cells.
+  const target = new Date(me.clock.now + 9 * 24 * 60 * 60 * 1000);
+  const cell = new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', month: 'short', day: 'numeric', year: 'numeric' }).format(target);
+  const wantedDay = new Intl.DateTimeFormat('en-CA', { timeZone: 'UTC', year: 'numeric', month: '2-digit', day: '2-digit' }).format(target);
+  const subject = `Day-early check ${Date.now()}`;
+
+  await openList(page, '/tasks');
+  await page.getByRole('button', { name: 'New task' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Subject').fill(subject);
+  await dialog.getByRole('button', { name: 'Occurred at' }).click();
+  await page.getByRole('button', { name: 'Today' }).click();
+  await dialog.getByRole('button', { name: 'Due', exact: true }).click();
+  await page.locator('.ain-cal').last().getByRole('gridcell', { name: cell }).click();
+  await expect(dialog.getByRole('button', { name: 'Due', exact: true })).toContainText(cell);
+  await dialog.getByRole('button', { name: 'Create task' }).click();
+
+  await page.waitForURL(/\/tasks\/task_/);
+  const id = page.url().split('/').pop()!;
+  const task = await recordOf(page.request, 'task', id);
+  // The stored instant has to fall on the clicked day where the business is —
+  // UTC midnight is the evening before on any workspace behind Greenwich.
+  const stored = new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' })
+    .format(task.properties.due_at as number);
+  expect(stored).toBe(wantedDay);
+  // And every screen that reads it back says the same day.
+  await expect(page.locator('.crm-prop', { hasText: 'Due' }).first()).toContainText(cell);
+  await openList(page, '/tasks');
+  await expect(page.locator('table tbody tr[data-index]', { hasText: subject }).first()).toContainText(cell);
+
+  await page.request.delete(`/api/v1/records/task/${id}?permanent=true`);
+});
+
+test('the link dialog offers only object types an association type actually reaches', async ({ page }) => {
+  const schema = (await (await page.request.get('/api/v1/crm/schema')).json()) as {
+    object_types: { name: string; label: string; plural_label: string; category: string }[];
+    association_types: { from_object: string; to_object: string }[];
+  };
+  const reaches = (a: string, b: string) => schema.association_types.some((t) => (
+    (t.from_object === a && t.to_object === b) || (t.from_object === b && t.to_object === a)
+  ));
+  const records = schema.object_types.filter((t) => t.category === 'record');
+  // Nothing in the shipped data model connects a ticket to a ticket, so the
+  // wildcard "Logged on" label used to take the write: 201, a toast saying the
+  // association shows on both sides, and an edge visible on neither.
+  const stranded = records.filter((t) => !reaches('ticket', t.name)).map((t) => t.plural_label);
+  const linkable = records.filter((t) => reaches('ticket', t.name)).map((t) => t.plural_label);
+  expect(stranded.length).toBeGreaterThan(0);
+
+  const ticket = ((await (await page.request.get('/api/v1/records/ticket?limit=1')).json()).data as { id: string }[])[0];
+  await page.goto(`/tickets/${ticket.id}`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Link another record' }).click();
+  const options = await page.getByRole('dialog').locator('#link-type option').allInnerTexts();
+  for (const label of linkable) expect(options).toContain(label);
+  for (const label of stranded) expect(options).not.toContain(label);
+});
+
+test('the import’s Check step refuses what the import would refuse, before promising it', async ({ page }) => {
+  const stamp = Date.now();
+  await openList(page, '/contacts');
+  await page.getByRole('button', { name: 'Import / export' }).click();
+  await page.getByRole('menuitem', { name: /Import/ }).first().click();
+
+  const dialog = page.getByRole('dialog');
+  // Email and a job title, and no name at all — which is what a "sync the
+  // titles" spreadsheet looks like. Ain requires a first and last name.
+  await dialog.getByLabel('Pasted CSV').fill(
+    `Email,Job title\nnobody-${stamp}-a@nordhavn.example,Plant manager\nnobody-${stamp}-b@nordhavn.example,QA lead\n`,
+  );
+  await dialog.getByRole('button', { name: 'Use the pasted rows' }).click();
+
+  // Said while the mapping can still be changed.
+  await expect(dialog.locator('.crm-import__filemeta')).toContainText('no column fills First name');
+
+  // Keyed on email, these rows can only update. The step says so rather than
+  // calling them ready.
+  await dialog.getByRole('button', { name: /^Check 2 rows/ }).click();
+  await expect(dialog.getByText('0 ready')).toBeVisible();
+  await expect(dialog.getByText('2 only if they already exist')).toBeVisible();
+
+  // Switched to "create every row", the refusal is certain and nothing is sent.
+  await dialog.getByRole('button', { name: 'Back' }).click();
+  await dialog.getByLabel('How to treat existing records').selectOption({ label: 'Create every row as a new record' });
+  await dialog.getByRole('button', { name: /^Check 2 rows/ }).click();
+  await expect(dialog.getByText('2 held back')).toBeVisible();
+  await expect(dialog.getByRole('button', { name: /^Import 0 contacts/ })).toBeDisabled();
+
+  const before = (await (await page.request.get('/api/v1/records/contact?limit=1')).json()).total_count as number;
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  const after = (await (await page.request.get('/api/v1/records/contact?limit=1')).json()).total_count as number;
+  expect(after).toBe(before);
+});

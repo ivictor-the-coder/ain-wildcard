@@ -515,7 +515,11 @@ test('a refused bill can be retried, read attempt by attempt, and stood down', a
   // queue holds and the write path runs on a campaign that can still take it.
   const all = await json(page, '/v1/dunning?status=all&limit=50');
   test.skip(!all.data.length, 'this workspace has never chased a bill');
-  const chaseable = all.data.find((row: { status: string }) => row.status === 'recovering' || row.status === 'open');
+  // A campaign with no usable method on file has nothing to present: retrying
+  // it records no attempt, which is the right answer and not a retry. The write
+  // path below has to run on one that can actually take a card.
+  const chaseable = all.data.find((row: { status: string; payment_method: string | null }) =>
+    (row.status === 'recovering' || row.status === 'open') && !!row.payment_method);
   const campaign = chaseable ?? all.data[0];
 
   await page.goto('/revenue/dunning?status=all', { waitUntil: 'networkidle' });
@@ -544,6 +548,21 @@ test('a refused bill can be retried, read attempt by attempt, and stood down', a
     await expect(page.locator('.ain-toast').first()).toBeVisible();
     await expect.poll(async () => (await json(page, `/v1/dunning/${campaign.id}`)).attempt_count)
       .toBeGreaterThan(campaign.attempt_count);
+  }
+
+  /* ---- and the one that has nothing to present does not offer to ---- */
+  const nothingToPresent = all.data.find((row: { status: string; payment_method: string | null }) =>
+    (row.status === 'recovering' || row.status === 'open') && !row.payment_method);
+  if (nothingToPresent) {
+    const row2 = page.locator('tbody tr', { hasText: nothingToPresent.invoice_number }).first();
+    await row2.getByRole('button', { name: 'Row actions' }).click();
+    const retry = page.getByRole('menuitem', { name: /Retry the charge now/ });
+    await expect(retry).toBeVisible();
+    // Offering it spent a click, named the attempt it was about to spend, and
+    // presented nothing — a success toast over an unchanged campaign.
+    await expect(retry).toHaveAttribute('aria-disabled', 'true');
+    await expect(retry).toContainText('No usable card on file');
+    await page.keyboard.press('Escape');
   }
 
   /* ---- every attempt is on the record, in the drawer ---- */
@@ -665,6 +684,10 @@ test('selling a credit pack states the tiered total before it raises the charge'
   const dialog = page.getByRole('dialog');
   await dialog.getByLabel('Customer').selectOption(account.id);
   await dialog.getByLabel('Price').selectOption(tiered.id);
+  // A pack sold in units has to name the meter those units belong to; the
+  // catalogue does not link the pack product to one, so the dialog asks.
+  const packMeters = await json(page, '/v1/meters');
+  await dialog.getByLabel('Redeemable against').selectOption(packMeters.data[0].id);
   await dialog.getByLabel('Packs').fill('6');
   await dialog.getByLabel('Packs').blur();
 
@@ -905,6 +928,8 @@ test('a pack sale can never charge an amount the button was not showing', async 
   const dialog = page.getByRole('dialog');
   await dialog.getByLabel('Customer').selectOption(account.id);
   await dialog.getByLabel('Price').selectOption(tiered.id);
+  const packMeters = await json(page, '/v1/meters');
+  await dialog.getByLabel('Redeemable against').selectOption(packMeters.data[0].id);
   await expect(dialog.getByRole('button', { name: /^Charge/ })).toBeEnabled();
 
   // One tick: the field changes and the button is pressed, with no blur.
@@ -1503,4 +1528,223 @@ test('/revenue/movement and /revenue/collections land on the board’s own secti
   await page.goto('/revenue/collections', { waitUntil: 'networkidle' });
   await expect(page).toHaveURL(/\/revenue#collections$/);
   await expect(page.locator('#collections')).toBeVisible();
+});
+
+/* ======================= what a credit pack actually is =================== */
+
+test('the pack picker sells the metered pack it is priced for, not unrestricted money', async ({ page }) => {
+  const prices = await json(page, '/v1/prices?limit=100');
+  const products = await json(page, '/v1/products?limit=100');
+  const size = (meta: Record<string, string> | undefined): number =>
+    Number(meta?.units_per_pack ?? meta?.events_per_pack ?? 0);
+  const pack = prices.data.find((p: { metadata: Record<string, string>; product: string }) =>
+    size(p.metadata) > 0 || size(products.data.find((d: { id: string }) => d.id === p.product)?.metadata) > 0);
+  test.skip(!pack, 'no price sells a pack of units');
+  const perPack = size(pack.metadata) || size(products.data.find((d: { id: string }) => d.id === pack.product)?.metadata);
+
+  const meters = await json(page, '/v1/meters');
+  const meter = meters.data.find((m: { event_name: string }) => m.event_name === 'telemetry_events') ?? meters.data[0];
+  const customers = await json(page, `/v1/customers?limit=50&currency=${pack.currency}`);
+  const account = customers.data[0];
+
+  await page.goto('/revenue/credits?new=topup', { waitUntil: 'networkidle' });
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Customer').selectOption(account.id);
+  await dialog.getByLabel('Price').selectOption(pack.id);
+
+  // Until it is told what the pack is redeemable against, the sale is
+  // withheld with the reason rather than quietly issuing money.
+  await expect(dialog.getByRole('button', { name: /^(Charge|Sell pack)/ })).toBeDisabled();
+  await expect(dialog).toContainText('has to name the meter those units belong to');
+
+  await dialog.getByLabel('Redeemable against').selectOption(meter.id);
+  await dialog.getByLabel('Packs').fill('3');
+  await dialog.getByLabel('Packs').blur();
+
+  // The dialog states what the money buys, in the denomination it buys it in.
+  const granted = (perPack * 3).toLocaleString('en-US');
+  await expect(dialog).toContainText(`${granted} ${meter.unit_label ?? 'unit'}s`);
+
+  const before = new Set((await json(page, '/v1/credit-grants?limit=200')).data.map((g: { id: string }) => g.id));
+  await dialog.getByRole('button', { name: /^Charge/ }).click();
+  await expect(dialog).toBeHidden();
+
+  const after = await json(page, '/v1/credit-grants?limit=200');
+  const minted = after.data.filter((g: { id: string }) => !before.has(g.id));
+  expect(minted).toHaveLength(1);
+  // The whole defect in four assertions: three packs of a metered pack are
+  // 3,000,000 prepaid events against that meter — not money spendable on any
+  // charge in the account's currency.
+  expect(minted[0].kind).toBe('unit');
+  expect(minted[0].meter).toBe(meter.id);
+  expect(minted[0].amount).toBe(perPack * 3);
+  expect(minted[0].applicability.scope).toBe('targeted');
+  expect(minted[0].applicability.meters).toEqual([meter.id]);
+});
+
+test('a pack sold as money is still sold as money, whatever the catalogue implies', async ({ page }) => {
+  const prices = await json(page, '/v1/prices?limit=100');
+  const products = await json(page, '/v1/products?limit=100');
+  const size = (meta: Record<string, string> | undefined): number =>
+    Number(meta?.units_per_pack ?? meta?.events_per_pack ?? 0);
+  const pack = prices.data.find((p: { metadata: Record<string, string>; product: string }) =>
+    size(p.metadata) > 0 || size(products.data.find((d: { id: string }) => d.id === p.product)?.metadata) > 0);
+  test.skip(!pack, 'no price sells a pack of units');
+  const customers = await json(page, `/v1/customers?limit=50&currency=${pack.currency}`);
+  const account = customers.data[0];
+
+  await page.goto('/revenue/credits?new=topup', { waitUntil: 'networkidle' });
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Customer').selectOption(account.id);
+  await dialog.getByLabel('Price').selectOption(pack.id);
+  await dialog.getByLabel('Redeemable against').selectOption('any');
+  await expect(dialog).toContainText('any charge in this currency');
+
+  const before = new Set((await json(page, '/v1/credit-grants?limit=200')).data.map((g: { id: string }) => g.id));
+  const commit = dialog.getByRole('button', { name: /^Charge/ });
+  const charged = await commit.textContent();
+  await commit.click();
+  await expect(dialog).toBeHidden();
+
+  const after = await json(page, '/v1/credit-grants?limit=200');
+  const minted = after.data.filter((g: { id: string }) => !before.has(g.id));
+  expect(minted).toHaveLength(1);
+  expect(minted[0].kind).toBe('monetary');
+  expect(minted[0].meter).toBeNull();
+  expect(minted[0].applicability.scope).toBe('all');
+  // The money granted is the money charged, which is what the button said.
+  expect(String(charged)).toContain((minted[0].amount / 100).toLocaleString('en-US', { minimumFractionDigits: 2 }));
+});
+
+/* ========================= settling a true-up ============================= */
+
+test('an open true-up states what it is worth before a resolution is chosen', async ({ page }) => {
+  const closures = await json(page, '/v1/meter-period-closures?limit=20');
+  const closure = closures.data.find((c: { price: string | null }) => c.price);
+  test.skip(!closure, 'no billed period names a price to re-value its drift against');
+
+  // Usage that lands inside a window an invoice was already drawn on: the
+  // late arrival the inspector exists to settle.
+  const inside = closure.period_start + Math.floor((closure.period_end - closure.period_start) / 2);
+  const recorded = await (await page.request.post('/api/v1/meter-events', {
+    data: { meter: closure.meter, customer: closure.customer, value: 250_000, timestamp: inside },
+  })).json();
+  test.skip(!recorded.late_arrival, 'the event was not filed as a late arrival');
+
+  const detail = await json(page, `/v1/meter-period-closures/${closure.id}`);
+  expect(detail.outstanding_amount).not.toBeNull();
+  const worth = new Intl.NumberFormat('en-US', { style: 'currency', currency: (detail.currency ?? 'usd').toUpperCase() })
+    .format(Math.abs(detail.outstanding_amount) / 100);
+
+  await page.goto('/revenue/usage?inspect=late', { waitUntil: 'networkidle' });
+  const table = page.locator('table').filter({ has: page.locator('caption', { hasText: 'arrived after its period was billed' }) });
+  const row = table.locator('tbody tr').filter({ hasText: 'Open' }).first();
+  await row.getByRole('button', { name: 'Row actions' }).click();
+  await page.getByRole('menuitem', { name: 'Settle this true-up' }).click();
+
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  // The worth is on screen before anything is chosen — it used to be hidden
+  // behind a false "Not priced", and only appeared as a refusal afterwards.
+  await expect(dialog).toContainText(worth);
+  await expect(dialog).not.toContainText('Not priced');
+  await expect(dialog).not.toContainText('minor units');
+  await expect(dialog).not.toContainText(String(Math.abs(detail.outstanding_amount)));
+
+  // And the direction the drift cannot go is not on offer, with the reason on
+  // the option rather than in an error after the button.
+  const owed = detail.outstanding_amount > 0;
+  const radio = (resolution: string) => dialog.locator(`input[name="late-resolution"][value="${resolution}"]`);
+  await expect(radio(owed ? 'credited' : 'rebilled')).toBeDisabled();
+  await expect(radio(owed ? 'rebilled' : 'credited')).toBeChecked();
+  await expect(dialog).toContainText(owed ? 'nothing to credit' : 'nothing more to bill');
+
+  // Settling it works first time, with no wire enum reaching the operator.
+  await dialog.getByRole('button', { name: new RegExp(`^(Bill|Credit) `) }).click();
+  await expect(dialog).toBeHidden();
+  const settled = await json(page, `/v1/meter-late-arrivals/${recorded.late_arrival.id}`);
+  expect(settled.resolution).toBe(owed ? 'rebilled' : 'credited');
+  expect(settled.amount).toBe(detail.outstanding_amount);
+  await expect(page.locator('.ain-toast').first()).toContainText(worth);
+});
+
+/* ================= the timeline and the tile agree =========================*/
+
+test('the campaign timeline states the same next attempt as the tile above it', async ({ page }) => {
+  const queue = await json(page, '/v1/dunning?status=all&limit=50');
+  let live: any = null; // eslint-disable-line @typescript-eslint/no-explicit-any
+  for (const row of queue.data) {
+    const detail = await json(page, `/v1/dunning/${row.id}`);
+    if (detail.attempts.some((a: { next_attempt_at: number | null }) => a.next_attempt_at)) { live = detail; break; }
+  }
+  test.skip(!live, 'no attempt has recorded a next attempt');
+
+  await page.goto('/revenue/dunning?status=all', { waitUntil: 'networkidle' });
+  await page.locator('tbody tr').filter({ hasText: live.customer_name }).first().click();
+  const drawer = page.getByRole('dialog');
+  await expect(drawer).toBeVisible();
+  const timeline = drawer.locator('.ain-timeline');
+  const items = timeline.locator('.ain-timeline__item');
+
+  // The prose recorded beside an attempt states the gap in words, and goes
+  // stale the moment the slot moves — which is how this drawer came to
+  // promise a retry "five days out" from Aug 31 under a tile reading Sep 11.
+  await expect(timeline).not.toContainText(/scheduled (two|three|four|five|six|seven) days out/);
+
+  // Where the schedule kept its word, the line saying when the next attempt
+  // was due carries the very instant the next attempt's own heading shows —
+  // one date, rendered once, whatever the workspace's format is.
+  for (let i = 0; i + 1 < live.attempts.length; i++) {
+    if (live.attempts[i].next_attempt_at !== live.attempts[i + 1].attempted_at) continue;
+    const shown = (await items.nth(i + 1).locator('.ain-timeline__time').textContent())?.trim() ?? '';
+    expect(shown).not.toBe('');
+    await expect(items.nth(i).locator('.ain-timeline__extra')).toContainText(shown);
+  }
+
+  // And while the queue still holds a slot, the tile and the timeline state it
+  // in the same words — the contradiction this test exists for.
+  if (live.next_attempt_at) {
+    const caption = drawer.locator('.ain-stat')
+      .filter({ has: page.locator('.ain-stat__label', { hasText: /^Next attempt$/ }) })
+      .locator('.ain-stat__caption');
+    const stated = (await caption.textContent())?.trim() ?? '';
+    expect(stated).not.toBe('');
+    await expect(timeline).toContainText(stated);
+  }
+});
+
+/* ========================= a grant with nothing left ===================== */
+
+test('a grant with nothing left on it reads as spent, not as a bill the schedule gave up on', async ({ page }) => {
+  const customers = await json(page, '/v1/customers?limit=50&currency=usd');
+  const account = customers.data[0];
+  // A paid grant refunded in full: balance zero, and `exhausted` on the wire —
+  // the same word a dunning campaign uses for a bill it stopped chasing.
+  const grant = await (await page.request.post('/api/v1/credit-grants', {
+    data: {
+      customer: account.id, name: 'Drawn to zero', category: 'paid', kind: 'monetary', currency: 'usd', amount: 1,
+    },
+  })).json();
+  await page.request.post(`/api/v1/credit-grants/${grant.id}/refund`, { data: {} });
+  const drawn = await json(page, `/v1/credit-grants/${grant.id}`);
+  expect(drawn.status).toBe('exhausted');
+  expect(drawn.balance).toBe(0);
+
+  await page.goto('/revenue/credits', { waitUntil: 'networkidle' });
+  const row = page.locator('tbody tr').filter({ hasText: 'Drawn to zero' }).first();
+  await expect(row).toBeVisible();
+  await expect(row).toContainText('Spent');
+  await expect(row).not.toContainText('Given up');
+
+  // The tile's breakdown counts it in the same word as the pill beside it.
+  const grants = page.locator('.ain-stat').filter({ has: page.locator('.ain-stat__label', { hasText: /^Grants$/ }) });
+  await expect(grants.locator('.ain-stat__caption')).toContainText('spent');
+  await expect(grants.locator('.ain-stat__caption')).not.toContainText('given up');
+
+  // And the drawer does not invent a third word for the same state.
+  await row.click();
+  const drawer = page.getByRole('dialog');
+  await expect(drawer.locator('.ain-stat').filter({ has: page.locator('.ain-stat__label', { hasText: /^Balance$/ }) }))
+    .toContainText('spent');
+  await expect(drawer).not.toContainText('Exhausted');
 });

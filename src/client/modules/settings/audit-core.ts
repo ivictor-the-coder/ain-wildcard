@@ -26,6 +26,13 @@ export interface TrailSeat {
 /** `Invited nina@northwind.io as analyst` → `nina@northwind.io`. */
 const INVITED = /^Invited (\S+@\S+) as \S+$/;
 
+/**
+ * `Cancelled the invitation to nina@northwind.io — the link no longer works`.
+ * A seat that never accepted is removed by the same route as one that did, and
+ * this is the only entry that carries its address.
+ */
+const CANCELLED = /^Cancelled the invitation to (\S+@\S+)\b/;
+
 /** Every teammate id the trail names, with what it can say about them. */
 export function seatsFromTrail(entries: readonly TrailEntry[]): Map<string, TrailSeat> {
   const seats = new Map<string, TrailSeat>();
@@ -35,6 +42,11 @@ export function seatsFromTrail(entries: readonly TrailEntry[]): Map<string, Trai
     if (entry.action === 'user.invited') {
       const match = INVITED.exec(entry.summary.trim());
       if (match) seat.email = match[1];
+    }
+    if (entry.action === 'user.invitation_cancelled') {
+      const match = CANCELLED.exec(entry.summary.trim());
+      if (match) seat.email = match[1];
+      seat.removed = true;
     }
     if (entry.action === 'user.removed') seat.removed = true;
     seats.set(entry.target_id, seat);
@@ -51,10 +63,28 @@ export function seatsFromTrail(entries: readonly TrailEntry[]): Map<string, Trai
  * things only a signed-in admin can do — because the routes that emit them do
  * not bind the event to the request. A label that says who did it when the
  * record does not is the wrong label; this one says only what the record says.
+ *
+ * `seats` is the other half of that honesty. The roster behind `name` holds
+ * the people who are *still* here, so the moment a teammate is removed every
+ * change they ever made read `usr_TVRkMLhpY9xBZcxM` — on the one screen whose
+ * whole purpose is accountability, and for exactly the person an auditor is
+ * most likely to be asking about. The trail itself recorded their address when
+ * they were invited, so a name the roster has forgotten is read back out of
+ * it, marked as removed because that is also something the reader needs.
  */
-export function actorLabel(id: string | null, kind: string | undefined, name: (id: string) => string | undefined): string {
+export function actorLabel(
+  id: string | null,
+  kind: string | undefined,
+  name: (id: string) => string | undefined,
+  seats?: ReadonlyMap<string, TrailSeat>,
+): string {
   if (!id) return 'Unattributed';
-  return name(id) ?? id;
+  const known = name(id);
+  if (known) return known;
+  const seat = seats?.get(id);
+  if (!seat) return id;
+  const called = seat.email ?? id;
+  return seat.removed ? `${called} · removed` : called;
 }
 
 /** Why an actor is unattributed, for the detail card — or nothing when it is not. */

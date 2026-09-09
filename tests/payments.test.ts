@@ -4374,3 +4374,411 @@ describe('the recovery queue can be asked about one bill', () => {
     }
   });
 });
+
+/* ========================================================================== *
+ * 13. A parameter this module does not know is refused, never ignored
+ * ========================================================================== */
+
+/**
+ * Every other module on this platform hard-rejects an unknown body parameter.
+ * Payments did not, and the two routes where that costs the most money are the
+ * refund and the retry policy: `amount` on a refund is optional and its absence
+ * means "all of it", so one transposed letter turns a partial refund into the
+ * whole charge going back — answered 201, with the figure the caller sent
+ * nowhere in the response. A mistyped policy key is the mirror: 200, and the
+ * schedule the operator believes they changed is the schedule they had.
+ */
+describe('a mistyped body parameter', () => {
+  test('a refund whose amount is misspelled is refused, not paid in full', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Wrenbury Tooling');
+      await ws.card(customer.id, 'succeeds');
+      const { invoice } = await ws.subscribe(customer.id);
+      const charge: Charge = (await ws.ok('GET', `/v1/charges?invoice=${invoice.id}&status=all`)).data[0];
+      assert.equal(charge.status, 'succeeded', 'fixture: the bill was collected');
+
+      const error = await ws.fail(
+        'POST', '/v1/refunds', { charge: charge.id, ammount: 2_500, reason: 'requested_by_customer' },
+        400, 'parameter_invalid',
+      );
+      assert.equal(error.param, 'ammount', 'the refusal names the parameter that was not understood');
+
+      const after: Charge = await ws.ok('GET', `/v1/charges/${charge.id}`);
+      assert.equal(
+        after.amount_refunded, 0,
+        `a typo in "amount" gave back ${after.amount_refunded} of a ${charge.amount} charge`,
+      );
+      assert.deepEqual((await ws.ok('GET', `/v1/refunds?charge=${charge.id}`)).data, [], 'and no refund was recorded');
+    } finally { ws.close(); }
+  });
+
+  test('a policy key that does not exist is refused, not answered 200 with nothing changed', async () => {
+    const ws = await workspace();
+    try {
+      const before = await ws.ok('GET', '/v1/payments/settings');
+      const error = await ws.fail(
+        'PATCH', '/v1/payments/settings', { dunning: { retry_dayz: [2, 4], max_attempts: 3 } },
+        400, 'parameter_invalid',
+      );
+      assert.equal(error.param, 'dunning.retry_dayz', 'the refusal names the key, path and all');
+      const after = await ws.ok('GET', '/v1/payments/settings');
+      assert.deepEqual(after.dunning, before.dunning, 'the policy is exactly what it was');
+      assert.equal(after.schedule_explained, before.schedule_explained);
+    } finally { ws.close(); }
+  });
+
+  /**
+   * The sweep. Body validation runs before the handler, so an id that does not
+   * exist is still a 400 about the parameter — which is the point: every write
+   * route in this module, not the two that were noticed.
+   */
+  test('every payments write route refuses a parameter it does not declare', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Ellesmere Controls');
+      const method = await ws.card(customer.id, 'succeeds');
+      const routes: [string, string, Record<string, unknown>][] = [
+        ['POST', '/v1/payment_methods', {
+          type: 'card', customer: customer.id, brand: 'visa', exp_month: 4, exp_year: 2031,
+          simulted_behavior: 'succeeds',
+        }],
+        ['PATCH', `/v1/payment_methods/${method.id}`, { exp_yr: 2032 }],
+        ['POST', `/v1/payment_methods/${method.id}/attach`, { customer: customer.id, present_open_invoice: false }],
+        ['POST', '/v1/payment_intents', { customer: customer.id, amount: 1_000, currency: 'usd', off_sesion: true }],
+        ['POST', '/v1/payment_intents/pi_nothing/confirm', { off_sesion: true }],
+        ['POST', '/v1/payment_intents/pi_nothing/authenticate', { result: 'approve', otp: '000000' }],
+        ['POST', '/v1/payment_intents/pi_nothing/cancel', { cancelation_reason: 'duplicate' }],
+        ['POST', '/v1/refunds', { charge: 'ch_nothing', amount: 100, resaon: 'duplicate' }],
+        ['POST', '/v1/disputes', { charge: 'ch_nothing', reason: 'fraudulent', evidence_due_dayz: 10 }],
+        ['POST', '/v1/disputes/dp_nothing/evidence', { product_descriptions: 'A telemetry gateway.' }],
+        ['POST', '/v1/disputes/dp_nothing/close', { status: 'won', notes: 'The tracking proves delivery.' }],
+        ['POST', '/v1/dunning/dun_nothing/cancel', { resaon: 'Collected by transfer.' }],
+        ['POST', '/v1/invoices/in_nothing/retry', { payment_methods: method.id }],
+        ['PATCH', '/v1/payments/settings', { dunning: { max_attempts: 3 }, dunnning: {} }],
+      ];
+      for (const [verb, path, body] of routes) {
+        const error = await ws.fail(verb, path, body, 400, 'parameter_invalid');
+        assert.match(
+          String(error.message), /unknown parameter/i,
+          `${verb} ${path} refused for some other reason than the parameter it does not know`,
+        );
+      }
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 14. Money only settles in a currency that exists
+ * ========================================================================== */
+
+/**
+ * `^[a-z]{3}$` is a shape, not a currency. "zzz" passed it, and the charge,
+ * the refund and the Payments book totals that followed were all denominated
+ * in a currency no bank has ever settled — rendered "ZZZ 125.00" because
+ * `Intl` has nothing better to say about it. The catalog has refused an
+ * unregistered code on a price for exactly this reason; payments took money in
+ * one.
+ */
+describe('a currency that does not exist', () => {
+  test('a payment intent in an unregistered code is refused before anything is charged', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.customer('Quatt Hydraulics');
+      const method = await ws.card(customer.id, 'succeeds');
+
+      const error = await ws.fail('POST', '/v1/payment_intents', {
+        customer: customer.id, amount: 12_500, currency: 'zzz', payment_method: method.id,
+        confirm: true, off_session: true,
+      }, 400, 'parameter_invalid');
+      assert.equal(error.param, 'currency');
+      assert.match(String(error.message), /zzz/, 'the refusal quotes the code that was sent');
+
+      assert.deepEqual(
+        (await ws.ok('GET', `/v1/payment_intents?customer=${customer.id}&status=all`)).data, [],
+        'an intent was created in a currency that does not exist',
+      );
+      assert.deepEqual((await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all`)).data, []);
+      assert.deepEqual(
+        ((await ws.ok('GET', '/v1/dunning/summary')).totals as { currency: string }[])
+          .filter((row) => !/^(usd|eur|gbp)$/.test(row.currency)),
+        [], 'and the Payments book has a row in it',
+      );
+    } finally { ws.close(); }
+  });
+
+  /**
+   * The other door. `currency` is optional on an intent and falls back to the
+   * customer's own, which is checked for shape one module along and not for
+   * existence — so a customer created in "zzz" had a card charged in it
+   * without anybody sending the code at all. The charge row is written by this
+   * module, so this module is where it stops. Written to survive billing
+   * closing its own door too: what must never happen is the charge.
+   */
+  test('a customer whose own currency is not a real code cannot have money taken in it', async () => {
+    const ws = await workspace();
+    try {
+      const opened = await ws.call('POST', '/v1/customers', {
+        name: 'Zedland Fabrication', email: 'ap@zedland.example', currency: 'zzz',
+      });
+      if (opened.status >= 400) {
+        assert.equal(opened.status, 400, 'the account was refused at its own door, which is the better place');
+        return;
+      }
+      const customer = opened.body;
+      const method = await ws.card(customer.id, 'succeeds');
+      const error = await ws.fail('POST', '/v1/payment_intents', {
+        customer: customer.id, amount: 12_500, payment_method: method.id, confirm: true, off_session: true,
+      }, 400, 'currency_invalid');
+      assert.equal(error.param, 'customer', 'and it says where the code that does not exist actually is');
+      assert.deepEqual(
+        (await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all`)).data, [],
+        'a card was charged in a currency no bank settles in',
+      );
+    } finally { ws.close(); }
+  });
+
+  test('the currencies the register does know are still accepted', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await ws.ok('POST', '/v1/customers', {
+        name: 'Kanda Robotics KK', email: 'ap@kanda.example', currency: 'jpy',
+      });
+      const method = await ws.card(customer.id, 'succeeds');
+      // A zero-decimal currency, so the guard cannot be passing by assuming
+      // every code is worth two decimal places.
+      const intent: PaymentIntent = await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, amount: 125_000, currency: 'jpy', payment_method: method.id,
+        confirm: true, off_session: true,
+      });
+      assert.equal(intent.status, 'succeeded');
+      assert.equal(intent.currency, 'jpy');
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 15. A credit note moves what the campaign is chasing
+ * ========================================================================== */
+
+/**
+ * A credit note reduces a bill from outside this module, and nothing told the
+ * campaign chasing it. `amount_at_risk` went on carrying the figure from
+ * before the workspace agreed to forgive part of the bill, so the queue told
+ * an operator to collect money that was no longer owed and the workspace's
+ * "At risk" total — the sum of exactly that column — overstated the book by
+ * the amount of every note ever written against a bill in recovery.
+ */
+describe('a credit note against a bill in recovery', () => {
+  /** A campaign chasing a bill nothing has been collected against. */
+  async function chased(ws: Workspace, name: string) {
+    const customer = await ws.customer(name);
+    await ws.card(customer.id, 'insufficient_funds');
+    const { invoice } = await ws.subscribe(customer.id);
+    const campaign = (await ws.dunning(customer.id))[0];
+    assert.equal(campaign.status, 'recovering', 'fixture: the bill is being chased');
+    assert.equal(campaign.amount_at_risk, invoice.amount_due, 'fixture: it is chasing the whole bill');
+    return { customer, invoice, campaign };
+  }
+
+  const atRisk = (summary: { totals: { currency: string; amount_at_risk: number }[] }, currency: string) =>
+    summary.totals.find((row) => row.currency === currency)?.amount_at_risk ?? 0;
+
+  test('crediting part of the bill moves what is at risk, the advice and the workspace total', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice } = await chased(ws, 'Cleobury Fabrication');
+      const before = await ws.ok('GET', '/v1/dunning/summary');
+      const credited = Math.round(invoice.amount_due / 2);
+
+      await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: credited, reason: 'order_change' });
+
+      const bill = await ws.invoice(invoice.id);
+      assert.equal(bill.status, 'open', 'fixture: half a bill is still a bill');
+      assert.equal(bill.amount_due, invoice.amount_due - credited);
+
+      const campaign = (await ws.dunning(customer.id))[0];
+      assert.equal(
+        campaign.amount_at_risk, bill.amount_due,
+        'the campaign is chasing what the bill was owed before the workspace credited it',
+      );
+      const shownInAdvice = (await ws.ok('GET', `/v1/invoices/${invoice.id}`)).amount_due_display;
+      assert.ok(
+        String(campaign.recommended_action).includes(String(shownInAdvice)),
+        `the queue tells an operator to chase a figure the customer no longer owes: "${campaign.recommended_action}"`,
+      );
+
+      const after = await ws.ok('GET', '/v1/dunning/summary');
+      assert.equal(
+        atRisk(after, 'usd'), atRisk(before, 'usd') - credited,
+        'the workspace "At risk" total still counts money it has agreed to forgive',
+      );
+    } finally { ws.close(); }
+  });
+
+  test('withdrawing the note puts back exactly what it took', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice } = await chased(ws, 'Ditton Priors Gearing');
+      const before = await ws.ok('GET', '/v1/dunning/summary');
+      const credited = Math.round(invoice.amount_due / 2);
+      const note: CreditNote = await ws.ok('POST', '/v1/credit_notes', {
+        invoice: invoice.id, amount: credited, reason: 'order_change',
+      });
+      assert.equal((await ws.dunning(customer.id))[0].amount_at_risk, invoice.amount_due - credited);
+
+      await ws.ok('POST', `/v1/credit_notes/${note.id}/void`, {});
+
+      const bill = await ws.invoice(invoice.id);
+      assert.equal(bill.amount_due, invoice.amount_due, 'fixture: the withdrawal put the bill back');
+      const campaign = (await ws.dunning(customer.id))[0];
+      assert.equal(
+        campaign.amount_at_risk, bill.amount_due,
+        'the campaign chases less than the bill is owed, for the rest of its life',
+      );
+      assert.equal(campaign.status, 'recovering', 'and it is still the same campaign');
+      assert.equal(atRisk(await ws.ok('GET', '/v1/dunning/summary'), 'usd'), atRisk(before, 'usd'));
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 16. needs_human means one thing
+ * ========================================================================== */
+
+/**
+ * `needs_human` is decided in one place — `advise` — and read in three: the
+ * flag on the campaign, the product's "Needs a person" filter, which reads that
+ * flag across every status, and the count on `/v1/dunning/summary`. The count
+ * was taken over running campaigns only, so an exhausted campaign carried the
+ * flag, appeared in the filter, and was left out of the number beside it. It is
+ * the worst case to leave out: an exhausted campaign is precisely the one
+ * nothing automatic will ever chase again.
+ */
+describe('the needs_human count', () => {
+  test('counts every campaign the queue badges, including the ones that ran out of attempts', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      await ws.ok('PATCH', '/v1/payments/settings', {
+        dunning: { end_behavior: 'leave_past_due', max_attempts: 2, retry_days: [3] },
+      });
+      const customer = await ws.customer('Bridgnorth Castings');
+      await ws.card(customer.id, 'insufficient_funds');
+      await ws.subscribe(customer.id);
+      assert.equal((await ws.travel(20 * DAY)).failed, 0);
+
+      const spent = (await ws.dunning(customer.id))[0];
+      assert.equal(spent.status, 'exhausted', 'fixture: the schedule ran out');
+      assert.equal(spent.needs_human, true, 'fixture: and the campaign says a person has to act');
+
+      const queue = await ws.ok('GET', '/v1/dunning?status=all&limit=200');
+      assert.equal(queue.total_count, queue.data.length, 'fixture: the whole queue fits in one page');
+      const badged = (queue.data as DunningView[]).filter((row) => row.needs_human);
+      assert.ok(badged.some((row) => row.id === spent.id), 'fixture: the filter shows the exhausted campaign');
+
+      const summary = await ws.ok('GET', '/v1/dunning/summary');
+      assert.equal(
+        summary.needs_human, badged.length,
+        'the summary and the queue disagree about how many people this workspace needs',
+      );
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 17. A bill on net terms is not dropped in silence
+ * ========================================================================== */
+
+/**
+ * A card refused against a `send_invoice` bill used to return from
+ * `onCollectionFailed` without a word. The decline still emitted
+ * `invoice.payment_failed`, billing still moved the subscription to
+ * `past_due` — and the recovery queue, the one screen that answers "who is
+ * behind and what do I do about it", had no row for it. `amount_at_risk` did
+ * not count the money, nobody needed a person, and the workspace reported
+ * recovering 100% of its failed payments with this one owed and chased by
+ * nobody. No schedule is started here — nothing presents a net-terms bill
+ * automatically, and inventing one would charge a card the customer did not
+ * choose to pay by — but the bill is put in front of a person.
+ */
+describe('a card refused against a bill on net terms', () => {
+  async function netTerms(ws: Workspace, name: string) {
+    const customer = await ws.customer(name);
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+      collection_method: 'send_invoice', days_until_due: 30,
+    });
+    await ws.tick();
+    const invoice = (await ws.invoicesFor(sub.id))[0];
+    assert.equal(invoice.status, 'open', 'fixture: a net-terms bill is never presented automatically');
+    const method = await ws.card(customer.id, 'insufficient_funds');
+    // The finance team offers a card over the phone, and it is refused.
+    await ws.ok('POST', '/v1/payment_intents', {
+      customer: customer.id, invoice: invoice.id, payment_method: method.id, confirm: true, off_session: true,
+    });
+    return { customer, sub, invoice, method };
+  }
+
+  test('the bill reaches the recovery queue instead of disappearing', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, sub, invoice } = await netTerms(ws, 'Netterms Instruments');
+      assert.equal(
+        (await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'past_due',
+        'fixture: the platform has already declared this account behind',
+      );
+
+      const queue = await ws.dunning(customer.id);
+      assert.equal(queue.length, 1, 'the account the platform called past due is in no queue at all');
+      const campaign = queue[0];
+      assert.equal(campaign.status, 'recovering');
+      assert.equal(campaign.amount_at_risk, invoice.amount_due, 'and what it is chasing is what the bill is owed');
+      assert.equal(campaign.needs_human, true);
+      assert.equal(campaign.hold?.reason, 'not_card_collected');
+      assert.equal(campaign.next_attempt_at, null, 'nothing is scheduled against a bill nobody presents automatically');
+      assert.match(String(campaign.recommended_action), /transfer/i, 'and the advice says how this bill actually gets paid');
+      assert.doesNotMatch(
+        String(campaign.recommended_action), /worth retrying/i,
+        'the advice opens by promising a retry of a bill nothing will ever retry',
+      );
+
+      const summary = await ws.ok('GET', '/v1/dunning/summary');
+      const usd = summary.totals.find((row: { currency: string }) => row.currency === 'usd');
+      assert.ok(usd.amount_at_risk >= invoice.amount_due, 'the money is counted as at risk');
+      assert.ok(summary.needs_human >= 1, 'and somebody is told to do something about it');
+    } finally { ws.close(); }
+  });
+
+  test('no card is presented against it, however long the clock runs', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const { customer, invoice } = await netTerms(ws, 'Netterms Pressings');
+      const presented = (await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all&limit=100`)).data.length;
+      assert.equal(presented, 1, 'fixture: exactly the one card the customer offered');
+
+      assert.equal((await ws.travel(45 * DAY)).failed, 0);
+
+      assert.equal(
+        (await ws.ok('GET', `/v1/charges?customer=${customer.id}&status=all&limit=100`)).data.length, presented,
+        'a net-terms bill was presented to a card by a schedule',
+      );
+      const campaign = (await ws.dunning(customer.id))[0];
+      assert.equal(campaign.status, 'recovering', 'and the hold has no deadline: only the bill being settled ends it');
+      assert.equal(campaign.hold?.reason, 'not_card_collected');
+      assert.equal((await ws.invoice(invoice.id)).status, 'open');
+    } finally { ws.close(); }
+  });
+
+  test('recording the transfer ends the campaign', async () => {
+    const ws = await workspace();
+    try {
+      const { customer, invoice } = await netTerms(ws, 'Netterms Gearing');
+      await ws.ok('POST', `/v1/invoices/${invoice.id}/pay`, { note: 'Bank transfer, ref NW-4471.' });
+
+      assert.equal((await ws.invoice(invoice.id)).status, 'paid');
+      const campaign = (await ws.dunning(customer.id))[0];
+      assert.equal(campaign.status, 'canceled', 'a bill that has been settled is not still being chased');
+      assert.equal(campaign.needs_human, false);
+    } finally { ws.close(); }
+  });
+});

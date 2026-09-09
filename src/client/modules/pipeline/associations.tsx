@@ -195,9 +195,11 @@ export function LinkRecordDialog({
 /* ------------------------------ account card ------------------------------ */
 
 /** Who the deal belongs to, and the controls that change it. */
-export function AccountCard({ deal, account, onChanged }: {
+export function AccountCard({ deal, account, writable, onChanged }: {
   deal: DealRecord;
   account: RecordAssociation | undefined;
+  /** `POST/DELETE /v1/associations` is gated at `member`; below it the card is a link. */
+  writable: boolean;
   onChanged: () => void;
 }) {
   const { navigate } = useRouter();
@@ -228,14 +230,16 @@ export function AccountCard({ deal, account, onChanged }: {
         icon: <Icons.external size={14} />,
         onSelect: () => account && navigate(recordHref('company', account.record_id)),
       },
-      { id: 'change', label: 'Change account', icon: <Icons.edit size={14} />, onSelect: () => setLinking(true) },
-      {
-        id: 'unlink',
-        label: 'Unlink this account',
-        icon: <Icons.trash size={14} />,
-        danger: true,
-        onSelect: () => setUnlinking(true),
-      },
+      ...(writable ? [
+        { id: 'change', label: 'Change account', icon: <Icons.edit size={14} />, onSelect: () => setLinking(true) },
+        {
+          id: 'unlink',
+          label: 'Unlink this account',
+          icon: <Icons.trash size={14} />,
+          danger: true,
+          onSelect: () => setUnlinking(true),
+        },
+      ] : []),
     ],
   }];
 
@@ -245,7 +249,9 @@ export function AccountCard({ deal, account, onChanged }: {
       description="Who this deal belongs to"
       actions={account
         ? <MenuButton sections={menu} label={`Account actions for ${account.display_name}`} size="sm" icon={<Icons.more size={14} />} />
-        : <Button size="sm" variant="secondary" iconLeft={<Icons.link size={13} />} onClick={() => setLinking(true)}>Link</Button>}
+        : writable
+          ? <Button size="sm" variant="secondary" iconLeft={<Icons.link size={13} />} onClick={() => setLinking(true)}>Link</Button>
+          : undefined}
     >
       {account ? (
         <button
@@ -277,7 +283,7 @@ export function AccountCard({ deal, account, onChanged }: {
       )}
 
       <LinkRecordDialog
-        open={linking}
+        open={linking && writable}
         deal={deal}
         objectType="company"
         associationType="deal_to_company"
@@ -292,7 +298,7 @@ export function AccountCard({ deal, account, onChanged }: {
       />
 
       <ConfirmDialog
-        open={unlinking}
+        open={unlinking && writable}
         onCancel={() => setUnlinking(false)}
         onConfirm={() => unlink.run().catch(() => undefined)}
         loading={unlink.loading}
@@ -307,9 +313,11 @@ export function AccountCard({ deal, account, onChanged }: {
 /* ----------------------------- committee card ----------------------------- */
 
 /** The people who have to say yes, add and remove. */
-export function CommitteeCard({ deal, contacts, onChanged }: {
+export function CommitteeCard({ deal, contacts, writable, onChanged }: {
   deal: DealRecord;
   contacts: RecordAssociation[];
+  /** `POST/DELETE /v1/associations` is gated at `member`; below it the roster is a list of links. */
+  writable: boolean;
   onChanged: () => void;
 }) {
   const { navigate } = useRouter();
@@ -338,11 +346,13 @@ export function CommitteeCard({ deal, contacts, onChanged }: {
     <Card
       title="Buying committee"
       description={contacts.length === 1 ? '1 contact on this deal' : `${contacts.length} contacts on this deal`}
-      actions={
-        <Button size="sm" variant="secondary" iconLeft={<Icons.plus size={13} />} onClick={() => setAdding(true)}>
-          Add
-        </Button>
-      }
+      actions={writable
+        ? (
+          <Button size="sm" variant="secondary" iconLeft={<Icons.plus size={13} />} onClick={() => setAdding(true)}>
+            Add
+          </Button>
+        )
+        : undefined}
     >
       {contacts.length === 0 && (
         <EmptyState
@@ -350,12 +360,14 @@ export function CommitteeCard({ deal, contacts, onChanged }: {
           inline
           illustration={null}
           title="Nobody named yet"
-          body="Add the people who have to say yes, so their calls and emails land on this deal’s timeline."
-          action={
-            <Button size="sm" variant="primary" iconLeft={<Icons.plus size={13} />} onClick={() => setAdding(true)}>
-              Add a contact
-            </Button>
-          }
+          body="The people who have to say yes go here, so their calls and emails land on this deal’s timeline."
+          action={writable
+            ? (
+              <Button size="sm" variant="primary" iconLeft={<Icons.plus size={13} />} onClick={() => setAdding(true)}>
+                Add a contact
+              </Button>
+            )
+            : undefined}
         />
       )}
 
@@ -373,19 +385,21 @@ export function CommitteeCard({ deal, contacts, onChanged }: {
             </span>
             <ChevronRightIcon size={14} />
           </button>
-          <Button
-            size="sm"
-            variant="ghost"
-            className="pl-assocrow__remove"
-            aria-label={`Remove ${contact.display_name} from the buying committee`}
-            iconLeft={<Icons.x size={13} />}
-            onClick={() => setRemoving(contact)}
-          />
+          {writable && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="pl-assocrow__remove"
+              aria-label={`Remove ${contact.display_name} from the buying committee`}
+              iconLeft={<Icons.x size={13} />}
+              onClick={() => setRemoving(contact)}
+            />
+          )}
         </div>
       ))}
 
       <LinkRecordDialog
-        open={adding}
+        open={adding && writable}
         deal={deal}
         objectType="contact"
         associationType="deal_to_contact"
@@ -401,7 +415,7 @@ export function CommitteeCard({ deal, contacts, onChanged }: {
       />
 
       <ConfirmDialog
-        open={!!removing}
+        open={!!removing && writable}
         tone="brand"
         onCancel={() => setRemoving(null)}
         onConfirm={() => { if (removing) void remove.run(removing).catch(() => undefined); }}

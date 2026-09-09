@@ -3,8 +3,9 @@ import type { Ctx } from '../../kernel/context';
 import { created, list, type Req } from '../../kernel/http';
 import { conflict, notFound } from '../../../shared/errors';
 import { formatMoney, money } from '../../../shared/money';
-import v from '../../../shared/validate';
+import v, { type SchemaNode, type Validator } from '../../../shared/validate';
 import { billingStore } from '../billing/module';
+import { assertCurrency } from '../catalog/currencies';
 import type { Invoice } from '../billing/types';
 import { DEFAULT_POLICY, endBehaviorPhrase, type DunningListFilter, type RecoverySummary } from './dunning';
 import type { ChargeListFilter, CollectionResult, IntentListFilter, RefundInput } from './gateway';
@@ -145,6 +146,37 @@ const COLLECTED_AGAIN: readonly string[] = ['active', 'trialing'];
 
 /* ------------------------------- validators ------------------------------- */
 
+/**
+ * A currency this platform can actually settle in, not a three-letter word.
+ *
+ * `v.currency()` checks the *shape*: "zzz" passes it, and a payment intent
+ * created in zzz is charged, refunded and totalled into the Payments book like
+ * any other — a whole ledger denominated in a currency that does not exist,
+ * displayed as "ZZZ 125.00" because `Intl` has nothing better to say about it.
+ * The catalog refuses a price in an unregistered code for the same reason and
+ * from the same register, so money entering payments is checked against that
+ * one list rather than a second copy of it.
+ */
+const currencyCode = (): Validator<string> => ({
+  parse: (value: unknown, path = '') => assertCurrency(v.currency().parse(value, path), path || 'currency'),
+  describe: (): SchemaNode => ({
+    type: 'string', format: 'currency', pattern: '^[a-z]{3}$',
+    description: 'Lowercase ISO-4217 currency code, e.g. usd.',
+  }),
+});
+
+/**
+ * Every body below is strict, and that is not pedantry.
+ *
+ * A refund whose amount arrives as `ammount` is a *full* refund of the charge —
+ * the field is optional and its absence means "all of it" — so one transposed
+ * letter turns a goodwill gesture into the whole invoice going back, answered
+ * 201 with a refund the caller never asked for. The policy PATCH is the mirror
+ * shape: a mistyped key answers 200 with the schedule untouched, and the
+ * operator believes they changed it. The rest of the platform hard-rejects
+ * unknown parameters; payments answering them with silence is how a caller
+ * learns about their typo from the bank statement.
+ */
 const methodCreateBody = v.object({
   type: v.default(v.enum(PAYMENT_METHOD_TYPES), 'card'),
   customer: v.id('cus'),
@@ -164,7 +196,7 @@ const methodCreateBody = v.object({
   set_default: v.optional(v.boolean()),
   present_open_invoices: v.optional(v.boolean()),
   metadata: v.metadata(),
-});
+}, { strict: true });
 
 const methodUpdateBody = v.object({
   exp_month: v.optional(v.int({ min: 1, max: 12 })),
@@ -174,12 +206,12 @@ const methodUpdateBody = v.object({
   simulated_behavior: v.optional(v.enum(SIMULATED_BEHAVIORS)),
   simulated_decline_count: v.optional(v.int({ min: 0, max: 20 })),
   metadata: v.optional(v.metadata()),
-});
+}, { strict: true });
 
 const intentCreateBody = v.object({
   customer: v.id('cus'),
   amount: v.optional(v.int({ min: 1, max: 100_000_000 })),
-  currency: v.optional(v.currency()),
+  currency: v.optional(currencyCode()),
   payment_method: v.optional(v.id('pm')),
   invoice: v.optional(v.id('in')),
   description: v.optional(v.string({ max: 500 })),
@@ -188,7 +220,7 @@ const intentCreateBody = v.object({
   confirm: v.optional(v.boolean()),
   idempotency_key: v.optional(v.string({ max: 200 })),
   metadata: v.metadata(),
-});
+}, { strict: true });
 
 const refundCreateBody = v.object({
   charge: v.optional(v.id('ch')),
@@ -197,7 +229,7 @@ const refundCreateBody = v.object({
   amount: v.optional(v.int({ min: 1, max: 100_000_000 })),
   reason: v.optional(v.enum(REFUND_REASONS)),
   description: v.optional(v.string({ max: 500 })),
-});
+}, { strict: true });
 
 const disputeCreateBody = v.object({
   charge: v.optional(v.id('ch')),
@@ -205,7 +237,7 @@ const disputeCreateBody = v.object({
   reason: v.enum(DISPUTE_REASONS),
   amount: v.optional(v.int({ min: 1, max: 100_000_000 })),
   evidence_due_days: v.optional(v.int({ min: 1, max: 90 })),
-});
+}, { strict: true });
 
 const evidenceBody = v.object({
   product_description: v.optional(v.string({ max: 5000 })),
@@ -213,7 +245,7 @@ const evidenceBody = v.object({
   service_documentation: v.optional(v.string({ max: 5000 })),
   cancellation_policy: v.optional(v.string({ max: 5000 })),
   uncategorized_text: v.optional(v.string({ max: 5000 })),
-});
+}, { strict: true });
 
 const policyBody = v.object({
   retry_days: v.optional(v.array(v.int({ min: 1, max: 60 }), { min: 1, max: 11 })),
@@ -224,7 +256,7 @@ const policyBody = v.object({
   collection_hour: v.optional(v.int({ min: 0, max: 23 })),
   jitter_hours: v.optional(v.int({ min: 0, max: 12 })),
   give_up_codes: v.optional(v.array(v.enum(DECLINE_CODES), { max: DECLINE_CODES.length })),
-});
+}, { strict: true });
 
 /** The shape every collection route answers with — the outcome, in words. */
 const collectionResponse = (ctx: Ctx, orgId: string, result: CollectionResult) => {
@@ -505,6 +537,13 @@ export default defineModule({
         note: `Credited by ${note.number ?? 'a credit note'}; what had been collected past the new balance went to the account.`,
         meta: { actorType: 'system' },
       });
+      // And the campaign chasing the bill is told the bill shrank. A note that
+      // clears the balance outright reaches `invoice.paid` and the campaign is
+      // stopped there; a note that only reduces it reaches nothing, and the
+      // campaign went on chasing — and reporting — the figure from before the
+      // workspace agreed to forgive part of it.
+      store.dunning.syncAmountAtRisk(event.org_id, note.invoice,
+        `${note.number ? `Credit note ${note.number}` : 'A credit note'} reduced what this bill is owed.`);
     }, 'payments');
 
     /**
@@ -548,6 +587,12 @@ export default defineModule({
       // field along. A note that only reduced a balance settled nothing and
       // stopped nothing, so nothing is restarted for it.
       if (noteHadSettledIt) restartCollection(ctx, store, event.org_id, note.invoice);
+      // The mirror of the sync on the way in, and read after the cash has moved
+      // back so it sees the balance the withdrawal actually left. A campaign
+      // told a bill had shrunk has to be told when it grows back, or it chases
+      // and reports less than is owed for the rest of its life.
+      store.dunning.syncAmountAtRisk(event.org_id, note.invoice,
+        `${note.number ? `Credit note ${note.number}` : 'A credit note'} was withdrawn, so this bill is owed again.`);
     }, 'payments');
 
     ctx.events.on('invoice.marked_uncollectible', (event) => {
@@ -637,7 +682,7 @@ export default defineModule({
     }, {
       summary: 'Attach a method to a customer', tags: ['payments'], roles: ['member'],
       description: 'A detached method comes back onto an account; a method already on another account is refused with payment_method_in_use, one already on this account with payment_method_already_attached, and a card whose expiry has passed with expired_card. Attaching never changes which method is the default unless the account had none. It presents the account’s un-reached open bills to the method exactly as POST /v1/payment_methods does, and takes present_open_invoices false for the same reason.',
-      body: v.object({ customer: v.id('cus'), present_open_invoices: v.optional(v.boolean()) }),
+      body: v.object({ customer: v.id('cus'), present_open_invoices: v.optional(v.boolean()) }, { strict: true }),
     });
 
     router.post('/v1/payment_methods/:id/detach', (req: Req, c: Ctx) =>
@@ -701,7 +746,7 @@ export default defineModule({
       body: v.object({
         payment_method: v.optional(v.id('pm')),
         off_session: v.optional(v.boolean()),
-      }),
+      }, { strict: true }),
     });
 
     router.post('/v1/payment_intents/:id/authenticate', (req: Req, c: Ctx) => {
@@ -710,7 +755,7 @@ export default defineModule({
     }, {
       summary: 'Complete the authentication step', tags: ['payments'], roles: ['member'],
       description: 'Stands in for the issuer’s 3-D Secure page. The state machine is real; the page is simulated, and the intent’s next_action says so.',
-      body: v.object({ result: v.enum(['approve', 'abandon']) }),
+      body: v.object({ result: v.enum(['approve', 'abandon']) }, { strict: true }),
     });
 
     router.post('/v1/payment_intents/:id/cancel', (req: Req, c: Ctx) => {
@@ -719,7 +764,7 @@ export default defineModule({
     }, {
       summary: 'Cancel a payment intent', tags: ['payments'], roles: ['member'],
       description: 'Withdraws an intent that has not been paid. One already paid is refused with payment_intent_succeeded (refund the charge instead), one with the bank with payment_intent_processing (wait for the answer), and one already cancelled with payment_intent_already_canceled — a second cancel is a double submit, and a 200 would read as though the reason it carried had been recorded when the first one’s stands.',
-      body: v.object({ cancellation_reason: v.optional(v.enum(['duplicate', 'fraudulent', 'requested_by_customer', 'abandoned', 'superseded'])) }),
+      body: v.object({ cancellation_reason: v.optional(v.enum(['duplicate', 'fraudulent', 'requested_by_customer', 'abandoned', 'superseded'])) }, { strict: true }),
     });
 
     /* --------------------------------- charges ------------------------------ */
@@ -821,7 +866,7 @@ export default defineModule({
     }, {
       summary: 'Close a dispute', tags: ['payments'], roles: ['member'],
       description: 'Winning returns the money to the invoice. Losing writes the invoice off as uncollectible, which billing turns into an unpaid subscription through its own status machine. A dispute already won or lost is refused with dispute_already_closed — a second close is a double submit, not a second verdict.',
-      body: v.object({ status: v.enum(['won', 'lost']), note: v.optional(v.string({ max: 1000 })) }),
+      body: v.object({ status: v.enum(['won', 'lost']), note: v.optional(v.string({ max: 1000 })) }, { strict: true }),
     });
 
     /* -------------------------------- recovery ------------------------------ */
@@ -863,7 +908,7 @@ export default defineModule({
     }, {
       summary: 'Stop chasing an invoice', tags: ['payments'], roles: ['member'],
       description: 'Stands the schedule down without touching the bill — for accounts being collected another way.',
-      body: v.object({ reason: v.optional(v.string({ max: 500 })) }),
+      body: v.object({ reason: v.optional(v.string({ max: 500 })) }, { strict: true }),
     });
 
     router.get('/v1/invoices/:id/payments', (req: Req, c: Ctx) => {
@@ -962,7 +1007,7 @@ export default defineModule({
       body: v.object({
         payment_method: v.optional(v.id('pm')),
         off_session: v.optional(v.boolean()),
-      }),
+      }, { strict: true }),
     });
 
     /* -------------------------------- settings ------------------------------ */
@@ -994,7 +1039,7 @@ export default defineModule({
     }, {
       summary: 'Change the retry policy', tags: ['payments'], roles: ['admin'],
       description: 'retry_days are the gaps between attempts, not offsets from the first failure. A campaign already running keeps the policy it started under.',
-      body: v.object({ dunning: policyBody }),
+      body: v.object({ dunning: policyBody }, { strict: true }),
     });
   },
 

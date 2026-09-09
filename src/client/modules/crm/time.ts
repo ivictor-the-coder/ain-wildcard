@@ -12,6 +12,8 @@
  * composer speaks the same language as the rest of the product.
  */
 
+import { SECOND } from '../../../shared/time';
+
 const partsCache = new Map<string, Intl.DateTimeFormat>();
 
 function formatter(timeZone: string): Intl.DateTimeFormat {
@@ -123,4 +125,49 @@ export function slaState(dueAt: number, now: number, closed: boolean): { state: 
   if (dueAt <= now) return { state: 'overdue', ms };
   if (dueAt - now <= SOON) return { state: 'due_soon', ms };
   return { state: 'due', ms };
+}
+
+/* ------------------------------- calendar days ---------------------------- */
+
+/**
+ * The instant a calendar day begins in the workspace's zone.
+ *
+ * The kit's calendar speaks in day *stamps* — midnight UTC on the day whose
+ * cell was clicked — because a calendar has no time of day to offer. A `date`
+ * property is stored in exactly that shape, so the stamp goes straight in. A
+ * `datetime` property is a real instant, and storing the stamp itself put
+ * every pick a day early on any workspace west of Greenwich: a task due
+ * "Sep 18" was written as `2026-09-18T00:00:00Z`, which is 8pm on the 17th in
+ * New York, and that is the day the list, the SLA badge and the record page
+ * all read back.
+ */
+export function zonedDayStart(dayStamp: number, timeZone: string): number {
+  if (!Number.isFinite(dayStamp)) return dayStamp;
+  const d = new Date(dayStamp);
+  const iso = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T00:00`;
+  return fromZonedInput(iso, timeZone) ?? dayStamp;
+}
+
+/**
+ * Move an instant onto the calendar day a picker handed back, keeping the time
+ * of day it already had.
+ *
+ * Re-dating an SLA target that was due at 17:00 must leave it due at 17:00 on
+ * the new day, not at midnight — the picker only offers a day, so the hours it
+ * cannot ask about are the hours already on the record. A stamp with nothing
+ * behind it lands at the start of that day where the business is.
+ */
+export function onCivilDay(dayStamp: number, timeZone: string, keepTimeOf: number | null): number {
+  const start = zonedDayStart(dayStamp, timeZone);
+  if (keepTimeOf === null || !Number.isFinite(keepTimeOf) || !Number.isFinite(dayStamp)) return start;
+  // The wall clock, not a millisecond offset from midnight: a day that lost or
+  // gained an hour to daylight saving is 23 or 25 hours long, and 09:00 has to
+  // stay 09:00 across one of those rather than slip to 08:00.
+  const d = new Date(dayStamp);
+  const when = wallClockIn(keepTimeOf, timeZone);
+  const moved = fromZonedInput(
+    `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(when.hour)}:${pad(when.minute)}`,
+    timeZone,
+  );
+  return moved === null ? start : moved + when.second * SECOND;
 }

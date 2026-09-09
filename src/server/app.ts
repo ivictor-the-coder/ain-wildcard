@@ -4,7 +4,7 @@ import { EventBus, type EmitOptions } from './kernel/events';
 import { JobQueue, type EnqueueOptions } from './kernel/jobs';
 import { createLogger, type Logger } from './kernel/logger';
 import { offsetClock, frozenClock, type Clock } from './kernel/clock';
-import { Router, type Auth, type Req, type Role, isRaw, parseQuery, newRequestId, errorToResponse, roleAtLeast, SYSTEM_AUTH } from './kernel/http';
+import { Router, type Auth, type Req, type Role, type Route, isRaw, parseQuery, newRequestId, errorToResponse, roleAtLeast, SYSTEM_AUTH } from './kernel/http';
 import { runInOrgScope, currentOrgScope, type OrgScope } from './kernel/org-scope';
 import type { Ctx, Config, AuditEntry } from './kernel/context';
 import { withAuth } from './kernel/context';
@@ -65,10 +65,9 @@ const WRITE_SCOPE = /(^|:)(write|admin|\*)$/;
 /**
  * How much of the role ladder an API key's own scopes justify.
  *
- * `route.meta.scopes` is the only thing that ever reads `auth.scopes`, and no
- * route in the platform declares it, so the scopes a customer chooses are
- * enforced nowhere else — the ladder is what has to carry them. Both ends of
- * that have been wrong in turn, and the failure is symmetric:
+ * A scope says two things — *how much* a key may do and *where* — and this
+ * answers only the first. `missingScope` below answers the second. Both ends of
+ * the ladder have been wrong in turn, and the failure is symmetric:
  *
  * - Every key authenticating as `admin` meant a key minted `["crm:read"]`
  *   could move the workspace clock, revoke the workspace's other credentials
@@ -86,10 +85,9 @@ const WRITE_SCOPE = /(^|:)(write|admin|\*)$/;
  * `readonly`. Nothing but `*` reaches `admin`, so a restricted credential can
  * still never travel time, revoke keys or delete an object type.
  *
- * What this deliberately does not claim is per-domain enforcement: until
- * routes declare `meta.scopes`, a `["crm:write"]` key is a member everywhere,
- * not only in CRM. That is a narrowing the platform still owes its customers,
- * and it belongs on the routes rather than in a guess made here.
+ * The rung is deliberately domain-blind: it says a `["crm:write"]` key may
+ * write, not that it may write anywhere. `missingScope` is the half that names
+ * the resource, and both are asked of every request.
  *
  * Nor is what the key asked for the whole answer: it is a ceiling the key's
  * author still has to reach. `authenticate` applies `boundedByAuthor` below.
@@ -112,6 +110,117 @@ function keyRole(scopes: string[]): Role {
 function boundedByAuthor(scoped: Role, author: Role | undefined): Role {
   if (author === undefined) return scoped;
   return roleAtLeast(scoped, author) ? author : scoped;
+}
+
+/** The verbs a scope can name. Anything else in that position is a domain. */
+const SCOPE_ACTIONS = new Set(['read', 'write', 'admin']);
+const READ_METHODS = new Set(['GET', 'HEAD']);
+
+/**
+ * Routes every live credential may reach whatever it was restricted to.
+ *
+ * `GET /v1/me` is how an SDK asks what the credential it is holding actually
+ * is, so refusing it for want of `core:read` would make a restricted key
+ * unable to discover it is restricted. It carries the workspace's own header
+ * and the caller's own rung — nothing a key holder is not already entitled to
+ * know. Public routes need no credential at all and are exempt below.
+ */
+const SCOPE_EXEMPT_PATHS = new Set(['/v1/me']);
+
+/**
+ * The domains a route belongs to: the module that registered it, and every tag
+ * it is filed under in the API reference.
+ *
+ * A customer picks scopes off that reference, where the heading is the tag —
+ * so `billing:read` has to reach the pages headed "billing", and `credits`,
+ * `entitlements`, `payments` and `metering` all publish routes there. Reading
+ * only `route.module` would have made `billing:read` mean the routes that happen
+ * to live in the module called `billing` and nothing else, which is not the
+ * promise the documentation makes.
+ */
+const routeDomains = (route: Route): string[] => [route.module, ...(route.meta.tags ?? [])];
+
+/** `<domain>:<action>`, with the shorthands the key-minting UI actually issues. */
+function splitScope(scope: string): { domain: string; action: string } {
+  const s = scope.trim().toLowerCase();
+  const colon = s.indexOf(':');
+  if (colon >= 0) return { domain: s.slice(0, colon), action: s.slice(colon + 1) };
+  // A bare token is one of two things: a verb, which applies in every domain
+  // (`write` — what the "Read and write" preset issues), or a domain named on
+  // its own (`crm`), which means every action in it.
+  return SCOPE_ACTIONS.has(s) ? { domain: '*', action: s } : { domain: s, action: '*' };
+}
+
+/**
+ * Which half of a domain a route sits in: its read surface or its write one.
+ *
+ * The verb is the obvious signal and the wrong one on its own. The platform's
+ * searches, previews and estimates are POSTs that compute an answer and change
+ * nothing — `POST /v1/records/:type/search`, `POST /v1/invoices/create_preview`,
+ * `POST /v1/entitlements/check` — and a reporting key that cannot run a search
+ * is not a reporting key.
+ *
+ * What separates them is already declared: every route that genuinely changes
+ * something is gated at `member` or above, and the read-shaped POSTs are the
+ * ones that gate at nothing (or, for `POST /v1/catalog/estimate`, at
+ * `readonly`). So the module's own role declaration decides, and a route that
+ * later starts writing has to raise its gate to `member` anyway — which moves
+ * it to the write side here in the same edit.
+ */
+function routeAction(route: Route): 'read' | 'write' {
+  if (READ_METHODS.has(route.method)) return 'read';
+  return route.meta.roles?.some((role) => roleAtLeast(role, 'member')) ? 'write' : 'read';
+}
+
+/**
+ * Does one held scope grant `action` on `domain`?
+ *
+ * `write` implies `read` in the same domain: a key issued to maintain records
+ * that cannot read the record it just wrote is not an integration credential,
+ * and every customer who has ever minted `["crm:write"]` meant both.
+ */
+function scopeGrants(held: string, domain: string, action: string): boolean {
+  if (held.trim() === '*') return true;
+  const { domain: d, action: a } = splitScope(held);
+  if (d !== '*' && d !== domain) return false;
+  return a === '*' || a === 'admin' || a === action || (action === 'read' && a === 'write');
+}
+
+/**
+ * What this credential is missing to reach this route, or `null` if it may.
+ *
+ * Scopes used to be cosmetic: `route.meta.scopes` was their only reader and no
+ * route in the platform declared it, so a key minted `["crm:read"]` — sold to
+ * the customer as a reporting credential — carried every read in the workspace,
+ * and `["metering:write"]`, the ingest scope, carried every write the `member`
+ * rung reaches: CRM records, invoices, credit grants, refunds. A restricted key
+ * was restricted only in the key list.
+ *
+ * Asking each of the platform's 250-odd routes to declare its own scope is the
+ * same promise made 250 times and broken by the first route that forgets, so the
+ * requirement is derived from where the route already says it lives — its module and its
+ * documentation tags — and a route may still name scopes explicitly to demand
+ * something the derivation would not.
+ *
+ * Only an API key is narrowed. A session's authority is its membership and its
+ * role, which the ladder above already applies; an anonymous caller on a public
+ * route holds no scopes at all and must not be refused for it.
+ */
+function missingScope(route: Route, auth: Auth): string | null {
+  if (auth.kind !== 'api_key' || route.meta.auth === 'public') return null;
+  if (auth.scopes.some((s) => s.trim() === '*')) return null;
+  if (SCOPE_EXEMPT_PATHS.has(route.path)) return null;
+  // A declared list is a conjunction: every scope named has to be held.
+  if (route.meta.scopes?.length) {
+    return route.meta.scopes.find((want) => {
+      const need = splitScope(want);
+      return !auth.scopes.some((held) => scopeGrants(held, need.domain, need.action));
+    }) ?? null;
+  }
+  const action = routeAction(route);
+  const domains = routeDomains(route);
+  if (domains.some((domain) => auth.scopes.some((held) => scopeGrants(held, domain, action)))) return null;
+  return `${domains[0]}:${action}`;
 }
 
 /**
@@ -420,8 +529,12 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
       if (route.meta.roles && !route.meta.roles.some((r) => roleAtLeast(auth.role, r))) {
         throw forbidden(`Your role (${auth.role}) cannot perform this action.`);
       }
-      if (route.meta.scopes?.length && !auth.scopes.includes('*') && !route.meta.scopes.every((s) => auth.scopes.includes(s))) {
-        throw forbidden(`This API key is missing required scopes: ${route.meta.scopes.join(', ')}.`);
+      const missing = missingScope(route, auth);
+      if (missing) {
+        throw forbidden(
+          `This API key holds ${auth.scopes.join(', ')}, which does not reach ${input.method.toUpperCase()} ${path}. `
+          + `It needs ${missing}.`,
+        );
       }
 
       const req: Req = {

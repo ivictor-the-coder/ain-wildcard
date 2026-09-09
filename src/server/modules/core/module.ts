@@ -287,6 +287,8 @@ export interface CoreService {
   org(orgId: string): OrgRow;
   user(userId: string): UserRow | undefined;
   users(orgId: string): Seat[];
+  /** One seat, as this workspace knows it — see `users` for what that withholds. */
+  seat(orgId: string, userId: string): Seat | undefined;
   setting<T>(orgId: string, key: string, fallback: T): T;
   setSetting(orgId: string, key: string, value: unknown): void;
   createSession(orgId: string, userId: string, meta?: { ip?: string; userAgent?: string }): { token: string; expires: number };
@@ -328,6 +330,24 @@ CREATE TABLE invitations (
 );
 CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
 `,
+  }, {
+    /**
+     * A seat is this workspace's record of a person; the user row is the
+     * person's own account, shared with every other workspace they belong to.
+     *
+     * They were the same row, so inviting `dana@northwind.io` into a second
+     * workspace read her name, title, avatar, sign-up date and last-seen time
+     * straight back to that workspace's admin — confirmation that the address
+     * is an Ain account, and her profile with it — and `PATCH /v1/users/:id`
+     * renamed her everywhere she worked. What a workspace types about someone
+     * belongs to the workspace, so it is stored on the membership. Null means
+     * "nothing of its own": the demo seats fall through to the profile.
+     */
+    id: 'core.0003_seat_identity',
+    sql: `
+ALTER TABLE memberships ADD COLUMN seat_name TEXT;
+ALTER TABLE memberships ADD COLUMN seat_title TEXT;
+`,
   }],
 
   boot(ctx) {
@@ -338,12 +358,39 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
         return row;
       },
       user(userId) { return ctx.db.get<UserRow>(`SELECT * FROM users WHERE id = ?`, userId); },
+      /**
+       * The workspace's own view of its people, never the platform's.
+       *
+       * A seat that has not been accepted yet is nothing but what an admin
+       * typed into the invite dialog: the name and title come off the
+       * membership *without falling through to the account*, and the profile
+       * fields that would say "this address is already an Ain account" — the
+       * avatar, the sign-up date, the last time they were seen anywhere — are
+       * withheld until they accept and the person is genuinely a member here.
+       * Answering with them turned `POST /v1/users` into an oracle any admin
+       * of any workspace could ask about any email address on the platform.
+       *
+       * The fallthrough is the subtle half: coalescing an invited seat's blank
+       * title to the account's filled it in with the job title of whoever owns
+       * that address elsewhere, so leaving the field empty in the dialog was
+       * itself the probe. An accepted seat coalesces, because by then the
+       * person has chosen to be here and the profile is theirs to show.
+       */
       users(orgId) {
         return ctx.db.all<any>(
-          `SELECT u.*, m.role, m.teams, m.status FROM users u JOIN memberships m ON m.user_id = u.id WHERE m.org_id = ? ORDER BY u.name`,
+          `SELECT u.id, u.email, u.password_hash, u.updated,
+                  CASE WHEN m.status = 'invited' THEN COALESCE(m.seat_name, u.email) ELSE COALESCE(m.seat_name, u.name) END AS name,
+                  CASE WHEN m.status = 'invited' THEN m.seat_title ELSE COALESCE(m.seat_title, u.title) END AS title,
+                  CASE WHEN m.status = 'invited' THEN NULL ELSE u.avatar_url END AS avatar_url,
+                  CASE WHEN m.status = 'invited' THEN NULL ELSE u.last_seen END AS last_seen,
+                  CASE WHEN m.status = 'invited' THEN m.created ELSE u.created END AS created,
+                  m.role, m.teams, m.status
+           FROM users u JOIN memberships m ON m.user_id = u.id
+           WHERE m.org_id = ? ORDER BY name`,
           orgId,
         ).map((r) => ({ ...r, teams: parseJson<string[]>(r.teams, []) }));
       },
+      seat(orgId, userId) { return service.users(orgId).find((u) => u.id === userId); },
       setting(orgId, key, fallback) {
         const row = ctx.db.get<{ value: string }>(`SELECT value FROM settings WHERE org_id = ? AND key = ?`, orgId, key);
         return row ? parseJson(row.value, fallback) : fallback;
@@ -507,12 +554,16 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
       // set by accepting the invitation, and only that acceptance activates
       // it. A person who holds a password from an earlier seat cannot walk
       // into a workspace that has merely invited them.
-      const membership = c.db.get<{ org_id: string }>(`SELECT org_id FROM memberships WHERE user_id = ? AND status = 'active' LIMIT 1`, user.id);
+      // One identity, several workspaces, and no workspace picker yet: sign-in
+      // lands in the oldest membership, which is the workspace the person
+      // already thinks of as theirs. Unordered, `LIMIT 1` meant accepting an
+      // invitation somewhere else could silently move where they sign in.
+      const membership = c.db.get<{ org_id: string }>(`SELECT org_id FROM memberships WHERE user_id = ? AND status = 'active' ORDER BY created, rowid LIMIT 1`, user.id);
       if (!membership) {
         const invited = c.db.get<{ name: string }>(
           `SELECT o.name FROM memberships m JOIN orgs o ON o.id = m.org_id WHERE m.user_id = ? AND m.status = 'invited' LIMIT 1`, user.id);
         throw forbidden(invited
-          ? `Your invitation to ${invited.name} has not been accepted yet — open the invitation link to set your password and join.`
+          ? `Your invitation to ${invited.name} has not been accepted yet — open the invitation link to join. Your password is already the right one; the link is what activates the seat.`
           : 'This account is not a member of any workspace.');
       }
       const session = c.svc.core.createSession(membership.org_id, user.id, { ip: req.ip, userAgent: req.headers['user-agent'] });
@@ -536,11 +587,25 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
 
     /**
      * The invitation link, redeemed. This is the only route that turns an
-     * invited seat into an active one: it proves possession of the email the
-     * link was sent to, sets the password, and signs the person straight in
-     * so the first thing they see is the workspace rather than a login form.
-     * Every reason the link can be dead answers the same way, so a token
-     * cannot be used to learn whether a seat exists.
+     * invited seat into an active one, and the password it takes means one of
+     * two things depending on something the person on the other end knows and
+     * the workspace does not: whether this email address already signs in to
+     * Ain.
+     *
+     * If it does not, this is an enrolment and the password is set. If it
+     * does, this is a *join*, and the password is checked against the one the
+     * account already has — never overwritten. That asymmetry is the whole
+     * fix for the platform's worst hole: identity is one global row with one
+     * shared `password_hash`, so a workspace that could set it through an
+     * invitation could set it for every *other* workspace the person belongs
+     * to. Any admin anywhere could invite `dana@northwind.io`, accept their
+     * own invitation with a password of their choosing, and walk into
+     * Northwind as its owner. Joining a workspace must never be a way to
+     * issue a credential to somebody else's account.
+     *
+     * Every reason the link can be dead answers the same way, and a link that
+     * is alive answers the same way whether or not the address is known here,
+     * so the token tells its holder nothing about the person it names.
      */
     router.post('/v1/auth/accept', (req: Req, c: Ctx) => {
       const { token, password } = req.body as { token: string; password: string };
@@ -549,33 +614,50 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
       if (invitation && scope) scope.orgId = invitation.org_id;
       const now = c.now();
       const seat = invitation
-        ? c.db.get<{ id: string; role: Role; status: SeatStatus }>(`SELECT id, role, status FROM memberships WHERE org_id = ? AND user_id = ?`, invitation.org_id, invitation.user_id)
+        ? c.db.get<{ id: string; role: Role; status: SeatStatus; seat_name: string | null }>(
+          `SELECT id, role, status, seat_name FROM memberships WHERE org_id = ? AND user_id = ?`, invitation.org_id, invitation.user_id)
         : undefined;
       if (!invitation || !seat || invitation.accepted_at || invitation.voided_at || invitation.expires <= now) {
         throw badRequest('invitation_invalid', 'This invitation link is no longer valid — it may have been used already, replaced by a newer one, cancelled, or expired. Ask an admin of the workspace to send a fresh one.', 'token');
       }
       const user = c.svc.core.user(invitation.user_id);
       if (!user) throw badRequest('invitation_invalid', 'This invitation link is no longer valid.', 'token');
+      const credential = user.password_hash;
+      if (credential && !verifyPassword(password, credential)) {
+        // The same answer `POST /v1/auth/login` gives a wrong password, and
+        // deliberately no code of its own: a distinct `credential_required`
+        // would be the confirmation this route exists to withhold.
+        throw unauthorized('That password is not right for this invitation. If you already sign in to Ain with this email address, join with the password you use there.');
+      }
+      const seatName = seat.seat_name ?? user.name;
       c.atomic(() => {
-        c.db.patch('users', 'id', user.id, { password_hash: hashPassword(password), updated: now, last_seen: now });
+        // An enrolment sets the credential; a join has one already and this
+        // workspace does not get to touch it.
+        c.db.patch('users', 'id', user.id, credential
+          ? { last_seen: now }
+          : { password_hash: hashPassword(password), updated: now, last_seen: now });
         c.db.patch('memberships', 'id', seat.id, { status: 'active' });
         c.db.patch('invitations', 'id', invitation.id, { accepted_at: now });
+        // The trail says the same thing either way, because a summary that
+        // said "set a password" for one and "signed in" for the other would
+        // read the answer back to whoever sent the invitation.
         c.audit({
           orgId: invitation.org_id, actorId: user.id, actorType: 'user', action: 'user.invitation_accepted',
-          targetType: 'user', targetId: user.id, summary: `${user.name} accepted their invitation and set a password`,
+          targetType: 'user', targetId: user.id, summary: `${seatName} accepted their invitation and joined the workspace`,
           before: { status: seat.status }, after: { status: 'active', role: seat.role }, requestId: req.requestId, ip: req.ip,
         });
         c.emit(invitation.org_id, 'user.activated', { id: user.id, email: user.email, role: seat.role, status: 'active' },
           { objectId: user.id, objectType: 'user', previous: { status: seat.status }, actorId: user.id, actorType: 'user', requestId: req.requestId });
       });
       const session = c.svc.core.createSession(invitation.org_id, user.id, { ip: req.ip, userAgent: req.headers['user-agent'] });
+      const joined = c.svc.core.seat(invitation.org_id, user.id)!;
       return httpStatus(200, {
-        object: 'session', user: { ...publicUser({ ...user, last_seen: now }), role: seat.role, status: 'active' },
+        object: 'session', user: { ...publicUser(joined), role: joined.role, status: joined.status },
         org_id: invitation.org_id, expires: session.expires,
       }, sessionCookie(session.token, session.expires));
     }, {
-      auth: 'public', summary: 'Accept an invitation: set a password and sign in', tags: ['auth'],
-      description: 'The token comes from the invitation link an admin was shown once when they invited the teammate (or re-sent the invitation). Accepting activates the seat, sets the password and starts a session. A used, replaced, cancelled or expired link is refused with `invitation_invalid`.',
+      auth: 'public', summary: 'Accept an invitation and sign in', tags: ['auth'],
+      description: 'The token comes from the invitation link an admin was shown once when they invited the teammate (or re-sent the invitation). Accepting activates the seat and starts a session. If the email address has no Ain account yet, `password` is the one it will sign in with from now on; if it already has one, `password` is that account\'s existing password — joining a workspace never sets or resets a credential, because the credential belongs to the person and not to the workspace. A used, replaced, cancelled or expired link is refused with `invitation_invalid`.',
       body: v.object({ token: v.string({ min: 10, max: 200 }), password: v.string({ min: 8, max: 200 }) }, { strict: true }),
     });
 
@@ -583,18 +665,20 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
       const invitation = c.db.get<InvitationRow>(`SELECT * FROM invitations WHERE token_hash = ?`, sha(req.params.token));
       const scope = currentOrgScope();
       if (invitation && scope) scope.orgId = invitation.org_id;
-      const seat = invitation
-        ? c.db.get<{ role: Role; status: SeatStatus }>(`SELECT role, status FROM memberships WHERE org_id = ? AND user_id = ?`, invitation.org_id, invitation.user_id)
-        : undefined;
+      const seat = invitation ? c.svc.core.seat(invitation.org_id, invitation.user_id) : undefined;
       if (!invitation || !seat || invitation.accepted_at || invitation.voided_at || invitation.expires <= c.now()) {
         throw badRequest('invitation_invalid', 'This invitation link is no longer valid — it may have been used already, replaced by a newer one, cancelled, or expired. Ask an admin of the workspace to send a fresh one.', 'token');
       }
-      const user = c.svc.core.user(invitation.user_id);
       const org = c.svc.core.org(invitation.org_id);
-      const inviter = invitation.invited_by ? c.svc.core.user(invitation.invited_by) : undefined;
+      const inviter = invitation.invited_by ? c.svc.core.seat(invitation.org_id, invitation.invited_by) : undefined;
+      // Every field here is something the workspace itself supplied: the
+      // address an admin typed and the name they typed with it. Reading the
+      // *account's* name back would answer "is this address already on Ain?"
+      // for whoever holds the link — and the person who holds it first is the
+      // admin who minted it.
       return {
         ...publicInvitation(invitation),
-        email: user?.email ?? null, name: user?.name ?? null, role: seat.role,
+        email: seat.email, name: seat.name, role: seat.role,
         org: { id: org.id, name: org.name, logo_url: org.logo_url, brand_color: org.brand_color },
         invited_by: inviter ? { id: inviter.id, name: inviter.name } : null,
       };
@@ -611,7 +695,8 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
 
     router.get('/v1/me', (req: Req, c: Ctx) => {
       const org = c.svc.core.org(req.auth.orgId);
-      const user = req.auth.userId ? c.svc.core.user(req.auth.userId) : undefined;
+      // The seat, so the name in the header is the one on the roster.
+      const user = req.auth.userId ? c.svc.core.seat(req.auth.orgId, req.auth.userId) : undefined;
       return {
         object: 'me',
         user: user ? publicUser(user) : null,
@@ -661,7 +746,7 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
       })),
       {
         summary: 'List workspace members', tags: ['settings'],
-        description: 'Every seat, with its `status`: `invited` until the person accepts the invitation and sets a password, `active` after. An invited seat carries its pending `invitation` (never the token — that was shown once, when it was minted).',
+        description: 'Every seat, with its `status`: `invited` until the person accepts the invitation, `active` after. An invited seat carries its pending `invitation` (never the token — that was shown once, when it was minted).',
       });
 
     /**
@@ -670,6 +755,14 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
      * Nothing about the seat lets anyone sign in until `POST /v1/auth/accept`
      * redeems that token: a person who already holds a password from an
      * earlier seat is invited afresh, not let straight back in.
+     *
+     * The answer is the same whether or not the address already belongs to an
+     * Ain account, because an invitation is a claim a workspace makes about an
+     * address, not a lookup of the platform's directory. It used to be both:
+     * an existing account's name, title, avatar, sign-up date and last-seen
+     * time came straight back in the 201, so any admin of any workspace could
+     * type an address and read off whether it was on the platform and who it
+     * belonged to. What comes back now is what the caller sent.
      */
     router.post('/v1/users', (req: Req, c: Ctx) => {
       const body = req.body as { email: string; name: string; role: Role; title?: string };
@@ -688,7 +781,13 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
             ? `${body.email} already has a pending invitation to this workspace. Resend it rather than inviting them again.`
             : `${body.email} is already a member of this workspace.`, 'email');
         }
-        c.db.insert('memberships', { id: newId('user'), org_id: req.auth.orgId, user_id: userId, role: body.role, status: 'invited', teams: '[]', created: now });
+        // The name and title go on the seat, not the account: they are what
+        // this workspace calls this person, and an account that already exists
+        // has a name of its own that is none of this workspace's business.
+        c.db.insert('memberships', {
+          id: newId('user'), org_id: req.auth.orgId, user_id: userId, role: body.role, status: 'invited',
+          teams: '[]', created: now, seat_name: body.name, seat_title: body.title ?? null,
+        });
         const invitation = mintInvitation(c, req.auth.orgId, userId, actor.actorType === 'user' ? actor.actorId : null, now);
         c.audit({
           orgId: req.auth.orgId, ...actor, action: 'user.invited', targetType: 'user', targetId: userId,
@@ -700,7 +799,7 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
         return { userId, invitation };
       });
       return created({
-        ...publicUser(c.svc.core.user(outcome.userId)!), role: body.role, teams: [] as string[], status: 'invited' as const,
+        ...publicUser(c.svc.core.seat(req.auth.orgId, outcome.userId)!), role: body.role, teams: [] as string[], status: 'invited' as const,
         invitation: { ...publicInvitation(outcome.invitation.row), token: outcome.invitation.token },
       });
     }, {
@@ -716,7 +815,9 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
     router.post('/v1/users/:id/reinvite', (req: Req, c: Ctx) => {
       const member = c.db.get<{ id: string; role: Role; status: SeatStatus }>(`SELECT id, role, status FROM memberships WHERE org_id = ? AND user_id = ?`, req.auth.orgId, req.params.id);
       if (!member) throw notFound('user', req.params.id);
-      const user = c.svc.core.user(req.params.id)!;
+      // The seat, not the account: a fresh link must not read a profile back
+      // to the workspace any more than the first one did.
+      const user = c.svc.core.seat(req.auth.orgId, req.params.id)!;
       // A fresh link is a fresh grant of the seat's role, so the same ceiling
       // applies as when the seat was first offered.
       assertMayGrant(req, member.role);
@@ -765,7 +866,26 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
           ...(body.teams ? { teams: JSON.stringify(body.teams) } : {}),
         });
       }
-      if (body.name || body.title) c.db.patch('users', 'id', req.params.id, { ...(body.name ? { name: body.name } : {}), ...(body.title ? { title: body.title } : {}), updated: c.now() });
+      if (body.name || body.title) {
+        // Renaming a teammate renames the *seat*. `users.name` is the person's
+        // own profile, shared with every workspace they belong to: an admin
+        // here editing it rewrote their name on another company's team list,
+        // in that company's record timelines and in its agent traces — a
+        // second way one workspace reached across a global identity, and the
+        // quiet twin of the invitation hole above.
+        //
+        // When this account belongs to nobody else there is no other reader to
+        // protect, and keeping the profile in step is what makes the name the
+        // rest of the platform reads off `users` agree with the roster.
+        const elsewhere = c.db.count(`SELECT COUNT(*) FROM memberships WHERE user_id = ? AND org_id <> ?`, req.params.id, req.auth.orgId);
+        c.db.patch('memberships', 'id', member.id, {
+          ...(body.name ? { seat_name: body.name } : {}),
+          ...(body.title ? { seat_title: body.title } : {}),
+        });
+        if (!elsewhere) {
+          c.db.patch('users', 'id', req.params.id, { ...(body.name ? { name: body.name } : {}), ...(body.title ? { title: body.title } : {}), updated: c.now() });
+        }
+      }
       if (body.role && body.role !== member.role) {
         const actor = actorOf(c, req.auth);
         c.audit({
@@ -776,7 +896,7 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
         c.emit(req.auth.orgId, 'user.role_changed', { id: req.params.id, role: body.role, previous: member.role },
           { objectId: req.params.id, objectType: 'user', previous: { role: member.role }, ...actor, requestId: req.requestId });
       }
-      return { ...publicUser(c.svc.core.user(req.params.id)!), role: body.role ?? member.role, status: member.status as SeatStatus };
+      return { ...publicUser(c.svc.core.seat(req.auth.orgId, req.params.id)!), role: body.role ?? member.role, status: member.status as SeatStatus };
     }, {
       summary: 'Update a teammate', tags: ['settings'], roles: ['admin'],
       body: v.object({
@@ -813,7 +933,7 @@ CREATE INDEX idx_invitations_seat ON invitations(org_id, user_id);
       assertKeepsAnAdmin(c, req.auth.orgId, req.params.id, null);
 
       const actor = actorOf(c, req.auth);
-      const user = c.svc.core.user(req.params.id);
+      const user = c.svc.core.seat(req.auth.orgId, req.params.id);
       c.atomic(() => {
         const now = c.now();
         c.db.run(`DELETE FROM memberships WHERE org_id = ? AND user_id = ?`, req.auth.orgId, req.params.id);

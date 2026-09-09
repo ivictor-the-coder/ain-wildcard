@@ -186,6 +186,20 @@ const holdColumns = (hold: DunningHold | null) => ({
   hold_note: hold?.note ?? null,
 });
 
+/**
+ * The statuses in which a campaign is still about money somebody owes.
+ *
+ * A recovered campaign brought the money in; a cancelled one had a person
+ * decide the account was being collected another way. Neither has a balance to
+ * re-state when a credit note moves one, and `advise` answers "nothing to do"
+ * for both. The other two do: `recovering` is chasing a balance, and
+ * `exhausted` is the bill still owed with nothing automatic left to ask for it
+ * — which is exactly why `advise` marks it as needing a person, and why the
+ * summary's count has to look at it rather than at the running campaigns
+ * alone.
+ */
+const STILL_OWED: readonly DunningStatus[] = ['recovering', 'exhausted'];
+
 const isWeekend = (ts: number): boolean => {
   const day = new Date(ts).getUTCDay();
   return day === 0 || day === 6;
@@ -389,11 +403,18 @@ export class DunningEngine {
     // front of a person, with the one call they can make to end it.
     if (campaign.hold) {
       const code = campaign.last_failure_code;
-      const why = code ? `${DECLINES[code].advice} ` : '';
-      return {
-        action: `${why}${campaign.hold.note}${hasMethod ? '' : ` There is no usable method on file: take the card details and attach them with POST /v1/payment_methods, and the bill is presented to the new card as soon as it lands.`}`,
-        needsHuman: true,
-      };
+      // The decline's own advice belongs in front of a hold that is *about* the
+      // card. In front of a net-terms hold it contradicts the sentence after
+      // it — "worth retrying, this one usually clears" over a bill nothing will
+      // ever retry — and so does the offer to attach a card and have the bill
+      // presented the moment it lands, which is precisely what a bill settled
+      // by transfer is not.
+      const aboutTheCard = campaign.hold.reason === 'card_needs_person';
+      const why = aboutTheCard && code ? `${DECLINES[code].advice} ` : '';
+      const noMethod = aboutTheCard && !hasMethod
+        ? ` There is no usable method on file: take the card details and attach them with POST /v1/payment_methods, and the bill is presented to the new card as soon as it lands.`
+        : '';
+      return { action: `${why}${campaign.hold.note}${noMethod}`, needsHuman: true };
     }
     if (!hasMethod) {
       return {
@@ -453,7 +474,21 @@ export class DunningEngine {
       `SELECT MIN(next_attempt_at) FROM payments_dunning WHERE org_id = ? AND status = 'recovering' AND next_attempt_at IS NOT NULL`,
       orgId,
     );
-    const needsHuman = this.list(orgId, { status: 'open', limit: 200 }).data
+    // One flag, one count. `needs_human` is decided by `advise` and travels on
+    // the campaign, and the product's "Needs a person" filter reads it across
+    // every status — so counting only the *running* ones here made this the one
+    // place that disagreed with both. It disagreed about the worst case, too:
+    // an exhausted campaign is precisely the one nothing automatic will ever
+    // chase again, so a workspace whose whole queue had run out of attempts was
+    // told nobody needed a person while every row on the screen said otherwise.
+    // Read from the same rows the queue reads, with no page limit — a count
+    // that silently stops at 200 is the same lie one order of magnitude along.
+    const needsHuman = this.ctx.db
+      .all<any>(
+        `SELECT * FROM payments_dunning WHERE org_id = ? AND status IN (${STILL_OWED.map(() => '?').join(', ')})`,
+        orgId, ...STILL_OWED,
+      )
+      .map(hydrateDunning)
       .filter((campaign) => this.view(orgId, campaign).needs_human).length;
     const held = this.ctx.db.count(
       `SELECT COUNT(*) FROM payments_dunning WHERE org_id = ? AND status = 'recovering' AND hold_reason IS NOT NULL`, orgId,
@@ -570,14 +605,74 @@ export class DunningEngine {
     orgId: string, invoice: Invoice, intent: PaymentIntent, charge: Charge | null,
     failure: { code: DeclineCode; message: string; advice: string },
   ): void {
-    if (invoice.collection_method === 'send_invoice') return;
     const campaign = this.open(orgId, invoice);
-    this.recordFailure(orgId, campaign, {
+    const input = {
       attemptNumber: campaign.attempt_count + 1,
       scheduledFor: campaign.next_attempt_at ?? this.ctx.now(),
       intentId: intent.id, chargeId: charge?.id ?? null, methodId: intent.payment_method,
       amount: intent.amount, failure,
+    };
+    if (invoice.collection_method === 'send_invoice') {
+      this.holdOffTerms(orgId, campaign, invoice, input);
+      return;
+    }
+    this.recordFailure(orgId, campaign, input);
+  }
+
+  /**
+   * A card was refused against a bill that is collected on net terms.
+   *
+   * No schedule starts, and none should: nothing presents a `send_invoice`
+   * bill automatically, and giving one a retry schedule would charge a card
+   * the customer did not choose to pay by. What was wrong was returning here
+   * in silence, which lost the bill entirely. The decline emits
+   * `invoice.payment_failed` like any other, billing moves the subscription to
+   * `past_due` off it, and then the recovery queue — this product's whole
+   * answer to "who is behind and what do I do about it" — had no row for the
+   * account, `amount_at_risk` did not count the money, and `/v1/dunning/summary`
+   * reported a workspace recovering 100% of its failed payments with this one
+   * still owed and nobody chasing it. Three screens agreeing that nothing had
+   * happened, over a subscription the platform had just marked past due.
+   *
+   * So it opens like any other campaign and is held on the spot, with no
+   * deadline: at risk, presenting nothing, needing a person, and ended by the
+   * bill being settled — the transfer arriving, or a card taken with the
+   * customer on the phone — exactly as every other held campaign is.
+   */
+  private holdOffTerms(
+    orgId: string, campaign: Dunning, invoice: Invoice,
+    input: {
+      attemptNumber: number; scheduledFor: number; intentId: string | null; chargeId: string | null;
+      methodId: string | null; amount: number; failure: { code: DeclineCode; message: string; advice: string };
+    },
+  ): void {
+    const now = this.ctx.now();
+    const org = this.orgFormat(orgId);
+    const shown = formatMoney(money(invoice.amount_due, invoice.currency), { locale: org.locale });
+    const terms = invoice.due_date
+      ? `net terms to ${formatDate(invoice.due_date, org)}`
+      : 'invoice terms, due on receipt';
+    const hold: DunningHold = {
+      reason: 'not_card_collected',
+      until: null,
+      note: `${invoice.number} is billed on ${terms} and settled by transfer, not by a card on file, so no retry is scheduled and nothing is presented automatically. The card offered on ${formatDate(now, org)} was refused with ${input.failure.code}. ${shown} stays owed until the payment arrives — record it with POST /v1/invoices/${invoice.id}/pay — or until someone takes a working method with the customer there: POST /v1/invoices/${invoice.id}/retry with {"off_session": false}.`,
+    };
+    this.ctx.db.patch('payments_dunning', 'id', campaign.id, {
+      attempt_count: input.attemptNumber, last_attempt_at: now, next_attempt_at: null, ...holdColumns(hold),
+      last_failure_code: input.failure.code, last_failure_message: input.failure.message, updated: now,
     });
+    const attempt = this.writeAttempt(orgId, campaign, {
+      attemptNumber: input.attemptNumber, scheduledFor: input.scheduledFor, outcome: 'failed',
+      methodId: input.methodId, intentId: input.intentId, chargeId: input.chargeId,
+      amount: input.amount, failure: { code: input.failure.code, message: input.failure.message },
+      decision: `The card offered against ${invoice.number} was refused with ${input.failure.code}. That bill is on ${terms}, so there is no schedule to retry it on and none is invented: it is held for a person until the transfer arrives or a working method is taken with the customer present.`,
+      nextAttemptAt: null,
+    });
+    const after = this.require(orgId, campaign.id);
+    this.ctx.emit(orgId, 'dunning.attempt_failed', { campaign: after, attempt }, {
+      objectId: campaign.id, objectType: 'dunning',
+    });
+    this.placeHold(orgId, after, hold, { failure_code: input.failure.code, attempt: attempt.id });
   }
 
   /** A bill was collected outside a scheduled retry: close the campaign. */
@@ -688,6 +783,50 @@ export class DunningEngine {
       resolution: scheduled === null
         ? `${shown(charge.amount)} of ${shown(campaign.amount_at_risk)} came in against this bill, so ${shown(invoice.amount_due)} is still owed. The campaign stays held — nothing is presented automatically — and the balance is what a person now has to collect or credit.`
         : `${shown(charge.amount)} of ${shown(campaign.amount_at_risk)} came in against this bill, so ${shown(invoice.amount_due)} is still at risk. Recovery keeps running — attempt ${campaign.attempt_count + 1} of ${campaign.max_attempts} is scheduled for ${formatDate(scheduled, { ...org, withTime: true })} and will present the balance, not the original amount.`,
+    }, {
+      objectId: campaign.id, objectType: 'dunning',
+      previous: { amount_at_risk: campaign.amount_at_risk },
+    });
+  }
+
+  /**
+   * Put the campaign back in step with the bill it is chasing.
+   *
+   * `amount_at_risk` is a claim about money owed *now*, and every path inside
+   * this module that moves the balance keeps it true — `open` on the way in,
+   * `recordPartialCollection` when cash arrives mid-schedule. A credit note
+   * moves the same balance from outside, and nothing put the campaign back in
+   * step: a note halving a bill left the campaign chasing the whole of it, so
+   * the queue told an operator to collect money the workspace had already
+   * agreed to forgive, the next attempt would have presented a figure the
+   * customer no longer owed, and the workspace's "At risk" total — which is
+   * the sum of exactly this column — overstated the book by every credit note
+   * ever written against a bill in recovery.
+   *
+   * `exhausted` is here for the same reason `recovering` is: that column is
+   * `lost_amount` once a schedule has run out, and a bill credited afterwards
+   * is not money lost. A recovered or cancelled campaign has no live claim on
+   * a balance, so nothing to re-state.
+   */
+  syncAmountAtRisk(orgId: string, invoiceId: string, why: string): void {
+    const campaign = this.forInvoice(orgId, invoiceId);
+    if (!campaign || !STILL_OWED.includes(campaign.status)) return;
+    const invoice = this.billing.invoices.invoice(orgId, invoiceId);
+    if (!invoice) return;
+    const atRisk = Math.max(0, invoice.amount_due);
+    if (atRisk === campaign.amount_at_risk) return;
+    const now = this.ctx.now();
+    this.ctx.db.patch('payments_dunning', 'id', campaign.id, { amount_at_risk: atRisk, updated: now });
+    const org = this.orgFormat(orgId);
+    const shown = (amount: number) => formatMoney(money(amount, campaign.currency), { locale: org.locale });
+    this.ctx.emit(orgId, 'dunning.amount_at_risk_changed', {
+      campaign: this.require(orgId, campaign.id),
+      invoice: invoice.id,
+      customer: campaign.customer,
+      subscription: campaign.subscription,
+      currency: campaign.currency,
+      amount_at_risk: atRisk,
+      resolution: `${why} ${shown(campaign.amount_at_risk)} was being chased on ${invoice.number}; ${atRisk === 0 ? 'nothing is owed on it now' : `${shown(atRisk)} is`}.`,
     }, {
       objectId: campaign.id, objectType: 'dunning',
       previous: { amount_at_risk: campaign.amount_at_risk },

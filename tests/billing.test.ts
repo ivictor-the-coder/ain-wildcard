@@ -6284,3 +6284,445 @@ describe('a refund leaves the bill paid', () => {
     assert.equal((await ws.ok('GET', `/v1/invoices/${open.id}`)).amount_refunded, 0, 'the refusal wrote nothing');
   });
 });
+
+/* ========================================================================== *
+ * The allowance the plan sells, and the bill that has to honour it
+ * ========================================================================== */
+
+/**
+ * A metered feature over `fx`'s meter, included with the Growth plan.
+ *
+ * Northwind's own shape: the *plan* says how many units come free, the
+ * *component* meters and prices them, and the two are joined only by the meter
+ * behind them — which is exactly the join the invoice never made.
+ */
+let allowanceSeq = 0;
+async function includedWithGrowth(ws: Workspace, fx: MeteredFixture, units: number): Promise<string> {
+  allowanceSeq += 1;
+  const key = `bench_included_${allowanceSeq}`;
+  await ws.ok('POST', '/v1/features', {
+    key,
+    name: `Bench events included ${allowanceSeq}`,
+    type: 'metered',
+    unit_label: 'event',
+    meter: fx.eventName,
+    usage_window: 'billing_period',
+  });
+  const price = (await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly')).data[0] as { product: string };
+  await ws.ok('POST', '/v1/product-features', { product: price.product, feature: key, value: units });
+  return key;
+}
+
+describe('the included allowance the catalogue sells', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 10, 2, 11, 5)); });
+  after(() => ws.close());
+
+  test('it comes off the metered charge, priced on the metered price’s own tiers', async () => {
+    const fx = await meteredPrice(ws);
+    const INCLUDED = 4_000;
+    const USED = 9_000;
+    await includedWithGrowth(ws, fx, INCLUDED);
+
+    const customer = await ws.customer('Allowance Ironworks');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }, { price: fx.price }],
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+    const first: Period = { start: sub.current_period_start, end: sub.current_period_end };
+
+    // The entitlement engine already knows the number; the question is whether
+    // the bill does.
+    const entitlements = await ws.ok('GET', `/v1/customers/${customer.id}/entitlements`);
+    const granted = (entitlements.entitlements as { feature: string; value: number }[]).find((e) => e.value === INCLUDED);
+    assert.ok(granted, 'the plan grants the allowance the catalogue sells');
+
+    await stream(ws, fx, customer.id, USED, first.start + 4 * DAY, 'allowance-1');
+    await ws.travelTo(first.end + 60_000);
+
+    const renewal = (await cycleInvoices(ws, sub.id))[0];
+    const usage = renewal.lines.filter((line) => line.kind === 'usage');
+    assert.equal(usage.length, 1);
+    assert.equal(usage[0].amount, usageCost(USED), 'the metered price still prices every unit that was used');
+
+    const allowance = renewal.lines.filter((line) => line.kind === 'included_allowance');
+    assert.equal(allowance.length, 1, 'the allowance is a line of its own, so the customer can see the subtraction');
+    // Priced by hand from the ladder in `meteredPrice`: 1,000 units at 2 and
+    // 3,000 at 1 — never read back out of the line under test.
+    assert.equal(allowance[0].amount, -usageCost(INCLUDED));
+    assert.equal(allowance[0].quantity, INCLUDED);
+    assert.equal(allowance[0].price, fx.price, 'taxed the way the charge it reduces is taxed');
+    assert.deepEqual(allowance[0].period, first);
+
+    // What the account is actually asked to pay for its metered usage.
+    const metered = usage[0].amount + allowance[0].amount;
+    assert.equal(metered, usageCost(USED) - usageCost(INCLUDED));
+    assert.equal(renewal.subtotal, GROWTH + metered, 'the plan fee, plus the usage past what the plan includes');
+    assert.equal(sumLines(renewal), renewal.subtotal);
+    assert.equal(renewal.subtotal + renewal.tax + renewal.balance_applied, renewal.total);
+
+    // Every line carries a sentence that reconstructs its own number.
+    assert.match(allowance[0].explanation, /Included in Telemetry Cloud Growth/);
+    assert.match(allowance[0].explanation, new RegExp(`${INCLUDED.toLocaleString('en-US')} events`));
+    const dollars = (minor: number) => `$${(minor / 100).toFixed(2)}`;
+    assert.ok(allowance[0].explanation.includes(dollars(usageCost(INCLUDED))), 'the money those 4,000 events are worth');
+    assert.ok(allowance[0].explanation.includes(dollars(usageCost(USED))), 'and the charge it comes off');
+  });
+
+  test('usage inside the allowance is billed at nothing, and the allowance never turns a charge negative', async () => {
+    const fx = await meteredPrice(ws);
+    const INCLUDED = 6_000;
+    const USED = 2_500;
+    await includedWithGrowth(ws, fx, INCLUDED);
+
+    const customer = await ws.customer('Underuse Fabrication');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }, { price: fx.price }],
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+    const first: Period = { start: sub.current_period_start, end: sub.current_period_end };
+    await stream(ws, fx, customer.id, USED, first.start + 2 * DAY, 'allowance-under-1');
+    await ws.travelTo(first.end + 60_000);
+
+    const renewal = (await cycleInvoices(ws, sub.id))[0];
+    const usage = renewal.lines.find((line) => line.kind === 'usage');
+    const allowance = renewal.lines.find((line) => line.kind === 'included_allowance');
+    assert.ok(usage && allowance);
+    assert.equal(usage.amount, usageCost(USED));
+    assert.equal(allowance.amount, -usageCost(USED), 'only the units actually used are given back');
+    assert.equal(allowance.quantity, USED);
+    assert.equal(usage.amount + allowance.amount, 0, 'usage inside the allowance costs nothing');
+    assert.equal(renewal.subtotal, GROWTH, 'so the bill is the plan fee and nothing else');
+  });
+
+  test('an unlimited grant is a ceiling removed, not a metered price waived', async () => {
+    const fx = await meteredPrice(ws);
+    allowanceSeq += 1;
+    const key = `bench_unlimited_${allowanceSeq}`;
+    await ws.ok('POST', '/v1/features', {
+      key, name: `Bench unlimited ${allowanceSeq}`, type: 'metered', unit_label: 'event',
+      meter: fx.eventName, usage_window: 'billing_period',
+    });
+    const growth = (await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly')).data[0] as { product: string };
+    await ws.ok('POST', '/v1/product-features', { product: growth.product, feature: key, unlimited: true });
+
+    const customer = await ws.customer('Unlimited Extrusion');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }, { price: fx.price }],
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+    const first: Period = { start: sub.current_period_start, end: sub.current_period_end };
+    await stream(ws, fx, customer.id, 3_000, first.start + 2 * DAY, 'allowance-unlimited-1');
+    await ws.travelTo(first.end + 60_000);
+
+    const renewal = (await cycleInvoices(ws, sub.id))[0];
+    assert.equal(renewal.lines.filter((line) => line.kind === 'included_allowance').length, 0);
+    assert.equal(renewal.lines.find((line) => line.kind === 'usage')?.amount, usageCost(3_000),
+      'a metered add-on sold as "unlimited" is uncapped, not free');
+  });
+});
+
+/* ========================================================================== *
+ * The upcoming invoice, as the bill's own arithmetic
+ * ========================================================================== */
+
+describe('the upcoming invoice against the bill it predicts', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 10, 4, 8, 20)); });
+  after(() => ws.close());
+
+  test('it carries the settled usage waiting for the bill, line for line and to the cent', async () => {
+    const fx = await meteredPrice(ws);
+    const INCLUDED = 3_000;
+    await includedWithGrowth(ws, fx, INCLUDED);
+
+    const customer = await ws.customer('Preview Precision');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }, { price: fx.price }],
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+    const first: Period = { start: sub.current_period_start, end: sub.current_period_end };
+    await stream(ws, fx, customer.id, 11_000, first.start + 3 * DAY, 'preview-usage-1');
+
+    // Settle the window without billing it, which is exactly the state a
+    // renewal leaves behind for a moment and a manual settlement leaves
+    // indefinitely: priced, in the outbox, waiting for an invoice.
+    await ws.ok('POST', '/v1/credit-settlements', {
+      customer: customer.id, price: fx.price,
+      period_start: first.start, period_end: first.start + 10 * DAY,
+      close_period: false,
+    });
+    const waiting = await ws.ok('GET', `/v1/credit-billable-items?customer=${customer.id}&status=pending`);
+    const owed = (waiting.data as { billed_amount: number }[]).reduce((sum, item) => sum + item.billed_amount, 0);
+    assert.ok(owed > 0, 'the fixture has to actually leave money waiting');
+
+    const preview: Invoice = await ws.ok('POST', '/v1/invoices/create_preview', { subscription: sub.id });
+    const previewUsage = preview.lines.filter((line) => line.source.type === 'billable_item' || line.kind === 'included_allowance');
+    assert.ok(previewUsage.length >= 2, 'the preview carries the usage and the allowance that comes off it');
+    assert.equal(preview.subtotal, GROWTH + owed - usageCost(INCLUDED),
+      'the plan fee plus the usage waiting, less what the plan includes');
+
+    // Now raise the bill those same lines are waiting for. The preview and the
+    // charge are one computation, so they agree line for line.
+    const bill: Invoice = await ws.ok('POST', '/v1/invoices', { customer: customer.id });
+    const billed = bill.lines.filter((line) => line.source.type === 'billable_item' || line.kind === 'included_allowance');
+    assert.deepEqual(
+      billed.map((line) => [line.kind, line.amount, line.description]),
+      previewUsage.map((line) => [line.kind, line.amount, line.description]),
+    );
+    assert.equal(bill.subtotal, preview.subtotal - GROWTH, 'the bill is the preview without the fee that is not due yet');
+  });
+
+  test('an always_invoice change collects the settled usage too, because the bill it raises does', async () => {
+    const fx = await meteredPrice(ws);
+    const INCLUDED = 2_000;
+    await includedWithGrowth(ws, fx, INCLUDED);
+
+    const customer = await ws.customer('Collect Now Castings');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      items: [{ price: 'growth_monthly' }, { price: fx.price }],
+      collection_method: 'send_invoice',
+      days_until_due: 30,
+    });
+    const first: Period = { start: sub.current_period_start, end: sub.current_period_end };
+    await stream(ws, fx, customer.id, 8_000, first.start + 2 * DAY, 'collect-now-1');
+    await ws.ok('POST', '/v1/credit-settlements', {
+      customer: customer.id, price: fx.price,
+      period_start: first.start, period_end: first.start + 9 * DAY,
+      close_period: false,
+    });
+
+    // Adding seats mid-cycle with always_invoice raises a bill on the spot,
+    // and that bill sweeps the settled usage with the proration.
+    const seats = { price: 'growth_seat_monthly', quantity: 4 };
+    const preview: ChangePreview = await ws.ok('POST', `/v1/subscriptions/${sub.id}/preview`, {
+      items: [seats], proration_behavior: 'always_invoice', proration_date: ws.now(),
+    });
+    await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+      items: [seats], proration_behavior: 'always_invoice', proration_date: ws.now(),
+    });
+    const raised = (await allInvoices(ws, `&subscription=${sub.id}`))
+      .find((invoice) => invoice.billing_reason === 'subscription_update');
+    assert.ok(raised, 'always_invoice raises a bill on the spot');
+    assert.equal(
+      preview.amount_due_now, raised.amount_due,
+      'what the button says it collects is what the bill it raises collects',
+    );
+    assert.ok(
+      raised.lines.some((line) => line.kind === 'usage') && raised.lines.some((line) => line.kind === 'included_allowance'),
+      'and that bill really did carry the usage and its allowance',
+    );
+  });
+});
+
+/* ========================================================================== *
+ * Tax resolves when the bill is finalised
+ * ========================================================================== */
+
+describe('a draft finalised after the address was corrected', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 10, 6, 9, 0)); });
+  after(() => ws.close());
+
+  const address = (state: string) => ({
+    address: { line1: '1 Industrial Way', city: state === 'Texas' ? 'Austin' : 'Memphis', state, postal_code: '78701', country: 'United States' },
+  });
+
+  test('it is priced at the jurisdiction it prints, not the one it was drawn in', async () => {
+    const customer = await ws.customer('Relocating Rollforming', address('Texas'));
+    const draft: Invoice = await ws.ok('POST', '/v1/invoices', {
+      customer: customer.id,
+      auto_advance: false,
+      items: [{ description: 'Commissioning week', amount: 100_000 }],
+    });
+    assert.equal(draft.status, 'draft');
+    assert.equal(draft.lines[0].tax.jurisdiction, 'Texas');
+    assert.equal(draft.tax, 6_250, '6.25% of $1,000.00');
+
+    // The account was in the wrong state on the CRM record; finance fixes it
+    // before the bill goes out.
+    await ws.ok('PATCH', `/v1/customers/${customer.id}`, address('Tennessee'));
+    const open: Invoice = await ws.ok('POST', `/v1/invoices/${draft.id}/finalize`);
+
+    assert.equal(open.status, 'open');
+    assert.equal(open.lines[0].tax.jurisdiction, 'Tennessee', 'the rate follows the address the document prints');
+    assert.equal(open.lines[0].tax.percentage, '7');
+    assert.equal(open.tax, 7_000, '7% of $1,000.00');
+    assert.equal(open.total, 107_000);
+    assert.equal(open.amount_due, open.total);
+    assert.equal(sumTax(open), open.tax);
+    assert.equal(open.subtotal + open.tax + open.balance_applied, open.total);
+
+    // The re-pricing is announced, so a webhook or a workflow sees the move.
+    const updates = ws.app.ctx.events.list(ORG, { types: ['invoice.updated'], objectId: draft.id, limit: 5 });
+    assert.equal(updates.length, 1);
+    assert.deepEqual(updates[0].previous, { subtotal: draft.subtotal, tax: draft.tax, total: draft.total });
+  });
+
+  test('a tax-inclusive hand-written line keeps the customer’s price through the re-pricing', async () => {
+    const customer = await ws.customer('Inclusive Interiors', address('Texas'));
+    const draft: Invoice = await ws.ok('POST', '/v1/invoices', {
+      customer: customer.id,
+      auto_advance: false,
+      items: [{ description: 'Retainer, tax included', amount: 106_250, tax_behavior: 'inclusive' }],
+    });
+    // $1,062.50 with 6.25% already inside it: the base is $1,000.00.
+    assert.equal(draft.lines[0].amount, 100_000);
+    assert.equal(draft.lines[0].tax.amount, 6_250);
+
+    await ws.ok('PATCH', `/v1/customers/${customer.id}`, address('Tennessee'));
+    const open: Invoice = await ws.ok('POST', `/v1/invoices/${draft.id}/finalize`);
+    assert.equal(open.lines[0].tax.behavior, 'inclusive', 'a line with no price behind it keeps its own behaviour');
+    assert.equal(open.lines[0].amount + open.lines[0].tax.amount, 106_250,
+      'the customer still pays the price they were quoted, whatever the jurisdiction');
+    assert.equal(open.lines[0].tax.percentage, '7');
+    assert.equal(open.total, 106_250);
+  });
+
+  test('a draft whose rate has not moved is finalised untouched', async () => {
+    const customer = await ws.customer('Settled Stampings', address('Texas'));
+    const draft: Invoice = await ws.ok('POST', '/v1/invoices', {
+      customer: customer.id,
+      auto_advance: false,
+      items: [{ description: 'Retrofit kit', amount: 40_000 }],
+    });
+    const open: Invoice = await ws.ok('POST', `/v1/invoices/${draft.id}/finalize`);
+    assert.equal(open.tax, draft.tax);
+    assert.equal(open.total, draft.total);
+    assert.equal(open.lines[0].id, draft.lines[0].id);
+    assert.equal(
+      ws.app.ctx.events.list(ORG, { types: ['invoice.updated'], objectId: draft.id, limit: 5 }).length, 0,
+      'nothing moved, so nothing is announced',
+    );
+  });
+});
+
+/* ========================================================================== *
+ * Crediting a bill that was part collected
+ * ========================================================================== */
+
+describe('a credit note on a bill that was part collected', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 10, 8, 10, 30)); });
+  after(() => ws.close());
+
+  /** A paid bill, then a partial chargeback: `open`, with real cash on it. */
+  async function partlyCollected(name: string): Promise<{ customer: { id: string }; invoice: Invoice; collected: number }> {
+    const customer = await ws.customer(name, {
+      address: { line1: '901 Congress Avenue', city: 'Austin', state: 'Texas', postal_code: '78701', country: 'United States' },
+    });
+    await ws.ok('POST', '/v1/payment_methods', {
+      type: 'card', customer: customer.id, brand: 'visa', exp_month: 4, exp_year: 2031, simulated_behavior: 'succeeds',
+    });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+    });
+    await ws.app.tick();
+    const paid = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    assert.equal(paid.status, 'paid', 'the card settled it');
+
+    const charges = await ws.ok('GET', `/v1/charges?invoice=${paid.id}`);
+    const clawback = Math.round(paid.total / 4);
+    await ws.ok('POST', '/v1/disputes', { charge: charges.data[0].id, reason: 'fraudulent', amount: clawback });
+    const invoice: Invoice = await ws.ok('GET', `/v1/invoices/${paid.id}`);
+    assert.equal(invoice.status, 'open');
+    assert.equal(invoice.amount_paid, paid.total - clawback, 'cash really is still sitting on the bill');
+    assert.equal(invoice.amount_due, clawback);
+    return { customer, invoice, collected: invoice.amount_paid };
+  }
+
+  test('the note accounts for the share the bill could not hold, and never says nothing was collected', async () => {
+    const { customer, invoice, collected } = await partlyCollected('Halfway Hydraulics');
+
+    const note = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: invoice.total, reason: 'order_change' });
+    assert.equal(note.pre_payment_amount, note.total, 'the note still reduces the bill, which is what withdrawing it puts back');
+    assert.equal(note.displaced_to_balance, collected,
+      'and it records the part the bill could not hold, because that much was already collected');
+
+    // That share really is on the account, and the note is no longer the only
+    // document that knows it moved.
+    const account = await ws.ok('GET', `/v1/customers/${customer.id}`);
+    assert.equal(account.balance, -collected);
+
+    const after: Invoice = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(after.amount_due, 0, 'never a bill owed less than nothing');
+    assert.equal(after.amount_paid + after.pre_payment_credit_notes_amount + after.amount_due, after.total);
+    assert.equal(after.status, 'paid');
+    assert.doesNotMatch(String(after.payment_note), /nothing was collected/,
+      'a bill that collected three quarters of itself may not say nothing was collected');
+
+    const fetched = await ws.ok('GET', `/v1/credit_notes/${note.id}`);
+    assert.doesNotMatch(fetched.routing_detail, /nothing had been collected yet/);
+    assert.match(fetched.routing_detail, /had already been collected/);
+    assert.ok(fetched.routing_detail.includes(`$${(collected / 100).toFixed(2)}`),
+      'and it names the figure, so the note reconstructs its own arithmetic');
+  });
+
+  test('a note on a bill nothing was collected on displaces nothing, and says so', async () => {
+    const customer = await ws.customer('Nothing Collected Yet');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], collection_method: 'send_invoice', days_until_due: 30,
+    });
+    const invoice = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    const note = await ws.ok('POST', '/v1/credit_notes', { invoice: invoice.id, amount: invoice.total, reason: 'order_change' });
+    assert.equal(note.displaced_to_balance, 0);
+    assert.equal(note.pre_payment_amount, note.total);
+    assert.match(note.routing_detail, /nothing had been collected yet/);
+    assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).balance, 0);
+    assert.match(String((await ws.ok('GET', `/v1/invoices/${invoice.id}`)).payment_note), /nothing was collected/);
+  });
+});
+
+/* ========================================================================== *
+ * The timestamps this API emits are the timestamps it takes back
+ * ========================================================================== */
+
+describe('timestamp query parameters', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 10, 10, 12, 0)); });
+  after(() => ws.close());
+
+  test('epoch milliseconds are accepted wherever the schema says unix-ms', async () => {
+    const customer = await ws.customer('Epoch Engineering');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+      collection_method: 'send_invoice', days_until_due: 30,
+    });
+    const invoice = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+
+    // The document says these are integers in unix-ms, and every one of them is
+    // a number this same API just emitted.
+    const schema = await ws.ok('GET', '/openapi.json');
+    const params = (schema.paths['/v1/invoices'].get.parameters as { name: string; schema: { type: string; format?: string } }[]);
+    for (const name of ['created_after', 'created_before', 'due_before']) {
+      const declared = params.find((p) => p.name === name);
+      assert.ok(declared, `/v1/invoices declares ${name}`);
+      assert.equal(declared.schema.type, 'integer', `${name} is published as an integer`);
+    }
+
+    const found = await ws.ok('GET', `/v1/invoices?customer=${customer.id}&created_after=${invoice.created - 1}&created_before=${invoice.created + 1}`);
+    assert.deepEqual((found.data as Invoice[]).map((row) => row.id), [invoice.id]);
+    const missed = await ws.ok('GET', `/v1/invoices?customer=${customer.id}&created_after=${invoice.created + 1}`);
+    assert.deepEqual(missed.data, [], 'and the bound really is applied, not merely accepted');
+    const due = await ws.ok('GET', `/v1/invoices?customer=${customer.id}&due_before=${invoice.due_date}`);
+    assert.deepEqual((due.data as Invoice[]).map((row) => row.id), [invoice.id]);
+    const subs = await ws.ok('GET', `/v1/subscriptions?customer=${customer.id}&created_after=${sub.created - 1}`);
+    assert.deepEqual((subs.data as Subscription[]).map((row) => row.id), [sub.id]);
+
+    // ISO-8601 still works, because both spellings name the same instant.
+    const iso = await ws.ok('GET', `/v1/invoices?customer=${customer.id}&created_after=${encodeURIComponent(new Date(invoice.created - 1).toISOString())}`);
+    assert.deepEqual((iso.data as Invoice[]).map((row) => row.id), [invoice.id]);
+    // And something that is neither is still refused, with the parameter named.
+    const bad = await ws.fail('GET', '/v1/invoices?created_after=yesterday', undefined, 400, 'parameter_invalid');
+    assert.equal(bad.param, 'created_after');
+  });
+});

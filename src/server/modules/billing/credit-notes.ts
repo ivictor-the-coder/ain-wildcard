@@ -21,6 +21,12 @@
  *     simply owes less. On one that has been paid there is nothing left to
  *     reduce, so the value goes onto the customer's balance and comes off the
  *     next invoice. The note records which of the two happened and by how much.
+ *     A bill that was *part* collected is the third case and the awkward one:
+ *     the credit still comes off what is owed, but only as far as that reaches,
+ *     and the payments module carries the rest onto the account the moment this
+ *     note is written. `displaced_to_balance` is the note's own record of that
+ *     share, so the document accounts for every unit of itself rather than
+ *     claiming the whole of it came off a bill that could not hold it.
  *  3. **The preview and the note are one function.** `preview()` and `issue()`
  *     both build the same draft; `issue()` is `preview()` plus the writes. A
  *     quote and a correction cannot disagree, for the same reason a proration
@@ -103,6 +109,11 @@ export interface CreditNoteDraft {
   /** What the invoice had left to credit before this note. */
   creditable_before: number;
   routing: 'pre_payment' | 'post_payment';
+  /**
+   * How much of a pre-payment note outran what the bill was still owed, and so
+   * cannot come off it — see `CreditNote.displaced_to_balance`.
+   */
+  displaced_to_balance: number;
   /** How a post-payment total is handed back; all zero on a pre-payment note. */
   refund_amount: number;
   credit_amount: number;
@@ -322,6 +333,7 @@ export class CreditNotes {
       creditable_before: creditableBefore,
       remaining_after: creditableBefore - total,
       routing,
+      displaced_to_balance: routing === 'pre_payment' ? displacedByCredit(invoice, total) : 0,
       ...split,
       reason: input.reason ?? 'billing_error',
       memo: input.memo ?? null,
@@ -346,9 +358,13 @@ export class CreditNotes {
       if (named.length) {
         throw badRequest(
           'credit_note_routing_not_applicable',
-          `Invoice ${invoice.number} is ${invoice.status}, so nothing has been collected on it and there is no money to route: the credit comes off what is owed. refund_amount, credit_amount and out_of_band_amount are for a bill that has been paid.`,
+          `Invoice ${invoice.number} is ${invoice.status}, so it is still owed and the credit comes off what is owed${
+            invoice.amount_paid > 0
+              ? ` — ${show(invoice.amount_paid)} of it has been collected, and anything this note credits past the ${show(Math.max(0, invoice.amount_due))} still outstanding goes onto the account on its own`
+              : ''
+          }. refund_amount, credit_amount and out_of_band_amount are for a bill that has been paid in full.`,
           named[0],
-          { status: invoice.status },
+          { status: invoice.status, amount_paid: invoice.amount_paid, amount_due: invoice.amount_due },
         );
       }
       return { refund_amount: 0, credit_amount: 0, out_of_band_amount: 0 };
@@ -547,6 +563,7 @@ export class CreditNotes {
       total: draft.total,
       pre_payment_amount: draft.routing === 'pre_payment' ? draft.total : 0,
       post_payment_amount: draft.routing === 'post_payment' ? draft.total : 0,
+      displaced_to_balance: draft.displaced_to_balance,
       refund_amount: draft.refund_amount,
       credit_amount: draft.credit_amount,
       out_of_band_amount: draft.out_of_band_amount,
@@ -593,6 +610,7 @@ export class CreditNotes {
         total: draft.total,
         pre_payment_amount: draft.routing === 'pre_payment' ? draft.total : 0,
         post_payment_amount: draft.routing === 'post_payment' ? draft.total : 0,
+        displaced_to_balance: draft.displaced_to_balance,
         refund_amount: draft.refund_amount,
         credit_amount: draft.credit_amount,
         out_of_band_amount: draft.out_of_band_amount,
@@ -716,8 +734,14 @@ export class CreditNotes {
    *
    * A bill whose remaining balance has been credited to nothing is not owed any
    * more, so it stops being open — but `amount_paid` stays where it is, because
-   * no money was collected. That distinction is the difference between "we
-   * collected $100" and "we billed $100 and then credited it".
+   * no money was collected here. That distinction is the difference between
+   * "we collected $100" and "we billed $100 and then credited it".
+   *
+   * A note bigger than what the bill was still owed leaves `amount_due` below
+   * zero for exactly as long as it takes the payments module to answer
+   * `credit_note.created` and carry the excess onto the customer's account —
+   * inside this same transaction. What is recorded here is what the note did to
+   * the bill, because that is what withdrawing it has to put back.
    */
   private applyPrePayment(
     orgId: string, invoice: Invoice, amount: number, number: string, at: number, meta: WriteMeta,
@@ -730,10 +754,17 @@ export class CreditNotes {
       updated: at,
     });
     if (amountDue !== 0 || invoice.status !== 'open') return;
+    const show = (value: number) => formatMoney(money(value, invoice.currency), { locale: this.billing.locale(orgId) });
     this.ctx.db.patch('billing_invoices', 'id', invoice.id, {
       status: 'paid',
       paid_at: at,
-      payment_note: `Settled in full by credit note ${number} — nothing was collected.`,
+      // "Nothing was collected" is the truth about a bill nobody paid, and a
+      // falsehood about one that was part collected and then part reversed —
+      // where this note closes the gap over cash that really did arrive, and
+      // `amount_paid` beside it says so.
+      payment_note: invoice.amount_paid > 0
+        ? `Settled by credit note ${number}: ${show(invoice.amount_paid)} had been collected and the remaining ${show(amount)} was credited.`
+        : `Settled in full by credit note ${number} — nothing was collected.`,
     });
     const settled = this.billing.invoices.require(orgId, invoice.id);
     this.ctx.emit(orgId, 'invoice.paid', settled, {
@@ -827,6 +858,29 @@ export class CreditNotes {
 }
 
 /* --------------------------------- helpers -------------------------------- */
+
+/**
+ * How much of a pre-payment credit the bill cannot absorb, because that much
+ * has already been collected against it.
+ *
+ * A note may only reduce what is still owed. Anything past that is the
+ * customer's money sitting on a bill that is no longer worth it, and it leaves
+ * the bill for the customer's balance — the same shortfall `applyCollection`
+ * lands on the account when a payment settles *after* a credit note, arriving
+ * in the other order. Recording it here is what stops a note claiming its whole
+ * value came off a bill that could only take part of it: a $499.00 note against
+ * a bill holding $400.00 of cash and owed $99.00 reduces $99.00 and displaces
+ * $400.00, and the document now says both.
+ *
+ * Cash already refunded is deliberately not counted. `amount_paid` keeps what
+ * was collected and `amount_refunded` records what went back beside it, so that
+ * share is no longer the bill's to move and putting it on the account would
+ * credit the customer a second time for money they already hold.
+ */
+function displacedByCredit(invoice: Invoice, total: number): number {
+  const excess = Math.max(0, total - Math.max(0, invoice.amount_due));
+  return Math.max(0, excess - Math.min(excess, invoice.amount_refunded));
+}
 
 /**
  * Split a gross credit into the base and the tax it is made of, in the same

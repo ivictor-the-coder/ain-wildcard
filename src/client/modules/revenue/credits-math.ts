@@ -146,3 +146,29 @@ export function movementLabel(entry: { type: string; ref_type: string | null }):
   if (entry.type === 'refund' && entry.ref_type === 'credit_true_up') return 'True-up return';
   return entry.type.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
 }
+
+/**
+ * A grant's state in the word the credits screen means by it.
+ *
+ * `exhausted` is one wire word doing two jobs. On a dunning campaign it means
+ * the schedule ran out of attempts and stopped chasing, which the product
+ * calls "Given up" — and the kit's one lifecycle map, quite correctly, gives
+ * that word to every `exhausted` it is handed. A credit grant reaches the
+ * same wire value by the opposite route: the customer used every unit of a
+ * pack they paid for. A prepaid pack drawn to zero rendered as a red "Given
+ * up" pill, over a caption counting "1 given up", beside a drawer stat
+ * reading "Exhausted" — three words, one of them accusing the customer of
+ * abandoning a bill they had already paid.
+ *
+ * So the grant's state is translated to a word of its own before the kit
+ * renders it: `spent` is not in the kit's map, so `statusLabel` humanises it
+ * to "Spent" and the shared ramp paints it neutral, which is what a fully
+ * drawn pack is — finished, not failed. The kit still owns the label and the
+ * tone; this only decides which word it is asked about, so the pill, the
+ * caption, the filter and the drawer cannot drift apart again.
+ *
+ * The kit edit that retires this: give `statusLabel`/`statusTone` an optional
+ * scope, `credit_grant`, mapping `exhausted` to "Spent"/neutral, and pass it
+ * from `<StatusPill>`.
+ */
+export const grantStatusWord = (status: string): string => (status === 'exhausted' ? 'spent' : status);

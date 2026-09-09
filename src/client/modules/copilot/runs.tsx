@@ -16,12 +16,12 @@ import {
   type DataTableColumn, type SelectOption,
 } from '@/client/design';
 import {
-  OUTCOME_LABEL, OUTCOME_TONE, answerCard, humanTool, runOutcome, useAiStatus, useAiUsage, useAllApprovals,
-  useApprovals, useFeatureCatalogue, useRun, useTemplates, useTools, useVocabulary, windowText,
+  OUTCOME_LABEL, OUTCOME_TONE, answerCard, currencyRefusal, humanTool, runOutcome, useAiStatus, useAiUsage,
+  useAllApprovals, useApprovals, useFeatureCatalogue, useRun, useTemplates, useTools, useVocabulary, windowText,
   type AiRun, type AiUsageBucket, type RunDetail, type RunOutcome,
 } from './api';
 import { ApprovalQueue, CitationChips, ReasoningList, RunFacts, TraceSteps } from './trace';
-import { CarriedMeasure, EngineIndicator, RefusalHelp, SlotChips } from './card';
+import { CarriedMeasure, CurrencyRefusalNote, EngineIndicator, RefusalHelp, SlotChips, currencyRefusalTitle } from './card';
 import { filterTools, tagLabel, toolSummary } from './tools-core';
 import { dayStart, everyDay } from './usage-core';
 
@@ -802,6 +802,7 @@ export function RunDetailPage({ id }: { id: string }) {
     },
   });
   const askAgain = (next: string) => navigate(`/copilot?new=1&ask=${encodeURIComponent(next)}`);
+  const currency = currencyRefusal(detail.question, card.refusal);
 
   return (
     <Page
@@ -838,8 +839,19 @@ export function RunDetailPage({ id }: { id: string }) {
       }
     >
       {card.refusal && (
-        <Banner tone="warning" title="This run refused to answer" bar>
-          {card.refusal.message && <p>{card.refusal.message}</p>}
+        <Banner
+          tone="warning"
+          bar
+          title={currency ? currencyRefusalTitle(currency) : 'This run refused to answer'}
+        >
+          {/* The engine's reason, except when the reason is the currency claim
+              its own unscoped answers contradict: that one is not restated
+              here as this page's sentence either. The wire text is still in
+              "Exactly what was returned to the caller", verbatim and labelled
+              as the caller's copy. */}
+          {currency
+            ? <CurrencyRefusalNote refusal={currency} onAsk={askAgain} />
+            : card.refusal.message && <p>{card.refusal.message}</p>}
           <RefusalHelp refusal={card.refusal} onAsk={askAgain} />
         </Banner>
       )}

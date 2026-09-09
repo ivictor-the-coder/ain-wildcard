@@ -189,6 +189,73 @@ export function splitRefusalOffer(content: string): { prose: string; offered: st
   return { prose: content.slice(0, match.index).trimEnd(), offered };
 }
 
+/* --------------------------- a currency refusal --------------------------- */
+
+/**
+ * A money measure the engine refused to narrow to the currency that was named.
+ *
+ * Two sentences come back for this, and both are statements about the *whole*
+ * measure written from a read that had already been narrowed to the currency:
+ *
+ *   "Overdue balance" is measured from records that carry no currency book in
+ *   this workspace, so it cannot be narrowed to GBP: the figure I hold is the
+ *   whole of it, in USD.
+ *
+ * Asked without the currency, the same measure answers "Overdue balance is
+ * held in 2 currencies … $127,840.00 in USD and €1,007.00 in EUR", so the
+ * sentence above is not true of this workspace — and the ageing answer even
+ * names the GBP book it says does not exist. The card must not print that as
+ * prose. It is read here so the surface can say what it can actually stand
+ * behind and hand over the question that gets a true answer.
+ */
+export interface CurrencyRefusal {
+  /** The measure as the engine labels it — "Overdue balance", "Monthly recurring revenue". */
+  measure: string;
+  /** The three-letter code that was asked for, upper case. */
+  currency: string;
+  /** The engine's own sentence, so it can be lifted out of the prose. */
+  claim: string;
+  /** The same question with the currency taken off it, when it can be taken off cleanly. */
+  unscoped: string | null;
+}
+
+const CURRENCY_CLAIMS = [
+  /"([^"]+)" is held in [^—]*?there is no ([A-Za-z]{3}) book in it[^.]*\./,
+  /"([^"]+)" is measured from records that carry no currency book[^:]*?cannot be narrowed to ([A-Za-z]{3})[^.]*\./,
+];
+
+/**
+ * The question with the currency removed — `… in GBP?` → `…?`.
+ *
+ * Null rather than a guess when the code is not in the sentence at all: the
+ * engine can bind a currency from a word the question never spells ("yen"),
+ * and offering "What is our overdue balance in yen?" back would be the same
+ * dead end twice.
+ */
+function withoutCurrency(question: string, code: string): string | null {
+  const stripped = question.replace(new RegExp(`\\s*\\b(?:in|for)\\s+${code}\\b`, 'i'), '');
+  return stripped !== question ? stripped.replace(/\s+([?.!])/, '$1').trim() : null;
+}
+
+export function currencyRefusal(
+  question: string,
+  refusal: { code: string; message: string | null } | null | undefined,
+): CurrencyRefusal | null {
+  if (!refusal?.message || refusal.code !== 'tool_failed') return null;
+  for (const pattern of CURRENCY_CLAIMS) {
+    const match = pattern.exec(refusal.message);
+    if (!match) continue;
+    const currency = match[2].toUpperCase();
+    return { measure: match[1], currency, claim: match[0], unscoped: withoutCurrency(question, currency) };
+  }
+  return null;
+}
+
+/** The refusal's prose with the engine's currency claim lifted out of it. */
+export function withoutCurrencyClaim(content: string, claim: string): string {
+  return content.replace(claim, '').replace(/\s{2,}/g, ' ').trim();
+}
+
 /**
  * A write asked for with the switch off.
  *

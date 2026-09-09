@@ -15,8 +15,9 @@ import {
 import { api, useQuery } from '@/client/kernel/api';
 import { useSession } from '@/client/kernel/session';
 import type { CrmRecord, CrmSchema, PropertyDef, PropertyValue, WorkspaceUser } from './api';
+import { civilDay } from '../../../shared/time';
 import { recordHref } from './links';
-import { slaState } from './time';
+import { onCivilDay, slaState } from './time';
 
 /* --------------------------------- colour --------------------------------- */
 
@@ -340,16 +341,26 @@ export function PropertyEditor({ property, value, onChange, users, invalid, auto
         />
       );
     case 'date':
-    case 'datetime':
+    case 'datetime': {
+      // A `date` is a calendar day held at midnight UTC, which is the shape the
+      // calendar hands back, so it goes straight through. A `datetime` is an
+      // instant: written as the day stamp it read back as the day *before* the
+      // one the operator clicked on every workspace behind UTC — a task due
+      // Sep 18 was stored as 8pm on the 17th in New York, and the list, the SLA
+      // badge and the property row all said the 17th. The instant is moved onto
+      // the day the workspace is on, and read back the same way.
+      const stored = value === null || value === undefined || value === '' ? null : Number(value);
+      const instant = property.type === 'datetime';
       return bounded(
         <DatePicker
           id={id}
-          value={value === null || value === undefined || value === '' ? null : Number(value)}
-          onChange={(ts) => { emit(ts); }}
+          value={stored === null || !Number.isFinite(stored) ? null : instant ? civilDay(stored, session.timeZone) : stored}
+          onChange={(ts) => { emit(ts === null || !instant ? ts : onCivilDay(ts, session.timeZone, stored)); }}
           invalid={invalid}
           aria-label={property.label}
         />,
       );
+    }
     case 'bool':
       return bounded(
         <Switch

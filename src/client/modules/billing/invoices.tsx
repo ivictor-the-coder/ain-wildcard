@@ -33,7 +33,10 @@ import {
   csvAmount, csvDay, csvInstant, useBookTotal,
   useCursorList, useDebounced, useDialogForm, useOpenOnQuery, useRecord, useRecordTab, useTableView, visibleRows,
 } from './common';
-import { billedTotal, bulkSkipReason, coversNoPeriod, humaniseNote, invoiceActions, lineCoversNoPeriod, type BulkInvoiceKind } from './copy';
+import {
+  billedTotal, bulkSkipReason, coversNoPeriod, creditNoteRouting, humaniseNote, invoiceActions, lineCoversNoPeriod,
+  type BulkInvoiceKind,
+} from './copy';
 import type { CsvColumn } from './common';
 import type {
   Charge, CreditNote, Customer, Invoice, InvoiceDunning, InvoiceItem, InvoiceLine, InvoicePayments, PaymentIntent,
@@ -2730,13 +2733,17 @@ function CreditNotesTab({ invoice, notes, loading, error, onRetry, onIssue }: {
                 <span style={{ marginLeft: 'var(--space-3)' }}><StatusPill status={note.status} /></span>
               )}
             </div>
-            {/* `routing_detail` is written at issue and stays in the present
-                tense — "came off what the invoice asks for" — which is a claim
-                the void above has already reversed. A voided note says so. */}
+            {/* Not `note.routing_detail`: the server's last branch asserts
+                "nothing had been collected yet" on a bill that was part
+                collected, because its routing only looks at whether the bill
+                is *paid in full*. The sentence is written here from the note
+                and the invoice together — and a voided note says instead what
+                the void put back, since the server's is written at issue and
+                stays in the present tense. */}
             <div className="bl-row__sub">
               {note.status === 'void'
                 ? `Voided${note.voided_at ? ` ${f.dateTime(note.voided_at)}` : ''}. The ${note.total_display} it credited went back onto ${invoice.number}.`
-                : note.routing_detail}
+                : creditNoteRouting(note, invoice, copyFormat(f))}
             </div>
             {note.memo && <div className="bl-row__sub">{note.memo}</div>}
           </div>
@@ -3102,7 +3109,7 @@ export function CreditNoteDialog({ invoice, open, onClose }: { invoice: Invoice;
       api.post<CreditNote>('/v1/credit_notes', JSON.parse(bodyKey), { idempotencyKey: idem() }),
       {
         success: 'Credit note issued',
-        description: preview?.routing_detail,
+        description: preview ? creditNoteRouting(preview, invoice, copyFormat(f)) : undefined,
         failure: 'The credit note was refused',
       },
       ['/v1/invoices', '/v1/credit_notes', '/v1/customers'],
@@ -3227,7 +3234,7 @@ export function CreditNoteDialog({ invoice, open, onClose }: { invoice: Invoice;
               <div className="bl-total"><span className="bl-total__label">Tax reversed</span><span className="bl-total__value">{preview.tax_display}</span></div>
               <div className="bl-total bl-total--grand"><span className="bl-total__label">Credited</span><span className="bl-total__value">{preview.total_display}</span></div>
             </div>
-            <Banner tone="info" compact>{preview.routing_detail}</Banner>
+            <Banner tone="info" compact>{creditNoteRouting(preview, invoice, copyFormat(f))}</Banner>
             {creditable !== undefined && (
               <div className="bl-sub">
                 {`After this note, ${f.money(Math.max(creditable - preview.total, 0), { currency: preview.currency })} of ${invoice.number} would still be creditable.`}

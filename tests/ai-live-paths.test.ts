@@ -444,12 +444,18 @@ describe('the read-only, allowlist, budget and approval gates cover every tool, 
   test('an API allowlist scopes the plan, the refusal and the tools a thread turn may reach', async () => {
     const shapes = await published();
     const reachable = (tools: string[]) => new Set(shapes.filter((t) => t.tools.every((tool) => tools.includes(tool))).map((t) => t.id));
-    const question = shapes.find((t) => t.id === 'invoices-status')!.example!;
+    const shape = shapes.find((t) => t.id === 'invoices-status')!;
+    const question = shape.example!;
 
-    const answered = await ask(question, { tools: ['billing_list_invoices'] });
-    assert.deepEqual(answered.analysis.scoped_tools, ['billing_list_invoices']);
+    // Scoped to the shape's own declared tools, whatever they are: "which
+    // invoices are overdue?" and "which invoices are paid?" are one shape with
+    // two branches, and lateness is not a status the ledger's list can filter.
+    const answered = await ask(question, { tools: shape.tools });
+    assert.deepEqual(answered.analysis.scoped_tools, shape.tools);
     assert.equal(answered.analysis.refusal, null, answered.content);
-    assert.deepEqual([...new Set(answered.trace.filter((s: Body) => s.kind === 'tool').map((s: Body) => s.name))], ['billing_list_invoices']);
+    const ran: string[] = [...new Set<string>(answered.trace.filter((s: Body) => s.kind === 'tool').map((s: Body) => String(s.name)))];
+    assert.ok(ran.length > 0, 'the shape answered without calling anything');
+    for (const tool of ran) assert.ok(shape.tools.includes(tool), `${tool} ran and the shape does not declare it`);
 
     const elsewhere = await ask(question, { tools: ['record_search'] });
     assert.deepEqual(elsewhere.analysis.scoped_tools, ['record_search']);
@@ -1811,5 +1817,247 @@ describe('the copilot offers grounded starting points, and the catalogues it pub
     tick();
     const unknown = (await runtime().execute('business_metric', { metric: 'vibes' }, callContext())).result as { available: string[] };
     assert.deepEqual([...unknown.available].sort(), [...ids].sort(), 'the tool names exactly the metrics the catalogue publishes');
+  });
+});
+
+/* ================= one definition of owed, one of late ==================== */
+
+describe('the receivables book has one definition, and every answer that reads it agrees', () => {
+  interface AgeingBook { currency: string; ageing: { buckets: { label: string; invoices: number; amount: number }[] } }
+
+  /** What the collections report — the page a finance team works from — ages as past due. */
+  async function pastDueBooks(from: App = app): Promise<{ currency: string; amount: number; invoices: number }[]> {
+    const res = await from.handle({ method: 'GET', path: '/v1/revenue/collections', auth: DANA });
+    assert.equal(res.status, 200, JSON.stringify(res.body).slice(0, 200));
+    return (res.body.by_currency as AgeingBook[]).map((book) => {
+      const late = book.ageing.buckets.filter((b) => b.label !== 'Not yet due');
+      return {
+        currency: book.currency,
+        amount: late.reduce((sum, b) => sum + b.amount, 0),
+        invoices: late.reduce((sum, b) => sum + b.invoices, 0),
+      };
+    }).filter((book) => book.invoices > 0);
+  }
+
+  test('the overdue metric, the invoice list, the past-due customers and the collections report describe one book', async () => {
+    const books = await pastDueBooks();
+    assert.ok(books.length > 1, 'fixture: bills are late in more than one currency');
+    const late = books.reduce((count, book) => count + book.invoices, 0);
+    // A bill with no due date is due on receipt, which is the earliest due date
+    // there is. Testing `due_date IS NOT NULL` is not a filter on those, it is
+    // a blindfold, and it is what made these four answers disagree.
+    const onReceipt = app.db.count(
+      `SELECT COUNT(*) FROM billing_invoices WHERE org_id = ? AND status = 'open' AND due_date IS NULL AND amount_due > 0 AND finalized_at <= ?`,
+      ORG, app.ctx.now());
+    assert.ok(onReceipt > 0, 'fixture: a bill that is due on receipt');
+
+    const balance = await ask('What is our overdue balance?');
+    assert.equal(balance.analysis.refusal, null, balance.content);
+    for (const book of books) {
+      assert.ok(balance.content.includes(money2(book.amount, book.currency)),
+        `${money2(book.amount, book.currency)} is what the collections report ages as past due in ${book.currency.toUpperCase()}, and the answer is:\n${balance.content}`);
+    }
+
+    const listed = await ask('Which invoices are overdue?');
+    assert.equal(listed.analysis.refusal, null, listed.content);
+    assert.match(listed.content, new RegExp(`\\b${late}\\b`), `the collections report ages ${late} bills:\n${listed.content}`);
+    assert.equal(listed.citations.length, Math.min(late, 25));
+
+    const counted = await ask('How many invoices are overdue?');
+    assert.equal(counted.analysis.refusal, null, counted.content);
+    assert.match(counted.content, new RegExp(`\\b${late}\\b`), counted.content);
+
+    // The accounts behind those exact bills, read off the citations rather than
+    // out of any query the engine writes.
+    const cited = (listed.citations as { id: string }[]).map((c) => c.id);
+    const owed = new Set(app.db.all<{ c: string }>(
+      `SELECT customer_id AS c FROM billing_invoices WHERE org_id = ? AND id IN (${cited.map(() => '?').join(', ')})`,
+      ORG, ...cited).map((r) => r.c));
+    const customers = await ask('Which customers are past due?');
+    assert.equal(customers.analysis.refusal, null, customers.content);
+    assert.match(customers.content, new RegExp(`^${owed.size} customers? (is|are) past due`), customers.content);
+    assert.equal(customers.citations.length, owed.size);
+    for (const citation of customers.citations as { id: string }[]) {
+      assert.ok(owed.has(citation.id), `${citation.id} is named past due and holds none of the late bills`);
+    }
+  });
+
+  test('a written-off bill leaves the receivables book, and a credited one is worth what is still due', async () => {
+    // Its own database: this moves money, and every other test in this file
+    // reads the seeded ledger as it stands.
+    const own = await createApp({ db: 'memory', config: { env: 'test' }, clock: frozenClock(T0) });
+    try {
+      const outstanding = (): { usd: number; count: number } => {
+        const metric = businessMetric(own.ctx, ORG, { metric: 'outstanding' });
+        assert.ok(!('error' in metric), 'outstanding errored');
+        const usd = metric.books.find((b) => b.currency === 'usd');
+        return { usd: usd?.value ?? 0, count: usd?.count ?? 0 };
+      };
+      const open = own.db.all<{ id: string; total: number; amount_due: number }>(
+        `SELECT id, total, amount_due FROM billing_invoices WHERE org_id = ? AND status = 'open' AND currency = 'usd' AND amount_due > 0 ORDER BY amount_due DESC`, ORG);
+      assert.ok(open.length >= 2, 'fixture: two open USD bills');
+      const before = outstanding();
+      assert.equal(before.usd, open.reduce((sum, i) => sum + i.amount_due, 0), 'the outstanding book is what is still due on the open bills');
+
+      // Written off. The money is a loss the moment someone says so, and a
+      // loss is not a receivable — the collections report has never counted
+      // one, and this engine counted every one of them.
+      const writeOff = open[0];
+      const marked = await own.handle({ method: 'POST', path: `/v1/invoices/${writeOff.id}/mark_uncollectible`, auth: DANA });
+      assert.equal(marked.status, 200, JSON.stringify(marked.body).slice(0, 200));
+      const afterWriteOff = outstanding();
+      assert.equal(afterWriteOff.usd, before.usd - writeOff.amount_due, 'a written-off bill is still counted as money owed');
+      assert.equal(afterWriteOff.count, before.count - 1);
+
+      // Credited in part. `total` does not move when a credit note lands, so a
+      // book summed on `total` reports a debt the customer no longer has.
+      const credited = open[1];
+      const credit = Math.round(credited.amount_due / 4);
+      assert.ok(credit > 0, 'fixture: a bill big enough to credit a quarter of');
+      const note = await own.handle({
+        method: 'POST', path: '/v1/credit_notes', auth: DANA,
+        body: { invoice: credited.id, amount: credit, reason: 'order_change' },
+      });
+      assert.equal(note.status, 201, JSON.stringify(note.body).slice(0, 300));
+      const still = own.db.get<{ amount_due: number; total: number }>(
+        `SELECT amount_due, total FROM billing_invoices WHERE org_id = ? AND id = ?`, ORG, credited.id)!;
+      assert.equal(still.total, credited.total, 'a credit note leaves the face value alone, which is the whole point');
+      assert.ok(still.amount_due < credited.amount_due, 'the credit came off what is due');
+      assert.equal(outstanding().usd, afterWriteOff.usd - (credited.amount_due - still.amount_due),
+        'the book moved by the credit, not by the invoice total');
+    } finally {
+      own.close();
+    }
+  });
+
+  test('a payment reminder is written around the bills the ledger holds, through the tool and through the route alike', async () => {
+    const billing = app.ctx.svc.billing!;
+    const owing = recs('company').map((company) => ({
+      company,
+      bills: customerIds(company.id)
+        .flatMap((id) => billing.invoices(ORG, { customer: id, status: 'open_like', limit: 20 }))
+        .filter((invoice) => invoice.amount_due > 0),
+    })).find((row) => row.bills.length);
+    assert.ok(owing, 'fixture: an account with an unpaid invoice');
+
+    const answer = await ask(`Write a payment reminder to ${owing!.company.name}`);
+    assert.equal(answer.analysis.refusal, null, answer.content);
+    assert.deepEqual(answer.tool_calls.map((c: Body) => c.name), ['compose_message']);
+    assert.equal(answer.tool_calls[0].arguments.kind, 'dunning');
+    for (const invoice of owing!.bills) {
+      assert.ok(answer.content.includes(invoice.number), `${invoice.number} is on the ledger and not in the chase:\n${answer.content}`);
+      assert.ok(answer.content.includes(money2(invoice.amount_due, invoice.currency)),
+        `${money2(invoice.amount_due, invoice.currency)} is what is due and is not in the chase:\n${answer.content}`);
+    }
+    assert.ok(!/nothing to chase|no invoice with an amount still due/i.test(answer.content),
+      `the ledger holds ${owing!.bills.length} unpaid ${owing!.bills.length === 1 ? 'bill' : 'bills'} on this account:\n${answer.content}`);
+
+    // The same instruction through the draft route: one reader, one answer.
+    const route = await expectOk('POST', '/v1/ai/draft', { kind: 'dunning', record_id: owing!.company.id, instruction: 'Chase the outstanding invoice' });
+    assert.equal(`Subject: ${route.subject}\n\n${route.body}`, answer.content, 'the tool and the route drafted different chases from the same ledger');
+  });
+
+  test('an account with nothing unpaid still gets no chase', async () => {
+    const clear = recs('company').find((company) => {
+      const ids = customerIds(company.id);
+      return ids.length > 0 && !ids.flatMap((id) => app.ctx.svc.billing!.invoices(ORG, { customer: id, status: 'open_like', limit: 20 })).some((i) => i.amount_due > 0);
+    });
+    assert.ok(clear, 'fixture: a billing account with nothing outstanding');
+    const answer = await ask(`Write a payment reminder to ${clear!.name}`);
+    assert.match(answer.content, /nothing to chase/, answer.content);
+  });
+});
+
+/* ================= a schema is filled from what was computed ============== */
+
+describe('a response schema is filled only from figures the run actually produced', () => {
+  test('a field naming a measure the run did not compute comes back null, and is named', async () => {
+    const open = recs('deal').filter(isOpen);
+    const pipeline = total(open);
+    const answer = await ask('What is our open pipeline?', {
+      response_schema: {
+        type: 'object',
+        properties: {
+          pipeline_value: { type: 'number' }, average_deal_size: { type: 'number' },
+          biggest_deal_amount: { type: 'number' }, win_rate_percent: { type: 'number' }, deal_count: { type: 'integer' },
+        },
+      },
+    });
+    const row = JSON.parse(answer.content) as Record<string, number | null>;
+    assert.equal(row.pipeline_value, pipeline, 'the figure the run computed is the one field it can account for');
+    assert.equal(row.deal_count, open.length);
+    for (const field of ['average_deal_size', 'biggest_deal_amount', 'win_rate_percent']) {
+      assert.equal(row[field], null, `\`${field}\` names a figure this run never computed and was answered ${JSON.stringify(row[field])}`);
+    }
+    // The biggest open deal, the average of them and the win rate are all real
+    // numbers this workspace holds, and none of them is the pipeline total.
+    const biggest = Math.max(...open.map((d) => amount(d)));
+    for (const wrong of [biggest, Math.round(pipeline / open.length)]) {
+      assert.notEqual(wrong, pipeline, 'fixture: those figures differ from the total');
+    }
+    assert.ok(answer.reasoning.some((line: string) => /average_deal_size/.test(line) && /null/.test(line)),
+      `the caller is told what was left out: ${answer.reasoning.join(' | ')}`);
+    assert.ok(answer.reasoning.some((line: string) => /minor units/.test(line) && line.includes(money2(pipeline, 'usd'))),
+      `a raw money figure says which unit it is in: ${answer.reasoning.join(' | ')}`);
+  });
+
+  test('the same field name is filled when it is the measure the run computed', async () => {
+    const answer = await ask('What was our average deal size in 2025?', {
+      response_schema: { type: 'object', properties: { average_deal_size: { type: 'number' }, deal_count: { type: 'integer' } } },
+    });
+    assert.equal(answer.analysis.refusal, null, answer.content);
+    const row = JSON.parse(answer.content) as { average_deal_size: number | null; deal_count: number | null };
+    assert.ok(row.average_deal_size !== null, 'the average-deal-size metric answers a field asking for the average deal size');
+    assert.equal(money2(row.average_deal_size!, 'usd'), answer.analysis.facts.formatted);
+  });
+});
+
+/* ===================== a second follow-up is a follow-up ================== */
+
+describe('a follow-up carries the measure from the question that had one', () => {
+  const turns = async (questions: string[]): Promise<Body[]> => {
+    const messages: { role: string; content: string }[] = [];
+    const out: Body[] = [];
+    for (const question of questions) {
+      messages.push({ role: 'user', content: question });
+      tick();
+      const body = await expectOk('POST', '/v1/ai/complete', { messages });
+      out.push(body);
+      messages.push({ role: 'assistant', content: body.content });
+    }
+    return out;
+  };
+
+  test('two groupings in a row both answer the measure the conversation opened with', async () => {
+    const [base, byOwner, byStage] = await turns(['What is our open pipeline?', 'And by owner?', 'And by stage?']);
+    assert.equal(base.analysis.refusal, null, base.content);
+
+    assert.equal(byOwner.analysis.refusal, null, byOwner.content);
+    assert.equal(byOwner.analysis.carried?.from, 'What is our open pipeline?');
+    assert.equal(byOwner.tool_calls[0].arguments.group_by, 'owner');
+
+    // The second follow-up used to be re-asked against the first — "And by
+    // owner by stage?" — a sentence with no subject in it, refused by quoting
+    // the word "And" back at the person three words after the same measure had
+    // been answered the other way round.
+    assert.equal(byStage.analysis.refusal, null, byStage.content);
+    assert.equal(byStage.analysis.carried?.measure, byOwner.analysis.carried?.measure);
+    assert.equal(byStage.analysis.carried?.from, 'What is our open pipeline?', 'the measure comes from the question that had one');
+    assert.equal(byStage.tool_calls[0].arguments.group_by, 'stage');
+    assert.ok(!/\bAnd\b/.test(byStage.content), `the follow-up's own first word is not a thing to refuse:\n${byStage.content}`);
+
+    const owners = new Set(recs('deal').filter(isOpen).map((d) => d.owner));
+    assert.ok(owners.size > 1 && byOwner.content !== byStage.content, 'the two groupings are two answers');
+  });
+
+  test('a new question ends the chain: the next follow-up carries that one, not the one before it', async () => {
+    const [, , weighted, grouped] = await turns(
+      ['What is our open pipeline?', 'And by owner?', 'What is our weighted pipeline?', 'And by stage?']);
+    assert.equal(weighted.analysis.refusal, null, weighted.content);
+    assert.equal(weighted.analysis.carried, null, 'a question that names its own measure carries nothing');
+    assert.equal(grouped.analysis.refusal, null, grouped.content);
+    assert.equal(grouped.analysis.carried?.from, 'What is our weighted pipeline?', 'the nearest question with a measure of its own is the one carried');
+    assert.equal(grouped.tool_calls[0].arguments.metric, 'weighted_pipeline');
+    assert.equal(grouped.tool_calls[0].arguments.group_by, 'stage');
   });
 });

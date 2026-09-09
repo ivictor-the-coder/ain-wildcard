@@ -7,10 +7,11 @@
  * navigate, steps that open to their exact arguments and result, and the
  * approval card that shows a write before it happens.
  */
-import { useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, invalidate, useMutation, useQuery } from '@/client/kernel/api';
 import { useRouter } from '@/client/kernel/router';
 import { useSession } from '@/client/kernel/session';
+import { canWrite } from '@/client/kernel/shell-core';
 import {
   AlertTriangleIcon,
   Badge, Banner, Button, Card, Checkbox, ChevronDownIcon, ChevronUpIcon, EmptyState, Icons, humanize,
@@ -21,12 +22,17 @@ import {
   consequenceLines, decidedByWords,
   humanReason, humanTool, isWiderName, linkedTargetOf, needsAcknowledgement, needsProbe, outcomeSummary, recordLink,
   recordPhraseMismatch,
-  runOutcome, scheduledFollowup, spokenPreview, stageConsequences, stageLabelIn, stageWriteOf, useRun, useVocabulary,
+  runOutcome, scheduledFollowup, spokenPreview, stageConsequences, stageLabelIn, stageWriteOf, useRecordName, useRun,
+  useVocabulary,
   writeTargetLabel, writeTargets, writtenToLabel,
   type AiApproval, type AiRun, type AiSpan, type Citation, type OutcomeContext, type StageConsequences,
   type Vocabulary, type WriteOutcome,
 } from './api';
 import { spanDigest } from './trace-core';
+// One rule, one definition. The board's stage dialog refuses a close that
+// records no reason; this card is the other surface that closes deals, and it
+// calls the same function rather than keeping a second opinion.
+import { stageRequirements, type PropertyDef } from '../pipeline/api';
 
 /* ------------------------------- citations -------------------------------- */
 
@@ -104,6 +110,46 @@ function CitationChip({ citation }: { citation: Citation }) {
       {body}
     </a>
   );
+}
+
+/**
+ * The records the plan named, drawn as sources for an answer that cited none.
+ *
+ * A citation is a claim that a row was read, so each of these is asked about
+ * before it is drawn: the id came from the engine's own arguments, the name
+ * comes from the record itself, and a record that does not answer is not shown
+ * at all. Until it answers there is no chip — an id is not a name, and one on
+ * screen under SOURCES would be a worse citation than none.
+ */
+export function PlanCitationChips({ ids }: { ids: readonly string[] }) {
+  const [named, setNamed] = useState<Record<string, string>>({});
+  const remember = useCallback((id: string, name: string) => {
+    setNamed((current) => (current[id] === name ? current : { ...current, [id]: name }));
+  }, []);
+  const shown = ids.filter((id) => named[id]);
+  return (
+    <>
+      {/* Each id is read once and reports the name back, so the row is drawn
+          only when there is a name to draw. A bare `cmp_nw_33` under SOURCES
+          would be a worse citation than none, and so would the word "Sources"
+          over nothing. */}
+      {ids.map((id) => <PlanCitationReader key={id} id={id} onNamed={remember} />)}
+      {shown.length > 0 && (
+        <div className="cp-chips" data-plan-sources={shown.length}>
+          <span className="cp-chips__label">Sources</span>
+          {shown.map((id) => (
+            <CitationChip key={id} citation={{ id, label: named[id], type: recordLink(id)?.type ?? 'record' }} />
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+function PlanCitationReader({ id, onNamed }: { id: string; onNamed: (id: string, name: string) => void }) {
+  const name = useRecordName(id);
+  useEffect(() => { if (name) onNamed(id, name); }, [id, name, onNamed]);
+  return null;
 }
 
 /**
@@ -363,6 +409,8 @@ export function ApprovalCard({ approval, question, onDecided }: {
 }) {
   const toast = useToast();
   const f = useFormat();
+  const session = useSession();
+  const { navigate } = useRouter();
   const [showArgs, setShowArgs] = useState(false);
   const [acknowledged, setAcknowledged] = useState(false);
 
@@ -405,6 +453,27 @@ export function ApprovalCard({ approval, question, onDecided }: {
   const consequences = stageWrite && dealRead.data && vocabulary.vocab.pipelines.length
     ? stageConsequences(dealNow(dealRead.data), stageWrite.stage, vocabulary.vocab)
     : null;
+
+  /**
+   * What the workspace demands of a close that this write does not supply.
+   *
+   * "The workspace requires Close reason" was a rule the board kept and the
+   * copilot did not: the stage dialog will not let a deal be marked won or
+   * lost until the outcome picklist is filled in, while an approved
+   * `update_record` set `deal_stage: closed_won` on its own and the deal
+   * closed with no reason recorded at all. The engine's write extractor reads
+   * a stage and nothing else, so it cannot supply one — which makes this the
+   * last place the rule can be kept, and the reason the approval is refused
+   * here rather than warned about.
+   */
+  const propertyRead = useQuery<{ data: PropertyDef[] }>(
+    stageWrite && pendingApproval(approval) ? '/v1/objects/deal/properties' : null,
+  );
+  const outcomeGap = stageWrite && consequences?.to?.isClosed && dealRead.data && propertyRead.data
+    ? stageRequirements(dealRead.data, { is_closed: true }, propertyRead.data.data).required
+      // A property the write itself sets is collected, not missing.
+      .filter((property) => stageWrite.properties[property.name] === undefined)
+    : [];
   const words = useOutcomeContext(approval, vocabulary.vocab, consequences?.from?.pipeline ?? null);
   // `Deal stage → negotiation` is the database value; the board calls it
   // "Negotiation", and this card already holds the board.
@@ -508,17 +577,24 @@ export function ApprovalCard({ approval, question, onDecided }: {
   const pending = approval.status === 'pending';
   const landed = approvalOutcome(approval);
   const summary = pending ? null : outcomeSummary(approval, words);
-  const blocked = mismatch
-    ? `This write targets ${mismatch.used}, not ${mismatch.asked}.`
-    : consequencesUnread
-      ? 'This card could not work out what this write does to the deal.'
-      : consequences?.closedState === 'reopens'
-        ? 'This reopens a closed deal and puts it back in the pipeline and the forecast.'
-        : consequences?.closedState === 'closes'
-          ? 'This closes an open deal and takes it out of the pipeline and the forecast.'
-          : consequences?.wrongPipeline
-            ? 'That stage belongs to another pipeline, so this write will fail.'
-            : null;
+  // The approvals route is gated at `member`, so a reader was shown two
+  // buttons whose only outcome was "Your role (readonly) cannot perform this
+  // action" — on the one card in the product that is supposed to be the
+  // considered pause before a write.
+  const mayDecide = canWrite(session.me?.role);
+  const blocked = outcomeGap.length
+    ? `This close records no ${f.list(outcomeGap.map((property) => property.label.toLowerCase()))}, which this workspace requires.`
+    : mismatch
+      ? `This write targets ${mismatch.used}, not ${mismatch.asked}.`
+      : consequencesUnread
+        ? 'This card could not work out what this write does to the deal.'
+        : consequences?.closedState === 'reopens'
+          ? 'This reopens a closed deal and puts it back in the pipeline and the forecast.'
+          : consequences?.closedState === 'closes'
+            ? 'This closes an open deal and takes it out of the pipeline and the forecast.'
+            : consequences?.wrongPipeline
+              ? 'That stage belongs to another pipeline, so this write will fail.'
+              : null;
 
   return (
     <Card
@@ -567,7 +643,43 @@ export function ApprovalCard({ approval, question, onDecided }: {
           />
         )}
 
-        {pending && mustAcknowledge && !mismatch && (
+        {pending && outcomeGap.length > 0 && (
+          <Banner
+            tone="danger"
+            bar
+            title={`This close records no ${f.list(outcomeGap.map((property) => property.label.toLowerCase()))}`}
+          >
+            <p>
+              {outcomeGap.length === 1
+                ? `${outcomeGap[0].label} is required on a deal this workspace closes, and this write does not set it.`
+                : `${f.list(outcomeGap.map((property) => property.label))} are required on a deal this workspace closes, and this write sets none of them.`}
+              {' '}The board refuses the same move until it is filled in, and the copilot reads a stage and nothing
+              else — so it cannot supply one here.
+            </p>
+            <p className="cp-note" style={{ marginTop: 'var(--space-3)' }}>
+              <a
+                className="cp-chip cp-chip--wide"
+                href={`/deals/${encodeURIComponent(stageWrite?.recordId ?? '')}`}
+                title="Open the deal and close it there, where the reason is collected with the move"
+                onClick={(e) => {
+                  if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+                  e.preventDefault();
+                  navigate(`/deals/${encodeURIComponent(stageWrite?.recordId ?? '')}`);
+                }}
+              >
+                <Icons.external size={12} />
+                <span className="u-truncate">
+                  Close {dealRead.data?.display_name ?? 'the deal'} on its own screen
+                </span>
+              </a>
+            </p>
+          </Banner>
+        )}
+
+        {/* No tick is offered against the outcome gap: the box would promise
+            that acknowledging it lets the write through, and nothing here
+            can. */}
+        {pending && mustAcknowledge && !mismatch && outcomeGap.length === 0 && (
           <Checkbox
             checked={acknowledged}
             onChange={setAcknowledged}
@@ -602,7 +714,15 @@ export function ApprovalCard({ approval, question, onDecided }: {
           <Button size="sm" variant="ghost" onClick={() => setShowArgs((value) => !value)} aria-expanded={showArgs}>
             {showArgs ? 'Hide the exact arguments' : 'Show the exact arguments'}
           </Button>
-          {pending && (
+          {pending && !mayDecide && (
+            <>
+              <div style={{ flex: '1 1 auto' }} />
+              <span className="cp-note">
+                Deciding a write needs the member role or higher; you are signed in as {session.me?.role ?? 'a guest'}.
+              </span>
+            </>
+          )}
+          {pending && mayDecide && (
             <>
               <div style={{ flex: '1 1 auto' }} />
               <Button
@@ -617,9 +737,14 @@ export function ApprovalCard({ approval, question, onDecided }: {
                 size="sm"
                 variant="primary"
                 loading={decide.loading}
-                disabled={((!!mismatch || mustAcknowledge) && !acknowledged) || dealRead.loading}
+                // The outcome gap is the one refusal a tick cannot clear: there
+                // is nothing to acknowledge, because the value the workspace
+                // wants is not in the write and this card cannot add it.
+                disabled={outcomeGap.length > 0
+                  || ((!!mismatch || mustAcknowledge) && !acknowledged)
+                  || dealRead.loading}
                 title={blocked
-                  ? `${blocked} Confirm it above first.`
+                  ? outcomeGap.length > 0 ? blocked : `${blocked} Confirm it above first.`
                   : undefined}
                 iconLeft={<Icons.check size={13} />}
                 onClick={() => {
@@ -627,7 +752,7 @@ export function ApprovalCard({ approval, question, onDecided }: {
                   void decide.run('approve').catch(() => undefined);
                 }}
               >
-                {mismatch || mustAcknowledge ? 'Approve anyway' : 'Approve and run'}
+                {outcomeGap.length === 0 && (mismatch || mustAcknowledge) ? 'Approve anyway' : 'Approve and run'}
               </Button>
             </>
           )}

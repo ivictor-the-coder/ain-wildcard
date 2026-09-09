@@ -1562,7 +1562,7 @@ export const TEMPLATES: Template[] = [
     ],
     tools: ['delinquent_customers'],
     example: () => 'Which customers are past due?',
-    plan: () => [{ tool: 'delinquent_customers', args: { limit: 25 }, why: 'Customers with open invoices past their due date.' }],
+    plan: () => [{ tool: 'delinquent_customers', args: { limit: 25 }, why: 'Customers with bills past the day they fell due.' }],
     render: (steps, _b, v) => renderDelinquent(resultOf<DelinquentCustomersResult>(steps), v.workspace),
   }),
   T({
@@ -1572,11 +1572,19 @@ export const TEMPLATES: Template[] = [
       `(which|what) invoices are {status:invoice-status}`,
       `${LIST} (the|our|all|) {status:invoice-status} invoices`,
     ],
-    tools: ['billing_list_invoices'],
+    // Two tools because "overdue" is not a status. The ledger's own list can
+    // filter on one, but its `due_before` reads `due_date IS NOT NULL`, and a
+    // bill due on receipt carries no due date — so that filter answered "which
+    // invoices are overdue?" with one invoice on a book the collections report
+    // ages three. The lateness question goes to the receivables book instead,
+    // which is the definition the collections report and dunning both use.
+    tools: ['billing_list_invoices', 'outstanding_invoices'],
     example: () => 'Which invoices are overdue?',
-    plan: (b, v) => {
+    plan: (b) => {
       const status = slot(b, 'status', 'invoice-status');
-      return [{ tool: 'billing_list_invoices', args: { status: status.value, ...(status.overdue ? { due_before: v.workspace.now } : {}), limit: 25 }, why: `Invoices whose status is ${status.label}.` }];
+      return status.overdue
+        ? [{ tool: 'outstanding_invoices', args: { overdue: true, limit: 25 }, why: 'Unsettled bills already past the day they fell due.' }]
+        : [{ tool: 'billing_list_invoices', args: { status: status.value, limit: 25 }, why: `Invoices whose status is ${status.label}.` }];
     },
     render: (steps, b, v) => {
       const status = slot(b, 'status', 'invoice-status');
@@ -1589,16 +1597,18 @@ export const TEMPLATES: Template[] = [
   }),
   T({
     id: 'count-invoices-status', kind: 'ledger', intent: 'aggregate',
-    description: 'How many invoices are in one status.',
+    description: 'How many invoices are in one status, or how many are late.',
     patterns: [
       `how many invoices are {status:invoice-status}`,
       `how many {status:invoice-status} invoices (do we have|are there|)`,
     ],
-    tools: ['billing_list_invoices'],
+    tools: ['billing_list_invoices', 'outstanding_invoices'],
     example: () => 'How many invoices are open?',
-    plan: (b, v) => {
+    plan: (b) => {
       const status = slot(b, 'status', 'invoice-status');
-      return [{ tool: 'billing_list_invoices', args: { status: status.value, ...(status.overdue ? { due_before: v.workspace.now } : {}), limit: 1 }, why: `Count invoices whose status is ${status.label}.` }];
+      return status.overdue
+        ? [{ tool: 'outstanding_invoices', args: { overdue: true, limit: 1 }, why: 'Count the unsettled bills already past their due date.' }]
+        : [{ tool: 'billing_list_invoices', args: { status: status.value, limit: 1 }, why: `Count invoices whose status is ${status.label}.` }];
     },
     render: (steps, b, v) => renderCount(resultOf<{ total: number }>(steps).total, `${slot(b, 'status', 'invoice-status').label} invoice|${slot(b, 'status', 'invoice-status').label} invoices`, '', v.workspace),
   }),

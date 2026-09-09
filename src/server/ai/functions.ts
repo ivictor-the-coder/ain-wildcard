@@ -15,11 +15,13 @@ import { billingSources, entityIndex, hasTable, workspaceProfile, type Workspace
 import { crmVocabulary, stageLabelIn } from './qualifiers';
 import { resolveEntities, type ResolvedEntity } from './resolve';
 import {
-  accountSnapshot, metricById, metricIds, stageSets, topAccounts,
+  accountSnapshot, linkedCustomerIds, metricById, metricIds, stageSets, topAccounts,
   type GroupBy, type MetricResult, type MetricSubject,
 } from './metrics';
 import { GROUP_KEY_SEPARATOR, aggregate, associatedRecords, fetchRecords, getRecord, propertyMap, type Condition, type RecordSummary } from './query';
 import { defaultWindow, previousWindow, type TimeWindow } from './dates';
+import { outstandingBills, type OutstandingBill } from './receivables';
+import type { OutstandingInvoice } from './draft';
 import { humanise, listPhrase, truncate } from './text';
 
 export interface SearchHit {
@@ -578,55 +580,182 @@ export function meteredUsage(ctx: Ctx, orgId: string, args: {
   };
 }
 
+/** The billing accounts behind a CRM record — or the record itself, when it already is one. */
+export function billingCustomersFor(ctx: Ctx, orgId: string, recordId: string): string[] {
+  const customers = billingSources(ctx.db).customers;
+  const record = getRecord(ctx, orgId, recordId);
+  if (!record) {
+    const direct = customers
+      ? ctx.db.get<{ id: string }>(`SELECT id FROM ${customers.table} WHERE org_id = ? AND id = ?`, orgId, recordId)
+      : null;
+    return direct ? [direct.id] : [];
+  }
+  return linkedCustomerIds(ctx, orgId, { id: record.id, label: record.display_name, type: record.object_type });
+}
+
 /* ------------------------- customers who owe money ------------------------ */
 
 export interface DelinquentCustomersResult {
   object: 'delinquent_customers';
   total: number;
   customers: {
-    id: string; name: string; currency: string;
-    outstanding: number; outstanding_formatted: string;
-    open_invoices: number; oldest_due_at: number | null; days_overdue: number | null;
+    id: string; name: string;
+    /** One book per currency this account's arrears were raised in. */
+    books: { currency: string; amount: number; amount_formatted: string }[];
+    /** The scalar, and the currency it is in — both null when the account owes in more than one. */
+    past_due: number | null; currency: string | null;
+    /** Safe to print whatever the books hold: "€918.00 and $200.00". */
+    past_due_formatted: string;
+    past_due_invoices: number; oldest_due_at: number | null; days_overdue: number | null;
     past_due_subscriptions: number;
   }[];
 }
 
 /**
- * The customers who owe money, from the customer ledger.
+ * The customers who are late paying, from the receivables book.
  *
- * "Which customers are past due?" was answered from subscription status — a
- * different table about a different thing that happened to hold two rows with
- * the same names. On another book those two sets differ, and the substitution
- * would be invisible: the sentence says customers and the rows are
- * subscriptions.
+ * Two substitutions have been made here for the real question, and both read as
+ * facts about named companies. First the answer came from *subscription*
+ * status, a different table about a different thing. Then it came from the
+ * `delinquent` flag on the customer row — which is that same subscription
+ * status under another name — intersected with the account's open invoices,
+ * so a company whose bills are two months late but whose subscription is
+ * collecting fine was simply absent from "who owes us money?".
+ *
+ * It is one query now, against the one receivables definition, so this list and
+ * the overdue balance above it are the same book counted twice.
  */
 export function delinquentCustomers(ctx: Ctx, orgId: string, args: { limit?: number } = {}): DelinquentCustomersResult | { error: string } {
   const billing = ctx.svc.billing;
   if (!billing) return { error: 'No module in this workspace keeps a customer ledger, so there is nothing to read.' };
   const workspace = workspaceProfile(ctx, orgId);
   const limit = Math.min(args.limit ?? 20, 50);
-  const rows = billing.customers(orgId, { delinquent: true, limit: 200 });
-  const customers = rows.map((customer) => {
-    const invoices = billing.invoices(orgId, { customer: customer.id, status: 'open_like', limit: 100 })
-      .filter((invoice) => invoice.amount_due > 0);
-    const outstanding = invoices.reduce((sum, invoice) => sum + invoice.amount_due, 0);
-    const dues = invoices.map((i) => i.due_date).filter((d): d is number => typeof d === 'number');
-    const oldest = dues.length ? Math.min(...dues) : null;
-    const currency = invoices[0]?.currency ?? customer.currency ?? workspace.currency;
+  // The whole arrears book, not a page of it: this list is ranked by what each
+  // account owes, and ranking a page ranks nothing.
+  const arrears = outstandingBills(ctx, orgId, { overdueOnly: true, limit: 200 });
+
+  const byCustomer = new Map<string, { name: string; bills: OutstandingBill[] }>();
+  for (const bill of arrears.bills) {
+    if (!bill.customerId) continue;
+    const entry = byCustomer.get(bill.customerId) ?? { name: bill.customerName ?? bill.customerId, bills: [] };
+    entry.bills.push(bill);
+    byCustomer.set(bill.customerId, entry);
+  }
+
+  const customers = [...byCustomer.entries()].map(([id, entry]) => {
+    const perCurrency = new Map<string, number>();
+    for (const bill of entry.bills) perCurrency.set(bill.currency, (perCurrency.get(bill.currency) ?? 0) + bill.amountDue);
+    const books = [...perCurrency.entries()]
+      .map(([currency, amount]) => ({ currency, amount, amount_formatted: formatAmount(amount, currency, workspace) }))
+      .sort((a, b) => b.amount - a.amount || a.currency.localeCompare(b.currency));
+    const oldest = entry.bills.reduce<number | null>((min, b) => (b.dueAt !== null && (min === null || b.dueAt < min) ? b.dueAt : min), null);
+    const single = books.length === 1 ? books[0] : null;
     return {
-      id: customer.id,
-      name: customer.name,
-      currency,
-      outstanding,
-      outstanding_formatted: formatAmount(outstanding, currency, workspace),
-      open_invoices: invoices.length,
+      id,
+      name: entry.name,
+      books,
+      past_due: single ? single.amount : null,
+      currency: single ? single.currency : null,
+      past_due_formatted: listPhrase(books.map((b) => b.amount_formatted)),
+      past_due_invoices: entry.bills.length,
       oldest_due_at: oldest,
-      days_overdue: oldest && oldest < ctx.now() ? Math.floor((ctx.now() - oldest) / DAY) : null,
-      past_due_subscriptions: billing.subscriptions(orgId, { customer: customer.id, limit: 50 })
+      days_overdue: oldest !== null && oldest <= ctx.now() ? Math.floor((ctx.now() - oldest) / DAY) : null,
+      past_due_subscriptions: billing.subscriptions(orgId, { customer: id, limit: 50 })
         .filter((sub) => sub.status === 'past_due').length,
     };
-  }).sort((a, b) => b.outstanding - a.outstanding || a.name.localeCompare(b.name));
+  })
+    // Ranked on the largest single book: there is no exchange rate here to add
+    // two of them together with, so there is no total to rank on.
+    .sort((a, b) => Math.max(...b.books.map((x) => x.amount)) - Math.max(...a.books.map((x) => x.amount)) || a.name.localeCompare(b.name));
+
   return { object: 'delinquent_customers', total: customers.length, customers: customers.slice(0, limit) };
+}
+
+/**
+ * The unpaid bills behind a dunning draft, in the words the recipient's copy uses.
+ *
+ * One reader for two callers — the draft route and the `compose_message` tool —
+ * because they had drifted: the route read the ledger and the tool passed
+ * nothing at all, so the same instruction produced a chase with the invoice
+ * number in it through one door and "no invoice with an amount still due on
+ * that account" through the other, about the same company on the same day.
+ */
+export function outstandingForDraft(ctx: Ctx, orgId: string, recordId: string | null): OutstandingInvoice[] {
+  if (!recordId) return [];
+  const workspace = workspaceProfile(ctx, orgId);
+  return outstandingBills(ctx, orgId, { customerIds: billingCustomersFor(ctx, orgId, recordId), limit: 10 }).bills
+    .map((bill) => ({
+      number: bill.number ?? bill.id,
+      amount_due_formatted: formatAmount(bill.amountDue, bill.currency, workspace),
+      due_at: bill.dueAt,
+      days_overdue: bill.daysOverdue,
+      status: bill.status,
+    }));
+}
+
+/* --------------------------- the receivables book -------------------------- */
+
+export interface OutstandingInvoicesResult {
+  object: 'outstanding_invoices';
+  scope: 'outstanding' | 'overdue';
+  total: number;
+  outstanding_by_currency: { currency: string; amount: number; amount_display: string }[];
+  outstanding_display: string;
+  outstanding_note: string | null;
+  invoices: {
+    id: string; number: string | null; customer: string | null; customer_name: string | null;
+    status: string; currency: string; amount_due: number; amount_due_display: string;
+    due: string | null; due_at: number | null; days_overdue: number | null;
+  }[];
+}
+
+/**
+ * Every bill still owed, or only the ones that are late.
+ *
+ * The ledger's own list tool cannot express this question: `due_before` is
+ * `due_date IS NOT NULL AND due_date <= ?`, and six of the seven bills open on
+ * the demo book carry no due date at all — they are due on receipt, which is
+ * the earliest due date there is, and that filter drops every one of them.
+ */
+export function outstandingInvoices(
+  ctx: Ctx, orgId: string, args: { overdue?: boolean; record_id?: string; limit?: number } = {},
+): OutstandingInvoicesResult | { error: string } {
+  const workspace = workspaceProfile(ctx, orgId);
+  const customerIds = args.record_id ? billingCustomersFor(ctx, orgId, args.record_id) : undefined;
+  const book = outstandingBills(ctx, orgId, { overdueOnly: args.overdue, customerIds, limit: args.limit ?? 25 });
+  const byCurrency = book.books.map((b) => ({ currency: b.currency, amount: b.amount, amount_display: formatAmount(b.amount, b.currency, workspace) }));
+  const shown = byCurrency.length ? byCurrency.map((b) => b.amount_display) : [formatAmount(0, workspace.currency, workspace)];
+  return {
+    object: 'outstanding_invoices',
+    scope: args.overdue ? 'overdue' : 'outstanding',
+    total: book.total,
+    outstanding_by_currency: byCurrency,
+    outstanding_display: listPhrase(shown),
+    outstanding_note: [
+      byCurrency.length > 1
+        ? `These bills were raised in ${listPhrase(byCurrency.map((b) => b.currency.toUpperCase()))}. Minor units of different currencies are not the same thing, so there is no single figure to quote — read outstanding_by_currency, and name each currency.`
+        : '',
+      // Said out loud rather than quietly substituted: on a ledger with no
+      // amount-due column the face value is standing in for the debt, and a
+      // bill a credit note has reduced reads here as larger than it is.
+      book.exact ? '' : 'This workspace\'s invoice table records no amount still due, so these are face values: a bill reduced by a credit note reads here at what it originally asked for.',
+    ].filter(Boolean).join(' ') || null,
+    invoices: book.bills.map((bill) => ({
+      id: bill.id,
+      number: bill.number,
+      customer: bill.customerId,
+      customer_name: bill.customerName,
+      status: bill.status,
+      currency: bill.currency,
+      amount_due: bill.amountDue,
+      amount_due_display: formatAmount(bill.amountDue, bill.currency, workspace),
+      // A bill with no due date of its own is due on receipt; saying so beats
+      // printing the finalisation date as if the customer had been given terms.
+      due: bill.dueOnReceipt ? 'on receipt' : bill.dueAt === null ? null : formatDate(bill.dueAt, { locale: workspace.locale, timeZone: 'UTC' }),
+      due_at: bill.dueAt,
+      days_overdue: bill.daysOverdue,
+    })),
+  };
 }
 
 /* ----------------------------- accounts gone quiet ------------------------ */

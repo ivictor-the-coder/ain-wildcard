@@ -11,6 +11,7 @@ import type { Ctx } from '../kernel/context';
 import { DAY, formatDate } from '../../shared/time';
 import { money as formatAmount } from './answer';
 import { billingSources, entityIndex, schemaOf, type WorkspaceProfile } from './grounding';
+import { receivableScope } from './receivables';
 import { resolveEntities } from './resolve';
 import { GROUP_KEY_SEPARATOR, aggregate, associatedRecords, fetchRecords, getRecord, type AggregateResult, type Condition, type RecordSummary } from './query';
 import { crmVocabulary, stageLabelIn } from './qualifiers';
@@ -500,35 +501,40 @@ export function invoiceFacts(
   const invoices = sources.invoices;
   if (!invoices) return { available: false, total: 0, count: 0, ids: [], groups: [], groupTotal: 0, books: [], label: 'no invoice table in this workspace' };
 
-  const amountColumn = opts.paidOnly && invoices.paidColumn ? invoices.paidColumn : invoices.amountColumn;
+  // Overdue is the receivables book with the ageing test on it, so it is
+  // scoped exactly as the outstanding book is — never on its own.
+  const receivable = !!opts.outstanding || !!opts.overdue;
   // Cash collected is dated by when it was paid; everything else is dated by
   // when the bill was raised. An unpaid invoice has no payment date, so dating
   // the outstanding book on `paid_at` excludes every row it is asking about.
   const dateColumn = opts.paidOnly && invoices.paidDateColumn ? invoices.paidDateColumn : invoices.issuedDateColumn;
   // What is owed is owed today, whatever period the question named: an invoice
   // raised last year and still open is money the business is still owed.
-  const windowed = !opts.outstanding;
+  const windowed = !receivable;
   const where: string[] = [`org_id = ?`];
   const params: unknown[] = [workspace.orgId];
-  // Overdue is a date test, not a status one. "How many overdue invoices are
-  // there?" was answered with the whole open book — 7 invoices in three
-  // currencies — when 1 of them was actually late; the other 6 are inside their
-  // terms and calling them overdue is a claim about the customers who owe them.
-  if (opts.overdue) {
-    if (!invoices.dueDateColumn) {
-      return { available: false, total: 0, count: 0, ids: [], groups: [], groupTotal: 0, books: [], label: 'no due date on invoices in this workspace' };
-    }
-    where.push(`${invoices.dueDateColumn} IS NOT NULL`, `${invoices.dueDateColumn} < ?`);
-    params.push(workspace.now);
+
+  // Both the scope and the money come from the one definition the collections
+  // report and the dunning module use — see `receivables.ts`. Written here it
+  // read `due_date IS NOT NULL AND due_date < now` over a status list that
+  // counted written-off bills as assets, and summed `total` rather than what
+  // was still due, so this engine and the collections page disagreed about the
+  // same book at the same instant.
+  const scope = receivable ? receivableScope(invoices, workspace.now, { overdue: opts.overdue }) : null;
+  const amountColumn = scope ? scope.amountColumn
+    : opts.paidOnly && invoices.paidColumn ? invoices.paidColumn
+      : invoices.amountColumn;
+  if (scope) {
+    where.push(...scope.clauses);
+    params.push(...scope.params);
   }
   if (windowed) {
     where.push(`${dateColumn} >= ?`, `${dateColumn} < ?`);
     params.push(window.start, window.end);
   }
 
-  if (invoices.statusColumn) {
-    if (opts.outstanding) { where.push(`${invoices.statusColumn} IN ('open', 'past_due', 'unpaid', 'uncollectible')`); }
-    else if (opts.paidOnly) { where.push(`${invoices.statusColumn} = 'paid'`); }
+  if (invoices.statusColumn && !scope) {
+    if (opts.paidOnly) { where.push(`${invoices.statusColumn} = 'paid'`); }
     else { where.push(`${invoices.statusColumn} NOT IN ('draft', 'void', 'deleted')`); }
   }
   if (input.currency && invoices.currencyColumn) {
@@ -868,8 +874,8 @@ function moneyIn(
       groupTotal: invoices.groupTotal,
       note: def.snapshot
         ? opts.overdue
-          ? 'Overdue is what is late right now — every open invoice whose due date has passed — so it ignores the reporting period, and it is a smaller set than the outstanding book.'
-          : 'Outstanding balance is what is owed right now — every invoice still open, whenever it was raised — so it ignores the reporting period.'
+          ? 'Overdue is what is late right now — every unsettled bill whose due date has passed, and a bill with no due date is due on receipt — so it ignores the reporting period, and it is a smaller set than the outstanding book.'
+          : 'Outstanding balance is what is still due on every finalised, unsettled bill, whenever it was raised — so it ignores the reporting period. Written-off bills are not in it: uncollectible is a loss, not a receivable.'
         : null,
       groups: invoices.groups.map((g) => ({
         key: g.key,

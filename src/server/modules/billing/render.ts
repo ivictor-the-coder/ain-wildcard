@@ -115,6 +115,7 @@ const KIND_LABEL: Record<InvoiceLine['kind'], string> = {
   credit_covered: 'Covered by prepaid credit',
   topup: 'Prepaid credit purchase',
   true_up: 'Usage true-up',
+  included_allowance: 'Included in the plan',
   invoice_item: 'Added by hand',
 };
 

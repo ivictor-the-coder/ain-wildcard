@@ -27,9 +27,12 @@ register(
 
 import { isWiderName, recordPhraseMismatch, type Vocabulary } from '../src/client/modules/copilot/scope-core';
 import {
-  nearestFromReasoning, noWritePrepared, propertyAsked, refusalOf, splitRefusalOffer, withoutApiInstruction, writeNeedsSwitch,
+  currencyRefusal, nearestFromReasoning, noWritePrepared, propertyAsked, refusalOf, splitRefusalOffer,
+  withoutApiInstruction, withoutCurrencyClaim, writeNeedsSwitch,
 } from '../src/client/modules/copilot/answer-core';
-import { citationHref, citationResolution, dedupeCitations, needsProbe, writeTargetLabel } from '../src/client/modules/copilot/citations';
+import {
+  citationHref, citationResolution, dedupeCitations, needsProbe, subjectRecordIds, writeTargetLabel,
+} from '../src/client/modules/copilot/citations';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { filterTools, tagLabel, toolSummary } from '../src/client/modules/copilot/tools-core';
@@ -58,6 +61,11 @@ import {
   bindingOf, numberAsked, rawRecordIds, slotChips, slotChipsFromPlan, windowText, type SlotFormat,
 } from '../src/client/modules/copilot/slots-core';
 import { answerCard, nearestOf, type TurnInput } from '../src/client/modules/copilot/card-core';
+
+// The board's rule, called from the copilot's own test the way the approval
+// card calls it: one definition, two surfaces. Dynamic because the pipeline's
+// api module reaches the design system, and the design system imports CSS.
+const { stageRequirements } = await import('../src/client/modules/pipeline/api');
 
 const ui = {
   card: await import('../src/client/modules/copilot/card.tsx'),
@@ -984,7 +992,10 @@ describe('a stage change that reopens a closed-lost deal', () => {
     const write = stageWriteOf('update_record', {
       object_type: 'deal', id: 'deal_nw_15', properties: { deal_stage: 'negotiation' },
     });
-    assert.deepEqual(write, { recordId: 'deal_nw_15', objectType: 'deal', stage: 'negotiation' });
+    assert.deepEqual(write, {
+      recordId: 'deal_nw_15', objectType: 'deal', stage: 'negotiation',
+      properties: { deal_stage: 'negotiation' },
+    });
 
     const c = stageConsequences(LOST_DEAL, 'negotiation', BOARD);
     assert.equal(c.closedState, 'reopens');
@@ -2093,5 +2104,183 @@ describe('the usage chart’s ticks', () => {
     assert.doesNotMatch(runsSource, /integerTickCount/, 'and the workaround is gone');
     const usageCore = readFileSync(join(MODULES, 'copilot', 'usage-core.ts'), 'utf8');
     assert.doesNotMatch(usageCore, /integerTickCount|niceStep/);
+  });
+});
+
+/* ====== a close the copilot prepared with none of the reason it needs ====== */
+
+/**
+ * `stageRequirements` is the board's rule, and the copilot is its second
+ * caller. The rule is not restated here: the fixture is the workspace's own
+ * `GET /v1/objects/deal/properties` shape, and what is asserted is that the
+ * approval card can compute the same gap the stage dialog computes from the
+ * same two inputs — the property definitions and the write's own arguments.
+ */
+const DEAL_PROPERTIES = [
+  { name: 'name', label: 'Deal name', type: 'string', group: 'Deal information', required: true, read_only: false },
+  { name: 'amount', label: 'Amount', type: 'currency', group: 'Deal information', required: true, read_only: false },
+  { name: 'close_reason', label: 'Close reason', type: 'enum', group: 'Outcome', required: false, read_only: false },
+  { name: 'close_notes', label: 'Close notes', type: 'text', group: 'Outcome', required: false, read_only: false },
+  { name: 'closed_at', label: 'Closed at', type: 'datetime', group: 'Outcome', required: false, read_only: true },
+] as unknown as Parameters<typeof stageRequirements>[2];
+
+const gapOf = (
+  tool: string,
+  args: Record<string, unknown>,
+  deal: { properties: Record<string, unknown> },
+  closing: boolean,
+): string[] => {
+  const write = stageWriteOf(tool, args);
+  if (!write || !closing) return [];
+  return stageRequirements(deal, { is_closed: true }, DEAL_PROPERTIES).required
+    .filter((property) => write.properties[property.name] === undefined)
+    .map((property) => property.name);
+};
+
+describe('a copilot write that closes a deal', () => {
+  const open = { properties: { name: 'Kaskade Pharma Group — pilot expansion', amount: 20_898_000, deal_stage: 'negotiation' } };
+
+  it('carries every property it sets, so the card can see what it leaves out', () => {
+    const write = stageWriteOf('update_record', {
+      object_type: 'deal', id: 'deal_nw_57', properties: { deal_stage: 'closed_won' },
+    });
+    assert.deepEqual(write?.properties, { deal_stage: 'closed_won' });
+  });
+
+  it('is short the close reason the board demands of the same move', () => {
+    // The engine's write extractor reads a stage and nothing else, so this is
+    // the shape every copilot close arrives in.
+    const gap = gapOf('update_record', {
+      object_type: 'deal', id: 'deal_nw_57', properties: { deal_stage: 'closed_won' },
+    }, open, true);
+    assert.deepEqual(gap, ['close_reason']);
+  });
+
+  it('is not short of it once the write names one', () => {
+    const gap = gapOf('update_record', {
+      object_type: 'deal', id: 'deal_nw_57', properties: { deal_stage: 'closed_won', close_reason: 'product_fit' },
+    }, open, true);
+    assert.deepEqual(gap, []);
+  });
+
+  it('leaves an open-to-open move alone — the rule is about closing', () => {
+    assert.deepEqual(gapOf('update_record', {
+      object_type: 'deal', id: 'deal_nw_57', properties: { deal_stage: 'negotiation' },
+    }, open, false), []);
+  });
+
+  it('is satisfied by a deal that already recorded one before it was reopened', () => {
+    const reopened = { properties: { ...open.properties, close_reason: 'competitor' } };
+    assert.deepEqual(gapOf('update_record', {
+      object_type: 'deal', id: 'deal_nw_57', properties: { deal_stage: 'closed_lost' },
+    }, reopened, true), []);
+  });
+});
+
+/* ========= a currency refusal the workspace's own answers contradict ======= */
+
+describe('a money measure refused for a currency', () => {
+  const asked = 'What is our overdue balance in GBP?';
+  const refusal = {
+    code: 'tool_failed',
+    message: '"Overdue balance" is measured from records that carry no currency book in this workspace, '
+      + 'so it cannot be narrowed to GBP: the figure I hold is the whole of it, in USD.',
+  };
+
+  it('is recognised as a claim about the books rather than an answer', () => {
+    const read = currencyRefusal(asked, refusal);
+    assert.equal(read?.measure, 'Overdue balance');
+    assert.equal(read?.currency, 'GBP');
+    assert.equal(read?.unscoped, 'What is our overdue balance?');
+  });
+
+  it('reads the other wording the same way — a book the measure does not hold', () => {
+    const read = currencyRefusal('What is our MRR in JPY?', {
+      code: 'tool_failed',
+      message: '"Monthly recurring revenue" is held in USD, EUR and GBP here, and there is no JPY book in it '
+        + '— the unscoped figure is a different number, not a smaller version of the one you asked for.',
+    });
+    assert.equal(read?.measure, 'Monthly recurring revenue');
+    assert.equal(read?.currency, 'JPY');
+    assert.equal(read?.unscoped, 'What is our MRR?');
+  });
+
+  it('takes the claim out of the prose, leaving the refusal itself', () => {
+    const read = currencyRefusal(asked, refusal);
+    const prose = `I can't answer that as asked. ${refusal.message}`;
+    const left = withoutCurrencyClaim(prose, read!.claim);
+    assert.equal(left, "I can't answer that as asked.");
+    assert.doesNotMatch(left, /no currency book/);
+    assert.doesNotMatch(left, /the whole of it, in USD/);
+  });
+
+  it('offers nothing to ask again when the currency is not a word of the question', () => {
+    // "in yen" binds GBP-style but the code is nowhere in the sentence, so
+    // handing back "What is our MRR in yen?" would be the same dead end twice.
+    const read = currencyRefusal('What is our MRR in yen?', {
+      code: 'tool_failed',
+      message: '"Monthly recurring revenue" is held in USD here, and there is no JPY book in it — the unscoped figure '
+        + 'is a different number, not a smaller version of the one you asked for.',
+    });
+    assert.equal(read?.currency, 'JPY');
+    assert.equal(read?.unscoped, null);
+  });
+
+  it('leaves every other refusal alone', () => {
+    assert.equal(currencyRefusal(asked, { code: 'qualifier_unbound', message: '"EUR" is not a stage.' }), null);
+    assert.equal(currencyRefusal(asked, { code: 'tool_failed', message: 'The invoice ledger did not answer.' }), null);
+    assert.equal(currencyRefusal(asked, null), null);
+  });
+
+  it('is drawn the same on the conversation and on the run’s own page', () => {
+    const read = currencyRefusal(asked, refusal)!;
+    assert.equal(ui.card.currencyRefusalTitle(read), 'The copilot will not narrow Overdue balance to GBP');
+    const html = renderToStaticMarkup(createElement(ui.card.CurrencyRefusalNote, { refusal: read, onAsk: () => undefined }));
+    assert.match(html, /one figure per book/);
+    assert.match(html, /holds no exchange rates/);
+    assert.ok(html.includes('What is our overdue balance?'), 'the unscoped question is not offered');
+    // The engine's own sentence is nowhere in what the surface says.
+    assert.doesNotMatch(html, /carry no currency book/);
+    assert.doesNotMatch(html, /the whole of it/);
+    // Both surfaces read the one component rather than keeping a copy each.
+    for (const file of ['chat.tsx', 'runs.tsx']) {
+      const source = readFileSync(join(MODULES, 'copilot', file), 'utf8');
+      assert.match(source, /<CurrencyRefusalNote refusal=\{currency\}/, `${file} draws its own version`);
+      assert.match(source, /currencyRefusalTitle\(currency\)/, `${file} writes its own title`);
+    }
+    // The run page no longer prints the engine's reason unconditionally.
+    const runs = readFileSync(join(MODULES, 'copilot', 'runs.tsx'), 'utf8');
+    assert.match(runs, /\? <CurrencyRefusalNote[\s\S]*?: card\.refusal\.message && <p>/);
+  });
+});
+
+/* ============ the records an uncited answer was actually scoped to ========= */
+
+describe('an answer the engine cited nothing for', () => {
+  it('still names the record its own plan was scoped to', () => {
+    assert.deepEqual(subjectRecordIds([
+      { arguments: { metric: 'outstanding', subject_id: 'cmp_nw_33', compare: false } },
+    ]), ['cmp_nw_33']);
+    assert.deepEqual(subjectRecordIds([
+      { arguments: { object_type: 'ticket', measure: 'count', associated_to: 'cmp_nw_13' } },
+    ]), ['cmp_nw_13']);
+  });
+
+  it('names each record once, however many calls carried it', () => {
+    assert.deepEqual(subjectRecordIds([
+      { arguments: { subject_id: 'cmp_nw_33' } },
+      { arguments: { associated_to: 'cmp_nw_33', record_id: 'deal_nw_57' } },
+    ]), ['cmp_nw_33', 'deal_nw_57']);
+  });
+
+  it('invents nothing from a plan that named no record', () => {
+    assert.deepEqual(subjectRecordIds([
+      { arguments: { metric: 'mrr', currency: 'gbp' } },
+      { arguments: { object_type: 'deal', measure: 'count', group_by: 'deal_stage' } },
+      // A teammate is not a record with a screen, and a price is not one of ours.
+      { arguments: { owner_id: 'usr_seed01', price: 'telemetry_events_monthly' } },
+      { arguments: null },
+    ]), []);
+    assert.deepEqual(subjectRecordIds([]), []);
   });
 });

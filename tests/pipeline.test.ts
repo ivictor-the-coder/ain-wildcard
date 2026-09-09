@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { readFileSync } from 'node:fs';
+import { register } from 'node:module';
 import { describe, it } from 'node:test';
 
 import {
@@ -30,6 +31,17 @@ import { citationHref, writeTargetLabel } from '../src/client/modules/copilot/ci
 import {
   OUTCOME_LABEL, OUTCOME_TONE, runOutcome, type AiApproval,
 } from '../src/client/modules/copilot/api';
+import { canWrite } from '../src/client/kernel/shell-core';
+
+// The design system's index pulls its stylesheets in and node has no idea what
+// a `.css` import is, so they are short-circuited before anything that reaches
+// one is loaded — which is why the pipeline's api module is imported here
+// rather than at the top with the rest.
+register(
+  'data:text/javascript,export async function load(url, context, next) { if (url.endsWith(".css")) return { format: "module", source: "", shortCircuit: true }; return next(url, context); }',
+  import.meta.url,
+);
+const { readOnlyReason } = await import('../src/client/modules/pipeline/api');
 
 const TODAY = Date.UTC(2026, 8, 2);
 
@@ -1179,5 +1191,68 @@ describe('the stat tiles below the toolbar’s breakpoint', () => {
     assert.ok(narrow >= 0, 'no rule lays the tiles out two by two below 1180px');
     // Equal specificity: whichever is later wins, so the override must be later.
     assert.ok(narrow > base, 'the two-by-two rule is written before the rule it overrides, so it never applies');
+  });
+});
+
+/* -------------------- who the board offers a write to --------------------- */
+
+/**
+ * The rung, in the words the reader gets.
+ *
+ * `POST/PATCH /v1/records/deal` is gated at `member`, so an `analyst` and a
+ * `readonly` seat can read the whole board and write none of it. The screen
+ * used to offer all of it anyway — New deal, a draggable card on every column,
+ * an inline editor on every property — and the refusal arrived only after the
+ * attempt, as a toast with a role name in it.
+ */
+describe('the deal board for a session that cannot write', () => {
+  it('names the rung rather than saying "permission denied"', () => {
+    assert.equal(
+      readOnlyReason('readonly'),
+      'You are signed in as a read-only user, and writing a deal needs the member role or higher.',
+    );
+    assert.equal(
+      readOnlyReason('analyst'),
+      'You are signed in as an analyst, and writing a deal needs the member role or higher.',
+    );
+    assert.match(readOnlyReason(null), /signed in as a guest/);
+  });
+
+  it('reads the kit’s ladder, so it and the server cannot disagree', () => {
+    // The same helper the command palette uses to decide what to offer.
+    assert.equal(canWrite('owner'), true);
+    assert.equal(canWrite('admin'), true);
+    assert.equal(canWrite('member'), true);
+    assert.equal(canWrite('analyst'), false);
+    assert.equal(canWrite('readonly'), false);
+    assert.equal(canWrite(null), false);
+    const source = readFileSync(new URL('../src/client/modules/pipeline/api.ts', import.meta.url), 'utf8');
+    assert.match(source, /import \{ canWrite \} from '@\/client\/kernel\/shell-core'/, 'the module keeps a ladder of its own');
+  });
+
+  it('hangs every write affordance on the board off that one answer', () => {
+    const source = readFileSync(new URL('../src/client/modules/pipeline/deals.tsx', import.meta.url), 'utf8');
+    assert.match(source, /const writable = useCanWriteDeals\(\);/, 'the board never asks');
+    // A card that lifts and snaps back on a 403 is the defect this replaces.
+    assert.match(source, /draggable=\{writable\}/);
+    assert.doesNotMatch(source, /^\s+draggable$/m, 'a card is still unconditionally draggable');
+    assert.match(source, /\{writable && \(\n\s+<Button ref=\{newDealButton\}/, 'New deal is still offered to everyone');
+    assert.match(source, /open=\{newOpen && writable\}/, '?new=1 still opens the create dialog');
+    assert.match(source, /if \(!writable \|\| dealStage\(deal\) === stage\.name\) return;/, 'a move can still be requested');
+  });
+
+  it('shuts the record page’s inline editors, which are one PATCH each', () => {
+    const inline = readFileSync(new URL('../src/client/modules/pipeline/inline.tsx', import.meta.url), 'utf8');
+    assert.match(inline, /const writable = scope\?\.writable \?\? true;/, 'the scope carries no answer');
+    assert.match(inline, /const editing = writable && /, 'a row can still open its editor');
+    const record = readFileSync(new URL('../src/client/modules/pipeline/record.tsx', import.meta.url), 'utf8');
+    assert.match(record, /<InlineEditingScope writable=\{writable\}>/, 'the scope is not told');
+    assert.match(record, /const writable = useCanWriteDeals\(\);/, 'the record page never asks');
+  });
+
+  it('offers no saved-view write either — /v1/views is the same rung', () => {
+    const views = readFileSync(new URL('../src/client/modules/pipeline/views.tsx', import.meta.url), 'utf8');
+    assert.match(views, /const writable = useCanWriteDeals\(\);/);
+    assert.match(views, /const manage: MenuItemDef\[\] = writable/);
   });
 });

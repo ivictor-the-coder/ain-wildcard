@@ -21,7 +21,7 @@ import {
   Textarea, useToast, type MenuItemDef, type MenuSection,
 } from '@/client/design';
 import {
-  describeBoardState, sameBoardState, stateToView, useDealFormat, useDealViews, viewToState,
+  describeBoardState, sameBoardState, stateToView, useCanWriteDeals, useDealFormat, useDealViews, viewToState,
   type BoardState, type DealView,
 } from './api';
 
@@ -59,6 +59,7 @@ export function ViewBar({
 }: ViewBarProps) {
   const toast = useToast();
   const session = useSession();
+  const writable = useCanWriteDeals();
   const views = useDealViews();
   // The two quarter windows the filter engine has no token for are stored as
   // the dates they are today, and read back against today as well.
@@ -153,10 +154,13 @@ export function ViewBar({
     onSelect: () => onApply(row),
   }));
 
-  const manage: MenuItemDef[] = [
-    { id: 'save', label: 'Save this board as a view…', icon: <Icons.plus size={14} />, onSelect: startNew },
-  ];
-  if (active) {
+  // Saving, updating, renaming and deleting a view are all `member` writes
+  // (`/v1/views`), so below that rung the menu offers the views themselves and
+  // nothing that writes one.
+  const manage: MenuItemDef[] = writable
+    ? [{ id: 'save', label: 'Save this board as a view…', icon: <Icons.plus size={14} />, onSelect: startNew }]
+    : [];
+  if (active && writable) {
     manage.push({
       id: 'update',
       label: `Update “${active.name}” to match this board`,
@@ -194,7 +198,7 @@ export function ViewBar({
       }],
     }] : []),
     ...(viewItems.length ? [{ id: 'views', label: 'Saved views', items: viewItems }] : []),
-    { id: 'manage', label: 'This board', items: manage },
+    ...(manage.length ? [{ id: 'manage', label: 'This board', items: manage }] : []),
   ];
 
   return (
@@ -221,7 +225,7 @@ export function ViewBar({
           the first Space of the name you type activates it, throwing away the
           dialog and everything typed into it. */}
       <Modal
-        open={!!draft}
+        open={!!draft && writable}
         onClose={() => setDraft(null)}
         size="sm"
         initialFocus={nameField}
@@ -297,7 +301,7 @@ export function ViewBar({
       </Modal>
 
       <ConfirmDialog
-        open={!!deleting}
+        open={!!deleting && writable}
         onCancel={() => setDeleting(null)}
         onConfirm={() => { if (deleting) void remove.run(deleting).catch(() => undefined); }}
         loading={remove.loading}

@@ -956,9 +956,12 @@ test('each move in the time machine history reads the count the server answered 
   const pending = (await json(page, '/v1/jobs?status=pending&limit=200')).data;
   const now = (await json(page, '/v1/me')).clock.now;
   const dueInADay = pending.filter((job: any) => job.run_at <= now + 24 * 3600 * 1000).length; // eslint-disable-line @typescript-eslint/no-explicit-any
+  // A floor, not a promise: the replay drains the queue, asks it again, and
+  // runs whatever the last batch queued — so a day-jump that this line called
+  // "18 jobs run on the way" recorded 42 in the history three lines below.
   await expect(page.getByTestId('due-day')).toHaveText(dueInADay === 0
     ? 'Nothing is due — the clock moves, no job runs'
-    : new RegExp(`^${dueInADay} jobs? runs? on the way$`));
+    : new RegExp(`^At least ${dueInADay} jobs? runs? on the way$`));
 
   await returnToNow();
 });
@@ -1225,12 +1228,17 @@ test('the trail names a removed teammate, and their link lands on a roster that 
   // rather than the page's, because `POST /v1/auth/accept` answers with a
   // session cookie and that would sign the browser in as the new teammate.
   const email = `e2e.gone.${stamp()}@northwind.io`;
-  const created: any = await postJson(page.request, '/api/v1/users', { email, name: 'E2E Departed', role: 'analyst' }); // eslint-disable-line @typescript-eslint/no-explicit-any
+  const created: any = await postJson(page.request, '/api/v1/users', { email, name: 'E2E Departed', role: 'admin' }); // eslint-disable-line @typescript-eslint/no-explicit-any
   expect(created.id, 'the seat was created').toBeTruthy();
   expect(created.invitation?.token, 'the seat came with a one-time invitation token').toBeTruthy();
   expect((await past429(() => request.post('/api/v1/auth/accept', {
     data: { token: created.invitation.token, password: 'demo1234' },
   }))).status()).toBe(200);
+  // Something audited, done by them, before they go: this is the row an
+  // auditor comes back to after the seat is gone.
+  const keyName = `E2E departed key ${stamp()}`;
+  const theirKey: any = await postJson(request, '/api/v1/api-keys', { name: keyName }); // eslint-disable-line @typescript-eslint/no-explicit-any
+  expect(theirKey.id, 'they minted a key while they were here').toBeTruthy();
   expect((await past429(() => page.request.delete(`/api/v1/users/${created.id}`))).status()).toBe(204);
 
   // The width the critic read "Workspace setti…" at.
@@ -1254,6 +1262,17 @@ test('the trail names a removed teammate, and their link lands on a roster that 
   expect(summaryWidth, `the summary cell (${summaryWidth}px) is the widest of ${widths.join(', ')}`).toBe(Math.max(...widths));
   expect(await summary.evaluate((el) => el.scrollWidth > el.clientWidth + 1), 'the summary is not truncated').toBe(false);
 
+  // And the change *they* made still says who made it. The roster no longer
+  // holds them, so this row read `usr_…` — on the screen whose whole purpose is
+  // saying who did what, for exactly the person an auditor is asking about.
+  await page.getByPlaceholder('Search summaries, targets and request ids').fill(keyName);
+  const minted = page.locator('tbody tr').filter({ hasText: 'api_key.created' }).first();
+  await expect(minted).toBeVisible({ timeout: 15_000 });
+  await expect(minted).toContainText(email);
+  await expect(minted).not.toContainText(created.id);
+
+  await page.getByPlaceholder('Search summaries, targets and request ids').fill(created.id);
+  await expect(removed).toBeVisible({ timeout: 15_000 });
   await removed.getByRole('link', { name: email }).click();
   await expect(page).toHaveURL(/\/settings\/team$/);
   await expect(page.getByText('That teammate is no longer on the roster')).toBeVisible({ timeout: 15_000 });

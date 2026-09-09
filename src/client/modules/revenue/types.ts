@@ -991,6 +991,8 @@ export interface CustomerLite {
 
 export interface PriceLite {
   id: string;
+  /** The product this price hangs off, for the pack size the price may not carry. */
+  product: string;
   nickname: string | null;
   currency: string;
   unit_label: string | null;
@@ -999,6 +1001,8 @@ export interface PriceLite {
   tiers_mode: 'graduated' | 'volume' | null;
   currencies: string[];
   recurring: { meter: string | null } | null;
+  /** `units_per_pack`/`events_per_pack` say what one credit pack contains. */
+  metadata: Record<string, string>;
   display: {
     headline: string;
     /** Present on a tiered price: the cheapest rung, and the ladder in words. */
@@ -1006,6 +1010,19 @@ export interface PriceLite {
     tiers: string[] | null;
     summary: string;
   } | null;
+}
+
+/**
+ * `GET /v1/products` as the pack picker reads it. A price may leave the pack
+ * size and the meter on its product — `prod_nw_credits` carries
+ * `events_per_pack` and every price hanging off it inherits it — so the
+ * dialog reads both.
+ */
+export interface ProductLite {
+  id: string;
+  name: string;
+  unit_label: string | null;
+  metadata: Record<string, string>;
 }
 
 /**

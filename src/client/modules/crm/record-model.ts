@@ -8,7 +8,9 @@
  * turns on that distinction lives here, pure, so the same rule reads the same
  * way on the page and in a test that never opens a browser.
  */
-import type { AssociationSummary, CrmRecord, ObjectTypeDef, PropertyDef, TimelineItem, ViewDef } from './api';
+import type {
+  AssociationSummary, AssociationTypeDef, CrmRecord, ObjectTypeDef, PropertyDef, TimelineItem, ViewDef,
+} from './api';
 
 /** The wildcard label the platform uses to pin an activity to a record. */
 export const ACTIVITY_LINK = 'activity_to_record';
@@ -28,15 +30,60 @@ export const isActivityDef = (def: Pick<ObjectTypeDef, 'category'> | undefined):
 export function groupAssociations(
   edges: AssociationSummary[],
   activityPage: boolean,
+  /**
+   * Which object types are activities. Without it every wildcard edge is taken
+   * for an activity edge, which is what hid the stranded links described below.
+   */
+  isActivityType?: (objectType: string) => boolean,
 ): Map<string, AssociationSummary[]> {
   const byType = new Map<string, AssociationSummary[]>();
   for (const edge of edges) {
-    if (!activityPage && edge.association_type === ACTIVITY_LINK) continue;
+    // `POST /v1/associations` falls back to the wildcard label when nothing
+    // else connects two types, so two *records* could end up joined by
+    // "Logged on" — an edge the rail hid on both pages, leaving a link that
+    // was reported as saved, showed nowhere and could not be removed. It is
+    // not offered any more (`linkableObjectTypes`), and the ones already in a
+    // workspace show here so they can be unlinked.
+    const strayLink = edge.association_type === ACTIVITY_LINK
+      && !activityPage
+      && !!isActivityType
+      && !isActivityType(edge.object_type);
+    if (!activityPage && edge.association_type === ACTIVITY_LINK && !strayLink) continue;
     const arr = byType.get(edge.object_type) ?? [];
     arr.push(edge);
     byType.set(edge.object_type, arr);
   }
   return byType;
+}
+
+/** Either end may be a wildcard: `*` matches whatever is on the other side. */
+const connects = (side: string, objectType: string): boolean => side === '*' || side === objectType;
+
+/**
+ * The object types a record of this type can actually be linked to.
+ *
+ * The link dialog used to offer every record type in the workspace, but
+ * `POST /v1/associations` infers the label from the two ends and falls back to
+ * the wildcard `activity_to_record` when nothing connects them. Two tickets
+ * linked that way came back 201 and a toast reading "The association shows on
+ * both sides" — and appeared on neither, because that label is the one the
+ * rail treats as timeline material. The wildcard is only a real answer when
+ * one end is an activity, which is the job it exists for; otherwise the type
+ * is not linkable and is not offered.
+ */
+export function linkableObjectTypes<T extends { name: string; category: 'record' | 'activity' }>(
+  objectType: string,
+  isActivity: boolean,
+  candidates: T[],
+  associationTypes: Pick<AssociationTypeDef, 'from_object' | 'to_object'>[],
+): T[] {
+  return candidates.filter((candidate) => associationTypes.some((type) => {
+    const forwards = connects(type.from_object, objectType) && connects(type.to_object, candidate.name);
+    const backwards = connects(type.from_object, candidate.name) && connects(type.to_object, objectType);
+    if (!forwards && !backwards) return false;
+    if (type.from_object !== '*' && type.to_object !== '*') return true;
+    return isActivity || candidate.category === 'activity';
+  }));
 }
 
 /** The records an activity was logged on, the one it was logged from first. */
@@ -107,6 +154,30 @@ export function reachedThrough(record: Pick<CrmRecord, 'merged_from'>): { text: 
  */
 export function visibleViews(views: ViewDef[], userId: string | null | undefined): ViewDef[] {
   return views.filter((view) => view.shared || !view.owner_id || view.owner_id === userId);
+}
+
+/**
+ * The view bar, with the view the server has just handed back.
+ *
+ * `POST /v1/views` returns the saved view, but the cached list behind the bar
+ * is one write behind until its refetch lands — and invalidation keeps the
+ * stale answer on screen while it does, so the list is not loading and
+ * genuinely does not contain the view. Everything reading that list then
+ * agreed the view did not exist: no tab appeared for it, and the stale-`?view=`
+ * guard below toasted "That view is not available" and stripped the parameter,
+ * which re-seeded the grid from the default view and threw away the filter the
+ * operator had just saved — one gesture after being told it was saved.
+ *
+ * An id already in the list is *replaced* by the fresh copy rather than
+ * duplicated: "Save changes" has to re-sort the grid by the sort it just
+ * wrote, not by the one the cache still holds.
+ */
+export function withFreshView(views: ViewDef[], fresh: ViewDef | null): ViewDef[] {
+  if (!fresh) return views;
+  if (views.some((view) => view.id === fresh.id)) return views.map((view) => (view.id === fresh.id ? fresh : view));
+  // The server lists views `ORDER BY position, name`; a new one takes its place
+  // in the bar rather than jumping to the end and moving again on refetch.
+  return [...views, fresh].sort((a, b) => a.position - b.position || a.name.localeCompare(b.name));
 }
 
 /**
