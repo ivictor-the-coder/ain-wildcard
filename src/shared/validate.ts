@@ -1,3 +1,4 @@
+import { assertCurrency } from './currencies';
 import { badRequest } from './errors';
 
 /**
@@ -92,22 +93,41 @@ export const boolean = (): Validator<boolean> =>
     return fail(path, `Expected a boolean, received ${typeName(raw)}.`);
   });
 
-/** Unix epoch milliseconds. Accepts a number or an ISO-8601 string. */
+/**
+ * Unix epoch milliseconds. Accepts a number, a numeric string, or ISO-8601.
+ *
+ * The numeric string is not a convenience, it is the format this validator
+ * publishes: the schema says `integer`, so `?created_after=1788825600000` —
+ * the exact value the API itself emits — is what a caller reading the docs
+ * sends, and a query string is always text. It came back 400 while the ISO
+ * spelling went through, and every module grew its own union to paper over it.
+ * `Date.parse('1788825600000')` is NaN, so the digits have to be read first.
+ */
 export const timestamp = (): Validator<number> =>
   make<number>({ type: 'integer', format: 'unix-ms' }, (raw, path) => {
     if (typeof raw === 'number' && Number.isFinite(raw)) return Math.trunc(raw);
     if (typeof raw === 'string') {
+      if (/^-?\d+$/.test(raw.trim())) return Number(raw.trim());
       const t = Date.parse(raw);
       if (Number.isFinite(t)) return t;
     }
     return fail(path, `Expected a unix millisecond timestamp or ISO-8601 date string.`);
   });
 
+/**
+ * A currency that exists, not a three-letter word.
+ *
+ * The shape check this used to be accepts "zzz", and modules that noticed —
+ * catalog, payments — each wrapped it in the same `assertCurrency` call. Every
+ * door that did not know to wrap it settled money in a currency no bank has
+ * ever cleared, displayed as "ZZZ 125.00" because `Intl` has nothing better to
+ * say about it. The register is the check, here, once. The published schema is
+ * unchanged: `^[a-z]{3}$` still describes every code the register holds.
+ */
 export const currency = (): Validator<string> =>
   make<string>({ type: 'string', format: 'currency', pattern: '^[a-z]{3}$' }, (raw, path) => {
     const s = string({ min: 3, max: 3 }).parse(raw, path).toLowerCase();
-    if (!/^[a-z]{3}$/.test(s)) return fail(path, `"${s}" is not a 3-letter ISO-4217 currency code.`);
-    return s;
+    return assertCurrency(s, path || 'currency');
   });
 
 export const id = (prefix?: string): Validator<string> =>
@@ -219,6 +239,26 @@ export const object = <S extends Record<string, Validator<any>>>(shape: S, o: Ob
     }
     return out as ShapeOf<S>;
   });
+};
+
+/**
+ * Refuse keys a shape does not declare, for a value parsed somewhere else.
+ *
+ * `object(..., { strict: true })` does this while parsing. A query string is
+ * parsed by the router against a shape the route hands it, and there was no
+ * moment to say "strict" — so an unknown query parameter was dropped in
+ * silence. `?statuss=open` came back as the unfiltered list, which reads as a
+ * filter that matched everything. Same wording and same error shape as the
+ * strict object, because to a caller it is the same mistake.
+ */
+export const refuseUnknown = (validator: Validator<any>, input: Record<string, unknown>): void => {
+  const node = validator.describe();
+  if (node.type !== 'object' || !node.fields) return;
+  const fields = node.fields;
+  const unknown = Object.keys(input).filter((key) => !(key in fields));
+  if (unknown.length) {
+    throw badRequest('parameter_invalid', `Received unknown parameter: ${unknown[0]}.`, unknown[0], { unknown });
+  }
 };
 
 export const union = <T extends readonly Validator<any>[]>(...options: T): Validator<Infer<T[number]>> =>

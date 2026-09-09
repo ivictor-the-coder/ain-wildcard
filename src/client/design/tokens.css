@@ -15,8 +15,12 @@
   --gray-200:#d8dee7;
   --gray-300:#bcc5d3;
   --gray-400:#98a3b5;
-  --gray-500:#76829a;
-  --gray-600:#5b667d;
+  /* 500 and up are the accessible text greys: every one of them clears
+     4.5:1 on --bg-surface, --bg-app, --bg-subtle, --bg-sunken and
+     --bg-surface-raised, which is what tests/design.test.ts asserts. */
+  --gray-500:#646f84;
+  --gray-550:#5a6478;
+  --gray-600:#4d576c;
   --gray-700:#454f64;
   --gray-800:#333c4d;
   --gray-900:#232a37;
@@ -40,7 +44,7 @@
   --amber-50:#fff5e6; --amber-100:#ffe8c2; --amber-300:#ffc768; --amber-500:#e08c00; --amber-600:#bd7300; --amber-700:#985c00;
   --red-50:  #fdeeee; --red-100:  #fbd8d8; --red-300:  #f39a9a; --red-500:  #dc3a3a; --red-600:  #bd2b2b; --red-700:  #9a2020;
   --blue-50: #eaf3ff; --blue-100: #d1e5ff; --blue-300: #7fb4f7; --blue-500: #2a7ae4; --blue-600: #1c62bd; --blue-700: #164e97;
-  --teal-50: #e6f7f7; --teal-100: #c4ecec; --teal-300: #5cc9c9; --teal-500: #12a0a0; --teal-600: #0c8383;
+  --teal-50: #e6f7f7; --teal-100: #c4ecec; --teal-300: #5cc9c9; --teal-500: #12a0a0; --teal-600: #0c8383; --teal-700: #0a6d6d;
   --pink-50: #fdeef6; --pink-100: #fbd6ea; --pink-300: #f294c4; --pink-500: #d63f8f; --pink-600: #b52d75;
   --violet-500:#8b5cf6; --violet-600:#7442e0;
 
@@ -60,8 +64,8 @@
   /* ---- text ---- */
   --text-primary: var(--gray-900);
   --text-secondary: var(--gray-600);
-  --text-tertiary: var(--gray-500);
-  --text-placeholder: var(--gray-400);
+  --text-tertiary: var(--gray-550);
+  --text-placeholder: var(--gray-500);
   --text-inverse: var(--gray-0);
   --text-brand: var(--brand-700);
   --text-success: var(--green-700);
@@ -160,7 +164,14 @@
   --page-max: 1440px;
   --z-base: 0; --z-sticky: 100; --z-dropdown: 400; --z-drawer: 500;
   --z-modal: 600; --z-popover: 700; --z-toast: 800; --z-tooltip: 900; --z-command: 1000;
+
+  /* Writing direction. Layout uses logical properties everywhere; the handful
+     of transforms that genuinely have a horizontal direction multiply by this
+     so the whole system mirrors when the document is `dir="rtl"`. */
+  --dir-x: 1;
 }
+
+[dir='rtl'] { --dir-x: -1; }
 
 [data-theme='dark'] {
   color-scheme: dark;
@@ -179,8 +190,8 @@
 
   --text-primary: #e8ecf3;
   --text-secondary: #a3adbf;
-  --text-tertiary: #7d8799;
-  --text-placeholder: #5f6a7d;
+  --text-tertiary: #949eb0;
+  --text-placeholder: #828c9e;
   --text-inverse: var(--gray-950);
   --text-brand: #a49df6;
   --text-success: #5fd39c;
@@ -239,4 +250,69 @@
   --control-height: 32px;
   --control-height-sm: 26px;
   --control-height-lg: 38px;
+}
+
+/* ---- avatar tones: deterministic per person/company, legible in both themes -- */
+:root {
+  --avatar-1-bg:#e3e1fd; --avatar-1-fg:#4a3bc4;
+  --avatar-2-bg:#c4ecec; --avatar-2-fg:#0c8383;
+  --avatar-3-bg:#ffe8c2; --avatar-3-fg:#985c00;
+  --avatar-4-bg:#fbd6ea; --avatar-4-fg:#b52d75;
+  --avatar-5-bg:#d1e5ff; --avatar-5-fg:#1c62bd;
+  --avatar-6-bg:#cdefdd; --avatar-6-fg:#0b6f40;
+  --avatar-7-bg:#e6e0ff; --avatar-7-fg:#7442e0;
+  --avatar-8-bg:#fbd8d8; --avatar-8-fg:#9a2020;
+
+  /* ---- surfaces that only appear inside the design system ---- */
+  --bg-code: var(--gray-75);
+  --bg-tooltip: var(--gray-900);
+  --text-tooltip: var(--gray-25);
+  /* Warning tone that sits on --bg-inverse (the bulk-action bar), so it flips
+     with the theme instead of staying amber on a light surface. */
+  --text-inverse-warning: var(--amber-300);
+  --bg-skeleton: var(--gray-100);
+  --bg-skeleton-sheen: var(--gray-75);
+  --bg-track: var(--gray-150);
+  --scrim: rgba(17, 21, 28, 0.44);
+
+  /* ---- extended semantic text tones (badges, chips, chart legends) ---- */
+  --text-purple: var(--violet-600);
+  --text-teal: var(--teal-700);
+  --text-pink: var(--pink-600);
+  --on-solid: #ffffff;
+
+  /* ---- semantic surface tints used by banners, badges and table rows ---- */
+  --surface-success: var(--green-50);
+  --surface-warning: var(--amber-50);
+  --surface-danger: var(--red-50);
+  --surface-info: var(--blue-50);
+  --surface-brand: var(--brand-50);
+  --border-success: color-mix(in srgb, var(--green-500) 34%, transparent);
+  --border-warning: color-mix(in srgb, var(--amber-500) 38%, transparent);
+  --border-danger-subtle: color-mix(in srgb, var(--red-500) 32%, transparent);
+  --border-info: color-mix(in srgb, var(--blue-500) 32%, transparent);
+}
+
+[data-theme='dark'] {
+  --avatar-1-bg:#2b2752; --avatar-1-fg:#b7b1ff;
+  --avatar-2-bg:#13383d; --avatar-2-fg:#5ed3d3;
+  --avatar-3-bg:#40300f; --avatar-3-fg:#f0b64d;
+  --avatar-4-bg:#3f1a30; --avatar-4-fg:#f28fc2;
+  --avatar-5-bg:#152c4a; --avatar-5-fg:#7fb4f7;
+  --avatar-6-bg:#12352a; --avatar-6-fg:#5fd39c;
+  --avatar-7-bg:#2f2350; --avatar-7-fg:#c0a6ff;
+  --avatar-8-bg:#43201f; --avatar-8-fg:#f28585;
+
+  --text-purple: #c0a6ff;
+  --text-teal: #5ed3d3;
+  --text-pink: #f28fc2;
+
+  --bg-code: #10151d;
+  --bg-tooltip: #2b3341;
+  --text-tooltip: #eef1f6;
+  --text-inverse-warning: var(--amber-700);
+  --bg-skeleton: #1e242e;
+  --bg-skeleton-sheen: #262d39;
+  --bg-track: #262d39;
+  --scrim: rgba(4, 6, 10, 0.68);
 }

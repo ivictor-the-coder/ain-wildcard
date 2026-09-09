@@ -1,6 +1,7 @@
 import type { Db } from './db';
 import { parseJson } from './db';
 import type { Logger } from './logger';
+import { runInOrgScope } from './org-scope';
 import { newId } from '../../shared/ids';
 
 /**
@@ -36,10 +37,31 @@ export interface EnqueueOptions {
 export type JobHandler = (payload: any, job: JobRow) => void | Promise<void>;
 
 export class JobQueue {
-  private handlers = new Map<string, JobHandler>();
-  private backoffs = new Map<string, number[]>();
+  private readonly handlers: Map<string, JobHandler>;
+  private readonly backoffs: Map<string, number[]>;
+  /** The only workspace this view can see; null is the whole process. */
+  readonly orgId: string | null;
 
-  constructor(private readonly db: Db, private readonly log: Logger) {}
+  constructor(
+    private readonly db: Db,
+    private readonly log: Logger,
+    view?: { orgId: string; handlers: Map<string, JobHandler>; backoffs: Map<string, number[]> },
+  ) {
+    this.handlers = view?.handlers ?? new Map();
+    this.backoffs = view?.backoffs ?? new Map();
+    this.orgId = view?.orgId ?? null;
+  }
+
+  /**
+   * A view of this queue that can only see — and only run — one workspace's
+   * jobs, sharing the one handler registry. The clock is per workspace, so
+   * draining has to be too: one org advancing a year must not run another
+   * org's renewals, dunning and credit expiry a year early.
+   */
+  forOrg(orgId: string): JobQueue {
+    if (this.orgId === orgId) return this;
+    return new JobQueue(this.db, this.log, { orgId, handlers: this.handlers, backoffs: this.backoffs });
+  }
 
   handle(type: string, handler: JobHandler, backoff?: number[]): void {
     this.handlers.set(type, handler);
@@ -79,13 +101,67 @@ export class JobQueue {
     ).changes;
   }
 
+  /**
+   * Put a failed job back on the queue, due now, with its attempt count intact.
+   *
+   * A retry is an operator saying "the cause is fixed, try once more" — not a
+   * reset. The attempts already made stay on the row so the history reads
+   * true, and because `runOne` fails a job outright once it is at or past
+   * `max_attempts`, one more failure sends it straight back to `failed` rather
+   * than into another backoff ladder. Only a `failed` job qualifies: a pending
+   * one is already going to run, a running one is mid-flight, and a done or
+   * cancelled one has nothing to try. The org filter is part of the WHERE so a
+   * scoped caller cannot re-queue another tenant's work by id.
+   */
+  retry(orgId: string, id: string, now: number): JobRow | null {
+    const changed = this.db.run(
+      `UPDATE jobs SET status = 'pending', run_at = ?, updated = ? WHERE org_id = ? AND id = ? AND status = 'failed'`,
+      now, now, orgId, id,
+    ).changes;
+    if (changed !== 1) return null;
+    const row = this.db.get<any>(`SELECT * FROM jobs WHERE org_id = ? AND id = ?`, orgId, id);
+    return row ? { ...row, payload: parseJson(row.payload, {}) } : null;
+  }
+
   due(now: number, limit = 100): JobRow[] {
+    const scope = this.orgId ? 'AND org_id = ?' : '';
+    const params = this.orgId ? [now, this.orgId, limit] : [now, limit];
     return this.db
-      .all<any>(`SELECT * FROM jobs WHERE status = 'pending' AND run_at <= ? ORDER BY run_at ASC, rowid ASC LIMIT ?`, now, limit)
+      .all<any>(`SELECT * FROM jobs WHERE status = 'pending' AND run_at <= ? ${scope} ORDER BY run_at ASC, rowid ASC LIMIT ?`, ...params)
       .map((r) => ({ ...r, payload: parseJson(r.payload, {}) }));
   }
 
-  pendingCount(): number { return this.db.count(`SELECT COUNT(*) FROM jobs WHERE status = 'pending'`); }
+  pendingCount(): number {
+    return this.orgId
+      ? this.db.count(`SELECT COUNT(*) FROM jobs WHERE status = 'pending' AND org_id = ?`, this.orgId)
+      : this.db.count(`SELECT COUNT(*) FROM jobs WHERE status = 'pending'`);
+  }
+
+  /**
+   * Every workspace with work waiting, oldest first.
+   *
+   * Whether a pending job is *due* depends on its own workspace's clock, so a
+   * process-wide ticker cannot ask one question of the whole table: it has to
+   * ask each workspace separately, under that workspace's scope. This is the
+   * list it walks. An unscoped view sees every workspace; a scoped one sees at
+   * most its own, so a caller cannot widen its reach by going through here.
+   */
+  pendingOrgIds(): string[] {
+    const rows = this.orgId
+      ? this.db.all<{ org_id: string }>(
+        `SELECT DISTINCT org_id FROM jobs WHERE status = 'pending' AND org_id = ?`, this.orgId)
+      : this.db.all<{ org_id: string }>(
+        `SELECT org_id FROM jobs WHERE status = 'pending' GROUP BY org_id ORDER BY MIN(run_at) ASC`);
+    return rows.map((r) => r.org_id);
+  }
+
+  /** When the next job this view can see becomes due, or null if there is none. */
+  nextRunAt(): number | null {
+    const next = this.orgId
+      ? this.db.pluck<number>(`SELECT MIN(run_at) FROM jobs WHERE status = 'pending' AND org_id = ?`, this.orgId)
+      : this.db.pluck<number>(`SELECT MIN(run_at) FROM jobs WHERE status = 'pending'`);
+    return next ?? null;
+  }
 
   /** Run every job due at `now`, including jobs enqueued by those jobs. */
   async drain(now: () => number, opts: { maxPasses?: number; batch?: number } = {}): Promise<{ ran: number; failed: number }> {
@@ -103,16 +179,35 @@ export class JobQueue {
   }
 
   async runOne(job: JobRow, now: number): Promise<'ok' | 'retry' | 'failed' | 'skipped'> {
-    const handler = this.handlers.get(job.type);
+    // A view scoped to one workspace refuses another's work even when handed
+    // the row directly, so no caller can drain across the tenant boundary by
+    // passing a job it fetched itself.
+    if (this.orgId && job.org_id !== this.orgId) return 'skipped';
     const attempts = job.attempts + 1;
+
+    // Claim the row before doing anything with it. `due()` and this call are not
+    // one transaction, so two drains racing the same batch would otherwise both
+    // run the same job — which for a renewal means two invoices for one period.
+    // The UPDATE ... WHERE status = 'pending' is the claim: exactly one caller
+    // can see `changes === 1`, and everyone else must leave the job alone.
+    const claimed = this.db.run(
+      `UPDATE jobs SET status = 'running', attempts = ?, updated = ? WHERE id = ? AND status = 'pending'`,
+      attempts, now, job.id,
+    ).changes;
+    if (claimed !== 1) return 'skipped';
+
+    const handler = this.handlers.get(job.type);
     if (!handler) {
-      this.db.patch('jobs', 'id', job.id, { status: 'failed', last_error: `No handler registered for job type "${job.type}"`, attempts, updated: now });
+      this.db.patch('jobs', 'id', job.id, { status: 'failed', last_error: `No handler registered for job type "${job.type}"`, updated: now });
       this.log.error('job.no_handler', { type: job.type, id: job.id });
       return 'failed';
     }
-    this.db.patch('jobs', 'id', job.id, { status: 'running', attempts, updated: now });
     try {
-      await handler(job.payload, job);
+      // A job is the system acting on its own behalf. It runs in a scope of
+      // its own — the row's workspace, no actor, no request — so a renewal
+      // drained under `POST /v1/time/advance` is not attributed to whoever
+      // pressed the button, and its events are not stamped with that request.
+      await runInOrgScope({ orgId: job.org_id }, () => handler(job.payload, job));
       this.db.patch('jobs', 'id', job.id, { status: 'done', updated: now, last_error: null });
       return 'ok';
     } catch (e) {
@@ -131,12 +226,13 @@ export class JobQueue {
   }
 
   stats(): { pending: number; running: number; failed: number; done: number; nextRunAt: number | null } {
-    const rows = this.db.all<{ status: string; n: number }>(`SELECT status, COUNT(*) as n FROM jobs GROUP BY status`);
+    const rows = this.orgId
+      ? this.db.all<{ status: string; n: number }>(`SELECT status, COUNT(*) as n FROM jobs WHERE org_id = ? GROUP BY status`, this.orgId)
+      : this.db.all<{ status: string; n: number }>(`SELECT status, COUNT(*) as n FROM jobs GROUP BY status`);
     const by = Object.fromEntries(rows.map((r) => [r.status, r.n]));
-    const next = this.db.pluck<number>(`SELECT MIN(run_at) FROM jobs WHERE status = 'pending'`);
     return {
       pending: by.pending ?? 0, running: by.running ?? 0, failed: by.failed ?? 0, done: by.done ?? 0,
-      nextRunAt: next ?? null,
+      nextRunAt: this.nextRunAt(),
     };
   }
 }

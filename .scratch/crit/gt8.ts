@@ -1,0 +1,14 @@
+import { createApp } from '../../src/server/app';
+const app = await createApp({ db: 'memory' });
+const db: any = (app.ctx as any).db;
+const now=(app.ctx as any).now();
+const deals = db.all(`select display_name,properties from crm_records where object_type='deal'`).map((r:any)=>({n:r.display_name,p:JSON.parse(r.properties)}));
+const neg = deals.filter((d:any)=>d.p.deal_stage==='negotiation');
+const stuck = neg.filter((d:any)=>d.p.stage_entered_at && (now-d.p.stage_entered_at)>60*86400000);
+console.log('negotiation:', neg.length, 'stuck>60d:', stuck.length, JSON.stringify(stuck.map((d:any)=>d.n+' '+Math.round((now-d.p.stage_entered_at)/86400000)+'d')));
+console.log('ages:', JSON.stringify(neg.map((d:any)=>Math.round((now-d.p.stage_entered_at)/86400000))));
+const dt:any={}; for(const d of deals) dt[d.p.deal_type]=(dt[d.p.deal_type]||0)+1; console.log('deal types:', JSON.stringify(dt));
+const ct:any={}; for(const d of deals) ct[d.p.contract_term_months]=(ct[d.p.contract_term_months]||0)+1; console.log('contract terms:', JSON.stringify(ct));
+const cos = db.all(`select display_name,properties from crm_records where object_type='company'`).map((r:any)=>JSON.parse(r.properties));
+const lc:any={}; for(const c of cos) lc[c.lifecycle_stage||c.lifecycle||'-']=(lc[c.lifecycle_stage||c.lifecycle||'-']||0)+1; console.log('lifecycle:', JSON.stringify(lc));
+app.close();

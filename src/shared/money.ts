@@ -55,17 +55,7 @@ export function sum(items: Money[], currency: Currency): Money {
   return items.reduce((acc, m) => add(acc, m), zero(currency));
 }
 
-export const isZero = (m: Money) => m.amount === 0;
-export const isNegative = (m: Money) => m.amount < 0;
-export const isPositive = (m: Money) => m.amount > 0;
 export const cmp = (a: Money, b: Money) => { assertSame(a, b); return a.amount - b.amount; };
-export const maxMoney = (a: Money, b: Money) => (cmp(a, b) >= 0 ? a : b);
-export const minMoney = (a: Money, b: Money) => (cmp(a, b) <= 0 ? a : b);
-
-/* ------------------------------------------------------------------ *
- * Exact rational arithmetic (BigInt numerator / denominator)
- * ------------------------------------------------------------------ */
-
 export interface Rational {
   n: bigint;
   d: bigint; // always > 0
@@ -98,8 +88,6 @@ export const ratCmp = (a: Rational, b: Rational): number => {
   const l = a.n * b.d, r = b.n * a.d;
   return l < r ? -1 : l > r ? 1 : 0;
 };
-export const ratToNumber = (a: Rational): number => Number(a.n) / Number(a.d);
-
 export type RoundingMode = 'half_up' | 'half_even' | 'up' | 'down';
 
 /** Round an exact rational to an integer using the given mode. */
@@ -218,5 +206,3 @@ export function parseMoney(input: string, currency: Currency): Money {
   const minor = BigInt(intPart || '0') * BigInt(10 ** exp) + BigInt(frac || '0') + BigInt(roundUp);
   return { amount: Number(negative ? -minor : minor), currency: currency.toLowerCase() };
 }
-
-export const toMajor = (m: Money): number => m.amount / 10 ** exponentOf(m.currency);

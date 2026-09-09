@@ -1,0 +1,12 @@
+import { createApp } from '../../src/server/app';
+const app = await createApp({ db: 'memory' });
+const db: any = (app.ctx as any).db;
+const q=(s:string)=>db.all(s);
+console.log('ORG', JSON.stringify(q("select * from orgs")));
+console.log('SETTINGS', JSON.stringify(q("select * from settings limit 20")));
+console.log('\nTELEMETRY AUG by customer (no join):');
+console.log(JSON.stringify(q(`select customer_id, sum(value_micro)/1000000.0 v, count(*) n, sum(case when cancelled_at is not null then 1 else 0 end) canc, sum(late) late from meter_events where meter_id='mtr_nw_telemetry' and timestamp>=${Date.UTC(2026,7,1)} and timestamp<${Date.UTC(2026,8,1)} group by customer_id`)));
+console.log('\nname map:', JSON.stringify(q("select id,name from billing_customers")).slice(0,200));
+console.log('\nALERTS by customer all time:', JSON.stringify(q(`select customer_id, count(*) n from meter_events where meter_id='mtr_nw_alerts' group by customer_id`)));
+console.log('\nCUSTOMERS:', JSON.stringify(q("select id,name from billing_customers")));
+app.close();

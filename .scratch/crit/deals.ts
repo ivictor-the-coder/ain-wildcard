@@ -1,0 +1,10 @@
+import { createApp } from '../../src/server/app';
+const app = await createApp({ db: 'memory' });
+const db: any = (app.ctx as any).db;
+const rows = db.all(`select r.id, r.display_name, r.owner_id, r.archived, r.properties from crm_records r where r.object_type='deal'`);
+const users = db.all(`select id, name, email from users`);
+const out = rows.map((r:any)=>{ const p = JSON.parse(r.properties||'{}'); const u = users.find((x:any)=>x.id===r.owner_id);
+ return { id:r.id, name:r.display_name, owner: u?u.name:r.owner_id, archived:r.archived, amount:p.amount, stage:p.deal_stage, pipeline:p.pipeline, close_date:p.close_date, status:p.deal_status, closed_at:p.closed_at, currency:p.currency };});
+console.log(JSON.stringify(out));
+console.log('USERS', JSON.stringify(users.map((u:any)=>({id:u.id,name:u.name}))));
+app.close();

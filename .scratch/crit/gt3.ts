@@ -1,0 +1,11 @@
+import { createApp } from '../../src/server/app';
+const app = await createApp({ db: 'memory' });
+const db: any = (app.ctx as any).db;
+const q=(s:string)=>db.all(s);
+const Y=(a:number,b:number)=>`finalized_at>=${a} and finalized_at<${b}`;
+console.log('EUR 2026:', JSON.stringify(q(`select status,count(*) n, sum(total) t from billing_invoices where currency='eur' and ${Y(Date.UTC(2026,0,1),Date.UTC(2027,0,1))} group by status`)));
+console.log('EUR 2025:', JSON.stringify(q(`select status,count(*) n, sum(total) t from billing_invoices where currency='eur' and ${Y(Date.UTC(2025,0,1),Date.UTC(2026,0,1))} group by status`)));
+console.log('GBP Q2 2026:', JSON.stringify(q(`select status,count(*) n, sum(total) t from billing_invoices where currency='gbp' and ${Y(Date.UTC(2026,3,1),Date.UTC(2026,6,1))} group by status`)));
+console.log('GBP Q1 2026:', JSON.stringify(q(`select status,count(*) n, sum(total) t from billing_invoices where currency='gbp' and ${Y(Date.UTC(2026,0,1),Date.UTC(2026,3,1))} group by status`)));
+console.log('statuses:', JSON.stringify(q(`select status,count(*) n from billing_invoices group by status`)));
+app.close();

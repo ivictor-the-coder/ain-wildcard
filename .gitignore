@@ -8,3 +8,8 @@ playwright-report/
 src/server/generated/registry.ts
 src/client/generated/registry.tsx
 .artifacts/
+
+# Agent working files — critics and builders write probe scripts and logs here
+scratchpad/
+.attack/
+*.out

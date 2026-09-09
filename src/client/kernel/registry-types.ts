@@ -12,6 +12,13 @@ export interface RouteDef {
 
 export type NavGroup = 'workspace' | 'crm' | 'engage' | 'revenue' | 'automation' | 'insights' | 'settings';
 
+/**
+ * The rungs a signed-in session can hold, top to bottom. The same ladder the
+ * server's routes are gated on (`ROLE_RANK` in `src/server/kernel/http.ts`):
+ * every write is member or above, the workspace itself is admin or above.
+ */
+export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'analyst' | 'readonly';
+
 export interface NavItem {
   id: string;
   label: string;
@@ -23,7 +30,7 @@ export interface NavItem {
   children?: { label: string; to: string; id: string }[];
   badge?: () => ReactNode;
   /** Hide for roles below this. */
-  minRole?: 'owner' | 'admin' | 'member' | 'analyst' | 'readonly';
+  minRole?: WorkspaceRole;
 }
 
 export interface CommandDef {
@@ -34,6 +41,14 @@ export interface CommandDef {
   keywords?: string[];
   shortcut?: string;
   icon?: ComponentType<{ size?: number }> | string;
+  /**
+   * Who may run it, declared the way the server's routes declare it:
+   * `['admin']` means admin and above, `['member']` member and above. Absent
+   * means every role. The palette hides a command from anyone below the gate
+   * rather than offering a verb that ends in a refusal. Independently of this,
+   * a `Create` command is never shown to a role that cannot write.
+   */
+  roles?: readonly WorkspaceRole[];
   run(nav: (to: string) => void): void | Promise<void>;
 }
 

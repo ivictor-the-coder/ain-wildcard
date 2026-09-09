@@ -1,0 +1,36 @@
+.ain-toaster {
+  position: fixed; bottom: var(--space-7); inset-inline-end: var(--space-7); z-index: var(--z-toast);
+  display: flex; flex-direction: column-reverse; gap: var(--space-4); width: 380px; max-width: calc(100vw - var(--space-8));
+  pointer-events: none;
+}
+.ain-toast {
+  pointer-events: auto; position: relative; display: flex; align-items: flex-start; gap: var(--space-4);
+  padding: var(--space-5); background: var(--bg-surface-raised); color: var(--text-primary);
+  border: 1px solid var(--border-default); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg);
+  animation: ain-slide-up var(--dur-normal) var(--ease-spring);
+}
+.ain-toast::before { content: ''; position: absolute; inset-inline-start: 0; top: var(--space-4); bottom: var(--space-4); width: 3px; border-radius: var(--radius-full); background: var(--border-strong); }
+.ain-toast--success::before { background: var(--green-500); }
+.ain-toast--warning::before { background: var(--amber-500); }
+.ain-toast--danger::before { background: var(--red-500); }
+.ain-toast--info::before { background: var(--blue-500); }
+.ain-toast--loading::before { background: var(--accent); }
+.ain-toast__icon { flex: 0 0 auto; margin-top: 1px; color: var(--text-tertiary); }
+.ain-toast--success .ain-toast__icon { color: var(--text-success); }
+.ain-toast--warning .ain-toast__icon { color: var(--text-warning); }
+.ain-toast--danger .ain-toast__icon { color: var(--text-danger); }
+.ain-toast--info .ain-toast__icon { color: var(--text-info); }
+.ain-toast--loading .ain-toast__icon { color: var(--accent); }
+.ain-toast__content { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.ain-toast__title { font-size: var(--text-md); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-snug); }
+.ain-toast__desc { font-size: var(--text-sm); color: var(--text-secondary); line-height: var(--leading-snug); overflow-wrap: anywhere; }
+.ain-toast__action { align-self: flex-start; margin-top: var(--space-2); }
+.ain-toast__close { flex: 0 0 auto; margin: -3px -4px 0 0; }
+
+@media (max-width: 520px) {
+  .ain-toaster { inset-inline-start: var(--space-5); inset-inline-end: var(--space-5); bottom: var(--space-5); width: auto; }
+}
+
+/* The stack is reachable with F6, so it needs to show where focus landed. */
+.ain-toast:focus-visible { outline: none; box-shadow: var(--shadow-lg), var(--focus-ring); }
+.ain-toast:focus-within { border-color: var(--border-focus); }
