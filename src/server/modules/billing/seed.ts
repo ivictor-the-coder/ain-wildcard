@@ -256,6 +256,27 @@ export function seedBilling(ctx: Ctx, orgId: string): void {
   const promoted = upgradable[0];
   const expanded = upgradable[1];
 
+  // The concessions the deal desk actually gave, written onto the contracts
+  // they belong to rather than onto the account, because that is where a signed
+  // "20% off year one" lives. Two of them run their twelve monthly periods out
+  // inside the history this seed writes — so the workspace opens with a
+  // discount that has already retired, which is the half nobody remembers to
+  // look at — and two are still running, so today's MRR is net of them.
+  const monthlyPlans = plans
+    .filter((plan) => !plan.isTrial && !plan.annualTerm && plan.entry.rung !== 'enterprise')
+    .sort((a, b) => a.startDate - b.startDate);
+  const yearOne = new Set([
+    ...monthlyPlans.filter((plan) => plan.startDate < now - 15 * MONTH).slice(0, 2),
+    ...monthlyPlans.filter((plan) => plan.startDate > now - 7 * MONTH).slice(0, 2),
+  ].map((plan) => plan.entry.customer.id));
+  // The partner programme is 10% off the platform fee and nothing else, for as
+  // long as the integrator stays certified: a restricted, endless coupon beside
+  // two bounded ones, so the telemetry lines on these bills stay at list.
+  const partners = new Set(
+    monthlyPlans.filter((plan) => !yearOne.has(plan.entry.customer.id)).slice(0, 2)
+      .map((plan) => plan.entry.customer.id),
+  );
+
   plans.forEach(({ entry, isTrial, annualTerm, startDate, seats }) => {
     const plan = byRung(entry.rung);
 
@@ -284,6 +305,8 @@ export function seedBilling(ctx: Ctx, orgId: string): void {
       days_until_due: collection === 'send_invoice' ? (entry.rung === 'enterprise' ? 45 : 30) : null,
       default_payment_method: collection === 'charge_automatically' ? `pm_card_${entry.slug.slice(0, 10)}` : null,
       description: `${entry.company.display_name} — Telemetry Cloud ${entry.rung[0].toUpperCase()}${entry.rung.slice(1)}${annualTerm ? ', annual term' : ''}`,
+      ...(yearOne.has(entry.customer.id) ? { coupon: 'coup_nw_year_one' } : {}),
+      ...(partners.has(entry.customer.id) ? { coupon: 'coup_nw_partner' } : {}),
       metadata: { rung: entry.rung, crm_company: entry.company.id, region: str(entry.company, 'region') },
     }, { actorType: 'system' });
     retimeEvents(ctx, orgId, sub.id, mark, startDate);

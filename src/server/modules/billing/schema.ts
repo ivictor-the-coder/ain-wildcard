@@ -520,4 +520,59 @@ ALTER TABLE billing_credit_notes ADD COLUMN refund_id TEXT;
 ALTER TABLE billing_credit_notes ADD COLUMN displaced_to_balance INTEGER NOT NULL DEFAULT 0;
 `,
   },
+  {
+    id: 'billing.0010_discounts',
+    sql: `
+-- One account's copy of a coupon. The catalogue owns what a coupon *is* and
+-- what it is worth against an amount; this row owns what it is doing to a
+-- particular customer or subscription, which is the half a bill has to read.
+CREATE TABLE billing_discounts (
+  -- The catalogue's redemption id, not a second identifier for the same fact:
+  -- a coupon's times_redeemed is a count of those rows, so a discount that
+  -- lived only here would spend a 150-use campaign without being counted by it.
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  customer_id TEXT NOT NULL REFERENCES billing_customers(id) ON DELETE CASCADE,
+  -- Null when the discount is the customer's own and governs every bill of
+  -- theirs that no subscription discount already governs.
+  subscription_id TEXT REFERENCES billing_subscriptions(id) ON DELETE CASCADE,
+  coupon_id TEXT NOT NULL,
+  promotion_code_id TEXT,
+  start INTEGER NOT NULL,
+  -- The instant it stops applying: the end of the last period it comes off.
+  -- Written when that period is billed, not guessed at when the discount is
+  -- attached, because a subscription's cadence can move between the two.
+  end_at INTEGER,
+  periods_used INTEGER NOT NULL DEFAULT 0,
+  -- The period start of the last bill that spent one of those periods. A
+  -- period billed twice — a cycle invoice and an "invoice now" for the
+  -- prorations inside it — is discounted twice and spends one period, not two.
+  last_period_start INTEGER,
+  status TEXT NOT NULL DEFAULT 'active',
+  ended_at INTEGER,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL
+);
+-- One live discount per holder. Two would need an order of application that
+-- nothing here defines, and "20% off then $50 off" is a different number from
+-- "$50 off then 20% off" — which is why Stripe allows one too.
+CREATE UNIQUE INDEX idx_billing_discounts_customer ON billing_discounts(org_id, customer_id)
+  WHERE subscription_id IS NULL AND status = 'active';
+CREATE UNIQUE INDEX idx_billing_discounts_sub ON billing_discounts(org_id, subscription_id)
+  WHERE subscription_id IS NOT NULL AND status = 'active';
+CREATE INDEX idx_billing_discounts_org ON billing_discounts(org_id, status, end_at);
+
+-- What the bill took off, and under which discount. Snapshotted onto the
+-- invoice for the same reason the tax rate is: the coupon behind it can be
+-- archived or edited, and the document still has to explain its own number.
+ALTER TABLE billing_invoices ADD COLUMN discount_id TEXT;
+ALTER TABLE billing_invoices ADD COLUMN discount_amount INTEGER NOT NULL DEFAULT 0;
+
+-- What the discount took off *this* line. The document is the only record of
+-- how the subtraction was spread, and finalisation prices a draft again — so
+-- without the share the discount line would be re-taxed as a negative number
+-- on its own and stop being the tax it removed.
+ALTER TABLE billing_invoice_lines ADD COLUMN discount_amount INTEGER NOT NULL DEFAULT 0;
+`,
+  },
 ];

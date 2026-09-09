@@ -277,6 +277,13 @@ export interface PreviewInput extends ProrateInput {
    */
   taxOf(lines: { price: string | null; amount: number; currency: string; taxBehavior?: TaxBehavior }[]): { base: number; tax: number };
   /**
+   * The same call for the period *after* this one, which is a different bill
+   * and can be governed by a different discount: the twelfth month of "20% off
+   * year one" is discounted and the thirteenth is not, and `next_invoice` is
+   * exactly the panel where that shows.
+   */
+  taxOfNextInvoice(lines: { price: string | null; amount: number; currency: string; taxBehavior?: TaxBehavior }[]): { base: number; tax: number };
+  /**
    * Whether a bill for this account can be placed. Read from the same call the
    * invoice makes, so a preview cannot promise a collection the bill it
    * predicts will be held back from making.
@@ -346,7 +353,7 @@ export function previewChange(input: PreviewInput): ChangePreview {
   // the same mistake, one panel over, that `next_invoice` on the customer
   // summary was carrying. `subtotal + tax` is the listed price either way.
   const billable = lines.filter((line) => !line.metered && line.amount !== null);
-  const nextTaxed = input.taxOf(billable.map((line) => ({
+  const nextTaxed = input.taxOfNextInvoice(billable.map((line) => ({
     price: line.price, amount: line.amount as number, currency: line.currency,
   })));
 

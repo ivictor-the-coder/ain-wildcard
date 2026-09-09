@@ -6,6 +6,7 @@ import { formatMoney, money } from '../../../shared/money';
 import v from '../../../shared/validate';
 import { PRORATION_BEHAVIORS, TAX_BEHAVIORS, type ProrationBehavior } from '../catalog/types';
 import { BILLING_MIGRATIONS } from './schema';
+import { DISCOUNT_EXPIRE_JOB } from './discounts';
 import { HOLD_RELEASE_JOB } from './holds';
 import { describeCadence, describeInterval, isMetered, longDate, Pricebook, recurringLines, recurringSubtotal, subscriptionMrr } from './cycle';
 import { Billing } from './store';
@@ -33,7 +34,7 @@ import {
   PAYMENT_BEHAVIORS, SCHEDULE_END_BEHAVIORS, SCHEDULE_STATUSES, SUBSCRIPTION_STATUSES, TRIAL_END_BEHAVIORS,
   INVOICE_ITEM_STATUSES,
   type BalanceTransaction, type BilledPeriod, type ChangePreview, type CreditNote, type Customer,
-  type Invoice, type InvoiceItem, type InvoiceStatus, type PendingInvoiceItem,
+  type Discount, type Invoice, type InvoiceItem, type InvoiceStatus, type PendingInvoiceItem,
   type Subscription, type SubscriptionSchedule, type SubscriptionStatus,
 } from './types';
 
@@ -100,6 +101,21 @@ export interface BillingService {
   claimPendingItems(orgId: string, customerId: string, invoiceId: string, opts?: { ids?: string[]; currency?: string }): PendingInvoiceItem[];
   /** Every period a subscription has entered, with the amount recognised. */
   periods(orgId: string, filter?: { subscription?: string; customer?: string; from?: number; to?: number }): BilledPeriod[];
+
+  /* -------------------------------- discounts ------------------------------ *
+   * The catalogue owns what a coupon is; billing owns what it is doing to an
+   * account. A discount attached here is what an invoice, a preview and MRR
+   * all read.                                                                 */
+
+  discounts(orgId: string, filter?: { customer?: string; subscription?: string; status?: 'active' | 'ended' }): Discount[];
+  discount(orgId: string, id: string): Discount | null;
+  /** The discount governing this account's bills, or null. */
+  customerDiscount(orgId: string, customerId: string): Discount | null;
+  subscriptionDiscount(orgId: string, subscriptionId: string): Discount | null;
+  /** Fasten a coupon to a customer, or to one of their subscriptions. */
+  attachDiscount(orgId: string, input: { customer?: string; subscription?: string; coupon?: string | null; promotion_code?: string | null }): Discount;
+  /** Take it off. An unused one gives its redemption back to the campaign. */
+  removeDiscount(orgId: string, id: string): Discount;
 
   /** Invoicing registers here at boot so summaries can show real invoices. */
   useInvoiceReader(reader: InvoiceReader): void;
@@ -238,6 +254,8 @@ const subscriptionCreateBody = v.object({
   cancel_at_period_end: v.optional(v.boolean()),
   cancel_at: v.optional(instant()),
   description: v.optional(v.string({ max: 500 })),
+  coupon: v.optional(v.string({ min: 1, max: 120, description: 'A coupon to attach to this subscription as it is created, so its first bill carries the concession.' })),
+  promotion_code: v.optional(v.string({ min: 1, max: 120, description: 'The code the customer typed, instead of a coupon id.' })),
   metadata: v.metadata(),
 }, { strict: true });
 
@@ -366,6 +384,17 @@ const invoiceItemFields = {
 const invoiceItemBody = v.object({ customer: v.id('cus'), ...invoiceItemFields }, { strict: true });
 const inlineInvoiceItemBody = v.object(invoiceItemFields, { strict: true });
 
+/**
+ * How a discount is attached: the coupon the deal desk negotiated, or the code
+ * the customer typed. One or the other — a code already names its coupon, and
+ * accepting both without checking they agree is how a bill ends up carrying a
+ * concession nobody approved.
+ */
+const discountBody = v.object({
+  coupon: v.optional(v.string({ min: 1, max: 120, description: 'A coupon id from the price book — coup_….' })),
+  promotion_code: v.optional(v.string({ min: 1, max: 120, description: 'The code as the customer types it (AUTOMATE26), or the promotion code\u2019s own id.' })),
+}, { strict: true });
+
 const balanceBody = v.object({
   amount: v.int({ min: -100_000_000, max: 100_000_000, description: 'Signed minor units. Negative grants credit.' }),
   description: v.string({ min: 3, max: 300 }),
@@ -382,10 +411,15 @@ function subscriptionPayload(ctx: Ctx, orgId: string, sub: Subscription, expand:
   const book = new Pricebook(ctx, orgId);
   const locale = localeOf(ctx, orgId);
   const lines = recurringLines(sub.items, { start: sub.current_period_start, end: sub.current_period_end }, { book, currency: sub.currency, locale });
+  // The subscription's own discount, or the account's when it has none of its
+  // own — the same precedence the bill applies, so the row and the invoice
+  // cannot quote two different concessions.
+  const discount = store.discounts.forSubscription(orgId, sub.id) ?? store.discounts.forCustomer(orgId, sub.customer);
   return {
     ...sub,
     items: sub.items.map((item, i) => ({ ...item, description: lines[i].description, amount: lines[i].amount })),
     recurring_subtotal: recurringSubtotal(lines),
+    discount,
     mrr: countsAsRevenue(sub.status) ? subscriptionMrr(sub, book) : 0,
     status_detail: describeStatus(sub.status),
     next_status_options: legalTransitions(sub.status),
@@ -525,6 +559,20 @@ export default defineModule({
       claimPendingItems: (orgId, customerId, invoiceId, opts) => billing.claimPendingItems(orgId, customerId, invoiceId, opts),
       periods: (orgId, filter) => billing.periods(orgId, { ...filter, limit: 2000 }),
 
+      discounts: (orgId, filter) => billing.discounts.list(orgId, filter ?? {}),
+      discount: (orgId, id) => billing.discounts.discount(orgId, id),
+      customerDiscount: (orgId, customerId) => billing.discounts.forCustomer(orgId, customerId),
+      subscriptionDiscount: (orgId, subscriptionId) => billing.discounts.forSubscription(orgId, subscriptionId),
+      attachDiscount: (orgId, input) => {
+        const sub = input.subscription ? billing.requireSubscription(orgId, input.subscription) : null;
+        const customerId = sub?.customer ?? input.customer;
+        if (!customerId) throw notFound('customer', input.customer ?? '');
+        return billing.discounts.attach(orgId, {
+          customer: customerId, subscription: sub, coupon: input.coupon, promotion_code: input.promotion_code,
+        });
+      },
+      removeDiscount: (orgId, id) => billing.discounts.remove(orgId, id),
+
       useInvoiceReader(reader) { invoiceReader = reader; },
     };
     ctx.provide('billing', service);
@@ -534,6 +582,14 @@ export default defineModule({
 
     ctx.jobs.handle('billing.renew', (payload: { subscription: string; period_end: number }, job) => {
       billing.renew(job.org_id, payload.subscription, payload.period_end);
+    });
+
+    // A duration that runs out mid-subscription. The instant is written onto
+    // the row when the last discounted period is billed and queued here, so the
+    // concession retires under `POST /v1/time/advance` on the same cycle a real
+    // calendar would retire it — never on a timer that a restart forgets.
+    ctx.jobs.handle(DISCOUNT_EXPIRE_JOB, (payload: { discount: string }, job) => {
+      billing.discounts.expire(job.org_id, payload.discount);
     });
 
     ctx.jobs.handle('billing.cancel_at', (payload: { subscription: string; cancel_at: number }, job) => {
@@ -683,9 +739,13 @@ export default defineModule({
       created(billingStore(c).billing.createCustomer(req.auth.orgId, req.body as CustomerInput, writeMeta(req))),
       { summary: 'Create a customer', tags: ['billing'], roles: ['member'], idempotent: true, body: customerCreateBody });
 
-    router.get('/v1/customers/:id', (req: Req, c: Ctx) =>
-      billingStore(c).billing.requireCustomer(req.auth.orgId, req.params.id),
-      { summary: 'Retrieve a customer', tags: ['billing'] });
+    router.get('/v1/customers/:id', (req: Req, c: Ctx) => {
+      const s = billingStore(c).billing;
+      const customer = s.requireCustomer(req.auth.orgId, req.params.id);
+      // Stripe hangs the discount off the customer, and so does every screen
+      // that asks "why is this account paying less than list?".
+      return { ...customer, discount: s.discounts.forCustomer(req.auth.orgId, customer.id) };
+    }, { summary: 'Retrieve a customer', tags: ['billing'] });
 
     router.patch('/v1/customers/:id', (req: Req, c: Ctx) =>
       billingStore(c).billing.updateCustomer(req.auth.orgId, req.params.id, req.body as Partial<CustomerInput>, writeMeta(req)),
@@ -714,6 +774,70 @@ export default defineModule({
     router.del('/v1/customers/:id', (req: Req, c: Ctx) =>
       billingStore(c).billing.deleteCustomer(req.auth.orgId, req.params.id, writeMeta(req)),
       { summary: 'Delete a customer', tags: ['billing'], roles: ['admin'] });
+
+    /* -------------------------------- discounts ---------------------------- */
+
+    router.get('/v1/discounts', (req: Req, c: Ctx) => {
+      const q = req.query as { customer?: string; subscription?: string; status?: 'active' | 'ended' };
+      const data = billingStore(c).billing.discounts.list(req.auth.orgId, q);
+      return list(data, { totalCount: data.length, url: '/v1/discounts' });
+    }, {
+      summary: 'Coupons attached to accounts and subscriptions', tags: ['billing'],
+      description:
+        'A discount is one account\u2019s copy of a coupon: which coupon, when it started, how many billing periods of its duration have been spent and when it stops. `end` is written the moment the last discounted period is billed, and a job retires the row there — so a duration that runs out mid-subscription runs out under POST /v1/time/advance exactly as it would on a calendar.',
+      query: v.object({
+        customer: v.optional(v.id('cus')),
+        subscription: v.optional(v.id('sub')),
+        status: v.optional(v.enum(['active', 'ended'] as const)),
+      }),
+    });
+
+    router.get('/v1/discounts/:id', (req: Req, c: Ctx) => {
+      const found = billingStore(c).billing.discounts.discount(req.auth.orgId, req.params.id);
+      if (!found) throw notFound('discount', req.params.id);
+      return found;
+    }, { summary: 'Retrieve a discount', tags: ['billing'] });
+
+    router.post('/v1/customers/:id/discount', (req: Req, c: Ctx) => {
+      const s = billingStore(c).billing;
+      const customer = s.requireCustomer(req.auth.orgId, req.params.id);
+      const body = req.body as { coupon?: string; promotion_code?: string };
+      return created(s.discounts.attach(req.auth.orgId, { customer: customer.id, ...body }, writeMeta(req)));
+    }, {
+      summary: 'Give an account a coupon', tags: ['billing'], roles: ['member'], idempotent: true, body: discountBody,
+      description:
+        'The discount governs every bill this account is sent that no subscription discount of its own already governs, and it comes off before tax — a percentage reduces the taxable base, which is a different number from a negative line taxed on its own. The coupon\u2019s redemption is spent here, so a campaign that has run out refuses now rather than at the next renewal.',
+    });
+
+    router.del('/v1/customers/:id/discount', (req: Req, c: Ctx) => {
+      const s = billingStore(c).billing;
+      const customer = s.requireCustomer(req.auth.orgId, req.params.id);
+      const found = s.discounts.forCustomer(req.auth.orgId, customer.id);
+      if (!found) throw notFound('discount', `customer ${customer.id}`);
+      return s.discounts.remove(req.auth.orgId, found.id, writeMeta(req));
+    }, {
+      summary: 'Take the account\u2019s coupon off', tags: ['billing'], roles: ['member'],
+      description: 'A discount that has never come off a bill hands its redemption back to the campaign; one that has is retired instead, because the redemption was spent on a document that still exists.',
+    });
+
+    router.post('/v1/subscriptions/:id/discount', (req: Req, c: Ctx) => {
+      const s = billingStore(c).billing;
+      const sub = s.requireSubscription(req.auth.orgId, req.params.id);
+      const body = req.body as { coupon?: string; promotion_code?: string };
+      return created(s.discounts.attach(req.auth.orgId, { customer: sub.customer, subscription: sub, ...body }, writeMeta(req)));
+    }, {
+      summary: 'Give a subscription a coupon', tags: ['billing'], roles: ['member'], idempotent: true, body: discountBody,
+      description:
+        'The negotiated concession — "20% off year one" — written onto the contract it belongs to rather than onto the account. It beats an account-wide discount rather than stacking with it, and its duration is counted in billing periods this subscription actually enters, not in months on a calendar.',
+    });
+
+    router.del('/v1/subscriptions/:id/discount', (req: Req, c: Ctx) => {
+      const s = billingStore(c).billing;
+      const sub = s.requireSubscription(req.auth.orgId, req.params.id);
+      const found = s.discounts.forSubscription(req.auth.orgId, sub.id);
+      if (!found) throw notFound('discount', `subscription ${sub.id}`);
+      return s.discounts.remove(req.auth.orgId, found.id, writeMeta(req));
+    }, { summary: 'Take a subscription\u2019s coupon off', tags: ['billing'], roles: ['member'] });
 
     router.get('/v1/customers/:id/summary', (req: Req, c: Ctx) =>
       c.svc.billing.summary(req.auth.orgId, req.params.id),
@@ -798,6 +922,8 @@ export default defineModule({
           if (sub.current_period_end <= now + 30 * 86_400_000) bucket.renewing_next_30_days += 1;
           if (sub.cancel_at_period_end || sub.cancel_at) bucket.scheduled_to_cancel += 1;
         }
+        // Net of whatever concession is still running on it: the book resolves
+        // that once for the whole loop.
         if (countsAsRevenue(sub.status)) {
           const amount = subscriptionMrr(sub, book);
           mrr += amount;

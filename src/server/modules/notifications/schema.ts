@@ -125,4 +125,40 @@ CREATE TABLE notification_settings (
 );
 `,
   },
+  {
+    id: 'notifications.0002_suppressions',
+    sql: `
+-- The addresses this workspace has stopped writing to.
+--
+-- A sixth table rather than a flag on the message rows, because the question
+-- 'send' has to answer is "may I write to this address", asked before anything
+-- is handed to a transport and about an address that may never have been
+-- written to from this workspace at all. Deriving it from failed messages
+-- answers a different question — "did this one fail" — which is why a payer
+-- whose mailbox is gone kept receiving one bounce per invoice, one per dunning
+-- retry, for as long as the campaign ran.
+--
+-- The address is stored normalised (trimmed, lowercased) and the unique index
+-- is over the stored form: mail addresses are not case-sensitive in the part
+-- that matters here, and a list that suppresses ap@acme.example while letting
+-- AP@Acme.example through is not a suppression list.
+CREATE TABLE notification_suppressions (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  channel TEXT NOT NULL DEFAULT 'email',
+  address TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  bounces INTEGER NOT NULL DEFAULT 0,
+  last_message_id TEXT,
+  last_bounce_at INTEGER,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX idx_notification_suppressions_address
+  ON notification_suppressions(org_id, channel, address);
+CREATE INDEX idx_notification_suppressions_org
+  ON notification_suppressions(org_id, created DESC);
+`,
+  },
 ];

@@ -12,12 +12,17 @@ import { describe, it } from 'node:test';
 import { readFileSync } from 'node:fs';
 
 import {
-  balanceDrawn, collectionSettled, coversNoPeriod, creditNoteRouting, describeAppliedChange, describeCreatedSubscription,
-  describeDelete, firstInvoiceSettled, humaniseNote, phaseGoverning, phaseLines, phasePreviewItems, phaseSummary,
-  pluraliseBrackets, scheduledUpcoming, type PhaseWindow,
+  balanceDrawn, collectionSettled, couponBody, couponCeilingWords, couponDraftBlocker, couponDurationWords,
+  couponRedemptionWords, couponScopeWords, couponStanding, coversNoPeriod, creditNoteRouting, describeAppliedChange,
+  describeCreatedSubscription, describeDelete, firstInvoiceSettled, humaniseNote, nextInvoicePricedOn, nextInvoiceRows,
+  phaseGoverning, phaseLines, phasePreviewItems, phaseSummary, pluraliseBrackets, promotionCodeRestrictionWords,
+  scheduledUpcoming, type CouponDraft, type PhaseWindow,
 } from '../src/client/modules/billing/copy';
 import { buildSources, hitsFrom } from '../src/client/kernel/search-core';
-import type { ChangePreview, Invoice, Subscription } from '../src/client/modules/billing/types';
+import { statusLabel } from '../src/client/design/status-core';
+import type {
+  ChangePreview, Invoice, NextInvoiceEstimate, RecurringLine, Subscription,
+} from '../src/client/modules/billing/types';
 
 const f = {
   money: (amount: number, currency: string) => `${currency.toUpperCase()} ${(amount / 100).toFixed(2)}`,
@@ -660,5 +665,296 @@ describe('the price book has a screen', () => {
     assert.equal(source.detailPattern, '/catalog/products/:id');
     const [hit] = hitsFrom(source, [{ id: 'prod_nw_scale', name: 'Telemetry Cloud Scale' }], 'scale');
     assert.equal(hit.href, '/catalog/products/prod_nw_scale');
+  });
+});
+
+/* ========================== the next invoice panel ======================== */
+
+/**
+ * The account page's next-invoice panel used to print three of the six figures
+ * the estimate is made of, and then the estimate. A usage-priced account read
+ * "Recurring subtotal $99.00" directly above "Estimated total $416.08" with
+ * nothing between them, because settled usage, the coupon and the tax had all
+ * joined the total since the rows were written.
+ *
+ * The invariant below is the server's own — `buildCustomerSummary` arrives at
+ * `estimated_total` by exactly this sum — so a row that stops being rendered
+ * fails here rather than on the screen of whoever is reading the number out.
+ */
+describe('what the next-invoice panel is made of', () => {
+  const line = (over: Partial<RecurringLine> = {}): RecurringLine => ({
+    subscription_item: 'si_1', price: 'price_1', description: 'Telemetry Cloud Starter', quantity: 1,
+    amount: 9900, currency: 'usd', metered: false, period: { start: NOW, end: NOW + 30 * DAY }, breakdown: [], ...over,
+  });
+
+  const estimate = (over: Partial<NextInvoiceEstimate> = {}): NextInvoiceEstimate => {
+    const base: NextInvoiceEstimate = {
+      subscription: 'sub_1', date: NOW + 30 * DAY, currency: 'usd', lines: [line()],
+      subtotal: 9900, uninvoiced_total: 0, settled_usage_total: 0, discount: null, discount_total: 0,
+      tax: 0, automatic_tax: { enabled: true, status: 'complete', detail: 'Worked out from the country on the record.' },
+      balance_applied: 0, estimated_total: 9900, note: 'Covers the next period.', ...over,
+    };
+    // The estimate is never pasted in: it is the identity the server uses, so a
+    // case here cannot quietly assert a total its own figures do not support.
+    return {
+      ...base,
+      estimated_total: over.estimated_total ?? Math.max(
+        0,
+        base.subtotal + base.uninvoiced_total + base.settled_usage_total - base.discount_total + base.tax
+          + base.balance_applied,
+      ),
+    };
+  };
+
+  const sum = (rows: { amount: number }[]) => rows.reduce((total, row) => total + row.amount, 0);
+
+  it('renders the settled usage a metered account is mostly billed for', () => {
+    const next = estimate({ settled_usage_total: 31708, lines: [line(), line({ metered: true, amount: null })] });
+    const rows = nextInvoiceRows(next);
+    const usage = rows.find((row) => row.id === 'settled_usage');
+    assert.ok(usage, 'the panel does not render the settled usage the estimate carries');
+    assert.equal(usage.amount, 31708);
+    assert.equal(sum(rows), next.estimated_total);
+  });
+
+  it('adds up to the estimate with usage, a coupon, tax and the balance all in play', () => {
+    const next = estimate({
+      subtotal: 107900, uninvoiced_total: 4210, settled_usage_total: 745300,
+      discount: 'di_1', discount_total: 4990, tax: 16074, balance_applied: -25000,
+    });
+    const rows = nextInvoiceRows(next);
+    assert.equal(sum(rows), next.estimated_total);
+    // The discount is stored positive and is a subtraction, so it must be
+    // signed on the way onto the screen or the rows overstate the bill twice.
+    assert.equal(rows.find((row) => row.id === 'discount')?.amount, -4990);
+    assert.equal(rows.find((row) => row.id === 'tax')?.amount, 16074);
+    assert.equal(rows.find((row) => row.id === 'balance')?.amount, -25000);
+  });
+
+  it('leaves out the terms worth nothing rather than printing a column of zeroes', () => {
+    const rows = nextInvoiceRows(estimate());
+    assert.deepEqual(rows.map((row) => row.id), ['subtotal']);
+    assert.equal(sum(rows), 9900);
+  });
+
+  it('says what the figure is priced on, naming each part of it', () => {
+    const next = estimate({
+      subtotal: 9900, settled_usage_total: 31708, lines: [line(), line({ metered: true, amount: null })],
+    });
+    const note = nextInvoicePricedOn(next, f);
+    assert.match(note, /USD 99\.00 of recurring charges/);
+    assert.match(note, /USD 317\.08 of metered usage/);
+    // The open period is a floor, not a prediction, and the note says so.
+    assert.match(note, /not priced until the period closes/);
+  });
+
+  it('says a bill it cannot place will be held rather than sent', () => {
+    const next = estimate({
+      subtotal: 10000,
+      automatic_tax: { enabled: true, status: 'requires_location_inputs', detail: 'No country on the account.' },
+    });
+    const note = nextInvoicePricedOn(next, f);
+    assert.match(note, /No tax could be worked out/);
+    assert.match(note, /held as a draft/);
+  });
+
+  it('is what the account page renders, rather than a second list beside it', () => {
+    const source = readFileSync(new URL('../src/client/modules/billing/customers.tsx', import.meta.url), 'utf8');
+    assert.match(source, /nextInvoiceRows\(next\)/,
+      'the next-invoice panel no longer builds its totals from nextInvoiceRows');
+    assert.match(source, /nextInvoicePricedOn\(next/,
+      'the next-invoice panel no longer says what the estimate is priced on');
+    // The hand-rolled block this replaced named three of the six terms.
+    assert.doesNotMatch(source, /bl-total__label">Recurring subtotal</,
+      'the panel prints a hand-rolled totals list again, which is how the rows stopped adding up');
+  });
+});
+
+/* ============================ coupons on screen =========================== */
+
+describe('coupons have a screen', () => {
+  const routesSource = readFileSync(new URL('../src/client/modules/billing/routes.tsx', import.meta.url), 'utf8');
+  const block = (name: string): string =>
+    new RegExp(`export const ${name}[\\s\\S]*?\\n\\];`).exec(routesSource)?.[0] ?? '';
+  const registered = [...block('routes').matchAll(/path: '([^']+)'/g)].map((match) => match[1]);
+
+  it('registers the list and the record', () => {
+    assert.ok(registered.includes('/catalog/products'), 'the route table was not read');
+    assert.ok(registered.includes('/catalog/coupons'), 'no coupon list is registered');
+    assert.ok(registered.includes('/catalog/coupons/:id'), 'no coupon record is registered');
+  });
+
+  it('gives the nav and the palette a way in', () => {
+    const destinations = [...block('nav').matchAll(/ to: '([^']+)'/g)].map((match) => match[1]);
+    assert.ok(destinations.includes('/catalog/coupons'), 'nothing in the nav reaches the coupons');
+    assert.match(block('commands'), /\/catalog\/coupons\?new=1/, 'the palette cannot create a coupon');
+  });
+});
+
+describe('what a coupon says about itself', () => {
+  const coupon = (over: Record<string, unknown> = {}) => ({
+    active: true, invalid_reason: null, duration: 'once', duration_in_periods: null,
+    applies_to: { products: [], prices: [] }, times_redeemed: 0, max_redemptions: null,
+    redemptions_remaining: null, ...over,
+  });
+
+  it('reads its standing off the record, archived first', () => {
+    assert.equal(couponStanding(coupon()), 'live');
+    assert.equal(couponStanding(coupon({ active: false, invalid_reason: 'inactive' })), 'archived');
+    assert.equal(couponStanding(coupon({ invalid_reason: 'expired' })), 'expired');
+    assert.equal(couponStanding(coupon({ invalid_reason: 'exhausted' })), 'fully_redeemed');
+  });
+
+  it('never borrows the word the kit already spends on a dunning campaign', () => {
+    // `statusLabel('exhausted')` is "Given up", which is a campaign nobody is
+    // chasing any more — not a coupon every seat has taken up.
+    assert.equal(statusLabel('exhausted'), 'Given up');
+    for (const reason of [null, 'inactive', 'expired', 'exhausted']) {
+      assert.notEqual(couponStanding(coupon({ invalid_reason: reason })), 'exhausted');
+    }
+  });
+
+  it('says how long it keeps coming off in periods, not months', () => {
+    assert.equal(couponDurationWords(coupon()), 'The first bill only');
+    assert.equal(couponDurationWords(coupon({ duration: 'forever' })), 'Every bill, without end');
+    assert.equal(couponDurationWords(coupon({ duration: 'repeating', duration_in_periods: 12 })), '12 billing periods');
+    assert.equal(couponDurationWords(coupon({ duration: 'repeating', duration_in_periods: 1 })), '1 billing period');
+  });
+
+  it('spells out the restriction that reads as no restriction', () => {
+    assert.equal(couponScopeWords(coupon()), 'The whole bill');
+    assert.equal(couponScopeWords(coupon({ applies_to: { products: ['prod_1'], prices: [] } })), '1 product');
+    assert.equal(
+      couponScopeWords(coupon({ applies_to: { products: ['prod_1'], prices: ['price_1', 'price_2'] } })),
+      '1 product and 2 prices',
+    );
+  });
+
+  it('counts what is left of a campaign from the ceiling, not from the take-up', () => {
+    assert.equal(couponCeilingWords(coupon({ times_redeemed: 4 })), 'No ceiling');
+    assert.equal(
+      couponCeilingWords(coupon({ times_redeemed: 3, max_redemptions: 150, redemptions_remaining: 147 })),
+      '147 of 150 left',
+    );
+    assert.equal(
+      couponCeilingWords(coupon({ times_redeemed: 150, max_redemptions: 150, redemptions_remaining: 0 })),
+      'None left',
+    );
+    assert.match(couponRedemptionWords(coupon({ times_redeemed: 4 })), /^4 redeemed · no ceiling$/);
+  });
+
+  it('lists the conditions a code carries that its coupon does not', () => {
+    const words = promotionCodeRestrictionWords({
+      expires_at: NOW + 30 * DAY,
+      max_redemptions: 150,
+      max_redemptions_per_customer: 1,
+      restrictions: { minimum_amount: 50000, first_time_transaction: true },
+      minimum_amount_display: '$500.00',
+    }, f);
+    assert.deepEqual(words, [
+      `Expires ${f.day(NOW + 30 * DAY)}`,
+      '150 in total',
+      'One per account',
+      'Orders of $500.00 or more',
+      'Only an account that has never been billed',
+    ]);
+    assert.deepEqual(promotionCodeRestrictionWords({
+      expires_at: null, max_redemptions: null, max_redemptions_per_customer: null,
+      restrictions: { minimum_amount: null, first_time_transaction: false }, minimum_amount_display: null,
+    }, f), []);
+  });
+});
+
+/**
+ * The create form refuses what the catalogue refuses, before the request
+ * rather than after it — and, more importantly, sends a body the catalogue
+ * accepts. Each rule below is one `Coupons.createCoupon` enforces.
+ */
+describe('creating a coupon from the screen', () => {
+  const draft = (over: Partial<CouponDraft> = {}): CouponDraft => ({
+    name: 'Q1 land-and-expand', kind: 'percent', percent: 20, amount: null, currency: 'usd',
+    duration: 'once', periods: null, maxRedemptions: null, redeemBy: null, ...over,
+  });
+
+  it('lets a straightforward percentage through', () => {
+    assert.equal(couponDraftBlocker(draft(), NOW), null);
+  });
+
+  it('holds back everything the catalogue would refuse', () => {
+    assert.match(couponDraftBlocker(draft({ name: '  ' }), NOW) ?? '', /name/i);
+    assert.match(couponDraftBlocker(draft({ percent: null }), NOW) ?? '', /percentage/i);
+    assert.match(couponDraftBlocker(draft({ percent: 0 }), NOW) ?? '', /greater than 0/);
+    assert.match(couponDraftBlocker(draft({ percent: 101 }), NOW) ?? '', /more than 100%/);
+    assert.match(couponDraftBlocker(draft({ percent: 33.333 }), NOW) ?? '', /two decimal places/);
+    assert.match(couponDraftBlocker(draft({ kind: 'amount', amount: null }), NOW) ?? '', /how much/i);
+    assert.match(couponDraftBlocker(draft({ kind: 'amount', amount: 5000, currency: '' }), NOW) ?? '', /currency/i);
+    assert.match(couponDraftBlocker(draft({ duration: 'repeating' }), NOW) ?? '', /how many billing periods/);
+    assert.match(couponDraftBlocker(draft({ redeemBy: NOW - DAY }), NOW) ?? '', /born expired/);
+    assert.equal(couponDraftBlocker(draft({ redeemBy: NOW + DAY }), NOW), null);
+  });
+
+  it('sends the percentage as basis points, so 33.33% is not rounded on the way', () => {
+    const body = couponBody(draft({ percent: 33.33 }));
+    assert.equal(body.percent_off_basis_points, 3333);
+    assert.equal('percent_off' in body, false, 'sending both spellings of the percentage is refused');
+    assert.equal('currency' in body, false, 'a percentage travels, so it carries no currency');
+  });
+
+  it('sends duration_in_periods only where it means something', () => {
+    assert.equal('duration_in_periods' in couponBody(draft()), false);
+    assert.equal('duration_in_periods' in couponBody(draft({ duration: 'forever' })), false);
+    assert.equal(couponBody(draft({ duration: 'repeating', periods: 12 })).duration_in_periods, 12);
+  });
+
+  it('denominates a fixed amount and leaves the ceiling out when there is none', () => {
+    const body = couponBody(draft({ kind: 'amount', amount: 50000, currency: 'eur' }));
+    assert.equal(body.amount_off, 50000);
+    assert.equal(body.currency, 'eur');
+    assert.equal('percent_off_basis_points' in body, false);
+    assert.equal('max_redemptions' in body, false);
+    assert.equal(couponBody(draft({ maxRedemptions: 150 })).max_redemptions, 150);
+  });
+});
+
+/* ========================= accepting an invitation ======================== */
+
+/**
+ * Accepting an invitation *verifies* an existing Ain credential and only
+ * *enrols* a new one — identity is one row shared across workspaces, so
+ * joining one must never set the credential for the others. The screen spent a
+ * wave after that change still asking the person to "choose a password", to
+ * type it twice, and telling them it was "the only thing that will let you
+ * back in": three sentences that are false for every address already on Ain,
+ * and a confirm box that cannot be filled in by someone typing a password they
+ * already have.
+ */
+describe('the accept screen asks for the password acceptance actually takes', () => {
+  const source = readFileSync(new URL('../src/client/kernel/accept.tsx', import.meta.url), 'utf8');
+
+  it('asks for the Ain password rather than a new one', () => {
+    assert.match(source, /label="Your Ain password"/, 'the field no longer names the password it takes');
+    assert.match(source, /already sign in with, or one you choose now/,
+      'the hint does not cover an address that already has an Ain account');
+    assert.doesNotMatch(source, /Choose a password/, 'the screen still says the password is chosen here');
+    assert.doesNotMatch(source, /only thing that will let you back in/,
+      'the screen still claims this password is the only way back in');
+  });
+
+  it('lets the browser offer the credential it has stored', () => {
+    const [, autoComplete] = source.match(/name="password"[\s\S]{0,120}?autoComplete="([a-z-]+)"/) ?? [];
+    assert.equal(autoComplete, 'current-password',
+      'new-password suppresses the stored credential the person is being asked for');
+  });
+
+  it('does not force a confirmation on a password the person already has', () => {
+    const [, confirm] = source.match(/name="confirm-password"([\s\S]*?)\/>/) ?? [];
+    assert.ok(confirm, 'the confirmation field could not be found');
+    assert.doesNotMatch(confirm, /\brequired\b/, 'the confirmation is still required');
+    // An empty confirmation is not a mismatch, so the submit gate may not
+    // compare the two directly.
+    assert.doesNotMatch(source, /const ready = password\.length >= MIN_PASSWORD && confirm === password/,
+      'the submit button is still gated on typing the password twice');
+    assert.match(source, /const ready = password\.length >= MIN_PASSWORD && !mismatch/,
+      'the submit gate no longer reads the mismatch rule');
   });
 });

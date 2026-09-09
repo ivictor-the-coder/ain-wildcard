@@ -52,11 +52,28 @@ export interface OutboundMessage {
   html: string | null;
 }
 
+/**
+ * Why a relay refused, in the only three shapes that change what we do next.
+ *
+ * `hard` is permanent — no such mailbox, domain gone — and one is enough to
+ * stop writing to the address. `soft` is temporary — a full mailbox, a greylist
+ * — and one means nothing, which is why it takes several in a row. `complaint`
+ * is the recipient reporting the mail as spam, and it is the one refusal that
+ * must never be retried at all.
+ */
+export type BounceKind = 'hard' | 'soft' | 'complaint';
+
 export interface MessageReceipt {
   accepted: boolean;
   /** The relay's own id for the message — what support quotes at the ISP. */
   provider_id: string;
   detail: string;
+  /**
+   * Set on a refusal the relay could classify. Absent on an accepted message,
+   * and absent on a refusal that says nothing useful — which is treated as
+   * soft, because guessing "permanent" costs a customer their invoices.
+   */
+  bounce?: BounceKind;
 }
 
 export interface MessageTransport {
@@ -148,8 +165,13 @@ export interface RecordedMessage {
 
 export interface RecordedMessageTransport extends MessageTransport {
   readonly outbox: readonly RecordedMessage[];
-  /** Bounce anything addressed to a matching recipient. */
-  bounce(match: string | RegExp, detail?: string): void;
+  /**
+   * Bounce anything addressed to a matching recipient. `hard` by default,
+   * because that is the bounce worth writing a rule for; pass `soft` for the
+   * mailbox that is merely full, which is the one the platform has to see
+   * several of before it believes it.
+   */
+  bounce(match: string | RegExp, detail?: string, kind?: BounceKind): void;
   clearRules(): void;
   reset(): void;
   to(match: string | RegExp): RecordedMessage[];
@@ -159,13 +181,13 @@ let messageSeq = 0;
 
 export function recordedMessageTransport(name = 'recorded'): RecordedMessageTransport {
   const outbox: RecordedMessage[] = [];
-  const bounces: { match: string | RegExp; detail: string }[] = [];
+  const bounces: { match: string | RegExp; detail: string; kind: BounceKind }[] = [];
 
   return {
     name,
     outbox,
-    bounce(match, detail = 'The address was rejected by the receiving server.') {
-      bounces.push({ match, detail });
+    bounce(match, detail = 'The address was rejected by the receiving server.', kind: BounceKind = 'hard') {
+      bounces.push({ match, detail, kind });
     },
     clearRules() { bounces.length = 0; },
     reset() { outbox.length = 0; bounces.length = 0; },
@@ -173,7 +195,7 @@ export function recordedMessageTransport(name = 'recorded'): RecordedMessageTran
     deliver(message) {
       const bounced = [...bounces].reverse().find((b) => matches(b.match, message.to));
       const receipt: MessageReceipt = bounced
-        ? { accepted: false, provider_id: '', detail: bounced.detail }
+        ? { accepted: false, provider_id: '', detail: bounced.detail, bounce: bounced.kind }
         : {
           accepted: true,
           provider_id: `${name}-${(++messageSeq).toString(36)}`,

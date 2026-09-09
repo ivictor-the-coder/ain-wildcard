@@ -4782,3 +4782,84 @@ describe('a card refused against a bill on net terms', () => {
     } finally { ws.close(); }
   });
 });
+
+/* ========================================================================== *
+ * A campaign that presents a card tells the payer what happened
+ * ========================================================================== */
+
+describe('what a campaign tells the payer', () => {
+  /** Every notice this workspace sent about one account, oldest first. */
+  const letters = async (ws: Workspace, customerId: string) =>
+    ((await ws.ok('GET', `/v1/notifications?customer=${customerId}&limit=200`)).data as
+      { kind: string; to: string | null; status: string }[]).reverse();
+
+  const noticeJobs = (ws: Workspace, campaignId: string) =>
+    ws.app.ctx.db.all<{ status: string; run_at: number; idem_key: string }>(
+      `SELECT status, run_at, idem_key FROM jobs WHERE type = 'payments.dunning_notice' AND idem_key LIKE ? ORDER BY rowid`,
+      `payments.dunning_notice:${campaignId}:%`,
+    );
+
+  test('queues the letter beside the retry, on the same job-row footing', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const customer = await ws.customer('Kestrel Fabrication');
+      await ws.card(customer.id, 'insufficient_funds');
+      await ws.subscribe(customer.id);
+
+      const campaign = (await ws.dunning(customer.id))[0];
+      assert.equal(campaign.status, 'recovering', 'fixture: the card was refused and a schedule opened');
+
+      // The retry is a row with a run_at, and so is the letter about it: one
+      // decision, two rows, replayed together by the time machine. Sending
+      // from inside the event handler instead put the letter somewhere a
+      // throw is swallowed and nothing is left to run again.
+      const retries = ws.app.ctx.db.all<{ run_at: number }>(
+        `SELECT run_at FROM jobs WHERE org_id = ? AND idem_key = ?`,
+        ORG, `payments.dunning_retry:${campaign.id}`,
+      );
+      assert.equal(retries.length, 1, 'the next attempt is queued');
+      assert.equal(retries[0].run_at, campaign.next_attempt_at, 'at the window the campaign published');
+
+      const queued = noticeJobs(ws, campaign.id);
+      assert.equal(queued.length, 1, 'and so is the letter that says so');
+      assert.equal(queued[0].status, 'done', 'which the same drain ran');
+      assert.equal(queued[0].idem_key, `payments.dunning_notice:${campaign.id}:dunning.payment_failed:1`,
+        'keyed by campaign, kind and attempt, so one decision can only produce one letter');
+
+      const sent = await letters(ws, customer.id);
+      assert.deepEqual(sent.filter((l) => l.kind.startsWith('dunning.')).map((l) => l.kind),
+        ['dunning.payment_failed']);
+    } finally { ws.close(); }
+  });
+
+  test('says nothing about a card against a bill that is settled by transfer', async () => {
+    const ws = await workspace(MONDAY);
+    try {
+      const customer = await ws.customer('Netterms Castings');
+      const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+        customer: customer.id, items: [{ price: 'growth_monthly' }],
+        collection_method: 'send_invoice', days_until_due: 30,
+      });
+      await ws.tick();
+      const invoice = (await ws.invoicesFor(sub.id))[0];
+      const method = await ws.card(customer.id, 'insufficient_funds');
+      // The finance team offers a card over the phone, and it is refused.
+      await ws.ok('POST', '/v1/payment_intents', {
+        customer: customer.id, invoice: invoice.id, payment_method: method.id, confirm: true, off_session: true,
+      });
+
+      const campaign = (await ws.dunning(customer.id))[0];
+      assert.equal(campaign.hold?.reason, 'not_card_collected', 'fixture: held, with nothing scheduled');
+      assert.equal(noticeJobs(ws, campaign.id).length, 0, 'no letter was queued');
+
+      // Nothing about this bill is ever presented automatically, and the payer
+      // was already sent the invoice with terms on it. A "we could not take
+      // payment, update your card" letter over a bill they are paying by
+      // transfer is an instruction to do something that is not required.
+      const sent = await letters(ws, customer.id);
+      assert.deepEqual(sent.filter((l) => l.kind.startsWith('dunning.')), [],
+        'the payer was told their card was declined for a bill nothing charges a card for');
+      assert.ok(sent.some((l) => l.kind === 'invoice.issued'), 'the bill itself was sent, which is the notice they need');
+    } finally { ws.close(); }
+  });
+});

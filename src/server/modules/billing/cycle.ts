@@ -13,7 +13,8 @@ import {
   addInterval, daysInMonth, formatDate, interval as makeInterval, periodFor,
   type Interval, type IntervalUnit, type Period,
 } from '../../../shared/time';
-import type { LineAmount, Price, Product } from '../catalog/types';
+import type { Coupon, LineAmount, Price, Product } from '../catalog/types';
+import { Discounts } from './discounts';
 import type { Cadence, RecurringLine, Subscription } from './types';
 
 /* ------------------------------- the pricebook ---------------------------- */
@@ -32,8 +33,26 @@ export interface ComputeInput {
 export class Pricebook {
   private readonly prices = new Map<string, Price>();
   private readonly products = new Map<string, Product | null>();
+  private discountIndex: { bySubscription: Map<string, Coupon>; byCustomer: Map<string, Coupon> } | null = null;
 
   constructor(private readonly ctx: Ctx, private readonly orgId: string) {}
+
+  /**
+   * The coupon still reducing what a subscription is worth, or null.
+   *
+   * Read as one index the first time it is asked for, because the callers that
+   * ask walk hundreds of subscriptions and the answer changes for none of them
+   * mid-loop. A subscription's own discount beats the account's, exactly as the
+   * invoice decides it — a run rate that netted one concession while the bill
+   * applied another would be a forecast of a bill nobody sends.
+   */
+  runningDiscount(subscriptionId: string | null, customerId: string | null): Coupon | null {
+    if (!subscriptionId && !customerId) return null;
+    if (!this.discountIndex) this.discountIndex = new Discounts(this.ctx).runningIndex(this.orgId, this.ctx.now());
+    return (subscriptionId ? this.discountIndex.bySubscription.get(subscriptionId) : undefined)
+      ?? (customerId ? this.discountIndex.byCustomer.get(customerId) : undefined)
+      ?? null;
+  }
 
   price(id: string): Price {
     let found = this.prices.get(id);
@@ -68,6 +87,25 @@ export class Pricebook {
 
   unitLabel(price: Price): string | null {
     return this.product(price)?.unit_label ?? null;
+  }
+
+  /**
+   * How much of one coupon each of these amounts carries, in minor units.
+   *
+   * The catalogue does the arithmetic — one rounding, half up, on the discount
+   * itself, and the per-line shares reconciled to it by largest remainder — so
+   * a discount taken off a run rate rounds the way the same discount rounds on
+   * the invoice, rather than a second implementation that agrees until it does
+   * not.
+   */
+  discountShares(coupon: Coupon, lines: { price: string; amount: number }[], currency: string): number[] {
+    if (!lines.length) return [];
+    const applied = this.ctx.svc.catalog.distributeDiscount(
+      coupon,
+      lines.map((line) => ({ price: line.price, product: this.find(line.price)?.product ?? null, amount: line.amount })),
+      currency,
+    );
+    return applied.lines.map((line) => line.discount);
   }
 
   /**
@@ -275,20 +313,47 @@ const NORMALISERS: Record<IntervalUnit, { numerator: number; denominator: number
  * Normalised monthly recurring revenue for one subscription, in minor units.
  * Metered items are excluded — usage is revenue, but it is not *recurring*
  * revenue, and pretending otherwise is how a forecast goes wrong.
+ *
+ * MRR is net of a discount that is still running: an account on "20% off year
+ * one" is worth 80% of its list price for as long as that runs and its list
+ * price again the month after, because a run rate that quotes a price nobody is
+ * paying is a forecast of money that will not arrive. The subtraction is spread
+ * over exactly the items counted here — the recurring ones — so a coupon
+ * restricted to the platform fee takes nothing off a metered line that was
+ * never in the figure to begin with.
+ *
+ * The discount is looked up rather than passed in, and that is deliberate: this
+ * function is imported by the revenue module precisely so that its figures and
+ * `/v1/subscriptions/overview` cannot disagree, and an argument every caller
+ * has to remember is an argument one of them will forget. A subscription
+ * synthesised for an arithmetic question — the two sides of a logged change —
+ * carries no identity and is priced at list, which is what those callers ask
+ * for. Pass `coupon` explicitly to override, `null` for the list price.
  */
 export function subscriptionMrr(
-  sub: Pick<Subscription, 'interval' | 'interval_count' | 'currency'> & { items: PricedItem[] },
+  sub: Pick<Subscription, 'interval' | 'interval_count' | 'currency'> & {
+    items: PricedItem[]; id?: string; customer?: string;
+  },
   book: Pricebook,
+  coupon?: Coupon | null,
 ): number {
-  let total = 0;
+  const running = coupon !== undefined ? coupon : book.runningDiscount(sub.id ?? null, sub.customer ?? null);
+  const counted: { price: string; amount: number }[] = [];
   for (const item of sub.items) {
     const price = book.find(item.price);
     if (!price || isMetered(price) || !isRecurring(price)) continue;
-    const line = book.compute(price, item.quantity, sub.currency, { customUnitAmount: item.custom_unit_amount });
-    const norm = NORMALISERS[sub.interval];
-    const amount: Money = money(line.amount, sub.currency);
-    total += mulFraction(amount, norm.numerator, norm.denominator * sub.interval_count).amount;
+    counted.push({
+      price: price.id,
+      amount: book.compute(price, item.quantity, sub.currency, { customUnitAmount: item.custom_unit_amount }).amount,
+    });
   }
+  const shares = running ? book.discountShares(running, counted, sub.currency) : counted.map(() => 0);
+  const norm = NORMALISERS[sub.interval];
+  let total = 0;
+  counted.forEach((line, index) => {
+    const amount: Money = money(line.amount - shares[index], sub.currency);
+    total += mulFraction(amount, norm.numerator, norm.denominator * sub.interval_count).amount;
+  });
   return total;
 }
 

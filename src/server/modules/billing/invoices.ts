@@ -44,6 +44,7 @@ import { DAY, startOfDay, type Period } from '../../../shared/time';
 import type { TaxBehavior } from '../catalog/types';
 import type { BillableItem } from '../credits/types';
 import { longDate } from './cycle';
+import { applyDiscount, discountDelta, type DiscountContext, type DiscountedShare } from './discounts';
 import { dueAtSql, outstandingSql } from './receivable';
 import {
   hydrateInvoice, hydrateInvoiceLine, like, rollUpLineTax,
@@ -122,6 +123,8 @@ export interface TaxedLine extends DraftLine {
   taxes: LineTaxAmount[];
   /** Those entries rolled up, so a caller that wants one figure has one. */
   tax: InvoiceLineTax;
+  /** What the bill's discount took off this line, before it was taxed. */
+  discountShare: number;
 }
 
 /** One currency's slice of the invoice book. */
@@ -678,18 +681,72 @@ export class Invoices {
    * The rate is snapshotted onto every line rather than referenced, so an
    * invoice raised at 19% still says 19% after the rate is changed to 20%.
    */
-  taxDrafts(orgId: string, customer: Customer, drafts: DraftLine[]): TaxedLine[] {
+  taxDrafts(orgId: string, customer: Customer, drafts: DraftLine[], discount: DiscountContext | null = null): TaxedLine[] {
     const rates = new TaxRates(this.ctx, orgId);
     const resolved = rates.forCustomer(customer);
     const book = this.billing.book(orgId);
     const where = describeJurisdiction(customer, resolved);
-    return drafts.map((draft) => {
-      const behavior: TaxBehavior = draft.taxBehavior
-        ?? (draft.price ? book.find(draft.price)?.tax_behavior ?? 'unspecified' : 'unspecified');
-      const split = rates.split(draft.amount, behavior, draft.currency, resolved);
+    const behaviorOf = (draft: DraftLine): TaxBehavior => draft.taxBehavior
+      ?? (draft.price ? book.find(draft.price)?.tax_behavior ?? 'unspecified' : 'unspecified');
+    const taxed: TaxedLine[] = drafts.map((draft) => {
+      const split = rates.split(draft.amount, behaviorOf(draft), draft.currency, resolved);
       const taxes = snapshotTax(rates, split, where);
-      return { ...draft, amount: split.base, taxes, tax: rollUpLineTax(taxes) };
+      return { ...draft, amount: split.base, taxes, tax: rollUpLineTax(taxes), discountShare: 0 };
     });
+    if (!discount || !drafts.length) return taxed;
+
+    // The coupon is spread over the amounts the pricing engine produced, not
+    // over the taxable bases underneath them: "20% off" a tax-inclusive €120
+    // line is €24 off the price on the price list, which is what the customer
+    // was promised and what they will see come off.
+    const currency = drafts[0].currency;
+    const application = applyDiscount({
+      ctx: this.ctx,
+      rates,
+      resolved,
+      where,
+      coupon: discount.coupon,
+      currency,
+      locale: this.billing.locale(orgId),
+      periodIndex: discount.periodIndex,
+      periods: this.ctx.svc.catalog.discountPeriods(discount.coupon),
+      lines: drafts.map((draft) => ({
+        price: draft.price,
+        // A coupon restricted to a product has to be told which product a line
+        // is for; the price knows, and the line only carries the price.
+        product: draft.price ? book.find(draft.price)?.product ?? null : null,
+        amount: draft.amount,
+        behavior: behaviorOf(draft),
+      })),
+    });
+    if (!application) return taxed;
+    // Each line keeps the record of what it handed over, because finalisation
+    // prices the draft again and has to rebuild the same subtraction.
+    application.shares.forEach((share, index) => { taxed[index].discountShare = share; });
+
+    return [...taxed, {
+      // The discount belongs to no claimable row, so it claims none: the source
+      // index is unique per live source id, and a monthly coupon would collide
+      // with itself on the second bill if it named one.
+      source: { type: 'discount' as InvoiceLineSource, id: null },
+      subscription: discount.subscription,
+      subscriptionItem: null,
+      price: null,
+      kind: 'discount' as InvoiceLineKind,
+      proration: false,
+      description: application.description,
+      explanation: application.explanation,
+      quantity: 1,
+      amount: application.amount,
+      currency,
+      period: discount.period,
+      fraction: null,
+      breakdown: [],
+      // The discount line is the sum of the shares, not one of them.
+      discountShare: 0,
+      taxes: application.taxes,
+      tax: application.tax,
+    }];
   }
 
   /**
@@ -707,6 +764,7 @@ export class Invoices {
    */
   taxTotals(
     orgId: string, customer: Customer, lines: { price: string | null; amount: number; currency: string; taxBehavior?: TaxBehavior }[],
+    discount: DiscountContext | null = null,
   ): { base: number; tax: number } {
     if (!lines.length) return { base: 0, tax: 0 };
     const taxed = this.taxDrafts(orgId, customer, lines.map((line) => ({
@@ -725,7 +783,7 @@ export class Invoices {
       fraction: null,
       breakdown: [],
       taxBehavior: line.taxBehavior,
-    })));
+    })), discount);
     return {
       base: taxed.reduce((total, line) => total + line.amount, 0),
       tax: taxed.reduce((total, line) => total + line.tax.amount, 0),
@@ -809,7 +867,12 @@ export class Invoices {
     if (!drafts.length) return null;
     const period: Period = input.subscription ? input.period : spanOf(drafts, fallbackWindow);
 
-    const lines = this.taxDrafts(orgId, customer, drafts);
+    // Whatever discount governs the window this bill covers. Resolved from the
+    // period rather than from `now`, so a renewal job that runs late applies
+    // the discount the period it is billing was entitled to.
+    const discount = this.billing.discounts.context(orgId, customer.id, input.subscription?.id ?? null, period);
+    const lines = this.taxDrafts(orgId, customer, drafts, discount);
+    const discountLine = discount ? lines.find((line) => line.kind === 'discount') ?? null : null;
     const taxStatus = this.taxStatusFor(orgId, customer);
     const { subtotal, tax, total, balanceApplied, ending } = billTotals(lines, customer.balance);
     const starting = customer.balance;
@@ -836,6 +899,10 @@ export class Invoices {
       subtotal,
       tax,
       automatic_tax_status: taxStatus,
+      discount_id: discountLine ? discount?.discount.id ?? null : null,
+      // Positive, and already inside `subtotal`: the invoice records what came
+      // off the base, not a second deduction waiting to be applied to it.
+      discount_amount: discountLine ? -discountLine.amount : 0,
       balance_applied: balanceApplied,
       total,
       amount_paid: 0,
@@ -887,6 +954,7 @@ export class Invoices {
         proration_numerator: line.fraction?.numerator ?? null,
         proration_denominator: line.fraction?.denominator ?? null,
         breakdown: line.breakdown,
+        discount_amount: line.discountShare,
         ...this.taxColumns(line.tax, line.taxes),
         released: 0,
         position,
@@ -911,6 +979,11 @@ export class Invoices {
         createdAt,
       });
     }
+
+    // One period of the coupon's duration, spent inside the invoice's own
+    // transaction: a bill that fails to commit must not burn a month of
+    // "20% off year one".
+    if (discount && discountLine) this.billing.discounts.spend(orgId, discount.discount, discount.coupon, period);
 
     this.billing.lockCurrency(orgId, customer.id);
     // The period ledger and the invoice now point at each other, which is what
@@ -1066,7 +1139,13 @@ export class Invoices {
 
     let subtotal = 0;
     let tax = 0;
-    const repriced = invoice.lines.map((line) => {
+    // The discount is not re-split on its own. Its tax is the tax it took off
+    // the lines below, so it is rebuilt from their shares after they have been
+    // re-priced — re-splitting a negative number at the account's headline rate
+    // would quietly turn "the base was reduced" back into "a negative line was
+    // taxed", which is a different bill on every inclusive-priced account.
+    const shares: DiscountedShare[] = [];
+    const repriced = invoice.lines.filter((line) => line.kind !== 'discount').map((line) => {
       // A line with a price behind it is taxed the way that price says, and a
       // line with none — a hand-written invoice item — carries its own
       // behaviour, which is the one it was drawn under. Reading the second as
@@ -1098,8 +1177,17 @@ export class Invoices {
       const rolled = rollUpLineTax(taxes);
       subtotal += split.base;
       tax += rolled.amount;
+      shares.push({ amount: priced, share: line.discount_amount, behavior });
       return { line, base: split.base, taxes, rolled };
     });
+
+    const discountLine = invoice.lines.find((line) => line.kind === 'discount');
+    if (discountLine) {
+      const delta = discountDelta(rates, resolved, where, shares, invoice.currency);
+      subtotal += delta.amount;
+      tax += delta.tax.amount;
+      repriced.push({ line: discountLine, base: delta.amount, taxes: delta.taxes, rolled: delta.tax });
+    }
 
     // The rate the draft already carries is the rate it should go out at, so
     // the draft goes out untouched. Compared line by line rather than on the

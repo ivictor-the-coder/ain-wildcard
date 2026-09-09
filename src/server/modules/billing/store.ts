@@ -18,6 +18,7 @@ import { formatMoney, money } from '../../../shared/money';
 import { DAY, HOUR, addInterval, type Interval, type Period } from '../../../shared/time';
 import type { Price, ProrationBehavior } from '../catalog/types';
 import { CreditNotes } from './credit-notes';
+import { Discounts } from './discounts';
 import {
   hydrateBalanceTransaction, hydrateCustomer, hydrateItem, hydratePendingItem, hydratePeriod,
   describeAutomaticTax, hydrateSubscription, like, normaliseAddress, taxSummaryOf,
@@ -89,11 +90,15 @@ export class Billing {
   /** Lines written by hand, waiting for a bill. */
   readonly invoiceItems: InvoiceItems;
 
+  /** Coupons fastened to accounts, and what they take off. */
+  readonly discounts: Discounts;
+
   constructor(private readonly ctx: Ctx) {
     this.invoices = new Invoices(ctx, this);
     this.creditNotes = new CreditNotes(ctx, this);
     this.holds = new InvoiceHolds(ctx, this);
     this.invoiceItems = new InvoiceItems(ctx, this);
+    this.discounts = new Discounts(ctx);
   }
 
   book(orgId: string): Pricebook { return new Pricebook(this.ctx, orgId); }
@@ -786,6 +791,15 @@ export class Billing {
       this.lockCurrency(orgId, customer.id);
       const sub = this.requireSubscription(orgId, id);
 
+      // Before the first invoice is raised, because the first invoice is the
+      // one a negotiated concession is most conspicuously missing from.
+      if (input.coupon || input.promotion_code) {
+        this.discounts.attach(orgId, {
+          customer: customer.id, subscription: sub, startedAt: start,
+          coupon: input.coupon, promotion_code: input.promotion_code,
+        }, meta);
+      }
+
       const fraction = trialing ? null : periodFraction(period, iv, anchorDay);
       this.recordPeriod(orgId, sub, period, trialing ? 'trial' : 'billed', book, fraction, { createdAt: start });
 
@@ -907,6 +921,12 @@ export class Billing {
     }));
 
     const subAfter = { ...sub, ...cadenceAfter, items: itemsAfter, billing_cycle_anchor_day: anchorDay };
+    // The bill this change would raise carries the discount governing the
+    // period it lands in, and the one after it carries the period after — the
+    // same two questions `issue()` asks, asked here so the quote and the charge
+    // cannot answer them differently.
+    const dueNowDiscount = this.discounts.context(orgId, customer.id, sub.id, currentPeriod);
+    const nextDiscount = this.discounts.context(orgId, customer.id, sub.id, nextPeriod);
     const preview = previewChange({
       subscriptionId: sub.id,
       customerId: customer.id,
@@ -927,6 +947,10 @@ export class Billing {
       book,
       trialEnd: sub.trial_end,
       itemsAfter,
+      // The change moves the items, not the concession: both sides carry the
+      // subscription's identity, so both are netted by the discount running on
+      // it and `mrr_delta` is the size of the change rather than the size of
+      // the discount.
       mrrBefore: subscriptionMrr(sub, book),
       mrrAfter: subscriptionMrr(subAfter, book),
       nextInvoiceDate: anchorReset ? nextPeriod.end : sub.current_period_end,
@@ -935,7 +959,8 @@ export class Billing {
       // The same call `issue()` makes, on the same customer. A preview that
       // priced its lines any other way would be a second implementation that
       // happens to agree today.
-      taxOf: (lines) => this.invoices.taxTotals(orgId, customer, lines),
+      taxOf: (lines) => this.invoices.taxTotals(orgId, customer, lines, dueNowDiscount),
+      taxOfNextInvoice: (lines) => this.invoices.taxTotals(orgId, customer, lines, nextDiscount),
       automaticTax: this.automaticTaxFor(orgId, customer),
       // What an `always_invoice` bill sweeps up besides its own lines: the
       // items already waiting for this customer, in the currency the bill can
@@ -2135,10 +2160,13 @@ export class Billing {
       })),
     ];
 
-    // The same call issuance makes, on the same customer: a preview that taxed
-    // its lines differently from the invoice it predicts would not be a
-    // preview of anything.
-    const taxed = this.invoices.taxDrafts(orgId, customer, drafts);
+    // The same call issuance makes, on the same customer, with the same
+    // discount: a preview that taxed its lines differently from the invoice it
+    // predicts — or quoted a concession the bill will have run out of — would
+    // not be a preview of anything.
+    const discount = this.discounts.context(orgId, customer.id, sub.id, period);
+    const taxed = this.invoices.taxDrafts(orgId, customer, drafts, discount);
+    const discountLine = taxed.find((line) => line.kind === 'discount') ?? null;
     const automaticTax = this.automaticTaxFor(orgId, customer);
     // `issue()`'s own formula, called rather than restated.
     const starting = customer.balance;
@@ -2162,6 +2190,7 @@ export class Billing {
       period: line.period,
       proration_fraction: line.fraction,
       breakdown: line.breakdown,
+      discount_amount: line.discountShare,
       taxes: line.taxes,
       tax: line.tax,
       released: false,
@@ -2182,6 +2211,8 @@ export class Billing {
       arrears_period: { start: sub.current_period_start, end: sub.current_period_end },
       lines,
       subtotal,
+      discount: discountLine ? discount?.discount.id ?? null : null,
+      discount_amount: discountLine ? -discountLine.amount : 0,
       balance_applied: balanceApplied,
       tax,
       total_taxes: taxSummaryOf(lines),

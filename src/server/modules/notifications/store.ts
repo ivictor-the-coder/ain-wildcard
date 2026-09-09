@@ -6,18 +6,19 @@ import { badRequest, conflict, notFound } from '../../../shared/errors';
 import { newId, randomId } from '../../../shared/ids';
 import { DAY, HOUR, MINUTE, formatDuration } from '../../../shared/time';
 import {
-  dunningFailed, dunningFinal, invoiceIssued, invoiceReceipt, orgVoice,
+  dunningFailed, dunningFinal, dunningGaveUp, dunningRecovered, invoiceIssued, invoiceReceipt, orgVoice,
   type Composed, type DunningFacts, type InvoiceFacts, type OrgVoice, type Recipient,
 } from './compose';
 import { SIGNATURE_HEADER, signatureHeader, signatureRecipe, verify, type SignatureCheck } from './signature';
 import {
   recordedHttpTransport, recordedMessageTransport,
-  type HttpTransport, type MessageTransport, type OutboundRequest, type OutboundResponse,
+  type BounceKind, type HttpTransport, type MessageTransport, type OutboundRequest, type OutboundResponse,
   type RecordedHttpTransport, type RecordedMessageTransport,
 } from './transport';
 import type {
-  DeliveryListFilter, EndpointInput, EndpointPatch, MessageChannel, MessageListFilter, MessageStatus,
-  MintedWebhookEndpoint, NotificationMessage, NotificationSettings, SendInput, SettingsPatch,
+  DeliveryListFilter, DunningNoticeKind, EndpointInput, EndpointPatch, MessageChannel, MessageListFilter,
+  MessageStatus, MintedWebhookEndpoint, NotificationMessage, NotificationSettings, SendInput, SettingsPatch,
+  SuppressedAddress, SuppressionInput, SuppressionListFilter, SuppressionReason,
   WebhookAttempt, WebhookDelivery, WebhookEndpoint, WebhookPayload,
 } from './types';
 
@@ -40,6 +41,17 @@ export const MAX_DELIVERY_ATTEMPTS = DELIVERY_BACKOFF_MS.length + 1;
 export const DISABLE_AFTER_FAILED_DELIVERIES = 3;
 
 export const DELIVERY_TIMEOUT_MS = 10_000;
+
+/**
+ * Soft bounces in a row before the address stops being written to.
+ *
+ * One is an accident — a full mailbox, a greylist, a relay having a bad
+ * afternoon — and suppressing on it would cut a paying customer off from their
+ * own invoices. Three in a row with nothing getting through in between is no
+ * longer an accident, and it is the point at which continuing to write costs
+ * the sending domain more than the notice is worth.
+ */
+export const SUPPRESS_AFTER_SOFT_BOUNCES = 3;
 
 /** How much of a subscriber's response is worth keeping. */
 const RESPONSE_BODY_LIMIT = 800;
@@ -128,6 +140,25 @@ interface SettingsRow {
   org_id: string; from_name: string; from_email: string; reply_to: string | null;
   enabled_since: number; created: number; updated: number;
 }
+
+export interface SuppressionRow {
+  id: string; org_id: string; channel: string; address: string; reason: string; detail: string;
+  bounces: number; last_message_id: string | null; last_bounce_at: number | null;
+  created: number; updated: number;
+}
+
+/**
+ * One mailbox, one entry. Addresses arrive from customer records typed by
+ * people, so `AP@Acme.example` and ` ap@acme.example ` are the same recipient
+ * and a list that only knows one of them is not a suppression list.
+ */
+export const normaliseAddress = (address: string): string => address.trim().toLowerCase();
+
+const DEFAULT_SUPPRESSION_DETAIL: Record<SuppressionReason, string> = {
+  bounced: 'Mail to this address came back and nothing further is written to it.',
+  complained: 'The recipient reported mail from this workspace as spam.',
+  manual: 'Suppressed by hand — someone here decided this address is not to be written to.',
+};
 
 export interface WriteMeta {
   actorId?: string | null;
@@ -790,7 +821,12 @@ export class Notifications {
     let status: MessageStatus;
     let failedReason: string | null = null;
     let providerId: string | null = null;
+    let bounce: BounceKind | null = null;
     const transportName = this.messages_.name;
+    // Asked before anything is handed to a transport, and asked of the
+    // normalised address, so a mailbox that is gone is gone whichever way the
+    // record that holds it happens to be capitalised.
+    const blocked = input.to ? this.suppressionRow(orgId, input.channel, input.to) : undefined;
 
     if (!input.to) {
       // Nothing was sent, and the record says so rather than claiming a send
@@ -799,6 +835,13 @@ export class Notifications {
       status = 'suppressed';
       failedReason = input.suppressed_reason
         ?? 'There is no address on file for this recipient, so nothing was sent.';
+    } else if (blocked) {
+      // The address exists and this workspace has stopped writing to it. The
+      // record keeps the address rather than blanking it: "we did not write to
+      // ap@… because it bounced on the 3rd" is an answer somebody can act on,
+      // and "there was nobody to write to" is not the same fact at all.
+      status = 'suppressed';
+      failedReason = describeSuppression(blocked);
     } else {
       let receipt;
       try {
@@ -823,6 +866,9 @@ export class Notifications {
       status = receipt.accepted ? 'sent' : 'failed';
       failedReason = receipt.accepted ? null : receipt.detail;
       providerId = receipt.accepted ? receipt.provider_id : null;
+      // A refusal the relay could not classify is soft. Guessing "permanent"
+      // costs a customer every invoice they were ever going to be sent.
+      if (!receipt.accepted) bounce = receipt.bounce ?? 'soft';
     }
 
     const row: MessageRow = {
@@ -842,8 +888,186 @@ export class Notifications {
         objectId: row.id, objectType: 'notification',
         actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
       });
+      // Inside the same transaction as the message it came back from: a bounce
+      // recorded without the message that bounced, or a message recorded
+      // without the bounce that answered it, is half a story either way.
+      if (bounce && input.to) this.noteBounce(orgId, input.channel, input.to, bounce, row, meta);
       return payload;
     });
+  }
+
+  /* ------------------------------ suppressions --------------------------- */
+
+  /**
+   * A bounce came back. Decide whether the address stays writable.
+   *
+   * A hard bounce and a spam complaint stop the address on the first one —
+   * there is nothing to wait for, and continuing to write to a complainant is
+   * how a sending domain gets blocked for every other customer too. A soft
+   * bounce is an accident until it stops looking like one: it takes
+   * `SUPPRESS_AFTER_SOFT_BOUNCES` back to back, counted from the last message
+   * that actually got through, so a mailbox that was full in March and has
+   * been fine since starts again from zero.
+   */
+  private noteBounce(
+    orgId: string, channel: MessageChannel, address: string, kind: BounceKind,
+    message: MessageRow, meta: WriteMeta,
+  ): void {
+    const consecutive = this.consecutiveBounces(orgId, channel, address);
+    this.ctx.emit(orgId, 'notification.bounced', {
+      object: 'notification_bounce',
+      notification: message.id,
+      channel,
+      to: message.to_address,
+      kind,
+      detail: message.failed_reason,
+      consecutive,
+      suppresses: kind !== 'soft' || consecutive >= SUPPRESS_AFTER_SOFT_BOUNCES,
+    }, {
+      objectId: message.id, objectType: 'notification',
+      actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
+    });
+    if (kind === 'soft' && consecutive < SUPPRESS_AFTER_SOFT_BOUNCES) return;
+    this.suppress(orgId, {
+      address,
+      channel,
+      reason: kind === 'complaint' ? 'complained' : 'bounced',
+      detail: kind === 'complaint'
+        ? `The recipient reported this mail as spam${message.failed_reason ? ` (${sentence(message.failed_reason)})` : ''}, so nothing further is written to this address.`
+        : kind === 'hard'
+          ? `The receiving server refused this address permanently: ${sentence(message.failed_reason ?? 'no reason given')}`
+          : `${consecutive} messages in a row came back and none got through. The last said: ${sentence(message.failed_reason ?? 'no reason given')}`,
+    }, meta, { bounces: consecutive, messageId: message.id });
+  }
+
+  /**
+   * Messages to this address that came back since the last one that did not.
+   *
+   * Counted from the log rather than kept in a counter, because the counter
+   * and the log would be two answers to one question and the log is the one
+   * with the evidence under it. The just-written row is included — it is in
+   * the same transaction — so this is the run *including* the bounce being
+   * judged.
+   *
+   * "In a row" is insertion order, not `created`. The workspace clock does not
+   * move inside a request and barely moves inside a tick, so several messages
+   * routinely share an instant; counting by timestamp made a delivery that
+   * came *after* two bounces fail to break the run, and suppressed an address
+   * that had just been written to successfully.
+   */
+  private consecutiveBounces(orgId: string, channel: MessageChannel, address: string): number {
+    const lastSuccess = this.ctx.db.pluck<number>(
+      `SELECT MAX(rowid) FROM notification_messages
+        WHERE org_id = ? AND channel = ? AND LOWER(TRIM(to_address)) = ? AND status = 'sent'`,
+      orgId, channel, normaliseAddress(address),
+    ) ?? 0;
+    return this.ctx.db.count(
+      `SELECT COUNT(*) FROM notification_messages
+        WHERE org_id = ? AND channel = ? AND LOWER(TRIM(to_address)) = ? AND status = 'failed' AND rowid > ?`,
+      orgId, channel, normaliseAddress(address), lastSuccess,
+    );
+  }
+
+  suppressionRow(orgId: string, channel: MessageChannel, address: string): SuppressionRow | undefined {
+    return this.ctx.db.get<SuppressionRow>(
+      `SELECT * FROM notification_suppressions WHERE org_id = ? AND channel = ? AND address = ?`,
+      orgId, channel, normaliseAddress(address),
+    );
+  }
+
+  suppressions(orgId: string, filter: SuppressionListFilter = {}): SuppressedAddress[] {
+    const clauses = ['org_id = ?'];
+    const params: unknown[] = [orgId];
+    if (filter.channel) { clauses.push('channel = ?'); params.push(filter.channel); }
+    if (filter.reason) { clauses.push('reason = ?'); params.push(filter.reason); }
+    if (filter.address) { clauses.push('address = ?'); params.push(normaliseAddress(filter.address)); }
+    return this.ctx.db
+      .all<SuppressionRow>(
+        `SELECT * FROM notification_suppressions WHERE ${clauses.join(' AND ')} ORDER BY created DESC, rowid DESC LIMIT ?`,
+        ...(params as any[]), Math.min(filter.limit ?? 50, 500))
+      .map(suppressionPayload);
+  }
+
+  /**
+   * Put an address on the list, or update the entry already there.
+   *
+   * An operator's `manual` entry is never overwritten by a machine: a person
+   * saying "stop writing to this account" outranks the relay's opinion, and a
+   * later soft bounce quietly rewriting the reason would lose why it is there.
+   */
+  suppress(
+    orgId: string, input: SuppressionInput, meta: WriteMeta = {},
+    from: { bounces?: number; messageId?: string | null } = {},
+  ): SuppressedAddress {
+    const address = normaliseAddress(input.address);
+    if (!address) throw badRequest('notification_address_missing', 'An address is needed to suppress one.', 'address');
+    const channel: MessageChannel = input.channel ?? 'email';
+    const reason: SuppressionReason = input.reason ?? 'manual';
+    const now = this.ctx.now();
+    const existing = this.suppressionRow(orgId, channel, address);
+    return this.ctx.atomic(() => {
+      if (existing) {
+        const keepManual = existing.reason === 'manual' && reason !== 'manual';
+        this.ctx.db.patch('notification_suppressions', 'id', existing.id, {
+          reason: keepManual ? existing.reason : reason,
+          detail: keepManual ? existing.detail : (input.detail ?? existing.detail),
+          bounces: Math.max(existing.bounces, from.bounces ?? 0),
+          last_message_id: from.messageId ?? existing.last_message_id,
+          last_bounce_at: from.messageId ? now : existing.last_bounce_at,
+          updated: now,
+        });
+        return suppressionPayload(this.requireSuppression(orgId, existing.id));
+      }
+      const row: SuppressionRow = {
+        id: randomId('nsup'), org_id: orgId, channel, address, reason,
+        detail: input.detail ?? DEFAULT_SUPPRESSION_DETAIL[reason],
+        bounces: from.bounces ?? 0, last_message_id: from.messageId ?? null,
+        last_bounce_at: from.messageId ? now : null, created: now, updated: now,
+      };
+      this.ctx.db.insert('notification_suppressions', { ...row });
+      const payload = suppressionPayload(row);
+      this.ctx.emit(orgId, 'notification.address_suppressed', payload, {
+        objectId: row.id, objectType: 'notification_suppression',
+        actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
+      });
+      return payload;
+    });
+  }
+
+  /**
+   * Take an address off the list.
+   *
+   * The mirror of `suppress`, and the module is a trap without it: a mailbox
+   * that was full in March, or an address suppressed by a typo in a bounce
+   * rule, would otherwise never receive another invoice and no screen would
+   * offer a way back. Releasing does not resend anything — the messages
+   * suppressed while it was listed are records of what did not happen, and a
+   * resend is a deliberate act with its own route.
+   */
+  release(orgId: string, id: string, meta: WriteMeta = {}): SuppressedAddress {
+    const row = this.requireSuppression(orgId, id);
+    return this.ctx.atomic(() => {
+      this.ctx.db.run(`DELETE FROM notification_suppressions WHERE org_id = ? AND id = ?`, orgId, id);
+      const payload = suppressionPayload(row);
+      this.ctx.emit(orgId, 'notification.address_released', payload, {
+        objectId: row.id, objectType: 'notification_suppression',
+        actorId: meta.actorId, actorType: meta.actorType, requestId: meta.requestId,
+      });
+      return payload;
+    });
+  }
+
+  suppression(orgId: string, id: string): SuppressedAddress | null {
+    const row = this.ctx.db.get<SuppressionRow>(
+      `SELECT * FROM notification_suppressions WHERE org_id = ? AND id = ?`, orgId, id);
+    return row ? suppressionPayload(row) : null;
+  }
+
+  private requireSuppression(orgId: string, id: string): SuppressionRow {
+    const row = this.ctx.db.get<SuppressionRow>(
+      `SELECT * FROM notification_suppressions WHERE org_id = ? AND id = ?`, orgId, id);
+    if (!row) throw notFound('notification suppression', id);
+    return row;
   }
 
   messages(orgId: string, filter: MessageListFilter = {}): NotificationMessage[] {
@@ -886,6 +1110,16 @@ export class Notifications {
     if (!address) {
       throw badRequest('notification_recipient_missing',
         'This notice was suppressed because there was no address for it. Give one to send it now.', 'to');
+    }
+    // A person clicking "send it again" is owed an answer, not a second
+    // suppressed row that looks like the first. Releasing the address is a
+    // deliberate act and this says which entry to release.
+    const blocked = this.suppressionRow(orgId, row.channel === 'sms' ? 'sms' : 'email', address);
+    if (blocked) {
+      throw conflict('notification_address_suppressed',
+        `${blocked.address} is on this workspace’s suppression list, so nothing is written to it. ${blocked.detail} `
+        + `Take it off the list with DELETE /v1/notification-suppressions/${blocked.id} to send to it again.`,
+        { suppression: blocked.id, address: blocked.address, reason: blocked.reason });
     }
     // A resend is a new send, not an edit of the old one: two rows, two
     // timestamps, and the first one keeps saying what happened to it.
@@ -1009,9 +1243,27 @@ export class Notifications {
     return message;
   }
 
+  /**
+   * Tell the payer what the campaign just did.
+   *
+   * Four kinds, because a campaign makes four different decisions and each one
+   * leaves the payer with a different thing to do — or nothing to do. They are
+   * mutually exclusive by construction: the caller sends one notice per
+   * decision, so the last refused attempt no longer produces both a "we will
+   * stop trying" letter and a "we have stopped trying" letter in the same
+   * millisecond.
+   */
   sendDunningNotice(
     orgId: string,
-    input: { invoiceId: string; customerId: string; facts: DunningFacts; kind: 'dunning.payment_failed' | 'dunning.final_notice'; resolution?: string | null },
+    input: {
+      invoiceId: string; customerId: string; facts: DunningFacts; kind: DunningNoticeKind;
+      /** When the hold on a `card_needs_person` campaign runs out. */
+      deadline?: number | null;
+      /** When the money arrived, for a `recovered` campaign. */
+      collectedAt?: number | null;
+      resolution?: string | null;
+      metadata?: Record<string, string>;
+    },
     meta: WriteMeta = {},
   ): NotificationMessage | null {
     const customer = this.ctx.svc.billing?.customer(orgId, input.customerId);
@@ -1022,11 +1274,18 @@ export class Notifications {
     const hosted = to.email ? this.hostedUrl(token) : null;
     const composed = input.kind === 'dunning.final_notice'
       ? dunningFinal(voice, input.facts, to, input.resolution ?? null, hosted)
-      : dunningFailed(voice, input.facts, to, hosted);
+      : input.kind === 'dunning.card_needs_person'
+        ? dunningGaveUp(voice, input.facts, to, input.deadline ?? null, hosted)
+        : input.kind === 'dunning.recovered'
+          ? dunningRecovered(voice, input.facts, to, input.collectedAt ?? this.ctx.now(), hosted)
+          : dunningFailed(voice, input.facts, to, hosted);
     return this.sendComposed(orgId, {
       kind: input.kind, to: to.email, to_name: to.name, customer: input.customerId,
       related: { type: 'invoice', id: input.invoiceId }, composed, token,
-      suppressed: `${to.name} has no billing email on file, so nobody was told the card was declined.`,
+      metadata: input.metadata,
+      suppressed: input.kind === 'dunning.recovered'
+        ? `${to.name} has no billing email on file, so nobody was told the payment went through.`
+        : `${to.name} has no billing email on file, so nobody was told the card was declined.`,
     }, meta);
   }
 
@@ -1035,6 +1294,7 @@ export class Notifications {
     input: {
       kind: string; to: string | null; to_name: string; customer: string | null;
       related: { type: string; id: string }; composed: Composed; token: string; suppressed: string;
+      metadata?: Record<string, string>;
     },
     meta: WriteMeta,
   ): NotificationMessage {
@@ -1050,6 +1310,7 @@ export class Notifications {
       related: input.related,
       suppressed_reason: input.suppressed,
       hosted_token: input.token,
+      metadata: input.metadata,
     }, meta);
   }
 
@@ -1109,6 +1370,37 @@ function describeAttempt(row: AttemptRow): string {
   return row.next_attempt_at
     ? `Attempt ${row.attempt} ${what} in ${took}; the next is ${formatDuration(row.next_attempt_at - row.at, 1)} later.`
     : `Attempt ${row.attempt} ${what} in ${took}, and it was the last one.`;
+}
+
+function suppressionPayload(row: SuppressionRow): SuppressedAddress {
+  return {
+    object: 'notification_suppression',
+    id: row.id,
+    channel: row.channel === 'sms' ? 'sms' : 'email',
+    address: row.address,
+    reason: row.reason === 'complained' ? 'complained' : row.reason === 'manual' ? 'manual' : 'bounced',
+    detail: row.detail,
+    bounces: row.bounces,
+    last_message: row.last_message_id,
+    last_bounce_at: row.last_bounce_at,
+    created: row.created,
+    updated: row.updated,
+  };
+}
+
+/**
+ * End a sentence exactly once. A relay's own reason may or may not be
+ * punctuated, and quoting one inside ours produced "…no mailbox by that name.."
+ * on the first address the demo ever suppressed.
+ */
+const sentence = (text: string): string => {
+  const trimmed = text.trim();
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+};
+
+/** What a message blocked by the list says about itself, in the message's voice. */
+function describeSuppression(row: SuppressionRow): string {
+  return `${row.address} is on this workspace’s suppression list, so nothing was sent to it. ${row.detail}`;
 }
 
 function describeMessage(row: MessageRow): string {

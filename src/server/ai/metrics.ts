@@ -987,6 +987,7 @@ function retentionMetric(input: MetricInput, kind: 'churn' | 'nrr' | 'grr'): Met
     value: scoped,
     count: months,
     groups,
+    ids: retentionEvidence(input, kind),
     perCurrencyOnly: !defined && groups.length > 1,
     source: `${months} completed ${months === 1 ? 'month' : 'months'} of MRR movement`,
     sourceKind: 'subscriptions',
@@ -995,6 +996,41 @@ function retentionMetric(input: MetricInput, kind: 'churn' | 'nrr' | 'grr'): Met
 }
 
 const countOfMonths = (n: number): string => `${n} completed ${n === 1 ? 'month' : 'months'}`;
+
+/** The movements a rate is made of: everything except new business, which no retention measure contains. */
+const RETAINED_MOVEMENTS = ['churn', 'contraction', 'expansion', 'reactivation', 'resumed', 'paused'] as const;
+
+/**
+ * The accounts a retention rate was measured over, largest movement first.
+ *
+ * `revenue.churn` is per-currency totals and names nobody, so every churn and
+ * retention sentence the engine printed arrived with no sources — a rate about
+ * specific accounts with no way for the reader to reach one of them.
+ * `revenue.movement` classifies the same book customer by customer over the
+ * same window, and its movers carry the customer id, so these are the rows
+ * behind the rate rather than a second reading of it.
+ *
+ * Logo churn cites only the logos that churned, because that is its numerator;
+ * a revenue-weighted rate cites every movement in it, which is all of them
+ * except new business. A rate whose movements are empty — nothing churned all
+ * year — honestly cites nothing.
+ */
+function retentionEvidence(input: MetricInput, kind: 'churn' | 'nrr' | 'grr'): string[] {
+  const revenue = input.ctx.svc.revenue;
+  if (!revenue) return [];
+  const wanted: readonly string[] = kind === 'churn' ? ['churn'] : RETAINED_MOVEMENTS;
+  const movers = revenue.movement(input.workspace.orgId, { from: input.window.start, to: input.window.end })
+    .series.flatMap((row) => row.top_movers)
+    .filter((mover) => wanted.includes(mover.kind))
+    .sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
+  const ids: string[] = [];
+  for (const mover of movers) {
+    // The same eight rows of evidence every other metric hands back.
+    if (ids.length >= 8) break;
+    if (!ids.includes(mover.customer)) ids.push(mover.customer);
+  }
+  return ids;
+}
 
 const DEFS: MetricDefinition[] = [
   {

@@ -58,11 +58,25 @@ export function seedNotifications(ctx: Ctx, orgId: string): void {
   replay(ctx, orgId, live.id, 24);
   replay(ctx, orgId, legacy.id, 6);
 
+  // One account's AP mailbox is gone, and the demo has to show what that does.
+  // A workspace where every address works says nothing about the case that
+  // costs money: a payer who is being written to and is not receiving any of
+  // it. The rule goes on the recorded transport, like the dead endpoint above,
+  // so a deployment that installs a real relay is unaffected — and the
+  // suppression that follows is produced by the same bounce path the product
+  // uses, not written here by hand.
+  const open = ctx.svc.billing.invoices(orgId, { status: 'open', limit: 50 });
+  const gone = open.map((invoice) => ctx.svc.billing.customer(orgId, invoice.customer)).find((c) => c?.email);
+  if (gone?.email) {
+    store.recordedMessages()?.bounce(gone.email, `550 5.1.1 no mailbox by that name at ${gone.email.split('@')[1]}.`, 'hard');
+  }
+
   // Every bill still owed must have been sent to somebody, or the receivables
   // book is asking for money nobody was asked for. Accounts with no billing
-  // address on file produce a suppressed record naming the account, which is
-  // the fact the invoice screen should show instead of "sent".
-  for (const invoice of ctx.svc.billing.invoices(orgId, { status: 'open', limit: 50 })) {
+  // address on file — and now the one whose address has stopped accepting mail
+  // — produce a record saying exactly that, naming the account, which is the
+  // fact the invoice screen should show instead of "sent".
+  for (const invoice of open) {
     store.sendInvoice(orgId, invoice.id, { kind: 'invoice.issued' });
   }
 }

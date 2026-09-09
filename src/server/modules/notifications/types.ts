@@ -23,12 +23,81 @@ export type MessageChannel = typeof MESSAGE_CHANNELS[number];
 
 /**
  * `suppressed` is not a failure and must not be filed as one: it is the
- * platform refusing to invent a recipient. A bill for an account with no
- * billing address on file has not been sent, has not bounced, and saying
- * either would be a lie the invoice screen then repeats.
+ * platform declining to write. Either there is no recipient to invent — a bill
+ * for an account with no billing address on file has not been sent, has not
+ * bounced, and saying either would be a lie the invoice screen then repeats —
+ * or there is an address and it is on the suppression list, which is a refusal
+ * with a reason and a date behind it rather than a delivery that went wrong.
  */
 export const MESSAGE_STATUSES = ['sent', 'failed', 'suppressed'] as const;
 export type MessageStatus = typeof MESSAGE_STATUSES[number];
+
+/**
+ * Why an address stopped being written to.
+ *
+ * `bounced` is the receiving server saying the mailbox is not there, or saying
+ * it is unavailable often enough in a row that treating the next one as an
+ * accident stops being honest. `complained` is the recipient reporting the mail
+ * as spam, which is the one signal you must never retry past. `manual` is an
+ * operator's decision, which is the only one a machine may not reverse.
+ */
+/**
+ * The four things a recovery campaign has to say to the person who owes the
+ * money, one per decision the campaign makes.
+ *
+ * They are separate kinds and not one "dunning" notice because they leave the
+ * payer with four different jobs: wait, replace the card, settle it by hand,
+ * or nothing at all. Collapsing the middle two — which is what happened while
+ * a refusal and an exhaustion both produced a decline notice — sent one
+ * customer whose card had simply expired both "we will try again" and "we have
+ * stopped trying" inside the same millisecond.
+ */
+export const DUNNING_NOTICE_KINDS = [
+  'dunning.payment_failed', 'dunning.card_needs_person', 'dunning.final_notice', 'dunning.recovered',
+] as const;
+export type DunningNoticeKind = typeof DUNNING_NOTICE_KINDS[number];
+
+export const SUPPRESSION_REASONS = ['bounced', 'complained', 'manual'] as const;
+export type SuppressionReason = typeof SUPPRESSION_REASONS[number];
+
+/**
+ * An address this workspace has stopped writing to.
+ *
+ * Held as its own row rather than derived from the failed messages, because
+ * the question `send` has to answer is "may I write to this address" and it
+ * has to answer it before it hands anything to a transport. A record that only
+ * says a message failed cannot stop the next one.
+ */
+export interface SuppressedAddress {
+  object: 'notification_suppression';
+  id: string;
+  channel: MessageChannel;
+  /** Normalised: trimmed and lowercased, so one mailbox is one entry. */
+  address: string;
+  reason: SuppressionReason;
+  detail: string;
+  /** How many messages came back before the address went on the list. */
+  bounces: number;
+  /** The message whose bounce put it here, when a bounce did. */
+  last_message: string | null;
+  last_bounce_at: number | null;
+  created: number;
+  updated: number;
+}
+
+export interface SuppressionInput {
+  address: string;
+  channel?: MessageChannel;
+  reason?: SuppressionReason;
+  detail?: string;
+}
+
+export interface SuppressionListFilter {
+  channel?: MessageChannel;
+  reason?: SuppressionReason;
+  address?: string;
+  limit?: number;
+}
 
 /* ------------------------------- endpoints -------------------------------- */
 
@@ -266,6 +335,8 @@ export interface NotificationsOverview {
   endpoints: { total: number; enabled: number; disabled: number };
   deliveries: { pending: number; succeeded: number; failed: number; success_rate: number | null };
   messages: { sent: number; failed: number; suppressed: number };
+  /** Addresses this workspace has stopped writing to, and why. */
+  suppressions: { total: number; bounced: number; complained: number; manual: number };
   /** The transports the platform is wired to right now. */
   transports: { http: string; message: string };
   settings: NotificationSettings;

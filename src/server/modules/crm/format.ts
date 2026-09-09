@@ -31,6 +31,7 @@ const NUMBER_FRACTION_DIGITS = 6;
 export class ValueFormatter {
   private workspace: WorkspaceFormat | null = null;
   private readonly names = new Map<string, string>();
+  private seats: Map<string, string> | null = null;
   private decimal: Intl.NumberFormat | null = null;
 
   constructor(private readonly ctx: Ctx, private readonly orgId: string) {}
@@ -88,12 +89,31 @@ export class ValueFormatter {
     return out;
   }
 
-  /** A teammate's name for their user id. Falls back to the email, then the id. */
+  /**
+   * A teammate's name for their user id, as *this* workspace knows them.
+   *
+   * Read through `core.users`, the service `core.seat` itself answers from, and
+   * never off the `users` table directly. The row in `users` is
+   * the person's own account, shared with every other workspace they belong to,
+   * and what this workspace calls them lives on the membership — so joining the
+   * two here put a name Northwind never typed onto a Northwind timeline: an
+   * owner or assignee chip reading the name the same address uses at another
+   * company. The workspace withholds it on purpose, and a property value
+   * printed for a person is the same claim about them as the Settings screen.
+   *
+   * Someone with no seat here is nobody this workspace can name, so the id is
+   * what is shown rather than the profile behind it.
+   */
   user(id: string): string {
     const cached = this.names.get(`u:${id}`);
     if (cached !== undefined) return cached;
-    const row = this.ctx.db.get<{ name: string; email: string }>(`SELECT name, email FROM users WHERE id = ?`, id);
-    const name = row?.name || row?.email || id;
+    // The whole roster in one read: `core.seat` walks the workspace's people
+    // for each id it is asked about, and a page of a hundred deals owned by six
+    // teammates would walk it six times.
+    if (!this.seats) {
+      this.seats = new Map((this.ctx.svc.core?.users(this.orgId) ?? []).map((seat) => [seat.id, seat.name || seat.email]));
+    }
+    const name = this.seats.get(id) || id;
     this.names.set(`u:${id}`, name);
     return name;
   }

@@ -7,7 +7,10 @@ import v, { type SchemaNode, type Validator } from '../../../shared/validate';
 import { billingStore } from '../billing/module';
 import { assertCurrency } from '../catalog/currencies';
 import type { Invoice } from '../billing/types';
-import { DEFAULT_POLICY, endBehaviorPhrase, type DunningListFilter, type RecoverySummary } from './dunning';
+import {
+  DEFAULT_POLICY, DUNNING_NOTICE_JOB, endBehaviorPhrase,
+  type DunningListFilter, type DunningNoticeJob, type RecoverySummary,
+} from './dunning';
 import type { ChargeListFilter, CollectionResult, IntentListFilter, RefundInput } from './gateway';
 import type { MethodInput, MethodListFilter, MethodUpdateInput } from './methods';
 import { PAYMENTS_MIGRATIONS } from './schema';
@@ -351,6 +354,36 @@ export default defineModule({
 
     ctx.jobs.handle('payments.dunning_retry', (payload: { dunning: string }, job) => {
       store.dunning.runScheduledAttempt(job.org_id, payload.dunning);
+    });
+
+    /**
+     * Tell the payer what the campaign decided.
+     *
+     * A job and not a call inside the campaign's own transaction, for the same
+     * reason the collection is one: a mail relay that is slow, down or async
+     * must not be able to roll back the attempt row that produced the letter,
+     * and a letter that could not be written has to fail somewhere a person
+     * can see it and run it again. The facts travel on the payload, frozen
+     * when the decision was made — see `DunningNoticeJob`.
+     *
+     * `notifications` is optional here on purpose. Payments boots first (that
+     * module depends on this one for its seed order), and a deployment that
+     * leaves the delivery spine out must still be able to collect money; it
+     * simply tells nobody, and the missing service is the honest reason.
+     */
+    ctx.jobs.handle(DUNNING_NOTICE_JOB, (payload: DunningNoticeJob, job) => {
+      const notifications = ctx.svc.notifications;
+      if (!notifications || !payload?.dunning) return;
+      notifications.sendDunningNotice(job.org_id, {
+        invoiceId: payload.invoice,
+        customerId: payload.customer,
+        facts: payload.facts,
+        kind: payload.kind,
+        deadline: payload.deadline,
+        collectedAt: payload.collected_at,
+        resolution: payload.resolution,
+        metadata: { dunning: payload.dunning, attempt: String(payload.facts.attempt) },
+      }, { actorType: 'system' });
     });
 
     ctx.jobs.handle('payments.settle_debit', (payload: { intent: string; charge: string }, job) => {

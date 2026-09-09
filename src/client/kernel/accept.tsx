@@ -7,9 +7,22 @@
  * and every way a link can be dead (used, replaced, cancelled, expired) is one
  * answer the server gives, with the way back written under it.
  *
- * `POST /v1/auth/accept` sets the password *and* starts the session, so there
- * is no second sign-in step: the person lands inside the workspace they were
- * invited to.
+ * `POST /v1/auth/accept` answers the password *and* starts the session, so
+ * there is no second sign-in step: the person lands inside the workspace they
+ * were invited to.
+ *
+ * The password field is the one thing on this screen that cannot be worded
+ * from what the server said, because the server deliberately will not say it.
+ * Accepting an invitation *verifies* an existing Ain credential and only
+ * *enrols* a new one — identity is one row shared across workspaces, so
+ * joining one must never set the credential for the others — and the lookup
+ * answers identically whether or not the address is already known, so that the
+ * link tells its holder nothing about the person it names. This screen
+ * therefore has to ask one question that is true both ways: your Ain password,
+ * the one you already use or the one you are choosing now. Which is why the
+ * field is `current-password` (asking for a new one suppresses the stored
+ * credential the browser would otherwise offer) and why typing it twice is
+ * offered rather than demanded — nobody confirms a password they already have.
  */
 import { useState } from 'react';
 import { Badge, Banner, Button, Card, DescriptionList, Field, Icons, Input, Loading, useFormat } from '../design';
@@ -46,7 +59,10 @@ export function AcceptInvitePage() {
 
   const short = password.length > 0 && password.length < MIN_PASSWORD;
   const mismatch = confirm.length > 0 && confirm !== password;
-  const ready = password.length >= MIN_PASSWORD && confirm === password;
+  // An empty confirmation is not a mismatch. Forcing it made the screen
+  // unusable for exactly the people it now serves first — an address that
+  // already signs in to Ain, typing the password it already has.
+  const ready = password.length >= MIN_PASSWORD && !mismatch;
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -97,7 +113,7 @@ export function AcceptInvitePage() {
             <h2 className="login__title">Accept your invitation</h2>
             <p className="login__lede">
               {invitation.data
-                ? <>Choose a password and you are in — no second sign-in step.</>
+                ? <>Confirm your Ain password and you are in — no second sign-in step.</>
                 : <>The link an admin sent you is checked before you type anything.</>}
             </p>
           </div>
@@ -139,14 +155,14 @@ export function AcceptInvitePage() {
 
               <form className="login__form" onSubmit={submit} style={{ marginTop: 'var(--space-6)' }}>
                 <Field
-                  label="Choose a password"
-                  hint={`At least ${MIN_PASSWORD} characters. It is the only thing that will let you back in.`}
+                  label="Your Ain password"
+                  hint={`The one you already sign in with, or one you choose now if this address is new to Ain. At least ${MIN_PASSWORD} characters.`}
                   error={short ? `At least ${MIN_PASSWORD} characters.` : error?.param === 'password' ? error.body.message : undefined}
                 >
                   <Input
                     type="password"
-                    name="new-password"
-                    autoComplete="new-password"
+                    name="password"
+                    autoComplete="current-password"
                     placeholder="••••••••"
                     value={password}
                     autoFocus
@@ -156,14 +172,18 @@ export function AcceptInvitePage() {
                     onChange={(e) => setPassword(e.target.value)}
                   />
                 </Field>
-                <Field label="Type it again" error={mismatch ? 'The two do not match yet.' : undefined}>
+                <Field
+                  label="Type it again"
+                  optional
+                  hint="Worth doing if you are choosing a password here. Leave it empty if you are typing one you already use."
+                  error={mismatch ? 'The two do not match yet.' : undefined}
+                >
                   <Input
                     type="password"
                     name="confirm-password"
                     autoComplete="new-password"
                     placeholder="••••••••"
                     value={confirm}
-                    required
                     invalid={mismatch}
                     iconLeft={<Icons.lock size={15} />}
                     onChange={(e) => setConfirm(e.target.value)}
@@ -184,7 +204,7 @@ export function AcceptInvitePage() {
           )}
 
           <p className="login__hint">
-            Already set a password? <a href="/login">Sign in instead</a>.
+            Nothing to accept here? <a href="/login">Sign in</a> to a workspace you are already in.
           </p>
         </div>
       </main>

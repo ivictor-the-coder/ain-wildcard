@@ -39,6 +39,8 @@ import { formatMoney, money, rat, ratMul, ratRound } from '../../../shared/money
 import { DAY, HOUR, MINUTE, formatDate, startOfDay } from '../../../shared/time';
 import { billingStore } from '../billing/module';
 import type { Invoice } from '../billing/types';
+import type { DunningFacts } from '../notifications/compose';
+import type { DunningNoticeKind } from '../notifications/types';
 import { hydrateAttempt, hydrateDunning, type Page, type WriteMeta } from './records';
 import { BANK_DEBIT_SETTLEMENT_DAYS, DECLINES, hash32, severityOf } from './simulator';
 import type { Payments } from './store';
@@ -50,6 +52,43 @@ import { DUNNING_END_BEHAVIORS } from './types';
 
 /** The setting key the workspace's retry policy lives under. */
 export const POLICY_KEY = 'payments.dunning_policy';
+
+/**
+ * The job that tells the payer what the campaign just decided.
+ *
+ * It is a job row, enqueued in the same transaction as the decision and beside
+ * the retry row that decision writes, for the reasons everything deferred in
+ * this platform is: it replays under `POST /v1/time/advance` exactly as the
+ * retry does, a transport that is slow or down fails visibly and is retried
+ * rather than vanishing, and the letter cannot roll back the campaign that
+ * produced it. Notices used to be sent from an event handler on the far side
+ * of the module boundary, where `EventBus.dispatch` swallows a throw — so a
+ * notice that could not be composed left no row, no error and nothing to run
+ * again.
+ */
+export const DUNNING_NOTICE_JOB = 'payments.dunning_notice';
+
+/**
+ * What the notice job carries.
+ *
+ * The facts are frozen at the moment the decision was made rather than re-read
+ * when the job runs. A job that runs late — a retried transport, a replay —
+ * must describe the attempt it was queued for, not the state of the campaign
+ * by the time it gets there: "attempt 2 of 4, the next is on the 14th" stops
+ * being true the moment attempt 3 runs.
+ */
+export interface DunningNoticeJob {
+  dunning: string;
+  invoice: string;
+  customer: string;
+  kind: DunningNoticeKind;
+  facts: DunningFacts;
+  /** When the hold on a `card_needs_person` campaign runs out. */
+  deadline: number | null;
+  /** When the money arrived, for a `recovered` campaign. */
+  collected_at: number | null;
+  resolution: string | null;
+}
 
 export const DEFAULT_POLICY: DunningPolicy = {
   retry_days: [3, 5, 7],
@@ -862,6 +901,61 @@ export class DunningEngine {
     });
   }
 
+  /* -------------------------- telling the payer --------------------------- */
+
+  /**
+   * Queue the letter this decision owes the payer.
+   *
+   * Called from the outcome the campaign just recorded, inside the same
+   * transaction, so the letter exists only if the decision committed — and so
+   * that one decision produces exactly one letter. The three that do not get
+   * one are deliberate: a bill on net terms was never going to be charged
+   * automatically and its payer has already been sent the invoice, an attempt
+   * that could not be presented refused nothing so there is nothing to report
+   * about a card, and a part payment is answered by the receipt the invoice
+   * itself sends.
+   */
+  private notify(
+    orgId: string, campaign: Dunning, kind: DunningNoticeKind,
+    over: {
+      attempt?: number; methodId?: string | null; amount?: number;
+      deadline?: number | null; collectedAt?: number | null; resolution?: string | null;
+    } = {},
+  ): void {
+    const invoice = this.billing.invoices.invoice(orgId, campaign.invoice);
+    // The bill this campaign was chasing is gone. A letter quoting an invoice
+    // number that resolves to nothing is worse than saying nothing at all.
+    if (!invoice) return;
+    const attempt = over.attempt ?? campaign.attempt_count;
+    const method = over.methodId ? this.payments.methods.method(orgId, over.methodId) : null;
+    const payload: DunningNoticeJob = {
+      dunning: campaign.id,
+      invoice: campaign.invoice,
+      customer: campaign.customer,
+      kind,
+      facts: {
+        invoice_number: invoice.number,
+        currency: campaign.currency,
+        amount_at_risk: over.amount ?? campaign.amount_at_risk,
+        attempt,
+        max_attempts: campaign.max_attempts,
+        next_attempt_at: campaign.next_attempt_at,
+        failure_message: campaign.last_failure_message,
+        // Which card was refused. Accounts hold more than one often enough
+        // that "your card was declined" is not, on its own, an instruction.
+        card_hint: method?.display_name ?? null,
+      },
+      deadline: over.deadline ?? null,
+      collected_at: over.collectedAt ?? null,
+      resolution: over.resolution ?? null,
+    };
+    this.ctx.enqueue(orgId, DUNNING_NOTICE_JOB, payload, {
+      // One key per decision, so a decision re-made before the queue drains
+      // replaces the letter waiting to go out rather than sending two.
+      idemKey: `${DUNNING_NOTICE_JOB}:${campaign.id}:${kind}:${attempt}`,
+    });
+  }
+
   /* ------------------------------- the outcomes --------------------------- */
 
   private recordFailure(
@@ -933,12 +1027,28 @@ export class DunningEngine {
       this.ctx.enqueue(orgId, 'payments.dunning_retry', { dunning: campaign.id }, {
         runAt: nextAt, idemKey: `payments.dunning_retry:${campaign.id}`,
       });
+      // The letter goes on the queue beside the retry it is about, so the two
+      // halves of one decision — present again on the 14th, tell them so —
+      // replay together and neither can happen without the other.
+      this.notify(orgId, after, 'dunning.payment_failed', {
+        attempt: input.attemptNumber, methodId: input.methodId,
+      });
       return attempt;
     }
     if (hold) {
       this.placeHold(orgId, after, hold, { failure_code: input.failure.code, attempt: attempt.id });
+      // Not the final notice: the retries were dropped, not the bill. A card
+      // added before the hold runs out settles it with nothing else needed,
+      // and the letter has to say that rather than "we have stopped trying".
+      this.notify(orgId, after, 'dunning.card_needs_person', {
+        attempt: input.attemptNumber, methodId: input.methodId, deadline: hold.until,
+      });
       return attempt;
     }
+    // No notice here: `exhaust` sends the final one. This attempt and the
+    // exhaustion it caused are one decision, and telling the payer twice in
+    // the same millisecond — once that the card must be updated, once that we
+    // have given up — is how the two of them used to read.
     this.exhaust(orgId, after, givingUp ? 'decline_is_final' : 'attempts_exhausted', input.failure);
     return attempt;
   }
@@ -1046,6 +1156,12 @@ export class DunningEngine {
     this.ctx.emit(orgId, 'dunning.recovered', after, {
       objectId: campaign.id, objectType: 'dunning', previous: { status: campaign.status },
     });
+    // The payer was written to on every refusal. Saying nothing when the money
+    // finally goes through leaves the last word with the bad news, and leaves
+    // them chasing a balance that is already settled.
+    this.notify(orgId, after, 'dunning.recovered', {
+      attempt: input.attemptNumber, methodId: input.methodId, amount: input.amount, collectedAt: now,
+    });
   }
 
   /**
@@ -1092,6 +1208,11 @@ export class DunningEngine {
       end_behavior: campaign.end_behavior,
       amount_lost: shown,
     }, { objectId: campaign.id, objectType: 'dunning', previous: { status: campaign.status } });
+    // The one letter a recovery must not skip: the money is still owed, no
+    // schedule will ask for it again, and the payer is the only person who can
+    // end it. It carries the campaign's own resolution rather than a rewrite,
+    // so the reason on the record and the reason in the letter are one string.
+    this.notify(orgId, after, 'dunning.final_notice', { resolution });
   }
 
   /**

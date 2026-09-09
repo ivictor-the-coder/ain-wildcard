@@ -3053,3 +3053,172 @@ test('a product and its first price can be written from the price book, in every
   await expect.poll(async () => (await json(page, `/v1/products/${written.id}`)).active).toBe(false);
   await expect(page.getByText('This product is archived')).toBeVisible();
 });
+
+/* ============================ discounts on screen ========================= */
+
+test('the discounts screen shows every coupon, what it takes off, and who redeemed it', async ({ page }) => {
+  await signIn(page);
+  // What is redeemable today, which is what the screen opens on — an archived
+  // campaign is behind the standing filter.
+  const coupons = await json(page, '/v1/coupons?limit=200&active=true');
+  expect(coupons.data.length).toBeGreaterThan(0);
+
+  await page.goto('/catalog/coupons', { waitUntil: 'networkidle' });
+  await expect(page.getByRole('heading', { name: 'Discounts' })).toBeVisible();
+  const rows = page.locator('tbody tr[data-index]');
+  await expect(rows.first()).toBeVisible();
+  // The catalogue writes what a coupon is worth, in the workspace's locale.
+  // The screen prints that sentence rather than arriving at one of its own.
+  const first = coupons.data[0];
+  await expect(page.locator('tbody').getByText(first.summary, { exact: true }).first()).toBeVisible();
+
+  // A coupon somebody has actually taken up, so the redemptions have rows.
+  const redeemed = coupons.data.find((row: { times_redeemed: number }) => row.times_redeemed > 0);
+  test.skip(!redeemed, 'no coupon in this workspace has been redeemed');
+  const takeUp = await json(page, `/v1/coupons/${redeemed.id}/redemptions?limit=50`);
+  const withCustomer = takeUp.data.find((row: { customer: string | null }) => row.customer);
+  const customer = withCustomer ? await json(page, `/v1/customers/${withCustomer.customer}`) : null;
+
+  await page.goto(`/catalog/coupons/${redeemed.id}`, { waitUntil: 'networkidle' });
+  await expect(page.getByRole('heading', { name: redeemed.name })).toBeVisible();
+  // "By whom" means the account's name, not the id every other screen resolves.
+  if (customer) await expect(page.locator('.bl-row').getByText(customer.name, { exact: true }).first()).toBeVisible();
+  // Terms freeze on first redemption, and the screen says so rather than
+  // offering an edit the catalogue will refuse.
+  await expect(page.getByText('Its terms are frozen')).toBeVisible();
+
+  const codes = await json(page, `/v1/promotion_codes?coupon=${redeemed.id}&limit=50`);
+  for (const code of codes.data) {
+    await expect(page.getByText(code.code, { exact: true }).first()).toBeVisible();
+  }
+});
+
+test('a coupon can be created and archived from the discounts screen', async ({ page }) => {
+  await signIn(page);
+  const name = `Trade show — 15% off ${Date.now()}`;
+
+  await page.goto('/catalog/coupons', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'New coupon' }).first().click();
+  const dialog = page.getByRole('dialog', { name: 'New coupon' });
+  await dialog.getByLabel('Coupon name').fill(name);
+  await dialog.getByLabel('Percentage off').fill('15');
+  await dialog.getByLabel('For how long').selectOption('repeating');
+  await dialog.getByLabel('Billing periods').fill('6');
+  await dialog.getByLabel('Redemption ceiling').fill('25');
+  await dialog.getByRole('button', { name: 'Create the coupon' }).click();
+
+  // It lands on the record it wrote, and the workspace agrees with every term.
+  await expect(page.getByRole('heading', { name })).toBeVisible();
+  const written = (await json(page, `/v1/coupons?query=${encodeURIComponent('15%')}&limit=50`))
+    .data.find((row: { name: string }) => row.name === name);
+  expect(written).toBeTruthy();
+  // 15% is 1500 hundredths of a percent — the figure the arithmetic reads,
+  // never a float the catalogue would have to round.
+  expect(written.percent_off_basis_points).toBe(1500);
+  expect(written.amount_off).toBe(null);
+  expect(written.currency).toBe(null);
+  expect(written.duration).toBe('repeating');
+  expect(written.duration_in_periods).toBe(6);
+  expect(written.max_redemptions).toBe(25);
+  expect(written.active).toBe(true);
+  await expect(page.getByText('25 of 25 left')).toBeVisible();
+
+  // A code is the customer-facing half, and it carries its own restrictions.
+  await page.getByRole('button', { name: 'Add a code' }).first().click();
+  const codeDialog = page.getByRole('dialog', { name: new RegExp('Add a code to') });
+  const code = `SHOW${Date.now()}`.slice(0, 20);
+  await codeDialog.getByLabel('Code', { exact: true }).fill(code);
+  await codeDialog.getByLabel('Per account').fill('1');
+  await codeDialog.getByRole('button', { name: 'Create the code' }).click();
+  await expect(page.getByText(code, { exact: true }).first()).toBeVisible();
+  const codes = await json(page, `/v1/promotion_codes?coupon=${written.id}&limit=10`);
+  expect(codes.data[0].code).toBe(code.toUpperCase());
+  expect(codes.data[0].max_redemptions_per_customer).toBe(1);
+
+  // Archiving is how a campaign is withdrawn: the invoices it cut have to keep
+  // explaining themselves, so nothing is deleted.
+  await page.getByRole('button', { name: 'More coupon actions' }).click();
+  await page.getByRole('menuitem', { name: 'Archive it' }).click();
+  await expect.poll(async () => (await json(page, `/v1/coupons/${written.id}`)).active).toBe(false);
+  await expect(page.getByText('This coupon cannot be redeemed')).toBeVisible();
+});
+
+/* ========================= the next-invoice estimate ====================== */
+
+/**
+ * The panel prints an estimate the summary computes from six figures. It used
+ * to render three of them, so on a usage-priced account the rows above the
+ * total came to a fraction of it and nothing on screen said why.
+ */
+test('the next-invoice panel’s rows add up to the estimate it prints', async ({ page }) => {
+  await signIn(page);
+  const customers = await json(page, '/v1/customers?limit=60');
+  let account: { id: string; name: string } | null = null;
+  let next: Record<string, number> | null = null;
+  for (const row of customers.data as { id: string; name: string }[]) {
+    const summary = await json(page, `/v1/customers/${row.id}/summary`);
+    const estimate = summary.next_invoice;
+    if (!estimate) continue;
+    if (estimate.settled_usage_total === 0 && estimate.discount_total === 0 && estimate.tax === 0) continue;
+    // A booked schedule phase is quoted from the corrected preview instead, in
+    // a different card; this is about the summary's own panel.
+    if (summary.subscriptions.data.some((sub: { id: string; schedule: string | null }) =>
+      sub.id === estimate.subscription && sub.schedule)) continue;
+    account = row;
+    next = estimate;
+    break;
+  }
+  test.skip(!account || !next, 'no account carries usage, a discount or tax on its next bill');
+
+  await page.goto(`/billing/customers/${account!.id}`, { waitUntil: 'networkidle' });
+  const card = page.locator('.ain-card').filter({ hasText: 'Estimated total' }).first();
+  await expect(card).toBeVisible();
+
+  const money = (text: string): number => Math.round(Number(text.replace(/[^0-9.-]/g, '')) * 100);
+  const values = await card.locator('.bl-total:not(.bl-total--grand) .bl-total__value').allTextContents();
+  const grand = await card.locator('.bl-total--grand .bl-total__value').innerText();
+  expect(values.length).toBeGreaterThan(0);
+  // Every term on screen, summed the way the server sums them to reach the
+  // figure printed under them.
+  expect(values.reduce((total, text) => total + money(text), 0)).toBe(money(grand));
+  expect(money(grand)).toBe(next!.estimated_total);
+
+  if (next!.settled_usage_total !== 0) {
+    const usage = card.locator('.bl-total', { hasText: 'Metered usage already settled' });
+    await expect(usage).toBeVisible();
+    expect(money(await usage.locator('.bl-total__value').innerText())).toBe(next!.settled_usage_total);
+  }
+  // And the note under it says what the figure was priced on.
+  await expect(card.locator('.bl-total__note')).toContainText('Priced on');
+});
+
+/* ========================= accepting an invitation ======================== */
+
+test('an invitation is accepted by typing the Ain password once', async ({ page }) => {
+  await signIn(page);
+  const email = `joiner.${Date.now()}@northwind.io`;
+  const seat = await post(page, '/v1/users', { email, name: 'Wave Three Joiner', role: 'member' });
+  expect(seat.status).toBe('invited');
+
+  await page.goto(`/accept?token=${seat.invitation.token}`, { waitUntil: 'networkidle' });
+  await expect(page.getByRole('heading', { name: 'Accept your invitation' })).toBeVisible();
+  await expect(page.getByText(email)).toBeVisible();
+
+  // Acceptance verifies an existing Ain credential and only enrols a new one,
+  // so the field asks for the password the person has rather than one chosen
+  // here — and typing it a second time is offered, never demanded. The field
+  // is reached by its type rather than its label, so the gate below is tested
+  // as behaviour rather than as wording.
+  await page.locator('input[type=password]').first().fill('joins-once-1234');
+  const join = page.getByRole('button', { name: /Join / });
+  await expect(join).toBeEnabled();
+  await expect(page.getByText('Your Ain password', { exact: true })).toBeVisible();
+  await join.click();
+
+  // The route hands back a live session, so the person lands inside.
+  await page.waitForSelector('.ain-stat');
+  await expect.poll(async () => {
+    const users = await json(page, '/v1/users');
+    return users.data.find((row: { email: string }) => row.email === email)?.status;
+  }).toBe('active');
+});

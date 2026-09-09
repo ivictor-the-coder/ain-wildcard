@@ -209,6 +209,12 @@
   font-weight: var(--weight-semibold);
 }
 .bl-total--grand .bl-total__label { color: var(--text-primary); }
+.bl-total__note {
+  margin: var(--space-4) 0 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-relaxed);
+  color: var(--text-tertiary);
+}
 
 .bl-duenow {
   display: flex;

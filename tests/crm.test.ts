@@ -2,6 +2,7 @@ import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createApp, type App } from '../src/server/app';
 import { crmEngine } from '../src/server/modules/crm/module';
+import { ValueFormatter } from '../src/server/modules/crm/format';
 import type { Auth } from '../src/server/kernel/http';
 import type { CrmRecord, FilterNode } from '../src/server/modules/crm/types';
 
@@ -2933,5 +2934,98 @@ describe('one definition of a canonical value, shared by both sides', () => {
     assert.equal(upsert.updated, 1, 'the server matched the existing company');
     assert.equal(upsert.created, 0);
     assert.equal(upsert.results[0].id, company.id);
+  });
+});
+
+/* ------------- a person is named by this workspace's seat, not their account ------------- */
+
+/**
+ * A record's owner is a user id, and the id is resolved to a name by
+ * `ValueFormatter`. The row in `users` is the person's own account, shared with
+ * every other workspace they belong to; what *this* workspace calls them lives
+ * on the membership. Reading the account here put a name Northwind never typed
+ * onto a Northwind record — on the timeline, in the history of the reassignment
+ * and in what the copilot's `search_records` quotes back — so the formatter goes
+ * through `core.seat` like every other reader of a teammate's name.
+ */
+describe('a teammate on a record is named by the seat, never by the account behind it', () => {
+  /** What the person's own Ain account is called, somewhere that is not Northwind. */
+  const ACCOUNT_NAME = 'Renata Oyelaran-Whitfield';
+  const SEAT_NAME = 'R. Oyelaran';
+  const EMAIL = 'renata@elsewhere.example';
+
+  let own: App;
+  let seatId: string;
+  let token: string;
+  let deal: CrmRecord;
+
+  const mine = (method: string, path: string, body?: unknown) => own.handle({ method, path, body, auth: DANA });
+
+  async function okOn(method: string, path: string, body?: unknown): Promise<any> {
+    const res = await mine(method, path, body);
+    assert.ok(res.status < 400, `${method} ${path} → ${res.status} ${JSON.stringify(res.body)}`);
+    return res.body;
+  }
+
+  before(async () => {
+    // Its own workspace: this suite counts the people in the shared one.
+    own = await createApp({ db: 'memory', config: { env: 'test' } });
+    // The account already exists, created by whichever workspace invited them
+    // first. Northwind never typed this name and must never read it back.
+    own.db.insert('users', {
+      id: 'usr_elsewhere', email: EMAIL, name: ACCOUNT_NAME, avatar_url: null,
+      title: 'Head of Revenue, Elsewhere GmbH', password_hash: null,
+      created: own.ctx.now(), updated: own.ctx.now(), last_seen: null,
+    });
+    const invited = await okOn('POST', '/v1/users', { email: EMAIL, name: SEAT_NAME, role: 'member', title: 'Account executive' });
+    seatId = invited.id;
+    token = invited.invitation.token;
+    deal = (await okOn('GET', '/v1/records/deal?limit=1')).data[0] as CrmRecord;
+  });
+
+  after(() => own.close());
+
+  const formatter = () => new ValueFormatter(own.ctx, ORG);
+
+  test('an invited seat reads as what the invite dialog typed, not the profile behind it', () => {
+    assert.equal(own.ctx.svc.core.seat(ORG, seatId)?.status, 'invited', 'fixture: the seat is still invited');
+    assert.equal(formatter().user(seatId), SEAT_NAME);
+  });
+
+  test('a user id this workspace holds no seat for is not a name it can print', () => {
+    own.db.insert('users', {
+      id: 'usr_stranger', email: 'stranger@elsewhere.example', name: 'Someone Else Entirely', avatar_url: null,
+      title: null, password_hash: null, created: own.ctx.now(), updated: own.ctx.now(), last_seen: null,
+    });
+    assert.equal(formatter().user('usr_stranger'), 'usr_stranger', 'no membership here, so nothing about them to read');
+  });
+
+  test('an accepted seat reads as the name this workspace typed', async () => {
+    const accepted = await own.handle({ method: 'POST', path: '/v1/auth/accept', body: { token, password: 'demo1234' } });
+    assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+    assert.equal(own.ctx.svc.core.seat(ORG, seatId)?.name, SEAT_NAME, 'fixture: the seat carries the workspace name');
+    assert.equal(formatter().user(seatId), SEAT_NAME);
+  });
+
+  test('a reassignment writes the seat name into the record history, not the account name', async () => {
+    const before = await okOn('GET', `/v1/records/deal/${deal.id}`);
+    await okOn('PATCH', `/v1/records/deal/${deal.id}`, { owner_id: seatId });
+    const history = await okOn('GET', `/v1/records/deal/${deal.id}/history`);
+    const entry = (history.data as { property: string; to_value: string | null; to_display: string | null; from_display: string | null }[])
+      .find((row) => row.property === 'owner_id' && row.to_value === seatId);
+    assert.ok(entry, `the reassignment is on the record's history:\n${JSON.stringify(history.data).slice(0, 400)}`);
+    assert.equal(entry!.to_display, SEAT_NAME);
+    // The reverse direction of the same read: the teammate the deal came from
+    // is a seat too, and its own name is what the "from" side has to print.
+    if (before.owner_id) {
+      assert.equal(entry!.from_display, own.ctx.svc.core.seat(ORG, before.owner_id)?.name);
+    }
+  });
+
+  test('nothing a record can print carries the account\'s own name', async () => {
+    const record = await okOn('GET', `/v1/records/deal/${deal.id}?expand=history,timeline`);
+    const printed = JSON.stringify(record) + JSON.stringify(await okOn('GET', `/v1/records/deal/${deal.id}/history`));
+    assert.ok(!printed.includes(ACCOUNT_NAME), `the account's own profile is none of this workspace's business:\n${ACCOUNT_NAME}`);
+    assert.ok(!printed.includes('Elsewhere GmbH'), 'nor the title it carries there');
   });
 });

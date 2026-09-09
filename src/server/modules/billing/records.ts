@@ -90,6 +90,14 @@ export interface SubscriptionCreateInput {
   cancel_at?: number | null;
   description?: string | null;
   metadata?: Record<string, string>;
+  /**
+   * A concession fastened to the contract at the moment it is signed, so the
+   * very first bill carries it. Stripe's shape, and the reason it is here
+   * rather than only on a route of its own: attaching a coupon a moment after
+   * the subscription exists means the first invoice went out at list price.
+   */
+  coupon?: string | null;
+  promotion_code?: string | null;
   /** Set by a subscription schedule that owns this subscription. */
   schedule?: string | null;
 }
@@ -522,6 +530,7 @@ export function hydrateInvoiceLine(row: any): InvoiceLine {
       ? null
       : { numerator: Number(numerator), denominator: Number(denominator) },
     breakdown: parseJson<InvoiceLine['breakdown']>(row.breakdown, []),
+    discount_amount: Number(row.discount_amount ?? 0),
     taxes,
     tax: rollUpLineTax(taxes),
     released: asBool(row.released),
@@ -693,6 +702,8 @@ export function hydrateInvoice(row: any, lines: InvoiceLine[], automaticTaxEnabl
     tax: Number(row.tax ?? 0),
     total_taxes: taxSummaryOf(lines),
     automatic_tax: automaticTax,
+    discount: (row.discount_id as string | null) ?? null,
+    discount_amount: Number(row.discount_amount ?? 0),
     balance_applied: Number(row.balance_applied),
     total: Number(row.total),
     total_excluding_tax: Number(row.total) - Number(row.tax ?? 0),

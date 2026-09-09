@@ -117,6 +117,7 @@ const KIND_LABEL: Record<InvoiceLine['kind'], string> = {
   true_up: 'Usage true-up',
   included_allowance: 'Included in the plan',
   invoice_item: 'Added by hand',
+  discount: 'Discount',
 };
 
 /** 'Grand Rapids, Michigan 49504' — how a postal address is actually written. */
@@ -397,6 +398,16 @@ function totals(invoice: Invoice, show: (n: number) => string): string {
     ['Tax', show(invoice.tax), false],
     ['Total', show(invoice.total), true],
   ];
+  // The discount is already inside the subtotal — it is a line, which is what
+  // makes the tax below it a tax on the discounted base — so what the document
+  // owes the reader is the two figures that add up to it, not a third
+  // subtraction underneath.
+  if (invoice.discount_amount !== 0) {
+    rows.splice(0, 0,
+      ['Charges before discount', show(invoice.subtotal + invoice.discount_amount), false],
+      ['Discount', `-${show(invoice.discount_amount)}`, false],
+    );
+  }
   if (invoice.balance_applied !== 0) {
     // A bill whose lines are worth less than nothing — a mid-cycle downgrade,
     // a cancellation — is money going the other way. It is not "carried

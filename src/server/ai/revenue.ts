@@ -346,8 +346,18 @@ export function renderAgeing(result: CollectionsToolResult, workspace: Workspace
 
 /* -------------------------------- summary -------------------------------- */
 
-/** The revenue half of the business, per currency, over the months the tool was asked for. */
-export function renderRevenueSummary(result: SummaryToolResult, months: number, workspace: WorkspaceProfile): Rendered {
+/**
+ * The revenue half of the business, per currency, over the months the tool was
+ * asked for.
+ *
+ * `evidence` is the accounts the MRR is measured over, for the same reason the
+ * collections sentences take one: `revenue_summary` answers in per-currency
+ * totals and names no row, so "MRR $43,880.86 across 18 accounts" arrived with
+ * an empty `citations` — the engine's own published example, measuring a set of
+ * twenty-five accounts and naming none of them, under a surface that promises
+ * it cites every record it used.
+ */
+export function renderRevenueSummary(result: SummaryToolResult, months: number, workspace: WorkspaceProfile, evidence: Citation[] = []): Rendered {
   const books = bookOrder(result.by_currency, workspace);
   if (!books.length) return { content: 'There is no recurring revenue to summarise: no subscription carries MRR.', citations: [], facts: { ...NO_FACTS, unit: 'money', count: 0, label: 'Revenue summary' } };
   const lines = books.map((book) =>
@@ -360,7 +370,7 @@ export function renderRevenueSummary(result: SummaryToolResult, months: number, 
   const single = books.length === 1 ? books[0] : null;
   return {
     content: [head, lines.join('\n'), [basis, caveat].filter(Boolean).join(' ')].filter(Boolean).join('\n\n'),
-    citations: [],
+    citations: evidence,
     facts: { ...NO_FACTS, unit: 'money', label: 'MRR', mixed: books.length > 1, value: single?.mrr ?? null, formatted: single?.mrr_display ?? null, currency: single?.currency ?? null, count: books.reduce((sum, b) => sum + b.accounts, 0) },
   };
 }

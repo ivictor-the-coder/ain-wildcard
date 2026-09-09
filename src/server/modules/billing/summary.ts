@@ -115,6 +115,15 @@ export interface NextInvoicePreview {
    * bill?" — carries it too rather than quoting a plan fee as the answer.
    */
   settled_usage_total: number;
+  /** The discount that will govern this bill, or null when none will. */
+  discount: string | null;
+  /**
+   * Positive minor units the discount takes off the taxable base of the three
+   * totals above. Already subtracted from `estimated_total`, and a further
+   * subtraction from `subtotal + uninvoiced_total + settled_usage_total`, which
+   * are what those lines are worth before the coupon.
+   */
+  discount_total: number;
   /**
    * The tax the bill this predicts will actually charge, worked out by the same
    * call `issue()` makes. A next-invoice figure with the tax left out is short
@@ -229,6 +238,9 @@ export function buildCustomerSummary(
   let mrr = 0;
   for (const sub of subs) {
     byStatus[sub.status] = (byStatus[sub.status] ?? 0) + 1;
+    // Net of whatever concession is still running: the summary quotes MRR to a
+    // support agent, and a figure that ignored the 20% the customer negotiated
+    // is the one number on that screen they would be corrected on.
     if (countsAsRevenue(sub.status)) mrr += subscriptionMrr(sub, book);
   }
   const live = subs.filter((s) => !isTerminal(s.status));
@@ -355,19 +367,29 @@ export function buildCustomerSummary(
     // through the store's one reader, so this panel and the upcoming invoice
     // cannot come to name different lines.
     const usage = billing.settledUsageDrafts(orgId, upcoming);
-    const taxed = billing.invoices.taxDrafts(orgId, customer, [...recurring, ...prorated, ...usage]);
-    const subtotal = taxed.slice(0, recurring.length).reduce((total, line) => total + line.amount, 0);
+    // The discount governing the period that bill covers — which is not
+    // necessarily the one governing today: a concession in its last month is
+    // running now and gone by the bill this panel predicts.
+    const discount = billing.discounts.context(orgId, customer.id, upcoming.id, period);
+    const taxed = billing.invoices.taxDrafts(orgId, customer, [...recurring, ...prorated, ...usage], discount);
+    // The discount is appended after the lines it came off, so the three slices
+    // below still name the three sources; taking it off the end first is what
+    // keeps a coupon from being counted as settled usage.
+    const sources = taxed.slice(0, recurring.length + prorated.length + usage.length);
+    const discountLine = taxed.length > sources.length ? taxed[taxed.length - 1] : null;
+    const subtotal = sources.slice(0, recurring.length).reduce((total, line) => total + line.amount, 0);
     // What the waiting items will be worth *on the bill*. `uninvoiced_items`
     // below still reports what the ledger holds; this is the same money after
     // an inclusive price has had its tax taken out of it.
-    const uninvoicedOnBill = taxed.slice(recurring.length, recurring.length + prorated.length)
+    const uninvoicedOnBill = sources.slice(recurring.length, recurring.length + prorated.length)
       .reduce((total, line) => total + line.amount, 0);
-    const settledUsage = taxed.slice(recurring.length + prorated.length).reduce((total, line) => total + line.amount, 0);
+    const settledUsage = sources.slice(recurring.length + prorated.length).reduce((total, line) => total + line.amount, 0);
+    const discountTotal = discountLine ? -discountLine.amount : 0;
     const tax = taxed.reduce((total, line) => total + line.tax.amount, 0);
     // What the lines are worth with their tax on them. For an exclusive price
     // that is the amount plus the tax; for an inclusive one the tax came out of
     // the amount, so the two halves add back up to the listed price either way.
-    const gross = subtotal + uninvoicedOnBill + settledUsage + tax;
+    const gross = subtotal + uninvoicedOnBill + settledUsage - discountTotal + tax;
     // `Invoices.issue()`'s own formula, not a second one that agrees on the
     // easy cases. Both invariants fall out of it: the bill never goes below
     // zero, and whatever the lines and the balance cannot settle between them
@@ -392,6 +414,8 @@ export function buildCustomerSummary(
       subtotal,
       uninvoiced_total: uninvoicedOnBill,
       settled_usage_total: settledUsage,
+      discount: discountLine ? discount?.discount.id ?? null : null,
+      discount_total: discountTotal,
       tax,
       automatic_tax: automaticTax,
       balance_applied: balanceApplied,

@@ -1828,15 +1828,14 @@ describe('an answer measured over a set of records names those records', () => {
    * check. So a shape whose answer counted something has to hand back some of
    * what it counted.
    *
-   * The one exception is not a judgement call — the loop proves it. The
-   * revenue summary reads `revenue_summary`, which publishes one row per
-   * currency book and nothing that identifies an account; a shape can only
-   * cite ids its tool handed it, and the assertion is that this tool hands
-   * back none. The day it carries a row id, this test fails and the shape has
-   * to cite it.
+   * There is no exception list. `revenue-summary` used to be one, on the
+   * grounds that a shape can only cite ids its own tool handed it — and
+   * `revenue_summary` publishes one row per currency book and nothing that
+   * identifies an account. That is a fact about the tool, not about the
+   * workspace: the ageing shapes had the same problem and read their bills
+   * from `receivables.ts`, and the summary now reads its accounts from
+   * `revenue.accounts`, which walks the book its own figures come from.
    */
-  const NO_ROW_IDENTITY = new Set(['revenue-summary']);
-
   test('every published shape whose answer counted rows cites some of them', async () => {
     const published = await app.handle({ method: 'GET', path: '/v1/ai/templates', auth: DANA });
     const shapes = published.body.data as { id: string; kind: string; example: string | null }[];
@@ -1849,11 +1848,6 @@ describe('an answer measured over a set of records names those records', () => {
       const facts = body.analysis.facts as { count: number | null; rows: { id: string; label: string }[] } | null;
       const counted = facts?.count ?? 0;
       const cited = (body.citations as unknown[]).length;
-      if (NO_ROW_IDENTITY.has(shape.id)) {
-        const identified = (facts?.rows ?? []).filter((row) => row.id !== row.label);
-        assert.deepEqual(identified, [], `${shape.id}'s tool now names rows by id, so the shape must cite them`);
-        continue;
-      }
       if (counted > 0 && cited === 0) silent.push(`${shape.id}: "${shape.example}" counted ${counted} rows and cited none of them`);
     }
     assert.deepEqual(silent, [], `${silent.length} shapes measure a set and name nothing in it:\n${silent.join('\n')}`);
@@ -1934,6 +1928,80 @@ describe('an answer measured over a set of records names those records', () => {
       // exact match on the ledger — never from the name it printed.
       assert.equal(customerName(citation.id), citation.label, `${citation.id} is the billing customer called ${citation.label}`);
       assert.ok(String(body.content).includes(citation.label), `${citation.label} is one of the accounts the answer names`);
+    }
+  });
+
+  /**
+   * The accounts carrying recurring revenue right now, per currency book, from
+   * the subscription ledger rather than from the revenue module's own read of
+   * it — so the expected set is arrived at by arithmetic the answer does not
+   * run. This is `recurringBooks` split by customer instead of summed.
+   */
+  function recurringAccounts(): Map<string, Set<string>> {
+    const billing = app.ctx.svc.billing!;
+    const books = new Map<string, Set<string>>();
+    for (const sub of billing.subscriptions(ORG, { status: 'all', limit: 500 })) {
+      if (billing.mrr(ORG, sub) <= 0) continue;
+      const currency = (sub.currency || 'usd').toLowerCase();
+      const held = books.get(currency) ?? new Set<string>();
+      held.add(sub.customer);
+      books.set(currency, held);
+    }
+    return books;
+  }
+
+  test('the revenue summary cites the accounts its MRR is measured over, one book at a time', async () => {
+    const books = recurringAccounts();
+    assert.ok(books.size > 1, `fixture: recurring revenue is held in ${books.size} currency books`);
+    const everyone = new Set([...books.values()].flatMap((set) => [...set]));
+
+    tick();
+    const body = await ask('How is the business doing?');
+    assert.equal(body.analysis.template?.id, 'revenue-summary', body.analysis.refusal?.why ?? body.content);
+    const cited = body.citations as { id: string; label: string; type: string }[];
+    assert.equal(cited.length, Math.min(everyone.size, 8), `it names as many of the ${everyone.size} accounts as a citation list holds`);
+    for (const citation of cited) {
+      assert.equal(citation.type, 'customer');
+      assert.ok(everyone.has(citation.id), `${citation.label} (${citation.id}) carries recurring revenue`);
+      assert.equal(customerName(citation.id), citation.label, `${citation.id} is the billing customer called ${citation.label}`);
+    }
+    assert.equal(new Set(cited.map((c) => c.id)).size, cited.length, 'no account is cited twice');
+    // The answer states a line per currency, so every book it states has an
+    // account under it: a single top-eight by raw minor units would fill with
+    // the workspace's own currency and leave the other lines unopenable.
+    for (const [currency, accounts] of books) {
+      assert.ok(
+        cited.some((c) => accounts.has(c.id)),
+        `the ${currency.toUpperCase()} line names ${accounts.size} accounts and cites none of them:\n${body.content}`,
+      );
+    }
+  });
+
+  test('a retention rate cites the accounts whose MRR moved, and never one that only signed', async () => {
+    const window = YEAR(2025);
+    const moved = await app.handle({
+      method: 'GET', path: '/v1/revenue/movement', query: { from: String(window.start), to: String(window.end) }, auth: DANA,
+    });
+    assert.equal(moved.status, 200, JSON.stringify(moved.body).slice(0, 200));
+    const movers = (moved.body.series as { top_movers: { customer: string; kind: string }[] }[]).flatMap((row) => row.top_movers);
+    const retained = new Set(movers.filter((m) => m.kind !== 'new').map((m) => m.customer));
+    const onlyNew = new Set(movers.filter((m) => m.kind === 'new').map((m) => m.customer));
+    for (const id of retained) onlyNew.delete(id);
+    assert.ok(retained.size > 0, 'fixture: accounts expanded or contracted in 2025');
+    assert.ok(onlyNew.size > 0, 'fixture: other accounts only signed in 2025');
+
+    tick();
+    const body = await ask('What was our net revenue retention in 2025?');
+    assert.equal(body.analysis.template?.id, 'metric-period', body.analysis.refusal?.why ?? body.content);
+    const cited = body.citations as { id: string; label: string; type: string }[];
+    assert.ok(cited.length > 0, `a rate weighted over the movement of ${retained.size} accounts names some of them:\n${body.content}`);
+    for (const citation of cited) {
+      assert.equal(citation.type, 'customer');
+      assert.ok(retained.has(citation.id), `${citation.label} (${citation.id}) moved MRR inside 2025`);
+      assert.equal(customerName(citation.id), citation.label);
+      // New business is the one movement no retention measure contains, so an
+      // account that did nothing in the year but sign is not evidence for it.
+      assert.ok(!onlyNew.has(citation.id), `${citation.label} only signed in 2025, and new business is never in retention`);
     }
   });
 

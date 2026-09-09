@@ -7109,3 +7109,410 @@ describe('one definition of what is outstanding', () => {
       'nobody is chased over a bill that is still inside its terms');
   });
 });
+
+/* ========================================================================== *
+ * 15. Discounts through billing
+ * ========================================================================== */
+
+describe('a discount on the bill', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 3, 1)); });
+  after(() => ws.close());
+
+  /** Half up, the one rounding this platform does, computed here rather than read off the code. */
+  const halfUp = (value: number): number => Math.sign(value) * Math.round(Math.abs(value));
+
+  const discountLineOf = (invoice: Invoice): InvoiceLine | undefined =>
+    invoice.lines.find((line) => line.kind === 'discount');
+
+  const latestFor = async (subscription: string): Promise<Invoice> => {
+    const invoices = await allInvoices(ws, `&subscription=${subscription}`);
+    assert.ok(invoices.length, `no invoice for ${subscription}`);
+    return invoices[0];
+  };
+
+  const coupon = (over: Record<string, unknown>) =>
+    ws.ok('POST', '/v1/coupons', { duration: 'forever', ...over });
+
+  test('a percentage comes off before tax, as its own line, and the rate is charged on what is left', async () => {
+    // New York's rate is already on the register this workspace seeds; the
+    // figures below are computed from it rather than from a literal.
+    const NY = 4 / 100;
+    const customer = await ws.customer('Hudson Valley Fabrication', {
+      address: { line1: '11 Wall Street', city: 'New York', state: 'New York', postal_code: '10005', country: 'United States' },
+    });
+    const twenty = await coupon({ name: 'Twenty off, always', percent_off: 20 });
+
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], coupon: twenty.id,
+    });
+    const invoice = await latestFor(sub.id);
+
+    // Longhand, from the list price and the registered rate:
+    //   20% of 49,900 = 9,980 exactly, so the base is 39,920.
+    //   4% of 39,920 = 1,596.80 → 1,597 (half up, once).
+    //   4% of 49,900 = 1,996, so the discount removes 399 of tax.
+    const line = discountLineOf(invoice);
+    assert.ok(line, `the bill carries a discount line: ${JSON.stringify(invoice.lines.map(shapeOf))}`);
+    assert.equal(line.amount, -Math.round(GROWTH * 0.20));
+    assert.equal(invoice.subtotal, GROWTH - Math.round(GROWTH * 0.20), 'the subtotal is the reduced taxable base');
+    assert.equal(invoice.discount_amount, Math.round(GROWTH * 0.20));
+    assert.equal(invoice.discount, (await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).discount.id);
+
+    // The claim that makes this "before tax" rather than "beside it": the tax
+    // on the document is the tax on the discounted base, to the minor unit.
+    assert.equal(invoice.tax, halfUp(invoice.subtotal * NY));
+    assert.equal(line.tax.amount, halfUp(invoice.subtotal * NY) - halfUp(GROWTH * NY));
+    assert.equal(sumLines(invoice), invoice.subtotal);
+    assert.equal(sumTax(invoice), invoice.tax);
+    assert.equal(invoice.subtotal + invoice.tax + invoice.balance_applied, invoice.total);
+
+    // The line reconstructs its own number, the way every other line here does.
+    assert.match(line.explanation, /20% off/);
+    assert.match(line.explanation, new RegExp(formatMoney(money(GROWTH, 'usd'), {}).replace(/[$.]/g, '\\$&')));
+    assert.match(line.explanation, /before tax/);
+  });
+
+  test('a tax-inclusive price is discounted on the price the customer was quoted, not on the base under it', async () => {
+    // The case where "a negative invoice item taxed as a negative line" gives a
+    // different answer: 20% off a €120.00 inclusive line is €24.00 off the
+    // listed price, leaving €96.00 to pay. Taxing −24.00 as its own exclusive
+    // line would take 24.00 off the base and 5.52 off the tax — €90.48 — for a
+    // customer who was promised €96.00.
+    const IE = 23;
+    const product = (await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly')).data[0].product;
+    const inclusive = await ws.ok('POST', '/v1/prices', {
+      product, currency: 'eur', model: 'flat', unit_amount: 12_000, nickname: 'Dublin all-in',
+      lookup_key: 'eur_inclusive_month', recurring: { interval: 'month' }, tax_behavior: 'inclusive',
+    });
+    const customer = await ws.customer('Shannon Robotics', {
+      currency: 'eur', address: { line1: '1 Grand Canal Square', city: 'Dublin', country: 'IE' },
+    });
+    const twenty = await coupon({ name: 'Twenty off, always', percent_off: 20 });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: inclusive.id }], coupon: twenty.id,
+    });
+    const invoice = await latestFor(sub.id);
+
+    const listed = 12_000;
+    const off = Math.round(listed * 0.20);
+    assert.equal(invoice.subtotal + invoice.tax, listed - off,
+      'what the customer pays is the listed price less the discount, exactly');
+    // 96.00 gross at 23% inclusive is 78.05 + 17.95, and the tax is rounded once.
+    assert.equal(invoice.tax, halfUp((listed - off) * IE / (100 + IE)));
+    assert.equal(invoice.subtotal, listed - off - invoice.tax);
+    const line = discountLineOf(invoice);
+    assert.ok(line);
+    assert.equal(line.amount + line.tax.amount, -off, 'the discount line is the listed reduction, tax and all');
+    assert.equal(line.tax.behavior, 'inclusive');
+  });
+
+  test('a held draft priced again at finalisation keeps the discount before the tax', async () => {
+    // The draft is drawn against an address that could not be placed, so
+    // nothing on it is taxed; the missing state arrives, and finalisation
+    // prices the whole document again. Re-splitting the discount line on its
+    // own at that point taxes −$24.00 as an exclusive line — the untaxed draft
+    // carries no behaviour for it to honour — and bills $94.62 for a customer
+    // quoted $96.00, which is the negative-invoice-item mistake one step later.
+    const OHIO = 5.75;
+    const listed = 12_000;
+    const off = listed * 0.20;
+    // The demo workspace ships with the tax-location hold off; this test is
+    // about what happens to a held draft, so it turns it on and back again.
+    await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: true });
+    const product = (await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly')).data[0].product;
+    const inclusive = await ws.ok('POST', '/v1/prices', {
+      product, currency: 'usd', model: 'flat', unit_amount: listed, nickname: 'Cleveland all-in',
+      lookup_key: 'usd_inclusive_held', recurring: { interval: 'month' }, tax_behavior: 'inclusive',
+    });
+    const customer = await ws.customer('State Arrives Later', {
+      // A country registered state by state, and no state: as unplaceable as
+      // no country at all, so the bill is held rather than sent at zero.
+      address: { line1: '200 Public Square', city: 'Cleveland', country: 'United States' },
+    });
+    const twenty = await coupon({ name: 'Twenty off, always', percent_off: 20 });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: inclusive.id }], coupon: twenty.id,
+    });
+    const held = await latestFor(sub.id);
+    assert.equal(held.status, 'draft', 'the address could not be placed, so the bill is held');
+    assert.equal(held.tax, 0);
+    assert.equal(held.discount_amount, off);
+
+    await ws.ok('PATCH', `/v1/customers/${customer.id}`, {
+      address: { line1: '200 Public Square', city: 'Cleveland', state: 'Ohio', postal_code: '44114', country: 'United States' },
+    });
+    const sent: Invoice = await ws.ok('POST', `/v1/invoices/${held.id}/finalize`, {});
+    assert.equal(sent.status, 'open');
+    assert.equal(sent.subtotal + sent.tax, listed - off, 'still the listed price less the discount, exactly');
+    assert.equal(sent.tax, halfUp((listed - off) * OHIO / (100 + OHIO)));
+    assert.equal(sumLines(sent), sent.subtotal);
+    assert.equal(sumTax(sent), sent.tax);
+    const line = discountLineOf(sent);
+    assert.ok(line);
+    assert.equal(line.amount + line.tax.amount, -off,
+      'the discount line is still the listed reduction, tax and all, after the re-pricing');
+    assert.equal(line.tax.behavior, 'inclusive', 'and it honours the behaviour of the line it came off');
+    // The share is recorded on the line it came off, which is what lets the
+    // document be priced again without losing how the subtraction was spread.
+    const source = sent.lines.find((line) => line.kind === 'recurring');
+    assert.equal(source?.discount_amount, off);
+    assert.equal(discountLineOf(sent)?.discount_amount, 0);
+    await ws.ok('POST', '/v1/billing/automatic_tax', { enabled: false });
+  });
+
+  test('the discount rounds once, half up, and the per-line shares add back to it', async () => {
+    const customer = await ws.customer('Rounding Works');
+    const product = (await ws.ok('GET', '/v1/prices?lookup_key=growth_monthly')).data[0].product;
+    // 9,999 x 20% is 1,999.8 — the half-minor-unit that has to go to the
+    // customer exactly once, and three lines that each have a remainder.
+    const odd = async (amount: number, key: string) => (await ws.ok('POST', '/v1/prices', {
+      product, currency: 'usd', model: 'flat', unit_amount: amount, nickname: `Odd ${key}`,
+      lookup_key: `odd_${key}`, recurring: { interval: 'month' },
+    })).id as string;
+    const prices = [await odd(9_999, 'a'), await odd(3_333, 'b'), await odd(101, 'c')];
+    const twenty = await coupon({ name: 'Twenty off, always', percent_off: 20 });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: prices.map((price) => ({ price })), coupon: twenty.id,
+    });
+    const invoice = await latestFor(sub.id);
+
+    const gross = 9_999 + 3_333 + 101;
+    assert.equal(invoice.discount_amount, halfUp(gross * 0.20), 'one rounding, on the discount itself');
+    assert.equal(invoice.subtotal, gross - halfUp(gross * 0.20));
+    assert.equal(sumLines(invoice), invoice.subtotal, 'and the lines still add up to it');
+    assert.equal(discountLineOf(invoice)?.amount, -halfUp(gross * 0.20));
+  });
+
+  test('a coupon restricted to the plan leaves the metered lines at list', async () => {
+    const customer = await ws.customer('Partner Integrator');
+    const plan = await priceIdOf(ws, 'growth_monthly');
+    // Northwind's own partner programme: 10% off the platform fee, never the telemetry.
+    const partner = await ws.ok('GET', '/v1/coupons/coup_nw_partner');
+    assert.deepEqual(partner.duration, 'forever');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id,
+      // The platform fee is on the coupon's list; the operator seats are not.
+      items: [{ price: 'growth_monthly' }, { price: 'growth_seat_monthly', quantity: 4 }],
+      coupon: partner.id,
+    });
+    const invoice = await latestFor(sub.id);
+    const line = discountLineOf(invoice);
+    assert.ok(line);
+    assert.equal(line.amount, -halfUp(GROWTH * 0.10), 'ten per cent of the plan fee and of nothing else');
+    assert.equal(invoice.subtotal, GROWTH + 4 * GROWTH_SEAT - halfUp(GROWTH * 0.10),
+      'the seats are billed at list beside it');
+    assert.match(line.explanation, /covered charges/);
+
+    // And a coupon restricted to something this bill does not carry adds no line.
+    const other = await ws.customer('Restricted To Elsewhere');
+    const elsewhere = await coupon({ name: 'Onboarding only', percent_off: 50, applies_to: { prices: [plan] } });
+    const bare: Invoice = await ws.ok('POST', '/v1/invoices', {
+      customer: other.id, items: [{ description: 'Commissioning visit', amount: 42_500, currency: 'usd' }],
+    });
+    await ws.ok('POST', `/v1/customers/${other.id}/discount`, { coupon: elsewhere.id });
+    const next: Invoice = await ws.ok('POST', '/v1/invoices', {
+      customer: other.id, items: [{ description: 'Second visit', amount: 42_500, currency: 'usd' }],
+    });
+    assert.equal(discountLineOf(bare), undefined);
+    assert.equal(discountLineOf(next), undefined, 'a coupon that covers nothing on the bill puts no line on it');
+    assert.equal(next.discount_amount, 0);
+  });
+
+  test('an amount-off coupon never takes off more than the bill charges', async () => {
+    const customer = await ws.customer('Small Bill');
+    const big = await coupon({ name: 'Five hundred off', amount_off: 50_000, currency: 'usd', duration: 'once' });
+    await ws.ok('POST', `/v1/customers/${customer.id}/discount`, { coupon: big.id });
+    const invoice: Invoice = await ws.ok('POST', '/v1/invoices', {
+      customer: customer.id, items: [{ description: 'Cable loom', amount: 12_500, currency: 'usd' }],
+    });
+    assert.equal(discountLineOf(invoice)?.amount, -12_500);
+    assert.equal(invoice.subtotal, 0);
+    assert.equal(invoice.total, 0, 'a discount can bring a bill to nothing and never below it');
+    assert.match(discountLineOf(invoice)?.explanation ?? '', /worth more than this bill/);
+  });
+
+  test('MRR is net of a discount that is running and gross again when it has expired', async () => {
+    // Its own workspace: this one walks the clock through three billing
+    // periods, and every test above pins an instant of its own.
+    const ws = await workspace(UTC(2026, 3, 1));
+    try {
+    const customer = await ws.customer('Year One Contract');
+    const coupon = (over: Record<string, unknown>) => ws.ok('POST', '/v1/coupons', { duration: 'forever', ...over });
+    const latestFor = async (subscription: string): Promise<Invoice> => {
+      const invoices = await allInvoices(ws, `&subscription=${subscription}`);
+      assert.ok(invoices.length, `no invoice for ${subscription}`);
+      return invoices[0];
+    };
+    const twoMonths = await coupon({ name: 'Twenty off, two periods', percent_off: 20, duration: 'repeating', duration_in_periods: 2 });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+      billing_cycle_anchor: UTC(2026, 3, 1), coupon: twoMonths.id,
+    });
+    const net = GROWTH - Math.round(GROWTH * 0.20);
+    assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).mrr, net,
+      'a subscription on 20% off is worth 80% of its list price');
+    const summary = await ws.ok('GET', `/v1/customers/${customer.id}/summary`);
+    assert.equal(summary.mrr, net, 'and the support screen says the same');
+
+    // The upcoming bill is the second discounted period; the one after is not.
+    const upcoming: Invoice = await ws.ok('POST', '/v1/invoices/create_preview', { subscription: sub.id });
+    assert.equal(upcoming.discount_amount, Math.round(GROWTH * 0.20));
+    assert.equal(upcoming.subtotal, net);
+
+    await ws.travelTo(UTC(2026, 4, 1) + HOUR);
+    const second = await latestFor(sub.id);
+    assert.equal(second.period.start, UTC(2026, 4, 1));
+    assert.equal(second.subtotal, net, 'the second period is the last discounted one');
+    const spent = await ws.ok('GET', `/v1/discounts/${second.discount}`);
+    assert.equal(spent.periods_used, 2);
+    assert.equal(spent.end, UTC(2026, 5, 1), 'and it stops applying when that period ends');
+
+    // Still running through the period it discounted: a run rate quotes what
+    // the account is paying today, not what it will pay next month.
+    assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).mrr, net);
+
+    await ws.travelTo(UTC(2026, 5, 1) + HOUR);
+    const third = await latestFor(sub.id);
+    assert.equal(third.period.start, UTC(2026, 5, 1));
+    assert.equal(discountLineOf(third), undefined, 'the duration ran out, so the third period is at list');
+    assert.equal(third.subtotal, GROWTH);
+    assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).mrr, GROWTH, 'and MRR is gross again');
+
+    // The retirement is a job row, replayed by the time machine — not a timer.
+    const retired = await ws.ok('GET', `/v1/discounts/${second.discount}`);
+    assert.equal(retired.status, 'ended');
+    assert.equal(retired.ended_at, UTC(2026, 5, 1));
+    } finally { ws.close(); }
+  });
+
+  test('the upcoming-invoice preview and the change preview price the discount exactly as the bill does', async () => {
+    const OHIO = 5.75 / 100;
+    const customer = await ws.customer('Preview Is The Charge', {
+      address: { line1: '1 Public Square', city: 'Cleveland', state: 'Ohio', postal_code: '44113', country: 'United States' },
+    });
+    const twenty = await coupon({ name: 'Twenty off, always', percent_off: 20 });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+      billing_cycle_anchor: UTC(2026, 3, 1), coupon: twenty.id,
+    });
+
+    const preview: Invoice = await ws.ok('POST', '/v1/invoices/create_preview', { subscription: sub.id });
+    const previewed = discountLineOf(preview);
+    assert.ok(previewed, 'the preview carries the discount too');
+
+    // A mid-cycle upgrade, quoted and then made: what the quote says is
+    // collected now is what the bill collects.
+    const at = midpointOf(sub);
+    const quote: ChangePreview = await ws.ok('POST', `/v1/subscriptions/${sub.id}/preview`, {
+      items: [{ id: sub.items[0].id, price: 'scale_monthly' }],
+      proration_date: at, proration_behavior: 'always_invoice',
+    });
+    const result = await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+      items: [{ id: sub.items[0].id, price: 'scale_monthly' }],
+      proration_date: at, proration_behavior: 'always_invoice',
+    });
+    const settled = (await allInvoices(ws, `&subscription=${sub.id}`))
+      .find((invoice) => invoice.billing_reason === 'subscription_update');
+    assert.ok(settled);
+    assert.equal(quote.amount_due_now, settled.amount_due, 'the quote is the charge');
+    assert.equal(quote.tax_due_now, settled.tax);
+    assert.equal((result.proration as ChangePreview).amount_due_now, settled.amount_due);
+    assert.ok(discountLineOf(settled), 'and the settling bill carries its own discount line');
+    assert.equal(settled.tax, halfUp(settled.subtotal * OHIO), 'taxed on the discounted base, once');
+    assert.equal(sumLines(settled), settled.subtotal);
+    assert.equal(sumTax(settled), settled.tax);
+
+    // The next invoice in the quote is priced net too.
+    assert.equal(quote.next_invoice.subtotal,
+      SCALE - Math.round(SCALE * 0.20), 'the period after the change is discounted as well');
+  });
+
+  test('a bill raised twice inside one period is discounted twice and spends one period, not two', async () => {
+    const customer = await ws.customer('Two Bills One Month');
+    const once = await coupon({ name: 'Twenty off, once', percent_off: 20, duration: 'once' });
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+      billing_cycle_anchor: UTC(2026, 3, 1), coupon: once.id,
+    });
+    const first = await latestFor(sub.id);
+    assert.equal(first.discount_amount, Math.round(GROWTH * 0.20));
+
+    const at = midpointOf(sub);
+    await ws.ok('PATCH', `/v1/subscriptions/${sub.id}`, {
+      items: [{ id: sub.items[0].id, quantity: 1, price: 'scale_monthly' }],
+      proration_date: at, proration_behavior: 'always_invoice',
+    });
+    const settled = (await allInvoices(ws, `&subscription=${sub.id}`))
+      .find((invoice) => invoice.billing_reason === 'subscription_update');
+    assert.ok(settled);
+    assert.ok((discountLineOf(settled)?.amount ?? 0) < 0, 'the same month is still discounted');
+    const discount = await ws.ok('GET', `/v1/discounts/${first.discount}`);
+    assert.equal(discount.periods_used, 1, 'and one period of the duration has been spent, not two');
+    assert.match(discountLineOf(settled)?.explanation ?? '', /Period 1 of 1/);
+  });
+
+  test('attaching and detaching are mirrors: an unused discount hands its redemption back', async () => {
+    const limited = await coupon({ name: 'Two only', percent_off: 15, max_redemptions: 2, duration: 'once' });
+    const a = await ws.customer('Redeemer A');
+    const b = await ws.customer('Redeemer B');
+    const c = await ws.customer('Redeemer C');
+
+    const first = await ws.ok('POST', `/v1/customers/${a.id}/discount`, { coupon: limited.id });
+    await ws.ok('POST', `/v1/customers/${b.id}/discount`, { coupon: limited.id });
+    assert.equal((await ws.ok('GET', `/v1/coupons/${limited.id}`)).times_redeemed, 2);
+    await ws.fail('POST', `/v1/customers/${c.id}/discount`, { coupon: limited.id }, 409, 'coupon_not_redeemable');
+
+    // Never billed, so the campaign gets its redemption back and the next
+    // account can have it.
+    await ws.ok('DELETE', `/v1/customers/${a.id}/discount`, {});
+    assert.equal((await ws.ok('GET', `/v1/coupons/${limited.id}`)).times_redeemed, 1);
+    assert.equal(await ws.ok('GET', `/v1/discounts/${first.id}`).then(() => 'found', () => 'gone'), 'gone');
+    await ws.ok('POST', `/v1/customers/${c.id}/discount`, { coupon: limited.id });
+
+    // One that has come off a bill is retired instead: the redemption was spent
+    // on a document that still exists.
+    const used = await ws.ok('GET', `/v1/customers/${b.id}/summary`).then(() => ws.ok('POST', '/v1/invoices', {
+      customer: b.id, items: [{ description: 'Commissioning', amount: 20_000, currency: 'usd' }],
+    }));
+    assert.equal(used.discount_amount, 3_000);
+    const held = await ws.ok('GET', `/v1/discounts?customer=${b.id}`);
+    await ws.ok('DELETE', `/v1/customers/${b.id}/discount`, {});
+    assert.equal((await ws.ok('GET', `/v1/coupons/${limited.id}`)).times_redeemed, 2,
+      'a redemption spent on a real bill is not handed back');
+    assert.equal((await ws.ok('GET', `/v1/discounts/${held.data[0].id}`)).status, 'ended');
+    assert.equal(used.discount, held.data[0].id);
+  });
+
+  test('two discounts on one holder are refused, and a subscription discount beats the account one', async () => {
+    const customer = await ws.customer('One At A Time');
+    const ten = await coupon({ name: 'Ten off account-wide', percent_off: 10 });
+    const twenty = await coupon({ name: 'Twenty off this contract', percent_off: 20 });
+    await ws.ok('POST', `/v1/customers/${customer.id}/discount`, { coupon: ten.id });
+    await ws.fail('POST', `/v1/customers/${customer.id}/discount`, { coupon: twenty.id }, 409, 'discount_already_attached');
+
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }], coupon: twenty.id,
+    });
+    const invoice = await latestFor(sub.id);
+    assert.equal(invoice.discount_amount, Math.round(GROWTH * 0.20),
+      'the contract’s own concession governs, and does not stack with the account’s');
+    assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).mrr, GROWTH - Math.round(GROWTH * 0.20));
+  });
+
+  test('a promotion code is redeemed by the code the customer typed', async () => {
+    const customer = await ws.customer('Trade Show Lead');
+    const attached = await ws.ok('POST', `/v1/customers/${customer.id}/discount`, { promotion_code: 'AUTOMATE26' });
+    assert.equal(attached.coupon, 'coup_nw_commissioning_500');
+    assert.equal(attached.promotion_code, 'promo_nw_automate26');
+
+    const onboarding = (await ws.ok('GET', '/v1/prices?product=prod_nw_onboarding')).data[0];
+    const invoice: Invoice = await ws.ok('POST', '/v1/invoices', {
+      customer: customer.id,
+      items: [{ description: 'Commissioning', amount: 120_000, currency: 'usd' }],
+    });
+    assert.equal(discountLineOf(invoice), undefined,
+      'the coupon is restricted to the onboarding product, and a hand-written line names no product');
+    assert.ok(onboarding, 'the onboarding product has a price to bill against');
+  });
+});

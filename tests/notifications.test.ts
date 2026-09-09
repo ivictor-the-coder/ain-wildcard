@@ -90,6 +90,15 @@ async function workspace(at = T0): Promise<Workspace> {
     now: () => app.ctx.now(),
     async tick() { const r = await app.tick(); assert.equal(r.failed, 0, 'a job failed'); },
     travel: (ms) => app.travel(ms).then((r) => ({ ran: r.ran, failed: r.failed })),
+    /**
+     * Most tests here subscribe to `customer.created` and not `customer.*`.
+     * The demo workspace goes on living while the clock moves — a seeded
+     * discount ends, a renewal runs — and those emit `customer.*` events of
+     * their own, so a wildcard turns "one write, one delivery" into a count
+     * that depends on what else the workspace happened to do that tick. The
+     * wildcard itself is asserted where it is the subject, in the fan-out
+     * suite and in `subscribes`.
+     */
     async endpoint(events, url, answer) {
       if (answer) http.respond(url, { status: answer.status, body: answer.body ?? '' });
       return ws.ok('POST', '/v1/webhook-endpoints', { url, enabled_events: events });
@@ -123,7 +132,7 @@ describe('registering an endpoint', () => {
   after(() => ws.close());
 
   test('mints a signing secret, shows it once, and never again', async () => {
-    const endpoint = await ws.endpoint(['customer.*'], nextSink());
+    const endpoint = await ws.endpoint(['customer.created'], nextSink());
     assert.match(endpoint.secret, /^whsec_/, 'the secret is minted at runtime with our own prefix');
     assert.ok(endpoint.secret.length > 20);
     assert.equal(endpoint.secret_last4, endpoint.secret.slice(-4));
@@ -139,7 +148,7 @@ describe('registering an endpoint', () => {
   });
 
   test('publishes the retry ladder and the signature recipe on the endpoint itself', async () => {
-    const endpoint = await ws.endpoint(['customer.*'], nextSink());
+    const endpoint = await ws.endpoint(['customer.created'], nextSink());
     assert.deepEqual(endpoint.retry_schedule_ms, DELIVERY_BACKOFF_MS);
     assert.equal(endpoint.max_attempts, MAX_DELIVERY_ATTEMPTS);
     assert.equal(endpoint.disable_after, DISABLE_AFTER_FAILED_DELIVERIES);
@@ -148,7 +157,7 @@ describe('registering an endpoint', () => {
   });
 
   test('rolling the secret hands back a different one', async () => {
-    const endpoint = await ws.endpoint(['customer.*'], nextSink());
+    const endpoint = await ws.endpoint(['customer.created'], nextSink());
     const rolled: MintedWebhookEndpoint = await ws.ok('POST', `/v1/webhook-endpoints/${endpoint.id}/roll-secret`);
     assert.notEqual(rolled.secret, endpoint.secret);
     assert.equal(rolled.secret_last4, rolled.secret.slice(-4));
@@ -227,7 +236,7 @@ describe('signing a delivery the way Stripe signs one', () => {
   before(async () => {
     ws = await workspace();
     const url = nextSink();
-    endpoint = await ws.endpoint(['customer.*'], url);
+    endpoint = await ws.endpoint(['customer.created'], url);
     await makeCustomer(ws);
     await ws.tick();
     const calls = ws.http.callsTo(url);
@@ -292,7 +301,7 @@ describe('signing a delivery the way Stripe signs one', () => {
   });
 
   test('a signature from another endpoint’s secret does not verify', async () => {
-    const stranger = await ws.endpoint(['customer.*'], nextSink());
+    const stranger = await ws.endpoint(['customer.created'], nextSink());
     const check = await ws.ok('POST', '/v1/webhook-signatures/verify', {
       endpoint: stranger.id, payload: body, signature: header,
     });
@@ -309,7 +318,7 @@ describe('a subscriber that is refusing', () => {
     const ws = await workspace();
     try {
       const url = nextSink();
-      const endpoint = await ws.endpoint(['customer.*'], url, { status: 500, body: 'upstream is down' });
+      const endpoint = await ws.endpoint(['customer.created'], url, { status: 500, body: 'upstream is down' });
       await makeCustomer(ws);
       await ws.tick();
 
@@ -348,7 +357,7 @@ describe('a subscriber that is refusing', () => {
     const ws = await workspace();
     try {
       const url = nextSink();
-      const endpoint = await ws.endpoint(['customer.*'], url, { status: 503 });
+      const endpoint = await ws.endpoint(['customer.created'], url, { status: 503 });
       await makeCustomer(ws);
       // Held from before the travel: the clock moves the rest of the business
       // too, and this endpoint subscribes to all of it.
@@ -379,7 +388,7 @@ describe('an endpoint that has gone', () => {
     const ws = await workspace();
     try {
       const url = nextSink();
-      const endpoint = await ws.endpoint(['customer.*'], url, { status: 410, body: 'gone' });
+      const endpoint = await ws.endpoint(['customer.created'], url, { status: 410, body: 'gone' });
       for (let i = 0; i < DISABLE_AFTER_FAILED_DELIVERIES; i++) await makeCustomer(ws);
       assert.equal((await ws.deliveriesFor(endpoint.id)).length, DISABLE_AFTER_FAILED_DELIVERIES);
 
@@ -411,7 +420,7 @@ describe('an endpoint that has gone', () => {
     const ws = await workspace();
     try {
       const url = nextSink();
-      const endpoint = await ws.endpoint(['customer.*'], url, { status: 500 });
+      const endpoint = await ws.endpoint(['customer.created'], url, { status: 500 });
       for (let i = 0; i < DISABLE_AFTER_FAILED_DELIVERIES; i++) await makeCustomer(ws);
       await ws.travel(DELIVERY_BACKOFF_MS.reduce((a, b) => a + b, 0) + MINUTE);
       assert.equal((await ws.ok('GET', `/v1/webhook-endpoints/${endpoint.id}`)).status, 'disabled');
@@ -433,7 +442,7 @@ describe('an endpoint that has gone', () => {
     const ws = await workspace();
     try {
       const url = nextSink();
-      const endpoint = await ws.endpoint(['customer.*'], url, { status: 500 });
+      const endpoint = await ws.endpoint(['customer.created'], url, { status: 500 });
       await makeCustomer(ws);
       await ws.travel(DELIVERY_BACKOFF_MS.reduce((a, b) => a + b, 0) + MINUTE);
       assert.equal((await ws.ok('GET', `/v1/webhook-endpoints/${endpoint.id}`)).consecutive_failures, 1);
@@ -548,6 +557,12 @@ describe('finalising an invoice sends it', () => {
  * 7. Dunning tells the payer
  * ========================================================================== */
 
+/** Every notice a campaign sent about this account, newest last. */
+const dunningNotices = async (ws: Workspace, customerId: string): Promise<NotificationMessage[]> => {
+  const page = await ws.ok('GET', `/v1/notifications?customer=${customerId}&limit=200`);
+  return (page.data as NotificationMessage[]).filter((n) => n.kind.startsWith('dunning.')).reverse();
+};
+
 describe('dunning', () => {
   test('tells the payer every time the card is refused, and what happens next', async () => {
     const ws = await workspace();
@@ -572,21 +587,284 @@ describe('dunning', () => {
       const body = (await ws.ok('GET', `/v1/notifications/${first[0].id}`)).body_text as string;
       assert.match(body, /try the same card again/, 'and told when the next attempt is');
 
-      // Walk the whole schedule. Every retry the campaign records must have a
-      // notice against it: this is the defect — three retries, no word to the payer.
+      // Walk the whole schedule. Every decision the campaign makes owes the
+      // payer exactly one letter: this is the defect — three retries and no
+      // word to the payer, and then two letters at once when it gave up.
       await ws.travel(30 * DAY);
       const settled = (await ws.ok('GET', `/v1/dunning/${campaign.id}`));
-      const notices = ((await ws.ok('GET', `/v1/notifications?kind=dunning.payment_failed&customer=${customer.id}&limit=100`))
-        .data as NotificationMessage[]);
-      assert.equal(notices.length, settled.attempt_count,
-        'one notice per refused attempt — the retry ladder is not silent');
-
-      const finals = ((await ws.ok('GET', `/v1/notifications?kind=dunning.final_notice&customer=${customer.id}`))
-        .data as NotificationMessage[]);
       assert.equal(settled.status, 'exhausted', 'the schedule ran out');
-      assert.equal(finals.length, 1, 'and the payer was told it had');
-      assert.match((await ws.ok('GET', `/v1/notifications/${finals[0].id}`)).body_text, /still unpaid/);
+
+      const notices = await dunningNotices(ws, customer.id);
+      assert.equal(notices.length, settled.attempt_count,
+        'one letter per decision: a refusal with a retry behind it, and the exhaustion — never both for one attempt');
+      assert.deepEqual(
+        notices.map((n) => n.kind),
+        [...Array(settled.attempt_count - 1).fill('dunning.payment_failed'), 'dunning.final_notice'],
+        'the last refused attempt is the final notice, not a decline notice plus a final notice',
+      );
+      assert.ok(notices.every((n) => n.status === 'sent' && n.to === customer.email));
+
+      const instants = notices.map((n) => n.sent_at);
+      assert.equal(new Set(instants).size, instants.length,
+        'no two letters in the same instant — one arriving on top of another is one of them being wrong');
+      assert.match((await ws.ok('GET', `/v1/notifications/${notices.at(-1)!.id}`)).body_text, /still unpaid/);
+      // An account can hold more than one card, so "your card was declined" is
+      // not on its own an instruction. Only payments knows which one it
+      // presented, which is half of why it is the caller.
+      assert.match(body, /Visa/, 'and which card it was');
       assert.ok(sub.id);
+    } finally { ws.close(); }
+  });
+
+  test('sends each letter as a job row, so the time machine replays it with the retry', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await makeCustomer(ws);
+      await ws.ok('POST', '/v1/payment_methods', {
+        type: 'card', customer: customer.id, brand: 'visa', exp_month: 4, exp_year: 2031,
+        simulated_behavior: 'insufficient_funds',
+      });
+      await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price: 'growth_monthly' }] });
+      await ws.tick();
+      const campaign = ((await ws.ok('GET', `/v1/dunning?status=all&customer=${customer.id}`)).data as any[])[0];
+
+      // Nothing sleeps on a timer and nothing is sent from inside an event
+      // handler, where a throw is swallowed and leaves no trace: each letter
+      // is a row in `jobs` beside the retry row the same decision wrote. Keyed
+      // by campaign, so the demo workspace's own campaigns are not counted
+      // here — and read before the clock moves a week, since done jobs are
+      // pruned after that.
+      const noticeJobs = () => ws.app.ctx.db.all<{ status: string; idem_key: string }>(
+        `SELECT status, idem_key FROM jobs WHERE type = 'payments.dunning_notice' AND idem_key LIKE ? ORDER BY rowid`,
+        `payments.dunning_notice:${campaign.id}:%`,
+      );
+      assert.equal(noticeJobs().length, 1, 'the first refusal queued its letter as a job');
+      assert.ok(noticeJobs().every((r) => r.status === 'done'), 'and the drain ran it');
+
+      // The second window is three days out; the letter travels with it.
+      await ws.travel(6 * DAY);
+      const rows = noticeJobs();
+      const notices = await dunningNotices(ws, customer.id);
+      assert.equal(rows.length, 2, 'the scheduled retry queued its own letter when it ran');
+      assert.equal(rows.length, notices.length, 'one job row per letter that went out');
+      assert.ok(rows.every((r) => r.status === 'done'), `every notice job ran: ${JSON.stringify(rows)}`);
+      assert.equal(new Set(rows.map((r) => r.idem_key)).size, rows.length,
+        'one key per decision, so replaying a decision cannot double the letter');
+    } finally { ws.close(); }
+  });
+
+  test('a card no retry can fix asks for a new one — it does not announce the end', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await makeCustomer(ws);
+      // `expired_card` is refused for a reason no amount of waiting changes,
+      // so the campaign drops its remaining retries and holds the account.
+      await ws.ok('POST', '/v1/payment_methods', {
+        type: 'card', customer: customer.id, brand: 'amex', exp_month: 4, exp_year: 2031,
+        simulated_behavior: 'expired_card',
+      });
+      await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price: 'growth_monthly' }] });
+      await ws.tick();
+
+      const campaign = ((await ws.ok('GET', `/v1/dunning?status=all&customer=${customer.id}`)).data as any[])[0];
+      assert.ok(campaign.hold, 'the retries were dropped and the account is held for a person');
+      assert.ok(campaign.attempt_count < campaign.max_attempts, 'with attempts still on the schedule');
+
+      const notices = await dunningNotices(ws, customer.id);
+      assert.deepEqual(notices.map((n) => n.kind), ['dunning.card_needs_person'],
+        'one letter, and it is the one that asks for a card');
+      const letter = await ws.ok('GET', `/v1/notifications/${notices[0].id}`);
+      assert.match(letter.body_text, /stopped trying it/, 'it says the retries were dropped');
+      assert.match(letter.body_text, /American Express|Amex/i, 'and which card has to be replaced');
+      assert.doesNotMatch(letter.body_text, /still unpaid/,
+        'and it is not the letter that says recovery is over — the bill is four days old');
+      assert.match(letter.subject!, /needs replacing/);
+    } finally { ws.close(); }
+  });
+
+  test('says so when the retry works, instead of leaving the last word with the decline', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await makeCustomer(ws);
+      await ws.ok('POST', '/v1/payment_methods', {
+        type: 'card', customer: customer.id, brand: 'visa', exp_month: 4, exp_year: 2031,
+        simulated_behavior: 'insufficient_funds', simulated_decline_count: 1,
+      });
+      const sub = await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price: 'growth_monthly' }] });
+      await ws.tick();
+      const campaign = ((await ws.ok('GET', `/v1/dunning?status=all&customer=${customer.id}`)).data as any[])[0];
+      assert.equal(campaign.status, 'recovering', 'the first presentation was refused');
+
+      await ws.travel(10 * DAY);
+      const settled = await ws.ok('GET', `/v1/dunning/${campaign.id}`);
+      assert.equal(settled.status, 'recovered', 'the second window took the money');
+
+      const notices = await dunningNotices(ws, customer.id);
+      assert.deepEqual(notices.map((n) => n.kind), ['dunning.payment_failed', 'dunning.recovered']);
+      const letter = await ws.ok('GET', `/v1/notifications/${notices[1].id}`);
+      const invoice = await ws.ok('GET', `/v1/invoices/${settled.invoice}`);
+      const amount = formatMoney(money(settled.recovered_amount, settled.currency), { locale: 'en-US' });
+      assert.match(letter.body_text, new RegExp(amount.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+        'quoting what was actually collected');
+      assert.match(letter.body_text, new RegExp(invoice.number), 'against the bill it settled');
+      assert.equal(notices[1].to, customer.email);
+      assert.ok(sub.id);
+    } finally { ws.close(); }
+  });
+});
+
+/* ========================================================================== *
+ * 7a. An address that bounces stops being written to
+ * ========================================================================== */
+
+describe('bounces and the suppression list', () => {
+  /** A bill for this customer, finalised — which is what sends the notice. */
+  const bill = (ws: Workspace, customerId: string, amount: number) =>
+    ws.ok('POST', '/v1/invoices', {
+      customer: customerId, items: [{ description: 'Telemetry', amount, currency: 'usd' }], auto_advance: true,
+    });
+
+  test('a hard bounce stops the address, and the next notice is never handed to the transport', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await makeCustomer(ws);
+      ws.mail.bounce(customer.email, 'No mailbox by that name here.', 'hard');
+
+      const first = await bill(ws, customer.id, 120_00);
+      const bounced = ((await ws.ok('GET', `/v1/notifications?related=${first.id}`)).data as NotificationMessage[])[0];
+      assert.equal(bounced.status, 'failed', 'the relay refused it, and the record says so');
+      assert.equal(ws.mail.to(customer.email).length, 1, 'it was handed over exactly once');
+
+      const listed = (await ws.ok('GET', `/v1/notification-suppressions?address=${encodeURIComponent(customer.email)}`)).data;
+      assert.equal(listed.length, 1, 'one bounce that permanent is enough');
+      assert.equal(listed[0].reason, 'bounced');
+      assert.equal(listed[0].last_message, bounced.id, 'and it names the message it came back from');
+      assert.match(listed[0].detail, /No mailbox by that name here/);
+
+      // The whole point: the *next* one is not written at all.
+      const second = await bill(ws, customer.id, 240_00);
+      const blocked = ((await ws.ok('GET', `/v1/notifications?related=${second.id}`)).data as NotificationMessage[])[0];
+      assert.equal(blocked.status, 'suppressed', 'not "failed" — nothing was attempted');
+      assert.equal(blocked.to, customer.email, 'and the record still names who was not written to');
+      assert.match(blocked.detail, /suppression list/);
+      assert.equal(ws.mail.to(customer.email).length, 1, 'the transport was never asked a second time');
+    } finally { ws.close(); }
+  });
+
+  test('a mailbox that is merely full takes three in a row before the address goes', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await makeCustomer(ws);
+      ws.mail.bounce(customer.email, 'Mailbox full, try later.', 'soft');
+
+      const listedFor = async () =>
+        (await ws.ok('GET', `/v1/notification-suppressions?address=${encodeURIComponent(customer.email)}`)).data;
+      for (let n = 1; n <= 2; n++) {
+        await bill(ws, customer.id, n * 100_00);
+        assert.equal((await listedFor()).length, 0,
+          `${n} soft bounce${n === 1 ? '' : 's'} is an accident, not a decision`);
+      }
+      await bill(ws, customer.id, 300_00);
+      const listed = await listedFor();
+      assert.equal(listed.length, 1, 'three in a row with nothing getting through is no longer an accident');
+      assert.equal(listed[0].bounces, 3, 'counted from the log, not guessed');
+      assert.equal(ws.mail.to(customer.email).length, 3, 'exactly three attempts were made');
+
+      await bill(ws, customer.id, 400_00);
+      assert.equal(ws.mail.to(customer.email).length, 3, 'and no fourth');
+    } finally { ws.close(); }
+  });
+
+  test('a message that gets through resets the run, so an old bad afternoon never adds up', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await makeCustomer(ws);
+      ws.mail.bounce(customer.email, 'Greylisted, try later.', 'soft');
+      await bill(ws, customer.id, 100_00);
+      await bill(ws, customer.id, 110_00);
+
+      ws.mail.clearRules();
+      await bill(ws, customer.id, 120_00);
+      assert.equal((await ws.ok('GET', '/v1/notifications?status=sent&limit=200')).data
+        .filter((n: NotificationMessage) => n.to === customer.email).length, 1, 'one got through');
+
+      ws.mail.bounce(customer.email, 'Mailbox full, try later.', 'soft');
+      await bill(ws, customer.id, 130_00);
+      assert.equal(
+        (await ws.ok('GET', `/v1/notification-suppressions?address=${encodeURIComponent(customer.email)}`)).data.length, 0,
+        'two bounces before the delivery and one after is not three in a row');
+    } finally { ws.close(); }
+  });
+
+  test('a spam complaint stops the address on the first one, and is never demoted', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await makeCustomer(ws);
+      ws.mail.bounce(customer.email, 'Reported as spam by the recipient.', 'complaint');
+      await bill(ws, customer.id, 100_00);
+      const listed = (await ws.ok('GET', `/v1/notification-suppressions?address=${encodeURIComponent(customer.email)}`)).data;
+      assert.equal(listed.length, 1);
+      assert.equal(listed[0].reason, 'complained');
+    } finally { ws.close(); }
+  });
+
+  test('the list is visible, addable by hand, and has a way off it', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await makeCustomer(ws);
+      const before = (await ws.ok('GET', '/v1/notifications/overview')).suppressions;
+      // Mail addresses are not case-sensitive where it matters, and a list
+      // that suppresses one casing and lets another through is not a list.
+      await ws.ok('POST', '/v1/notification-suppressions', {
+        address: customer.email.toUpperCase(), reason: 'manual',
+        detail: 'Their AP inbox is being migrated; nothing is to be written to it this week.',
+      });
+      const overview = await ws.ok('GET', '/v1/notifications/overview');
+      assert.equal(overview.suppressions.total, before.total + 1, 'the overview counts it');
+      assert.equal(overview.suppressions.manual, before.manual + 1, 'under the reason it was given');
+
+      const invoice = await bill(ws, customer.id, 500_00);
+      const blocked = ((await ws.ok('GET', `/v1/notifications?related=${invoice.id}`)).data as NotificationMessage[])[0];
+      assert.equal(blocked.status, 'suppressed');
+      assert.equal(ws.mail.to(customer.email).length, 0);
+
+      // A person clicking "send it again" is owed an answer, not a second
+      // suppressed row, and the answer names the entry to release.
+      const address = `/v1/notification-suppressions?address=${encodeURIComponent(customer.email)}`;
+      const entry = (await ws.ok('GET', address)).data[0];
+      const err = await ws.fail('POST', `/v1/notifications/${blocked.id}/resend`, {}, 409, 'notification_address_suppressed');
+      assert.match(err.message, new RegExp(entry.id));
+
+      // The mirror image: the list has a way off it, and writing resumes.
+      await ws.ok('DELETE', `/v1/notification-suppressions/${entry.id}`);
+      assert.equal((await ws.ok('GET', address)).data.length, 0);
+      const sent: NotificationMessage = await ws.ok('POST', `/v1/notifications/${blocked.id}/resend`, {});
+      assert.equal(sent.status, 'sent');
+      assert.equal(ws.mail.to(customer.email).length, 1);
+    } finally { ws.close(); }
+  });
+
+  test('a payer who bounces is not written to on every retry of a dunning campaign', async () => {
+    const ws = await workspace();
+    try {
+      const customer = await makeCustomer(ws);
+      ws.mail.bounce(customer.email, 'No such user.', 'hard');
+      await ws.ok('POST', '/v1/payment_methods', {
+        type: 'card', customer: customer.id, brand: 'visa', exp_month: 4, exp_year: 2031,
+        simulated_behavior: 'insufficient_funds',
+      });
+      await ws.ok('POST', '/v1/subscriptions', { customer: customer.id, items: [{ price: 'growth_monthly' }] });
+      await ws.tick();
+      await ws.travel(30 * DAY);
+
+      // The bill's own notice bounced; every letter the campaign wrote after
+      // that is a record of a decision not to write, not another bounce.
+      const handed = ws.mail.to(customer.email).length;
+      assert.equal(handed, 1, `the transport was asked once and then never again (was ${handed})`);
+      const notices = await dunningNotices(ws, customer.id);
+      assert.ok(notices.length >= 2, 'the campaign still recorded what it decided');
+      assert.ok(notices.every((n) => n.status === 'suppressed'),
+        'each one is a suppressed record naming the address, not a claimed send');
     } finally { ws.close(); }
   });
 });
@@ -648,7 +926,7 @@ describe('the envelope Settings › Events promises', () => {
 
   test('is the Stripe-shaped envelope, with the real deliveries of that event under it', async () => {
     const url = nextSink();
-    const endpoint = await ws.endpoint(['customer.*'], url);
+    const endpoint = await ws.endpoint(['customer.created'], url);
     const customer = await makeCustomer(ws);
     await ws.tick();
 
@@ -719,7 +997,7 @@ describe('the transport seam', () => {
     const ws = await workspace();
     try {
       const url = nextSink();
-      const endpoint = await ws.endpoint(['customer.*'], url);
+      const endpoint = await ws.endpoint(['customer.created'], url);
       await makeCustomer(ws);
       await makeCustomer(ws);
       await ws.tick();
@@ -743,7 +1021,7 @@ describe('the transport seam', () => {
         },
       });
       const url = nextSink();
-      const endpoint = await ws.endpoint(['customer.*'], url);
+      const endpoint = await ws.endpoint(['customer.created'], url);
       await makeCustomer(ws);
       await ws.tick();
       assert.equal(seen.filter((u) => u === url).length, 1, 'the installed transport received the delivery');
@@ -759,7 +1037,7 @@ describe('the transport seam', () => {
     try {
       const url = nextSink();
       ws.http.refuse(url, 'ECONNREFUSED 10.0.0.4:443');
-      const endpoint = await ws.endpoint(['customer.*'], url);
+      const endpoint = await ws.endpoint(['customer.created'], url);
       await makeCustomer(ws);
       await ws.tick();
       const [delivery] = await ws.deliveriesFor(endpoint.id);

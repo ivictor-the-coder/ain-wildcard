@@ -30,7 +30,7 @@ import {
   type Vocabulary,
 } from './slots';
 import {
-  renderAgeing, renderAgeingBucket, renderDso, renderMovement, renderOverdueAge, renderRevenueSummary,
+  bookOrder, renderAgeing, renderAgeingBucket, renderDso, renderMovement, renderOverdueAge, renderRevenueSummary,
   type CollectionsToolResult, type MovementToolResult, type SummaryToolResult,
 } from './revenue';
 import {
@@ -733,6 +733,9 @@ function moverCitations(v: Vocabulary, names: string[]): Citation[] {
   return out.slice(0, 8);
 }
 
+/** How many rows any one answer's SOURCES list carries. */
+const CITATION_CAP = 8;
+
 /**
  * The bills a collections answer is measured over.
  *
@@ -753,7 +756,49 @@ function receivableCitations(v: Vocabulary, opts: { overdueOnly?: boolean; bucke
   const inBucket = (days: number | null): AgeingBucketId =>
     days === null ? 'not_yet_due' : days <= 30 ? 'd1_30' : days <= 60 ? 'd31_60' : days <= 90 ? 'd61_90' : 'd90_plus';
   const kept = opts.bucket ? bills.filter((bill) => inBucket(bill.daysOverdue) === opts.bucket) : bills;
-  return invoiceCitations(kept.slice(0, 8).map((bill) => ({ id: bill.id, number: bill.number, status: bill.status })));
+  return invoiceCitations(kept.slice(0, CITATION_CAP).map((bill) => ({ id: bill.id, number: bill.number, status: bill.status })));
+}
+
+/**
+ * The accounts a revenue summary's figures are measured over.
+ *
+ * `revenue_summary` answers in per-currency totals the same way the collections
+ * tool does — "MRR $43,880.86 across 18 accounts" — and names none of the
+ * eighteen, so "How is the business doing?", the published example of the whole
+ * engine, came back with no sources at all over a set of twenty-five accounts.
+ * Read here from `revenue.accounts`, which walks the same book the summary's
+ * own MRR comes from, so the chips are the accounts that add up to the figure
+ * rather than a second opinion about it.
+ *
+ * An account is cut off at MRR of zero because that is the population the
+ * summary counts: `accounts` per book is the customers whose subscriptions are
+ * earning now, and `revenue.accounts` also returns the ones that stopped last
+ * month so a movement row can show the drop.
+ */
+function recurringCitations(v: Vocabulary): Citation[] {
+  const revenue = v.ctx.svc.revenue;
+  if (!revenue) return [];
+  const byBook = new Map<string, Citation[]>();
+  for (const row of revenue.accounts(v.orgId, {}).rows) {
+    if (row.mrr === 0) continue;
+    const book = byBook.get(row.currency) ?? [];
+    // `revenue.accounts` sorts each currency largest first, which is the order
+    // a reader checks a book in.
+    book.push({ id: row.customer, label: row.name, type: 'customer' });
+    byBook.set(row.currency, book);
+  }
+  // One row per book before any book gets a second: the answer states a line
+  // per currency, and a single top-eight by raw minor units would fill with
+  // dollars and leave the euro and sterling lines with nothing to open.
+  const books = bookOrder([...byBook.entries()].map(([currency, rows]) => ({ currency, rows })), v.workspace);
+  const out: Citation[] = [];
+  const deepest = Math.max(0, ...books.map((book) => book.rows.length));
+  for (let rank = 0; rank < deepest && out.length < CITATION_CAP; rank++) {
+    for (const book of books) {
+      if (book.rows[rank] && out.length < CITATION_CAP) out.push(book.rows[rank]);
+    }
+  }
+  return out;
 }
 
 export const TEMPLATES: Template[] = [
@@ -2748,7 +2793,7 @@ export const TEMPLATES: Template[] = [
     tools: ['revenue_summary'],
     example: () => 'How is the business doing?',
     plan: () => [{ tool: 'revenue_summary', args: { months: TRAILING_MONTHS }, why: `MRR, ARR, retention and receivables per currency over the last ${TRAILING_MONTHS} months.` }],
-    render: (steps, _b, v) => renderRevenueSummary(resultOf<SummaryToolResult>(steps), TRAILING_MONTHS, v.workspace),
+    render: (steps, _b, v) => renderRevenueSummary(resultOf<SummaryToolResult>(steps), TRAILING_MONTHS, v.workspace, recurringCitations(v)),
   }),
 
   /* -------------------------------- drafts ------------------------------- */

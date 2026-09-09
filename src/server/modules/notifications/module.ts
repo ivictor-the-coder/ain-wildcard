@@ -33,10 +33,12 @@ import type {
 } from './transport';
 import type { DunningFacts } from './compose';
 import {
-  DELIVERY_STATUSES, ENDPOINT_STATUSES, MESSAGE_CHANNELS, MESSAGE_STATUSES,
-  type DeliveryListFilter, type EndpointInput, type EndpointPatch, type MessageListFilter,
+  DELIVERY_STATUSES, ENDPOINT_STATUSES, MESSAGE_CHANNELS, MESSAGE_STATUSES, SUPPRESSION_REASONS,
+  type DeliveryListFilter, type DunningNoticeKind, type EndpointInput, type EndpointPatch,
+  type MessageChannel, type MessageListFilter,
   type MintedWebhookEndpoint, type NotificationMessage,
   type NotificationSettings, type NotificationsOverview, type SendInput,
+  type SuppressedAddress, type SuppressionInput, type SuppressionListFilter,
   type WebhookDelivery, type WebhookEndpoint,
 } from './types';
 
@@ -62,8 +64,24 @@ export interface NotificationsService {
 
   /** Email a finalised invoice to the account that owes it. Idempotent. */
   sendInvoice(orgId: string, invoiceId: string, opts?: { kind?: 'invoice.issued' | 'invoice.receipt'; force?: boolean; to?: string | null }, meta?: WriteMeta): NotificationMessage | null;
-  /** Tell the payer a card was refused, and what happens next. */
-  sendDunningNotice(orgId: string, input: { invoiceId: string; customerId: string; facts: DunningFacts; kind: 'dunning.payment_failed' | 'dunning.final_notice'; resolution?: string | null }, meta?: WriteMeta): NotificationMessage | null;
+  /**
+   * Tell the payer what a recovery campaign just decided — a refusal with a
+   * retry behind it, a card that has to be replaced, a schedule that ran out,
+   * or the money arriving. Called by `payments` from its own job handler, one
+   * notice per decision.
+   */
+  sendDunningNotice(orgId: string, input: {
+    invoiceId: string; customerId: string; facts: DunningFacts; kind: DunningNoticeKind;
+    deadline?: number | null; collectedAt?: number | null; resolution?: string | null;
+    metadata?: Record<string, string>;
+  }, meta?: WriteMeta): NotificationMessage | null;
+
+  /** The addresses this workspace has stopped writing to, and why. */
+  suppressions(orgId: string, filter?: SuppressionListFilter): SuppressedAddress[];
+  /** Stop writing to an address. Idempotent, and never demotes a manual entry. */
+  suppress(orgId: string, input: SuppressionInput, meta?: WriteMeta): SuppressedAddress;
+  /** Is this address writable? The answer `send` gives itself before it sends. */
+  isSuppressed(orgId: string, address: string, channel?: MessageChannel): SuppressedAddress | null;
 
   endpoints(orgId: string, filter?: { status?: string }): WebhookEndpoint[];
   endpoint(orgId: string, id: string): WebhookEndpoint | null;
@@ -157,43 +175,28 @@ const verifyBody = v.object({
   tolerance_ms: v.optional(v.int({ min: 0, max: 86_400_000 })),
 });
 
+const suppressionsQuery = v.object({
+  channel: v.optional(v.enum(MESSAGE_CHANNELS)),
+  reason: v.optional(v.enum(SUPPRESSION_REASONS)),
+  address: v.optional(v.string({ max: 320 })),
+  limit: v.default(v.int({ min: 1, max: 500 }), 50),
+});
+
+// No `channel`: every notice this platform composes is email, and offering to
+// suppress an "sms" channel that nothing writes to would be an API promising a
+// feature. The column exists for when one does.
+const suppressionBody = v.object({
+  address: v.email(),
+  reason: v.optional(v.enum(SUPPRESSION_REASONS)),
+  detail: v.optional(v.string({ min: 1, max: 500 })),
+});
+
 const sendInvoiceBody = v.object({
   invoice: v.id('in'),
   kind: v.default(v.enum(['invoice.issued', 'invoice.receipt'] as const), 'invoice.issued'),
   to: v.optional(v.nullable(v.email())),
   force: v.optional(v.boolean()),
 });
-
-/* ---------------------------- reading the events -------------------------- */
-
-/** The campaign as `dunning.*` carries it — read defensively, like a payload. */
-interface DunningEventCampaign {
-  id?: string; invoice?: string; customer?: string; currency?: string;
-  amount_at_risk?: number; attempt_count?: number; max_attempts?: number;
-  next_attempt_at?: number | null; last_failure_message?: string | null; resolution?: string | null;
-}
-
-const campaignOf = (event: AinEvent<any>): DunningEventCampaign | null => {
-  const data = (event.data ?? {}) as { campaign?: DunningEventCampaign; invoice?: unknown };
-  const campaign = data.campaign ?? (event.data as DunningEventCampaign);
-  return campaign && typeof campaign === 'object' && typeof campaign.invoice === 'string' ? campaign : null;
-};
-
-function dunningFacts(ctx: Ctx, orgId: string, campaign: DunningEventCampaign): DunningFacts | null {
-  if (!campaign.invoice) return null;
-  const invoice = ctx.svc.billing?.invoice(orgId, campaign.invoice);
-  if (!invoice) return null;
-  return {
-    invoice_number: invoice.number,
-    currency: campaign.currency ?? invoice.currency,
-    amount_at_risk: campaign.amount_at_risk ?? invoice.amount_due,
-    attempt: campaign.attempt_count ?? 1,
-    max_attempts: campaign.max_attempts ?? 1,
-    next_attempt_at: campaign.next_attempt_at ?? null,
-    failure_message: campaign.last_failure_message ?? null,
-    card_hint: null,
-  };
-}
 
 /* --------------------------------- module --------------------------------- */
 
@@ -221,6 +224,12 @@ export default defineModule({
       lastSent: (orgId, relatedId, kind) => store.lastSent(orgId, relatedId, kind),
       sendInvoice: (orgId, invoiceId, opts, meta) => store.sendInvoice(orgId, invoiceId, opts, meta),
       sendDunningNotice: (orgId, input, meta) => store.sendDunningNotice(orgId, input, meta),
+      suppressions: (orgId, filter) => store.suppressions(orgId, filter),
+      suppress: (orgId, input, meta) => store.suppress(orgId, input, meta),
+      isSuppressed: (orgId, address, channel) => {
+        const row = store.suppressionRow(orgId, channel ?? 'email', address);
+        return row ? store.suppression(orgId, row.id) : null;
+      },
       endpoints: (orgId, filter) => store.endpoints(orgId, filter),
       endpoint: (orgId, id) => store.endpoint(orgId, id),
       deliveries: (orgId, filter) => store.deliveries(orgId, filter),
@@ -276,28 +285,20 @@ export default defineModule({
       if (invoiceId) store.sendInvoice(event.org_id, invoiceId, { kind: 'invoice.receipt' });
     }, 'notifications');
 
-    ctx.events.on('dunning.attempt_failed', (event) => {
-      if (!isLive(event)) return;
-      const campaign = campaignOf(event);
-      if (!campaign?.invoice || !campaign.customer) return;
-      const facts = dunningFacts(ctx, event.org_id, campaign);
-      if (!facts) return;
-      store.sendDunningNotice(event.org_id, {
-        invoiceId: campaign.invoice, customerId: campaign.customer, facts, kind: 'dunning.payment_failed',
-      });
-    }, 'notifications');
-
-    ctx.events.on('dunning.exhausted', (event) => {
-      if (!isLive(event)) return;
-      const campaign = campaignOf(event);
-      if (!campaign?.invoice || !campaign.customer) return;
-      const facts = dunningFacts(ctx, event.org_id, campaign);
-      if (!facts) return;
-      store.sendDunningNotice(event.org_id, {
-        invoiceId: campaign.invoice, customerId: campaign.customer, facts,
-        kind: 'dunning.final_notice', resolution: campaign.resolution ?? null,
-      });
-    }, 'notifications');
+    /**
+     * Dunning is deliberately not listened for here.
+     *
+     * A campaign's notices are queued by `payments` itself, as
+     * `payments.dunning_notice` job rows beside the retry rows the same
+     * decision writes — see `Dunning.notify`. Eavesdropping on
+     * `dunning.attempt_failed` and `dunning.exhausted` from this side produced
+     * two letters in the same millisecond on the last refused attempt (the
+     * failure and the exhaustion are two events about one decision), and it
+     * put the send inside `EventBus.dispatch`, which swallows a throw: a
+     * notice that failed to compose disappeared with no row, no error and
+     * nothing to retry. Payments knows which decision it made and which card
+     * was refused; it is the right caller.
+     */
   },
 
   seed(ctx, orgId) {
@@ -480,6 +481,12 @@ export default defineModule({
           failed: count(`SELECT COUNT(*) FROM notification_messages WHERE org_id = ? AND status = 'failed'`, orgId),
           suppressed: count(`SELECT COUNT(*) FROM notification_messages WHERE org_id = ? AND status = 'suppressed'`, orgId),
         },
+        suppressions: {
+          total: count(`SELECT COUNT(*) FROM notification_suppressions WHERE org_id = ?`, orgId),
+          bounced: count(`SELECT COUNT(*) FROM notification_suppressions WHERE org_id = ? AND reason = 'bounced'`, orgId),
+          complained: count(`SELECT COUNT(*) FROM notification_suppressions WHERE org_id = ? AND reason = 'complained'`, orgId),
+          manual: count(`SELECT COUNT(*) FROM notification_suppressions WHERE org_id = ? AND reason = 'manual'`, orgId),
+        },
         transports: { http: store.httpTransport().name, message: store.messageTransport().name },
         settings: store.settings(orgId),
         as_of: ctx.now(),
@@ -547,6 +554,36 @@ export default defineModule({
       idempotent: true,
     });
 
+    /* ----------------------------- suppressions --------------------------- */
+
+    r.get('/v1/notification-suppressions', (req: Req) =>
+      list(store.suppressions(req.auth.orgId, queryOf(req, suppressionsQuery))), {
+      summary: 'Addresses this workspace has stopped writing to',
+      description: 'A hard bounce or a spam complaint lands an address here on the first one; a soft bounce takes three in a row with nothing getting through in between. Every notice addressed to a listed address is recorded `suppressed`, naming the entry, rather than handed to a transport.',
+      tags: ['notifications'],
+      query: suppressionsQuery,
+    });
+
+    r.post('/v1/notification-suppressions', (req: Req) =>
+      created(store.suppress(req.auth.orgId, req.body as SuppressionInput, writeMeta(req))), {
+      summary: 'Stop writing to an address',
+      description: 'Idempotent by address: suppressing one already listed updates the entry rather than adding a second. A `manual` entry is never demoted by a later bounce — a person saying "do not write to this account" outranks the relay’s opinion.',
+      tags: ['notifications'],
+      body: suppressionBody,
+      roles: ['member'],
+      idempotent: true,
+    });
+
+    r.del('/v1/notification-suppressions/:id', (req: Req) => {
+      store.release(req.auth.orgId, req.params.id, writeMeta(req));
+      return noContent();
+    }, {
+      summary: 'Write to this address again',
+      description: 'A mailbox that was full in March is not a mailbox that is gone, so the list has a way off it. Releasing sends nothing: the notices suppressed while it was listed are records of what did not happen, and each can be sent with POST /v1/notifications/:id/resend.',
+      tags: ['notifications'],
+      roles: ['member'],
+    });
+
     /* ------------------------------- settings ----------------------------- */
 
     r.get('/v1/notification-settings', (req: Req) => store.settings(req.auth.orgId), {
@@ -573,6 +610,15 @@ export default defineModule({
         input: v.object({ id: v.string({ min: 1, max: 120 }) }),
         run: (args: { id: string }, c: Ctx, meta) =>
           notificationsStore(c).messages(meta.orgId, { related: args.id, limit: 20 }),
+      },
+      {
+        name: 'notifications.suppressed_addresses',
+        description: 'The addresses this workspace has stopped writing to and why — the answer to "why has this customer not had their invoices". A hard bounce or a spam complaint lands here on the first one; a soft bounce takes three in a row.',
+        readOnly: true,
+        tags: ['notifications'],
+        input: v.object({ address: v.optional(v.string({ max: 320 })) }),
+        run: (args: { address?: string }, c: Ctx, meta) =>
+          notificationsStore(c).suppressions(meta.orgId, { address: args.address, limit: 100 }),
       },
       {
         name: 'notifications.webhook_health',

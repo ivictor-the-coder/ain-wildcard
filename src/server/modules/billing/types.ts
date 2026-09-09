@@ -464,14 +464,24 @@ export type InvoiceBillingReason = (typeof INVOICE_BILLING_REASONS)[number];
  * the rest are what the credits module hands over for usage already consumed;
  * and `included_allowance` is the negative line that takes the plan's own
  * included quantity back off a metered charge, priced on that price's tiers.
+ * `discount` is the coupon's subtraction, and it is a line rather than a
+ * footer for one reason: a line is inside `subtotal`, so the base every rate is
+ * charged on is the discounted one.
  */
 export const INVOICE_LINE_KINDS = [
   'recurring', 'unused_time', 'remaining_time', 'immediate',
   'usage', 'credit_covered', 'topup', 'true_up', 'included_allowance', 'invoice_item',
+  'discount',
 ] as const;
 export type InvoiceLineKind = (typeof INVOICE_LINE_KINDS)[number];
 
-export const INVOICE_LINE_SOURCES = ['subscription_item', 'pending_item', 'billable_item', 'invoice_item'] as const;
+/**
+ * Where a line came from, and — for the four that name a row — what it claimed,
+ * so nothing can be billed twice. `discount` names no row on purpose: the same
+ * discount comes off every bill it governs, so a claim would make the second
+ * one collide with the first.
+ */
+export const INVOICE_LINE_SOURCES = ['subscription_item', 'pending_item', 'billable_item', 'invoice_item', 'discount'] as const;
 export type InvoiceLineSource = (typeof INVOICE_LINE_SOURCES)[number];
 
 /* ------------------------------- invoice items ---------------------------- */
@@ -536,6 +546,13 @@ export interface InvoiceLine {
   /** The exact fraction of the interval behind a prorated line. */
   proration_fraction: { numerator: number; denominator: number } | null;
   breakdown: LineBreakdownRow[];
+  /**
+   * Positive minor units the bill's discount took off this line, spread by
+   * largest remainder so the shares add back to the discount line exactly.
+   * Zero on a line the coupon did not cover — and on the discount line itself,
+   * which is the sum of these rather than one of them.
+   */
+  discount_amount: number;
   /**
    * Every jurisdiction's tax on this line's base, one entry per rate.
    *
@@ -660,6 +677,14 @@ export interface Invoice {
   total_taxes: TaxSummaryRow[];
   /** Whether the tax on this bill was worked out from a location Ain knows. */
   automatic_tax: AutomaticTax;
+  /** The discount this bill applied, if any. Null when nothing governed the period. */
+  discount: string | null;
+  /**
+   * Positive minor units the coupon took off the taxable base, already
+   * subtracted inside `subtotal` — never a further deduction from it. Read it
+   * as "what `subtotal` would have been, less this".
+   */
+  discount_amount: number;
   /** Signed. `subtotal + tax + balance_applied === total`, always. */
   balance_applied: number;
   total: number;
@@ -694,6 +719,59 @@ export interface Invoice {
   livemode: boolean;
 }
 
+
+/* -------------------------------- discounts ------------------------------- */
+
+/**
+ * A coupon fastened to something that gets billed.
+ *
+ * The coupon is reusable and says nothing about anybody; the discount is one
+ * account's copy of it, and it is the copy that carries the three facts a bill
+ * needs — which coupon, when it started, and how much of its duration has been
+ * spent. "20% off year one" is not twelve months on a calendar: it is twelve
+ * billing periods this subscription actually enters, which is why the count is
+ * advanced by the bills that apply it rather than by the clock.
+ */
+export const DISCOUNT_STATUSES = ['active', 'ended'] as const;
+export type DiscountStatus = (typeof DISCOUNT_STATUSES)[number];
+
+export interface Discount {
+  object: 'discount';
+  /**
+   * The catalogue's redemption id. One row here is one redemption there, so a
+   * campaign limited to 150 uses cannot be spent 151 times by attaching it.
+   */
+  id: string;
+  customer: string;
+  /**
+   * Null when the discount is the customer's own, in which case it governs
+   * every bill they are sent that no subscription discount already governs.
+   */
+  subscription: string | null;
+  coupon: string;
+  /** The code that was typed, when it was handed out that way rather than negotiated. */
+  promotion_code: string | null;
+  start: number;
+  /**
+   * The instant it stops applying — the end of the last period it comes off.
+   * Null while that is still ahead, and null forever on a `forever` coupon.
+   */
+  end: number | null;
+  /** Billing periods it has actually come off. */
+  periods_used: number;
+  /**
+   * The period a bill last spent one of those on. A second bill inside the same
+   * period is discounted too and spends nothing further — a mid-cycle upgrade
+   * and the cycle invoice around it are both the same discounted month.
+   */
+  last_period_start: number | null;
+  /** Periods it will ever come off; null on a coupon with no end. */
+  duration_periods: number | null;
+  status: DiscountStatus;
+  ended_at: number | null;
+  created: number;
+  updated: number;
+}
 
 /* ------------------------------- credit notes ----------------------------- */
 

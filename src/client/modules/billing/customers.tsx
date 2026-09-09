@@ -30,7 +30,9 @@ import {
 import { ActionMenu, CreditDialog, Headline, SubscriptionCreateDialog } from './subscriptions';
 import { BillNowDialog, BulkBillDialog, CustomerInvoices } from './invoices';
 import { PaymentsTab, TaxRegistrationsCard } from './payments';
-import { annualRecurring, describeDelete, pluraliseBrackets, type PhaseWindow } from './copy';
+import {
+  annualRecurring, describeDelete, nextInvoicePricedOn, nextInvoiceRows, pluraliseBrackets, type PhaseWindow,
+} from './copy';
 import type { BillingFormatter, CsvColumn } from './common';
 import type {
   BalanceTransaction, Customer, CustomerSummary, Invoice, RevenueAccount, Subscription,
@@ -1055,16 +1057,20 @@ function OverviewTab({ summary, booked, onNewSubscription }: {
                 </tbody>
               </table>
             </div>
+            {/* Every term the estimate is made of, so the rows on screen add
+                up to the figure under them. The panel used to stop at the
+                recurring subtotal, which on a usage-priced account is the
+                smallest thing on the bill. */}
             <div className="bl-totals" style={{ marginTop: 'var(--space-5)' }}>
-              <div className="bl-total"><span className="bl-total__label">Recurring subtotal</span><span className="bl-total__value">{f.money(next.subtotal, { currency: next.currency })}</span></div>
-              {next.uninvoiced_total !== 0 && (
-                <div className="bl-total"><span className="bl-total__label">Prorations waiting</span><span className="bl-total__value">{f.money(next.uninvoiced_total, { currency: next.currency })}</span></div>
-              )}
-              {next.balance_applied !== 0 && (
-                <div className="bl-total"><span className="bl-total__label">Balance applied</span><span className="bl-total__value">{f.money(next.balance_applied, { currency: next.currency })}</span></div>
-              )}
+              {nextInvoiceRows(next).map((row) => (
+                <div className="bl-total" key={row.id}>
+                  <span className="bl-total__label">{row.label}</span>
+                  <span className="bl-total__value">{f.money(row.amount, { currency: next.currency })}</span>
+                </div>
+              ))}
               <div className="bl-total bl-total--grand"><span className="bl-total__label">Estimated total</span><span className="bl-total__value">{f.money(next.estimated_total, { currency: next.currency })}</span></div>
             </div>
+            <p className="bl-total__note">{nextInvoicePricedOn(next, copyFormat(f))}</p>
           </Card>
         )}
 

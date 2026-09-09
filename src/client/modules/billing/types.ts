@@ -486,6 +486,53 @@ export interface AutomaticTaxSettings {
   detail: string;
 }
 
+/**
+ * Whether the bill a figure predicts can be sent at all. A prediction of
+ * "€100.00, no tax" for an account Ain cannot place is a prediction of a bill
+ * that will be held as a draft, and a screen that quotes the first without the
+ * second is reading out a number nobody will be asked to pay.
+ */
+export interface AutomaticTax {
+  enabled: boolean;
+  status: 'complete' | 'requires_location_inputs';
+  detail: string;
+}
+
+/**
+ * The next bill, priced by the same call `issue()` makes.
+ *
+ * Every one of these figures moves the estimate, which is the whole reason
+ * they are listed separately: `subtotal + uninvoiced_total +
+ * settled_usage_total - discount_total + tax + balance_applied` is
+ * `estimated_total`, exactly. A panel that renders only some of them prints
+ * rows that do not add up to the total above them.
+ */
+export interface NextInvoiceEstimate {
+  subscription: string;
+  date: number;
+  currency: string;
+  lines: RecurringLine[];
+  /** The taxable base of the recurring lines — not what the price list says. */
+  subtotal: number;
+  /** Proration already priced and waiting for a bill, on the same basis. */
+  uninvoiced_total: number;
+  /**
+   * Metered usage priced when its window closed, net of the plan's allowance
+   * and of prepaid credit, waiting for a bill to claim it. On a usage-priced
+   * account this is routinely larger than the plan fee itself.
+   */
+  settled_usage_total: number;
+  /** The discount that will govern this bill, or null when none will. */
+  discount: string | null;
+  /** Positive minor units that discount takes off the taxable base. */
+  discount_total: number;
+  tax: number;
+  automatic_tax: AutomaticTax;
+  balance_applied: number;
+  estimated_total: number;
+  note: string;
+}
+
 export interface CustomerSummary {
   object: 'customer_summary';
   as_of: number;
@@ -533,10 +580,7 @@ export interface CustomerSummary {
     customer_since: number | null;
     source: string;
   };
-  next_invoice: {
-    subscription: string; date: number; currency: string; lines: RecurringLine[];
-    subtotal: number; uninvoiced_total: number; balance_applied: number; estimated_total: number; note: string;
-  } | null;
+  next_invoice: NextInvoiceEstimate | null;
   open_invoices: {
     data: { id: string; number: string | null; status: string; currency: string; total: number; amount_due: number; due_date: number | null; created: number }[];
     total: number;
@@ -1036,4 +1080,93 @@ export interface PricePreview {
   product: { id: string; name: string; unit_label: string | null } | null;
   warning: { code: string; param: string; message: string } | null;
   breakdown: (BreakdownRow & { amount_display: string; unit_display: string | null })[];
+}
+
+/* ------------------------- coupons and promotion codes -------------------- */
+
+export type CouponDuration = 'once' | 'repeating' | 'forever';
+
+/** What a coupon may touch. Both lists empty means the whole bill. */
+export interface CouponAppliesTo {
+  products: string[];
+  prices: string[];
+}
+
+/** `GET /v1/coupons` — the stored terms, plus what the catalogue says they mean. */
+export interface Coupon {
+  object: 'coupon';
+  id: string;
+  /** The internal label — "Q1 land-and-expand", not the code a customer types. */
+  name: string | null;
+  percent_off: number | null;
+  /** Hundredths of a percent: 2000 is 20%. The figure the arithmetic reads. */
+  percent_off_basis_points: number | null;
+  amount_off: number | null;
+  currency: string | null;
+  duration: CouponDuration;
+  duration_in_periods: number | null;
+  max_redemptions: number | null;
+  /** Counted from the redemption rows, never from a column that can drift. */
+  times_redeemed: number;
+  redeem_by: number | null;
+  applies_to: CouponAppliesTo;
+  /** False once archived: unredeemable, but still explaining the bills it cut. */
+  active: boolean;
+  /** Active, in date and not exhausted — the one field a checkout reads. */
+  valid: boolean;
+  metadata: Record<string, string>;
+  created: number;
+  updated: number;
+  livemode: boolean;
+  summary: string;
+  percent_off_display: string | null;
+  amount_off_display: string | null;
+  redemptions_remaining: number | null;
+  invalid_reason: 'inactive' | 'expired' | 'exhausted' | null;
+  invalid_message: string | null;
+}
+
+/** `GET /v1/coupons/:id` — with the codes that hand it out. */
+export interface CouponDetail extends Coupon {
+  promotion_codes: PromotionCode[];
+  /** Its terms freeze on first redemption, exactly as a price freezes. */
+  editable: boolean;
+}
+
+export interface PromotionCodeRestrictions {
+  minimum_amount: number | null;
+  minimum_amount_currency: string | null;
+  first_time_transaction: boolean;
+}
+
+/** `GET /v1/promotion_codes` — one way of handing a coupon out. */
+export interface PromotionCode {
+  object: 'promotion_code';
+  id: string;
+  code: string;
+  coupon: string;
+  active: boolean;
+  expires_at: number | null;
+  max_redemptions: number | null;
+  max_redemptions_per_customer: number | null;
+  times_redeemed: number;
+  restrictions: PromotionCodeRestrictions;
+  valid: boolean;
+  metadata: Record<string, string>;
+  created: number;
+  updated: number;
+  livemode: boolean;
+  redemptions_remaining: number | null;
+  minimum_amount_display: string | null;
+}
+
+/** `GET /v1/coupons/:id/redemptions` — one take-up, and what holds it. */
+export interface CouponRedemption {
+  object: 'coupon_redemption';
+  id: string;
+  coupon: string;
+  promotion_code: string | null;
+  customer: string | null;
+  ref: { type: string; id: string } | null;
+  created: number;
 }

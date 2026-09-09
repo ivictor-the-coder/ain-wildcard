@@ -293,6 +293,88 @@ export function dunningFailed(voice: OrgVoice, facts: DunningFacts, to: Recipien
   };
 }
 
+/**
+ * The card cannot be fixed by waiting, so the remaining retries were dropped.
+ *
+ * This is not the final notice and must not read like one: the bill is not
+ * written off, the account is not closed, and there is a date by which a new
+ * card settles it with nothing else needed. Sending the "we have stopped
+ * retrying" letter here — which is what happened while one composer covered
+ * both endings — tells a customer whose card simply expired that their account
+ * is finished, four days after their first invoice.
+ */
+export function dunningGaveUp(voice: OrgVoice, facts: DunningFacts, to: Recipient, deadline: number | null, hostedUrl: string | null): Composed {
+  const amount = show(facts.amount_at_risk, facts.currency, voice.locale);
+  const dropped = Math.max(0, facts.max_attempts - facts.attempt);
+  const by = deadline
+    ? `A new card added before ${day(deadline, voice)} settles it and nothing else changes.`
+    : 'A new card on the account settles it and nothing else changes.';
+  const letter: Letter = {
+    preheader: `The card on file cannot be charged for invoice ${facts.invoice_number}.`,
+    title: `The card on file needs replacing — invoice ${facts.invoice_number}`,
+    blocks: [
+      {
+        paragraphs: [
+          `${to.name}, the card on file was refused for ${amount} against invoice ${facts.invoice_number}, and it is the kind of refusal that will not clear on its own.`,
+          ...(facts.failure_message ? [`The bank said: ${facts.failure_message}`] : []),
+          dropped
+            ? `Rather than present the same card ${dropped} more time${dropped === 1 ? '' : 's'} and have it refused ${dropped === 1 ? 'again' : 'each time'}, we have stopped trying it. ${by}`
+            : `We are not presenting that card again. ${by}`,
+        ],
+        rows: [
+          { label: 'Invoice', value: facts.invoice_number },
+          { label: 'Amount', value: amount, strong: true },
+          ...(facts.card_hint ? [{ label: 'Card refused', value: facts.card_hint }] : []),
+          ...(deadline ? [{ label: 'Please update by', value: day(deadline, voice) }] : []),
+        ],
+      },
+    ],
+    action: hostedUrl ? { label: 'View invoice', url: hostedUrl } : null,
+    footer: footerOf(voice, null),
+  };
+  return {
+    subject: `Action needed: the card for invoice ${facts.invoice_number} needs replacing — ${amount}`,
+    text: renderText(voice, letter),
+    html: renderLetter(voice, letter),
+  };
+}
+
+/**
+ * The money arrived. The payer is told, because they were told it failed.
+ *
+ * A platform that writes on every refusal and says nothing when the retry
+ * works leaves the last word with the bad news, and the customer chasing a
+ * balance that is already settled.
+ */
+export function dunningRecovered(voice: OrgVoice, facts: DunningFacts, to: Recipient, paidAt: number, hostedUrl: string | null): Composed {
+  const amount = show(facts.amount_at_risk, facts.currency, voice.locale);
+  const letter: Letter = {
+    preheader: `${amount} went through for invoice ${facts.invoice_number}. Nothing further is owed.`,
+    title: `That went through — invoice ${facts.invoice_number} is settled`,
+    blocks: [
+      {
+        paragraphs: [
+          `${to.name}, the card on file was accepted for ${amount} against invoice ${facts.invoice_number} on ${day(paidAt, voice)}, so the earlier decline is settled and nothing further is owed on it.`,
+          `It took ${facts.attempt} attempt${facts.attempt === 1 ? '' : 's'}. You do not need to do anything.`,
+        ],
+        rows: [
+          { label: 'Invoice', value: facts.invoice_number },
+          { label: 'Collected', value: day(paidAt, voice) },
+          { label: 'Amount', value: amount, strong: true },
+          ...(facts.card_hint ? [{ label: 'Card', value: facts.card_hint }] : []),
+        ],
+      },
+    ],
+    action: hostedUrl ? { label: 'View invoice', url: hostedUrl } : null,
+    footer: footerOf(voice, null),
+  };
+  return {
+    subject: `Payment received for invoice ${facts.invoice_number} — ${amount}`,
+    text: renderText(voice, letter),
+    html: renderLetter(voice, letter),
+  };
+}
+
 export function dunningFinal(voice: OrgVoice, facts: DunningFacts, to: Recipient, resolution: string | null, hostedUrl: string | null): Composed {
   const amount = show(facts.amount_at_risk, facts.currency, voice.locale);
   const letter: Letter = {

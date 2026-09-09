@@ -23,6 +23,7 @@ import { SubscriptionsPage, SubscriptionDetailPage } from './subscriptions';
 import { InvoicesPage, InvoiceDetailPage } from './invoices';
 import { PaymentsPage } from './payments-book';
 import { PriceBookPage, ProductDetailPage } from './pricebook';
+import { CouponDetailPage, CouponsPage } from './coupons';
 import type { BillingOverview, Invoice, RevenueAccount, Subscription } from './types';
 
 /**
@@ -465,6 +466,11 @@ export const routes: RouteDef[] = [
   // registering it here is what turns those hits from dead rows into links.
   { path: '/catalog/products', element: PriceBookPage, title: 'Price book' },
   { path: '/catalog/products/:id', element: ProductDetailPage, title: 'Product' },
+  // Alongside the price book rather than under `/billing/…`: a coupon is a
+  // catalogue object with the same immutability rule as a price, and the two
+  // screens link to each other constantly.
+  { path: '/catalog/coupons', element: CouponsPage, title: 'Discounts' },
+  { path: '/catalog/coupons/:id', element: CouponDetailPage, title: 'Coupon' },
 ];
 
 export const nav: NavItem[] = [
@@ -474,6 +480,7 @@ export const nav: NavItem[] = [
   { id: 'billing.invoices.nav', label: 'Invoices', to: '/billing/invoices', group: 'revenue', order: 16, icon: 'invoice' },
   { id: 'billing.payments.nav', label: 'Payments', to: '/billing/payments', group: 'revenue', order: 18, icon: 'coins' },
   { id: 'billing.pricebook.nav', label: 'Price book', to: '/catalog/products', group: 'revenue', order: 20, icon: 'tag' },
+  { id: 'billing.coupons.nav', label: 'Discounts', to: '/catalog/coupons', group: 'revenue', order: 22, icon: 'percent' },
 ];
 
 /**
@@ -537,6 +544,25 @@ export const commands: CommandDef[] = [
     keywords: ['archived', 'retired', 'price book', 'catalog', 'products'],
     icon: 'tag',
     run: (nav) => nav('/catalog/products?standing=archived'),
+  },
+  {
+    id: 'billing.coupon.new',
+    title: 'New coupon',
+    subtitle: 'A percentage or an amount off, and how long it keeps coming off',
+    group: 'Create',
+    keywords: ['coupon', 'discount', 'promotion code', 'promo', 'concession', 'percent off'],
+    icon: 'percent',
+    roles: ['member'],
+    run: (nav) => nav('/catalog/coupons?new=1'),
+  },
+  {
+    id: 'billing.coupons.archived',
+    title: 'Archived coupons',
+    subtitle: 'Campaigns nothing can redeem, still explaining the invoices they cut',
+    group: 'Go to',
+    keywords: ['coupon', 'discount', 'archived', 'campaign', 'promotion code', 'expired'],
+    icon: 'percent',
+    run: (nav) => nav('/catalog/coupons?standing=archived'),
   },
   {
     id: 'billing.open.past_due',

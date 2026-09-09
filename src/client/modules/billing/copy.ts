@@ -11,7 +11,9 @@
  * browser: hand them the subscription or invoice the API returned and they say
  * only what that record supports.
  */
-import type { ChangePreview, Invoice, InvoicePayments, ProrationBehavior, Subscription } from './types';
+import type {
+  ChangePreview, Invoice, InvoicePayments, NextInvoiceEstimate, ProrationBehavior, Subscription,
+} from './types';
 
 /** The two formatters a sentence about money needs, decoupled from React. */
 export interface CopyFormat {
@@ -352,6 +354,266 @@ export function pluraliseBrackets(line: string): string {
  */
 export function billedTotal(invoice: Pick<Invoice, 'subtotal' | 'tax'>): number {
   return invoice.subtotal + invoice.tax;
+}
+
+/* --------------------------- what the next bill is ------------------------ */
+
+/** One row of the next bill's arithmetic, in the order the bill states it. */
+export interface EstimateRow {
+  id: string;
+  label: string;
+  /** Signed minor units: a discount and a credit balance are negative here. */
+  amount: number;
+}
+
+/**
+ * Every figure the next-invoice estimate is made of.
+ *
+ * The panel printed the recurring subtotal, the waiting prorations and the
+ * balance, and then the estimate — and once that estimate learned about
+ * settled usage, the coupon and the tax, those rows stopped adding up to it. A
+ * metered account read "Recurring subtotal $99.00" directly above "Estimated
+ * total $416.08", with nothing on screen to say where the other $317.08 came
+ * from, and a support agent reading it aloud had two numbers and no sentence.
+ *
+ * So every term the server adds or subtracts is a row here. `sum(rows)` is
+ * `estimated_total` exactly — the same identity `buildCustomerSummary` uses to
+ * arrive at it — which makes the panel's honesty a property a test can hold it
+ * to rather than a coincidence of the cases someone happened to look at.
+ */
+export function nextInvoiceRows(next: NextInvoiceEstimate): EstimateRow[] {
+  const rows: EstimateRow[] = [{ id: 'subtotal', label: 'Recurring subtotal', amount: next.subtotal }];
+  if (next.uninvoiced_total !== 0) {
+    rows.push({ id: 'uninvoiced', label: 'Prorations waiting', amount: next.uninvoiced_total });
+  }
+  if (next.settled_usage_total !== 0) {
+    rows.push({ id: 'settled_usage', label: 'Metered usage already settled', amount: next.settled_usage_total });
+  }
+  // Stored positive — it is a subtraction, and it reads as one.
+  if (next.discount_total !== 0) rows.push({ id: 'discount', label: 'Discount', amount: -next.discount_total });
+  if (next.tax !== 0) rows.push({ id: 'tax', label: 'Tax', amount: next.tax });
+  if (next.balance_applied !== 0) {
+    rows.push({ id: 'balance', label: 'Balance applied', amount: next.balance_applied });
+  }
+  return rows;
+}
+
+/**
+ * What the estimate is priced on, named figure by figure.
+ *
+ * The server's own note says which period the bill covers; this says what went
+ * into the number under it — including the two things that are true of the
+ * prediction rather than of the lines: that a metered period still open is not
+ * in it, and that a bill Ain cannot place a tax location for is quoted here
+ * but will be held as a draft rather than sent.
+ */
+export function nextInvoicePricedOn(next: NextInvoiceEstimate, f: CopyFormat): string {
+  const money = (amount: number) => f.money(amount, next.currency);
+  const parts: string[] = [
+    next.subtotal === 0
+      ? 'nothing recurring on that date'
+      : `${money(next.subtotal)} of recurring charges`,
+  ];
+  if (next.uninvoiced_total !== 0) parts.push(`${money(next.uninvoiced_total)} of proration already waiting`);
+  if (next.settled_usage_total !== 0) {
+    parts.push(`${money(next.settled_usage_total)} of metered usage priced when its window closed`);
+  }
+  if (next.discount_total !== 0) parts.push(`the ${money(next.discount_total)} the discount on this account takes off`);
+  if (next.tax !== 0) parts.push(`${money(next.tax)} of tax`);
+  if (next.balance_applied !== 0) {
+    parts.push(next.balance_applied < 0
+      ? `${money(-next.balance_applied)} drawn from the account balance`
+      : `${money(next.balance_applied)} left on the account balance because the bill could not absorb it`);
+  }
+  const sentences = [`Priced on ${joinWords(parts)} — the same calculation the bill itself runs.`];
+  // A metered item on the subscription has no amount until its period closes,
+  // so the estimate is a floor on those accounts and says so.
+  if (next.lines.some((line) => line.metered)) {
+    sentences.push(`Usage recorded between now and ${f.day(next.date)} is not in it — that is not priced until the period closes.`);
+  }
+  if (next.automatic_tax.status === 'requires_location_inputs') {
+    sentences.push(next.automatic_tax.enabled
+      ? `No tax could be worked out: ${lowerFirst(next.automatic_tax.detail)} This bill will be held as a draft rather than sent.`
+      : `No tax could be worked out: ${lowerFirst(next.automatic_tax.detail)}`);
+  }
+  return sentences.join(' ');
+}
+
+/** "a, b and c" — the Oxford-free list every sentence above builds. */
+function joinWords(parts: string[]): string {
+  if (parts.length <= 1) return parts[0] ?? '';
+  return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
+const lowerFirst = (text: string): string => (text ? text[0].toLowerCase() + text.slice(1) : text);
+
+/* -------------------------- coupons and their codes ----------------------- */
+
+/**
+ * A coupon's standing, in the four states an operator sorts a campaign list by.
+ *
+ * `fully_redeemed` is deliberately not called `exhausted`, which is the word
+ * the kit's status map already spends on a dunning campaign it has given up
+ * on. One word, two meanings, and a coupon every seat had taken up would have
+ * read "Given up" beside a dunning row meaning something else entirely.
+ */
+export type CouponStanding = 'live' | 'archived' | 'expired' | 'fully_redeemed';
+
+export function couponStanding(
+  coupon: { active: boolean; invalid_reason: string | null },
+): CouponStanding {
+  if (!coupon.active) return 'archived';
+  if (coupon.invalid_reason === 'expired') return 'expired';
+  if (coupon.invalid_reason === 'exhausted') return 'fully_redeemed';
+  return 'live';
+}
+
+/** How long the concession keeps applying to something that renews. */
+export function couponDurationWords(
+  coupon: { duration: string; duration_in_periods: number | null },
+): string {
+  if (coupon.duration === 'forever') return 'Every bill, without end';
+  if (coupon.duration === 'repeating') {
+    const periods = coupon.duration_in_periods ?? 0;
+    return `${periods} billing ${periods === 1 ? 'period' : 'periods'}`;
+  }
+  return 'The first bill only';
+}
+
+/**
+ * What the coupon is allowed to touch. Both lists empty is the whole bill —
+ * the restriction that reads as "no restriction", which is why it is spelled
+ * out rather than left as an empty cell.
+ */
+export function couponScopeWords(
+  coupon: { applies_to: { products: string[]; prices: string[] } },
+): string {
+  const products = coupon.applies_to.products.length;
+  const prices = coupon.applies_to.prices.length;
+  if (!products && !prices) return 'The whole bill';
+  const parts: string[] = [];
+  if (products) parts.push(`${products} ${products === 1 ? 'product' : 'products'}`);
+  if (prices) parts.push(`${prices} ${prices === 1 ? 'price' : 'prices'}`);
+  return parts.join(' and ');
+}
+
+/** How much of the campaign is spent, said in one line. */
+export function couponRedemptionWords(
+  coupon: { times_redeemed: number; max_redemptions: number | null; redemptions_remaining: number | null },
+): string {
+  const taken = `${coupon.times_redeemed} redeemed`;
+  if (coupon.max_redemptions === null) return `${taken} · no ceiling`;
+  return `${coupon.times_redeemed} of ${coupon.max_redemptions} redeemed · ${couponCeilingWords(coupon).toLowerCase()}`;
+}
+
+/** What is left of the campaign, for the line under a redemption count. */
+export function couponCeilingWords(
+  coupon: { times_redeemed: number; max_redemptions: number | null; redemptions_remaining: number | null },
+): string {
+  if (coupon.max_redemptions === null) return 'No ceiling';
+  const left = coupon.redemptions_remaining ?? Math.max(0, coupon.max_redemptions - coupon.times_redeemed);
+  return left === 0 ? 'None left' : `${left} of ${coupon.max_redemptions} left`;
+}
+
+/**
+ * The conditions a code carries that its coupon does not, one phrase each.
+ *
+ * Two codes can stand for the same coupon with different floors and different
+ * expiries, so these belong to the code and are listed on it — a code shown
+ * only as a string beside a percentage is a promise nobody can check.
+ */
+export function promotionCodeRestrictionWords(
+  code: {
+    expires_at: number | null;
+    max_redemptions: number | null;
+    max_redemptions_per_customer: number | null;
+    restrictions: { minimum_amount: number | null; first_time_transaction: boolean };
+    minimum_amount_display: string | null;
+  },
+  f: CopyFormat,
+): string[] {
+  const words: string[] = [];
+  if (code.expires_at !== null) words.push(`Expires ${f.day(code.expires_at)}`);
+  if (code.max_redemptions !== null) words.push(`${code.max_redemptions} in total`);
+  if (code.max_redemptions_per_customer !== null) {
+    words.push(code.max_redemptions_per_customer === 1
+      ? 'One per account'
+      : `${code.max_redemptions_per_customer} per account`);
+  }
+  if (code.restrictions.minimum_amount !== null && code.minimum_amount_display) {
+    words.push(`Orders of ${code.minimum_amount_display} or more`);
+  }
+  if (code.restrictions.first_time_transaction) words.push('Only an account that has never been billed');
+  return words;
+}
+
+/** A coupon as the create form holds it, before it is a request body. */
+export interface CouponDraft {
+  name: string;
+  kind: 'percent' | 'amount';
+  /** As a person writes it: 20 is 20%. Null while the field is empty. */
+  percent: number | null;
+  /** Integer minor units in `currency`. */
+  amount: number | null;
+  currency: string;
+  duration: 'once' | 'repeating' | 'forever';
+  periods: number | null;
+  maxRedemptions: number | null;
+  redeemBy: number | null;
+}
+
+/**
+ * Why the coupon on the form cannot be created yet — the catalogue's own
+ * refusals, checked before the request rather than after it.
+ *
+ * Every rule here is one `Coupons.createCoupon` enforces: a coupon takes off a
+ * percentage or an amount and never both, a percentage carries no currency and
+ * at most two decimal places, an amount has to name one, a repeating coupon
+ * has to say how many periods, and a `redeem_by` in the past would be a coupon
+ * born expired. Duplicated deliberately and kept honest by a test, because the
+ * alternative is a form that lets someone fill in eight fields and then hands
+ * back a sentence about the ninth.
+ */
+export function couponDraftBlocker(draft: CouponDraft, now: number): string | null {
+  if (!draft.name.trim()) return 'Give the coupon a name — the deal desk has to recognise it in a list.';
+  if (draft.kind === 'percent') {
+    if (draft.percent === null) return 'Say what percentage this coupon takes off.';
+    if (draft.percent <= 0) return 'A coupon takes something off: the percentage must be greater than 0.';
+    if (draft.percent > 100) return 'A coupon cannot take more than 100% off — that would pay the customer to buy.';
+    if (Math.abs(draft.percent * 100 - Math.round(draft.percent * 100)) > 1e-6) {
+      return 'A percentage carries at most two decimal places — 33.33, not 33.333.';
+    }
+  } else {
+    if (draft.amount === null) return 'Say how much this coupon takes off.';
+    if (draft.amount <= 0) return 'A coupon takes something off: the amount must be greater than 0.';
+    if (!draft.currency) return 'An amount-off coupon has to say which currency it is denominated in.';
+  }
+  if (draft.duration === 'repeating' && (draft.periods === null || draft.periods < 1)) {
+    return 'A repeating coupon has to say how many billing periods it repeats for.';
+  }
+  if (draft.maxRedemptions !== null && draft.maxRedemptions < 1) {
+    return 'A redemption ceiling is a whole number of redemptions, at least 1.';
+  }
+  if (draft.redeemBy !== null && draft.redeemBy <= now) {
+    return 'That redeem-by date has passed, so the coupon would be born expired.';
+  }
+  return null;
+}
+
+/** The body `POST /v1/coupons` takes, built from a draft that already passed. */
+export function couponBody(draft: CouponDraft): Record<string, unknown> {
+  return {
+    name: draft.name.trim(),
+    // Basis points rather than the float: 33.33% is 3333 exactly, and the
+    // catalogue refuses a percentage it would have to round.
+    ...(draft.kind === 'percent'
+      ? { percent_off_basis_points: Math.round((draft.percent ?? 0) * 100) }
+      : { amount_off: draft.amount ?? 0, currency: draft.currency }),
+    duration: draft.duration,
+    ...(draft.duration === 'repeating' ? { duration_in_periods: draft.periods } : {}),
+    ...(draft.maxRedemptions !== null ? { max_redemptions: draft.maxRedemptions } : {}),
+    ...(draft.redeemBy !== null ? { redeem_by: draft.redeemBy } : {}),
+  };
 }
 
 /* -------------------------- what an invoice can do ------------------------ */
