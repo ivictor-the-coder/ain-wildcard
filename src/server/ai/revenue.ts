@@ -10,7 +10,7 @@
 import type { WorkspaceProfile } from './grounding';
 import { listPhrase, plural } from './text';
 import type { AgeingBucketId, MovementBucket } from './slots';
-import { NO_FACTS, money as formatAmount, periodPhrase, type Rendered } from './answer';
+import { NO_FACTS, money as formatAmount, periodPhrase, type Citation, type Rendered } from './answer';
 
 /* --------------------------------- shapes -------------------------------- */
 
@@ -179,6 +179,13 @@ const moverLine = (mover: Mover, monthed: boolean): string =>
  */
 export function renderMovement(
   result: MovementToolResult, window: MovementWindow, bucket: MovementBucket, lead: 'amount' | 'accounts', workspace: WorkspaceProfile,
+  /**
+   * Turns the account names the bridge printed into the records behind them.
+   * `revenue_movement` publishes its movers as prose, so the name is the only
+   * handle there is, and the caller is the one that knows how to resolve it —
+   * exactly, or not at all.
+   */
+  cite: (names: string[]) => Citation[] = () => [],
 ): Rendered {
   const rows = monthsIn(result, window);
   const when = periodPhrase(window.label);
@@ -190,7 +197,11 @@ export function renderMovement(
   const currencies = books.map((b) => code(b.currency));
   const monthed = rows.length > 1;
   const movers = moversOf(rows);
-  const facts = { ...NO_FACTS, unit: 'money' as const, label, period: window.label, mixed: books.length > 1, count: movers.length, rows: movers.map((m) => ({ id: m.name, label: m.name })) };
+  const named = cite(movers.map((m) => m.name));
+  const facts = {
+    ...NO_FACTS, unit: 'money' as const, label, period: window.label, mixed: books.length > 1, count: movers.length,
+    rows: named.length ? named.map((c) => ({ id: c.id, label: c.label })) : movers.map((m) => ({ id: m.name, label: m.name })),
+  };
   const lines: string[] = [];
 
   if (bucket === 'all') {
@@ -205,14 +216,14 @@ export function renderMovement(
     }
     const head = `MRR movement ${when}, one book per currency (${listPhrase(currencies)}) and the books are not added together:`;
     const tail = movers.length ? `Largest movers: ${movers.map((m) => `${m.name} ${BUCKET_VERB[m.kind]} ${m.amount}${monthed ? ` in ${monthName(m.month)}` : ''}`).join('; ')}.` : '';
-    return { content: [head, lines.join('\n'), tail].filter(Boolean).join('\n\n'), citations: [], facts: { ...facts, value: books.length === 1 ? books[0].net : null, currency: books.length === 1 ? books[0].currency : null } };
+    return { content: [head, lines.join('\n'), tail].filter(Boolean).join('\n\n'), citations: named, facts: { ...facts, value: books.length === 1 ? books[0].net : null, currency: books.length === 1 ? books[0].currency : null } };
   }
 
   if (bucket === 'net') {
     const parts = books.map((book) => `${signed(book.net, book.currency, workspace)} in ${code(book.currency)} (${fmt(book.opening, book.currency, workspace)} at open, ${fmt(book.closing, book.currency, workspace)} at close)`);
     const head = `Net new MRR ${when}: ${listPhrase(parts)}.${books.length > 1 ? ' One figure per currency; they are not added together.' : ''}`;
     const tail = movers.length ? `Largest movers: ${movers.map((m) => `${m.name} ${BUCKET_VERB[m.kind]} ${m.amount}${monthed ? ` in ${monthName(m.month)}` : ''}`).join('; ')}.` : '';
-    return { content: [head, tail].filter(Boolean).join('\n\n'), citations: [], facts: { ...facts, value: books.length === 1 ? books[0].net : null, formatted: books.length === 1 ? signed(books[0].net, books[0].currency, workspace) : null, currency: books.length === 1 ? books[0].currency : null } };
+    return { content: [head, tail].filter(Boolean).join('\n\n'), citations: named, facts: { ...facts, value: books.length === 1 ? books[0].net : null, formatted: books.length === 1 ? signed(books[0].net, books[0].currency, workspace) : null, currency: books.length === 1 ? books[0].currency : null } };
   }
 
   const moved = books.filter((book) => book[bucket] !== 0);
@@ -226,13 +237,17 @@ export function renderMovement(
     ? `${lead === 'accounts' ? `Accounts that ${verb} ${when}` : `The largest accounts that ${verb}`}: ${ofKind.map((m) => moverLine(m, monthed)).join('; ')}.`
     : '';
   const content = lead === 'accounts' ? [names, amounts].filter(Boolean).join('\n\n') : [amounts, names].filter(Boolean).join('\n\n');
+  // Only the accounts this bucket's sentence actually names: citing every
+  // mover of every kind under "who churned?" would name accounts that
+  // expanded.
+  const ofKindNamed = cite(ofKind.map((m) => m.name));
   return {
     content,
-    citations: [],
+    citations: ofKindNamed,
     facts: {
       ...facts,
       count: ofKind.length,
-      rows: ofKind.map((m) => ({ id: m.name, label: m.name })),
+      rows: ofKindNamed.length ? ofKindNamed.map((c) => ({ id: c.id, label: c.label })) : ofKind.map((m) => ({ id: m.name, label: m.name })),
       value: moved.length === 1 && books.length === 1 ? moved[0][bucket] : null,
       formatted: moved.length === 1 && books.length === 1 ? fmt(moved[0][bucket], moved[0].currency, workspace) : null,
       currency: moved.length === 1 && books.length === 1 ? moved[0].currency : null,
@@ -242,10 +257,17 @@ export function renderMovement(
 
 /* ------------------------------ collections ------------------------------ */
 
+/**
+ * `evidence` is the receivables book itself, read by the caller from the one
+ * definition of "still owed" the whole product uses (`receivables.ts`). The
+ * collections tool answers in per-currency totals and names no row, so every
+ * ageing sentence used to arrive with an empty `citations` — a figure about
+ * four specific bills with no way for the reader to reach one of them.
+ */
 const bookNoun = (n: number): string => plural(n, 'invoice');
 
 /** Days sales outstanding, per currency, on the months the tool was asked for. */
-export function renderDso(result: CollectionsToolResult, months: number, workspace: WorkspaceProfile): Rendered {
+export function renderDso(result: CollectionsToolResult, months: number, workspace: WorkspaceProfile, evidence: Citation[] = []): Rendered {
   const books = bookOrder(result.by_currency, workspace);
   if (!books.length) return { content: 'There is no DSO to report: nothing has been billed.', citations: [], facts: { ...NO_FACTS, unit: 'days', count: 0, label: 'DSO' } };
   const parts = books.map((book) => (book.dso_days === 'n/a'
@@ -253,13 +275,13 @@ export function renderDso(result: CollectionsToolResult, months: number, workspa
     : `${book.dso_days} days in ${code(book.currency)}`));
   const content = `DSO is ${listPhrase(parts)}, on the last ${months} months of billings${books.length > 1 ? ' — one figure per currency, since a day count across currencies is a ratio of two numbers that were never in the same unit' : ''}.`;
   const single = books.length === 1 && books[0].dso_days !== 'n/a' ? books[0] : null;
-  return { content, citations: [], facts: { ...NO_FACTS, unit: 'days', label: 'DSO', mixed: books.length > 1, value: single ? Number(single.dso_days) : null, formatted: single ? `${single.dso_days} days` : null, currency: single?.currency ?? null } };
+  return { content, citations: evidence, facts: { ...NO_FACTS, unit: 'days', label: 'DSO', mixed: books.length > 1, value: single ? Number(single.dso_days) : null, formatted: single ? `${single.dso_days} days` : null, currency: single?.currency ?? null } };
 }
 
 const pastDueBuckets = (book: CollectionsBook) => book.ageing.filter((b) => b.bucket !== 'Not yet due' && b.amount !== 0);
 
 /** What is past due and how long it has been, per currency. */
-export function renderOverdueAge(result: CollectionsToolResult, workspace: WorkspaceProfile): Rendered {
+export function renderOverdueAge(result: CollectionsToolResult, workspace: WorkspaceProfile, evidence: Citation[] = []): Rendered {
   const books = bookOrder(result.by_currency, workspace);
   if (!books.length) return { content: 'Nothing is outstanding, so nothing is past due.', citations: [], facts: { ...NO_FACTS, unit: 'money', count: 0, label: 'Past due' } };
   const lines = books.map((book) => {
@@ -275,7 +297,7 @@ export function renderOverdueAge(result: CollectionsToolResult, workspace: Works
   const single = books.length === 1 ? books[0] : null;
   return {
     content: [`Past due${books.length > 1 ? ', one book per currency' : ''}:`, lines.join('\n')].join('\n\n'),
-    citations: [],
+    citations: evidence,
     facts: { ...NO_FACTS, unit: 'money', label: 'Past due', mixed: books.length > 1, value: single?.past_due ?? null, formatted: single?.past_due_display ?? null, currency: single?.currency ?? null, count: books.reduce((sum, b) => sum + pastDueBuckets(b).reduce((s, x) => s + x.invoices, 0), 0) },
   };
 }
@@ -285,7 +307,7 @@ const BUCKET_NAMES: Record<AgeingBucketId, string> = {
 };
 
 /** One ageing bucket, per currency. */
-export function renderAgeingBucket(result: CollectionsToolResult, bucket: AgeingBucketId, workspace: WorkspaceProfile): Rendered {
+export function renderAgeingBucket(result: CollectionsToolResult, bucket: AgeingBucketId, workspace: WorkspaceProfile, evidence: Citation[] = []): Rendered {
   const name = BUCKET_NAMES[bucket];
   const books = bookOrder(result.by_currency, workspace);
   const held = books.map((book) => ({ book, cell: book.ageing.find((b) => b.bucket === name) })).filter((x) => x.cell && x.cell.amount !== 0);
@@ -299,13 +321,13 @@ export function renderAgeingBucket(result: CollectionsToolResult, bucket: Ageing
   const single = held.length === 1 && books.length === 1 ? held[0] : null;
   return {
     content,
-    citations: [],
+    citations: evidence,
     facts: { ...NO_FACTS, unit: 'money', label, mixed: books.length > 1, count: held.reduce((sum, x) => sum + x.cell!.invoices, 0), value: single ? single.cell!.amount : null, formatted: single ? fmt(single.cell!.amount, single.book.currency, workspace) : null, currency: single?.book.currency ?? null },
   };
 }
 
 /** The whole ageing, per currency: what is outstanding and how old each part is. */
-export function renderAgeing(result: CollectionsToolResult, workspace: WorkspaceProfile): Rendered {
+export function renderAgeing(result: CollectionsToolResult, workspace: WorkspaceProfile, evidence: Citation[] = []): Rendered {
   const books = bookOrder(result.by_currency, workspace);
   if (!books.length) return { content: 'Nothing is outstanding: there are no receivables to age.', citations: [], facts: { ...NO_FACTS, unit: 'money', count: 0, label: 'Receivables ageing' } };
   const lines = books.map((book) => {
@@ -317,7 +339,7 @@ export function renderAgeing(result: CollectionsToolResult, workspace: Workspace
   const single = books.length === 1 ? books[0] : null;
   return {
     content: [`Receivables ageing${books.length > 1 ? ', one book per currency — the books are not added together' : ''}:`, lines.join('\n')].join('\n\n'),
-    citations: [],
+    citations: evidence,
     facts: { ...NO_FACTS, unit: 'money', label: 'Receivables ageing', mixed: books.length > 1, value: single?.outstanding ?? null, formatted: single?.outstanding_display ?? null, currency: single?.currency ?? null, count: books.reduce((sum, b) => sum + b.ageing.reduce((s, x) => s + x.invoices, 0), 0) },
   };
 }

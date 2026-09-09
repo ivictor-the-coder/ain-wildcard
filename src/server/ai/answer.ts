@@ -106,17 +106,30 @@ export const citationsOf = (rows: { id: string; name?: string; label?: string }[
 
 /* -------------------------------- shapes --------------------------------- */
 
-/** "There are 25 closed-won deals." */
-export function renderCount(count: number, thing: string, scope: string, workspace: WorkspaceProfile, opts: { subject?: string | null; period?: string | null } = {}): Rendered {
+/**
+ * "There are 25 closed-won deals."
+ *
+ * A count is measured over a set, and `evidence` is that set as far as the
+ * tool read it. Naming the rows is not decoration: the copilot's own empty
+ * state promises it "cites every record it used", and a client cannot
+ * enumerate rows the server never named — "there are 7 open invoices" with no
+ * sources under it is a number the reader has no way to check. A count whose
+ * set no single row stands for passes nothing and stays honestly silent.
+ */
+export function renderCount(
+  count: number, thing: string, scope: string, workspace: WorkspaceProfile,
+  opts: { subject?: string | null; period?: string | null; evidence?: Citation[] } = {},
+): Rendered {
   const [singular, pluralForm] = thing.split('|');
   const nounPhrase = count === 1 ? singular : (pluralForm ?? plural(2, singular));
   const content = count === 0
     ? `There are no ${pluralForm ?? plural(2, singular)}${scope ? ` ${scope}` : ''}.`
     : `There ${count === 1 ? 'is' : 'are'} ${n(count, workspace.locale)} ${nounPhrase}${scope ? ` ${scope}` : ''}.`;
+  const evidence = (opts.evidence ?? []).slice(0, 8);
   return {
     content,
-    citations: [],
-    facts: { ...NO_FACTS, value: count, formatted: String(count), unit: 'count', count, label: nounPhrase, period: opts.period ?? null, subject: opts.subject ?? null },
+    citations: evidence,
+    facts: { ...NO_FACTS, value: count, formatted: String(count), unit: 'count', count, label: nounPhrase, period: opts.period ?? null, subject: opts.subject ?? null, rows: evidence.map((c) => ({ id: c.id, label: c.label })) },
   };
 }
 
@@ -145,8 +158,7 @@ export function renderList(
 
 /** A count from `record_aggregate`, with the same sentence as any other count. */
 export function renderAggregateCount(result: RecordAggregateResult, thing: string, scope: string, workspace: WorkspaceProfile, opts: { subject?: string | null; period?: string | null } = {}): Rendered {
-  const rendered = renderCount(result.matched_records, thing, scope, workspace, opts);
-  return { ...rendered, citations: result.samples.map((s) => ({ id: s.id, label: s.label, type: result.object_type })), facts: { ...rendered.facts, rows: result.samples } };
+  return renderCount(result.matched_records, thing, scope, workspace, { ...opts, evidence: citationsOf(result.samples, result.object_type) });
 }
 
 /** A sum or an average of one property. */
@@ -179,7 +191,10 @@ export function renderGroupedCount(result: RecordAggregateResult, thing: string,
   const tail = rest > 0 ? `…and ${n(rest, workspace.locale)} more.` : '';
   return {
     content: [head, lines.join('\n'), tail].filter(Boolean).join('\n\n'),
-    citations: [],
+    // A group key is a picklist value, not a record — "Closed won" opens
+    // nothing. The rows the breakdown counted are records, and they are what
+    // the reader can check the split against.
+    citations: citationsOf(result.samples, result.object_type),
     facts: { ...NO_FACTS, value: total, formatted: String(total), unit: 'count', count: total, label: pluralForm, mixed: true, rows: result.groups.map((g) => ({ id: g.key, label: g.label })) },
   };
 }
@@ -427,17 +442,30 @@ export function renderUsage(result: MeteredUsageResult, workspace: WorkspaceProf
     : `${scope}${result.meter.name} ${verb} ${result.formatted} ${periodPhrase(result.window.label)}${who}.`;
   return {
     content,
-    citations: result.by_account.slice(0, 5).map((a) => ({ id: a.id, label: a.label, type: 'customer' })),
+    // The meter leads, because it is the record the figure was read from and
+    // the one row that exists whether or not anything streamed into it: an
+    // account that metered nothing all month has no accounts to cite, and
+    // "recorded nothing" with no source under it is a claim about a meter the
+    // reader cannot open.
+    citations: [
+      { id: result.meter.id, label: result.meter.name, type: 'meter' },
+      ...result.by_account.slice(0, 5).map((a) => ({ id: a.id, label: a.label, type: 'customer' })),
+    ],
     facts: { ...NO_FACTS, value: result.value, formatted: result.formatted, unit: 'units', count: result.accounts, label: result.meter.name, period: result.window.label, subject: result.subject?.label ?? null },
   };
 }
 
-export function renderQuote(result: { product: string | null; quantity: number; amount: number; amount_display: string; breakdown: string[]; warning: string | null }, unit: string, currency: string, workspace: WorkspaceProfile): Rendered {
+export function renderQuote(
+  result: { product: string | null; quantity: number; amount: number; amount_display: string; breakdown: string[]; warning: string | null },
+  unit: string, currency: string, workspace: WorkspaceProfile,
+  /** The record the price is attached to, so the reader can check the rate the quote used. */
+  priced: Citation | null = null,
+): Rendered {
   const qty = `${n(result.quantity, workspace.locale)} ${unit}`;
   const content = `${qty} would cost ${result.amount_display}${result.product ? ` on ${result.product}` : ''}.`;
   return {
     content,
-    citations: [],
+    citations: priced ? [priced] : [],
     facts: { ...NO_FACTS, value: result.amount, formatted: result.amount_display, unit: 'money', currency, count: result.quantity, label: 'Quoted price' },
   };
 }
@@ -485,6 +513,10 @@ export function renderStale(result: StaleAccountsResult, workspace: WorkspacePro
 
 export interface SubscriptionRow { id: string; customer_name: string | null; status: string; status_detail?: string; items: string[]; mrr_display?: string; current_period_end?: string }
 
+/** The ledger rows a subscription answer names — whether it lists them or only counts them. */
+export const subscriptionCitations = (rows: SubscriptionRow[]): Citation[] =>
+  rows.map((s) => ({ id: s.id, label: s.customer_name ?? s.id, type: 'subscription' }));
+
 export function renderSubscriptions(rows: SubscriptionRow[], total: number, scope: string, workspace: WorkspaceProfile): Rendered {
   void workspace;
   if (!total) return { content: `There are no subscriptions ${scope}.`, citations: [], facts: { ...NO_FACTS, unit: 'count', value: 0, formatted: '0', count: 0, label: 'subscriptions' } };
@@ -492,7 +524,7 @@ export function renderSubscriptions(rows: SubscriptionRow[], total: number, scop
   const rest = total - rows.length;
   return {
     content: [`${total} ${plural(total, 'subscription is', 'subscriptions are')} ${scope}:`, lines.join('\n'), rest > 0 ? `…and ${rest} more.` : ''].filter(Boolean).join('\n\n'),
-    citations: rows.map((s) => ({ id: s.id, label: s.customer_name ?? s.id, type: 'subscription' })),
+    citations: subscriptionCitations(rows),
     facts: { ...NO_FACTS, unit: 'count', value: total, formatted: String(total), count: total, label: 'subscriptions', rows: rows.map((s) => ({ id: s.id, label: s.customer_name ?? s.id })) },
   };
 }
@@ -517,6 +549,10 @@ function invoiceDetail(i: InvoiceRow): string {
   return `${i.amount_due_display ? `${i.amount_due_display} due` : i.total_display ?? ''}${i.due ? ` · due ${i.due}` : ''}`.trim();
 }
 
+/** The bills an invoice answer names — whether it lists them or only counts them. */
+export const invoiceCitations = (rows: InvoiceRow[]): Citation[] =>
+  rows.map((i) => ({ id: i.id, label: i.number ?? i.id, type: 'invoice' }));
+
 export function renderInvoices(rows: InvoiceRow[], total: number, scope: string): Rendered {
   if (!total) return { content: `There are no ${scope} invoices.`, citations: [], facts: { ...NO_FACTS, unit: 'count', value: 0, formatted: '0', count: 0, label: 'invoices' } };
   const lines = rows.map((i) => {
@@ -526,7 +562,7 @@ export function renderInvoices(rows: InvoiceRow[], total: number, scope: string)
   const rest = total - rows.length;
   return {
     content: [`${total} ${scope} ${plural(total, 'invoice')}:`, lines.join('\n'), rest > 0 ? `…and ${rest} more.` : ''].filter(Boolean).join('\n\n'),
-    citations: rows.map((i) => ({ id: i.id, label: i.number ?? i.id, type: 'invoice' })),
+    citations: invoiceCitations(rows),
     facts: { ...NO_FACTS, unit: 'count', value: total, formatted: String(total), count: total, label: `${scope} invoices`, rows: rows.map((i) => ({ id: i.id, label: i.number ?? i.id })) },
   };
 }

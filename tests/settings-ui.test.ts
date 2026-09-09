@@ -11,8 +11,10 @@
  * answer against the API's own numbers.
  */
 import { strict as assert } from 'node:assert';
-import { describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 import { readFileSync, readdirSync } from 'node:fs';
+
+import { createApp, type App } from '../src/server/app';
 
 import {
   RECORD_LIMIT, RETENTION, attributeJobs, covers, dueBy, readRecordedMoves, recordKey, recordMove, recordedFor, tallyMove,
@@ -21,6 +23,9 @@ import { targetLabel, targetRoute } from '../src/client/modules/settings/targets
 import { TILE_DASH, tileOf } from '../src/client/modules/settings/tiles';
 import { FALLBACK_LOCALE, FALLBACK_ZONE, isHostname, isLocale, isTimeZone, previewSettings, problemWith } from '../src/client/modules/settings/workspace-core';
 import { actorLabel, seatsFromTrail, unattributedBecause } from '../src/client/modules/settings/audit-core';
+import { ALWAYS_REACHABLE, readScopes } from '../src/client/modules/settings/keys-core';
+import { readActor, seatsFromStream } from '../src/client/modules/settings/events-core';
+import { whatTheLinkDoes, withArticle } from '../src/client/modules/settings/team-core';
 import { byPressure, describePressure, readPressure } from '../src/client/modules/settings/features-core';
 
 const DAY = 86_400_000;
@@ -562,6 +567,269 @@ describe('the time machine screen renders counts only through the tally', () => 
 });
 
 /**
+ * A scope used to be nothing but a rung on the role ladder, and both settings
+ * surfaces that mention one said so in as many words. `missingScope` in
+ * `src/server/app.ts` now refuses a request whose route no held scope covers,
+ * so what these screens print about a credential has to be what the door does
+ * with it — which is why the reach is computed from the same two rules and
+ * then, below, checked against the door itself.
+ */
+describe('what an API key’s scopes reach', () => {
+  it('confines a key to the domain its scope names', () => {
+    const reach = readScopes(['crm:write']);
+    assert.deepEqual(reach.writes, ['crm']);
+    assert.deepEqual(reach.reads, ['crm'], 'write implies read in the same domain');
+    assert.match(reach.summary, /crm/, 'the domain is named, not implied');
+    // The old sentence, in one assertion: any scope that named a write was
+    // said to reach every write in the platform.
+    assert.ok(!/every write/i.test(reach.summary), 'it no longer promises every write in the platform');
+    assert.ok(!/scopes by domain/i.test(reach.summary), 'and no longer says nothing enforces domains');
+  });
+
+  it('reads a bare verb as every domain, and nothing but * as admin', () => {
+    const both = readScopes(['read', 'write']);
+    assert.equal(both.role, 'member');
+    assert.equal(both.reads, null, 'a bare verb applies in every domain');
+    assert.equal(both.writes, null);
+    assert.match(both.summary, /admin-only/, 'and says which routes stay shut');
+
+    const full = readScopes(['*']);
+    assert.equal(full.role, 'admin');
+    assert.equal(full.writes, null);
+    // `keyRole` tests the array for '*' itself, so a domain-scoped everything
+    // is a member with wide reach, not an admin.
+    assert.equal(readScopes(['crm:*']).role, 'member');
+  });
+
+  it('never lets read imply write', () => {
+    const reading = readScopes(['billing:read']);
+    assert.deepEqual(reading.writes, []);
+    assert.deepEqual(reading.reads, ['billing']);
+    assert.equal(reading.role, 'readonly');
+  });
+
+  /**
+   * `["metering"]` is the trap the door sets and the screen has to disclose: a
+   * bare domain grants every action in it, but nothing in the set ends in
+   * write, admin or `*`, so `keyRole` authenticates the key as `readonly` and
+   * the role check refuses every mutating route before the domain is looked at.
+   */
+  it('closes the writes of a bare domain, because the rung refuses them before the domain is read', () => {
+    const reading = readScopes(['metering']);
+    assert.equal(reading.role, 'readonly');
+    assert.deepEqual(reading.writes, [], 'the rung, not the domain, is what shuts them');
+    assert.deepEqual(reading.reads, ['metering']);
+    assert.match(reading.held[0].reach, /authenticates as readonly/);
+    assert.match(reading.held[0].reach, /metering:write/, 'and says what to write instead');
+    assert.ok(!/^Reads and writes/.test(reading.held[0].reach), 'the line does not promise writes the key cannot make');
+  });
+
+  it('says so when a scope matches no route at all', () => {
+    // A route is only ever a read or a write, so `crm:list` grants nothing —
+    // and a scope with no domain grants nothing whichever verb it names.
+    for (const dead of [['crm:list'], [':write'], ['crm:']]) {
+      const reading = readScopes(dead);
+      assert.deepEqual(reading.reads, [], `${dead[0]} reaches no read`);
+      assert.deepEqual(reading.writes, [], `${dead[0]} reaches no write`);
+      assert.deepEqual(reading.dead, dead);
+      assert.match(reading.summary, /^Nothing\./);
+      assert.match(reading.summary, /GET \/v1\/me/, 'except the one route no scope closes');
+      assert.equal(reading.tone, 'danger');
+    }
+    // ':write' still ends in a write verb, so the rung is member even though
+    // the key reaches nothing — the screen says both.
+    assert.equal(readScopes([':write']).role, 'member');
+  });
+
+  it('marks a scope that adds nothing beside *', () => {
+    const reading = readScopes(['*', 'crm:read']);
+    assert.match(reading.held[1].reach, /Redundant/);
+  });
+});
+
+/**
+ * The claim and the enforcement, checked against each other.
+ *
+ * Every sentence above is a promise about what a credential will do at 3am in
+ * somebody's build server, and the only proof is the door. So the keys are
+ * really minted and really presented, and what this surface prints about each
+ * one is compared with the status the platform answers.
+ */
+describe('the reach the key screen prints is the reach the door enforces', () => {
+  let app: App;
+  let cookie = '';
+
+  before(async () => {
+    app = await createApp({ db: 'memory' });
+    const login = await app.handle({ method: 'POST', path: '/v1/auth/demo' });
+    cookie = String(login.headers['set-cookie'] || '').split(';')[0];
+  });
+  after(() => app?.close());
+
+  const mint = async (scopes: string[]): Promise<string> => {
+    const res = await app.handle({
+      method: 'POST', path: '/v1/api-keys', headers: { cookie }, body: { name: `reach ${scopes.join(' ')}`, scopes },
+    });
+    assert.equal(res.status, 201, JSON.stringify(res.body));
+    return (res.body as { secret: string }).secret;
+  };
+  /** A 403 is the refusal; anything else means the door let the request in. */
+  const reaches = async (secret: string, method: string, path: string): Promise<boolean> => {
+    const res = await app.handle({ method, path, body: method === 'GET' ? undefined : {}, headers: { authorization: `Bearer ${secret}` } });
+    return res.status !== 403;
+  };
+
+  /** The read side and the write side of three domains, by their own routes. */
+  const CRM_READ = ['GET', '/v1/records/company'] as const;
+  const CRM_WRITE = ['POST', '/v1/records/company'] as const;
+  const BILLING_READ = ['GET', '/v1/invoices'] as const;
+  const BILLING_WRITE = ['POST', '/v1/invoices'] as const;
+  const METERING_WRITE = ['POST', '/v1/meter-events'] as const;
+
+  it('a domain-scoped write reaches that domain and is refused in every other', async () => {
+    const reading = readScopes(['crm:write']);
+    const secret = await mint(['crm:write']);
+    assert.deepEqual(reading.writes, ['crm']);
+    assert.equal(await reaches(secret, ...CRM_WRITE), true, 'the domain it names');
+    assert.equal(await reaches(secret, ...CRM_READ), true, 'and that domain’s reads');
+    assert.equal(await reaches(secret, ...BILLING_WRITE), false, 'not a write elsewhere');
+    assert.equal(await reaches(secret, ...BILLING_READ), false, 'not even a read elsewhere');
+  });
+
+  it('a domain-scoped read cannot write its own domain', async () => {
+    const reading = readScopes(['crm:read']);
+    const secret = await mint(['crm:read']);
+    assert.deepEqual(reading.writes, []);
+    assert.equal(await reaches(secret, ...CRM_READ), true);
+    assert.equal(await reaches(secret, ...CRM_WRITE), false);
+  });
+
+  it('a bare domain reaches its reads and none of its writes, exactly as the line says', async () => {
+    const reading = readScopes(['metering']);
+    const secret = await mint(['metering']);
+    assert.deepEqual(reading.writes, []);
+    assert.equal(await reaches(secret, 'GET', '/v1/meter-events'), true);
+    assert.equal(await reaches(secret, ...METERING_WRITE), false, 'the rung refuses the ingest write');
+    // Naming the action is what the line tells the operator to do, and it works.
+    const named = await mint(['metering:write']);
+    assert.deepEqual(readScopes(['metering:write']).writes, ['metering']);
+    assert.equal(await reaches(named, ...METERING_WRITE), true);
+  });
+
+  it('a scope no route matches reaches nothing but the route that says what the key is', async () => {
+    const reading = readScopes(['crm:list']);
+    const secret = await mint(['crm:list']);
+    assert.deepEqual(reading.reads, []);
+    assert.equal(await reaches(secret, ...CRM_READ), false);
+    assert.equal(await reaches(secret, 'GET', '/v1/me'), true, ALWAYS_REACHABLE);
+  });
+
+  it('a bare verb is every domain, and no verb reaches an admin-only route', async () => {
+    const everyRead = await mint(['read']);
+    assert.equal(readScopes(['read']).reads, null);
+    assert.equal(await reaches(everyRead, ...CRM_READ), true);
+    assert.equal(await reaches(everyRead, ...BILLING_READ), true);
+    assert.equal(await reaches(everyRead, ...BILLING_WRITE), false);
+
+    const readWrite = await mint(['read', 'write']);
+    assert.equal(readScopes(['read', 'write']).writes, null);
+    assert.equal(await reaches(readWrite, ...BILLING_WRITE), true);
+    // The sentence names these four; two of them are readable routes, and a
+    // member-rung key is refused both.
+    assert.equal(await reaches(readWrite, 'GET', '/v1/audit-log'), false);
+    assert.equal(await reaches(readWrite, 'GET', '/v1/api-keys'), false);
+
+    const everything = await mint(['*']);
+    assert.equal(readScopes(['*']).role, 'admin');
+    assert.equal(await reaches(everything, 'GET', '/v1/audit-log'), true, 'full access is full');
+  });
+});
+
+/**
+ * The stream carries `actor_id` and nothing else about the actor, and the only
+ * roster it has holds current seats — so a removed teammate arrived as a bare
+ * `usr_…` printed in the same face as the name beside it. The stream's own
+ * payloads carry the address; where they do not, an id has to read as an id.
+ */
+describe('what the event stream can say about the people behind it', () => {
+  const stream = [
+    { type: 'user.invited', object_type: 'user', object_id: 'usr_gone', data: { id: 'usr_gone', email: 'critic@northwind.io', role: 'member', status: 'invited' } },
+    { type: 'user.activated', object_type: 'user', object_id: 'usr_gone', data: { id: 'usr_gone', email: 'critic@northwind.io', role: 'member', status: 'active' } },
+    { type: 'user.removed', object_type: 'user', object_id: 'usr_gone', data: { id: 'usr_gone', role: 'member', status: 'removed', sessions_ended: 1, api_keys_revoked: 0 } },
+    { type: 'credit.usage_settled', object_type: 'credit_grant', object_id: 'cg_1', data: { id: 'cg_1' } },
+  ];
+  const roster = (id: string) => (id === 'usr_seed01' ? 'Dana Whitfield' : undefined);
+
+  it('names a removed teammate off the payload a subscriber receives, and marks the seat removed', () => {
+    const seats = seatsFromStream(stream);
+    assert.deepEqual(seats.get('usr_gone'), { email: 'critic@northwind.io', removed: true });
+    assert.equal(seats.has('cg_1'), false, 'only teammates');
+    // Which is what the ladder then reads, so the row stops printing the id.
+    assert.equal(actorLabel('usr_gone', 'user', roster, seats), 'critic@northwind.io · removed');
+  });
+
+  it('takes the removal on its own, and the address on its own', () => {
+    // `user.removed` carries no address, so a page holding only that entry can
+    // still say the seat is gone rather than showing a live-looking name.
+    assert.deepEqual(seatsFromStream([stream[2]]).get('usr_gone'), { email: null, removed: true });
+    // And a seat only ever seen activated is named without being called gone.
+    assert.deepEqual(seatsFromStream([stream[1]]).get('usr_gone'), { email: 'critic@northwind.io', removed: false });
+  });
+
+  it('reads an id as an id when nothing names it, and says what is known about it', () => {
+    const unnamed = readActor('usr_ghost', 'user', 'usr_ghost');
+    assert.equal(unnamed.isId, true, 'an id is rendered as an id, never in the face of a name');
+    assert.match(unnamed.note ?? '', /roster/);
+    assert.match(unnamed.detail ?? '', /audit trail/, 'and where the name it cannot show is kept');
+
+    const key = readActor('ak_1', 'api_key', 'ak_1');
+    assert.equal(key.isId, true);
+    assert.match(key.note ?? '', /API key/);
+  });
+
+  it('says nothing extra about an actor the ladder already named', () => {
+    const named = readActor('usr_seed01', 'user', 'Dana Whitfield');
+    assert.equal(named.isId, false);
+    assert.equal(named.note, null);
+    // Unattributed is a label, not an id: it must not be set in the id face.
+    const nobody = readActor(null, 'system', 'Unattributed');
+    assert.equal(nobody.isId, false);
+    assert.equal(nobody.detail, null);
+  });
+});
+
+/**
+ * Redeeming an invitation verifies an existing credential and only enrols a
+ * new one — `POST /v1/auth/accept` sets a password for an address Ain has never
+ * seen and checks it against the account's own for one it has, because
+ * identity is one global row and a workspace that could set that password
+ * could set it for every other workspace the person belongs to. The roster
+ * says what the link does in four places and none of them may say "they set a
+ * password".
+ */
+describe('what an invitation link does, for the admin handing it over', () => {
+  it('never promises a password is chosen, because half the people opening it already have one', () => {
+    for (const role of ['owner', 'admin', 'member', 'analyst', 'readonly'] as const) {
+      const sentence = whatTheLinkDoes(role);
+      assert.match(sentence, /confirm their Ain password/);
+      assert.ok(!/set a password/.test(sentence), `${role}: nothing sets a password`);
+      assert.ok(!/choose a password/.test(sentence), `${role}: nor chooses one outright`);
+      assert.match(sentence, /or one they choose now if this address is new to Ain/, 'both branches are covered');
+      assert.match(sentence, /It works once\./);
+    }
+  });
+
+  it('reads the role with the article the role takes', () => {
+    assert.match(whatTheLinkDoes('admin'), /as an admin\b/);
+    assert.match(whatTheLinkDoes('owner'), /as an owner\b/);
+    assert.match(whatTheLinkDoes('analyst'), /as an analyst\b/);
+    assert.match(whatTheLinkDoes('member'), /as a member\b/);
+    assert.equal(withArticle('member'), 'a member');
+    assert.equal(withArticle('admin'), 'an admin');
+  });
+});
+
+/**
  * Sentences the screens must and must not say. Each of these was read on
  * screen by someone judging the surface, and each is checked at the source so
  * it cannot quietly come back.
@@ -642,6 +910,50 @@ describe('what the settings screens say', () => {
       assert.ok(read(file).includes('<DialogForm onSubmit='), `${file} wraps its dialog fields in a form`);
     }
     assert.ok(!/onKeyDown=\{\(e\) => \{ if \(e\.key === 'Enter'/.test(read('team.tsx')), 'no per-field Enter handler is left to disagree with the form');
+  });
+
+  it('no longer says a scope is unenforced by domain, on either surface that mentions one', () => {
+    // Both sentences were true when they were written and are now the most
+    // dangerous thing either screen could say: a key minted crm:write really
+    // is confined to the CRM.
+    const common = read('common.tsx');
+    const keys = read('keys.tsx');
+    for (const [file, source] of [['common.tsx', common], ['keys.tsx', keys]] as const) {
+      assert.ok(!/scopes by domain yet/.test(source), `${file}: the "not yet" claim is gone`);
+      assert.ok(!/reaches every write in the/.test(source), `${file}: and the promise it made with it`);
+      assert.ok(!/member on every write in the/.test(source), `${file}: including the card's version`);
+    }
+    // And the screen now says where a key may act, not only how much.
+    assert.match(keys, /Where it may do it/, 'the bounded card has a domain half');
+    assert.match(keys, /write<\/code>\n\s*\{' implies '\}/, 'and states that write implies read');
+  });
+
+  it('the mint dialog explains the reach of the exact scopes it is about to turn into a credential', () => {
+    const keys = read('keys.tsx');
+    assert.match(keys, /reach\.held\.map\(\(held\) => \(/, 'one line per scope, from readScopes');
+    assert.match(keys, /reaches nothing/, 'and a scope no route matches is called out before it is minted');
+    assert.ok(!/read through the same ladder/.test(keys), 'the ladder-only explanation is gone');
+  });
+
+  it('the event stream shows an actor id as an id, with what is known about it', () => {
+    const events = read('events.tsx');
+    assert.match(events, /seatsFromStream\(/, 'the stream is read for the addresses its own payloads carry');
+    assert.match(events, /useActorName\(\{ seats \}\)/);
+    assert.match(events, /actor\.isId/, 'and an id it still cannot name is rendered as an id');
+    // The bare interpolation is what printed `usr_…` in the face of a name.
+    assert.ok(!/\{actorName\(event\.actor_id, event\.actor_type\)\}/.test(events), 'the plain actor label is gone from the row');
+    assert.ok(!/by \$\{actorName\(selected\.actor_id/.test(events), 'and from the payload card’s sentence');
+  });
+
+  it('nothing on the roster says the workspace sets anybody’s password', () => {
+    // Accepting an invitation verifies an existing credential and only enrols
+    // a new one, and the screen cannot tell which half the reader is in.
+    const team = read('team.tsx');
+    const prose = team.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    assert.ok(!/set a password/.test(prose), 'no sentence promises a password is set');
+    assert.ok(!/sets a password/.test(prose));
+    assert.match(prose, /CREDENTIAL_RULE/, 'the one clause is written once and reused');
+    assert.match(prose, /whatTheLinkDoes\(seat\.role\)/, 'and the link panel composes its sentence from it');
   });
 
   it('names the actor from everything the screen knows, not the roster alone', () => {

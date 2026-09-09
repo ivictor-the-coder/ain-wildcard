@@ -8,12 +8,14 @@
  * So the one moment it exists is given its own panel, with a copy control and a
  * warning that says plainly it cannot be shown again.
  *
- * And the scopes are shown for what they actually do. `keyRole` in
- * `src/server/app.ts` reads them as a ladder — `*` is admin, anything naming a
- * write is a member *everywhere*, everything else is read-only — because no
- * route in the platform declares `meta.scopes` yet. Rendering `crm:write` as
- * though it confined a key to CRM would be the most dangerous sentence on this
- * surface, so the reach is spelled out under every key.
+ * And the scopes are shown for what they actually do, which changed under this
+ * screen: a scope used to be read as nothing but a rung on the role ladder, so
+ * `crm:write` reached every write in the workspace and this screen said so.
+ * `missingScope` in `src/server/app.ts` now refuses any request whose route no
+ * held scope covers, so the reach is computed by `readScopes` — the same two
+ * rules the door applies — and spelled out under every key, beside every
+ * preset, and once more against the exact scopes the mint dialog is about to
+ * turn into a live credential.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, useQuery, type ListEnvelope } from '../../kernel/api';
@@ -26,7 +28,8 @@ import {
   AlertTriangleIcon, XCircleIcon,
 } from '../../design';
 import {
-  DialogForm, ListFailure, NeedsAdmin, SettingsShell, scopeReach, useAction, useActorName, useConsumeQuery, useOpenFromQuery,
+  ALWAYS_REACHABLE, DialogForm, ListFailure, NeedsAdmin, SettingsShell, scopeReach, useAction, useActorName,
+  useConsumeQuery, useOpenFromQuery,
 } from './common';
 import type { ApiKey, AuditEntry, MintedApiKey } from './types';
 
@@ -59,15 +62,17 @@ function useMinters(enabled: boolean): { minter: (keyId: string) => string | nul
 }
 
 /**
- * The three reaches the platform actually distinguishes, named as such. A
- * custom set is still allowed — it is read through the same ladder, and the
- * dialog says which rung it lands on before the key is minted.
+ * The three workspace-wide reaches, named as such: `*`, and the two bare verbs
+ * — a bare verb being the shorthand the door reads as "in every domain".
+ * Anything narrower is a custom set, because the domains are this
+ * installation's own and a list of them written down here would go stale the
+ * first time a module is added.
  */
 const PRESETS = [
   { id: 'full', label: 'Full access', scopes: ['*'] },
-  { id: 'write', label: 'Read and write', scopes: ['read', 'write'] },
-  { id: 'read', label: 'Read only', scopes: ['read'] },
-  { id: 'custom', label: 'Custom scopes', scopes: [] as string[] },
+  { id: 'write', label: 'Read and write, every domain', scopes: ['read', 'write'] },
+  { id: 'read', label: 'Read only, every domain', scopes: ['read'] },
+  { id: 'custom', label: 'One domain at a time', scopes: [] as string[] },
 ] as const;
 
 type PresetId = (typeof PRESETS)[number]['id'];
@@ -158,7 +163,19 @@ export function ApiKeysPage() {
           <Tooltip content={reach.summary}>
             <span className="u-row" style={{ gap: 'var(--space-3)', flexWrap: 'wrap' }}>
               <Badge tone={reach.tone} pill>{reach.role}</Badge>
-              {row.scopes.map((scope) => <span key={scope} className="st-mono">{scope}</span>)}
+              {/* A scope no route can match is struck through rather than listed
+                  as though it granted something — a key made only of those
+                  authenticates and then reaches nothing. */}
+              {reach.held.map((held) => (
+                <span
+                  key={held.scope}
+                  className="st-mono"
+                  style={!held.reads && !held.writes ? { textDecoration: 'line-through', color: 'var(--text-tertiary)' } : undefined}
+                  title={held.reach}
+                >
+                  {held.scope}
+                </span>
+              ))}
             </span>
           </Tooltip>
         );
@@ -295,17 +312,47 @@ export function ApiKeysPage() {
           />
         </Card>
 
-        <Card title="How a key is bounded" description="Two ceilings, both enforced on every request.">
+        <Card title="How a key is bounded" description="Two ceilings and one door, all three enforced on every request.">
           <div className="st-rows">
             <div className="st-row">
               <div className="st-row__main">
-                <div className="st-row__title">Its own scopes</div>
+                <div className="st-row__title">How much it may do</div>
                 <div className="st-row__sub">
-                  {'No route declares scopes by domain yet, so the platform reads them as a ladder: '}
+                  {'The rung it authenticates at. '}
                   <code className="st-mono">*</code>
-                  {' authenticates as admin, anything naming a write authenticates as member on every write in the '
-                    + 'product, and everything else is read-only. A restricted key can never move the clock, mint '
-                    + 'keys or read this screen.'}
+                  {' is admin; anything naming a write — '}
+                  <code className="st-mono">write</code>
+                  {', '}
+                  <code className="st-mono">crm:write</code>
+                  {', '}
+                  <code className="st-mono">billing:admin</code>
+                  {' — is member, which is the rung every mutating route in the product is gated at; everything else '
+                    + 'is read-only. Nothing but '}
+                  <code className="st-mono">*</code>
+                  {' reaches an admin-only route, so a restricted key can never move the clock, mint keys or read '
+                    + 'this screen.'}
+                </div>
+              </div>
+            </div>
+            <div className="st-row">
+              <div className="st-row__main">
+                <div className="st-row__title">Where it may do it</div>
+                <div className="st-row__sub">
+                  {'A scope names a domain as well as an action, and both are checked. A route belongs to its module '
+                    + 'and to every tag it is filed under in the API reference, and it sits on that domain’s read '
+                    + 'side or its write side — so '}
+                  <code className="st-mono">crm:write</code>
+                  {' reaches the CRM’s writes and its reads, and answers 403 with the scope it would have needed '
+                    + 'anywhere else. Two things that are easy to get wrong: '}
+                  <code className="st-mono">write</code>
+                  {' implies '}
+                  <code className="st-mono">read</code>
+                  {' in the same domain, because a key that cannot read back the record it just wrote is not an '
+                    + 'integration credential; and the searches, previews and estimates that compute an answer '
+                    + 'without changing anything are reads even though they are POSTs, so a reporting key can still '
+                    + 'run them. '}
+                  <code className="st-mono">{ALWAYS_REACHABLE}</code>
+                  {' is the one route no scope closes — it is how an SDK discovers that its key is restricted.'}
                 </div>
               </div>
             </div>
@@ -366,6 +413,19 @@ function CreateKeyDialog({ open, action, onClose, onMinted }: {
   const [custom, setCustom] = useState<string[]>([]);
   const [livemode, setLivemode] = useState(false);
   const first = useRef<HTMLInputElement>(null);
+  /**
+   * The domain names a custom scope can actually be built from. A route
+   * belongs to its module and to its documentation tags, and the module half
+   * is what this installation reports — so these are names that certainly
+   * resolve, offered rather than validated against, since a tag is a domain
+   * too. The shell already reads this URL once per session, so it costs
+   * nothing here.
+   */
+  const map = useQuery<{ modules?: { name?: string }[] }>('/v1/system/map', undefined, { enabled: open });
+  const domains = useMemo(
+    () => (map.data?.modules ?? []).map((module) => module.name).filter((name): name is string => !!name).sort(),
+    [map.data],
+  );
 
   const scopes: string[] = preset === 'custom' ? custom : [...PRESETS.find((p) => p.id === preset)!.scopes];
   const reach = scopeReach(scopes);
@@ -440,7 +500,7 @@ function CreateKeyDialog({ open, action, onClose, onMinted }: {
               value: option.id,
               label: option.label,
               hint: option.id === 'custom'
-                ? 'Your own scope strings. They are read through the same ladder.'
+                ? 'Scopes of your own, as domain:action — the reach is spelled out below as you add them.'
                 : scopeReach(option.scopes).summary,
             }))}
           />
@@ -450,7 +510,7 @@ function CreateKeyDialog({ open, action, onClose, onMinted }: {
           <Field
             label="Scopes"
             required
-            hint="Enter to add. A scope ending in write, admin or * makes this key a member everywhere; anything else keeps it read-only."
+            hint={`Enter to add. ${domains.length ? `Domains this installation serves: ${domains.join(', ')} — the API reference’s headings work too.` : 'A domain is a module name or one of the API reference’s headings.'}`}
           >
             <TagInput
               value={custom}
@@ -463,8 +523,33 @@ function CreateKeyDialog({ open, action, onClose, onMinted }: {
           </Field>
         )}
 
-        <Banner tone={reach.tone === 'warning' ? 'warning' : 'info'} compact title={`This key will authenticate as ${reach.role}`}>
-          {reach.summary}
+        {/*
+          * The reach is stated against the scopes themselves, not the preset,
+          * because the preset is a shorthand and the credential is not: a key
+          * is minted once and lives until somebody revokes it, so the sentence
+          * that matters is the one about the strings being sent.
+          */}
+        <Banner
+          tone={reach.tone === 'neutral' ? 'info' : reach.tone}
+          compact
+          title={`This key will authenticate as ${reach.role}`}
+        >
+          <Stack gap={3}>
+            <span>{reach.summary}</span>
+            {reach.held.length > 0 && (
+              <div className="st-rows">
+                {reach.held.map((held) => (
+                  <div className="st-row" key={held.scope}>
+                    <div className="st-row__main">
+                      <div className="st-row__title"><span className="st-mono">{held.scope}</span></div>
+                      <div className="st-row__sub">{held.reach}</div>
+                    </div>
+                    {!held.reads && !held.writes && <div className="st-row__aside"><Badge tone="danger" pill>reaches nothing</Badge></div>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </Stack>
         </Banner>
 
         <Field
@@ -491,6 +576,7 @@ function SecretDialog({ minted, onClose }: { minted: MintedApiKey | null; onClos
 
   if (minted && seeded !== minted.id) { setSeeded(minted.id); setAcknowledged(false); }
   if (!minted) return null;
+  const reach = scopeReach(minted.scopes);
 
   return (
     <Modal
@@ -533,10 +619,26 @@ function SecretDialog({ minted, onClose }: { minted: MintedApiKey | null; onClos
           <div className="st-row">
             <div className="st-row__main">
               <div className="st-row__title">What it reaches</div>
-              <div className="st-row__sub">{scopeReach(minted.scopes).summary}</div>
+              <div className="st-row__sub">{reach.summary}</div>
             </div>
-            <div className="st-row__aside"><Badge tone={scopeReach(minted.scopes).tone} pill>{scopeReach(minted.scopes).role}</Badge></div>
+            <div className="st-row__aside"><Badge tone={reach.tone} pill>{reach.role}</Badge></div>
           </div>
+          {reach.dead.length > 0 && (
+            <div className="st-row">
+              <div className="st-row__main">
+                <div className="st-row__title">One scope on this key matches no route</div>
+                {/* Said again here because this is the last screen that can
+                    say it while the secret still exists: a key whose scopes
+                    the door never matches authenticates and then 403s, which
+                    reads like an outage rather than a mint mistake. */}
+                <div className="st-row__sub">
+                  {reach.dead.map((scope) => <span key={scope} className="st-mono">{scope}</span>)}
+                  {' — revoke this key and mint another with a domain and an action the platform knows.'}
+                </div>
+              </div>
+              <div className="st-row__aside"><Badge tone="danger" pill>dead scope</Badge></div>
+            </div>
+          )}
           <div className="st-row">
             <div className="st-row__main">
               <div className="st-row__title">In the list it will read</div>

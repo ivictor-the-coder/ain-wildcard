@@ -30,7 +30,7 @@ export interface MessageRow {
 export interface RunRow {
   id: string; org_id: string; thread_id: string | null; feature: string; provider: string; model: string;
   actor_id: string | null; actor_type: string; status: string; question: string; answer: string;
-  intent: string | null; confidence: number | null; reasoning: string; citations: string;
+  intent: string | null; confidence: number | null; reasoning: string; citations: string; refusal: string | null;
   steps: number; span_count: number; input_tokens: number; output_tokens: number;
   credits: number; cost_micros: number; error: string | null;
   started: number; finished: number | null; duration_ms: number;
@@ -108,6 +108,9 @@ export const publicRun = (row: RunRow, spans?: SpanRow[]) => ({
   confidence: row.confidence,
   reasoning: parseJson<string[]>(row.reasoning, []),
   citations: parseJson<{ id: string; label: string; type: string }[]>(row.citations, []),
+  // The refusal's facts, filed where the live completion files them, so a
+  // reopened thread and a fresh answer read the same shape.
+  analysis: row.refusal ? parseJson<unknown>(row.refusal, null) : null,
   steps: row.steps,
   span_count: row.span_count,
   usage: {
@@ -139,10 +142,12 @@ export function recordNamer(ctx: Ctx, orgId: string): (id: string) => string | n
     if (cache.has(id)) return cache.get(id) ?? null;
     const record = ctx.db.get<{ display_name: string }>(
       `SELECT display_name FROM crm_records WHERE org_id = ? AND id = ?`, orgId, id);
-    const user = record ? null : ctx.db.get<{ name: string }>(
-      `SELECT u.name AS name FROM users u JOIN memberships m ON m.user_id = u.id
-       WHERE m.org_id = ? AND u.id = ?`, orgId, id);
-    const name = record?.display_name || user?.name || null;
+    // The seat, not the account: `users.name` is the person's own profile,
+    // shared with every workspace they belong to, and an approval card that
+    // reads it names an invited teammate by whatever another company calls
+    // them. `core.seat` gives what this workspace typed.
+    const seat = record ? null : ctx.svc.core?.seat(orgId, id);
+    const name = record?.display_name || seat?.name || null;
     cache.set(id, name);
     return name;
   };
@@ -331,6 +336,7 @@ export class AiStore {
       confidence: finish.confidence,
       reasoning: JSON.stringify(finish.reasoning),
       citations: JSON.stringify(finish.citations),
+      refusal: finish.refusal ? JSON.stringify(finish.refusal) : null,
       steps: finish.steps,
       span_count: finish.spans.length,
       input_tokens: finish.usage.inputTokens,

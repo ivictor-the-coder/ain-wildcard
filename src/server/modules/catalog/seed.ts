@@ -10,6 +10,7 @@
 import type { Ctx } from '../../kernel/context';
 import { DAY } from '../../../shared/time';
 import { Catalog, type PriceInput, type ProductInput } from './store';
+import { Coupons, type CouponInput, type PromotionCodeInput } from './coupons';
 
 /** The repo's convention for "no uploaded asset yet" — see core's avatars. */
 const swatch = (hex: string) => [`color:${hex}`];
@@ -429,6 +430,82 @@ export const NORTHWIND_CATALOG: SeedProduct[] = [
   },
 ];
 
+/**
+ * The concessions Northwind actually gives.
+ *
+ * Two of them are handed out by a code a customer types; the first is not —
+ * "20% off year one" is written into a signed contract by the deal desk and
+ * attached to the subscription, which is why a coupon and a promotion code are
+ * two objects and not one.
+ */
+interface SeedCoupon extends CouponInput {
+  id: string;
+  /** Days before "now" the coupon was created. */
+  ageDays: number;
+  /** Days after "now" it stops being redeemable. */
+  redeemInDays?: number;
+  codes?: (Omit<PromotionCodeInput, 'coupon' | 'expires_at'> & { id: string; expiresInDays?: number })[];
+}
+
+/** The plan fees a partner discount comes off — never the metered telemetry. */
+const PLAN_BASE_PRICES = [
+  'price_nw_starter_monthly', 'price_nw_starter_annual',
+  'price_nw_growth_monthly', 'price_nw_growth_annual',
+  'price_nw_scale_monthly', 'price_nw_scale_annual',
+];
+
+export const NORTHWIND_COUPONS: SeedCoupon[] = [
+  {
+    id: 'coup_nw_year_one',
+    ageDays: 210,
+    name: 'Negotiated contract — 20% off year one',
+    percent_off: 20,
+    duration: 'repeating',
+    duration_in_periods: 12,
+    metadata: {
+      approval: 'vp_sales',
+      note: 'The standard concession on a signed multi-year contract. Attached by the deal desk, never typed by a customer.',
+    },
+  },
+  {
+    id: 'coup_nw_commissioning_500',
+    ageDays: 45,
+    name: 'Automate 2026 — $500 off commissioning',
+    amount_off: 50_000,
+    currency: 'usd',
+    duration: 'once',
+    max_redemptions: 150,
+    redeemInDays: 120,
+    applies_to: { products: ['prod_nw_onboarding'] },
+    metadata: { campaign: 'automate_2026', channel: 'trade_show' },
+    codes: [{
+      id: 'promo_nw_automate26',
+      code: 'AUTOMATE26',
+      max_redemptions: 150,
+      max_redemptions_per_customer: 1,
+      expiresInDays: 120,
+      metadata: { printed_on: 'stand booklet, Automate 2026 Detroit' },
+    }],
+  },
+  {
+    id: 'coup_nw_partner',
+    ageDays: 300,
+    name: 'Systems-integrator partner — 10% off the platform fee',
+    percent_off: 10,
+    duration: 'forever',
+    applies_to: { prices: PLAN_BASE_PRICES },
+    metadata: { programme: 'partner', note: 'Platform fee only — telemetry events are billed at list.' },
+    codes: [{
+      id: 'promo_nw_partner10',
+      code: 'NWPARTNER10',
+      max_redemptions_per_customer: 1,
+      minimum_amount: 50_000,
+      minimum_amount_currency: 'usd',
+      metadata: { issued_to: 'certified integrators' },
+    }],
+  },
+];
+
 export function seedCatalog(ctx: Ctx, orgId: string): void {
   const catalog = new Catalog(ctx);
   const now = ctx.now();
@@ -451,5 +528,26 @@ export function seedCatalog(ctx: Ctx, orgId: string): void {
       if (def) catalog.setDefaultPrice(orgId, product.id, def.id);
     }
     ctx.db.patch('catalog_products', 'id', product.id, { updated: productCreated });
+  }
+
+  const coupons = new Coupons(ctx);
+  for (const entry of NORTHWIND_COUPONS) {
+    const { ageDays, redeemInDays, codes, ...input } = entry;
+    coupons.createCoupon(orgId, {
+      ...input,
+      redeem_by: redeemInDays === undefined ? null : now + redeemInDays * DAY,
+    }, { actorType: 'system' });
+    const created = now - ageDays * DAY;
+    ctx.db.patch('catalog_coupons', 'id', input.id, { created, updated: created });
+
+    for (const code of codes ?? []) {
+      const { expiresInDays, ...codeInput } = code;
+      coupons.createPromotionCode(orgId, {
+        ...codeInput,
+        coupon: input.id,
+        expires_at: expiresInDays === undefined ? null : now + expiresInDays * DAY,
+      }, { actorType: 'system' });
+      ctx.db.patch('catalog_promotion_codes', 'id', code.id, { created, updated: created });
+    }
   }
 }

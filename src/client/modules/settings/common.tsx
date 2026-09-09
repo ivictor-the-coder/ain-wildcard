@@ -256,39 +256,18 @@ export function RoleBadge({ role }: { role: Role }) {
 }
 
 /**
- * What a key's scopes actually reach, from `keyRole` in `src/server/app.ts`.
+ * What a key's scopes actually reach.
  *
- * No route in the platform declares `meta.scopes`, so a scope string is not
- * enforced per domain — it is read as a ladder: `*` authenticates as admin,
- * anything naming a write authenticates as member everywhere, and everything
- * else is read-only. Showing `crm:write` as though it confined a key to CRM
- * would be the most dangerous sentence on this surface.
+ * This used to be a ladder and nothing else — `*` is admin, anything naming a
+ * write is a member *everywhere*, the rest is read-only — because
+ * `route.meta.scopes` was the only reader of a scope and no route declared it.
+ * `missingScope` in `src/server/app.ts` now refuses every request whose route
+ * no held scope covers, so `crm:write` confines a key to CRM for real and the
+ * old sentence has become the dangerous one. `readScopes` computes the reach
+ * from the same two rules the door applies, and is the only place on this
+ * surface that decides what a credential can do.
  */
-const WRITE_SCOPE = /(^|:)(write|admin|\*)$/;
-
-export function scopeReach(scopes: readonly string[]): { role: Role; summary: string; tone: Tone } {
-  if (scopes.includes('*')) {
-    return {
-      role: 'admin',
-      tone: 'warning',
-      summary: 'Full access — this key can do anything an admin can, including minting and revoking other keys.',
-    };
-  }
-  if (scopes.some((scope) => WRITE_SCOPE.test(scope.trim().toLowerCase()))) {
-    return {
-      role: 'member',
-      tone: 'info',
-      summary:
-        'Read and write. No route enforces scopes by domain yet, so a key naming any write reaches every write in the '
-        + 'platform — but never the admin-only routes: settings, keys, the audit log and the clock stay closed to it.',
-    };
-  }
-  return {
-    role: 'readonly',
-    tone: 'neutral',
-    summary: 'Read-only. Every mutating route in the platform refuses this key.',
-  };
-}
+export { ALWAYS_REACHABLE, readScope, readScopes as scopeReach, type HeldScope, type ScopeReading } from './keys-core';
 
 /* =============================== mutations =============================== */
 

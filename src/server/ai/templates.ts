@@ -22,20 +22,23 @@ import type {
 import type { DraftResult } from './draft';
 import { linkedCustomerIds } from './metrics';
 import { invoiceSettlements } from './functions';
+import { outstandingBills } from './receivables';
 import { capitalise, plural, humanise, listPhrase, subjectOf } from './text';
 import {
   bind, bindsAnywhere, bound, candidates, describeSlot, slotSpan, stripPoliteness, tokenise,
-  type Bindings, type Bound, type MovementBucket, type SlotKind, type SlotValue, type Token, type Vocabulary,
+  type AgeingBucketId, type Bindings, type Bound, type MovementBucket, type SlotKind, type SlotValue, type Token,
+  type Vocabulary,
 } from './slots';
 import {
   renderAgeing, renderAgeingBucket, renderDso, renderMovement, renderOverdueAge, renderRevenueSummary,
   type CollectionsToolResult, type MovementToolResult, type SummaryToolResult,
 } from './revenue';
 import {
-  NO_FACTS, citationsOf, dateOf, money, periodPhrase, renderAggregateCount, renderAggregateMeasure, renderBreakdown,
-  renderCompare, renderCount, renderDelinquent, renderDraft, renderField, renderGroupedCount, renderInvoices, renderList,
-  renderMetric, renderPrices, renderProfile, renderQuote, renderRank, renderStale, renderSubscriptions, renderTimeline,
-  renderUsage, type InvoiceRow, type Rendered, type SubscriptionRow,
+  NO_FACTS, citationsOf, dateOf, invoiceCitations, money, periodPhrase, renderAggregateCount, renderAggregateMeasure,
+  renderBreakdown, renderCompare, renderCount, renderDelinquent, renderDraft, renderField, renderGroupedCount,
+  renderInvoices, renderList, renderMetric, renderPrices, renderProfile, renderQuote, renderRank, renderStale,
+  renderSubscriptions, renderTimeline, renderUsage, subscriptionCitations,
+  type Citation, type InvoiceRow, type Rendered, type SubscriptionRow,
 } from './answer';
 
 /* --------------------------------- types --------------------------------- */
@@ -701,6 +704,58 @@ function stateScope(b: Bindings): { object: Of<'object'>; state: Of<'state'> | n
 
 const ownerScope = (owner: Of<'owner'>): string => `owned by ${owner.name}`;
 
+/**
+ * The accounts an MRR movement answer named, as records.
+ *
+ * `revenue_movement` prints its movers as prose — "Cascade Medical Devices: new
+ * $963.00" — so a customer's own name is the only handle on the row. Matched
+ * exactly, and only where one customer answers to that name: a near match here
+ * would put a chip for a different company under a sentence naming this one,
+ * which is the failure "one company, one identity" exists to prevent. An
+ * ambiguous or unknown name is left uncited rather than guessed at.
+ */
+function moverCitations(v: Vocabulary, names: string[]): Citation[] {
+  const billing = v.ctx.svc.billing;
+  if (!billing || !names.length) return [];
+  const byName = new Map<string, string | null>();
+  for (const customer of billing.customers(v.orgId, { limit: 500 })) {
+    const key = customer.name.trim().toLowerCase();
+    byName.set(key, byName.has(key) ? null : customer.id);
+  }
+  const out: Citation[] = [];
+  const seen = new Set<string>();
+  for (const name of names) {
+    const id = byName.get(name.trim().toLowerCase());
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, label: name, type: 'customer' });
+  }
+  return out.slice(0, 8);
+}
+
+/**
+ * The bills a collections answer is measured over.
+ *
+ * `revenue_collections` answers in per-currency totals and names no row, so
+ * the ageing shapes had nothing to cite; read here from `receivables.ts`,
+ * which is the same definition of "still owed" and "late" the tool, the
+ * collections report and dunning all use — so the chips under the answer are
+ * the bills the figures were computed from, not a second opinion about them.
+ * Oldest debt first, which is the order the answer itself reads in.
+ */
+function receivableCitations(v: Vocabulary, opts: { overdueOnly?: boolean; bucket?: AgeingBucketId } = {}): Citation[] {
+  // The book oldest-debt-first, up to the helper's own cap: a bucket is a
+  // slice of it, and reading only the first page would leave the newest bucket
+  // — what is not yet due — citing nothing on a long book.
+  const { bills } = outstandingBills(v.ctx, v.orgId, { overdueOnly: opts.overdueOnly, limit: 200 });
+  // The boundaries the collections report ages by, restated over `daysOverdue`:
+  // a bill inside its terms has none, and one due today is a day one debt.
+  const inBucket = (days: number | null): AgeingBucketId =>
+    days === null ? 'not_yet_due' : days <= 30 ? 'd1_30' : days <= 60 ? 'd31_60' : days <= 90 ? 'd61_90' : 'd90_plus';
+  const kept = opts.bucket ? bills.filter((bill) => inBucket(bill.daysOverdue) === opts.bucket) : bills;
+  return invoiceCitations(kept.slice(0, 8).map((bill) => ({ id: bill.id, number: bill.number, status: bill.status })));
+}
+
 export const TEMPLATES: Template[] = [
   /* ------------------------------ CRM counts ----------------------------- */
   T({
@@ -1323,13 +1378,18 @@ export const TEMPLATES: Template[] = [
     render: (steps, b, v) => {
       const owner = slot(b, 'owner', 'owner');
       const period = slot(b, 'period', 'period');
-      const won = resultOf<RecordAggregateResult>(steps, 0).matched_records;
-      const lost = resultOf<RecordAggregateResult>(steps, 1).matched_records;
+      const wonRows = resultOf<RecordAggregateResult>(steps, 0);
+      const lostRows = resultOf<RecordAggregateResult>(steps, 1);
+      const won = wonRows.matched_records;
+      const lost = lostRows.matched_records;
       const decided = won + lost;
       if (!decided) return { content: `${owner.name} decided no deals ${periodPhrase(period.window.label)}, so there is no win rate to report.`, citations: [], facts: { ...NO_FACTS, unit: 'percent', count: 0, label: 'Win rate', period: period.window.label, subject: owner.name } };
       const rate = Math.round((won / decided) * 1000) / 10;
       void v;
-      return { content: `${owner.name}'s win rate ${periodPhrase(period.window.label)} is ${rate}%: ${won} won of ${decided} decided ${plural(decided, 'deal')}.`, citations: [], facts: { ...NO_FACTS, value: rate, formatted: `${rate}%`, unit: 'percent', count: decided, label: 'Win rate', period: period.window.label, subject: owner.name } };
+      // A rate is won over decided, so the deals it was divided by are both
+      // sets: citing only the wins would name the numerator of a fraction.
+      const decidedDeals = [...citationsOf(wonRows.samples, 'deal'), ...citationsOf(lostRows.samples, 'deal')].slice(0, 8);
+      return { content: `${owner.name}'s win rate ${periodPhrase(period.window.label)} is ${rate}%: ${won} won of ${decided} decided ${plural(decided, 'deal')}.`, citations: decidedDeals, facts: { ...NO_FACTS, value: rate, formatted: `${rate}%`, unit: 'percent', count: decided, label: 'Win rate', period: period.window.label, subject: owner.name, rows: decidedDeals.map((c) => ({ id: c.id, label: c.label })) } };
     },
   }),
   T({
@@ -1377,7 +1437,9 @@ export const TEMPLATES: Template[] = [
       const top = groups[0];
       const lines = groups.map((g, i) => `${i + 1}. ${g.label} — ${g.formatted} (${g.count} open ${plural(g.count, 'deal')})`);
       void v;
-      return { content: `${top.label} has the ${most.direction === 'desc' ? 'most' : 'least'} open pipeline, at ${top.formatted} across ${top.count} open ${plural(top.count, 'deal')}.\n\n${lines.join('\n')}`, citations: [], facts: { ...NO_FACTS, unit: 'money', label: result.label, mixed: true, rows: groups.map((g) => ({ id: g.key, label: g.label })) } };
+      // The same rows its sibling shape cites: a ranking of owners is measured
+      // over deals, and an owner's name is not a record the reader can open.
+      return { content: `${top.label} has the ${most.direction === 'desc' ? 'most' : 'least'} open pipeline, at ${top.formatted} across ${top.count} open ${plural(top.count, 'deal')}.\n\n${lines.join('\n')}`, citations: result.evidence.slice(0, 6), facts: { ...NO_FACTS, unit: 'money', label: result.label, mixed: true, rows: groups.map((g) => ({ id: g.key, label: g.label })) } };
     },
   }),
   T({
@@ -1512,9 +1574,14 @@ export const TEMPLATES: Template[] = [
     example: (v) => need('How many subscriptions are on the ', samplesOf(v).plan, ' plan?'),
     plan: (b) => {
       const plan = slot(b, 'plan', 'plan');
-      return [{ tool: 'subscriptions_on_plan', args: { product_id: plan.id, limit: 1 }, why: `Count subscriptions with an item priced on ${plan.name}.` }];
+      // The count comes from `total`, which is the whole set whatever the page
+      // size is; the rows are asked for so the answer can name some of them.
+      return [{ tool: 'subscriptions_on_plan', args: { product_id: plan.id, limit: 8 }, why: `Count subscriptions with an item priced on ${plan.name}.` }];
     },
-    render: (steps, b, v) => renderCount(resultOf<{ total: number }>(steps).total, 'subscription|subscriptions', `on ${slot(b, 'plan', 'plan').name}`, v.workspace),
+    render: (steps, b, v) => {
+      const result = resultOf<{ total: number; subscriptions: SubscriptionRow[] }>(steps);
+      return renderCount(result.total, 'subscription|subscriptions', `on ${slot(b, 'plan', 'plan').name}`, v.workspace, { evidence: subscriptionCitations(result.subscriptions) });
+    },
   }),
   T({
     id: 'subscriptions-status', kind: 'ledger', intent: 'lookup',
@@ -1547,9 +1614,13 @@ export const TEMPLATES: Template[] = [
     example: () => 'How many subscriptions are active?',
     plan: (b) => {
       const status = slot(b, 'status', 'subscription-status');
-      return [{ tool: 'billing_list_subscriptions', args: { status: status.value, limit: 1 }, why: `Count subscriptions whose status is ${status.label}.` }];
+      return [{ tool: 'billing_list_subscriptions', args: { status: status.value, limit: 8 }, why: `Count subscriptions whose status is ${status.label}.` }];
     },
-    render: (steps, b, v) => renderCount(resultOf<{ total: number }>(steps).total, `${slot(b, 'status', 'subscription-status').label} subscription|${slot(b, 'status', 'subscription-status').label} subscriptions`, '', v.workspace),
+    render: (steps, b, v) => {
+      const status = slot(b, 'status', 'subscription-status');
+      const result = resultOf<{ total: number; subscriptions: SubscriptionRow[] }>(steps);
+      return renderCount(result.total, `${status.label} subscription|${status.label} subscriptions`, '', v.workspace, { evidence: subscriptionCitations(result.subscriptions) });
+    },
   }),
   T({
     id: 'customers-past-due', kind: 'ledger', intent: 'lookup',
@@ -1607,10 +1678,14 @@ export const TEMPLATES: Template[] = [
     plan: (b) => {
       const status = slot(b, 'status', 'invoice-status');
       return status.overdue
-        ? [{ tool: 'outstanding_invoices', args: { overdue: true, limit: 1 }, why: 'Count the unsettled bills already past their due date.' }]
-        : [{ tool: 'billing_list_invoices', args: { status: status.value, limit: 1 }, why: `Count invoices whose status is ${status.label}.` }];
+        ? [{ tool: 'outstanding_invoices', args: { overdue: true, limit: 8 }, why: 'Count the unsettled bills already past their due date.' }]
+        : [{ tool: 'billing_list_invoices', args: { status: status.value, limit: 8 }, why: `Count invoices whose status is ${status.label}.` }];
     },
-    render: (steps, b, v) => renderCount(resultOf<{ total: number }>(steps).total, `${slot(b, 'status', 'invoice-status').label} invoice|${slot(b, 'status', 'invoice-status').label} invoices`, '', v.workspace),
+    render: (steps, b, v) => {
+      const status = slot(b, 'status', 'invoice-status');
+      const result = resultOf<{ total: number; invoices: InvoiceRow[] }>(steps);
+      return renderCount(result.total, `${status.label} invoice|${status.label} invoices`, '', v.workspace, { evidence: invoiceCitations(result.invoices) });
+    },
   }),
   T({
     id: 'count-invoices-period', kind: 'metric', intent: 'aggregate',
@@ -1633,7 +1708,7 @@ export const TEMPLATES: Template[] = [
       const period = slot(b, 'period', 'period');
       const result = resultOf<MetricToolResult>(steps);
       const paid = result.metric === 'revenue';
-      return renderCount(result.count, `${paid ? 'paid' : 'issued'} invoice|${paid ? 'paid' : 'issued'} invoices`, periodPhrase(period.window.label), v.workspace, { period: period.window.label });
+      return renderCount(result.count, `${paid ? 'paid' : 'issued'} invoice|${paid ? 'paid' : 'issued'} invoices`, periodPhrase(period.window.label), v.workspace, { period: period.window.label, evidence: result.evidence });
     },
   }),
   T({
@@ -1751,7 +1826,9 @@ export const TEMPLATES: Template[] = [
       const meter = slot(b, 'meter', 'meter');
       const result = resultOf<{ product: string | null; quantity: number; amount: number; amount_display: string; breakdown: string[]; warning: string | null }>(steps);
       const unit = meter.unit ? (result.quantity === 1 ? meter.unit : /^[A-Z]{1,4}$/.test(meter.unit) ? meter.unit : `${meter.unit}s`) : meter.name.toLowerCase();
-      return renderQuote(result, unit, v.workspace.currency, v.workspace);
+      // The meter is the record the price hangs off, and the one the reader
+      // opens to check the rate the quote was worked out on.
+      return renderQuote(result, unit, v.workspace.currency, v.workspace, { id: meter.id, label: meter.name, type: 'meter' });
     },
   }),
 
@@ -2573,7 +2650,8 @@ export const TEMPLATES: Template[] = [
     },
     render: (steps, b, v) => {
       const period = slot(b, 'period', 'period');
-      return renderCount(resultOf<MetricToolResult>(steps).count, 'new customer|new customers', periodPhrase(period.window.label), v.workspace, { period: period.window.label });
+      const result = resultOf<MetricToolResult>(steps);
+      return renderCount(result.count, 'new customer|new customers', periodPhrase(period.window.label), v.workspace, { period: period.window.label, evidence: result.evidence });
     },
   }),
 
@@ -2599,7 +2677,8 @@ export const TEMPLATES: Template[] = [
     render: (steps, b, v) => {
       const period = slot(b, 'period', 'period');
       const lead = /^(who|which)\b/.test(b.$question.text) ? 'accounts' : 'amount';
-      return renderMovement(resultOf<MovementToolResult>(steps), period.window, movementBucket(b), lead, v.workspace);
+      return renderMovement(resultOf<MovementToolResult>(steps), period.window, movementBucket(b), lead, v.workspace,
+        (names) => moverCitations(v, names));
     },
   }),
   T({
@@ -2612,7 +2691,7 @@ export const TEMPLATES: Template[] = [
     tools: ['revenue_collections'],
     example: () => 'What is our DSO?',
     plan: () => [{ tool: 'revenue_collections', args: { months: TRAILING_MONTHS }, why: `Receivables against the last ${TRAILING_MONTHS} months of billings, per currency.` }],
-    render: (steps, _b, v) => renderDso(resultOf<CollectionsToolResult>(steps), TRAILING_MONTHS, v.workspace),
+    render: (steps, _b, v) => renderDso(resultOf<CollectionsToolResult>(steps), TRAILING_MONTHS, v.workspace, receivableCitations(v)),
   }),
   T({
     id: 'overdue-ageing', kind: 'metric', intent: 'aggregate',
@@ -2625,7 +2704,7 @@ export const TEMPLATES: Template[] = [
     tools: ['revenue_collections'],
     example: () => 'How much is overdue and how old is it?',
     plan: () => [{ tool: 'revenue_collections', args: { months: TRAILING_MONTHS }, why: 'The receivables ageing as it stands now, per currency.' }],
-    render: (steps, _b, v) => renderOverdueAge(resultOf<CollectionsToolResult>(steps), v.workspace),
+    render: (steps, _b, v) => renderOverdueAge(resultOf<CollectionsToolResult>(steps), v.workspace, receivableCitations(v, { overdueOnly: true })),
   }),
   T({
     id: 'ageing-bucket', kind: 'metric', intent: 'aggregate',
@@ -2638,7 +2717,10 @@ export const TEMPLATES: Template[] = [
     tools: ['revenue_collections'],
     example: () => 'What is in the 61–90 day bucket?',
     plan: (b) => [{ tool: 'revenue_collections', args: { months: TRAILING_MONTHS }, why: `The receivables ageing as it stands now; the ${slot(b, 'bucket', 'ageing-bucket').label.toLowerCase()} bucket of it.` }],
-    render: (steps, b, v) => renderAgeingBucket(resultOf<CollectionsToolResult>(steps), slot(b, 'bucket', 'ageing-bucket').bucket, v.workspace),
+    render: (steps, b, v) => {
+      const bucket = slot(b, 'bucket', 'ageing-bucket').bucket;
+      return renderAgeingBucket(resultOf<CollectionsToolResult>(steps), bucket, v.workspace, receivableCitations(v, { bucket }));
+    },
   }),
   T({
     id: 'receivables-ageing', kind: 'breakdown', intent: 'aggregate',
@@ -2651,7 +2733,7 @@ export const TEMPLATES: Template[] = [
     tools: ['revenue_collections'],
     example: () => 'What is our receivables ageing?',
     plan: () => [{ tool: 'revenue_collections', args: { months: TRAILING_MONTHS }, why: 'The receivables ageing as it stands now, per currency.' }],
-    render: (steps, _b, v) => renderAgeing(resultOf<CollectionsToolResult>(steps), v.workspace),
+    render: (steps, _b, v) => renderAgeing(resultOf<CollectionsToolResult>(steps), v.workspace, receivableCitations(v)),
   }),
   T({
     id: 'revenue-summary', kind: 'metric', intent: 'summarise',
@@ -2723,7 +2805,10 @@ export const TEMPLATES: Template[] = [
       const body = sentenceCase(text.text);
       return [{ tool: 'add_note', args: { record_ids: [record.id], subject: subjectOf(body), body }, why: `Write the note onto ${record.label}; the instruction wrapper is stripped so the timeline reads as a note.` }];
     },
-    render: (steps, b) => renderWrite(steps, `note on ${slot(b, 'record', 'record').label}`, `"${String(steps[0]?.args.body ?? '')}"`),
+    render: (steps, b) => {
+      const record = slot(b, 'record', 'record');
+      return renderWrite(steps, `note on ${record.label}`, `"${String(steps[0]?.args.body ?? '')}"`, { id: record.id, label: record.label, type: record.type });
+    },
   }),
   T({
     id: 'write-stage', kind: 'write', intent: 'act',
@@ -2740,7 +2825,10 @@ export const TEMPLATES: Template[] = [
       const stage = slot(b, 'stage', 'stage');
       return [{ tool: 'update_record', args: { object_type: 'deal', id: deal.id, properties: { deal_stage: stage.value } }, why: `Set ${deal.label} to the ${stage.label} stage.` }];
     },
-    render: (steps, b) => renderWrite(steps, `${slot(b, 'deal', 'record').label} moved to ${slot(b, 'stage', 'stage').label}`, ''),
+    render: (steps, b) => {
+      const deal = slot(b, 'deal', 'record');
+      return renderWrite(steps, `${deal.label} moved to ${slot(b, 'stage', 'stage').label}`, '', { id: deal.id, label: deal.label, type: deal.type });
+    },
   }),
   T({
     id: 'write-followup', kind: 'write', intent: 'act',
@@ -2758,7 +2846,10 @@ export const TEMPLATES: Template[] = [
       const text = slot(b, 'text', 'text');
       return [{ tool: 'schedule_followup', args: { record_id: record.id, in_days: Math.min(days, 365), note: sentenceCase(text.text) }, why: `Follow up on ${record.label} in ${days} days.` }];
     },
-    render: (steps, b) => renderWrite(steps, `follow-up on ${slot(b, 'record', 'record').label} in ${slot(b, 'number', 'number').value} days`, `"${String(steps[0]?.args.note ?? '')}"`),
+    render: (steps, b) => {
+      const record = slot(b, 'record', 'record');
+      return renderWrite(steps, `follow-up on ${record.label} in ${slot(b, 'number', 'number').value} days`, `"${String(steps[0]?.args.note ?? '')}"`, { id: record.id, label: record.label, type: record.type });
+    },
   }),
 ];
 
@@ -2772,20 +2863,28 @@ function sentenceCase(text: string): string {
   return /[.!?]$/.test(capitalised) ? capitalised : `${capitalised}.`;
 }
 
-/** What a write step came to: done, waiting, or refused. */
-function renderWrite(steps: StepOutcome[], what: string, detail: string): Rendered {
+/**
+ * What a write step came to: done, waiting, or refused.
+ *
+ * The target is cited on every outcome, including the refusals. A person
+ * reading "the note on Aconcagua Alimentos needs your approval" is one click
+ * from deciding, and the record named in that sentence was the one thing the
+ * card could not open.
+ */
+function renderWrite(steps: StepOutcome[], what: string, detail: string, target: Citation | null = null): Rendered {
   const step = steps[0];
-  const facts = { ...NO_FACTS, label: what };
-  if (!step) return { content: `I changed nothing: no write was prepared.`, citations: [], facts };
-  if (step.ok) return { content: `Done — ${what}${detail ? `: ${detail}` : ''}.`, citations: [], facts };
+  const facts = { ...NO_FACTS, label: what, ...(target ? { subject: target.label, subjectId: target.id, rows: [{ id: target.id, label: target.label }] } : {}) };
+  const citations = target ? [target] : [];
+  if (!step) return { content: `I changed nothing: no write was prepared.`, citations, facts };
+  if (step.ok) return { content: `Done — ${what}${detail ? `: ${detail}` : ''}.`, citations, facts };
   const code = step.error?.code;
   if (code === 'approval_required') {
-    return { content: `The ${what} needs your approval first. Nothing has been written.${detail ? ` It will read ${detail}.` : ''}`, citations: [], facts };
+    return { content: `The ${what} needs your approval first. Nothing has been written.${detail ? ` It will read ${detail}.` : ''}`, citations, facts };
   }
   if (code === 'write_not_permitted') {
-    return { content: `I changed nothing. This run is read-only — send \`allow_writes: true\` and I will prepare the ${what} for your approval.`, citations: [], facts };
+    return { content: `I changed nothing. This run is read-only — send \`allow_writes: true\` and I will prepare the ${what} for your approval.`, citations, facts };
   }
-  return { content: `I changed nothing. The ${what} could not be prepared: ${step.error?.message ?? 'the tool failed'}.`, citations: [], facts };
+  return { content: `I changed nothing. The ${what} could not be prepared: ${step.error?.message ?? 'the tool failed'}.`, citations, facts };
 }
 
 /* ------------------------------- catalogue ------------------------------- */

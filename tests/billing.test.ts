@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createApp, frozenClock, type App } from '../src/server/app';
 import type { Auth } from '../src/server/kernel/http';
 import { DAY, HOUR, type Period } from '../src/shared/time';
+import { formatMoney, money } from '../src/shared/money';
 import type { ChangePreview, Invoice, InvoiceLine, ProrationLine, Subscription } from '../src/server/modules/billing/types';
 import { TaxRates } from '../src/server/modules/billing/tax';
 
@@ -1986,7 +1987,20 @@ describe("Northwind's book of business", () => {
     assert.ok(overview.by_status.trialing >= 1, 'at least one live trial');
     assert.ok(overview.by_status.canceled >= 3, 'churn to report on');
     assert.ok(overview.mrr > 1_000_000, `MRR should be a real number, got ${overview.mrr}`);
-    assert.equal(overview.delinquent_customers, 2);
+    // Counted, not pinned: every account the business is chasing — one with a
+    // subscription that stopped collecting, or one with a bill past the day it
+    // fell due. The tile read 2 while /v1/revenue/collections aged 3.
+    const chased = new Set<string>([
+      ...ws.app.ctx.db.all<{ customer_id: string }>(
+        `SELECT DISTINCT customer_id FROM billing_subscriptions WHERE org_id = ? AND status IN ('past_due','unpaid')`, ORG,
+      ).map((row) => row.customer_id),
+      ...ws.app.ctx.db.all<{ customer_id: string }>(
+        `SELECT DISTINCT customer_id FROM billing_invoices
+          WHERE org_id = ? AND status = 'open' AND amount_due > 0
+            AND COALESCE(due_date, finalized_at, created) <= ?`, ORG, ws.now(),
+      ).map((row) => row.customer_id),
+    ]);
+    assert.equal(overview.delinquent_customers, chased.size);
     assert.ok(overview.scheduled_to_cancel >= 1);
 
     const ladder = new Set<string>();
@@ -6724,5 +6738,374 @@ describe('timestamp query parameters', () => {
     // And something that is neither is still refused, with the parameter named.
     const bad = await ws.fail('GET', '/v1/invoices?created_after=yesterday', undefined, 400, 'parameter_invalid');
     assert.equal(bad.param, 'created_after');
+  });
+});
+
+/* ========================================================================== *
+ * 40. Four seams where billing described something other than what it will do
+ * ========================================================================== */
+
+/**
+ * A schedule phase is billed in the subscription's currency. Pricing it in
+ * `price.currency` — whichever currency the price row happens to be written in
+ * — and then stamping that symbol on the result is not a rounding error; it is
+ * a different number under a different sign, published as fact to the API, the
+ * copilot and every webhook consumer.
+ */
+describe('a schedule phase, priced in the currency it will be billed in', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 5, 1)); });
+  after(() => ws.close());
+
+  /** The workspace's own locale, so the expectation is formatted the way the payload is. */
+  const localeOf = (w: Workspace): string => w.app.ctx.svc.core.org(ORG).locale || 'en-US';
+
+  test('states each phase in the subscription’s currency, not the price row’s own', async () => {
+    const customer = await ws.customer('Rhein Fördertechnik', { currency: 'eur' });
+    const scaleId = await priceIdOf(ws, 'scale_monthly');
+    const growthId = await priceIdOf(ws, 'growth_monthly');
+    const scale = await ws.ok('GET', `/v1/prices/${scaleId}`);
+    const euro = scale.currency_options?.eur?.unit_amount as number | undefined;
+    assert.ok(typeof euro === 'number' && euro !== scale.unit_amount,
+      'the euro book and the dollar book differ on this price, or this proves nothing');
+
+    const schedule = await ws.ok('POST', '/v1/subscription-schedules', {
+      customer: customer.id,
+      phases: [
+        { items: [{ price: scaleId }], iterations: 1 },
+        { items: [{ price: growthId }], iterations: 1 },
+      ],
+    });
+    assert.equal(schedule.currency, 'eur', 'the schedule says which book it is quoting');
+
+    const locale = localeOf(ws);
+    const inEuro = formatMoney(money(euro, 'eur'), { locale });
+    const inDollars = formatMoney(money(scale.unit_amount as number, 'usd'), { locale });
+    assert.notEqual(inEuro, inDollars);
+    assert.ok(schedule.phases[0].summary.includes(inEuro),
+      `phase 1 should quote ${inEuro}, said "${schedule.phases[0].summary}"`);
+    assert.ok(!schedule.phases[0].summary.includes(inDollars),
+      `phase 1 must not quote the dollar book, said "${schedule.phases[0].summary}"`);
+
+    // And the bill really is raised in euros, so the phase summary and the
+    // invoice behind it are one number.
+    const sub: Subscription = await ws.ok('GET', `/v1/subscriptions/${schedule.subscription}`);
+    assert.equal(sub.currency, 'eur');
+    const invoice = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    assert.equal(invoice.currency, 'eur');
+    assert.equal(invoice.lines[0].amount, euro, 'the phase quoted exactly what the invoice charged');
+  });
+
+  test('a schedule that has not created its subscription yet quotes the customer’s currency', async () => {
+    const customer = await ws.customer('Ateliers Beauvais', { currency: 'eur' });
+    const scaleId = await priceIdOf(ws, 'scale_monthly');
+    const scale = await ws.ok('GET', `/v1/prices/${scaleId}`);
+    const schedule = await ws.ok('POST', '/v1/subscription-schedules', {
+      customer: customer.id,
+      start_date: ws.now() + 30 * DAY,
+      phases: [{ items: [{ price: scaleId }], iterations: 1 }],
+    });
+    assert.equal(schedule.status, 'not_started');
+    assert.equal(schedule.subscription, null, 'there is no subscription to read a currency off yet');
+    assert.equal(schedule.currency, 'eur');
+    const locale = localeOf(ws);
+    assert.ok(schedule.phases[0].summary.includes(
+      formatMoney(money(scale.currency_options.eur.unit_amount as number, 'eur'), { locale })));
+  });
+});
+
+/**
+ * The phase boundary is a period boundary, so everything that prices the period
+ * after this one is pricing a phase the subscription has not moved onto yet.
+ * Reading the items off the subscription row instead quotes the plan being left
+ * — right up to the morning the customer leaves it.
+ */
+describe('what the next bill is predicted from, when a schedule is driving', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 5, 1)); });
+  after(() => ws.close());
+
+  /** A Starter subscription that a schedule moves onto Growth at the next boundary. */
+  async function ramp(name: string): Promise<{ customer: any; sub: Subscription; growth: number }> {
+    const customer = await ws.customer(name);
+    const starterId = await priceIdOf(ws, 'starter_monthly');
+    const growthId = await priceIdOf(ws, 'growth_monthly');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: starterId }],
+    });
+    await ws.ok('POST', '/v1/subscription-schedules', {
+      from_subscription: sub.id,
+      phases: [
+        { items: [{ price: starterId }], iterations: 1 },
+        { items: [{ price: growthId }], iterations: 1 },
+      ],
+    });
+    const growth = (await ws.ok('GET', `/v1/prices/${growthId}`)).unit_amount as number;
+    assert.notEqual(growth, STARTER, 'the two phases cost different money, or this proves nothing');
+    return { customer, sub, growth };
+  }
+
+  test('create_preview prices the phase that covers the period, not the one being left', async () => {
+    const { sub, growth } = await ramp('Kessel Fertigung');
+    const preview: Invoice = await ws.ok('POST', '/v1/invoices/create_preview', { subscription: sub.id });
+
+    assert.equal(preview.period.start, sub.current_period_end,
+      'the preview covers the period that begins where this one ends — the phase 2 period');
+    const recurring = preview.lines.filter((line) => line.kind === 'recurring');
+    assert.equal(recurring.length, 1);
+    assert.equal(recurring[0].amount, growth, 'the bill will carry the phase it moves onto');
+    assert.notEqual(recurring[0].amount, STARTER);
+  });
+
+  test('the customer summary’s next invoice reads the same phase', async () => {
+    const { customer, sub, growth } = await ramp('Baumann Steuerungen');
+    const summary = await ws.ok('GET', `/v1/customers/${customer.id}/summary`);
+    assert.equal(summary.next_invoice.subscription, sub.id);
+    assert.equal(summary.next_invoice.date, sub.current_period_end);
+    assert.equal(summary.next_invoice.subtotal, growth);
+    assert.deepEqual(summary.next_invoice.lines.map((line: { amount: number }) => line.amount), [growth]);
+  });
+
+  test('and the bill that actually lands is the one they were both shown', async () => {
+    const { customer, sub, growth } = await ramp('Wehrle Antriebstechnik');
+    const predicted: Invoice = await ws.ok('POST', '/v1/invoices/create_preview', { subscription: sub.id });
+    await ws.travelTo(sub.current_period_end + HOUR);
+    const raised = (await allInvoices(ws, `&customer=${customer.id}`))
+      .filter((invoice) => invoice.billing_reason === 'subscription_cycle')
+      .sort((a, b) => b.created - a.created)[0];
+    assert.ok(raised, 'the cycle turned over');
+    const recurring = raised.lines.filter((line) => line.kind === 'recurring');
+    assert.deepEqual(recurring.map((line) => line.amount), [growth]);
+    assert.equal(predicted.lines.filter((line) => line.kind === 'recurring')[0].amount, recurring[0].amount);
+  });
+
+  test('a change the caller is quoting still answers about the caller’s own items', async () => {
+    const { sub } = await ramp('Nordmann Prüftechnik');
+    const scaleId = await priceIdOf(ws, 'scale_monthly');
+    const preview: Invoice = await ws.ok('POST', '/v1/invoices/create_preview', {
+      subscription: sub.id,
+      items: [{ id: sub.items[0].id, price: scaleId }],
+    });
+    const recurring = preview.lines.filter((line) => line.kind === 'recurring');
+    assert.deepEqual(recurring.map((line) => line.price), [scaleId],
+      'asking what Scale would cost is not asking what the schedule has planned');
+  });
+});
+
+/**
+ * "Nothing had been collected yet" is true of a bill nobody has paid and false
+ * of one that was part collected, where it contradicts the `amount_paid`
+ * printed beside it.
+ */
+describe('a credit note on a part-collected bill', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 5, 1)); });
+  after(() => ws.close());
+
+  test('says what was collected instead of claiming nothing was', async () => {
+    const customer = await ws.customer('Halvorsen Marine');
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+      collection_method: 'send_invoice', days_until_due: 30,
+    });
+    let invoice = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    if (invoice.status === 'draft') invoice = await ws.ok('POST', `/v1/invoices/${invoice.id}/finalize`, {});
+
+    const method = await ws.ok('POST', '/v1/payment_methods', {
+      type: 'card', customer: customer.id, brand: 'visa', exp_month: 4, exp_year: 2031,
+      simulated_behavior: 'succeeds',
+    });
+    const part = Math.floor(invoice.amount_due / 4);
+    await ws.ok('POST', '/v1/payment_intents', {
+      customer: customer.id, invoice: invoice.id, amount: part,
+      payment_method: method.id, confirm: true,
+    });
+    const partly: Invoice & { amount_paid_display: string } = await ws.ok('GET', `/v1/invoices/${invoice.id}`);
+    assert.equal(partly.status, 'open', 'part of it is collected and the rest is still owed');
+    assert.equal(partly.amount_paid, part);
+    assert.ok(partly.amount_due > 0);
+
+    const note = await ws.ok('POST', '/v1/credit_notes', {
+      invoice: invoice.id, amount: Math.floor(partly.amount_due / 2), reason: 'order_change',
+    });
+    // Neither of the other two sentences applies: nothing was handed back, and
+    // nothing was displaced onto the balance.
+    assert.equal(note.post_payment_amount, 0);
+    assert.equal(note.displaced_to_balance, 0);
+    assert.ok(note.pre_payment_amount > 0);
+
+    assert.doesNotMatch(note.routing_detail as string, /nothing had been collected/,
+      `the bill holds ${partly.amount_paid_display}: ${note.routing_detail}`);
+    assert.ok((note.routing_detail as string).includes(partly.amount_paid_display),
+      `the sentence names what was collected: ${note.routing_detail}`);
+
+    // The mirror: on a bill nobody has paid, the old sentence is still the true one.
+    const clean = await ws.customer('Nothing Collected Here');
+    const cleanSub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: clean.id, items: [{ price: 'growth_monthly' }],
+      collection_method: 'send_invoice', days_until_due: 30,
+    });
+    const untouched = (await allInvoices(ws, `&subscription=${cleanSub.id}`))[0];
+    const cleanNote = await ws.ok('POST', '/v1/credit_notes', {
+      invoice: untouched.id, amount: Math.floor(untouched.amount_due / 2), reason: 'order_change',
+    });
+    assert.match(cleanNote.routing_detail as string, /nothing had been collected yet/);
+  });
+});
+
+/**
+ * One word for "owed", across the three places billing published it.
+ *
+ * The definition is the collections report's, because that is the page a
+ * finance team works from: a receivable is a finalised bill that has not been
+ * paid, voided or written off and still asks for money, and it is late once the
+ * day it falls due has passed — its own due date, or the day it was finalised
+ * when it carries none, because a bill with no terms is due on receipt.
+ */
+describe('one definition of what is outstanding', () => {
+  let ws: Workspace;
+  before(async () => { ws = await workspace(UTC(2026, 9, 1)); });
+  after(() => ws.close());
+
+  interface Row { id: string; customer_id: string; currency: string; status: string; amount_due: number; due_at: number }
+
+  /** The receivables book read straight off the columns, not out of any query the product writes. */
+  const book = (w: Workspace): Row[] => w.app.ctx.db.all<Row>(
+    `SELECT id, customer_id, currency, status, amount_due,
+            COALESCE(due_date, finalized_at, created) AS due_at
+       FROM billing_invoices WHERE org_id = ? AND status = 'open' AND amount_due > 0`, ORG,
+  ).map((row) => ({ ...row, amount_due: Number(row.amount_due), due_at: Number(row.due_at) }));
+
+  const ids = (rows: { id: string }[]): string[] => rows.map((row) => row.id).sort();
+
+  test('the invoice list, the overview and /v1/revenue/collections count one book', async () => {
+    const now = ws.now();
+    const outstanding = book(ws);
+    const overdue = outstanding.filter((row) => row.due_at <= now);
+    const onReceipt = ws.app.ctx.db.all<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM billing_invoices WHERE org_id = ? AND status = 'open' AND amount_due > 0 AND due_date IS NULL`, ORG,
+    )[0];
+    assert.ok(outstanding.length >= 3, 'the seeded book is owed money, or this proves nothing');
+    assert.ok(Number(onReceipt.n) > 0, 'some of it is due on receipt — the case the overdue filter used to drop');
+    assert.ok(overdue.length > 0 && overdue.length < outstanding.length, 'some of it is late and some of it is not');
+
+    assert.deepEqual(ids(await allInvoices(ws, '&status=open_like')), ids(outstanding));
+    assert.deepEqual(ids(await allInvoices(ws, `&status=open_like&due_before=${now}`)), ids(overdue));
+
+    // Cross-module: the same money, counted by the report a finance team reads.
+    const owed = new Map<string, number>();
+    for (const row of outstanding) owed.set(row.currency, (owed.get(row.currency) ?? 0) + row.amount_due);
+    assert.ok(owed.size > 1, 'the book is owed in more than one currency, so no scalar could stand for it');
+
+    const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+    const tile = new Map<string, number>(
+      (overview.invoices.by_currency as { currency: string; outstanding: number }[])
+        .map((row) => [row.currency, row.outstanding]),
+    );
+    const collections = await ws.ok('GET', '/v1/revenue/collections');
+    const aged = new Map<string, number>(
+      (collections.ageing.by_currency as { currency: string; total: number }[]).map((row) => [row.currency, row.total]),
+    );
+    for (const [currency, amount] of owed) {
+      assert.equal(tile.get(currency), amount, `the overview's ${currency} book`);
+      assert.equal(aged.get(currency), amount, `collections' ${currency} book`);
+    }
+  });
+
+  test('delinquent means the same thing on the tile, on the list and on the record', async () => {
+    const now = ws.now();
+    const arrears = new Set(ws.app.ctx.db.all<{ customer_id: string }>(
+      `SELECT DISTINCT customer_id FROM billing_subscriptions WHERE org_id = ? AND status IN ('past_due','unpaid')`, ORG,
+    ).map((row) => row.customer_id));
+    const chased = new Set<string>([...arrears, ...book(ws).filter((row) => row.due_at <= now).map((row) => row.customer_id)]);
+    assert.ok(chased.size > arrears.size,
+      'at least one account is late on a bill without a subscription in arrears, or this proves nothing');
+
+    const overview = await ws.ok('GET', '/v1/subscriptions/overview');
+    assert.equal(overview.delinquent_customers, chased.size);
+
+    const listed = await ws.ok('GET', '/v1/customers?delinquent=true&limit=200');
+    assert.equal(listed.total_count, chased.size);
+    assert.deepEqual(ids(listed.data), [...chased].sort());
+    for (const row of listed.data) {
+      assert.equal(row.delinquent, true, `${row.name} is listed as delinquent and says so about itself`);
+    }
+    // And the filter's other half agrees: nobody is on both lists.
+    const good = await ws.ok('GET', '/v1/customers?delinquent=false&limit=200');
+    for (const row of good.data) assert.ok(!chased.has(row.id), `${row.name} is on both lists`);
+  });
+
+  test('a bill due on receipt makes an account delinquent even when its subscription collects fine', async () => {
+    const customer = await ws.customer('Terminfrei Anlagenbau');
+    // Collected on a card, so the bill carries no terms — it is due on receipt,
+    // which is the shape six of the seven bills open on the demo book have.
+    const sub: Subscription = await ws.ok('POST', '/v1/subscriptions', {
+      customer: customer.id, items: [{ price: 'growth_monthly' }],
+    });
+    let invoice = (await allInvoices(ws, `&subscription=${sub.id}`))[0];
+    if (invoice.status === 'draft') invoice = await ws.ok('POST', `/v1/invoices/${invoice.id}/finalize`, {});
+    assert.equal(invoice.due_date, null, 'nothing set terms on it, so it is due on receipt');
+    assert.equal(invoice.status, 'open');
+    assert.equal((await ws.ok('GET', `/v1/subscriptions/${sub.id}`)).status, 'active',
+      'the subscription is collecting fine — the only thing wrong is the bill');
+
+    const overdue = await allInvoices(ws, `&customer=${customer.id}&status=open_like&due_before=${ws.now()}`);
+    assert.deepEqual(overdue.map((row) => row.id), [invoice.id]);
+    assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).delinquent, true);
+    const listed = await ws.ok('GET', '/v1/customers?delinquent=true&limit=200');
+    assert.ok((listed.data as { id: string }[]).some((row) => row.id === customer.id));
+
+    // The support screen ages it the same way, and says the real reason.
+    const summary = await ws.ok('GET', `/v1/customers/${customer.id}/summary`);
+    assert.deepEqual((summary.open_invoices.data as { id: string }[]).map((row) => row.id), [invoice.id]);
+    assert.equal(summary.open_invoices.total, invoice.amount_due);
+    assert.equal(summary.open_invoices.oldest_due, invoice.finalized_at,
+      'a bill with no terms ages from the day it was sent');
+    const notes = summary.attention as string[];
+    assert.ok(notes.some((note) => /past the day it fell due/.test(note)),
+      `the delinquency note names the bill, not a subscription that is collecting fine: ${JSON.stringify(notes)}`);
+    assert.ok(!notes.some((note) => /0 subscription/.test(note)), JSON.stringify(notes));
+    assert.ok(notes.some((note) => /overdue since/.test(note)), JSON.stringify(notes));
+
+    // Settle it and the account is in good standing again, by the same rule.
+    await ws.ok('POST', `/v1/invoices/${invoice.id}/pay`, { note: 'Bank transfer.' });
+    assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).delinquent, false);
+    assert.deepEqual(await allInvoices(ws, `&customer=${customer.id}&status=open_like`), []);
+  });
+
+  test('a draft is not outstanding — nobody has been asked for that money yet', async () => {
+    const customer = await ws.customer('Held In Draft');
+    const before = (await ws.ok('GET', '/v1/subscriptions/overview')).invoices.outstanding as number;
+    const draft: Invoice = await ws.ok('POST', '/v1/invoices', {
+      customer: customer.id, auto_advance: false,
+      items: [{ description: 'Commissioning visit', amount: 42_500, currency: 'usd' }],
+    });
+    assert.equal(draft.status, 'draft');
+    assert.equal((await ws.ok('GET', '/v1/subscriptions/overview')).invoices.outstanding, before,
+      'raising a draft does not move what the book says is outstanding');
+
+    assert.deepEqual(await allInvoices(ws, `&customer=${customer.id}&status=open_like`), [],
+      'a draft is not money the customer has been asked for');
+    assert.deepEqual(ids(await allInvoices(ws, `&customer=${customer.id}&status=draft`)), [draft.id],
+      'and status=draft is where it is found');
+    assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).delinquent, false);
+    const held = await ws.ok('GET', `/v1/customers/${customer.id}/summary`);
+    assert.deepEqual(held.open_invoices.data, [], 'the support screen does not call a draft outstanding either');
+    assert.equal(held.open_invoices.total, 0);
+
+    // Finalising it is what puts it on the book — owed, and not yet late,
+    // because this one went out with terms on it.
+    const sent: Invoice = await ws.ok('POST', `/v1/invoices/${draft.id}/finalize`, {});
+    assert.equal(sent.status, 'open');
+    assert.deepEqual(ids(await allInvoices(ws, `&customer=${customer.id}&status=open_like`)), [draft.id]);
+    assert.equal((await ws.ok('GET', '/v1/subscriptions/overview')).invoices.outstanding, before + sent.amount_due,
+      'and finalising it moves that figure by exactly what the bill asks for');
+    assert.ok(sent.due_date !== null && sent.due_date > ws.now(), 'it was sent with terms that have not run out');
+    assert.deepEqual(await allInvoices(ws, `&customer=${customer.id}&status=open_like&due_before=${ws.now()}`), [],
+      'owed is not the same as overdue');
+    assert.deepEqual(
+      ids(await allInvoices(ws, `&customer=${customer.id}&status=open_like&due_before=${sent.due_date}`)), [draft.id]);
+    assert.equal((await ws.ok('GET', `/v1/customers/${customer.id}`)).delinquent, false,
+      'nobody is chased over a bill that is still inside its terms');
   });
 });

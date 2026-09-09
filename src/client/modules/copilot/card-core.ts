@@ -109,8 +109,44 @@ export interface AnswerCard {
    */
   carried: { measure: string; from: string } | null;
   failed: string | null;
+  /**
+   * A money measure the engine would not narrow to the currency that was asked
+   * for, as facts rather than as a sentence to be parsed back apart. Resolved
+   * here, once, because everything the card draws comes out of this function —
+   * the two screens that draw it were each reading it out of the prose.
+   */
+  refusedCurrency: { measure: string; currency: string; books: string[] } | null;
   /** Every banner the card will draw. A scoped answer draws none. */
   banners: CardBanner[];
+}
+
+/**
+ * The refused currency, wherever the run carries it.
+ *
+ * The completion sends it inside `analysis`; a remembered turn keeps the same
+ * object. Neither is present on a thread answered before the engine published
+ * it, and for those the surface still reads the sentence.
+ */
+export function refusedCurrencyOf(
+  source: { analysis?: unknown } | null | undefined,
+  remembered: { analysis?: unknown } | null | undefined,
+): { measure: string; currency: string; books: string[] } | null {
+  for (const analysis of [source?.analysis, remembered?.analysis]) {
+    if (!isRecord(analysis)) continue;
+    // `refused_currency` is the API's shape, the same snake_case the client
+    // already reads `write_blocked` in; the camel one is the engine's own.
+    const said = analysis.refused_currency ?? analysis.refusedCurrency;
+    if (!isRecord(said)) continue;
+    const measure = said.measure;
+    const currency = said.currency;
+    if (typeof measure !== 'string' || typeof currency !== 'string') continue;
+    return {
+      measure,
+      currency: currency.toUpperCase(),
+      books: Array.isArray(said.books) ? said.books.filter((b): b is string => typeof b === 'string') : [],
+    };
+  }
+  return null;
 }
 
 export function answerCard(input: TurnInput): AnswerCard {
@@ -164,5 +200,8 @@ export function answerCard(input: TurnInput): AnswerCard {
   if (noWrite) banners.push('no_write');
   if (switchOff) banners.push('switch_off');
 
-  return { engine, indicator, refusal, slots, noWrite, switchOff, failed, carried, banners };
+  return {
+    engine, indicator, refusal, slots, noWrite, switchOff, failed, carried,
+    refusedCurrency: refusedCurrencyOf(run, remembered), banners,
+  };
 }

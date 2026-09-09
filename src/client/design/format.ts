@@ -23,13 +23,62 @@ export interface FormatLocale {
 
 export const DEFAULT_LOCALE: FormatLocale = { locale: 'en-US', currency: 'usd', timeZone: 'UTC' };
 
+/* --------------------------- a usable environment ------------------------- */
+
+/**
+ * A stored locale or timezone the platform cannot actually format with.
+ *
+ * `Intl` throws a `RangeError` on a tag it does not recognise — `"en_US"` with
+ * an underscore, `"Europe/Nowhere"`, a value pasted into a settings field. The
+ * throw happens inside render, React unmounts the tree that was formatting,
+ * and because every screen in the product formats something, *every* screen
+ * goes blank at once — including Settings, which is the only place a person
+ * could have put it back. There is no way out from inside the product.
+ *
+ * So the format layer refuses to be the thing that takes the app down: an
+ * unusable value degrades to the default and the screen keeps rendering, with
+ * the wrong grouping or the wrong offset, which a person can see and fix. The
+ * verdict is cached per string, so this costs one constructor per bad value
+ * rather than one per formatted cell.
+ */
+const usable = new Map<string, boolean>();
+function works(key: string, build: () => unknown): boolean {
+  const cached = usable.get(key);
+  if (cached !== undefined) return cached;
+  let ok = true;
+  try { build(); } catch { ok = false; }
+  usable.set(key, ok);
+  return ok;
+}
+
+/** The locale to format in: the one asked for when `Intl` accepts it, otherwise the default. */
+export function usableLocale(locale: string | undefined | null): string {
+  if (!locale) return DEFAULT_LOCALE.locale;
+  return works(`l:${locale}`, () => new Intl.NumberFormat(locale)) ? locale : DEFAULT_LOCALE.locale;
+}
+
+/** The zone to read instants in: the one asked for when `Intl` accepts it, otherwise UTC. */
+export function usableZone(timeZone: string | undefined | null): string {
+  if (!timeZone) return DEFAULT_LOCALE.timeZone;
+  return works(`z:${timeZone}`, () => new Intl.DateTimeFormat('en-US', { timeZone })) ? timeZone : DEFAULT_LOCALE.timeZone;
+}
+
 /* ------------------------------- numbers --------------------------------- */
 
 const numCache = new Map<string, Intl.NumberFormat>();
 function nf(locale: string, opts: Intl.NumberFormatOptions): Intl.NumberFormat {
-  const key = locale + '|' + JSON.stringify(opts);
+  const safe = usableLocale(locale);
+  const key = safe + '|' + JSON.stringify(opts);
   let f = numCache.get(key);
-  if (!f) { f = new Intl.NumberFormat(locale, opts); numCache.set(key, f); }
+  if (!f) {
+    // The locale is already known good, so the only thing left that throws is
+    // a currency code the workspace stored and ISO does not have. A figure
+    // without its symbol is a worse answer than one with it, and a blank
+    // screen is worse than both.
+    try { f = new Intl.NumberFormat(safe, opts); }
+    catch { f = new Intl.NumberFormat(safe, { ...opts, style: 'decimal', currency: undefined }); }
+    numCache.set(key, f);
+  }
   return f;
 }
 
@@ -45,7 +94,7 @@ export function formatNumber(value: number, o: NumberOptions = {}): string {
   if (!Number.isFinite(value)) return '—';
   const min = o.decimals ?? 0;
   const max = o.maxDecimals ?? Math.max(min, o.decimals ?? 0);
-  return nf(o.locale || DEFAULT_LOCALE.locale, {
+  return nf(usableLocale(o.locale), {
     minimumFractionDigits: min,
     maximumFractionDigits: max,
     signDisplay: o.signDisplay || 'auto',
@@ -57,7 +106,7 @@ export function formatNumber(value: number, o: NumberOptions = {}): string {
 export function formatCompact(value: number, o: NumberOptions = {}): string {
   if (!Number.isFinite(value)) return '—';
   const abs = Math.abs(value);
-  return nf(o.locale || DEFAULT_LOCALE.locale, {
+  return nf(usableLocale(o.locale), {
     notation: 'compact',
     maximumFractionDigits: abs >= 1000 ? 1 : (o.maxDecimals ?? 0),
     signDisplay: o.signDisplay || 'auto',
@@ -73,7 +122,7 @@ export function formatPercent(value: number, o: PercentOptions = {}): string {
   if (!Number.isFinite(value)) return '—';
   const v = o.fraction === false ? value / 100 : value;
   const decimals = o.decimals ?? (Math.abs(v) < 0.1 && v !== 0 ? 1 : 0);
-  return nf(o.locale || DEFAULT_LOCALE.locale, {
+  return nf(usableLocale(o.locale), {
     style: 'percent',
     minimumFractionDigits: decimals,
     maximumFractionDigits: o.maxDecimals ?? decimals,
@@ -90,7 +139,7 @@ export function formatDelta(value: number, o: PercentOptions & { unit?: 'percent
 }
 
 export function formatOrdinal(value: number, locale = DEFAULT_LOCALE.locale): string {
-  const pr = new Intl.PluralRules(locale, { type: 'ordinal' });
+  const pr = new Intl.PluralRules(usableLocale(locale), { type: 'ordinal' });
   const suffix: Record<string, string> = { one: 'st', two: 'nd', few: 'rd', other: 'th', zero: 'th', many: 'th' };
   return `${formatNumber(value, { locale })}${suffix[pr.select(value)] ?? 'th'}`;
 }
@@ -113,7 +162,7 @@ export function formatMoney(value: Money | number, o: MoneyOptions = {}): string
     : value;
   if (!Number.isFinite(m.amount)) return '—';
   return formatMoneyBase(m, {
-    locale: o.locale || DEFAULT_LOCALE.locale,
+    locale: usableLocale(o.locale),
     compact: o.compact,
     trimZeroFraction: o.trimZeroFraction,
     signDisplay: o.signDisplay,
@@ -193,8 +242,8 @@ export interface DateOptions {
 export function formatDate(ts: number | null | undefined, o: DateOptions = {}): string {
   if (!isTimestamp(ts)) return '—';
   return formatDateBase(ts, {
-    locale: o.locale || DEFAULT_LOCALE.locale,
-    timeZone: o.timeZone || DEFAULT_LOCALE.timeZone,
+    locale: usableLocale(o.locale),
+    timeZone: usableZone(o.timeZone),
     withTime: o.withTime,
     withYear: o.withYear,
   });
@@ -206,22 +255,23 @@ export function formatDateTime(ts: number | null | undefined, o: DateOptions = {
 
 export function formatTime(ts: number | null | undefined, o: DateOptions = {}): string {
   if (!isTimestamp(ts)) return '—';
-  return new Intl.DateTimeFormat(o.locale || DEFAULT_LOCALE.locale, {
-    timeZone: o.timeZone || DEFAULT_LOCALE.timeZone, hour: 'numeric', minute: '2-digit',
+  return new Intl.DateTimeFormat(usableLocale(o.locale), {
+    timeZone: usableZone(o.timeZone), hour: 'numeric', minute: '2-digit',
   }).format(ts);
 }
 
 export function formatMonth(ts: number, o: DateOptions = {}): string {
   if (!isTimestamp(ts)) return '—';
-  return new Intl.DateTimeFormat(o.locale || DEFAULT_LOCALE.locale, {
-    timeZone: o.timeZone || DEFAULT_LOCALE.timeZone, month: 'short', year: o.withYear === false ? undefined : 'numeric',
+  return new Intl.DateTimeFormat(usableLocale(o.locale), {
+    timeZone: usableZone(o.timeZone), month: 'short', year: o.withYear === false ? undefined : 'numeric',
   }).format(ts);
 }
 
 const rtfCache = new Map<string, Intl.RelativeTimeFormat>();
 function rtf(locale: string): Intl.RelativeTimeFormat {
-  let f = rtfCache.get(locale);
-  if (!f) { f = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' }); rtfCache.set(locale, f); }
+  const safe = usableLocale(locale);
+  let f = rtfCache.get(safe);
+  if (!f) { f = new Intl.RelativeTimeFormat(safe, { numeric: 'auto' }); rtfCache.set(safe, f); }
   return f;
 }
 
@@ -241,7 +291,7 @@ export function formatRelative(ts: number | null | undefined, now: number, local
   const diff = ts - now;
   const abs = Math.abs(diff);
   if (abs >= RELATIVE_DAYS_FROM && abs < RELATIVE_DAYS_UNTIL) return rtf(locale).format(Math.round(diff / DAY), 'day');
-  return formatRelativeBase(ts, now, locale);
+  return formatRelativeBase(ts, now, usableLocale(locale));
 }
 
 /** "3 days ago" under a week, an absolute date beyond it — how activity feeds read. */
@@ -254,8 +304,8 @@ export function formatWhen(ts: number, now: number, o: DateOptions = {}): string
 
 export function formatDateRange(start: number, end: number, o: DateOptions = {}): string {
   if (!isTimestamp(start) || !isTimestamp(end)) return `${formatDate(start, o)} – ${formatDate(end, o)}`;
-  const locale = o.locale || DEFAULT_LOCALE.locale;
-  const timeZone = o.timeZone || DEFAULT_LOCALE.timeZone;
+  const locale = usableLocale(o.locale);
+  const timeZone = usableZone(o.timeZone);
   const sameYear = new Date(start).getUTCFullYear() === new Date(end).getUTCFullYear();
   const left = formatDateBase(start, { locale, timeZone, withYear: !sameYear });
   const right = formatDateBase(end, { locale, timeZone });
@@ -302,7 +352,7 @@ export function plural(count: number, word: string, o: { locale?: string; hideCo
 
 export function formatList(items: string[], o: { locale?: string; type?: 'conjunction' | 'disjunction' } = {}): string {
   if (!items.length) return '';
-  return new Intl.ListFormat(o.locale || DEFAULT_LOCALE.locale, { style: 'long', type: o.type || 'conjunction' }).format(items);
+  return new Intl.ListFormat(usableLocale(o.locale), { style: 'long', type: o.type || 'conjunction' }).format(items);
 }
 
 /* --------------------------------- text ---------------------------------- */
@@ -359,7 +409,12 @@ export interface Formatter extends FormatLocale {
 }
 
 export function createFormatter(base: FormatLocale, now: () => number): Formatter {
-  const { locale, currency, timeZone } = base;
+  // Resolved once, here, so `fmt.locale` and `fmt.timeZone` are values a
+  // caller can hand to `Intl` itself — the calendar builds its own formatters
+  // out of them — rather than whatever string the workspace happens to hold.
+  const locale = usableLocale(base.locale);
+  const timeZone = usableZone(base.timeZone);
+  const { currency } = base;
   return {
     locale, currency, timeZone,
     money: (v, o) => formatMoney(v, { locale, currency, ...o }),

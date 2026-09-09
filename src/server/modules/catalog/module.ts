@@ -10,16 +10,25 @@ import {
   Catalog, type CatalogView, type PriceInput, type PriceListFilter, type ProductInput, type ProductListFilter,
 } from './store';
 import {
+  Coupons, type CouponInput, type CouponListFilter, type PromotionCodeInput, type PromotionCodeListFilter,
+  type RedemptionInput, type RedemptionListFilter,
+} from './coupons';
+import {
+  couponAppliesToPeriod, couponCovers, couponValidity, describeCoupon, discountOn, discountPeriods,
+  distributeDiscount, formatPercent, promotionCodeValidity, type DiscountLine, type PromotionCodeContext,
+} from './discounts';
+import {
   aggregateUsage, boundariesOf, computeLineAmount, currenciesOf, previewCurve, resolveForCurrency,
   type ComputeOptions, type CurveOptions,
 } from './engine';
 import { describePrice, formatMinor, formatMinorDecimal, type PriceDisplay } from './format';
 import { seedCatalog } from './seed';
 import {
-  INTERVAL_UNITS, PRICE_MODELS, PRICE_TYPES, PRODUCT_CATEGORIES, PRORATION_BEHAVIORS, TAX_BEHAVIORS,
-  TIERS_MODES, USAGE_AGGREGATIONS, USAGE_TYPES,
-  type LineAmount, type Price, type PriceCurve, type PriceUsage, type Product, type UsageAggregation,
-  type UsageRecord,
+  COUPON_DURATIONS, INTERVAL_UNITS, PRICE_MODELS, PRICE_TYPES, PRODUCT_CATEGORIES, PRORATION_BEHAVIORS,
+  TAX_BEHAVIORS, TIERS_MODES, USAGE_AGGREGATIONS, USAGE_TYPES,
+  type AppliedDiscount, type Coupon, type CouponInvalidReason, type CouponRedemption, type LineAmount,
+  type Price, type PriceCurve, type PriceUsage, type Product, type PromotionCode,
+  type PromotionCodeInvalidReason, type UsageAggregation, type UsageRecord, type Validity,
 } from './types';
 
 /* -------------------------------- service --------------------------------- */
@@ -59,6 +68,51 @@ export interface CatalogService {
   releaseUsage(orgId: string, priceId: string, ref: { type: string; id: string }): void;
 
   view(orgId: string, opts?: { currency?: string; locale?: string; includeInactive?: boolean }): CatalogView;
+
+  /* -------------------------------- discounts ------------------------------ *
+   * The price book's only subtraction. Billing owns what a discount does to an
+   * invoice, a subscription and MRR; the catalog owns what a coupon *is*, what
+   * it is worth against an amount, and whether it may still be redeemed.       */
+
+  coupons(orgId: string, filter?: CouponListFilter): Coupon[];
+  coupon(orgId: string, id: string): Coupon | null;
+  requireCoupon(orgId: string, id: string): Coupon;
+  createCoupon(orgId: string, input: CouponInput): Coupon;
+  updateCoupon(orgId: string, id: string, patch: Partial<CouponInput>): Coupon;
+
+  promotionCodes(orgId: string, filter?: PromotionCodeListFilter): PromotionCode[];
+  promotionCode(orgId: string, id: string): PromotionCode | null;
+  promotionCodeByCode(orgId: string, code: string): PromotionCode | null;
+  createPromotionCode(orgId: string, input: PromotionCodeInput): PromotionCode;
+  /**
+   * What a customer typed, resolved. Null when no such code exists; a code that
+   * exists but cannot be used comes back with `validity.valid === false` and
+   * the reason, because "no such code" and "that code ran out" are different
+   * things to say to a customer.
+   */
+  resolveCode(orgId: string, code: string, opts?: PromotionCodeContext & { customer?: string | null }):
+    { promotion_code: PromotionCode; coupon: Coupon; validity: Validity<PromotionCodeInvalidReason> } | null;
+
+  couponValidity(coupon: Coupon, now?: number): Validity<CouponInvalidReason>;
+  promotionCodeValidity(
+    code: PromotionCode, coupon: Coupon, opts?: PromotionCodeContext, now?: number,
+  ): Validity<PromotionCodeInvalidReason>;
+
+  /** Take a coupon off one amount, rounded once, half-up. Pure. */
+  discountOn(coupon: Coupon, amount: number, currency: string, subject?: { price?: string | null; product?: string | null }): AppliedDiscount;
+  /** Spread one coupon across lines so the per-line shares sum to the total. Pure. */
+  distributeDiscount(coupon: Coupon, lines: DiscountLine[], currency: string): AppliedDiscount;
+  couponCovers(coupon: Coupon, line: { price?: string | null; product?: string | null }): boolean;
+  /** How many billing periods the coupon applies to; null means without end. */
+  discountPeriods(coupon: Coupon): number | null;
+  couponAppliesToPeriod(coupon: Coupon, index: number): boolean;
+
+  /** Spend one redemption. Idempotent on `ref`, so a retry costs nothing. */
+  redeem(orgId: string, input: RedemptionInput): CouponRedemption;
+  /** Give it back when whatever held the discount never happened. */
+  releaseRedemption(orgId: string, ref: { type: string; id: string }, opts?: { coupon?: string }): CouponRedemption[];
+  redemptions(orgId: string, filter?: RedemptionListFilter): CouponRedemption[];
+  customerRedemptions(orgId: string, promotionCodeId: string, customerId: string): number;
 }
 
 declare module '../../kernel/services' {
@@ -70,6 +124,13 @@ export function catalogStore(ctx: Ctx): Catalog {
   let engine = engines.get(ctx);
   if (!engine) { engine = new Catalog(ctx); engines.set(ctx, engine); }
   return engine;
+}
+
+const couponStores = new WeakMap<Ctx, Coupons>();
+export function couponStore(ctx: Ctx): Coupons {
+  let store = couponStores.get(ctx);
+  if (!store) { store = new Coupons(ctx); couponStores.set(ctx, store); }
+  return store;
 }
 
 const writeMeta = (req: Req) => ({
@@ -234,6 +295,90 @@ const previewBody = v.object({
   proration: v.optional(v.object({ numerator: v.int({ min: 0 }), denominator: v.int({ min: 1 }) }, { strict: true })),
 }, { strict: true });
 
+/* -------------------------------- discounts ------------------------------- */
+
+/**
+ * A restriction has to name things that exist. `v.id('prod')` checks the
+ * prefix; the store checks the workspace actually sells them, because a coupon
+ * scoped to a product nobody has reads on screen as a working coupon that never
+ * comes off the bill.
+ */
+const appliesToBody = v.object({
+  products: v.optional(v.array(v.id('prod'), { max: 100 })),
+  prices: v.optional(v.array(v.id('price'), { max: 100 })),
+}, { strict: true });
+
+const COUPON_FIELDS = {
+  name: v.optional(v.nullable(v.string({ max: 160 }))),
+  percent_off: v.optional(v.nullable(described(
+    v.number({ min: 0, max: 100 }),
+    'Percentage off as a person writes it: 20 is 20%, 33.33 is a third. Two decimal places at most — it is stored as an exact integer number of hundredths of a percent, so 33.333 is refused rather than silently rounded.',
+  ))),
+  percent_off_basis_points: v.optional(v.nullable(described(
+    v.int({ min: 0, max: 10_000 }),
+    'The same figure with no float in it: hundredths of a percent, so 2000 is 20% and 10000 is everything. Send this or percent_off, never both.',
+  ))),
+  amount_off: v.optional(v.nullable(described(
+    v.int({ min: 0 }),
+    'A fixed amount off, in integer minor units, in `currency` — 5000 is $50.00. Exclusive with a percentage: two subtractions on one line have no defined order.',
+  ))),
+  currency: v.optional(v.nullable(described(
+    currencyCode(),
+    'Required with amount_off and refused without it. A percentage travels between currencies; $50 off does not.',
+  ))),
+  duration: v.optional(described(
+    v.enum(COUPON_DURATIONS),
+    'How long the discount keeps applying to something that renews: "once" is the first billing period only, "repeating" is duration_in_periods of them, "forever" never stops. Periods rather than months, because a subscription\u2019s period is whatever its price says it is.',
+  )),
+  duration_in_periods: v.optional(v.nullable(v.int({ min: 1, max: 600 }))),
+  max_redemptions: v.optional(v.nullable(v.int({ min: 1 }))),
+  redeem_by: v.optional(v.nullable(v.timestamp())),
+  applies_to: v.optional(appliesToBody),
+  active: v.optional(v.boolean()),
+  metadata: v.metadata(),
+};
+
+const couponCreateBody = v.object(COUPON_FIELDS, { strict: true });
+const couponUpdateBody = v.object(COUPON_FIELDS, { strict: true });
+
+const PROMOTION_CODE_FIELDS = {
+  code: v.optional(v.nullable(described(
+    v.string({ min: 3, max: 40 }),
+    'What the customer types. Upper-cased on the way in and unique per workspace, so "spring20" and "SPRING20" are one code. Omit it and one is generated from an alphabet with no O/0 or I/1 in it, because these get read out over the phone.',
+  ))),
+  active: v.optional(v.boolean()),
+  expires_at: v.optional(v.nullable(v.timestamp())),
+  max_redemptions: v.optional(v.nullable(v.int({ min: 1 }))),
+  max_redemptions_per_customer: v.optional(v.nullable(v.int({ min: 1 }))),
+  minimum_amount: v.optional(v.nullable(v.int({ min: 0 }))),
+  minimum_amount_currency: v.optional(v.nullable(currencyCode())),
+  first_time_transaction: v.optional(v.boolean()),
+  metadata: v.metadata(),
+};
+
+const promotionCodeCreateBody = v.object({ coupon: v.id('coup'), ...PROMOTION_CODE_FIELDS }, { strict: true });
+
+const promotionCodeUpdateBody = v.object(
+  { coupon: v.optional(v.id('coup')), ...PROMOTION_CODE_FIELDS }, { strict: true },
+);
+
+const discountLineBody = v.object({
+  id: v.optional(v.string({ max: 120 })),
+  price: v.optional(v.id('price')),
+  product: v.optional(v.id('prod')),
+  amount: described(v.int(), 'Integer minor units. A negative line is a credit: it neither enlarges the base nor takes anything off.'),
+}, { strict: true });
+
+const discountPreviewBody = v.object({
+  coupon: v.optional(v.id('coup')),
+  code: v.optional(v.string({ min: 3, max: 40 })),
+  currency: v.optional(currencyCode()),
+  amount: v.optional(v.int()),
+  lines: v.optional(v.array(discountLineBody, { min: 1, max: 200 })),
+  customer: v.optional(v.id('cus')),
+  first_time_transaction: v.optional(v.boolean()),
+}, { strict: true });
+
 /* --------------------------------- queries -------------------------------- */
 
 const expandQuery = v.object({ expand: v.optional(v.string({ max: 120 })) });
@@ -274,6 +419,30 @@ const catalogQuery = v.object({
   include_inactive: v.optional(v.boolean()),
 });
 
+const couponListQuery = v.object({
+  active: v.optional(v.boolean()),
+  valid: v.optional(v.boolean()),
+  duration: v.optional(v.enum(COUPON_DURATIONS)),
+  currency: v.optional(currencyCode()),
+  query: v.optional(v.string({ max: 120 })),
+  limit: v.optional(v.int({ min: 1, max: 200 })),
+  cursor: v.optional(v.string({ max: 200 })),
+});
+
+const promotionCodeListQuery = v.object({
+  coupon: v.optional(v.id('coup')),
+  code: v.optional(v.string({ min: 3, max: 40 })),
+  active: v.optional(v.boolean()),
+  limit: v.optional(v.int({ min: 1, max: 200 })),
+  cursor: v.optional(v.string({ max: 200 })),
+});
+
+const redemptionListQuery = v.object({
+  promotion_code: v.optional(v.id('promo')),
+  customer: v.optional(v.id('cus')),
+  limit: v.optional(v.int({ min: 1, max: 500 })),
+});
+
 /**
  * `Req.query` is declared as raw strings, but by the time a handler runs the
  * router has replaced it with the output of the route's own query validator:
@@ -312,6 +481,42 @@ function pricePayload(price: Price, product: Product | null, locale: string): Re
 }
 
 /**
+ * A coupon as the price book shows it: the stored terms, plus the two figures a
+ * screen needs and cannot compute for itself — what the offer says in words,
+ * and how many redemptions are left.
+ */
+function couponPayload(coupon: Coupon, locale: string, now: number): Record<string, unknown> {
+  const standing = couponValidity(coupon, now);
+  return {
+    ...coupon,
+    summary: describeCoupon(coupon, locale),
+    percent_off_display: coupon.percent_off_basis_points === null
+      ? null
+      : `${formatPercent(coupon.percent_off_basis_points)}%`,
+    amount_off_display: coupon.amount_off !== null && coupon.currency
+      ? formatMinor(coupon.amount_off, coupon.currency, locale)
+      : null,
+    redemptions_remaining: coupon.max_redemptions === null
+      ? null
+      : Math.max(0, coupon.max_redemptions - coupon.times_redeemed),
+    invalid_reason: standing.reason,
+    invalid_message: standing.message,
+  };
+}
+
+function promotionCodePayload(code: PromotionCode, locale: string): Record<string, unknown> {
+  return {
+    ...code,
+    redemptions_remaining: code.max_redemptions === null
+      ? null
+      : Math.max(0, code.max_redemptions - code.times_redeemed),
+    minimum_amount_display: code.restrictions.minimum_amount !== null
+      ? formatMinor(code.restrictions.minimum_amount, code.restrictions.minimum_amount_currency ?? 'usd', locale)
+      : null,
+  };
+}
+
+/**
  * What a flat price has to say when it is quoted at a quantity it will not
  * bill. The subscription route refuses an item carrying one outright; a quote
  * is a question rather than a purchase, so it answers — and then says plainly
@@ -345,12 +550,13 @@ export default defineModule({
   name: 'catalog',
   title: 'Products & pricing',
   description:
-    'The price book and the pricing engine: products, immutable prices, graduated and volume tiers, package and metered pricing, multi-currency, and the exact quantity-to-money calculation every invoice line is built from.',
+    'The price book and the pricing engine: products, immutable prices, graduated and volume tiers, package and metered pricing, multi-currency, coupons and promotion codes, and the exact quantity-to-money calculation every invoice line is built from.',
   dependsOn: ['core'],
   migrations: CATALOG_MIGRATIONS,
 
   boot(ctx) {
     const store = catalogStore(ctx);
+    const discounts = couponStore(ctx);
     const service: CatalogService = {
       products: (orgId, filter) => store.listProducts(orgId, { limit: 200, ...filter }).data,
       product: (orgId, id) => store.product(orgId, id),
@@ -385,6 +591,33 @@ export default defineModule({
         locale: opts?.locale ?? localeOf(ctx, orgId),
         includeInactive: opts?.includeInactive,
       }),
+
+      coupons: (orgId, filter) => discounts.listCoupons(orgId, { limit: 200, ...filter }).data,
+      coupon: (orgId, id) => discounts.coupon(orgId, id),
+      requireCoupon: (orgId, id) => discounts.requireCoupon(orgId, id),
+      createCoupon: (orgId, input) => discounts.createCoupon(orgId, input),
+      updateCoupon: (orgId, id, patch) => discounts.updateCoupon(orgId, id, patch),
+
+      promotionCodes: (orgId, filter) => discounts.listPromotionCodes(orgId, { limit: 200, ...filter }).data,
+      promotionCode: (orgId, id) => discounts.promotionCode(orgId, id),
+      promotionCodeByCode: (orgId, code) => discounts.promotionCodeByCode(orgId, code),
+      createPromotionCode: (orgId, input) => discounts.createPromotionCode(orgId, input),
+      resolveCode: (orgId, code, opts) => discounts.resolveCode(orgId, code, opts),
+
+      couponValidity: (coupon, now) => couponValidity(coupon, now ?? ctx.now()),
+      promotionCodeValidity: (code, coupon, opts, now) => promotionCodeValidity(code, coupon, now ?? ctx.now(), opts),
+
+      discountOn: (coupon, amount, currency, subject) => discountOn(coupon, amount, currency, subject),
+      distributeDiscount: (coupon, lines, currency) => distributeDiscount(coupon, lines, currency),
+      couponCovers: (coupon, line) => couponCovers(coupon, line),
+      discountPeriods: (coupon) => discountPeriods(coupon),
+      couponAppliesToPeriod: (coupon, index) => couponAppliesToPeriod(coupon, index),
+
+      redeem: (orgId, input) => discounts.redeem(orgId, input),
+      releaseRedemption: (orgId, ref, opts) => discounts.releaseRedemption(orgId, ref, opts),
+      redemptions: (orgId, filter) => discounts.redemptions(orgId, filter),
+      customerRedemptions: (orgId, promotionCodeId, customerId) =>
+        discounts.customerRedemptions(orgId, promotionCodeId, customerId),
     };
     ctx.provide('catalog', service);
   },
@@ -736,6 +969,235 @@ export default defineModule({
           custom_unit_amount: v.optional(v.int({ min: 0 })),
         }, { strict: true }), { min: 1, max: 50 }),
       }, { strict: true }),
+    });
+
+    /* -------------------------------- coupons ----------------------------- */
+
+    router.get('/v1/coupons', (req: Req, c: Ctx) => {
+      const q = queryOf(req, couponListQuery);
+      const page = couponStore(c).listCoupons(req.auth.orgId, {
+        active: q.active, valid: q.valid, duration: q.duration, currency: q.currency,
+        query: q.query, limit: q.limit, cursor: q.cursor ?? null,
+      });
+      const locale = localeOf(c, req.auth.orgId);
+      const now = c.now();
+      return list(page.data.map((coupon) => couponPayload(coupon, locale, now)), {
+        hasMore: page.hasMore, nextCursor: page.nextCursor, totalCount: page.totalCount, url: '/v1/coupons',
+      });
+    }, {
+      summary: 'List coupons', tags: ['catalog'],
+      description: 'Newest first. active=true is what has not been archived; valid=true is the narrower question a checkout asks — active, in date, and not yet redeemed to its limit.',
+      query: couponListQuery,
+    });
+
+    router.post('/v1/coupons', (req: Req, c: Ctx) =>
+      created(c.atomic(() => {
+        const coupon = couponStore(c).createCoupon(req.auth.orgId, req.body as CouponInput, writeMeta(req));
+        return couponPayload(coupon, localeOf(c, req.auth.orgId), c.now());
+      })),
+      {
+        summary: 'Create a coupon', tags: ['catalog'], roles: ['member'], idempotent: true,
+        description:
+          'A coupon is either a percentage off or a fixed amount off in a stated currency, never both. duration says how long it keeps applying to something that renews, applies_to narrows it to particular products or prices, and max_redemptions and redeem_by close the campaign. Its terms freeze the first time it is redeemed, exactly as a price freezes the first time it bills.',
+        body: couponCreateBody,
+      });
+
+    router.post('/v1/coupons/preview', (req: Req, c: Ctx) => {
+      const orgId = req.auth.orgId;
+      const store = couponStore(c);
+      const body = req.body as {
+        coupon?: string; code?: string; currency?: string; amount?: number;
+        lines?: DiscountLine[]; customer?: string; first_time_transaction?: boolean;
+      };
+      if (!body.coupon && !body.code) {
+        throw badRequest('parameter_missing', 'Say which coupon to price: a coupon id, or the code a customer typed.', 'coupon');
+      }
+      if (body.coupon && body.code) {
+        throw badRequest('parameter_invalid', 'Send a coupon id or a promotion code, not both — the code already names its coupon.', 'code');
+      }
+      if (body.amount === undefined && !body.lines?.length) {
+        throw badRequest('parameter_missing', 'Give the coupon something to come off: an amount, or the lines it should be spread across.', 'amount');
+      }
+      if (body.amount !== undefined && body.lines?.length) {
+        throw badRequest('parameter_invalid', 'Send an amount or lines, not both — the lines carry their own amounts.', 'amount');
+      }
+
+      const locale = localeOf(c, orgId);
+      const now = c.now();
+      const lines: DiscountLine[] = body.lines?.length ? body.lines : [{ amount: body.amount ?? 0 }];
+      const subtotal = lines.reduce((acc, line) => acc + line.amount, 0);
+
+      let coupon: Coupon;
+      let promotionCode: PromotionCode | null = null;
+      let standing: Validity<CouponInvalidReason | PromotionCodeInvalidReason>;
+      if (body.coupon) {
+        coupon = store.requireCoupon(orgId, body.coupon);
+        standing = couponValidity(coupon, now);
+      } else {
+        const found = store.promotionCodeByCode(orgId, body.code as string);
+        if (!found) {
+          // Not a 404: a checkout asking "is this code any good?" gets one
+          // answer shape whether the code is unknown, expired or fine.
+          return {
+            object: 'discount_preview',
+            coupon: null, promotion_code: null,
+            valid: false, reason: 'unknown_code',
+            message: `No promotion code matches “${String(body.code).trim().toUpperCase()}”.`,
+            currency: (body.currency || currencyOf(c, orgId)).toLowerCase(),
+            discount: null,
+          };
+        }
+        promotionCode = found;
+        coupon = store.requireCoupon(orgId, found.coupon);
+        const currencyForFloor = (body.currency || coupon.currency || currencyOf(c, orgId)).toLowerCase();
+        standing = promotionCodeValidity(found, coupon, now, {
+          amount: subtotal,
+          currency: currencyForFloor,
+          firstTransaction: body.first_time_transaction,
+          customerRedemptions: body.customer ? store.customerRedemptions(orgId, found.id, body.customer) : 0,
+        });
+      }
+
+      const currency = (body.currency || coupon.currency || currencyOf(c, orgId)).toLowerCase();
+      // The arithmetic runs whether or not the coupon may still be redeemed:
+      // an operator looking at an archived campaign still wants the figure, and
+      // `valid` beside it is what says it cannot be used.
+      const applied = body.lines?.length
+        ? distributeDiscount(coupon, lines, currency)
+        : discountOn(coupon, body.amount ?? 0, currency);
+
+      return {
+        object: 'discount_preview',
+        coupon: couponPayload(coupon, locale, now),
+        promotion_code: promotionCode ? promotionCodePayload(promotionCode, locale) : null,
+        valid: standing.valid,
+        reason: standing.reason,
+        message: standing.message,
+        currency,
+        discount: {
+          ...applied,
+          amount_display: formatMinor(applied.amount, currency, locale),
+          remaining_display: formatMinor(applied.remaining, currency, locale),
+          lines: applied.lines.map((line) => ({
+            ...line,
+            discount_display: formatMinor(line.discount, currency, locale),
+            remaining_display: formatMinor(line.remaining, currency, locale),
+          })),
+        },
+      };
+    }, {
+      summary: 'What a coupon takes off, with the arithmetic shown', tags: ['catalog'], roles: ['readonly'],
+      description:
+        'Send a coupon id or the code a customer typed, and either one amount or the lines it should be spread across. A percentage is rounded once, half-up, on the discount itself, and the per-line shares are reconciled to that single total, so what is shown always sums to what is charged. An unknown code is answered rather than 404-ed: a checkout needs "no such code" and "that code expired" in the same shape.',
+      body: discountPreviewBody,
+    });
+
+    router.get('/v1/coupons/:id', (req: Req, c: Ctx) => {
+      const store = couponStore(c);
+      const coupon = store.requireCoupon(req.auth.orgId, req.params.id);
+      const locale = localeOf(c, req.auth.orgId);
+      const codes = store.listPromotionCodes(req.auth.orgId, { coupon: coupon.id, limit: 200 });
+      return {
+        ...couponPayload(coupon, locale, c.now()),
+        promotion_codes: codes.data.map((code) => promotionCodePayload(code, locale)),
+        editable: coupon.times_redeemed === 0,
+      };
+    }, {
+      summary: 'Retrieve a coupon', tags: ['catalog'],
+      description: 'With the codes that hand it out, and whether its terms can still be edited — they freeze on first redemption.',
+    });
+
+    router.patch('/v1/coupons/:id', (req: Req, c: Ctx) =>
+      c.atomic(() => {
+        const coupon = couponStore(c).updateCoupon(req.auth.orgId, req.params.id, req.body as Partial<CouponInput>, writeMeta(req));
+        return couponPayload(coupon, localeOf(c, req.auth.orgId), c.now());
+      }),
+      {
+        summary: 'Update or archive a coupon', tags: ['catalog'], roles: ['member'],
+        description:
+          'Labels (name, metadata, active) and the campaign limits (max_redemptions, redeem_by) are always editable; active: false is how a coupon is archived, which stops further redemptions while the invoices it discounted keep explaining themselves. What it is worth — the percentage or amount, the currency, the duration and applies_to — can only change while nothing has redeemed it.',
+        body: couponUpdateBody,
+      });
+
+    router.del('/v1/coupons/:id', (req: Req, c: Ctx) => {
+      c.atomic(() => couponStore(c).deleteCoupon(req.auth.orgId, req.params.id, writeMeta(req)));
+      return noContent();
+    }, {
+      summary: 'Delete a coupon', tags: ['catalog'], roles: ['admin'],
+      description: 'Refused once anything has redeemed it, and while a promotion code still points at it. Archive it instead (active: false) so discounted invoices still explain themselves.',
+    });
+
+    router.get('/v1/coupons/:id/redemptions', (req: Req, c: Ctx) => {
+      const store = couponStore(c);
+      const coupon = store.requireCoupon(req.auth.orgId, req.params.id);
+      const q = queryOf(req, redemptionListQuery);
+      const rows = store.redemptions(req.auth.orgId, {
+        coupon: coupon.id, promotion_code: q.promotion_code, customer: q.customer, limit: q.limit,
+      });
+      return list(rows, { totalCount: coupon.times_redeemed, url: `/v1/coupons/${coupon.id}/redemptions` });
+    }, {
+      summary: 'Who has redeemed a coupon', tags: ['catalog'],
+      description: 'One row per take-up, newest first. These rows are what times_redeemed counts, which is why releasing one — a subscription undone before it ever billed — gives the redemption back.',
+      query: redemptionListQuery,
+    });
+
+    /* ---------------------------- promotion codes ------------------------- */
+
+    router.get('/v1/promotion_codes', (req: Req, c: Ctx) => {
+      const q = queryOf(req, promotionCodeListQuery);
+      const page = couponStore(c).listPromotionCodes(req.auth.orgId, {
+        coupon: q.coupon, code: q.code, active: q.active, limit: q.limit, cursor: q.cursor ?? null,
+      });
+      const locale = localeOf(c, req.auth.orgId);
+      return list(page.data.map((code) => promotionCodePayload(code, locale)), {
+        hasMore: page.hasMore, nextCursor: page.nextCursor, totalCount: page.totalCount, url: '/v1/promotion_codes',
+      });
+    }, {
+      summary: 'List promotion codes', tags: ['catalog'],
+      description: 'Newest first. Pass code=SPRING20 to look one up the way a customer typed it — matching ignores case and surrounding space.',
+      query: promotionCodeListQuery,
+    });
+
+    router.post('/v1/promotion_codes', (req: Req, c: Ctx) =>
+      created(c.atomic(() => {
+        const code = couponStore(c).createPromotionCode(req.auth.orgId, req.body as PromotionCodeInput, writeMeta(req));
+        return promotionCodePayload(code, localeOf(c, req.auth.orgId));
+      })),
+      {
+        summary: 'Create a promotion code', tags: ['catalog'], roles: ['member'], idempotent: true,
+        description:
+          'The customer-facing half of a coupon. Two codes can stand for the same coupon with different expiries, limits and floors — which is how one "20% off year one" is handed to a sales team and to a campaign at the same time. Omit code and one is generated.',
+        body: promotionCodeCreateBody,
+      });
+
+    router.get('/v1/promotion_codes/:id', (req: Req, c: Ctx) => {
+      const store = couponStore(c);
+      const code = store.requirePromotionCode(req.auth.orgId, req.params.id);
+      const locale = localeOf(c, req.auth.orgId);
+      return {
+        ...promotionCodePayload(code, locale),
+        coupon_detail: couponPayload(store.requireCoupon(req.auth.orgId, code.coupon), locale, c.now()),
+      };
+    }, { summary: 'Retrieve a promotion code', tags: ['catalog'] });
+
+    router.patch('/v1/promotion_codes/:id', (req: Req, c: Ctx) =>
+      c.atomic(() => {
+        const code = couponStore(c).updatePromotionCode(req.auth.orgId, req.params.id, req.body as Partial<PromotionCodeInput>, writeMeta(req));
+        return promotionCodePayload(code, localeOf(c, req.auth.orgId));
+      }),
+      {
+        summary: 'Update or switch off a promotion code', tags: ['catalog'], roles: ['member'],
+        description:
+          'The limits, the expiry, the floor and active all move. The code itself and the coupon behind it never do: the string is already in an email or on a call, and repointing it would change what a promise already made means.',
+        body: promotionCodeUpdateBody,
+      });
+
+    router.del('/v1/promotion_codes/:id', (req: Req, c: Ctx) => {
+      c.atomic(() => couponStore(c).deletePromotionCode(req.auth.orgId, req.params.id, writeMeta(req)));
+      return noContent();
+    }, {
+      summary: 'Delete a promotion code', tags: ['catalog'], roles: ['admin'],
+      description: 'Refused once it has been redeemed. Set active: false instead, so the discounts it granted keep explaining themselves.',
     });
 
     void store;

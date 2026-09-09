@@ -257,13 +257,34 @@ export function meterSource(db: Db): MeterSource | null {
 
 /* ----------------------------- workspace facts ---------------------------- */
 
+/**
+ * The people this workspace can attribute work to.
+ *
+ * Read through `core.users`, never off `users` directly: the row in `users` is
+ * the person's own account, shared with every other workspace they belong to,
+ * and what *this* workspace calls them lives on the membership
+ * (`seat_name`/`seat_title`). Joining the two here read a name Northwind never
+ * typed straight into the copilot's grounding — the engine would greet an
+ * invited seat by the name they use at another company, and rank "their"
+ * pipeline under it.
+ *
+ * An `invited` seat is dropped as well. An invitation is not a membership yet:
+ * nobody has accepted, nothing is owned, and "Priya has the most open
+ * pipeline" is not a sentence about an address that has never signed in.
+ */
+function seatsOf(ctx: Ctx, orgId: string): { id: string; name: string; email: string; title: string | null; role: string }[] {
+  const core = ctx.svc.core;
+  if (!core) return [];
+  return core.users(orgId)
+    .filter((seat) => seat.status !== 'invited')
+    .map((seat) => ({ id: seat.id, name: seat.name, email: seat.email, title: seat.title, role: seat.role }));
+}
+
 export function workspaceProfile(ctx: Ctx, orgId: string): WorkspaceProfile {
   const org = ctx.db.get<{
     id: string; name: string; domain: string | null; default_currency: string; locale: string; timezone: string;
   }>(`SELECT id, name, domain, default_currency, locale, timezone FROM orgs WHERE id = ?`, orgId);
-  const people = ctx.db.all<{ id: string; name: string; email: string; title: string | null; role: string }>(
-    `SELECT u.id, u.name, u.email, u.title, m.role FROM users u
-     JOIN memberships m ON m.user_id = u.id WHERE m.org_id = ? ORDER BY u.name`, orgId);
+  const people = seatsOf(ctx, orgId);
   return {
     orgId,
     // Every sentence in the engine starts with this name, so its fallback has
@@ -294,7 +315,14 @@ const cacheFor = (db: Db): Map<string, EntityIndex> => {
 function crmStamp(ctx: Ctx, orgId: string): string {
   const row = ctx.db.get<{ n: number; u: number | null }>(
     `SELECT COUNT(*) AS n, MAX(updated) AS u FROM crm_records WHERE org_id = ?`, orgId);
-  const users = ctx.db.count(`SELECT COUNT(*) FROM memberships WHERE org_id = ?`, orgId);
+  // Seats are counted by status, not just in total: the index holds the
+  // people work can be attributed to, and an invited seat only becomes one of
+  // them when it is accepted — which changes no row count at all. Without the
+  // second number a teammate who joined this morning stayed invisible to every
+  // question until some unrelated record moved.
+  const seats = ctx.db.get<{ n: number; invited: number | null }>(
+    `SELECT COUNT(*) AS n, SUM(CASE WHEN status = 'invited' THEN 1 ELSE 0 END) AS invited FROM memberships WHERE org_id = ?`, orgId);
+  const users = `${seats?.n ?? 0}/${seats?.invited ?? 0}`;
   const billing = billingSources(ctx.db);
   const invoices = billing.invoices ? ctx.db.count(`SELECT COUNT(*) FROM ${billing.invoices.table} WHERE org_id = ?`, orgId) : 0;
   const meters = meterSource(ctx.db);
@@ -344,8 +372,7 @@ export function entityIndex(ctx: Ctx, orgId: string): EntityIndex {
     }
   }
 
-  for (const person of ctx.db.all<{ id: string; name: string; email: string; title: string | null }>(
-    `SELECT u.id, u.name, u.email, u.title FROM users u JOIN memberships m ON m.user_id = u.id WHERE m.org_id = ?`, orgId)) {
+  for (const person of seatsOf(ctx, orgId)) {
     entities.push({
       id: person.id, type: 'user', label: person.name, aliases: [person.email, person.email.split('@')[0]],
       sublabel: person.title, ownerId: person.id, updated: 0, source: 'user',

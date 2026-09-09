@@ -19,6 +19,9 @@ import assert from 'node:assert/strict';
 import { createApp, type App } from '../src/server/app';
 import { frozenClock, type Clock } from '../src/server/kernel/clock';
 import type { Auth } from '../src/server/kernel/http';
+import { businessMetric } from '../src/server/ai/functions';
+import { entityIndex, workspaceProfile } from '../src/server/ai/grounding';
+import { recordNamer } from '../src/server/modules/ai/store';
 import { formatMoney } from '../src/shared/money';
 import { DAY, formatDate, formatRelative } from '../src/shared/time';
 
@@ -1812,6 +1815,245 @@ describe('a breakdown by account states every book in its own currency and count
     assert.equal(body.analysis.template?.id, 'breakdown-snapshot', body.analysis.refusal?.why ?? body.content);
     assert.ok(String(body.content).includes(`…and ${n(rows.length - 25)} more.`), `the tail counts the ${rows.length - 25} accounts below the cut:\n${body.content}`);
     for (const g of rows.slice(25)) assert.ok(!String(body.content).includes(g.label), `${g.label} is below the cut and not printed`);
+  });
+});
+
+/* --------------------- an answer names the rows it read -------------------- */
+
+describe('an answer measured over a set of records names those records', () => {
+  /**
+   * The copilot's own empty state promises it "cites every record it used",
+   * and a client cannot enumerate rows the server never named: "there are 7
+   * open invoices" with nothing under it is a number the reader has no way to
+   * check. So a shape whose answer counted something has to hand back some of
+   * what it counted.
+   *
+   * The one exception is not a judgement call — the loop proves it. The
+   * revenue summary reads `revenue_summary`, which publishes one row per
+   * currency book and nothing that identifies an account; a shape can only
+   * cite ids its tool handed it, and the assertion is that this tool hands
+   * back none. The day it carries a row id, this test fails and the shape has
+   * to cite it.
+   */
+  const NO_ROW_IDENTITY = new Set(['revenue-summary']);
+
+  test('every published shape whose answer counted rows cites some of them', async () => {
+    const published = await app.handle({ method: 'GET', path: '/v1/ai/templates', auth: DANA });
+    const shapes = published.body.data as { id: string; kind: string; example: string | null }[];
+    assert.ok(shapes.length > 50, `fixture: ${shapes.length} shapes published`);
+    const silent: string[] = [];
+    for (const shape of shapes) {
+      assert.ok(shape.example, `${shape.id} publishes no example`);
+      tick();
+      const body = await ask(shape.example!);
+      const facts = body.analysis.facts as { count: number | null; rows: { id: string; label: string }[] } | null;
+      const counted = facts?.count ?? 0;
+      const cited = (body.citations as unknown[]).length;
+      if (NO_ROW_IDENTITY.has(shape.id)) {
+        const identified = (facts?.rows ?? []).filter((row) => row.id !== row.label);
+        assert.deepEqual(identified, [], `${shape.id}'s tool now names rows by id, so the shape must cite them`);
+        continue;
+      }
+      if (counted > 0 && cited === 0) silent.push(`${shape.id}: "${shape.example}" counted ${counted} rows and cited none of them`);
+    }
+    assert.deepEqual(silent, [], `${silent.length} shapes measure a set and name nothing in it:\n${silent.join('\n')}`);
+  });
+
+  test('a count of invoices cites invoices that are in the set it counted', async () => {
+    const open = app.db.all<{ id: string; number: string }>(
+      `SELECT id, number FROM billing_invoices WHERE org_id = ? AND status = 'open'`, ORG);
+    assert.ok(open.length > 1, `fixture: ${open.length} open invoices`);
+    tick();
+    const body = await ask('How many invoices are open?');
+    assert.equal(body.analysis.template?.id, 'count-invoices-status', body.analysis.refusal?.why ?? body.content);
+    const cited = body.citations as { id: string; label: string; type: string }[];
+    assert.equal(cited.length, Math.min(open.length, 8), `it names as many of the ${open.length} as a citation list holds`);
+    for (const citation of cited) {
+      const row = open.find((i) => i.id === citation.id);
+      assert.ok(row, `${citation.label} (${citation.id}) is one of the open invoices`);
+      assert.equal(citation.label, row!.number, 'a bill is cited by its number');
+      assert.equal(citation.type, 'invoice');
+    }
+  });
+
+  test('the receivables ageing cites the bills it aged, and the past-due answer only the late ones', async () => {
+    const now = clock.now();
+    const book = app.db.all<{ id: string; number: string; due_date: number | null; finalized_at: number | null; created: number }>(
+      `SELECT id, number, due_date, finalized_at, created FROM billing_invoices
+       WHERE org_id = ? AND finalized_at IS NOT NULL AND finalized_at <= ?
+         AND paid_at IS NULL AND voided_at IS NULL AND marked_uncollectible_at IS NULL AND amount_due > 0`, ORG, now);
+    assert.ok(book.length > 1, `fixture: ${book.length} bills on the receivables book`);
+    const ids = new Set(book.map((b) => b.id));
+    const late = new Set(book.filter((b) => (b.due_date ?? b.finalized_at ?? b.created) <= now).map((b) => b.id));
+    assert.ok(late.size > 0 && late.size < ids.size, `fixture: some of the book is late and some is not (${late.size} of ${ids.size})`);
+
+    tick();
+    const ageing = await ask('What is our receivables ageing?');
+    assert.equal(ageing.analysis.template?.id, 'receivables-ageing', ageing.analysis.refusal?.why ?? ageing.content);
+    const aged = ageing.citations as { id: string }[];
+    assert.equal(aged.length, Math.min(ids.size, 8));
+    for (const c of aged) assert.ok(ids.has(c.id), `${c.id} is on the receivables book`);
+
+    tick();
+    const overdue = await ask('How much is overdue and how old is it?');
+    assert.equal(overdue.analysis.template?.id, 'overdue-ageing', overdue.analysis.refusal?.why ?? overdue.content);
+    const chased = overdue.citations as { id: string }[];
+    assert.equal(chased.length, Math.min(late.size, 8));
+    // The reverse of the rule above: a bill still inside its terms is not
+    // evidence for a sentence about arrears.
+    for (const c of chased) assert.ok(late.has(c.id), `${c.id} is past due, not merely outstanding`);
+  });
+
+  test('a win rate cites the deals it divided, wins and losses both', async () => {
+    const decided = dealsBy('Dana Whitfield').filter((d) => (isWon(d) || isLost(d)) && closeIn(d, YEAR(2025)));
+    assert.ok(decided.some(isWon) && decided.some(isLost), 'fixture: Dana decided deals both ways in 2025');
+    tick();
+    const body = await ask("What was Dana Whitfield's win rate in 2025?");
+    assert.equal(body.analysis.template?.id, 'owner-win-rate-period', body.analysis.refusal?.why ?? body.content);
+    const cited = body.citations as { id: string; type: string }[];
+    assert.ok(cited.length > 0, `a rate over ${decided.length} deals cites some of them:\n${body.content}`);
+    const ids = new Set(decided.map((d) => d.id));
+    for (const c of cited) {
+      assert.ok(ids.has(c.id), `${c.id} is one of the deals Dana decided in 2025`);
+      assert.equal(c.type, 'deal');
+    }
+    const byId = new Map(decided.map((d) => [d.id, d]));
+    assert.ok(cited.some((c) => isWon(byId.get(c.id)!)), 'the wins are named');
+    assert.ok(cited.some((c) => isLost(byId.get(c.id)!)), 'the losses are named too — a rate is a fraction of both');
+  });
+
+  test('the MRR bridge cites the accounts it named, by their billing ids', async () => {
+    tick();
+    const body = await ask('How much mrr did we expand in Q2 2026?');
+    assert.equal(body.analysis.template?.id, 'mrr-movement-period', body.analysis.refusal?.why ?? body.content);
+    const cited = body.citations as { id: string; label: string; type: string }[];
+    assert.ok(cited.length > 0, `the accounts that expanded are named in the sentence and must be cited:\n${body.content}`);
+    for (const citation of cited) {
+      assert.equal(citation.type, 'customer');
+      // The tool names its movers in prose, so the id has to come from an
+      // exact match on the ledger — never from the name it printed.
+      assert.equal(customerName(citation.id), citation.label, `${citation.id} is the billing customer called ${citation.label}`);
+      assert.ok(String(body.content).includes(citation.label), `${citation.label} is one of the accounts the answer names`);
+    }
+  });
+
+  test('a breakdown by a picklist cites records, never the picklist values', async () => {
+    tick();
+    const body = await ask('How many deals are there by stage?');
+    assert.equal(body.analysis.template?.id, 'count-by-dimension', body.analysis.refusal?.why ?? body.content);
+    const cited = body.citations as { id: string; type: string }[];
+    assert.ok(cited.length > 0, `a split of 77 deals names some of them:\n${body.content}`);
+    const deals = new Set(recs('deal').map((d) => d.id));
+    for (const c of cited) {
+      assert.equal(c.type, 'deal');
+      assert.ok(deals.has(c.id), `${c.id} is a deal in this workspace, not a stage name`);
+    }
+  });
+});
+
+/* ------------------------- seats, not global accounts ---------------------- */
+
+describe('the engine names a teammate by this workspace\'s seat, never by the account behind it', () => {
+  /** What the person's own Ain account is called, somewhere that is not Northwind. */
+  const ACCOUNT_NAME = 'Renata Oyelaran-Whitfield';
+  const SEAT_NAME = 'R. Oyelaran';
+  const EMAIL = 'renata@elsewhere.example';
+
+  let own: App;
+  let seatId: string;
+  let token: string;
+
+  before(async () => {
+    // Its own app: this test invites a teammate, and the suite's workspace is
+    // read by six hundred other questions that count the people in it.
+    own = await createApp({ db: 'memory', config: { env: 'test' }, clock: frozenClock(T0) });
+    // The account already exists, created by whichever workspace invited them
+    // first. Northwind never typed this name and must never read it back.
+    own.db.insert('users', {
+      id: 'usr_elsewhere', email: EMAIL, name: ACCOUNT_NAME, avatar_url: null,
+      title: 'Head of Revenue, Elsewhere GmbH', password_hash: null, created: T0 - DAY, updated: T0 - DAY, last_seen: null,
+    });
+    const invited = await own.handle({
+      method: 'POST', path: '/v1/users', auth: DANA,
+      body: { email: EMAIL, name: SEAT_NAME, role: 'member', title: 'Account executive' },
+    });
+    assert.equal(invited.status, 201, JSON.stringify(invited.body));
+    seatId = invited.body.id;
+    token = invited.body.invitation.token;
+  });
+
+  after(() => own.close());
+
+  const profile = () => workspaceProfile(own.ctx, ORG);
+
+  test('an invited seat is nobody to attribute work to, so the grounding leaves it out', () => {
+    const seat = own.ctx.svc.core.seat(ORG, seatId);
+    assert.equal(seat?.status, 'invited', 'fixture: the seat is still invited');
+    const people = profile().people;
+    assert.ok(!people.some((p) => p.id === seatId), `an invited seat is not in the workspace's people:\n${people.map((p) => p.name).join(', ')}`);
+    const index = entityIndex(own.ctx, ORG);
+    assert.deepEqual(
+      index.entities.filter((e) => e.type === 'user' && e.id === seatId).map((e) => e.label), [],
+      'an invited seat is not an entity a question can be attached to',
+    );
+  });
+
+  test('once accepted, the seat is named the way this workspace named it', async () => {
+    const accepted = await own.handle({ method: 'POST', path: '/v1/auth/accept', body: { token, password: 'demo1234' } });
+    assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+    const person = profile().people.find((p) => p.id === seatId);
+    assert.ok(person, 'an active seat is one of the workspace\'s people');
+    assert.equal(person!.name, SEAT_NAME);
+    assert.equal(person!.title, 'Account executive');
+    const index = entityIndex(own.ctx, ORG);
+    const entity = index.entities.find((e) => e.type === 'user' && e.id === seatId);
+    assert.equal(entity?.label, SEAT_NAME, 'the entity index carries the seat name');
+    assert.equal(recordNamer(own.ctx, ORG)(seatId), SEAT_NAME, 'an approval card names the seat');
+  });
+
+  test('the account\'s own name reaches nothing the engine reads', () => {
+    const leaked = [
+      ...profile().people.map((p) => `${p.name} ${p.title ?? ''}`),
+      ...entityIndex(own.ctx, ORG).entities.map((e) => `${e.label} ${e.sublabel ?? ''} ${e.aliases.join(' ')}`),
+      recordNamer(own.ctx, ORG)(seatId) ?? '',
+    ].filter((text) => text.includes(ACCOUNT_NAME) || text.includes('Elsewhere GmbH'));
+    assert.deepEqual(leaked, [], `the account's own profile is none of this workspace's business:\n${leaked.join('\n')}`);
+  });
+});
+
+/* -------------------- a currency the workspace has no book in -------------- */
+
+describe('a money metric narrowed to a currency it holds no book in refuses with the books it does hold', () => {
+  /**
+   * A refusal is a statement about the workspace, so it is checked against the
+   * ledger rather than against its own phrasing. The metric computes narrowed
+   * to the currency it was asked for, so its empty book list means "nothing in
+   * JPY" — never "no currency book at all", which is what it used to say.
+   */
+  const ABSENT = 'jpy';
+
+  test('recurring revenue in a currency nothing is billed in names every book the ledger keeps', () => {
+    const books = recurringBooks(1);
+    assert.ok(books.length > 1, 'fixture: recurring revenue is held in more than one currency');
+    assert.ok(!books.some((b) => b.currency === ABSENT), `fixture: nothing recurring is billed in ${ABSENT.toUpperCase()}`);
+
+    const refused = businessMetric(app.ctx, ORG, { metric: 'mrr', currency: ABSENT });
+    assert.ok('error' in refused, `a currency with no book is refused, not answered: ${JSON.stringify(refused).slice(0, 200)}`);
+    const why = refused.error;
+    assert.ok(why.includes(ABSENT.toUpperCase()), `the refusal names the currency that was asked for:\n${why}`);
+    for (const book of books) {
+      assert.ok(why.includes(book.currency.toUpperCase()), `the refusal names the ${book.currency.toUpperCase()} book this workspace holds:\n${why}`);
+    }
+    assert.doesNotMatch(why, /no currency book/i, `the ledger keeps ${books.length} currency books, so the refusal must not say it keeps none:\n${why}`);
+  });
+
+  test('a metric whose records really carry no currency still says exactly that', () => {
+    // A deal has no currency of its own here, so open pipeline is one book in
+    // the workspace's currency and cannot be narrowed at all — the reverse of
+    // the case above, and the sentence has to stay different.
+    const refused = businessMetric(app.ctx, ORG, { metric: 'pipeline', currency: ABSENT });
+    assert.ok('error' in refused, `pipeline cannot be narrowed by currency: ${JSON.stringify(refused).slice(0, 200)}`);
+    assert.match(refused.error, /carry no currency book/i, refused.error);
   });
 });
 

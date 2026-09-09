@@ -2,7 +2,7 @@
  * Calendar arithmetic in UTC, matching `shared/time`. Working in UTC keeps a
  * date from sliding a day when the workspace timezone differs from the browser.
  */
-import { DAY, startOfDay } from '../../shared/time';
+import { DAY, civilDay, startOfDay } from '../../shared/time';
 
 export interface CalendarDay {
   ts: number;
@@ -40,6 +40,21 @@ export const addMonths = (ts: number, count: number): number => {
 };
 export const addDays = (ts: number, count: number): number => startOfDay(ts) + count * DAY;
 export const isSameDay = (a: number, b: number): boolean => startOfDay(a) === startOfDay(b);
+
+/**
+ * The day the reader is on, in the shape this grid speaks.
+ *
+ * Every date here is a calendar day held at midnight UTC, and "today" has to
+ * be that shape too — but *which* day it is belongs to the reader's zone, not
+ * to Greenwich. Between 8pm and midnight in New York the two disagree, and a
+ * "Today" button built on `startOfDay(now)` puts tomorrow's date in the field
+ * for those four hours every evening, and rings the wrong square behind it.
+ *
+ * An instant a `Date` cannot hold falls back to the wall clock rather than
+ * making every `getUTC*` below NaN.
+ */
+export const todayIn = (now: number, timeZone?: string): number =>
+  civilDay(isTimestamp(now) ? now : Date.now(), timeZone);
 
 /**
  * Six weeks of days covering the month, so the grid never changes height as the

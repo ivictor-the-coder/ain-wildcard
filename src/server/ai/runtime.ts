@@ -90,6 +90,13 @@ export interface AiRunFinish {
   pendingApprovals: PendingApproval[];
   intent: string | null;
   confidence: number | null;
+  /**
+   * What this run would not do, as facts rather than as the sentence it said.
+   * A thread reopened later has only the stored row, and the surface used to
+   * read the refusal back out of the prose with a regex — which matched none
+   * of the wordings the third time one was improved.
+   */
+  refusal?: unknown;
 }
 
 export interface PendingApproval {
@@ -611,6 +618,9 @@ export function createAiRuntime(config: Config): AinAiRuntime {
           finishedAt: call.ctx.now(),
           error: null,
           pendingApprovals: call.pendingApprovals,
+          refusal: (completion as { analysis?: { refusedCurrency?: unknown } }).analysis?.refusedCurrency
+            ? { refused_currency: (completion as { analysis?: { refusedCurrency?: unknown } }).analysis!.refusedCurrency }
+            : null,
           // A template match is exact, so a matched question is read with
           // certainty and a refused one with none; the hosted model reports
           // neither.

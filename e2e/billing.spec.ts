@@ -2905,13 +2905,18 @@ test('the upcoming invoice quotes the plan the schedule books, not the one it re
   }
   await expect(card.locator('table')).not.toContainText(booked.leaving[0]);
 
-  // What the endpoint answers when nobody tells it about the schedule: the
-  // plan being left, for the period the phase replaces. That figure is the
-  // defect, so it must not be the one on screen.
-  const stale = await post(page, '/v1/invoices/create_preview', { subscription: booked.subscription });
+  // The endpoint itself now knows about the schedule, so asking it plainly —
+  // the way the copilot's billing_upcoming_invoice tool and any other consumer
+  // does — answers about the phase that will bill rather than the plan being
+  // left. This assertion used to read `not.toHaveText`, because the screen was
+  // compensating for a server that quoted the wrong plan; the two agreeing is
+  // the fix, and the screen having to differ from the API was the defect.
+  const preview = await post(page, '/v1/invoices/create_preview', { subscription: booked.subscription });
   const total = card.locator('.bl-total--grand').last().locator('.bl-total__value');
-  await expect(total).not.toHaveText(stale.amount_due_display);
+  await expect(total).toHaveText(preview.amount_due_display);
   const quoted = (await total.innerText()).trim();
+  // And it is genuinely the booked plan being quoted, not the one it replaces.
+  expect(preview.lines.some((line: { description: string }) => booked.leaving.includes(line.description))).toBe(false);
 
   // And the account header, which reads the same bill through the customer
   // summary — a figure the summary builds from today's items. The two screens
@@ -2919,7 +2924,6 @@ test('the upcoming invoice quotes the plan the schedule books, not the one it re
   await page.goto(`/billing/customers/${booked.customer}`, { waitUntil: 'networkidle' });
   const tile = page.locator('.bl-headline__item', { has: page.locator('.bl-headline__label', { hasText: /^Next invoice$/ }) });
   await expect(tile.locator('.bl-headline__caption')).toContainText(quoted);
-  await expect(tile.locator('.bl-headline__caption')).not.toContainText(stale.amount_due_display);
 });
 
 /* ===================== what a credit note says it did ===================== */

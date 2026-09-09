@@ -1,4 +1,5 @@
 /** The vocabulary of the CRM substrate. Every other module speaks this. */
+import type { CanonicalNormaliser } from '../../../shared/canonical';
 
 export type PropertyType =
   | 'string' | 'text' | 'number' | 'currency' | 'date' | 'datetime' | 'bool'
@@ -15,8 +16,11 @@ export type ChangeSource = 'user' | 'import' | 'workflow' | 'agent' | 'api' | 'm
  * `ANDINAENVASES.CL`, `www.andinaenvases.cl` and `andinaenvases.cl ` all
  * become the same bytes, so the uniqueness check, the duplicate finder and
  * the filter engine can never disagree about whether two records match.
+ *
+ * The vocabulary and the functions that apply it are in `shared/canonical` so
+ * the client can canonicalise a CSV cell exactly as the write path will.
  */
-export type PropertyNormaliser = 'none' | 'lower' | 'upper' | 'domain' | 'digits';
+export type PropertyNormaliser = CanonicalNormaliser;
 
 export type ActorType = 'user' | 'api_key' | 'system' | 'agent' | 'workflow';
 

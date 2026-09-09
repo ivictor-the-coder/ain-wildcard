@@ -26,10 +26,7 @@ register(
 );
 
 import { isWiderName, recordPhraseMismatch, type Vocabulary } from '../src/client/modules/copilot/scope-core';
-import {
-  currencyRefusal, nearestFromReasoning, noWritePrepared, propertyAsked, refusalOf, splitRefusalOffer,
-  withoutApiInstruction, withoutCurrencyClaim, writeNeedsSwitch,
-} from '../src/client/modules/copilot/answer-core';
+import { currencyRefusal, nearestFromReasoning, noWritePrepared, propertyAsked, refusalOf, splitRefusalOffer, withoutApiInstruction, withoutCurrencyClaim, writeNeedsSwitch } from '../src/client/modules/copilot/answer-core';
 import {
   citationHref, citationResolution, dedupeCitations, needsProbe, subjectRecordIds, writeTargetLabel,
 } from '../src/client/modules/copilot/citations';
@@ -60,7 +57,7 @@ import {
 import {
   bindingOf, numberAsked, rawRecordIds, slotChips, slotChipsFromPlan, windowText, type SlotFormat,
 } from '../src/client/modules/copilot/slots-core';
-import { answerCard, nearestOf, type TurnInput } from '../src/client/modules/copilot/card-core';
+import { answerCard, nearestOf, refusedCurrencyOf, type TurnInput } from '../src/client/modules/copilot/card-core';
 
 // The board's rule, called from the copilot's own test the way the approval
 // card calls it: one definition, two surfaces. Dynamic because the pipeline's
@@ -2282,5 +2279,61 @@ describe('an answer the engine cited nothing for', () => {
       { arguments: null },
     ]), []);
     assert.deepEqual(subjectRecordIds([]), []);
+  });
+});
+
+/* ------------- a refusal the card reads as facts, not as prose ------------ */
+
+/**
+ * The engine would not narrow a money measure to a currency the workspace does
+ * not hold, and the card has to say which measure and which currency.
+ *
+ * It used to recover both from the refusal sentence with a regex, and carried
+ * two patterns for two past wordings. Improving that sentence a third time
+ * matched neither, so the card silently stopped drawing the banner and the
+ * "ask it without the currency" button — a whole feature turned off by a
+ * better sentence. The engine publishes the facts now; the sentences are kept
+ * only for a thread answered before it did.
+ */
+describe('the currency a measure is not held in', () => {
+  const analysis = (refusedCurrency: unknown) => ({ analysis: { refusedCurrency } });
+
+  it('is read from the facts the engine published, whatever the sentence says', () => {
+    const said = refusedCurrencyOf(analysis({ measure: 'Overdue balance', currency: 'gbp', books: ['USD', 'EUR'] }), null);
+    assert.deepEqual(said, { measure: 'Overdue balance', currency: 'GBP', books: ['USD', 'EUR'] });
+
+    const refusal = currencyRefusal('What is our overdue balance in GBP?', { code: 'tool_failed', message: 'anything at all' }, said);
+    assert.equal(refusal?.measure, 'Overdue balance');
+    assert.equal(refusal?.currency, 'GBP');
+    assert.equal(refusal?.unscoped, 'What is our overdue balance?');
+  });
+
+  it('is read from a remembered turn when the run no longer carries it', () => {
+    const said = refusedCurrencyOf(null, analysis({ measure: 'MRR', currency: 'jpy', books: ['USD'] }));
+    assert.equal(said?.currency, 'JPY');
+  });
+
+  it('still reads a thread answered before the engine published facts', () => {
+    const old = '"Overdue balance" is measured from records that carry no currency book in this workspace, '
+      + 'so it cannot be narrowed to GBP: the figure I hold is the whole of it, in USD.';
+    const refusal = currencyRefusal('What is our overdue balance in GBP?', { code: 'tool_failed', message: old }, null);
+    assert.equal(refusal?.measure, 'Overdue balance');
+    assert.equal(refusal?.currency, 'GBP');
+  });
+
+  it('reaches the card itself, which is where both screens read it from', () => {
+    // Not just the helper: the two screens read `card.refusedCurrency`, so the
+    // wiring through answerCard is the part that can silently come undone.
+    const card = answerCard(turn(RIGHT[0], {
+      run: { ...TEMPLATE_RUN, analysis: { refusedCurrency: { measure: 'Overdue balance', currency: 'gbp', books: ['USD'] } } },
+    }));
+    assert.deepEqual(card.refusedCurrency, { measure: 'Overdue balance', currency: 'GBP', books: ['USD'] });
+    // And a run that refused nothing carries nothing.
+    assert.equal(answerCard(turn(RIGHT[0])).refusedCurrency, null);
+  });
+
+  it('does not invent one when neither the facts nor a known sentence is there', () => {
+    assert.equal(refusedCurrencyOf({ analysis: { refusedCurrency: { measure: 7 } } }, null), null);
+    assert.equal(currencyRefusal('What is our MRR?', { code: 'tool_failed', message: 'the tool fell over' }, null), null);
   });
 });

@@ -240,7 +240,23 @@ function withoutCurrency(question: string, code: string): string | null {
 export function currencyRefusal(
   question: string,
   refusal: { code: string; message: string | null } | null | undefined,
+  said?: { measure: string; currency: string } | null,
 ): CurrencyRefusal | null {
+  // The facts first. The engine publishes which measure and which currency it
+  // would not narrow, and the card resolves them, so this no longer reads them
+  // back out of a sentence. It did, with a regex, and carried two patterns for
+  // two past wordings; improving the sentence a third time turned this whole
+  // card off in silence, which is how the browser suite found it.
+  if (said) {
+    const code = said.currency.toUpperCase();
+    return {
+      measure: said.measure,
+      currency: code,
+      claim: refusal?.message ?? '',
+      unscoped: withoutCurrency(question, code),
+    };
+  }
+  // And the sentences, for a thread answered before the engine carried facts.
   if (!refusal?.message || refusal.code !== 'tool_failed') return null;
   for (const pattern of CURRENCY_CLAIMS) {
     const match = pattern.exec(refusal.message);

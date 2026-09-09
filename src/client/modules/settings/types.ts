@@ -32,7 +32,7 @@ export interface Member {
   last_seen: number | null;
   role: Role;
   teams: string[];
-  /** `invited` until the person redeems their link and sets a password. */
+  /** `invited` until the person redeems their link and confirms their Ain password. */
   status: SeatStatus;
   invitation: Invitation | null;
 }

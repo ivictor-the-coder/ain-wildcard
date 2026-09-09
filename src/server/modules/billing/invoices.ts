@@ -44,6 +44,7 @@ import { DAY, startOfDay, type Period } from '../../../shared/time';
 import type { TaxBehavior } from '../catalog/types';
 import type { BillableItem } from '../credits/types';
 import { longDate } from './cycle';
+import { dueAtSql, outstandingSql } from './receivable';
 import {
   hydrateInvoice, hydrateInvoiceLine, like, rollUpLineTax,
   type InvoiceListFilter, type Page, type WriteMeta,
@@ -256,14 +257,23 @@ export class Invoices {
     if (filter.customer) { clauses.push('i.customer_id = ?'); params.push(filter.customer); }
     if (filter.subscription) { clauses.push('i.subscription_id = ?'); params.push(filter.subscription); }
     if (filter.status && filter.status !== 'all') {
-      if (filter.status === 'open_like') clauses.push(`i.status IN ('draft','open')`);
+      // `open_like` is the receivables book, which is the collections report's
+      // book: a bill that was sent and has not been settled. It once meant
+      // `IN ('draft','open')`, and a draft is money nobody has been asked for
+      // yet — so the overview tile, this list and /v1/revenue/collections gave
+      // a finance team three different answers to "what is outstanding?".
+      if (filter.status === 'open_like') clauses.push(outstandingSql('i'));
       else { clauses.push('i.status = ?'); params.push(filter.status); }
     }
     if (filter.billing_reason) { clauses.push('i.billing_reason = ?'); params.push(filter.billing_reason); }
     if (filter.collection_method) { clauses.push('i.collection_method = ?'); params.push(filter.collection_method); }
     if (filter.created_after !== undefined) { clauses.push('i.created >= ?'); params.push(filter.created_after); }
     if (filter.created_before !== undefined) { clauses.push('i.created <= ?'); params.push(filter.created_before); }
-    if (filter.due_before !== undefined) { clauses.push('i.due_date IS NOT NULL AND i.due_date <= ?'); params.push(filter.due_before); }
+    // A bill with no due date is due on receipt, so it ages from the day it was
+    // finalised — the `dueAt()` the collections report ages on. Testing
+    // `due_date IS NOT NULL` made the only query the tool descriptions point at
+    // for "what is overdue?" step over every due-on-receipt bill on the book.
+    if (filter.due_before !== undefined) { clauses.push(`${dueAtSql('i')} <= ?`); params.push(filter.due_before); }
     // `missing` is not "no tax was charged": it is "the address could not be
     // placed, so the tax on it was never worked out", which is the queue a
     // finance team clears before those bills can go out.
@@ -334,11 +344,17 @@ export class Invoices {
   }
 
   /** Everything still owed, for the customer summary and the dunning view. */
+  /**
+   * What this account is still owed on, oldest first — the receivables book for
+   * one customer, and the same set open_like lists and /v1/revenue/collections
+   * ages. It read `IN ('draft','open')`, so the support screen's "$X is
+   * outstanding across N invoices" counted bills nobody had been asked for.
+   */
   openInvoices(orgId: string, customerId: string): Invoice[] {
     const enabled = this.automaticTaxEnabled(orgId);
     return this.ctx.db.all<Record<string, unknown>>(
-      `SELECT * FROM billing_invoices WHERE org_id = ? AND customer_id = ? AND status IN ('draft','open')
-        ORDER BY created ASC`, orgId, customerId,
+      `SELECT * FROM billing_invoices i WHERE i.org_id = ? AND i.customer_id = ? AND ${outstandingSql('i')}
+        ORDER BY i.created ASC`, orgId, customerId,
     ).map((row) => hydrateInvoice(row, this.linesOf(orgId, String(row.id)), enabled));
   }
 
@@ -379,7 +395,11 @@ export class Invoices {
          currency,
          COALESCE(SUM(CASE WHEN status IN ('open','paid','uncollectible') THEN total ELSE 0 END), 0) AS billed,
          COALESCE(SUM(amount_paid - amount_refunded), 0) AS collected,
-         COALESCE(SUM(CASE WHEN status IN ('draft','open') THEN amount_due ELSE 0 END), 0) AS outstanding,
+         -- The receivables book, the same set open_like lists and
+         -- /v1/revenue/collections ages. It counted drafts too, so the
+         -- overview's "outstanding" stood beside a collections total it could
+         -- not equal, and neither figure said which of them was the book.
+         COALESCE(SUM(CASE WHEN status = 'open' AND amount_due > 0 THEN amount_due ELSE 0 END), 0) AS outstanding,
          COALESCE(SUM(CASE WHEN status = 'uncollectible' THEN total ELSE 0 END), 0) AS written_off,
          COUNT(*) AS count,
          -- A bill that charged no tax at all. Most are right — an exempt
@@ -1008,6 +1028,10 @@ export class Invoices {
       );
     }
     this.ctx.db.patch('billing_invoices', 'id', id, { status: 'open', finalized_at: now, updated: now });
+    // A bill entering or leaving the receivables book can move the account's
+    // standing, and a bill with no terms is due the moment it is sent, so the
+    // record and its event are refreshed on every one of the four transitions.
+    this.billing.refreshDelinquency(orgId, invoice.customer);
     this.assertBalanced(orgId, id);
     const after = this.require(orgId, id);
     this.ctx.emit(orgId, 'invoice.finalized', after, {
@@ -1185,6 +1209,7 @@ export class Invoices {
       finalized_at: invoice.finalized_at ?? now, paid_at: now,
       payment_note: opts.note ?? invoice.payment_note, updated: now,
     });
+    this.billing.refreshDelinquency(orgId, invoice.customer);
     const after = this.require(orgId, id);
     this.ctx.emit(orgId, 'invoice.paid', after, {
       objectId: id, objectType: 'invoice', previous: { status: invoice.status },
@@ -1307,6 +1332,7 @@ export class Invoices {
     this.ctx.db.patch('billing_invoices', 'id', id, {
       status: 'void', voided_at: now, amount_due: 0, updated: now,
     });
+    this.billing.refreshDelinquency(orgId, invoice.customer);
     if (invoice.balance_applied !== 0) {
       this.billing.adjustBalance(orgId, invoice.customer, invoice.balance_applied, {
         type: 'adjustment',
@@ -1370,6 +1396,7 @@ export class Invoices {
       status: 'uncollectible', marked_uncollectible_at: now,
       finalized_at: invoice.finalized_at ?? now, updated: now,
     });
+    this.billing.refreshDelinquency(orgId, invoice.customer);
     const after = this.require(orgId, id);
     this.ctx.emit(orgId, 'invoice.marked_uncollectible', after, {
       objectId: id, objectType: 'invoice', previous: { status: invoice.status },

@@ -1355,10 +1355,22 @@ export class Crm {
     if (exact) return { type: exact, swap: false };
     const reversed = all.find((t) => t.from_object === toType && t.to_object === fromType);
     if (reversed) return { type: reversed, swap: true };
-    const wildcard = all.find((t) => t.from_object === '*' || t.to_object === '*');
-    if (wildcard) {
-      const activityTypes = this.activityTypes(orgId);
-      return { type: wildcard, swap: activityTypes.includes(toType) && !activityTypes.includes(fromType) };
+    // The builtin `activity_to_record` is `* → *`, so falling back to any
+    // wildcard type meant every pair of objects matched something and
+    // `association_undefined` below could never be thrown. A ticket linked to a
+    // contract, a company to a quote — nothing in the schema says those connect,
+    // and the link showed up on both records as "Logged on". The record page
+    // already refuses to offer it (`linkableObjectTypes`); a script, the
+    // copilot's association tool and a direct POST /v1/associations did not go
+    // that way. The wildcard is what puts an engagement on a timeline, so it is
+    // an answer only when one end is an engagement — the same rule, server side.
+    const connects = (declared: string, actual: string) => declared === '*' || declared === actual;
+    const activityTypes = this.activityTypes(orgId);
+    if (activityTypes.includes(fromType) || activityTypes.includes(toType)) {
+      const wildcard = all.find((t) => (t.from_object === '*' || t.to_object === '*')
+        && ((connects(t.from_object, fromType) && connects(t.to_object, toType))
+          || (connects(t.from_object, toType) && connects(t.to_object, fromType))));
+      if (wildcard) return { type: wildcard, swap: activityTypes.includes(toType) && !activityTypes.includes(fromType) };
     }
     throw badRequest('association_undefined', `No association type connects ${fromType} to ${toType}. Create one with POST /v1/association-types.`, 'association_type');
   }

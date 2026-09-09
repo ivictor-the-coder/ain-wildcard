@@ -34,6 +34,8 @@ import { InvoiceHolds, type InvoiceHold } from './holds';
 import { InvoiceItems, type InvoiceItemInput } from './invoice-items';
 import { Invoices, billTotals, describeWindow, type DraftLine } from './invoices';
 import { previewChange, prorate, type ItemState, type ProrationSet } from './proration';
+import { hydrateSchedule } from './schedules';
+import { delinquentSql } from './receivable';
 import { assertTransition, countsAsRevenue, isTerminal, transitionEvent } from './status';
 import {
   checkTaxId, defaultVerificationNote, isCheckableTaxIdType, normaliseTaxIdValue, pendingVerification,
@@ -108,11 +110,32 @@ export class Billing {
 
   /* ------------------------------- customers ------------------------------ */
 
+  /**
+   * Every customer read, with `delinquent` decided at the instant it is asked
+   * for rather than at the instant a subscription last changed status.
+   *
+   * The one `?` in the predicate is the first parameter in the statement,
+   * because the select list is bound before the where clause.
+   */
+  private readonly customerSelect =
+    `SELECT c.*, ${delinquentSql('c')} AS delinquent_now FROM billing_customers c`;
+
+  private readonly hydrateStanding = (row: Record<string, unknown>): Customer =>
+    hydrateCustomer({ ...row, delinquent: row.delinquent_now });
+
+  private readCustomer(sql: string, ...params: unknown[]): Customer | null {
+    const row = this.ctx.db.get<Record<string, unknown>>(sql, ...(params as string[]));
+    return row ? this.hydrateStanding(row) : null;
+  }
+
   listCustomers(orgId: string, filter: CustomerListFilter = {}): Page<Customer> {
+    const at = this.ctx.now();
     const clauses = ['c.org_id = ?'];
     const params: unknown[] = [orgId];
     if (filter.email) { clauses.push('c.email = ?'); params.push(filter.email.toLowerCase()); }
-    if (filter.delinquent !== undefined) { clauses.push('c.delinquent = ?'); params.push(filter.delinquent ? 1 : 0); }
+    // The filter and the column it filters on are one expression, so "Delinquent
+    // only" can never return a row the row itself calls good standing.
+    if (filter.delinquent !== undefined) { clauses.push(`${delinquentSql('c')} = ?`); params.push(at, filter.delinquent ? 1 : 0); }
     if (filter.currency) { clauses.push('c.currency = ?'); params.push(filter.currency.toLowerCase()); }
     if (filter.crm_record_id) { clauses.push('c.crm_record_id = ?'); params.push(filter.crm_record_id); }
     if (filter.query) {
@@ -138,18 +161,17 @@ export class Billing {
     }
     const limit = Math.min(Math.max(filter.limit ?? 25, 1), 200);
     const rows = this.ctx.db.all<any>(
-      `SELECT c.* FROM billing_customers c WHERE ${where}${cursorClause} ORDER BY c.created DESC, c.id DESC LIMIT ?`,
-      ...(paged as any[]), limit + 1,
+      `${this.customerSelect} WHERE ${where}${cursorClause} ORDER BY c.created DESC, c.id DESC LIMIT ?`,
+      at, ...(paged as any[]), limit + 1,
     );
     const hasMore = rows.length > limit;
-    const data = rows.slice(0, limit).map(hydrateCustomer);
+    const data = rows.slice(0, limit).map(this.hydrateStanding);
     const last = data[data.length - 1];
     return { data, hasMore, nextCursor: hasMore && last ? cursorOf(last.created, last.id) : null, totalCount };
   }
 
   customer(orgId: string, id: string): Customer | null {
-    const row = this.ctx.db.get<any>(`SELECT * FROM billing_customers WHERE org_id = ? AND id = ?`, orgId, id);
-    return row ? hydrateCustomer(row) : null;
+    return this.readCustomer(`${this.customerSelect} WHERE c.org_id = ? AND c.id = ?`, this.ctx.now(), orgId, id);
   }
 
   requireCustomer(orgId: string, id: string): Customer {
@@ -159,13 +181,14 @@ export class Billing {
   }
 
   customerByCrmRecord(orgId: string, recordId: string): Customer | null {
-    const row = this.ctx.db.get<any>(`SELECT * FROM billing_customers WHERE org_id = ? AND crm_record_id = ?`, orgId, recordId);
-    return row ? hydrateCustomer(row) : null;
+    return this.readCustomer(
+      `${this.customerSelect} WHERE c.org_id = ? AND c.crm_record_id = ?`, this.ctx.now(), orgId, recordId);
   }
 
   customerByEmail(orgId: string, email: string): Customer | null {
-    const row = this.ctx.db.get<any>(`SELECT * FROM billing_customers WHERE org_id = ? AND email = ? ORDER BY created LIMIT 1`, orgId, email.toLowerCase());
-    return row ? hydrateCustomer(row) : null;
+    return this.readCustomer(
+      `${this.customerSelect} WHERE c.org_id = ? AND c.email = ? ORDER BY c.created LIMIT 1`,
+      this.ctx.now(), orgId, email.toLowerCase());
   }
 
   createCustomer(orgId: string, input: CustomerInput, meta: WriteMeta = {}): Customer {
@@ -1231,20 +1254,40 @@ export class Billing {
     return after;
   }
 
-  /** Delinquent means "at least one live subscription is not being collected". */
-  private refreshDelinquency(orgId: string, customerId: string): void {
-    const bad = this.ctx.db.count(
-      `SELECT COUNT(*) FROM billing_subscriptions WHERE org_id = ? AND customer_id = ? AND status IN ('past_due','unpaid')`,
-      orgId, customerId,
+  /**
+   * Delinquent means the business is chasing this account: a bill of theirs has
+   * fallen due and not been collected, or a subscription of theirs has stopped
+   * collecting. It used to mean only the second half, which is subscription
+   * status under another name — so an account two months late on its bills
+   * whose subscription was collecting fine stood in good standing on the
+   * overview tile while `/v1/revenue/collections` aged it on the page beside it.
+   *
+   * The stored column is the *record* that raises the event; nothing reads it
+   * for an answer. Every read derives the flag at the instant it is asked for,
+   * because a bill falls due by the clock moving and there is no write at that
+   * instant for a cached flag to ride on.
+   */
+  refreshDelinquency(orgId: string, customerId: string): void {
+    const at = this.ctx.now();
+    const row = this.ctx.db.get<{ was: number; delinquent_now: number; arrears: number; late: number }>(
+      `SELECT c.delinquent AS was, ${delinquentSql('c')} AS delinquent_now,
+              (SELECT COUNT(*) FROM billing_subscriptions s
+                WHERE s.org_id = c.org_id AND s.customer_id = c.id AND s.status IN ('past_due','unpaid')) AS arrears,
+              (SELECT COUNT(*) FROM billing_invoices i
+                WHERE i.org_id = c.org_id AND i.customer_id = c.id
+                  AND i.status = 'open' AND i.amount_due > 0
+                  AND COALESCE(i.due_date, i.finalized_at, i.created) <= ?) AS late
+         FROM billing_customers c WHERE c.org_id = ? AND c.id = ?`,
+      at, at, orgId, customerId,
     );
-    const customer = this.customer(orgId, customerId);
-    if (!customer) return;
-    const delinquent = bad > 0;
-    if (customer.delinquent === delinquent) return;
-    this.ctx.db.patch('billing_customers', 'id', customerId, { delinquent: delinquent ? 1 : 0, updated: this.ctx.now() });
+    if (!row) return;
+    const was = Number(row.was) === 1;
+    const delinquent = Number(row.delinquent_now) === 1;
+    if (was === delinquent) return;
+    this.ctx.db.patch('billing_customers', 'id', customerId, { delinquent: delinquent ? 1 : 0, updated: at });
     this.ctx.emit(orgId, delinquent ? 'customer.marked_delinquent' : 'customer.cleared_delinquent',
-      { customer: customerId, subscriptions_in_arrears: bad },
-      { objectId: customerId, objectType: 'customer', previous: { delinquent: customer.delinquent } });
+      { customer: customerId, subscriptions_in_arrears: Number(row.arrears), past_due_invoices: Number(row.late) },
+      { objectId: customerId, objectType: 'customer', previous: { delinquent: was } });
   }
 
   /* --------------------------------- cancel ------------------------------- */
@@ -2009,7 +2052,9 @@ export class Billing {
    * prepaid credit covered, the credit packs bought since the last bill, and
    * the allowance the plan includes. Because a cadence change re-anchors the
    * cycle, "the period after next" is derived from the subscription as it would
-   * be, not as it is.
+   * be, not as it is — and where a schedule has a phase covering that period,
+   * so are the items, because the subscription row goes on holding the plan
+   * being left right up to the boundary.
    *
    * The credits outbox was the source this preview did not have, and it is the
    * one that made the number wrong rather than merely incomplete: a Starter
@@ -2035,12 +2080,22 @@ export class Billing {
     const nextDate = preview.next_invoice.date;
     const anchor = change.anchorReset ? change.prorationDate : sub.billing_cycle_anchor;
     const period = clampFirstPeriod(periodAt(anchor, change.iv, nextDate, change.anchorDay), nextDate);
-    const itemsAfter: PricedItem[] = change.resolved.map((item) => ({
-      id: item.from?.id ?? null,
-      price: item.price.id,
-      quantity: item.quantity,
-      custom_unit_amount: item.customUnitAmount ?? null,
-    }));
+    // A schedule phase covering that period is what the subscription will be on
+    // when the bill is raised, so it is what the bill is priced from. Skipped
+    // when the caller is quoting a change of their own: they are asking what
+    // *these* items would cost, and answering with the schedule's would be
+    // answering a question nobody asked. The window itself still comes from
+    // today's cadence — a phase that also changes the interval re-anchors the
+    // cycle when it lands, which is a move `previewChange` describes, not this.
+    const phase = input.items ? null : this.phaseCovering(orgId, sub, period.start);
+    const itemsAfter: PricedItem[] = phase
+      ? this.phaseItems(sub, phase)
+      : change.resolved.map((item) => ({
+        id: item.from?.id ?? null,
+        price: item.price.id,
+        quantity: item.quantity,
+        custom_unit_amount: item.customUnitAmount ?? null,
+      }));
     const upcoming = this.periodLines(
       orgId, itemsAfter, sub.currency, period,
       periodFraction(period, change.iv, change.anchorDay), book,
@@ -2155,7 +2210,7 @@ export class Billing {
         // A metered account's bill has one part nobody can predict: the window
         // still open. Saying so is the difference between a preview that is
         // incomplete and one that is wrong.
-        settled.length || sub.items.some((item) => isMetered(book.price(item.price)))
+        settled.length || itemsAfter.some((item) => isMetered(book.price(item.price)))
           ? `, plus the metered usage already settled and waiting for it. Usage still accruing ${describeWindow(arrears, locale)} lands on this bill too, and is not known until that window closes`
           : ''
       }.`,
@@ -2167,6 +2222,48 @@ export class Billing {
   }
 
   /* ------------------------------- schedule glue -------------------------- */
+
+  /**
+   * The phase a schedule will have this subscription on at `at`, when that is
+   * not the phase it is running today.
+   *
+   * A phase boundary is a period boundary, so anything that prices the period
+   * *after* this one — the upcoming-invoice preview, the customer summary's
+   * next bill — is pricing a phase the subscription has not moved onto yet.
+   * Reading the items off the row instead quoted the plan being left: a ramp
+   * whose second phase doubles the seat count was previewed at the first
+   * phase's price right up to the day the bill went out at the second's.
+   *
+   * `null` for a schedule that is not managing anything yet, has finished, or
+   * has been released, because in all three the row's items are the truth.
+   */
+  phaseCovering(orgId: string, sub: Subscription, at: number): SchedulePhase | null {
+    if (!sub.schedule) return null;
+    const row = this.ctx.db.get<Record<string, unknown>>(
+      `SELECT * FROM billing_subscription_schedules WHERE org_id = ? AND id = ?`, orgId, sub.schedule,
+    );
+    if (!row) return null;
+    const schedule = hydrateSchedule(row);
+    if (schedule.status !== 'active' && schedule.status !== 'not_started') return null;
+    const index = schedule.phases.findIndex((phase) => at >= phase.start_date && at < phase.end_date);
+    if (index < 0 || index === schedule.current_phase) return null;
+    return schedule.phases[index];
+  }
+
+  /**
+   * A phase's items as the subscription will hold them — the same substitution
+   * `applyPhase` makes, so a preview of the phase and the change that lands it
+   * price the same set. An item the phase also carries keeps its id, so the
+   * predicted lines carry the subscription-item ids the real ones will.
+   */
+  phaseItems(sub: Subscription, phase: SchedulePhase): PricedItem[] {
+    return phase.items.map((item) => ({
+      id: sub.items.find((existing) => existing.price === item.price)?.id ?? null,
+      price: item.price,
+      quantity: item.quantity,
+      custom_unit_amount: item.custom_unit_amount,
+    }));
+  }
 
   /** Replace a subscription's items to match a schedule phase, with proration. */
   applyPhase(orgId: string, sub: Subscription, phase: SchedulePhase, at: number, behavior?: ProrationBehavior): Subscription {

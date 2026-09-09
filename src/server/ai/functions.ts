@@ -9,6 +9,7 @@
  * disagree.
  */
 import type { Ctx } from '../kernel/context';
+import type { RefusedCurrency } from './engine';
 import { DAY, formatDate, formatRelative } from '../../shared/time';
 import { money as formatAmount } from './answer';
 import { billingSources, entityIndex, hasTable, workspaceProfile, type WorkspaceProfile } from './grounding';
@@ -243,7 +244,7 @@ function labelIds(ctx: Ctx, orgId: string, ids: string[], fallbackType: string):
 export function businessMetric(ctx: Ctx, orgId: string, args: {
   metric: string; start?: number; end?: number; window_label?: string; subject_id?: string; group_by?: GroupBy; compare?: boolean;
   currency?: string; pipeline?: string; stage?: string; limit?: number; direction?: 'asc' | 'desc';
-}): MetricToolResult | { error: string; available: string[] } {
+}): MetricToolResult | { error: string; available: string[]; refused_currency?: RefusedCurrency } {
   const definition = metricById(args.metric);
   if (!definition) return { error: `Unknown metric "${args.metric}".`, available: metricIds() };
   const workspace = workspaceProfile(ctx, orgId);
@@ -326,11 +327,34 @@ export function businessMetric(ctx: Ctx, orgId: string, args: {
     const asked = args.currency.toLowerCase();
     const held = computed.books.map((book) => book.currency.toLowerCase());
     if (definition.unit === 'money' && !held.includes(asked) && (computed.currency ?? '').toLowerCase() !== asked) {
+      // `computed` was narrowed by `args.currency` on the way in — every money
+      // metric filters on `input.currency` — so an empty `books` here says only
+      // that nothing is written in the currency that was asked for. It says
+      // nothing about which books the workspace keeps, and reading it as if it
+      // did is what made "what is our MRR in JPY?" answer that recurring
+      // revenue "is measured from records that carry no currency book in this
+      // workspace" — false of a subscription ledger that keeps one book per
+      // currency. The books this workspace actually holds come from the same
+      // metric computed without the narrowing.
+      const unscoped = definition.compute({ ...input, currency: null });
+      const actual = unscoped.books.map((book) => book.currency.toUpperCase());
       return {
-        error: held.length
-          ? `"${definition.label}" is held in ${listPhrase(held.map((code) => code.toUpperCase()))} here, and there is no ${asked.toUpperCase()} book in it — the unscoped figure is a different number, not a smaller version of the one you asked for.`
-          : `"${definition.label}" is measured from records that carry no currency book in this workspace, so it cannot be narrowed to ${asked.toUpperCase()}: the figure I hold is the whole of it, in ${(computed.currency ?? workspace.currency).toUpperCase()}.`,
+        error: actual.length
+          ? `"${definition.label}" is held in ${listPhrase(actual)} in this workspace, and ${asked.toUpperCase()} is not one of them — the unscoped figure is a different number, not a smaller version of the one you asked for.`
+          : unscoped.count > 0
+            ? `"${definition.label}" is measured from records that carry no currency book in this workspace, so it cannot be narrowed to ${asked.toUpperCase()}: the figure I hold is the whole of it, in ${(unscoped.currency ?? workspace.currency).toUpperCase()}.`
+            : `"${definition.label}" has nothing behind it in this workspace right now — no rows in ${asked.toUpperCase()} or in any other currency — so there is no ${asked.toUpperCase()} book to narrow to.`,
         available: metricIds().filter((id) => metricById(id)?.unit === 'money'),
+        // The same refusal as facts, not as a sentence. The surface has to say
+        // which measure and which currency it will not narrow, and it used to
+        // read them back out of the prose with a regex — so it carried two
+        // patterns for two past wordings and went silent the third time this
+        // sentence was improved. Prose is for the reader; this is for the card.
+        refused_currency: {
+          measure: definition.label,
+          currency: asked.toUpperCase(),
+          books: actual,
+        },
       };
     }
   }

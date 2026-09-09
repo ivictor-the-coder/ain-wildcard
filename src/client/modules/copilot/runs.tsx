@@ -802,7 +802,7 @@ export function RunDetailPage({ id }: { id: string }) {
     },
   });
   const askAgain = (next: string) => navigate(`/copilot?new=1&ask=${encodeURIComponent(next)}`);
-  const currency = currencyRefusal(detail.question, card.refusal);
+  const currency = currencyRefusal(detail.question, card.refusal, card.refusedCurrency);
 
   return (
     <Page

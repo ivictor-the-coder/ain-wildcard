@@ -175,9 +175,13 @@ const MAX_MINOR_UNITS = 1_000_000_000_000;
  * fields are refused by `v.int({ min: 0 })` before a request ever reaches the
  * store, so this repeats that assertion verbatim and then adds the remedy the
  * operator actually wants.
+ *
+ * That remedy used to name a coupon the platform did not have, which is worse
+ * than no advice: it sent an operator looking for a screen that was not there.
+ * `POST /v1/coupons` is the route now, so the sentence names it.
  */
 const NEGATIVE_AMOUNT =
-  'Must be greater than or equal to 0. A negative rate bills the customer backwards — discount with a coupon, refund with a credit note.';
+  'Must be greater than or equal to 0. A negative rate bills the customer backwards — take money off with a coupon (POST /v1/coupons), or hand it back with a credit note.';
 const HUGE_AMOUNT = 'Amount is implausibly large.';
 
 function checkAmount(value: number | null | undefined, param: string): number | null {
@@ -1217,7 +1221,7 @@ export function normalizeFeatures(features: ProductInput['features']): ProductFe
 }
 
 /** The subset of `before` whose values changed — Stripe's previous_attributes. */
-function diff<T extends object>(before: T, after: T): Record<string, unknown> {
+export function diff<T extends object>(before: T, after: T): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   const a = before as Record<string, unknown>;
   const b = after as Record<string, unknown>;

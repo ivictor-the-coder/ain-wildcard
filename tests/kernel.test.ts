@@ -11,7 +11,8 @@ import { CORE_MIGRATIONS } from '../src/server/kernel/core-schema';
 import { runInOrgScope } from '../src/server/kernel/org-scope';
 import type { AiToolDef } from '../src/server/kernel/ai';
 import { aiRuntime, type AiCallContext } from '../src/server/ai/runtime';
-import v from '../src/shared/validate';
+import v, { type SchemaNode, type Validator } from '../src/shared/validate';
+import type { ApiError } from '../src/shared/errors';
 import {
   ApiClientError, currentAuthLoss, currentNetworkFailure, currentRateLimit, request,
 } from '../src/client/kernel/api';
@@ -1297,6 +1298,148 @@ describe('a query parameter the route never declared', () => {
       });
       assert.equal(body.status, 400);
       assert.equal(body.body.error.code, 'parameter_invalid');
+    } finally {
+      app.close();
+    }
+  });
+});
+
+/**
+ * A validator's schema is a promise. `/api/openapi.json` publishes it, the API
+ * reference renders it and an integration is written against it — so a
+ * validator that refuses the format it documents is not a small bug in one
+ * module, it is every route that uses it. Two of the kernel's did.
+ */
+describe('a kernel validator accepts what its own schema documents', () => {
+  /** A value the shape will take, so a probe reaches the field it is aiming at. */
+  const stub = (node: SchemaNode): unknown => {
+    if (node.enum?.length) return node.enum[0];
+    switch (node.type) {
+      case 'integer': case 'number': return node.min ?? 1;
+      case 'boolean': return true;
+      case 'array': return [];
+      case 'object': return {};
+      default:
+        if (node.format === 'currency') return 'usd';
+        if (node.format === 'email') return 'probe@northwind.io';
+        if (node.format === 'uri') return 'https://northwind.io';
+        if (node.format === 'unix-ms') return 1;
+        if (node.format?.startsWith('id:')) return `${node.format.slice(3)}_probe`;
+        return 'x';
+    }
+  };
+
+  /** The smallest input that gets `target` past every other field in the shape. */
+  const fill = (node: SchemaNode, target: string, value: unknown, path = ''): Record<string, unknown> => {
+    const out: Record<string, unknown> = {};
+    for (const [key, field] of Object.entries(node.fields ?? {})) {
+      const here = path ? `${path}.${key}` : key;
+      if (here === target) out[key] = value;
+      else if (target.startsWith(`${here}.`)) out[key] = fill(field, target, value, here);
+      else if (!field.optional) out[key] = stub(field);
+    }
+    return out;
+  };
+
+  const fieldsWithFormat = (node: SchemaNode | undefined, format: string, path = '', out: string[] = []): string[] => {
+    if (!node) return out;
+    if (node.format === format) out.push(path);
+    for (const [key, field] of Object.entries(node.fields ?? {})) {
+      fieldsWithFormat(field, format, path ? `${path}.${key}` : key, out);
+    }
+    return out;
+  };
+
+  interface Door { label: string; validator: Validator<unknown>; field: string }
+
+  const doors = (app: App, format: string): Door[] => {
+    const found: Door[] = [];
+    for (const route of app.ctx.router.routes) {
+      for (const kind of ['query', 'body'] as const) {
+        const validator = route.meta[kind];
+        if (!validator) continue;
+        for (const field of fieldsWithFormat(validator.describe(), format)) {
+          found.push({ label: `${route.method} ${route.path} ${kind}.${field}`, validator, field });
+        }
+      }
+    }
+    return found;
+  };
+
+  /** What the probe learned about one door, or nothing when it never got there. */
+  const probe = (door: Door, value: unknown): { verdict: 'accepted' | 'refused'; message: string } | null => {
+    try {
+      door.validator.parse(fill(door.validator.describe(), door.field, value), '');
+      return { verdict: 'accepted', message: '' };
+    } catch (e) {
+      const error = e as ApiError;
+      if (error.param !== door.field) return null;
+      return { verdict: 'refused', message: error.message };
+    }
+  };
+
+  test('a unix-ms timestamp is accepted in the spelling the API itself emits', () => {
+    const emitted = Date.UTC(2026, 4, 14, 9, 30, 15, 123);
+
+    // The schema says `integer`, and a query string is text: this is the exact
+    // value `changed_at` came back as, sent straight back in as `?before=`.
+    assert.equal(v.timestamp().parse(String(emitted)), emitted);
+    assert.equal(v.timestamp().parse(`  ${emitted}  `), emitted);
+    assert.equal(v.timestamp().parse(String(-emitted)), -emitted, 'a date before 1970 is still a timestamp');
+    assert.equal(v.timestamp().parse('0'), 0, 'and the epoch is not the year 2000');
+
+    assert.equal(v.timestamp().parse(emitted), emitted);
+    assert.equal(v.timestamp().parse(new Date(emitted).toISOString()), emitted);
+
+    assert.throws(() => v.timestamp().parse('yesterday'), /unix millisecond/);
+    assert.throws(() => v.timestamp().parse('2026-13-45'), /unix millisecond/);
+    assert.throws(() => v.timestamp().parse(''), /unix millisecond/);
+  });
+
+  test('every route that declares one takes one, without a private union of its own', async () => {
+    const app = await createApp({ db: 'memory', config: { env: 'test' } });
+    try {
+      const emitted = Date.UTC(2026, 4, 14, 9, 30, 15, 123);
+      const checked = doors(app, 'unix-ms');
+      const refused = checked
+        .map((door) => ({ door, result: probe(door, String(emitted)) }))
+        .filter((r) => r.result?.verdict === 'refused')
+        .map((r) => `${r.door.label}: ${r.result!.message}`);
+
+      assert.ok(checked.length >= 20, `only ${checked.length} timestamp doors found — the probe stopped finding them`);
+      assert.deepEqual(refused, [], 'these routes publish `integer` and refuse the integer');
+    } finally {
+      app.close();
+    }
+  });
+
+  test('a currency is checked against the register, not against the alphabet', () => {
+    assert.equal(v.currency().parse('usd'), 'usd');
+    assert.equal(v.currency().parse('BHD'), 'bhd', 'a real code, cased however the caller had it');
+
+    let refusal: ApiError | undefined;
+    try { v.currency().parse('zzz', 'price.currency'); } catch (e) { refusal = e as ApiError; }
+    assert.ok(refusal, 'a code no register knows was accepted');
+    assert.match(refusal.message, /Invalid currency: zzz/);
+    assert.equal(refusal.param, 'price.currency', 'and the refusal names the field that carried it');
+
+    assert.throws(() => v.currency().parse('dollars'), /at most 3 characters/);
+  });
+
+  test('every door that takes a currency refuses one no bank settles in', async () => {
+    const app = await createApp({ db: 'memory', config: { env: 'test' } });
+    try {
+      const checked = doors(app, 'currency');
+      const accepted = checked
+        .filter((door) => probe(door, 'zzz')?.verdict === 'accepted')
+        .map((door) => door.label);
+
+      // Whatever a handler goes on to do, the validator is the door: one that
+      // lets "zzz" past is a row written, totalled and rendered as "ZZZ 125.00"
+      // unless something further in happens to catch it, which is how a price,
+      // a customer and a credit grant each ended up denominated in it.
+      assert.ok(checked.length >= 20, `only ${checked.length} currency doors found — the probe stopped finding them`);
+      assert.deepEqual(accepted, [], 'these validators accept a currency that has never existed');
     } finally {
       app.close();
     }

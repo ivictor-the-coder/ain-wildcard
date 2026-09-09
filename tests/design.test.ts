@@ -2,10 +2,10 @@ import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
 import {
-  currencySymbol, formatCompact, formatDate, formatDelta, formatFileSize, formatMoney,
-  formatNumber, formatOrdinal, formatPercent, formatRelative, humanize, initials, plural,
-  pluralize, titleCase, truncateMiddle, createFormatter, formatDateRange,
-  moneyInputText, numberSeparators, parseMoneyText,
+  currencySymbol, formatCompact, formatDate, formatDelta, formatFileSize, formatList, formatMoney,
+  formatMonth, formatNumber, formatOrdinal, formatPercent, formatRelative, formatTime, formatWhen,
+  humanize, initials, plural, pluralize, titleCase, truncateMiddle, createFormatter, formatDateRange,
+  moneyInputText, numberSeparators, parseMoneyText, usableLocale, usableZone,
 } from '../src/client/design/format';
 import { STATUS_COPY, statusLabel, statusTone } from '../src/client/design/status-core';
 import { hashString, toneOf, toneForStatus, vizColor, AVATAR_TONE_COUNT } from '../src/client/design/color';
@@ -26,7 +26,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { computePosition, repositionFloating, type FloatingElement, type PositionResult, type Size } from '../src/client/design/position';
 import {
-  addDays, addMonths, monthMatrix, nextRange, RANGE_PRESETS, startOfMonthUtc, weekdayLabels,
+  addDays, addMonths, monthMatrix, nextRange, RANGE_PRESETS, startOfMonthUtc, todayIn, weekdayLabels,
 } from '../src/client/design/calendar-core';
 import { computeWindow, matchesHotkey, scrollTopForIndex } from '../src/client/design/hooks';
 import { toastDuration, type ToastRecord } from '../src/client/design/toast-store';
@@ -1705,5 +1705,128 @@ describe('the rule that a dialog opens on its first field', () => {
       assert.match(readFileSync(file, 'utf8'), /useFocusFirstField\s*\(/,
         `${file} wraps a dialog's fields but never moves focus off Close`);
     }
+  });
+});
+
+/* ==================== the kit's date contract, in writing ================== */
+
+describe("the picker's day contract, and whose today it means", () => {
+  const NY = 'America/New_York';
+  // 8:30pm in New York on 2 October 2026 — Greenwich is already on the 3rd.
+  const EVENING = Date.UTC(2026, 9, 3, 0, 30);
+
+  it('today is the reader\'s calendar day, as a midnight-UTC day stamp', () => {
+    assert.equal(todayIn(EVENING, NY), Date.UTC(2026, 9, 2), 'a New York evening is still the 2nd');
+    assert.equal(todayIn(EVENING, 'UTC'), Date.UTC(2026, 9, 3), 'Greenwich has turned over');
+    assert.equal(todayIn(EVENING, 'Asia/Tokyo'), Date.UTC(2026, 9, 3), 'Tokyo is on the 3rd already');
+    // The shape is the grid's, so it compares with a stored date property.
+    for (const zone of [NY, 'UTC', 'Asia/Tokyo', 'Australia/Sydney']) {
+      assert.equal(todayIn(EVENING, zone) % DAY, 0, `${zone} lands on midnight UTC`);
+    }
+  });
+
+  it('falls back to Greenwich rather than throwing on a zone nobody has', () => {
+    assert.equal(todayIn(EVENING, 'Europe/Nowhere'), Date.UTC(2026, 9, 3));
+    assert.equal(todayIn(EVENING, undefined), Date.UTC(2026, 9, 3));
+    assert.equal(todayIn(Number.NaN, NY) % DAY, 0, 'an unusable instant still yields a day');
+  });
+
+  it('the range presets end on the reader\'s day when they are given it', () => {
+    const today = todayIn(EVENING, NY);
+    for (const preset of RANGE_PRESETS) {
+      const range = preset.range(today);
+      assert.ok(range.end !== null && range.end <= today, `${preset.id} does not end after the reader's today`);
+    }
+    const last7 = RANGE_PRESETS.find((p) => p.id === 'last7')!.range(today);
+    assert.equal(last7.end, Date.UTC(2026, 9, 2));
+    assert.equal(last7.start, Date.UTC(2026, 8, 26));
+    // The same presets read off the raw instant are a day out, which is the
+    // defect: every caller had to convert, and most did not.
+    assert.equal(RANGE_PRESETS.find((p) => p.id === 'last7')!.range(EVENING).end, Date.UTC(2026, 9, 3));
+  });
+
+  it('both pickers take their today from the reader\'s zone, not from Greenwich', () => {
+    const source = designSource('datepicker.tsx');
+    // The exact shape of the defect: a day derived from the clock alone.
+    assert.ok(!/startOfDay\(fmt\.now\(\)\)/.test(source), '"Today" must not emit the Greenwich day');
+    assert.ok(!/\bpreset\.range\(fmt\.now\(\)\)/.test(source), 'a range preset must not be measured from the raw clock');
+    assert.match(source, /const zone = timeZone \?\? fmt\.timeZone;/, 'the picker resolves a zone');
+    // Four places read "today": the button, the month the popover opens on
+    // (twice), and the range picker's presets.
+    assert.ok((source.match(/todayIn\(fmt\.now\(\), zone\)/g) ?? []).length >= 4, source.match(/todayIn\(/g)?.length + ' uses of todayIn');
+    assert.match(source, /timeZone=\{zone\}/, 'the calendar is told which day to ring');
+  });
+
+  it('the contract the callers kept getting wrong is written on the props', () => {
+    const source = designSource('datepicker.tsx');
+    const docs = source.slice(0, source.indexOf('export interface DatePickerProps'));
+    assert.ok(/midnight UTC/.test(docs), 'CalendarProps says what its timestamps are');
+    const picker = source.slice(source.lastIndexOf('/**', source.indexOf('export interface DatePickerProps')), source.indexOf('export function DatePicker('));
+    assert.ok(/midnight UTC/.test(picker), 'DatePickerProps says a value is a day, not an instant');
+    assert.ok(/timeZone/.test(picker), 'DatePickerProps says which zone decides today');
+  });
+});
+
+/* ============ a stored locale or zone the platform cannot use ============= */
+
+describe('a locale or timezone nothing can format with never blanks a screen', () => {
+  // Values a workspace can really hold: an underscore instead of a hyphen, a
+  // zone that was renamed, a field somebody pasted into.
+  const BAD_LOCALES = ['en_US', 'en-US-', '!!', 'e', '12345', 'zz-ZZ-ZZ-ZZ'];
+  const BAD_ZONES = ['Europe/Nowhere', 'EST5EDT7', 'america/new york', 'GMT+25'];
+  const TS = Date.UTC(2026, 4, 14, 9, 30);
+
+  it('a locale Intl rejects formats as en-US instead of throwing', () => {
+    for (const locale of BAD_LOCALES) {
+      assert.equal(usableLocale(locale), 'en-US', `${locale} is not a locale`);
+      assert.equal(formatNumber(1234.5, { locale, decimals: 1 }), formatNumber(1234.5, { decimals: 1 }));
+      assert.equal(formatMoney({ amount: 124800, currency: 'usd' }, { locale }), '$1,248.00');
+      assert.equal(formatDate(TS, { locale }), formatDate(TS));
+      assert.equal(formatRelative(TS - 3 * DAY, TS, locale), formatRelative(TS - 3 * DAY, TS));
+      assert.equal(formatOrdinal(3, locale), '3rd');
+      assert.equal(formatPercent(0.42, { locale }), formatPercent(0.42));
+      assert.equal(formatList(['a', 'b'], { locale }), formatList(['a', 'b']));
+      assert.equal(formatDateRange(TS, TS + 3 * DAY, { locale }), formatDateRange(TS, TS + 3 * DAY));
+      assert.equal(numberSeparators(locale).group, ',');
+      assert.equal(currencySymbol('usd', locale), '$');
+    }
+  });
+
+  it('a timezone Intl rejects reads as UTC instead of throwing', () => {
+    for (const timeZone of BAD_ZONES) {
+      assert.equal(usableZone(timeZone), 'UTC', `${timeZone} is not a zone`);
+      assert.equal(formatDate(TS, { timeZone }), formatDate(TS));
+      assert.equal(formatDate(TS, { timeZone, withTime: true }), formatDate(TS, { withTime: true }));
+      assert.equal(formatDateRange(TS, TS + DAY, { timeZone }), formatDateRange(TS, TS + DAY));
+    }
+  });
+
+  it('a formatter built on a stored pair of them still works, and reports what it fell back to', () => {
+    // The whole client is rendered through one of these; if the constructor or
+    // any method throws, every screen unmounts at once — including Settings,
+    // which is the only place the value could be put back.
+    const fmt = createFormatter({ locale: 'en_US', currency: 'usd', timeZone: 'Europe/Nowhere' }, () => TS);
+    assert.equal(fmt.locale, 'en-US', 'the formatter publishes a locale a caller can hand to Intl');
+    assert.equal(fmt.timeZone, 'UTC');
+    assert.equal(fmt.money(124800), '$1,248.00');
+    assert.equal(fmt.number(1234), '1,234');
+    assert.equal(fmt.date(TS), formatDate(TS));
+    assert.equal(fmt.dateTime(TS), formatDate(TS, { withTime: true }));
+    assert.equal(fmt.time(TS), formatTime(TS));
+    assert.equal(fmt.month(TS), formatMonth(TS));
+    assert.equal(fmt.relative(TS - 3 * DAY), formatRelative(TS - 3 * DAY, TS));
+    assert.equal(fmt.when(TS - 2 * DAY), formatWhen(TS - 2 * DAY, TS));
+    assert.equal(fmt.dateRange(TS, TS + DAY), formatDateRange(TS, TS + DAY));
+    assert.equal(fmt.list(['a', 'b']), 'a and b');
+    assert.equal(fmt.percent(0.5), '50%');
+    assert.equal(fmt.plural(2, 'invoice'), '2 invoices');
+    assert.equal(fmt.symbol(), '$');
+  });
+
+  it('a currency code no register holds prints a number rather than nothing at all', () => {
+    // The same class of stored value one field along. A figure without its
+    // symbol is a poor answer; a blank workspace is not an answer.
+    assert.doesNotThrow(() => currencySymbol('zzz' as never));
+    assert.doesNotThrow(() => formatNumber(12, { locale: 'en_US' }));
   });
 });

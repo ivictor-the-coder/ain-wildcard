@@ -25,7 +25,8 @@
  *
  * And the invitation is a real invitation now. `POST /v1/users` mints a
  * one-time token and answers with it exactly once; `/accept?token=…` is where
- * the person sets a password and lands inside the workspace. So the token is
+ * the person confirms their Ain password — see `team-core.ts` for why that is
+ * not the same as setting one — and lands inside the workspace. So the token is
  * handled the way this module already handles the one other secret it shows —
  * the API key: its own panel, masked until revealed, copied, acknowledged
  * before the dialog will close. A seat sits at `invited` until the link is
@@ -48,6 +49,7 @@ import {
   DialogForm, ListFailure, ROLE_GRANTS, ROLE_ORDER, ROLE_RANK, ReadOnlyForYou, RoleBadge, SettingsShell, useAction,
   useConsumeQuery, useOpenFromQuery,
 } from './common';
+import { CREDENTIAL_RULE, whatTheLinkDoes } from './team-core';
 import type { InvitedMember, Member, Role } from './types';
 
 /**
@@ -57,8 +59,7 @@ import type { InvitedMember, Member, Role } from './types';
  */
 export const INVITE_TRUTH =
   'A seat is created at the role you choose and a one-time invitation link is minted. Ain does not send email, so the '
-  + 'link is shown to you once, here, and it is yours to pass on. The seat stays “invited” until they open it and set '
-  + 'a password.';
+  + `link is shown to you once, here, and it is yours to pass on. The seat stays “invited” until they open it: ${CREDENTIAL_RULE}.`;
 
 /** Where an invitation is redeemed. Absolute, because it is going into someone else’s inbox. */
 export const invitationUrl = (token: string): string =>
@@ -332,8 +333,8 @@ export function TeamPage() {
         {admin && invitedCount > 0 && (
           <Banner tone="info" compact title={`${f.plural(invitedCount, 'invitation')} still open`}>
             {'Ain mints the link but sends no mail, so an invitation only travels once somebody passes it on. Nobody '
-              + 'on an invited seat can sign in, own a record or hold a key until they open theirs and set a password. '
-              + '“Send a fresh link” on the row mints a new one and voids the old.'}
+              + 'on an invited seat can sign in, own a record or hold a key until they open theirs: '
+              + `${CREDENTIAL_RULE}. “Send a fresh link” on the row mints a new one and voids the old.`}
           </Banner>
         )}
 
@@ -499,7 +500,7 @@ function InviteDialog({ open, grantable, myRole, action, onClose, onInvited }: {
             {' answers with a one-time token; Ain stores only its hash and no route ever reads it back. Send the link '
               + 'to them yourself — it is good for seven days, and '}
             <code className="st-mono">POST /v1/auth/accept</code>
-            {' spends it the moment they set a password. Lose it and “Send a fresh link” on their row mints another.'}
+            {` spends it the moment ${CREDENTIAL_RULE}. Lose it and “Send a fresh link” on their row mints another.`}
           </Banner>
           <Field label="Work email" required error={action.errorFor('email')}>
             <Input
@@ -600,7 +601,7 @@ function InvitationLinkDialog({ seat, onClose }: { seat: InvitedMember | null; o
             <div className="st-row__main">
               <div className="st-row__title">What it does</div>
               <div className="st-row__sub">
-                {`Opens /accept, where they set a password and land in ${seat.role === 'owner' ? 'the workspace as an owner' : `the workspace as ${seat.role === 'admin' || seat.role === 'analyst' ? 'an' : 'a'} ${seat.role}`}. It works once.`}
+                {whatTheLinkDoes(seat.role)}
               </div>
             </div>
           </div>

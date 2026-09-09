@@ -6,7 +6,13 @@ import {
   aggregateUsage, applyTransform, computeLineAmount, previewCurve, ratToDecimal, decimalToRat,
 } from '../src/server/modules/catalog/engine';
 import { describePrice, formatMinor, formatMinorDecimal } from '../src/server/modules/catalog/format';
-import type { CurrencyOption, Price, PriceTier, Product, TransformQuantity } from '../src/server/modules/catalog/types';
+import {
+  couponAppliesToPeriod, couponCovers, couponValidity, describeCoupon, discountOn, discountPeriods,
+  distributeDiscount, formatPercent, promotionCodeValidity,
+} from '../src/server/modules/catalog/discounts';
+import type {
+  Coupon, CurrencyOption, Price, PriceTier, Product, PromotionCode, TransformQuantity,
+} from '../src/server/modules/catalog/types';
 
 const ORG = 'org_demo';
 const DANA: Auth = { kind: 'session', orgId: ORG, userId: 'usr_seed01', role: 'owner', scopes: ['*'], livemode: true };
@@ -2099,5 +2105,750 @@ describe('the model a payload implies', () => {
       product: 'prod_nw_growth', currency: 'usd', recurring: { interval: 'month' }, tiers_mode: 'graduated', tiers: ladder,
     });
     assert.equal(licensed.model, 'tiered');
+  });
+});
+
+/* ================================ discounts ================================ */
+
+const couponOf = (over: Partial<Coupon> = {}): Coupon => ({
+  object: 'coupon',
+  id: 'coup_fixture',
+  name: null,
+  percent_off: null,
+  percent_off_basis_points: null,
+  amount_off: null,
+  currency: null,
+  duration: 'once',
+  duration_in_periods: null,
+  max_redemptions: null,
+  times_redeemed: 0,
+  redeem_by: null,
+  applies_to: { products: [], prices: [] },
+  active: true,
+  valid: true,
+  metadata: {},
+  created: 0,
+  updated: 0,
+  livemode: true,
+  ...over,
+});
+
+/** Basis points are what the arithmetic reads; `percent_off` only reads back. */
+const percentOff = (basisPoints: number, over: Partial<Coupon> = {}): Coupon =>
+  couponOf({ percent_off: basisPoints / 100, percent_off_basis_points: basisPoints, ...over });
+
+const amountOff = (amount: number, currency = 'usd', over: Partial<Coupon> = {}): Coupon =>
+  couponOf({ amount_off: amount, currency, ...over });
+
+/*
+ * A second implementation of the rounding rule, written the other way: integer
+ * BigInt division with the half-up comparison spelled out, sharing no code with
+ * src/shared/money.ts. If this and `distributeDiscount` ever disagree by a
+ * minor unit, one of them is wrong.
+ */
+function oraclePercentDiscount(base: bigint, basisPoints: bigint): bigint {
+  if (base <= 0n) return 0n;
+  const numerator = base * basisPoints;
+  const denominator = 10_000n;
+  const quotient = numerator / denominator;
+  const remainder = numerator % denominator;
+  return remainder * 2n >= denominator ? quotient + 1n : quotient;
+}
+
+describe('the rule for a percentage that does not divide evenly', () => {
+  test('the discount is rounded once, half-up, and the remainder is what is left over', () => {
+    // 20% of 9,999 minor units is exactly 1,999.8.
+    const applied = discountOn(percentOff(2000), 9999, 'usd');
+    assert.equal(applied.amount, 2000, 'the discount rounds up from 1999.8');
+    assert.equal(applied.amount_decimal, '1999.8', 'and the exact figure it rounded is reported');
+    assert.equal(applied.remaining, 7999);
+    assert.equal(applied.amount + applied.remaining, applied.subtotal, 'the two halves reconcile exactly');
+  });
+
+  test('an exact half-minor-unit goes to the customer, not to the merchant', () => {
+    // 50% of 1 is 0.5 — the tie the rule has to answer. Half-up means the
+    // discount takes it, so the customer pays 0 rather than 1.
+    const applied = discountOn(percentOff(5000), 1, 'usd');
+    assert.equal(applied.amount, 1);
+    assert.equal(applied.remaining, 0);
+
+    // 25% of 2 is 0.5 as well, and lands the same way.
+    assert.equal(discountOn(percentOff(2500), 2, 'usd').amount, 1);
+  });
+
+  test('a percentage carries two decimal places exactly, with no float in the arithmetic', () => {
+    // A third off 100.00: 33.33% of 10,000 is 3,333 to the cent.
+    assert.equal(discountOn(percentOff(3333), 10_000, 'usd').amount, 3333);
+    // 33.33% of 3,701 is 1,233.5433 — down, because the fraction is below half.
+    assert.equal(discountOn(percentOff(3333), 3701, 'usd').amount, 1234);
+    assert.equal(formatPercent(3333), '33.33');
+    assert.equal(formatPercent(2000), '20');
+    assert.equal(formatPercent(2050), '20.5');
+    assert.equal(formatPercent(50), '0.5');
+  });
+
+  test('every percentage against every amount agrees with an independently written oracle', () => {
+    const random = mulberry32(0x0d15c0);
+    let checked = 0;
+    for (let i = 0; i < 4000; i++) {
+      const basisPoints = 1 + Math.floor(random() * 10_000);
+      const amount = Math.floor(random() * 5_000_000);
+      const applied = discountOn(percentOff(basisPoints), amount, 'usd');
+      const expected = Number(oraclePercentDiscount(BigInt(amount), BigInt(basisPoints)));
+      assert.equal(applied.amount, expected, `${basisPoints}bp of ${amount}`);
+      assert.ok(applied.amount >= 0 && applied.amount <= amount, `${basisPoints}bp of ${amount} left the bill`);
+      assert.equal(applied.amount + applied.remaining, amount);
+      checked++;
+    }
+    assert.equal(checked, 4000);
+  });
+
+  test('100% takes the whole thing and nothing more', () => {
+    const applied = discountOn(percentOff(10_000), 123_456, 'usd');
+    assert.equal(applied.amount, 123_456);
+    assert.equal(applied.remaining, 0);
+    assert.equal(applied.capped, false, 'a percentage is never a cap — it cannot exceed its base');
+  });
+});
+
+describe('a discount spread across lines still adds up', () => {
+  const lineOf = (amount: number, id: string) => ({ id, amount });
+
+  test('the per-line shares sum exactly to the one rounded total', () => {
+    const random = mulberry32(0xa11c8);
+    for (let i = 0; i < 600; i++) {
+      const basisPoints = 1 + Math.floor(random() * 10_000);
+      const lines = Array.from({ length: 1 + Math.floor(random() * 8) }, (_, n) =>
+        lineOf(Math.floor(random() * 200_000), `l${n}`));
+      const applied = distributeDiscount(percentOff(basisPoints), lines, 'usd');
+      const summed = applied.lines.reduce((acc, line) => acc + line.discount, 0);
+      assert.equal(summed, applied.amount, `${basisPoints}bp across ${JSON.stringify(lines.map((l) => l.amount))}`);
+      for (const line of applied.lines) {
+        assert.ok(line.discount >= 0 && line.discount <= line.amount, 'no line was discounted past zero');
+        assert.equal(line.discount + line.remaining, line.amount);
+      }
+    }
+  });
+
+  test('spreading over lines gives the same total as discounting their subtotal', () => {
+    const random = mulberry32(0xbeef1);
+    for (let i = 0; i < 600; i++) {
+      const basisPoints = 1 + Math.floor(random() * 10_000);
+      const amounts = Array.from({ length: 2 + Math.floor(random() * 9) }, () => Math.floor(random() * 90_000));
+      const subtotal = amounts.reduce((a, b) => a + b, 0);
+      const coupon = percentOff(basisPoints);
+      const spread = distributeDiscount(coupon, amounts.map((a, n) => lineOf(a, `l${n}`)), 'usd');
+      const whole = discountOn(coupon, subtotal, 'usd');
+      // Rounding per line instead of once would drift by up to one minor unit
+      // per line here, and the invoice total would stop matching the summary.
+      assert.equal(spread.amount, whole.amount, `${basisPoints}bp across ${amounts.length} lines`);
+    }
+  });
+
+  test('each line lands within one minor unit of its own exact share', () => {
+    const applied = distributeDiscount(percentOff(3333), [
+      lineOf(1000, 'a'), lineOf(1000, 'b'), lineOf(1000, 'c'),
+    ], 'usd');
+    // 33.33% of 3,000 is 999.9 → 1,000, shared over three lines of 333.3.
+    assert.equal(applied.amount, 1000);
+    assert.deepEqual(applied.lines.map((l) => l.discount), [334, 333, 333]);
+    assert.equal(applied.lines.reduce((a, l) => a + l.discount, 0), 1000);
+  });
+
+  test('a credit line neither enlarges the base nor collects a discount', () => {
+    // Without the rule, a -$100 proration beside a $100 charge would earn a
+    // discount on $200 of gross and hand some of it to the credit.
+    const applied = distributeDiscount(percentOff(2000), [
+      lineOf(10_000, 'charge'), lineOf(-10_000, 'proration credit'),
+    ], 'usd');
+    assert.equal(applied.subtotal, 0);
+    assert.equal(applied.eligible_subtotal, 10_000, 'only the positive line forms the base');
+    assert.equal(applied.amount, 2000);
+    assert.deepEqual(applied.lines.map((l) => l.discount), [2000, 0]);
+  });
+});
+
+describe('an amount-off coupon is denominated, and never overdraws', () => {
+  test('it is capped at what it met, and says so', () => {
+    const applied = discountOn(amountOff(50_000), 30_000, 'usd');
+    assert.equal(applied.amount, 30_000);
+    assert.equal(applied.remaining, 0);
+    assert.equal(applied.capped, true);
+  });
+
+  test('it refuses a bill in another currency rather than converting one', () => {
+    assert.throws(
+      () => discountOn(amountOff(5000, 'usd'), 30_000, 'eur'),
+      (e: any) => e.code === 'coupon_currency_mismatch' && /euro|EUR/i.test(e.message),
+    );
+    // A percentage travels, because 20% is 20% wherever it is quoted.
+    assert.equal(discountOn(percentOff(2000), 30_000, 'eur').amount, 6000);
+  });
+
+  test('it is shared across lines in proportion, to the cent', () => {
+    const applied = distributeDiscount(amountOff(1000), [
+      { id: 'a', amount: 3333 }, { id: 'b', amount: 3333 }, { id: 'c', amount: 3334 },
+    ], 'usd');
+    assert.equal(applied.amount, 1000);
+    assert.equal(applied.lines.reduce((a, l) => a + l.discount, 0), 1000);
+    assert.deepEqual(applied.lines.map((l) => l.discount), [333, 333, 334]);
+  });
+});
+
+describe('a coupon restricted to part of the book only touches that part', () => {
+  const partner = percentOff(1000, { applies_to: { products: [], prices: ['price_nw_growth_monthly'] } });
+
+  test('an uncovered line is left at list price', () => {
+    const applied = distributeDiscount(partner, [
+      { id: 'plan', price: 'price_nw_growth_monthly', amount: 29_900 },
+      { id: 'events', price: 'price_nw_telemetry_events', amount: 18_333 },
+    ], 'usd');
+    assert.equal(applied.eligible_subtotal, 29_900);
+    assert.equal(applied.amount, 2990);
+    assert.equal(applied.lines[1].eligible, false);
+    assert.equal(applied.lines[1].discount, 0);
+    assert.equal(applied.remaining, 48_233 - 2990);
+  });
+
+  test('a line that will not say what it is does not qualify', () => {
+    assert.equal(couponCovers(partner, { amount: 100 } as never), false);
+    assert.equal(couponCovers(couponOf(), { price: 'price_anything' }), true, 'an unrestricted coupon covers everything');
+    assert.equal(couponCovers(
+      percentOff(1000, { applies_to: { products: ['prod_nw_growth'], prices: [] } }),
+      { product: 'prod_nw_growth' },
+    ), true);
+  });
+
+  test('a bare amount refuses a restricted coupon rather than guessing', () => {
+    assert.throws(
+      () => discountOn(partner, 29_900, 'usd'),
+      (e: any) => e.code === 'coupon_restriction_unresolved',
+    );
+    // Naming the price it came from is enough to answer.
+    assert.equal(discountOn(partner, 29_900, 'usd', { price: 'price_nw_growth_monthly' }).amount, 2990);
+  });
+});
+
+describe('how long a coupon lasts', () => {
+  test('once, repeating and forever answer in periods', () => {
+    assert.equal(discountPeriods(couponOf({ duration: 'once' })), 1);
+    assert.equal(discountPeriods(couponOf({ duration: 'repeating', duration_in_periods: 12 })), 12);
+    assert.equal(discountPeriods(couponOf({ duration: 'forever' })), null);
+
+    const yearOne = percentOff(2000, { duration: 'repeating', duration_in_periods: 12 });
+    assert.equal(couponAppliesToPeriod(yearOne, 0), true);
+    assert.equal(couponAppliesToPeriod(yearOne, 11), true, 'the twelfth period still carries it');
+    assert.equal(couponAppliesToPeriod(yearOne, 12), false, 'the thirteenth does not');
+    assert.equal(couponAppliesToPeriod(couponOf({ duration: 'forever' }), 500), true);
+    assert.equal(couponAppliesToPeriod(couponOf({ duration: 'once' }), 1), false);
+  });
+
+  test('the offer reads as a sentence', () => {
+    assert.equal(describeCoupon(percentOff(2000, { duration: 'repeating', duration_in_periods: 12 })),
+      '20% off for 12 billing periods');
+    assert.equal(describeCoupon(amountOff(50_000, 'usd')), '$500.00 off once');
+    assert.equal(describeCoupon(percentOff(1000, { duration: 'forever' })), '10% off, forever');
+  });
+});
+
+describe('whether a coupon may still be redeemed', () => {
+  const NOW = Date.UTC(2026, 5, 1);
+
+  test('archived, out of date and used up are three different answers', () => {
+    assert.equal(couponValidity(percentOff(2000), NOW).valid, true);
+
+    const archived = couponValidity(percentOff(2000, { active: false }), NOW);
+    assert.equal(archived.reason, 'inactive');
+    assert.match(archived.message ?? '', /archived/);
+
+    const expired = couponValidity(percentOff(2000, { redeem_by: NOW - 1 }), NOW);
+    assert.equal(expired.reason, 'expired');
+
+    const exhausted = couponValidity(percentOff(2000, { max_redemptions: 3, times_redeemed: 3 }), NOW);
+    assert.equal(exhausted.reason, 'exhausted');
+    assert.match(exhausted.message ?? '', /3 times/);
+
+    assert.equal(couponValidity(percentOff(2000, { max_redemptions: 3, times_redeemed: 2 }), NOW).valid, true);
+  });
+
+  const codeOf = (over: Partial<PromotionCode> = {}): PromotionCode => ({
+    object: 'promotion_code',
+    id: 'promo_fixture',
+    code: 'SPRING20',
+    coupon: 'coup_fixture',
+    active: true,
+    expires_at: null,
+    max_redemptions: null,
+    max_redemptions_per_customer: null,
+    times_redeemed: 0,
+    restrictions: { minimum_amount: null, minimum_amount_currency: null, first_time_transaction: false },
+    valid: true,
+    metadata: {},
+    created: 0,
+    updated: 0,
+    livemode: true,
+    ...over,
+  });
+
+  test('the code carries limits of its own, on top of the coupon behind it', () => {
+    const coupon = percentOff(2000);
+    assert.equal(promotionCodeValidity(codeOf(), coupon, NOW).valid, true);
+
+    assert.equal(promotionCodeValidity(codeOf({ active: false }), coupon, NOW).reason, 'code_inactive');
+    assert.equal(promotionCodeValidity(codeOf({ expires_at: NOW - 1 }), coupon, NOW).reason, 'code_expired');
+    assert.equal(promotionCodeValidity(codeOf({ max_redemptions: 2, times_redeemed: 2 }), coupon, NOW).reason, 'code_exhausted');
+
+    const perCustomer = promotionCodeValidity(
+      codeOf({ max_redemptions_per_customer: 1 }), coupon, NOW, { customerRedemptions: 1 },
+    );
+    assert.equal(perCustomer.reason, 'customer_limit_reached');
+    assert.equal(
+      promotionCodeValidity(codeOf({ max_redemptions_per_customer: 1 }), coupon, NOW, { customerRedemptions: 0 }).valid,
+      true,
+    );
+  });
+
+  test('an exhausted coupon behind a live code is reported as the coupon’s fault', () => {
+    const spent = percentOff(2000, { max_redemptions: 1, times_redeemed: 1 });
+    const standing = promotionCodeValidity(codeOf(), spent, NOW);
+    assert.equal(standing.reason, 'coupon_exhausted');
+    assert.match(standing.message ?? '', /SPRING20/);
+  });
+
+  test('a minimum order value is checked in its own currency and never converted', () => {
+    const coupon = percentOff(1000);
+    const code = codeOf({ restrictions: { minimum_amount: 50_000, minimum_amount_currency: 'usd', first_time_transaction: false } });
+
+    assert.equal(promotionCodeValidity(code, coupon, NOW, { amount: 49_999, currency: 'usd' }).reason, 'below_minimum_amount');
+    assert.equal(promotionCodeValidity(code, coupon, NOW, { amount: 50_000, currency: 'usd' }).valid, true);
+
+    const wrongCurrency = promotionCodeValidity(code, coupon, NOW, { amount: 90_000, currency: 'eur' });
+    assert.equal(wrongCurrency.reason, 'below_minimum_amount');
+    assert.match(wrongCurrency.message ?? '', /euro/i);
+  });
+
+  test('a first-order code refuses an account that has been billed before', () => {
+    const coupon = percentOff(1000);
+    const code = codeOf({ restrictions: { minimum_amount: null, minimum_amount_currency: null, first_time_transaction: true } });
+    assert.equal(promotionCodeValidity(code, coupon, NOW, { firstTransaction: false }).reason, 'not_first_transaction');
+    assert.equal(promotionCodeValidity(code, coupon, NOW, { firstTransaction: true }).valid, true);
+  });
+});
+
+describe('the coupon API', () => {
+  test('creates, reads, lists, edits and archives a coupon', async () => {
+    const created = await expectOk('POST', '/v1/coupons', {
+      name: 'Winter pilot — 15% off', percent_off: 15, duration: 'repeating', duration_in_periods: 3,
+      max_redemptions: 25, metadata: { campaign: 'winter_pilot' },
+    });
+    assert.equal(created.object, 'coupon');
+    assert.match(created.id, /^coup_/);
+    assert.equal(created.percent_off, 15);
+    assert.equal(created.percent_off_basis_points, 1500, 'stored as an exact integer, not a float');
+    assert.equal(created.amount_off, null);
+    assert.equal(created.currency, null);
+    assert.equal(created.times_redeemed, 0);
+    assert.equal(created.valid, true);
+    assert.equal(created.summary, '15% off for 3 billing periods');
+    assert.equal(created.redemptions_remaining, 25);
+
+    const read = await expectOk('GET', `/v1/coupons/${created.id}`);
+    assert.equal(read.id, created.id);
+    assert.equal(read.editable, true);
+    assert.deepEqual(read.promotion_codes, []);
+
+    const listed = await expectOk('GET', '/v1/coupons?limit=200');
+    assert.ok(listed.data.some((c: any) => c.id === created.id));
+
+    const renamed = await expectOk('PATCH', `/v1/coupons/${created.id}`, { name: 'Winter pilot — 15% off, extended' });
+    assert.equal(renamed.name, 'Winter pilot — 15% off, extended');
+    assert.equal(renamed.percent_off_basis_points, 1500, 'a rename does not touch the terms');
+
+    const archived = await expectOk('PATCH', `/v1/coupons/${created.id}`, { active: false });
+    assert.equal(archived.active, false);
+    assert.equal(archived.valid, false, 'an archived coupon stops being redeemable');
+    assert.equal(archived.invalid_reason, 'inactive');
+    const onlyValid = await expectOk('GET', '/v1/coupons?valid=true&limit=200');
+    assert.ok(!onlyValid.data.some((c: any) => c.id === created.id));
+
+    await expectOk('DELETE', `/v1/coupons/${created.id}`);
+    await expectError('GET', `/v1/coupons/${created.id}`, undefined, 404, 'resource_missing');
+  });
+
+  test('a coupon is a percentage or an amount, and an amount is denominated', async () => {
+    const both = await expectError('POST', '/v1/coupons', { percent_off: 10, amount_off: 500, currency: 'usd' }, 400, 'parameter_invalid');
+    assert.match(both.message, /not both/);
+
+    const neither = await expectError('POST', '/v1/coupons', { name: 'Nothing off' }, 400, 'parameter_missing');
+    assert.match(neither.message, /take something off/);
+
+    const noCurrency = await expectError('POST', '/v1/coupons', { amount_off: 5000 }, 400, 'parameter_missing');
+    assert.equal(noCurrency.param, 'currency');
+
+    const pointless = await expectError('POST', '/v1/coupons', { percent_off: 10, currency: 'usd' }, 400, 'parameter_invalid');
+    assert.equal(pointless.param, 'currency');
+    assert.match(pointless.message, /travels/);
+
+    const zero = await expectError('POST', '/v1/coupons', { percent_off: 0 }, 400, 'parameter_invalid');
+    assert.match(zero.message, /greater than 0/);
+    await expectError('POST', '/v1/coupons', { percent_off: 101 }, 400, 'parameter_invalid');
+    await expectError('POST', '/v1/coupons', { amount_off: 0, currency: 'usd' }, 400, 'parameter_invalid');
+  });
+
+  test('a percentage is refused rather than silently rounded to what fits', async () => {
+    const tooPrecise = await expectError('POST', '/v1/coupons', { percent_off: 33.333 }, 400, 'parameter_invalid');
+    assert.equal(tooPrecise.param, 'percent_off');
+    assert.match(tooPrecise.message, /two decimal places/);
+
+    const third = await expectOk('POST', '/v1/coupons', { percent_off: 33.33 });
+    assert.equal(third.percent_off_basis_points, 3333);
+    assert.equal(third.percent_off, 33.33);
+    await expectOk('DELETE', `/v1/coupons/${third.id}`);
+
+    const exact = await expectOk('POST', '/v1/coupons', { percent_off_basis_points: 3333 });
+    assert.equal(exact.percent_off, 33.33, 'both spellings land on the same stored integer');
+    await expectOk('DELETE', `/v1/coupons/${exact.id}`);
+
+    const doubled = await expectError('POST', '/v1/coupons', { percent_off: 20, percent_off_basis_points: 2000 }, 400, 'parameter_invalid');
+    assert.match(doubled.message, /two spellings/);
+  });
+
+  test('a duration says how long it lasts, and only says it once', async () => {
+    const missing = await expectError('POST', '/v1/coupons', { percent_off: 20, duration: 'repeating' }, 400, 'parameter_missing');
+    assert.equal(missing.param, 'duration_in_periods');
+
+    const redundant = await expectError('POST', '/v1/coupons', {
+      percent_off: 20, duration: 'forever', duration_in_periods: 6,
+    }, 400, 'parameter_invalid');
+    assert.equal(redundant.param, 'duration_in_periods');
+
+    const forever = await expectOk('POST', '/v1/coupons', { percent_off: 20, duration: 'forever' });
+    assert.equal(forever.duration_in_periods, null);
+    await expectOk('DELETE', `/v1/coupons/${forever.id}`);
+  });
+
+  test('a restriction has to name products and prices this workspace actually has', async () => {
+    const ghost = await expectError('POST', '/v1/coupons', {
+      percent_off: 20, applies_to: { products: ['prod_does_not_exist'] },
+    }, 400, 'parameter_invalid');
+    assert.equal(ghost.param, 'applies_to.products');
+
+    const ghostPrice = await expectError('POST', '/v1/coupons', {
+      percent_off: 20, applies_to: { prices: ['price_does_not_exist'] },
+    }, 400, 'parameter_invalid');
+    assert.equal(ghostPrice.param, 'applies_to.prices');
+
+    const real = await expectOk('POST', '/v1/coupons', {
+      percent_off: 20, applies_to: { products: ['prod_nw_growth'], prices: ['price_nw_growth_seat_monthly'] },
+    });
+    assert.deepEqual(real.applies_to, { products: ['prod_nw_growth'], prices: ['price_nw_growth_seat_monthly'] });
+    await expectOk('DELETE', `/v1/coupons/${real.id}`);
+  });
+
+  test('a coupon cannot be born expired, and unknown parameters are named', async () => {
+    const past = await expectError('POST', '/v1/coupons', {
+      percent_off: 20, redeem_by: app.ctx.now() - 1000,
+    }, 400, 'parameter_invalid');
+    assert.equal(past.param, 'redeem_by');
+
+    const typo = await expectError('POST', '/v1/coupons', { percent_off: 20, duration_in_month: 3 }, 400);
+    assert.match(typo.message, /duration_in_month/);
+  });
+});
+
+describe('promotion codes are the customer-facing half', () => {
+  let coupon = '';
+
+  before(async () => {
+    coupon = (await expectOk('POST', '/v1/coupons', { name: 'Code fixture — 5% off', percent_off: 5 })).id;
+  });
+
+  after(async () => {
+    for (const code of (await expectOk('GET', `/v1/promotion_codes?coupon=${coupon}&limit=200`)).data) {
+      await call('DELETE', `/v1/promotion_codes/${code.id}`);
+    }
+    await call('DELETE', `/v1/coupons/${coupon}`);
+  });
+
+  test('a code is upper-cased, unique, and found the way a customer typed it', async () => {
+    const created = await expectOk('POST', '/v1/promotion_codes', { coupon, code: '  spring20 ' });
+    assert.equal(created.code, 'SPRING20');
+    assert.equal(created.coupon, coupon);
+    assert.equal(created.valid, true);
+
+    const clash = await expectError('POST', '/v1/promotion_codes', { coupon, code: 'Spring20' }, 409, 'promotion_code_in_use');
+    assert.match(clash.message, /SPRING20/);
+
+    const found = await expectOk('GET', '/v1/promotion_codes?code=sPrInG20');
+    assert.equal(found.data.length, 1);
+    assert.equal(found.data[0].id, created.id);
+
+    const detail = await expectOk('GET', `/v1/promotion_codes/${created.id}`);
+    assert.equal(detail.coupon_detail.id, coupon);
+
+    await expectOk('DELETE', `/v1/promotion_codes/${created.id}`);
+  });
+
+  test('a generated code is readable out loud', async () => {
+    const created = await expectOk('POST', '/v1/promotion_codes', { coupon });
+    assert.match(created.code, /^[A-HJ-NP-Z2-9]{10}$/, 'no O/0 or I/1 to mishear');
+    await expectOk('DELETE', `/v1/promotion_codes/${created.id}`);
+  });
+
+  test('a code cannot be renamed or repointed once it exists', async () => {
+    const created = await expectOk('POST', '/v1/promotion_codes', { coupon, code: 'RENAMEME' });
+    const renamed = await expectError('PATCH', `/v1/promotion_codes/${created.id}`, { code: 'SOMETHINGELSE' }, 400, 'parameter_invalid');
+    assert.match(renamed.message, /cannot be renamed/);
+
+    const other = await expectOk('POST', '/v1/coupons', { percent_off: 7 });
+    const repointed = await expectError('PATCH', `/v1/promotion_codes/${created.id}`, { coupon: other.id }, 400, 'parameter_invalid');
+    assert.match(repointed.message, /cannot be repointed/);
+    await expectOk('DELETE', `/v1/coupons/${other.id}`);
+
+    // Sending the code it already has is not a rename, so it is accepted.
+    const untouched = await expectOk('PATCH', `/v1/promotion_codes/${created.id}`, { code: 'renameme', active: false });
+    assert.equal(untouched.active, false);
+    assert.equal(untouched.valid, false);
+    await expectOk('DELETE', `/v1/promotion_codes/${created.id}`);
+  });
+
+  test('a code cannot outlive the coupon it stands for', async () => {
+    const ending = await expectOk('POST', '/v1/coupons', {
+      percent_off: 20, redeem_by: app.ctx.now() + 30 * 86_400_000,
+    });
+    const tooLong = await expectError('POST', '/v1/promotion_codes', {
+      coupon: ending.id, code: 'OUTLIVES', expires_at: app.ctx.now() + 90 * 86_400_000,
+    }, 400, 'parameter_invalid');
+    assert.equal(tooLong.param, 'expires_at');
+
+    const fits = await expectOk('POST', '/v1/promotion_codes', {
+      coupon: ending.id, code: 'FITSINSIDE', expires_at: app.ctx.now() + 10 * 86_400_000,
+    });
+    await expectOk('DELETE', `/v1/promotion_codes/${fits.id}`);
+    await expectOk('DELETE', `/v1/coupons/${ending.id}`);
+  });
+
+  test('a minimum order value on a percentage code has to name its currency', async () => {
+    const missing = await expectError('POST', '/v1/promotion_codes', {
+      coupon, code: 'FLOORLESS', minimum_amount: 50_000,
+    }, 400, 'parameter_missing');
+    assert.equal(missing.param, 'minimum_amount_currency');
+
+    const stated = await expectOk('POST', '/v1/promotion_codes', {
+      coupon, code: 'FLOOR500', minimum_amount: 50_000, minimum_amount_currency: 'usd',
+    });
+    assert.equal(stated.minimum_amount_display, '$500.00');
+    await expectOk('DELETE', `/v1/promotion_codes/${stated.id}`);
+  });
+});
+
+describe('a coupon freezes the first time it is redeemed', () => {
+  const svc = () => app.ctx.svc.catalog;
+  const REF = { type: 'subscription', id: 'sub_discount_probe' };
+
+  test('its terms stop moving, its labels do not, and releasing gives it back', async () => {
+    const coupon = await expectOk('POST', '/v1/coupons', { name: 'Freeze probe — 20% off', percent_off: 20 });
+
+    const redemption = svc().redeem(ORG, { coupon: coupon.id, ref: REF });
+    assert.match(redemption.id, /^di_/, 'the redemption carries the reserved discount prefix');
+
+    const afterRedeem = await expectOk('GET', `/v1/coupons/${coupon.id}`);
+    assert.equal(afterRedeem.times_redeemed, 1);
+    assert.equal(afterRedeem.editable, false);
+
+    const frozen = await expectError('PATCH', `/v1/coupons/${coupon.id}`, { percent_off: 40 }, 409, 'coupon_immutable');
+    assert.match(frozen.message, /percent_off/);
+    assert.equal((await expectOk('GET', `/v1/coupons/${coupon.id}`)).percent_off, 20, 'and nothing moved');
+
+    const relabelled = await expectOk('PATCH', `/v1/coupons/${coupon.id}`, { name: 'Freeze probe — still 20% off' });
+    assert.equal(relabelled.percent_off, 20);
+
+    const undeletable = await expectError('DELETE', `/v1/coupons/${coupon.id}`, undefined, 409, 'coupon_in_use');
+    assert.match(undeletable.message, /active: false/);
+
+    // The mirror image: the subscription never billed, so the redemption goes
+    // back and the coupon is editable again.
+    const released = svc().releaseRedemption(ORG, REF);
+    assert.equal(released.length, 1);
+    assert.equal((await expectOk('GET', `/v1/coupons/${coupon.id}`)).times_redeemed, 0);
+    await expectOk('PATCH', `/v1/coupons/${coupon.id}`, { percent_off: 40 });
+    await expectOk('DELETE', `/v1/coupons/${coupon.id}`);
+  });
+
+  test('redeeming the same thing twice does not spend two redemptions', async () => {
+    const coupon = await expectOk('POST', '/v1/coupons', { percent_off: 10, max_redemptions: 1 });
+    const first = svc().redeem(ORG, { coupon: coupon.id, ref: REF });
+    const retry = svc().redeem(ORG, { coupon: coupon.id, ref: REF });
+    assert.equal(retry.id, first.id, 'a retry gets the row it already has');
+    assert.equal(svc().requireCoupon(ORG, coupon.id).times_redeemed, 1);
+
+    assert.throws(
+      () => svc().redeem(ORG, { coupon: coupon.id, ref: { type: 'subscription', id: 'sub_second_probe' } }),
+      (e: any) => e.code === 'coupon_not_redeemable' && /full 1 time/.test(e.message),
+    );
+
+    svc().releaseRedemption(ORG, REF);
+    await expectOk('DELETE', `/v1/coupons/${coupon.id}`);
+  });
+
+  test('a per-customer limit counts that customer, not the campaign', async () => {
+    const customer = app.ctx.svc.billing.customers(ORG, { limit: 1 })[0];
+    assert.ok(customer, 'the demo workspace has customers to redeem against');
+
+    const coupon = await expectOk('POST', '/v1/coupons', { percent_off: 10 });
+    const code = await expectOk('POST', '/v1/promotion_codes', {
+      coupon: coupon.id, code: 'ONCEEACH', max_redemptions_per_customer: 1,
+    });
+
+    const refA = { type: 'subscription', id: 'sub_percustomer_a' };
+    const refB = { type: 'subscription', id: 'sub_percustomer_b' };
+    svc().redeem(ORG, { coupon: coupon.id, promotion_code: code.id, customer: customer.id, ref: refA });
+    assert.equal(svc().customerRedemptions(ORG, code.id, customer.id), 1);
+
+    assert.throws(
+      () => svc().redeem(ORG, { coupon: coupon.id, promotion_code: code.id, customer: customer.id, ref: refB }),
+      (e: any) => e.code === 'promotion_code_not_redeemable' && /per account/.test(e.message),
+    );
+
+    const other = app.ctx.svc.billing.customers(ORG, { limit: 2 })[1];
+    assert.ok(other && other.id !== customer.id);
+    const second = svc().redeem(ORG, { coupon: coupon.id, promotion_code: code.id, customer: other.id, ref: refB });
+    assert.equal(second.customer, other.id, 'a different account is a different count');
+
+    svc().releaseRedemption(ORG, refA);
+    svc().releaseRedemption(ORG, refB);
+    await expectOk('DELETE', `/v1/promotion_codes/${code.id}`);
+    await expectOk('DELETE', `/v1/coupons/${coupon.id}`);
+  });
+
+  test('a code that stands for another coupon cannot be redeemed against this one', async () => {
+    const a = await expectOk('POST', '/v1/coupons', { percent_off: 10 });
+    const b = await expectOk('POST', '/v1/coupons', { percent_off: 20 });
+    const code = await expectOk('POST', '/v1/promotion_codes', { coupon: a.id, code: 'BELONGSTOA' });
+    assert.throws(
+      () => svc().redeem(ORG, { coupon: b.id, promotion_code: code.id, ref: { type: 'quote', id: 'qt_probe' } }),
+      (e: any) => e.param === 'promotion_code',
+    );
+    await expectOk('DELETE', `/v1/promotion_codes/${code.id}`);
+    await expectOk('DELETE', `/v1/coupons/${a.id}`);
+    await expectOk('DELETE', `/v1/coupons/${b.id}`);
+  });
+});
+
+describe('POST /v1/coupons/preview shows the arithmetic', () => {
+  test('it agrees, to the cent, with the function billing will call', async () => {
+    const coupon = await expectOk('POST', '/v1/coupons', { percent_off: 12.5, duration: 'once' });
+    const preview = await expectOk('POST', '/v1/coupons/preview', { coupon: coupon.id, amount: 9999 });
+    const expected = discountOn(app.ctx.svc.catalog.requireCoupon(ORG, coupon.id), 9999, 'usd');
+    assert.equal(preview.discount.amount, expected.amount);
+    assert.equal(preview.discount.remaining, expected.remaining);
+    assert.equal(preview.discount.amount_display, formatMinor(expected.amount, 'usd'));
+    assert.equal(preview.valid, true);
+    await expectOk('DELETE', `/v1/coupons/${coupon.id}`);
+  });
+
+  test('an unknown code is answered, not 404-ed, so a checkout can say why', async () => {
+    const body = await expectOk('POST', '/v1/coupons/preview', { code: 'NOSUCHCODE', amount: 10_000 });
+    assert.equal(body.valid, false);
+    assert.equal(body.reason, 'unknown_code');
+    assert.match(body.message, /NOSUCHCODE/);
+    assert.equal(body.discount, null);
+  });
+
+  test('it insists on exactly one coupon and exactly one basis', async () => {
+    await expectError('POST', '/v1/coupons/preview', { amount: 100 }, 400, 'parameter_missing');
+    await expectError('POST', '/v1/coupons/preview', {
+      coupon: 'coup_nw_partner', code: 'NWPARTNER10', amount: 100,
+    }, 400, 'parameter_invalid');
+    await expectError('POST', '/v1/coupons/preview', { coupon: 'coup_nw_partner' }, 400, 'parameter_missing');
+    await expectError('POST', '/v1/coupons/preview', {
+      coupon: 'coup_nw_partner', amount: 100, lines: [{ amount: 100 }],
+    }, 400, 'parameter_invalid');
+  });
+
+  test('the shares it prints sum to the discount it charges', async () => {
+    const body = await expectOk('POST', '/v1/coupons/preview', {
+      code: 'NWPARTNER10',
+      lines: [
+        { id: 'plan', price: 'price_nw_growth_monthly', amount: 29_900 },
+        { id: 'seats', price: 'price_nw_growth_seat_monthly', amount: 14_000 },
+        { id: 'events', price: 'price_nw_telemetry_events', amount: 18_333 },
+      ],
+    });
+    const summed = body.discount.lines.reduce((acc: number, line: any) => acc + line.discount, 0);
+    assert.equal(summed, body.discount.amount);
+    assert.equal(body.discount.eligible_subtotal, 29_900, 'the partner rate is on the platform fee only');
+    assert.equal(body.discount.lines.find((l: any) => l.id === 'events').discount, 0);
+  });
+});
+
+describe('Northwind’s own concessions', () => {
+  test('the price book ships with the discounts the sales team actually gives', async () => {
+    const coupons = await expectOk('GET', '/v1/coupons?limit=200');
+    const byId = new Map(coupons.data.map((c: any) => [c.id, c]));
+    assert.ok(coupons.total_count >= 3);
+
+    const yearOne: any = byId.get('coup_nw_year_one');
+    assert.ok(yearOne, 'the negotiated "20% off year one" the pipeline assumes');
+    assert.equal(yearOne.percent_off_basis_points, 2000);
+    assert.equal(yearOne.duration, 'repeating');
+    assert.equal(yearOne.duration_in_periods, 12);
+    assert.equal(yearOne.valid, true);
+
+    const commissioning: any = byId.get('coup_nw_commissioning_500');
+    assert.equal(commissioning.amount_off, 50_000);
+    assert.equal(commissioning.currency, 'usd');
+    assert.deepEqual(commissioning.applies_to.products, ['prod_nw_onboarding']);
+
+    const partner: any = byId.get('coup_nw_partner');
+    assert.equal(partner.duration, 'forever');
+    assert.ok(partner.applies_to.prices.includes('price_nw_growth_monthly'));
+    assert.ok(!partner.applies_to.prices.includes('price_nw_telemetry_events'));
+
+    const codes = await expectOk('GET', '/v1/promotion_codes?limit=200');
+    const byCode = new Map(codes.data.map((c: any) => [c.code, c]));
+    assert.equal((byCode.get('AUTOMATE26') as any).coupon, 'coup_nw_commissioning_500');
+    assert.equal((byCode.get('NWPARTNER10') as any).restrictions.minimum_amount, 50_000);
+  });
+
+  test('the commissioning coupon takes exactly $500 off the seeded commissioning fee', () => {
+    const svc = app.ctx.svc.catalog;
+    const coupon = svc.requireCoupon(ORG, 'coup_nw_commissioning_500');
+    const fee = svc.compute(svc.requirePrice(ORG, 'price_nw_onboarding'), 1, 'usd');
+    const applied = svc.discountOn(coupon, fee.amount, 'usd', { product: 'prod_nw_onboarding' });
+    assert.equal(applied.amount, coupon.amount_off);
+    assert.equal(applied.remaining, fee.amount - (coupon.amount_off ?? 0));
+    assert.ok(applied.remaining > 0, 'the fee is larger than the concession, so nothing is capped');
+    assert.equal(applied.capped, false);
+  });
+
+  test('year one on a seeded plan is 20% of what that plan actually costs', () => {
+    const svc = app.ctx.svc.catalog;
+    const coupon = svc.requireCoupon(ORG, 'coup_nw_year_one');
+    const plan = svc.requirePrice(ORG, 'price_nw_growth_monthly');
+    const line = svc.compute(plan, 1, 'usd');
+    const applied = svc.discountOn(coupon, line.amount, 'usd');
+    assert.equal(applied.amount, Number(oraclePercentDiscount(BigInt(line.amount), 2000n)));
+    assert.equal(svc.discountPeriods(coupon), 12);
+    assert.equal(svc.couponAppliesToPeriod(coupon, 12), false, 'and month thirteen is at list price');
+  });
+});
+
+describe('the price book’s advice names something that exists', () => {
+  test('the negative-rate refusal points at a route this platform serves', async () => {
+    const error = await expectError('POST', '/v1/prices', {
+      product: 'prod_nw_growth', currency: 'usd', recurring: { interval: 'month' }, unit_amount_decimal: '-4',
+    }, 400, 'parameter_invalid');
+
+    // The sentence used to send the operator to "discount with a coupon" when
+    // no coupon existed anywhere in the platform — advice that led nowhere.
+    const cited = error.message.match(/\b(GET|POST|PATCH|DELETE) (\/v1\/[A-Za-z0-9_\-/:.]+)/g) ?? [];
+    assert.ok(cited.length > 0, `the refusal recommends a remedy but names no route: "${error.message}"`);
+
+    const served = new Set(app.ctx.router.routes.map((r) => `${r.method} ${r.path}`));
+    for (const route of cited) {
+      assert.ok(served.has(route), `"${error.message}" recommends ${route}, which nothing serves`);
+    }
+    assert.match(error.message, /coupon/, 'and it is still the coupon it points at');
   });
 });

@@ -235,3 +235,158 @@ export interface PriceUsage {
   /** True once anything has ever billed against this price. */
   in_use: boolean;
 }
+
+/* --------------------------------- discounts ------------------------------ */
+
+/**
+ * How long a coupon keeps applying once it is attached to something that
+ * renews. `once` is the first billing period only, `repeating` is
+ * `duration_in_periods` of them, `forever` never stops — the three answers a
+ * negotiated "20% off year one" needs, said in periods rather than months
+ * because a subscription's period is whatever its price says it is.
+ */
+export type CouponDuration = 'once' | 'repeating' | 'forever';
+
+export const COUPON_DURATIONS = ['once', 'repeating', 'forever'] as const;
+
+/**
+ * What a coupon is allowed to touch. Both lists empty means the whole basket;
+ * otherwise a line qualifies only by naming one of these prices or products,
+ * which is how "20% off the platform fee, not the metered events" is written.
+ */
+export interface CouponAppliesTo {
+  products: string[];
+  prices: string[];
+}
+
+export interface Coupon {
+  object: 'coupon';
+  id: string;
+  /** Internal label — "Q1 land-and-expand", not the code a customer types. */
+  name: string | null;
+  /**
+   * Percentage off as a person writes it: `20` is 20%, `33.33` is a third.
+   * Null on an amount-off coupon; the two are mutually exclusive.
+   */
+  percent_off: number | null;
+  /**
+   * The same figure with no float in it — hundredths of a percent, so 20% is
+   * 2000 and 33.33% is 3333. This is the number the arithmetic actually reads;
+   * `percent_off` is the readable spelling of it.
+   */
+  percent_off_basis_points: number | null;
+  /** Integer minor units taken off, in `currency`. Null on a percent coupon. */
+  amount_off: number | null;
+  /** Required with `amount_off`, and null without it: a percentage travels. */
+  currency: string | null;
+  duration: CouponDuration;
+  /** Only set when `duration` is `repeating`. */
+  duration_in_periods: number | null;
+  max_redemptions: number | null;
+  /** Counted from the redemption rows, never from a column that can drift. */
+  times_redeemed: number;
+  redeem_by: number | null;
+  applies_to: CouponAppliesTo;
+  /** False once archived: it stops being redeemable but keeps explaining old bills. */
+  active: boolean;
+  /** Active, in date, and not exhausted — the one field a checkout has to read. */
+  valid: boolean;
+  metadata: Record<string, string>;
+  created: number;
+  updated: number;
+  livemode: boolean;
+}
+
+/**
+ * Conditions a code carries that the coupon behind it does not. A coupon is
+ * the discount; the code is one way of handing it out, and two codes for the
+ * same coupon can have different floors and different expiries.
+ */
+export interface PromotionCodeRestrictions {
+  /** The order has to reach this, in minor units, before the code applies. */
+  minimum_amount: number | null;
+  minimum_amount_currency: string | null;
+  /** Only redeemable by an account that has never been billed before. */
+  first_time_transaction: boolean;
+}
+
+export interface PromotionCode {
+  object: 'promotion_code';
+  id: string;
+  /** What the customer types. Upper-cased on the way in, unique per workspace. */
+  code: string;
+  coupon: string;
+  active: boolean;
+  expires_at: number | null;
+  max_redemptions: number | null;
+  max_redemptions_per_customer: number | null;
+  times_redeemed: number;
+  restrictions: PromotionCodeRestrictions;
+  /** The code's own standing — the coupon behind it is checked separately. */
+  valid: boolean;
+  metadata: Record<string, string>;
+  created: number;
+  updated: number;
+  livemode: boolean;
+}
+
+/**
+ * One coupon, taken up once. The id carries the reserved `di_` prefix because
+ * this row *is* the discount from the catalogue's side: billing hangs its own
+ * subscription- or invoice-level object off it, and the count of these rows is
+ * what `times_redeemed` reports.
+ */
+export interface CouponRedemption {
+  object: 'coupon_redemption';
+  id: string;
+  coupon: string;
+  promotion_code: string | null;
+  customer: string | null;
+  /** What holds the discount — a subscription, an invoice, a quote. */
+  ref: { type: string; id: string } | null;
+  created: number;
+}
+
+/** One line the discount was spread across, with its exact share. */
+export interface DiscountedLine {
+  index: number;
+  /** The caller's own id for the line, echoed back untouched. */
+  id: string | null;
+  eligible: boolean;
+  amount: number;
+  discount: number;
+  /** This line's exact, unrounded share before the single rounding. */
+  discount_decimal: string;
+  remaining: number;
+}
+
+export interface AppliedDiscount {
+  object: 'applied_discount';
+  coupon: string;
+  currency: string;
+  /** Every line handed in. */
+  subtotal: number;
+  /** Only the lines this coupon covers, and only the positive ones. */
+  eligible_subtotal: number;
+  amount: number;
+  /** The exact, unrounded discount, before it was rounded once. */
+  amount_decimal: string;
+  remaining: number;
+  /** True when an amount-off coupon was larger than the amount it met. */
+  capped: boolean;
+  lines: DiscountedLine[];
+}
+
+export type CouponInvalidReason = 'inactive' | 'expired' | 'exhausted';
+
+export type PromotionCodeInvalidReason =
+  | 'code_inactive' | 'code_expired' | 'code_exhausted' | 'customer_limit_reached'
+  | 'below_minimum_amount' | 'not_first_transaction'
+  | 'coupon_inactive' | 'coupon_expired' | 'coupon_exhausted';
+
+export interface Validity<R extends string> {
+  valid: boolean;
+  reason: R | null;
+  /** Why, in words the operator or the customer can be shown. */
+  message: string | null;
+}

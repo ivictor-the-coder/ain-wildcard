@@ -558,8 +558,13 @@ test.describe('a money measure asked for in a currency it does not hold', () => 
     await signIn(page, request);
     const asked = 'What is our overdue balance in GBP?';
     const { thread, answers } = await threadWith(request, [asked]);
-    // The premise: the engine refuses with a sentence about the whole measure.
-    expect(answers[0].content).toMatch(/carry no currency book|there is no GBP book/);
+    // The premise: the engine refuses, and it does so without the falsehood it
+    // used to state. It said "we carry no currency book" over a workspace that
+    // holds several; it now names the books it does hold and says GBP is not
+    // among them.
+    expect(answers[0].content).toMatch(/is held in [A-Z]{3}/);
+    expect(answers[0].content).not.toMatch(/carry no currency book|there is no GBP book/);
+    expect(answers[0].content).toContain('GBP');
 
     await visit(page, `/copilot?thread=${thread.id}`, '.cp-answer');
     const answer = page.locator('.cp-answer').last();
@@ -584,8 +589,17 @@ test.describe('the promise that every record an answer used is cited', () => {
     const company = await postJson<CompanyRecord>(request, '/api/v1/records/company', { properties: { name } });
     const asked = `How many open tickets does ${name} have?`;
     const { thread, answers } = await threadWith(request, [asked, 'How many invoices are open?']);
+    // A company with nothing on it has no row to name, so this one still cites
+    // nothing — that is the honest case the card has to speak for.
     expect(answers[0].citations, 'the engine cited something after all').toHaveLength(0);
-    expect(answers[1].citations).toHaveLength(0);
+    // The counting question, though, is measured over rows that exist, and it
+    // used to promise a citation and give none. It names them now.
+    expect(answers[1].citations.length, 'a countable answer still cites nothing').toBeGreaterThan(0);
+    for (const cited of answers[1].citations) {
+      expect(cited.type).toBe('invoice');
+      expect(cited.id).toMatch(/^in_/);
+      expect(cited.label, 'a citation with no label is not a citation').toBeTruthy();
+    }
 
     await visit(page, `/copilot?thread=${thread.id}`, '.cp-answer');
     const scoped = page.locator('.cp-answer').first();
@@ -593,11 +607,14 @@ test.describe('the promise that every record an answer used is cited', () => {
     await expect(sources).toContainText(name, { timeout: 15_000 });
     await expect(sources).toHaveAttribute('href', `/companies/${company.id}`);
 
-    // Where the plan named no record, the card says what it measured instead of
-    // leaving the promise silently unkept.
+    // And the counting answer shows the rows it counted, rather than saying it
+    // was measured over a set nobody can inspect. These are citations — the
+    // records the answer was read from — not the plan's own scope chips.
     const counted = page.locator('.cp-answer').last();
-    await expect(counted).toContainText('it is measured over a set', { timeout: 15_000 });
-    await expect(counted.locator('[data-plan-sources]')).toHaveCount(0);
+    const cited = counted.locator('.cp-chips').filter({ hasText: 'Sources' });
+    await expect(cited.first()).toBeVisible({ timeout: 15_000 });
+    expect(await cited.locator('.cp-chip').count(), 'the card cited fewer rows than the answer carried')
+      .toBe(answers[1].citations.length);
 
     // The empty state no longer promises what a quarter of the shapes cannot do.
     await visit(page, '/copilot?new=1', '.ain-empty');

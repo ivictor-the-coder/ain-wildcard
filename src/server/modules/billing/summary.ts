@@ -37,8 +37,22 @@ export interface OpenInvoice {
   total: number;
   amount_due: number;
   due_date: number | null;
+  /**
+   * When the bill was sent, for a reader that keeps it. A bill with no due date
+   * is due on receipt and ages from here; a reader that cannot say falls back
+   * to `created`.
+   */
+  finalized_at?: number | null;
   created: number;
 }
+
+/**
+ * The day a bill falls due — the collections report's `dueAt`, over whatever
+ * this seam's reader could tell us. Reading `due_date` alone and dropping the
+ * nulls meant "an invoice has been overdue since…" never fired for a bill with
+ * no terms, which is the earliest due date there is.
+ */
+const dueAt = (invoice: OpenInvoice): number => invoice.due_date ?? invoice.finalized_at ?? invoice.created;
 
 /**
  * The extension point. It is deliberately tiny: this screen only ever asks
@@ -309,9 +323,16 @@ export function buildCustomerSummary(
       start: upcoming.current_period_end,
       end: addInterval(upcoming.current_period_end, iv, upcoming.billing_cycle_anchor_day),
     };
+    // What the subscription will be carrying when that bill is raised, which is
+    // not what it carries today if a schedule moves it onto another phase
+    // first. The phase boundary is a period boundary, so the panel quoted the
+    // plan the account is leaving right up to the morning it left it — the same
+    // substitution `applyPhase` makes when the phase actually lands.
+    const phase = billing.phaseCovering(orgId, upcoming, period.start);
+    const items = phase ? billing.phaseItems(upcoming, phase) : upcoming.items;
     const lines = upcoming.cancel_at_period_end
       ? []
-      : recurringLines(upcoming.items, period, { book, currency: upcoming.currency, locale });
+      : recurringLines(items, period, { book, currency: upcoming.currency, locale });
     // The same rate engine the bill itself runs, on the same lines: a screen
     // that predicts a total the invoice will not charge is not a prediction.
     //
@@ -362,7 +383,7 @@ export function buildCustomerSummary(
     // disagreement went unseen.
     const estimatedTotal = Math.max(0, gross + customer.balance);
     const balanceApplied = estimatedTotal - gross;
-    const metered = upcoming.items.filter((item) => isMetered(book.price(item.price)));
+    const metered = items.filter((item) => isMetered(book.price(item.price)));
     nextInvoice = {
       subscription: upcoming.id,
       date: upcoming.current_period_end,
@@ -387,16 +408,27 @@ export function buildCustomerSummary(
 
   const openInvoices = reader.openInvoices(orgId, customerId);
   const openTotal = openInvoices.reduce((total, invoice) => total + invoice.amount_due, 0);
-  const oldestDue = openInvoices
-    .map((invoice) => invoice.due_date)
-    .filter((due): due is number => due !== null)
-    .sort((a, b) => a - b)[0] ?? null;
+  const oldestDue = openInvoices.map(dueAt).sort((a, b) => a - b)[0] ?? null;
 
   /* -------------------------------- attention ------------------------------ */
 
   const attention: string[] = [];
   if (customer.delinquent) {
-    attention.push(`${customer.name} is delinquent — ${(byStatus.past_due ?? 0) + (byStatus.unpaid ?? 0)} subscription(s) are not being collected.`);
+    // Two reasons, and they send a support agent to two different places. The
+    // sentence named only the second, so an account whose subscription was
+    // collecting perfectly well and whose bills were two months late was told
+    // "0 subscription(s) are not being collected".
+    const arrears = (byStatus.past_due ?? 0) + (byStatus.unpaid ?? 0);
+    const late = openInvoices.filter((invoice) => dueAt(invoice) <= now);
+    const because = [
+      arrears ? `${arrears} subscription${arrears === 1 ? ' is' : 's are'} not being collected` : '',
+      late.length ? `${late.length} invoice${late.length === 1 ? ' is' : 's are'} past the day ${late.length === 1 ? 'it' : 'they'} fell due` : '',
+    ].filter(Boolean);
+    attention.push(because.length
+      ? `${customer.name} is delinquent — ${because.join(', and ')}.`
+      // A reader that cannot list this account's bills can still be told the
+      // standing; it is the one thing the flag is certain of.
+      : `${customer.name} is delinquent — the business is chasing money on this account.`);
   }
   // The one thing on this screen that stops a bill going out, so it is said
   // before the things that only slow one down.
@@ -436,7 +468,10 @@ export function buildCustomerSummary(
       `${oldest.number ?? oldest.id}, raised ${longDate(oldest.created, locale)}.`,
     );
   }
-  if (oldestDue !== null && oldestDue < now) {
+  // `<=`, not `<`: the same threshold the sentence above it and the collections
+  // report both use, so one payload cannot call an account delinquent over a
+  // bill and then decline to say the bill is overdue.
+  if (oldestDue !== null && oldestDue <= now) {
     attention.push(`An invoice has been overdue since ${longDate(oldestDue, locale)}.`);
   }
 

@@ -2792,3 +2792,146 @@ describe('a relative date resolves in the workspace’s own calendar', () => {
     );
   });
 });
+
+/**
+ * The three doors this module opens onto the kernel: an instant, a currency and
+ * a canonical form. Each was answering a different question from the one the
+ * caller asked.
+ */
+describe('an instant spelled the way the API prints it', () => {
+  test('logs an activity at the moment the caller meant', async () => {
+    const company = (await expectOk('GET', '/v1/records/company?limit=1')).data[0] as CrmRecord;
+    const when = Date.UTC(2026, 1, 17, 14, 5, 30, 250);
+
+    // Every timestamp Ain emits is an integer, and JSON from a form, a CSV
+    // column or a shell script carries it as text. The route's own schema says
+    // `integer`; it used to answer 400 to one.
+    const logged = await expectOk('POST', `/v1/records/company/${company.id}/activities`, {
+      type: 'call', subject: 'Quarterly telemetry review', occurred_at: String(when),
+    });
+    assert.equal(logged.properties.occurred_at, when);
+
+    const iso = await expectOk('POST', `/v1/records/company/${company.id}/activities`, {
+      type: 'call', subject: 'Same call, ISO spelling', occurred_at: new Date(when).toISOString(),
+    });
+    assert.equal(iso.properties.occurred_at, when, 'both spellings must name the same instant');
+
+    const nonsense = await call('POST', `/v1/records/company/${company.id}/activities`, {
+      type: 'call', subject: 'Not a time', occurred_at: 'last thursday',
+    });
+    assert.equal(nonsense.status, 400, 'and something that is not a time is still refused');
+    assert.equal(nonsense.body.error.param, 'occurred_at');
+  });
+});
+
+describe('a currency property is denominated in a real currency', () => {
+  test('refuses a code the ISO-4217 register has never held', async () => {
+    const refused = await call('POST', '/v1/objects/company/properties', {
+      name: 'tooling_budget_zzz', label: 'Tooling budget', type: 'currency', currency: 'zzz',
+    });
+    // A property's currency is what every cell, rollup and export of it is
+    // formatted in: "ZZZ 12,500.00" on a screen, for the life of the property.
+    assert.equal(refused.status, 400, 'a made-up currency was written onto a property');
+    assert.equal(refused.body.error.code, 'parameter_invalid');
+    assert.equal(refused.body.error.param, 'currency');
+    assert.match(refused.body.error.message, /Invalid currency: zzz/);
+
+    const accepted = await expectOk('POST', '/v1/objects/company/properties', {
+      name: 'tooling_budget_sek', label: 'Tooling budget (SEK)', type: 'currency', currency: 'sek',
+    });
+    assert.equal(accepted.currency, 'sek', 'a real code, however unusual, still goes through');
+  });
+});
+
+describe('the API links two types only when something connects them', () => {
+  const concreteTypes = (types: { from_object: string; to_object: string }[], a: string, b: string) =>
+    types.filter((t) => (t.from_object === a && t.to_object === b) || (t.from_object === b && t.to_object === a));
+
+  test('two deals, which nothing connects, are refused rather than filed under "Logged on"', async () => {
+    const types = (await expectOk('GET', '/v1/association-types')).data as { from_object: string; to_object: string }[];
+    assert.deepEqual(concreteTypes(types, 'deal', 'deal'), [],
+      'this workspace grew a deal→deal type; the fixture no longer tests anything');
+
+    const deal = (properties: Record<string, unknown>) => expectOk('POST', '/v1/records/deal', { properties });
+    const first = await deal({ name: 'Undefined link probe A', amount: 40_000_00, deal_stage: 'qualification' });
+    const second = await deal({ name: 'Undefined link probe B', amount: 12_000_00, deal_stage: 'qualification' });
+
+    // `activity_to_record` is `* → *`, so this used to fall through to it: the
+    // two deals came back linked, labelled "Logged on", on a schema that says
+    // nothing connects them. The record page never offered it; a script, the
+    // copilot's association tool and this route all did.
+    const linked = await call('POST', '/v1/associations', { from_id: first.id, to_id: second.id });
+    assert.equal(linked.status, 400, `two deals were linked as ${JSON.stringify(linked.body?.association_type)}`);
+    assert.equal(linked.body.error.code, 'association_undefined');
+    assert.equal(linked.body.error.param, 'association_type');
+
+    const edges = await expectOk('GET', `/v1/records/deal/${first.id}/associations`);
+    assert.deepEqual(edges.data, [], 'the refusal must leave no edge behind');
+
+    // The same door in the other direction, and the one `associate_to` opens.
+    const reverse = await call('POST', '/v1/associations', { from_id: second.id, to_id: first.id });
+    assert.equal(reverse.status, 400);
+    const onCreate = await call('POST', '/v1/records/deal', {
+      properties: { name: 'Undefined link probe C', amount: 5_000_00, deal_stage: 'qualification' },
+      associate_to: [first.id],
+    });
+    assert.equal(onCreate.status, 400, 'associate_to takes the same fallback');
+  });
+
+  test('but an engagement still lands on a record, which is the job the wildcard has', async () => {
+    const company = (await expectOk('GET', '/v1/records/company?limit=1')).data[0] as CrmRecord;
+    const note = await expectOk('POST', '/v1/records/note', {
+      properties: {
+        subject: 'Wildcard still works', body: 'Logged without naming an association type.',
+        occurred_at: Date.UTC(2026, 1, 17, 9, 0),
+      },
+    });
+
+    const edge = await expectOk('POST', '/v1/associations', { from_id: note.id, to_id: company.id });
+    assert.equal(edge.association_type, 'activity_to_record');
+
+    // And from the record's end, where the activity is the `to_id`: the type is
+    // the same one, with the two records the right way round.
+    const other = (await expectOk('GET', '/v1/records/company?limit=2')).data[1] as CrmRecord;
+    const swapped = await expectOk('POST', '/v1/associations', { from_id: other.id, to_id: note.id });
+    assert.equal(swapped.association_type, 'activity_to_record');
+    const fromNote = await expectOk('GET', `/v1/records/note/${note.id}/associations`);
+    assert.deepEqual(
+      (fromNote.data as { record_id: string; direction: string }[]).map((e) => e.direction).sort(),
+      ['outgoing', 'outgoing'],
+      'the activity is the "from" end of both edges, whichever way it was sent',
+    );
+  });
+});
+
+describe('one definition of a canonical value, shared by both sides', () => {
+  test('the server stores exactly what the shared canonicaliser predicts', async () => {
+    const { canonicalLookupValue, normaliseText } = await import('../src/shared/canonical');
+    const domain = await expectOk('GET', '/v1/objects/company/properties/domain');
+    assert.equal(domain.normalize, 'domain', 'the fixture assumes domain is canonicalised on write');
+
+    const typed = 'HTTPS://WWW.Vestland-Marine.example:8443/about?ref=1';
+    const company = await expectOk('POST', '/v1/records/company', {
+      properties: { name: 'Vestland Marine', domain: typed, description: 'Norwegian yard automating hull-section welding cells across two docks.' },
+    });
+    assert.equal(company.properties.domain, normaliseText(typed, domain.normalize),
+      'the write path and the shared helper must agree, or the importer preview cannot be trusted');
+
+    // Which is the whole point: the importer's "Check" step has to be able to
+    // work out, client-side, that this row updates that company rather than
+    // creating a second one.
+    const again = 'vestland-marine.example/careers';
+    assert.equal(
+      canonicalLookupValue({ type: domain.type, normalize: domain.normalize }, again),
+      canonicalLookupValue({ type: domain.type, normalize: domain.normalize }, typed),
+      'two spellings of one domain must canonicalise to one lookup key',
+    );
+    const upsert = await expectOk('POST', '/v1/records/company/batch', {
+      operation: 'upsert', id_property: 'domain',
+      records: [{ properties: { domain: again, name: 'Vestland Marine AS' } }],
+    });
+    assert.equal(upsert.updated, 1, 'the server matched the existing company');
+    assert.equal(upsert.created, 0);
+    assert.equal(upsert.results[0].id, company.id);
+  });
+});

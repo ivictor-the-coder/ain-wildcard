@@ -1,3 +1,6 @@
+import {
+  NORMALISERS, canonicalDigits, canonicalDomain, canonicalLookupValue, normaliseText,
+} from '../../../shared/canonical';
 import { badRequest } from '../../../shared/errors';
 import { DAY, HOUR, MINUTE, WEEK, addInterval, civilDay, startOfDay, startOfMonth } from '../../../shared/time';
 import type { PropertyDef, PropertyNormaliser, PropertyValue, RelativeUnit } from './types';
@@ -102,50 +105,13 @@ export function resolveDate(raw: unknown, now: number, timeZone?: string): numbe
 /* ----------------------------- canonical forms ---------------------------- */
 
 /**
- * The canonical form of a web domain: no scheme, no `www.`, no path, no port,
- * no trailing dot, lowercased and trimmed. `https://WWW.Andinaenvases.CL/about`
- * and `andinaenvases.cl ` are the same company, and a dedupe key that cannot
- * see that is not a dedupe key.
+ * Canonicalisation itself lives in `src/shared/canonical.ts` so the importer's
+ * "Check" step can answer with the same rule the write path applies. Re-exported
+ * here because this module is still the CRM's one door onto value handling.
  */
-export function canonicalDomain(raw: unknown): string {
-  let value = String(raw ?? '').trim().toLowerCase();
-  if (!value) return '';
-  value = value.replace(/^[a-z][a-z0-9+.-]*:\/\//, '');
-  value = value.replace(/^[^@/]*@/, '');
-  value = value.split(/[/?#]/)[0];
-  value = value.replace(/:\d+$/, '');
-  value = value.replace(/^www\./, '');
-  return value.replace(/\.+$/, '');
-}
+export { NORMALISERS, canonicalDigits, canonicalDomain, canonicalLookupValue, normaliseText };
 
 const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/;
-
-export const canonicalDigits = (raw: unknown): string => String(raw ?? '').replace(/\D/g, '');
-
-/** Apply a property's declared canonical form. Runs before uniqueness. */
-export function normaliseText(value: string, normalize: PropertyNormaliser): string {
-  switch (normalize) {
-    case 'lower': return value.trim().toLowerCase();
-    case 'upper': return value.trim().toUpperCase();
-    case 'domain': return canonicalDomain(value);
-    case 'digits': return canonicalDigits(value);
-    case 'none': default: return value;
-  }
-}
-
-export const NORMALISERS: PropertyNormaliser[] = ['none', 'lower', 'upper', 'domain', 'digits'];
-
-/**
- * The form a value takes once stored, used when looking a record up by one of
- * its properties. `findBy('domain', 'WWW.Andina.CL')` has to find the record
- * stored as `andina.cl`, or keyed imports create a duplicate every run.
- */
-export function canonicalLookupValue(prop: PropertyDef | null, value: string | number): string | number {
-  if (typeof value !== 'string' || !prop) return value;
-  if (prop.type === 'email') return value.trim().toLowerCase();
-  if (prop.normalize !== 'none') return normaliseText(value, prop.normalize);
-  return value;
-}
 
 /* -------------------------------- coercion ------------------------------- */
 

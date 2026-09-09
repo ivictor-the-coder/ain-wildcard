@@ -278,7 +278,7 @@ function AssistantMessage({
   // A refusal whose stated reason is a claim about the workspace's own books
   // that its other answers contradict does not get read out as prose. What the
   // surface can stand behind goes in the banner under it instead.
-  const currency = currencyRefusal(question, card.refusal);
+  const currency = currencyRefusal(question, card.refusal, card.refusedCurrency);
   const refused = card.refusal ? splitRefusalOffer(prose).prose : null;
   const spoken = refused !== null
     ? (currency ? withoutCurrencyClaim(refused, currency.claim) : refused)

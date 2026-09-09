@@ -446,9 +446,20 @@ test('the event stream filters by type on the server and shows the whole payload
   const shownId = (await page.locator('.st-body .st-mono').filter({ hasText: /^evt_/ }).first().innerText()).trim();
   const event = await json(page, `/v1/events/${shownId}`);
   expect(event.type).toBe(type);
-  // What is on screen is what the API sent, not a summary of it.
+  // What is on screen is what a subscriber is actually posted, not a summary of
+  // it. This screen used to offer to show "exactly what a webhook would receive"
+  // over a feature that had no endpoint and no delivery behind it; now that
+  // there is one, the first block is the signed envelope itself — and the
+  // payload the envelope carries is still the event's own data, unabridged.
   const printed = JSON.parse(await payload.innerText());
-  expect(printed).toEqual(event.data);
+  if ('data' in printed && 'type' in printed) {
+    // The envelope a subscriber is posted, which wraps the event's own data as
+    // { object, previous_attributes } — the shape a webhook consumer parses.
+    expect(printed.type).toBe(event.type);
+    expect(printed.data.object).toEqual(event.data);
+  } else {
+    expect(printed).toEqual(event.data);
+  }
 });
 
 /* =============================== audit log =============================== */
@@ -1111,7 +1122,13 @@ test('the invitation says what the seat can and cannot do, and Enter in any fiel
   // seat that works before the link is opened.
   await expect(dialog(page)).toContainText('a one-time invitation link is minted');
   await expect(dialog(page)).toContainText('Ain does not send email');
-  await expect(dialog(page)).toContainText('until they open it and set a password');
+  // Acceptance verifies an existing Ain credential and only enrols a new one,
+  // so the seat is no longer waiting for a password to be *set*. The dialog
+  // used to say "until they open it and set a password", which stopped being
+  // true the moment one workspace could no longer choose another's password.
+  await expect(dialog(page)).toContainText('until they open it');
+  await expect(dialog(page)).toContainText('the one they already sign in with');
+  await expect(dialog(page)).not.toContainText('and set a password');
   await expect(dialog(page)).not.toContainText('immediately');
 
   // Enter in the second field — not only the first — submits the form.

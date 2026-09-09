@@ -10,6 +10,7 @@ import { HOLD_RELEASE_JOB } from './holds';
 import { describeCadence, describeInterval, isMetered, longDate, Pricebook, recurringLines, recurringSubtotal, subscriptionMrr } from './cycle';
 import { Billing } from './store';
 import { INVOICE_TAX_FILTERS } from './records';
+import { delinquentSql } from './receivable';
 import type {
   CustomerInput, CustomerListFilter, InvoiceListFilter, SubscriptionCreateInput, SubscriptionListFilter,
   SubscriptionUpdateInput,
@@ -469,6 +470,9 @@ export default defineModule({
         total: invoice.total,
         amount_due: invoice.amount_due,
         due_date: invoice.due_date,
+        // A bill with no terms is due on receipt, so the summary needs the day
+        // it was sent to age it at all.
+        finalized_at: invoice.finalized_at,
         created: invoice.created,
       })),
       lifetimeCollected: (orgId, customerId) => billing.invoices.lifetimeCollected(orgId, customerId),
@@ -662,7 +666,7 @@ export default defineModule({
       return list(page.data, { hasMore: page.hasMore, nextCursor: page.nextCursor, totalCount: page.totalCount, url: '/v1/customers' });
     }, {
       summary: 'List and search customers', tags: ['billing'],
-      description: 'Free text matches name, email, description and id. Filter to the accounts that still have something live with has_subscription=true.',
+      description: 'Free text matches name, email, description and id. Filter to the accounts that still have something live with has_subscription=true, or to the ones the business is chasing with delinquent=true — an account with a bill past the day it fell due, or a subscription that has stopped collecting. That is the definition /v1/revenue/collections ages on, so the list and the report name the same accounts.',
       query: v.object({
         query: v.optional(v.string({ max: 160 })),
         email: v.optional(v.string({ max: 320 })),
@@ -864,7 +868,12 @@ export default defineModule({
          */
         cross_currency_sum_minor_units: mixed ? { mrr, arr: mrr * 12, trial_mrr: trialMrr } : null,
         customers: c.db.count(`SELECT COUNT(*) FROM billing_customers WHERE org_id = ?`, orgId),
-        delinquent_customers: c.db.count(`SELECT COUNT(*) FROM billing_customers WHERE org_id = ? AND delinquent = 1`, orgId),
+        // Counted through the one receivables predicate rather than off the
+        // stored flag, which only ever moved when a *subscription* changed
+        // status: the tile said 2 past-due accounts over a book /v1/revenue/
+        // collections was ageing 3 of, and both numbers were printed as fact.
+        delinquent_customers: c.db.count(
+          `SELECT COUNT(*) FROM billing_customers c WHERE c.org_id = ? AND ${delinquentSql('c')}`, orgId, now),
         renewing_next_30_days: live.filter((sub) => sub.current_period_end <= now + 30 * 86_400_000).length,
         scheduled_to_cancel: live.filter((sub) => sub.cancel_at_period_end || sub.cancel_at).length,
         // The same rule the MRR above follows: a proration waiting on a euro
@@ -1045,7 +1054,7 @@ export default defineModule({
     }, {
       summary: 'List invoices', tags: ['billing'],
       description:
-        'status=open_like is everything still owed — drafts held back by a paused subscription and finalised bills alike. due_before finds what is overdue. tax=missing is the other queue: bills still standing for an account whose address Ain could not place — no country, or no state in a country whose tax is registered state by state — where the figure means "we never learned where they are" rather than "nothing is due".',
+        'status=open_like is the receivables book: a bill that was finalised, has not been paid, voided or written off, and still asks for money — the same set /v1/revenue/collections ages, so the two can never quote different totals. A draft is not in it; nobody has been asked for that money yet, and status=draft lists those. due_before finds what is overdue, ageing a bill from its own due date or, when it carries none, from the day it was finalised — a bill with no terms is due on receipt. tax=missing is the other queue: bills still standing for an account whose address Ain could not place — no country, or no state in a country whose tax is registered state by state — where the figure means "we never learned where they are" rather than "nothing is due".',
       query: v.object({
         customer: v.optional(v.id('cus')),
         subscription: v.optional(v.id('sub')),
@@ -1838,7 +1847,7 @@ function creditNotePayload(ctx: Ctx, orgId: string, note: CreditNote) {
     refund_amount_display: display(note.refund_amount),
     credit_amount_display: display(note.credit_amount),
     out_of_band_amount_display: display(note.out_of_band_amount),
-    routing_detail: describeRouting(note, display),
+    routing_detail: describeRouting(note, display, invoice?.amount_paid ?? 0),
   };
 }
 
@@ -1850,7 +1859,7 @@ function creditNotePayload(ctx: Ctx, orgId: string, note: CreditNote) {
  * own money onto their account, and telling them nothing had been collected is
  * the platform contradicting the `amount_paid` printed beside it.
  */
-function describeRouting(note: CreditNote, display: (amount: number) => string): string {
+function describeRouting(note: CreditNote, display: (amount: number) => string, amountPaid: number): string {
   if (note.post_payment_amount > 0) {
     const parts: string[] = [];
     if (note.refund_amount > 0) parts.push(`${display(note.refund_amount)} went back to the customer’s card through the payments module`);
@@ -1861,6 +1870,14 @@ function describeRouting(note: CreditNote, display: (amount: number) => string):
   if (note.displaced_to_balance > 0) {
     return `${display(note.pre_payment_amount - note.displaced_to_balance)} came off what the invoice asks for, which is all it was still owed; `
       + `the remaining ${display(note.displaced_to_balance)} had already been collected, so it went onto the customer’s balance and comes off the next invoice.`;
+  }
+  // A part-collected bill has money on it and still owes the rest, so neither
+  // of the sentences above fits and "nothing had been collected yet" is the
+  // platform contradicting the `amount_paid` printed beside it.
+  if (amountPaid > 0) {
+    return `${display(note.pre_payment_amount)} came off what the invoice still asks for. `
+      + `${display(amountPaid)} had already been collected on it and stays where it is — this note reduces what is left to pay `
+      + `rather than handing anything back.`;
   }
   return `${display(note.pre_payment_amount)} came off what the invoice asks for; nothing had been collected yet.`;
 }
@@ -1926,11 +1943,23 @@ function describeInvoiceStatus(invoice: Invoice, locale: string): string {
 }
 
 function schedulePayload(ctx: Ctx, orgId: string, schedule: SubscriptionSchedule) {
+  const store = billingStore(ctx).billing;
   const book = new Pricebook(ctx, orgId);
   const locale = localeOf(ctx, orgId);
   const now = ctx.now();
+  // A phase is billed in the *subscription's* currency, never in whichever one
+  // the price row happens to list first. Pricing the phase in `price.currency`
+  // and then stamping that symbol on it told every non-USD account $1,900.00
+  // for a phase that bills €1,750.00 — a falsehood the API, the copilot and
+  // every webhook consumer were handed as a fact. A schedule whose subscription
+  // does not exist yet bills in the currency the customer will be billed in.
+  const currency = (schedule.subscription ? store.subscription(orgId, schedule.subscription)?.currency : null)
+    ?? store.customer(orgId, schedule.customer)?.currency
+    ?? store.defaultCurrency(orgId);
   return {
     ...schedule,
+    /** The currency every `summary` below is stated in — the one the bills will be raised in. */
+    currency,
     phases: schedule.phases.map((phase, index) => ({
       ...phase,
       index,
@@ -1942,8 +1971,8 @@ function schedulePayload(ctx: Ctx, orgId: string, schedule: SubscriptionSchedule
           const price = book.price(item.price);
           const label = book.label(price);
           if (isMetered(price)) return `${label} (metered)`;
-          const line = book.compute(price, item.quantity, price.currency, { customUnitAmount: item.custom_unit_amount });
-          return `${item.quantity > 1 ? `${item.quantity} x ` : ''}${label} — ${formatMoney(money(line.amount, price.currency), { locale })}`;
+          const line = book.compute(price, item.quantity, currency, { customUnitAmount: item.custom_unit_amount });
+          return `${item.quantity > 1 ? `${item.quantity} x ` : ''}${label} — ${formatMoney(money(line.amount, currency), { locale })}`;
         })
         .join(', '),
       window: `${longDate(phase.start_date, locale)} to ${longDate(phase.end_date, locale)}`,

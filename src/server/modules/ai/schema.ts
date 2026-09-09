@@ -127,4 +127,19 @@ CREATE TABLE ai_usage_daily (
 CREATE INDEX idx_ai_usage_day ON ai_usage_daily(org_id, day);
 `,
   },
+  {
+    /**
+     * What a run refused, as facts.
+     *
+     * A run kept its answer, its notes and its citations, but not the structured
+     * account of what it would not do — so a thread reopened later had only the
+     * prose, and the surface read the refusal back out of it with a regex. That
+     * regex carried two patterns for two past wordings and matched none the
+     * third time the sentence was improved, which turned the card's banner and
+     * its way out of the refusal off in silence. The sentence is for the reader;
+     * this column is for the screen.
+     */
+    id: 'ai.0002_run_refusal',
+    sql: `ALTER TABLE ai_runs ADD COLUMN refusal TEXT;`,
+  },
 ];

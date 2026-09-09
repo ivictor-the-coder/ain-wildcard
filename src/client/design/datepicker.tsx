@@ -8,10 +8,19 @@ import { formatDate, formatDateRange, useFormat } from './format';
 import { startOfDay } from '../../shared/time';
 import {
   addDays, addMonths, dayOf, inRange, isSameDay, isTimestamp, monthMatrix, monthOf, nextRange,
-  startOfMonthUtc, weekdayLabels, RANGE_PRESETS, type DateRange,
+  startOfMonthUtc, todayIn, weekdayLabels, RANGE_PRESETS, type DateRange,
 } from './calendar-core';
 import './fields.css';
 
+/**
+ * Every timestamp on this grid — `value`, `range`, `min`, `max`, `month`, and
+ * whatever `onSelect` hands back — is **a calendar day held at midnight UTC**,
+ * the shape a date property is stored in. It is not an instant: nothing here
+ * carries a time of day, and a caller that puts one in gets it back rounded.
+ *
+ * `today` is the exception, because "now" really is an instant: pass the
+ * clock, and `timeZone` for the zone whose day should be drawn as today.
+ */
 export interface CalendarProps {
   value?: number | null;
   onSelect?: (ts: number) => void;
@@ -24,8 +33,10 @@ export interface CalendarProps {
   min?: number;
   max?: number;
   locale?: string;
+  /** The zone the reader's day is measured in; defaults to Greenwich's. */
   timeZone?: string;
   weekStartsOn?: number;
+  /** An instant, not a day — which day it lands on is `timeZone`'s business. */
   today?: number;
   /** Hide the arrows when two calendars share one header. */
   hideNav?: 'left' | 'right' | 'none';
@@ -41,13 +52,14 @@ export interface CalendarProps {
 
 export function Calendar({
   value, onSelect, range, hoverTs, onHover, month: monthProp, onMonthChange, min, max,
-  locale = 'en-US', weekStartsOn = 0, today = Date.now(), hideNav = 'none', dayRef, className,
+  locale = 'en-US', timeZone, weekStartsOn = 0, today = Date.now(), hideNav = 'none', dayRef, className,
 }: CalendarProps) {
   // The month is a caller's number — an API field, a decoded query string, a bad
   // import. Out of range it makes every `getUTC*` NaN and throws in the month
   // label, which unmounts the tree that rendered the calendar. Fall back to the
   // month of today instead of taking the page down.
-  const now = isTimestamp(today) ? today : Date.now();
+  // The day the reader is on, as a day stamp, so it compares with the grid.
+  const now = todayIn(isTimestamp(today) ? today : Date.now(), timeZone);
   const month = isTimestamp(monthProp) ? monthProp : startOfMonthUtc(now);
   const days = useMemo(() => monthMatrix(month, weekStartsOn), [month, weekStartsOn]);
   const labels = useMemo(() => weekdayLabels(locale, weekStartsOn), [locale, weekStartsOn]);
@@ -148,11 +160,30 @@ export function Calendar({
 
 /* =============================== DatePicker =============================== */
 
+/**
+ * A day, never an instant.
+ *
+ * `value`, `min`, `max` and everything `onChange` hands back are **a calendar
+ * day held at midnight UTC** — the shape a date property is stored in. Pass an
+ * instant and the calendar reads the Greenwich day of it; a caller that needs
+ * a moment on that day (an SLA still due at 17:00, a filter on a datetime
+ * column) converts on the way in and on the way out, in the workspace's zone.
+ * That contract was undocumented, and every caller that guessed at it got the
+ * same defect: the wrong day for the four hours a day New York and Greenwich
+ * disagree.
+ *
+ * `timeZone` is the one place the zone shows: it decides which square is drawn
+ * as today and which day the "Today" button emits. It defaults to the
+ * workspace's, so "Today" means the reader's today unless a caller says
+ * otherwise.
+ */
 export interface DatePickerProps {
   value: number | null;
   onChange: (ts: number | null) => void;
   min?: number;
   max?: number;
+  /** Whose today. Defaults to the workspace timezone `useFormat` publishes. */
+  timeZone?: string;
   placeholder?: string;
   disabled?: boolean;
   invalid?: boolean;
@@ -167,17 +198,20 @@ export interface DatePickerProps {
 }
 
 export function DatePicker({
-  value, onChange, min, max, placeholder = 'Pick a date', disabled, invalid, clearable = true,
+  value, onChange, min, max, timeZone, placeholder = 'Pick a date', disabled, invalid, clearable = true,
   footer, autoFocus, id, className, ...aria
 }: DatePickerProps) {
   const fmt = useFormat();
+  const zone = timeZone ?? fmt.timeZone;
   const field = useFieldControl({ id, invalid, disabled });
   const anchor = useRef<HTMLButtonElement>(null);
   const day = useRef<HTMLButtonElement | null>(null);
   const [open, setOpen] = useState(false);
-  const [month, setMonth] = useState(() => startOfMonthUtc(value ?? fmt.now()));
+  // Opening with nothing picked lands on the reader's month, which on the last
+  // evening of a month is not the month Greenwich has already turned over to.
+  const [month, setMonth] = useState(() => startOfMonthUtc(value ?? todayIn(fmt.now(), zone)));
 
-  useEffect(() => { if (open) setMonth(startOfMonthUtc(value ?? fmt.now())); }, [open, value, fmt]);
+  useEffect(() => { if (open) setMonth(startOfMonthUtc(value ?? todayIn(fmt.now(), zone))); }, [open, value, fmt, zone]);
 
   return (
     <>
@@ -227,12 +261,13 @@ export function DatePicker({
             min={min}
             max={max}
             locale={fmt.locale}
+            timeZone={zone}
             today={fmt.now()}
           />
           <div className="ain-cal__foot" style={{ padding: '0 var(--space-5) var(--space-5)' }}>
             {footer ?? (
               <>
-                <Button size="sm" variant="ghost" onClick={() => { onChange(startOfDay(fmt.now())); setOpen(false); }}>Today</Button>
+                <Button size="sm" variant="ghost" onClick={() => { onChange(todayIn(fmt.now(), zone)); setOpen(false); }}>Today</Button>
                 {clearable && <Button size="sm" variant="ghost" onClick={() => { onChange(null); setOpen(false); }}>Clear</Button>}
               </>
             )}
@@ -245,11 +280,19 @@ export function DatePicker({
 
 /* ============================ DateRangePicker ============================= */
 
+/**
+ * Two days, inclusive — each one a midnight-UTC day stamp, the same contract
+ * `DatePickerProps` documents. `timeZone` decides whose today the presets and
+ * the ringed square mean; "Last 7 days" ending on Greenwich's tomorrow is a
+ * different week from the one the reader asked for.
+ */
 export interface DateRangePickerProps {
   value: DateRange;
   onChange: (range: DateRange) => void;
   min?: number;
   max?: number;
+  /** Whose today. Defaults to the workspace timezone `useFormat` publishes. */
+  timeZone?: string;
   disabled?: boolean;
   /** Named ranges down the left edge; pass `[]` to hide them. */
   presets?: typeof RANGE_PRESETS;
@@ -261,24 +304,29 @@ export interface DateRangePickerProps {
 }
 
 export function DateRangePicker({
-  value, onChange, min, max, disabled, presets = RANGE_PRESETS, placeholder = 'Select a period', autoFocus, id, className, ...aria
+  value, onChange, min, max, timeZone, disabled, presets = RANGE_PRESETS, placeholder = 'Select a period', autoFocus, id, className, ...aria
 }: DateRangePickerProps) {
   const fmt = useFormat();
+  const zone = timeZone ?? fmt.timeZone;
+  // Every preset is written as an offset from "today" and rounds with
+  // `startOfDay`, so handing it the reader's day rather than the instant is
+  // what makes "Month to date" end on the day they are living in.
+  const today = () => todayIn(fmt.now(), zone);
   const anchor = useRef<HTMLButtonElement>(null);
   const day = useRef<HTMLButtonElement | null>(null);
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<DateRange>(value);
   const [hover, setHover] = useState<number | null>(null);
-  const [month, setMonth] = useState(() => startOfMonthUtc(addMonths(value.start ?? fmt.now(), 0)));
+  const [month, setMonth] = useState(() => startOfMonthUtc(addMonths(value.start ?? todayIn(fmt.now(), zone), 0)));
 
-  useEffect(() => { if (open) { setDraft(value); setMonth(startOfMonthUtc(value.start ?? fmt.now())); } }, [open, value, fmt]);
+  useEffect(() => { if (open) { setDraft(value); setMonth(startOfMonthUtc(value.start ?? todayIn(fmt.now(), zone))); } }, [open, value, fmt, zone]);
 
   const label = value.start && value.end
     ? formatDateRange(value.start, value.end, { locale: fmt.locale, timeZone: 'UTC' })
     : placeholder;
 
   const activePreset = presets.find((p) => {
-    const r = p.range(fmt.now());
+    const r = p.range(today());
     return value.start !== null && value.end !== null && r.start === value.start && r.end === value.end;
   });
 
@@ -319,7 +367,7 @@ export function DateRangePicker({
                   key={preset.id}
                   type="button"
                   className={cx('ain-daterange__preset', activePreset?.id === preset.id && 'is-active')}
-                  onClick={() => { const r = preset.range(fmt.now()); onChange(r); setDraft(r); setOpen(false); }}
+                  onClick={() => { const r = preset.range(today()); onChange(r); setDraft(r); setOpen(false); }}
                 >
                   {preset.label}
                 </button>
@@ -339,6 +387,7 @@ export function DateRangePicker({
               max={max}
               hideNav="right"
               locale={fmt.locale}
+              timeZone={zone}
               today={fmt.now()}
               className="ain-cal--range"
             />
@@ -353,6 +402,7 @@ export function DateRangePicker({
               max={max}
               hideNav="left"
               locale={fmt.locale}
+              timeZone={zone}
               today={fmt.now()}
               className="ain-cal--range"
             />

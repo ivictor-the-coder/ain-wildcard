@@ -25,6 +25,13 @@ export const ENGINE_MODEL = 'ain-engine-1';
 
 export type RefusalCode = 'no_template' | 'slot_unbound' | 'no_tools' | 'tool_failed';
 
+/** Which measure was refused, in which currency, and what this workspace holds. */
+export interface RefusedCurrency {
+  measure: string;
+  currency: string;
+  books: string[];
+}
+
 export interface EngineAnalysis {
   question: string;
   /** Which engine produced this answer. */
@@ -34,6 +41,13 @@ export interface EngineAnalysis {
   /** Every slot the question filled, and the typed value it bound to. */
   slots: { name: string; kind: string; text: string; label: string; qualifier: QualifierKind | null }[];
   refusal: { code: RefusalCode; why: string } | null;
+  /**
+   * A money measure the engine would not narrow to the currency that was asked
+   * for, as facts: which measure, which currency, and the books the workspace
+   * actually holds. The card used to recover these from the refusal sentence
+   * with a regex, so every improvement to the wording silently disabled it.
+   */
+  refusedCurrency: RefusedCurrency | null;
   /** The shapes offered instead, as concrete questions. */
   nearest: Nearest[];
   plan: PlanStep[];
@@ -209,6 +223,7 @@ export function builtinEngine(): AiProvider {
       let content = '';
       let citations: Citation[] = [];
       let refusal: EngineAnalysis['refusal'] = null;
+      let refusedCurrency: RefusedCurrency | null = null;
       let nearest: Nearest[] = [];
       let plan: PlanStep[] = [];
       let steps: StepOutcome[] = [];
@@ -270,9 +285,18 @@ export function builtinEngine(): AiProvider {
           refusal = { code: 'tool_failed', why: failed!.error?.message ?? 'budget exhausted' };
           reasoning.push(`Refused after the run (tool_failed): ${refusal.why}`);
         } else if (failed) {
+          // A tool that refuses may say why in fields as well as in a sentence.
+          // Carry those through rather than leaving the card to parse the
+          // sentence back apart — it did, with a regex, and went silent the
+          // third time the sentence was improved.
+          refusedCurrency = (failed.result as { refused_currency?: RefusedCurrency } | undefined)?.refused_currency ?? null;
           refuse('tool_failed', `${failed.tool} could not answer: ${failed.error?.message ?? 'it failed'}`);
         } else if (steps.some((s) => s.result && typeof s.result === 'object' && 'error' in (s.result as object))) {
+          const refusing = steps.find((s) => s.result && typeof s.result === 'object' && 'error' in (s.result as object));
           const error = steps.map((s) => (s.result as { error?: string }).error).find(Boolean) ?? 'the tool refused the arguments';
+          // A tool that refuses may also say why in fields. Carry those through
+          // rather than leaving the card to parse the sentence back apart.
+          refusedCurrency = (refusing?.result as { refused_currency?: RefusedCurrency })?.refused_currency ?? null;
           refuse('tool_failed', String(error));
         } else {
           const rendered = template.render(steps, bindings, vocab);
@@ -315,6 +339,7 @@ export function builtinEngine(): AiProvider {
         template: template ? { id: template.id, kind: template.kind, description: template.description, example: template.example(vocab) } : null,
         slots: Object.values(bindings).filter((one) => !one.name.startsWith('$')).map((one) => ({ name: one.name, kind: one.slot, text: one.text, label: labelOf(one), qualifier: one.qualifier })),
         refusal,
+        refusedCurrency,
         nearest,
         plan,
         steps: steps.map((s) => ({ tool: s.tool, ok: s.ok, code: s.error?.code ?? null, ms: s.ms })),
